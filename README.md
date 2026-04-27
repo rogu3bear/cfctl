@@ -12,16 +12,18 @@ If you've ever found yourself stitching together `wrangler`, `cloudflared`, raw 
 
 ## Quickstart
 
-See [QUICKSTART.md](QUICKSTART.md) for install, credential setup, and your first `cfctl` commands. The short version:
+See [QUICKSTART.md](QUICKSTART.md) for install, credential setup, and your first `cfctl` commands. The shortest path:
 
 ```bash
 git clone https://github.com/rogu3bear/cfctl.git
 cd cfctl
-ln -s "$(pwd)/cfctl" ~/bin/cfctl   # if ~/bin is on your PATH
-cp .env.example ~/dev/.env         # then fill in CF_DEV_TOKEN + CLOUDFLARE_ACCOUNT_ID
+./bootstrap.sh           # checks tools, symlinks cfctl, scaffolds ~/dev/.env, runs doctor
+$EDITOR ~/dev/.env       # fill in CF_DEV_TOKEN + CLOUDFLARE_ACCOUNT_ID
 cfctl doctor
 cfctl surfaces
 ```
+
+`bootstrap.sh` is idempotent and never installs anything — it only checks, symlinks, and scaffolds. See `./bootstrap.sh --help` for flags.
 
 ## Why use this instead of plain wrangler?
 
