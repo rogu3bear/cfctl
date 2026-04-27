@@ -8,18 +8,17 @@
 #   3. Checks optional tools: wrangler, cloudflared.
 #   4. Symlinks cfctl into ~/bin (or $CFCTL_BIN_DIR) if not already there.
 #   5. Scaffolds an env file at $CFCTL_ENV_FILE (default ~/dev/.env) from
-#      .env.example, but never overwrites an existing file.
+#      .env.example with mode 600, but never overwrites an existing file.
 #   6. Runs `cfctl doctor` as a smoke test.
 #
 # What this does NOT do:
 #   - Install anything. Tool installation is up to you (homebrew, apt, etc.).
 #   - Touch any Cloudflare account. Doctor is read-only.
-#   - Overwrite an existing ~/dev/.env or symlink.
+#   - Overwrite an existing env file or a symlink that points elsewhere.
 #
 # Flags:
-#   --check-only     Only run checks; do not create symlink or env file.
-#   --non-interactive  Never prompt; assume the safe default for any choice.
-#   -h, --help       Show this help.
+#   --check-only   Only run checks; do not create symlink or env file.
+#   -h, --help     Show this help.
 #
 # Environment overrides:
 #   CFCTL_BIN_DIR    Where to symlink cfctl. Default: ~/bin
@@ -29,15 +28,29 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve the script through any chain of symlinks (so ROOT_DIR points at the
+# checkout, not at $CFCTL_BIN_DIR if someone symlinks bootstrap.sh too).
+# python3 is required anyway, so use it to dodge macOS readlink not having -f
+# on older versions.
+_resolve_script() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}"
+  elif readlink -f -- "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
+    readlink -f -- "${BASH_SOURCE[0]}"
+  else
+    # Fallback: best-effort resolve (won't follow symlinks, but better than nothing)
+    cd -P "$(dirname "${BASH_SOURCE[0]}")" && printf '%s/%s\n' "$(pwd)" "$(basename "${BASH_SOURCE[0]}")"
+  fi
+}
+SCRIPT_PATH="$(_resolve_script)"
+ROOT_DIR="$(cd -P "$(dirname "${SCRIPT_PATH}")" && pwd)"
 CFCTL_BIN_DIR="${CFCTL_BIN_DIR:-${HOME}/bin}"
 CFCTL_ENV_FILE="${CFCTL_ENV_FILE:-${HOME}/dev/.env}"
 CHECK_ONLY=0
-NON_INTERACTIVE=0
 
-# ---------- output helpers ----------
+# ---------- output helpers (diagnostics go to stderr; stdout reserved for data) ----------
 
-if [[ -t 1 ]]; then
+if [[ -t 2 ]]; then
   C_RED=$'\033[31m'
   C_GREEN=$'\033[32m'
   C_YELLOW=$'\033[33m'
@@ -49,14 +62,38 @@ else
   C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_BOLD=""; C_DIM=""; C_RESET=""
 fi
 
-step()  { printf '%s==>%s %s\n' "${C_BLUE}${C_BOLD}" "${C_RESET}" "$*"; }
-ok()    { printf '%s ok %s   %s\n' "${C_GREEN}" "${C_RESET}" "$*"; }
-warn()  { printf '%swarn%s   %s\n' "${C_YELLOW}" "${C_RESET}" "$*"; }
-fail()  { printf '%sfail%s   %s\n' "${C_RED}" "${C_RESET}" "$*"; }
-info()  { printf '%s     %s%s\n'  "${C_DIM}" "$*" "${C_RESET}"; }
+step()  { printf '%s==>%s %s\n' "${C_BLUE}${C_BOLD}" "${C_RESET}" "$*" >&2; }
+ok()    { printf '%s ok %s   %s\n' "${C_GREEN}" "${C_RESET}" "$*" >&2; }
+warn()  { printf '%swarn%s   %s\n' "${C_YELLOW}" "${C_RESET}" "$*" >&2; }
+fail()  { printf '%sfail%s   %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; }
+info()  { printf '%s     %s%s\n'  "${C_DIM}" "$*" "${C_RESET}" >&2; }
 
 usage() {
-  sed -n '2,/^# Re-running/p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<'EOF'
+bootstrap.sh — first-run setup for cfctl.
+
+Usage:
+  ./bootstrap.sh [--check-only] [-h|--help]
+
+What it does (in order):
+  1. Detects platform (macOS / Linux).
+  2. Checks required tools: bash, jq, curl, python3.
+  3. Checks optional tools: wrangler, cloudflared.
+  4. Symlinks cfctl into ~/bin (or $CFCTL_BIN_DIR) if not already there.
+  5. Scaffolds an env file at $CFCTL_ENV_FILE (default ~/dev/.env) from
+     .env.example with mode 600, but never overwrites an existing file.
+  6. Runs `cfctl doctor` as a smoke test.
+
+Flags:
+  --check-only  Only run the tool checks; do not modify the filesystem.
+  -h, --help    Show this help and exit.
+
+Environment overrides:
+  CFCTL_BIN_DIR    Where to symlink cfctl. Default: ~/bin
+  CFCTL_ENV_FILE   Where to scaffold the env file. Default: ~/dev/.env
+
+Re-running this script is safe: every step is idempotent.
+EOF
   exit 0
 }
 
@@ -65,7 +102,6 @@ usage() {
 for arg in "$@"; do
   case "${arg}" in
     --check-only) CHECK_ONLY=1 ;;
-    --non-interactive) NON_INTERACTIVE=1 ;;
     -h|--help) usage ;;
     *)
       fail "unknown flag: ${arg}"
@@ -177,12 +213,20 @@ esac
 # ---------- scaffold env file ----------
 
 step "Setting up env file"
+ENV_TEMPLATE="${ROOT_DIR}/.env.example"
+if [[ ! -f "${ENV_TEMPLATE}" ]]; then
+  fail "expected env template at ${ENV_TEMPLATE} — re-clone the repo"
+  exit 1
+fi
+
 if [[ -f "${CFCTL_ENV_FILE}" ]]; then
   ok "${CFCTL_ENV_FILE} already exists — leaving it alone"
 else
   ENV_DIR="$(dirname "${CFCTL_ENV_FILE}")"
   mkdir -p "${ENV_DIR}"
-  cp "${ROOT_DIR}/.env.example" "${CFCTL_ENV_FILE}"
+  # Create the file mode-tight from the start. The subshell-umask pattern
+  # ensures the file is never observable at 0644 between cp and chmod.
+  ( umask 077 && cp "${ENV_TEMPLATE}" "${CFCTL_ENV_FILE}" )
   chmod 600 "${CFCTL_ENV_FILE}"
   ok "scaffolded ${CFCTL_ENV_FILE} from .env.example (mode 600)"
   warn "${CFCTL_ENV_FILE} is empty — fill in CF_DEV_TOKEN and CLOUDFLARE_ACCOUNT_ID before continuing"
@@ -193,11 +237,16 @@ fi
 
 step "Running cfctl doctor"
 DOCTOR_BIN="${ROOT_DIR}/cfctl"
-if "${DOCTOR_BIN}" doctor >/dev/null 2>&1; then
+DOCTOR_OUT="$(mktemp -t cfctl-bootstrap-doctor.XXXXXX)"
+trap 'rm -f "${DOCTOR_OUT}"' EXIT
+if "${DOCTOR_BIN}" doctor >"${DOCTOR_OUT}" 2>&1; then
   ok "cfctl doctor reports green"
 else
-  warn "cfctl doctor reports issues — run it yourself to see details:"
-  info "  ${DOCTOR_BIN} doctor"
+  warn "cfctl doctor reports issues — output below:"
+  info "(run \`${DOCTOR_BIN} doctor\` to reproduce)"
+  printf '%s\n' "----- doctor output -----" >&2
+  cat "${DOCTOR_OUT}" >&2
+  printf '%s\n' "-------------------------" >&2
   info "common causes: env file empty, CF_DEV_TOKEN wrong scope, CLOUDFLARE_ACCOUNT_ID missing"
   WARNINGS=$((WARNINGS + 1))
 fi
@@ -210,7 +259,7 @@ if (( WARNINGS > 0 )); then
   warn "${WARNINGS} non-fatal warning(s) above — review before relying on cfctl"
 fi
 
-cat <<NEXT
+cat >&2 <<NEXT
 
 ${C_BOLD}Next steps:${C_RESET}
   1. ${C_DIM}# if your env file was just scaffolded:${C_RESET}
