@@ -1,0 +1,418 @@
+{
+  "version": 1,
+  "title": "Cloudflare Docs Bank",
+  "checked_on": "2026-04-22",
+  "intent": "Compact official-doc bank for stable Cloudflare references and incoming capabilities worth tracking in this runtime.",
+  "source_policy": {
+    "allowed_domains": [
+      "developers.cloudflare.com"
+    ],
+    "prefer": [
+      "product docs",
+      "product changelog",
+      "Cloudflare API reference"
+    ],
+    "avoid": [
+      "third-party summaries",
+      "dashboard-only memory",
+      "model-by-model churn unless it changes platform shape"
+    ]
+  },
+  "refresh_policy": {
+    "mode": "curated_not_exhaustive",
+    "refresh_interval_days": 30,
+    "when_to_refresh": [
+      "before broad Cloudflare architecture or capability work",
+      "when Cloudflare launches or renames a platform capability",
+      "when a beta or open beta looks operationally relevant here",
+      "when cfctl grows a surface that depends on a new official doc family"
+    ],
+    "operator_note": "Track platform-shape changes, not every single changelog item."
+  },
+  "docs_access": {
+    "llms_index": "https://developers.cloudflare.com/llms.txt",
+    "llms_full": "https://developers.cloudflare.com/llms-full.txt",
+    "page_markdown_rule": "Append /index.md to any docs page URL to fetch the Markdown version.",
+    "notes": [
+      "Prefer Cloudflare's Markdown or llms.txt surfaces over HTML for agent refreshes.",
+      "Use product-specific llms.txt and llms-full.txt when a task is scoped to one product."
+    ],
+    "sources": [
+      {
+        "title": "AI tooling",
+        "url": "https://developers.cloudflare.com/style-guide/ai-tooling/"
+      },
+      {
+        "title": "AI consumability",
+        "url": "https://developers.cloudflare.com/style-guide/how-we-docs/ai-consumability/"
+      }
+    ]
+  },
+  "foundation": [
+    {
+      "id": "docs-access",
+      "title": "AI-friendly docs access",
+      "area": "docs",
+      "status": "stable",
+      "summary": "Cloudflare publishes llms.txt, llms-full.txt, and page-level Markdown via /index.md.",
+      "why_it_matters_here": "This runtime should refresh against Cloudflare's own compact text surfaces instead of scraping HTML.",
+      "sources": [
+        {
+          "title": "AI tooling",
+          "url": "https://developers.cloudflare.com/style-guide/ai-tooling/"
+        },
+        {
+          "title": "AI consumability",
+          "url": "https://developers.cloudflare.com/style-guide/how-we-docs/ai-consumability/"
+        }
+      ]
+    },
+    {
+      "id": "api-auth",
+      "title": "API auth and token model",
+      "area": "platform",
+      "status": "stable",
+      "summary": "API tokens remain the primary auth model; account-owned tokens remain relevant for automation and service-style use.",
+      "why_it_matters_here": "This repo's lane model, token minting, and permission probes all depend on the official token model.",
+      "sources": [
+        {
+          "title": "API get started",
+          "url": "https://developers.cloudflare.com/fundamentals/api/get-started/"
+        },
+        {
+          "title": "Account-owned tokens",
+          "url": "https://developers.cloudflare.com/fundamentals/api/get-started/account-owned-tokens/"
+        },
+        {
+          "title": "Create tokens via API",
+          "url": "https://developers.cloudflare.com/fundamentals/api/how-to/create-via-api/"
+        }
+      ]
+    },
+    {
+      "id": "wrangler",
+      "title": "Wrangler as the product runtime hinge",
+      "area": "workers",
+      "status": "stable",
+      "summary": "Wrangler remains the canonical CLI surface for Workers, Pages-adjacent developer flows, bindings, env, and deployment wiring.",
+      "why_it_matters_here": "This repo already wraps Wrangler heavily; incoming capability tracking should stay aligned with official Wrangler behavior.",
+      "sources": [
+        {
+          "title": "Wrangler commands",
+          "url": "https://developers.cloudflare.com/workers/wrangler/commands/"
+        },
+        {
+          "title": "Wrangler configuration",
+          "url": "https://developers.cloudflare.com/workers/wrangler/configuration/"
+        },
+        {
+          "title": "Wrangler system environment variables",
+          "url": "https://developers.cloudflare.com/workers/wrangler/system-environment-variables/"
+        }
+      ]
+    },
+    {
+      "id": "zero-trust-api",
+      "title": "Zero Trust and Access control plane",
+      "area": "zero-trust",
+      "status": "stable",
+      "summary": "Zero Trust API and Access service tokens remain the official primitives for automation, Access apps, and service-to-service reach.",
+      "why_it_matters_here": "This repo already inventories and mutates Access-adjacent state, so the official API surface remains foundational.",
+      "sources": [
+        {
+          "title": "Zero Trust API reference",
+          "url": "https://developers.cloudflare.com/api/resources/zero_trust/"
+        },
+        {
+          "title": "Access service tokens",
+          "url": "https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/"
+        }
+      ]
+    },
+    {
+      "id": "changelog-hubs",
+      "title": "Product changelog hubs",
+      "area": "docs",
+      "status": "stable",
+      "summary": "Cloudflare product changelog pages are the cleanest way to track meaningful capability movement without diffing the full docs tree.",
+      "why_it_matters_here": "This bank should refresh from product changelogs first, then only expand into deeper docs when a change matters here.",
+      "sources": [
+        {
+          "title": "Cloudflare changelog",
+          "url": "https://developers.cloudflare.com/changelog/"
+        },
+        {
+          "title": "Workers changelog",
+          "url": "https://developers.cloudflare.com/changelog/product/workers/"
+        },
+        {
+          "title": "AI changelog",
+          "url": "https://developers.cloudflare.com/changelog/product-group/ai/"
+        }
+      ]
+    },
+    {
+      "id": "cloudflare-mcp",
+      "title": "Cloudflare's own MCP posture",
+      "area": "agents",
+      "status": "stable",
+      "summary": "Cloudflare treats MCP as a first-class operating surface and publishes both general and product-specific managed MCP servers.",
+      "why_it_matters_here": "This repo is an agent runtime; it should understand Cloudflare's official MCP direction even when cfctl remains the primary local interface.",
+      "sources": [
+        {
+          "title": "Cloudflare MCP servers",
+          "url": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/"
+        },
+        {
+          "title": "Model Context Protocol",
+          "url": "https://developers.cloudflare.com/agents/model-context-protocol/"
+        }
+      ]
+    }
+  ],
+  "watch": [
+    {
+      "id": "mcp-servers",
+      "title": "Managed Cloudflare MCP servers",
+      "area": "agents",
+      "status": "recent",
+      "source_date": "2026-04-22",
+      "summary": "Cloudflare's managed MCP catalog now includes the Cloudflare API MCP server and product-specific docs, bindings, and builds servers. The API server uses Codemode instead of exposing thousands of native tools.",
+      "why_it_matters_here": "This runtime should stay MCP-aware without becoming MCP-dependent. It is a likely future integration lane for docs and account operations.",
+      "track_here": [
+        "keep cfctl docs bank aligned with Cloudflare MCP posture",
+        "consider future MCP-aware adapters only where they improve exactness instead of hiding it"
+      ],
+      "sources": [
+        {
+          "title": "Cloudflare MCP servers",
+          "url": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/"
+        }
+      ]
+    },
+    {
+      "id": "ai-search",
+      "title": "AI Search is moving fast",
+      "area": "ai",
+      "status": "recent",
+      "source_date": "2026-04-16",
+      "summary": "New AI Search instances now come with built-in storage and a vector index, plus namespace bindings and cross-instance search. In March 2026 Cloudflare also added public endpoints, UI snippets, and MCP support.",
+      "why_it_matters_here": "AI Search is no longer just a niche retrieval add-on. It is becoming a real agent-facing surface with bindings, public endpoints, and MCP.",
+      "track_here": [
+        "inventory if the account starts using AI Search instances",
+        "consider future standards for public endpoint and snippet posture",
+        "track MCP endpoint usage separately from generic search usage"
+      ],
+      "sources": [
+        {
+          "title": "AI Search changelog",
+          "url": "https://developers.cloudflare.com/changelog/product/ai-search/"
+        }
+      ]
+    },
+    {
+      "id": "browser-run",
+      "title": "Browser Rendering became Browser Run",
+      "area": "ai",
+      "status": "recent",
+      "source_date": "2026-04-15",
+      "summary": "Browser Rendering was renamed to Browser Run, with higher limits, a redesigned dashboard, Live View, human-in-the-loop features, session recordings, and WebMCP. The crawl API remains a beta-style surface.",
+      "why_it_matters_here": "This matters for agent operations, crawl posture, remote browser debugging, and any future Cloudflare-native web automation lane.",
+      "track_here": [
+        "treat Browser Run as an agent/browser capability, not just screenshot tooling",
+        "watch crawl and WebMCP maturity before building first-class wrappers"
+      ],
+      "sources": [
+        {
+          "title": "Browser Run changelog",
+          "url": "https://developers.cloudflare.com/changelog/product/browser-run/"
+        },
+        {
+          "title": "Browser Run detailed changelog",
+          "url": "https://developers.cloudflare.com/browser-run/changelog/"
+        }
+      ]
+    },
+    {
+      "id": "workflows",
+      "title": "Workflows remains an active moving surface",
+      "area": "workers",
+      "status": "recent",
+      "source_date": "2026-04-21",
+      "summary": "Workflows continues to ship meaningful execution features such as richer step context and ReadableStream outputs. The product is already GA, but the changelog still shows a fast-moving feature surface.",
+      "why_it_matters_here": "This repo already inventories Workflows. The docs bank should keep their changing execution model visible without tracking every minor fix.",
+      "track_here": [
+        "watch execution semantics that affect verification and operator expectations",
+        "track major language/runtime additions, not every single retry tweak"
+      ],
+      "sources": [
+        {
+          "title": "Workflows changelog",
+          "url": "https://developers.cloudflare.com/changelog/product/workflows/"
+        }
+      ]
+    },
+    {
+      "id": "dynamic-workers",
+      "title": "Dynamic Workers entered open beta",
+      "area": "workers",
+      "status": "open_beta",
+      "source_date": "2026-03-24",
+      "summary": "Dynamic Workers let one Worker spin up other Workers at runtime for isolated code execution, with explicit control over bindings and network access.",
+      "why_it_matters_here": "This is directly relevant to agent-grade execution, code mode, and future Cloudflare-native sandboxing inside this runtime.",
+      "track_here": [
+        "watch for API/runtime stabilization before adding first-class wrappers",
+        "compare against Containers and Browser Run for agent execution use cases"
+      ],
+      "sources": [
+        {
+          "title": "Dynamic Workers overview",
+          "url": "https://developers.cloudflare.com/dynamic-workers/"
+        },
+        {
+          "title": "Dynamic Workers open beta",
+          "url": "https://developers.cloudflare.com/changelog/post/2026-03-24-dynamic-workers-open-beta/"
+        }
+      ]
+    },
+    {
+      "id": "workers-vpc",
+      "title": "Workers VPC is expanding beyond single-service bindings",
+      "area": "networking",
+      "status": "public_beta",
+      "source_date": "2026-04-14",
+      "summary": "Workers VPC added VPC Network bindings and Cloudflare Mesh support in public beta, extending Workers access deeper into private-network routing.",
+      "why_it_matters_here": "This is a new private-connectivity shape that may matter for future internal service access from Workers or agent tooling.",
+      "track_here": [
+        "watch VPC network bindings and mesh routing maturity",
+        "treat this separately from classic Tunnel inventory"
+      ],
+      "sources": [
+        {
+          "title": "Workers VPC changelog",
+          "url": "https://developers.cloudflare.com/changelog/product/workers-vpc/"
+        }
+      ]
+    },
+    {
+      "id": "containers",
+      "title": "Containers remain a real beta platform surface",
+      "area": "workers",
+      "status": "beta",
+      "source_date": "2026-03-02",
+      "summary": "Containers are still in beta but already support Worker-controlled images, Durable Object integration, placement, rollouts, outbound traffic handling, SSH, and R2/FUSE examples.",
+      "why_it_matters_here": "This repo already saw real account usage of Containers. The docs bank should keep the operational surface legible for future inventory and standards work.",
+      "track_here": [
+        "watch runtime semantics, rollouts, and outbound policy changes",
+        "keep container standards distinct from Dynamic Workers and Browser Run"
+      ],
+      "sources": [
+        {
+          "title": "Containers overview",
+          "url": "https://developers.cloudflare.com/containers/"
+        },
+        {
+          "title": "Containers changelog",
+          "url": "https://developers.cloudflare.com/changelog/product/containers/"
+        }
+      ]
+    },
+    {
+      "id": "secrets-store",
+      "title": "Secrets Store remains important and still constrained",
+      "area": "security",
+      "status": "open_beta",
+      "source_date": "2026-04-16",
+      "summary": "Secrets Store is still in open beta and currently integrates with Workers and AI Gateway. It is account-level, centralized, and intended to replace ad hoc secret sprawl.",
+      "why_it_matters_here": "This runtime should be explicit about when to use Secrets Store instead of repo env files or per-project secrets.",
+      "track_here": [
+        "track product integrations beyond Workers and AI Gateway",
+        "keep standards aligned with centralized secret posture"
+      ],
+      "sources": [
+        {
+          "title": "Secrets Store overview",
+          "url": "https://developers.cloudflare.com/secrets-store/"
+        },
+        {
+          "title": "Secrets Store changelog",
+          "url": "https://developers.cloudflare.com/changelog/product/secrets-store/"
+        }
+      ]
+    },
+    {
+      "id": "pipelines",
+      "title": "Pipelines is a real beta data-plane surface",
+      "area": "data",
+      "status": "beta",
+      "source_date": "2025-04-10",
+      "summary": "Pipelines is still a beta surface for high-volume data ingestion with streams, SQL transforms, and R2 or Data Catalog sinks.",
+      "why_it_matters_here": "This is operationally relevant if the account starts using event pipelines or if R2 SQL and analytics work grows here.",
+      "track_here": [
+        "watch for GA and broader sink support",
+        "keep Pipelines distinct from Queues, Logpush, and analytics exports"
+      ],
+      "sources": [
+        {
+          "title": "Pipelines overview",
+          "url": "https://developers.cloudflare.com/pipelines/"
+        },
+        {
+          "title": "Pipelines changelog",
+          "url": "https://developers.cloudflare.com/changelog/product/pipelines/"
+        }
+      ]
+    },
+    {
+      "id": "api-shield-vulnerability-scanner",
+      "title": "API Shield vulnerability scanning is now a real API surface",
+      "area": "security",
+      "status": "open_beta",
+      "source_date": "2026-03-09",
+      "summary": "Cloudflare's Web and API Vulnerability Scanner is in open beta via API, focused first on stateful API scanning and BOLA detection.",
+      "why_it_matters_here": "This is a meaningful next-step surface for security posture beyond passive API Shield inventory.",
+      "track_here": [
+        "watch dashboard availability and API maturity",
+        "consider future inventory or mutation wrappers only after the surface stabilizes"
+      ],
+      "sources": [
+        {
+          "title": "API Shield vulnerability scanner changelog",
+          "url": "https://developers.cloudflare.com/changelog/post/2026-03-09-vulnerability-scanner/"
+        },
+        {
+          "title": "Vulnerability scanner docs",
+          "url": "https://developers.cloudflare.com/api-shield/security/vulnerability-scanner/"
+        }
+      ]
+    },
+    {
+      "id": "workers-builds",
+      "title": "Workers Builds is still worth tracking as an incoming ops surface",
+      "area": "workers",
+      "status": "open_beta",
+      "source_date": "2025-08-04",
+      "summary": "Workers Builds remains in open beta and Cloudflare continues to raise operational limits like build disk size. Cloudflare also ships a product-specific Builds MCP server.",
+      "why_it_matters_here": "If this repo becomes a stronger deploy/control-plane for Worker repos, Builds may become operationally relevant here.",
+      "track_here": [
+        "watch GA posture and build-management APIs",
+        "treat Builds as separate from wrangler deploy and Pages builds"
+      ],
+      "sources": [
+        {
+          "title": "Workers Builds changelog entry",
+          "url": "https://developers.cloudflare.com/changelog/post/2025-08-04-builds-increased-disk-size/"
+        },
+        {
+          "title": "Cloudflare MCP servers",
+          "url": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/"
+        }
+      ]
+    }
+  ],
+  "excluded_noise": [
+    "Do not track every Workers AI model addition here unless it changes the platform shape or control plane.",
+    "Do not track every V8/runtime patch from the Workers platform changelog here.",
+    "Do not mirror full Cloudflare changelog feeds into this repo."
+  ]
+}

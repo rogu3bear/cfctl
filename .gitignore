@@ -1,0 +1,31 @@
+# Live secrets — never commit
+.env
+.env.*
+!.env.example
+!.env.local.example
+
+# Runtime evidence and logs (per evidence contract in README)
+var/
+
+# Wrangler local cache and state
+.wrangler/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Token sinks (cfctl token mint --value-out targets)
+*.token
+secrets-out/
+.secrets/
+
+# OS / editor scratch
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local overrides
+*.local
+local.*

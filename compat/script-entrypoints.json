@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "policy": "shim_then_hide",
+  "entries": [
+    {
+      "legacy_path": "scripts/cf_inventory_zones.sh",
+      "replacement": "./cfctl list zone"
+    },
+    {
+      "legacy_path": "scripts/cf_inventory_pages.sh",
+      "replacement": "./cfctl list pages.project"
+    },
+    {
+      "legacy_path": "scripts/cf_inventory_workers.sh",
+      "replacement": "./cfctl list worker.script"
+    },
+    {
+      "legacy_path": "scripts/cf_inventory_d1.sh",
+      "replacement": "./cfctl list d1.database"
+    },
+    {
+      "legacy_path": "scripts/cf_inventory_r2.sh",
+      "replacement": "./cfctl list r2.bucket"
+    },
+    {
+      "legacy_path": "scripts/cf_inventory_queues.sh",
+      "replacement": "./cfctl list queue"
+    },
+    {
+      "legacy_path": "scripts/cf_inventory_workflows.sh",
+      "replacement": "./cfctl list workflow"
+    },
+    {
+      "legacy_path": "scripts/cf_inventory_access.sh",
+      "replacement": "./cfctl list access.app"
+    },
+    {
+      "legacy_path": "scripts/cf_inventory_turnstile.sh",
+      "replacement": "./cfctl list turnstile.widget"
+    },
+    {
+      "legacy_path": "scripts/cf_inventory_dns.sh",
+      "replacement": "./cfctl list dns.record --zone <zone>"
+    },
+    {
+      "legacy_path": "scripts/cf_inventory_waiting_rooms.sh",
+      "replacement": "./cfctl list waiting_room --zone <zone>"
+    },
+    {
+      "legacy_path": "scripts/cf_inventory_logpush.sh",
+      "replacement": "./cfctl list logpush.job"
+    },
+    {
+      "legacy_path": "scripts/cf_inventory_tunnels.sh",
+      "replacement": "./cfctl list tunnel"
+    },
+    {
+      "legacy_path": "scripts/cf_auth_check.sh",
+      "replacement": "./cfctl lanes"
+    },
+    {
+      "legacy_path": "scripts/cf_probe_token_permissions.sh",
+      "replacement": "./cfctl can <surface> <operation> --all-lanes"
+    },
+    {
+      "legacy_path": "scripts/cf_mutate_access_app.sh",
+      "replacement": "./cfctl apply access.app <operation> ...",
+      "mode": "backend_only"
+    },
+    {
+      "legacy_path": "scripts/cf_mutate_access_policy.sh",
+      "replacement": "./cfctl apply access.policy <operation> ...",
+      "mode": "backend_only"
+    },
+    {
+      "legacy_path": "scripts/cf_mutate_dns_record.sh",
+      "replacement": "./cfctl apply dns.record <operation> ...",
+      "mode": "backend_only"
+    },
+    {
+      "legacy_path": "scripts/cf_mutate_tunnel.sh",
+      "replacement": "./cfctl apply tunnel <operation> ...",
+      "mode": "backend_only"
+    },
+    {
+      "legacy_path": "scripts/cf_api_apply.sh",
+      "replacement": "./cfctl apply <surface> <operation> ...",
+      "mode": "backend_only"
+    },
+    {
+      "legacy_path": "scripts/cf_token_mint.sh",
+      "replacement": "./cfctl token mint ...",
+      "mode": "backend_only"
+    }
+  ]
+}

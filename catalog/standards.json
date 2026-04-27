@@ -1,0 +1,685 @@
+{
+  "version": 2,
+  "title": "Cloudflare Configuration Standards",
+  "intent": "Canonical Cloudflare configuration standards for this runtime. These standards tell agents how to shape changes, not just how to execute them.",
+  "default_change_path": [
+    "cfctl doctor",
+    "cfctl standards <surface>",
+    "cfctl explain <surface>",
+    "cfctl classify <surface> <operation>",
+    "cfctl guide <surface> <operation>"
+  ],
+  "audit": {
+    "default_root_env": "CFCTL_AUDIT_ROOT",
+    "config_names": [
+      "wrangler.toml",
+      "wrangler.jsonc"
+    ],
+    "compatibility_date_freshness": {
+      "note_after_days": 30,
+      "warning_after_days": 90
+    },
+    "exclude_path_tokens": [
+      "/node_modules/",
+      "/.git/",
+      "/ARCHIVE_",
+      "/_wt/",
+      "/archive/",
+      "/fixtures/"
+    ]
+  },
+  "universal": [
+    {
+      "id": "runtime.cfctl-first",
+      "level": "required",
+      "title": "Use cfctl as the public control plane",
+      "summary": "Agents should use cfctl for reads, writes, verification, and evidence. Direct backend scripts are maintainer-only.",
+      "why": "This preserves one trust path, one evidence path, and one mutation policy surface.",
+      "evidence": [
+        "cfctl doctor",
+        "cfctl explain <surface>"
+      ]
+    },
+    {
+      "id": "auth.dev-first",
+      "level": "required",
+      "title": "Use the dev lane first",
+      "summary": "Default to CF_DEV_TOKEN. Switch to CF_TOKEN_LANE=global only when the dev lane is blocked or the operation intentionally needs the wider emergency surface.",
+      "why": "This keeps normal work on the narrower lane and makes emergency-scope work explicit.",
+      "evidence": [
+        "cfctl lanes",
+        "cfctl can <surface> <operation> --all-lanes"
+      ]
+    },
+    {
+      "id": "change.preview-before-apply",
+      "level": "required",
+      "title": "Preview before mutation",
+      "summary": "Real writes must run with --plan first, then re-run with --ack-plan <operation-id>.",
+      "why": "This binds the applied change to a reviewed plan and keeps a durable audit artifact.",
+      "evidence": [
+        "cfctl classify <surface> <operation>",
+        "cfctl apply <surface> <operation> ... --plan"
+      ]
+    },
+    {
+      "id": "verification.readback-required",
+      "level": "required",
+      "title": "Verify after meaningful change",
+      "summary": "After a write, perform a targeted readback or use the runtime's verification path.",
+      "why": "Inventory alone is not proof that the intended resource state actually changed.",
+      "evidence": [
+        "cfctl verify <surface>",
+        "var/inventory/runtime/",
+        "var/inventory/operations/"
+      ]
+    },
+    {
+      "id": "secrets.no-secret-in-repo",
+      "level": "required",
+      "title": "Keep secret material out of the repo",
+      "summary": "Secrets stay in ~/dev/.env or approved secret sinks. Runtime artifacts and state specs must remain redacted.",
+      "why": "This repo is an operational bank, not a credential store.",
+      "evidence": [
+        "cfctl doctor --strict",
+        "var/inventory/auth/",
+        "cfctl token mint ... --value-out <secure-path>"
+      ]
+    },
+    {
+      "id": "state.use-desired-state-for-repeatable-drift",
+      "level": "recommended",
+      "title": "Promote repeatable resources to desired state",
+      "summary": "When drift is common or the resource is foundational, prefer diff/sync over repeated ad hoc mutation.",
+      "why": "Desired state is the cleanest path for recurring DNS, Access, and tunnel topology.",
+      "evidence": [
+        "cfctl diff <surface>",
+        "cfctl apply <surface> sync --plan"
+      ]
+    }
+  ],
+  "surfaces": {
+    "access.app": {
+      "stance": "desired-state preferred for durable applications",
+      "standards": [
+        {
+          "id": "access.app.explicit-identity-shape",
+          "level": "required",
+          "title": "Declare the application identity shape explicitly",
+          "summary": "Application domain, type, and self-hosted posture should be explicit rather than inherited by assumption."
+        },
+        {
+          "id": "access.app.allowed-idps-explicit",
+          "level": "required",
+          "title": "Keep allowed identity providers deliberate",
+          "summary": "Self-hosted applications should not drift into implicit or duplicate IdP allowance. allowed_idps should reflect intentional policy."
+        },
+        {
+          "id": "access.app.state-backed",
+          "level": "recommended",
+          "title": "Manage durable Access apps in state/access.app",
+          "summary": "Foundational apps should be diffed and reconciled through desired state instead of hand-edited repeatedly."
+        }
+      ],
+      "evidence": [
+        "cfctl explain access.app",
+        "cfctl diff access.app",
+        "cfctl apply access.app sync --plan"
+      ]
+    },
+    "access.policy": {
+      "stance": "desired-state preferred for shared and high-value policies",
+      "standards": [
+        {
+          "id": "access.policy.reusable-preferred",
+          "level": "recommended",
+          "title": "Prefer reusable policies for shared intent",
+          "summary": "When policy intent is reused across multiple apps, make it reusable instead of cloning near-identical policies."
+        },
+        {
+          "id": "access.policy.match-logic-explicit",
+          "level": "required",
+          "title": "Keep include/exclude/require logic explicit",
+          "summary": "Policy match structure should be intentional and readable. Do not rely on remembered dashboard defaults."
+        },
+        {
+          "id": "access.policy.state-backed",
+          "level": "recommended",
+          "title": "Store durable policies in state/access.policy",
+          "summary": "Stable policies should be diffable and syncable from desired state."
+        }
+      ],
+      "evidence": [
+        "cfctl explain access.policy",
+        "cfctl diff access.policy",
+        "cfctl apply access.policy sync --plan"
+      ]
+    },
+    "dns.record": {
+      "stance": "desired-state preferred for repeated, platform, and routing-critical records",
+      "standards": [
+        {
+          "id": "dns.record.ttl-explicit",
+          "level": "required",
+          "title": "Set TTL deliberately",
+          "summary": "Do not rely on implicit TTL assumptions. Critical records should use an explicit TTL that matches the intended failover posture."
+        },
+        {
+          "id": "dns.record.proxy-posture-explicit",
+          "level": "required",
+          "title": "Set proxy posture explicitly",
+          "summary": "A/AAAA/CNAME records should declare whether they are proxied. Do not assume the current proxy posture is safe."
+        },
+        {
+          "id": "dns.record.zone-specific-checks",
+          "level": "required",
+          "title": "Classify with full selectors",
+          "summary": "Permission and safety checks for DNS require zone, name, and type. Partial selectors are not enough to claim lane truth."
+        },
+        {
+          "id": "dns.record.state-backed-critical",
+          "level": "recommended",
+          "title": "Move durable routing records into state/dns.record",
+          "summary": "Records that define app routing, verification, or infrastructure topology should be diffed and synced instead of repeatedly hand-edited."
+        }
+      ],
+      "evidence": [
+        "cfctl classify dns.record upsert --zone <zone> --name <name> --type <type>",
+        "cfctl diff dns.record --zone <zone>",
+        "cfctl apply dns.record sync --zone <zone> --plan"
+      ]
+    },
+    "logpush.job": {
+      "stance": "explicit destination validation and scope control",
+      "standards": [
+        {
+          "id": "logpush.job.destination-validated",
+          "level": "required",
+          "title": "Validate every destination",
+          "summary": "Logpush jobs should validate ownership and destination reachability before live enablement."
+        },
+        {
+          "id": "logpush.job.scope-deliberate",
+          "level": "required",
+          "title": "Keep account or zone scope deliberate",
+          "summary": "Logpush jobs should make their scope explicit and avoid overlapping, undocumented collectors."
+        }
+      ],
+      "evidence": [
+        "cfctl explain logpush.job",
+        "cfctl apply logpush.job validate-destination --plan"
+      ]
+    },
+    "pages.project": {
+      "stance": "source-repo-owned with platform verification here",
+      "audit_features": [
+        "pages_build_output_dir"
+      ],
+      "standards": [
+        {
+          "id": "pages.project.source-repo-is-ssot",
+          "level": "required",
+          "title": "Treat the app repo as the Pages source of truth",
+          "summary": "This runtime manages Cloudflare posture and inventory, but Pages code and build configuration stay in the application repo."
+        },
+        {
+          "id": "pages.project.output-dir-explicit",
+          "level": "required",
+          "title": "Keep pages_build_output_dir explicit",
+          "summary": "Pages projects should declare their output directory in config so deployment posture is legible without dashboard memory."
+        },
+        {
+          "id": "pages.project.functions-ownership-explicit",
+          "level": "recommended",
+          "title": "Document Functions ownership and secret expectations",
+          "summary": "If a Pages project uses Functions, the repo should make the ownership and secret path legible to arriving agents."
+        },
+        {
+          "id": "pages.project.domains-explicit",
+          "level": "recommended",
+          "title": "Document attached domains and environment intent",
+          "summary": "Project domains, preview posture, and environment linkage should be visible in inventory or source-repo docs."
+        }
+      ],
+      "evidence": [
+        "cfctl list pages.project",
+        "cfctl standards audit ~/dev",
+        "./scripts/cf_wrangler.sh pages project list"
+      ]
+    },
+    "tunnel": {
+      "stance": "desired-state preferred for durable tunnel topology",
+      "standards": [
+        {
+          "id": "tunnel.remote-managed-default",
+          "level": "required",
+          "title": "Prefer remote-managed tunnels",
+          "summary": "Treat Cloudflare-managed configuration as the default. Local tunnel process state is runtime, not the source of truth."
+        },
+        {
+          "id": "tunnel.config-src-explicit",
+          "level": "required",
+          "title": "Keep config source explicit",
+          "summary": "Tunnel configuration source, routes, and intended ownership should be explicit and inventoried."
+        },
+        {
+          "id": "tunnel.state-backed",
+          "level": "recommended",
+          "title": "Represent durable tunnels under state/tunnel",
+          "summary": "Long-lived tunnel topology belongs in diff/sync workflows."
+        }
+      ],
+      "evidence": [
+        "cfctl explain tunnel",
+        "cfctl diff tunnel",
+        "cfctl apply tunnel sync --plan"
+      ]
+    },
+    "turnstile.widget": {
+      "stance": "explicit ownership and rotation discipline",
+      "standards": [
+        {
+          "id": "turnstile.widget.owner-documented",
+          "level": "required",
+          "title": "Document the widget owner and purpose",
+          "summary": "Each widget should map to a known domain, flow, or product purpose."
+        },
+        {
+          "id": "turnstile.widget.rotation-ready",
+          "level": "recommended",
+          "title": "Keep secret rotation operationally ready",
+          "summary": "Widgets should have a known rotation path and a verification step for downstream consumers."
+        }
+      ],
+      "evidence": [
+        "cfctl explain turnstile.widget",
+        "cfctl apply turnstile.widget rotate-secret --plan"
+      ]
+    },
+    "waiting_room": {
+      "stance": "high-risk, explicitly reversible changes only",
+      "standards": [
+        {
+          "id": "waiting_room.preview-first",
+          "level": "required",
+          "title": "Treat waiting-room changes as high-risk",
+          "summary": "Waiting room changes should be previewed carefully because they can alter public traffic flow immediately."
+        },
+        {
+          "id": "waiting_room.reversible-change-shape",
+          "level": "recommended",
+          "title": "Prefer clearly reversible edits",
+          "summary": "Operational changes should preserve a clean rollback path and avoid multi-variable surprise edits."
+        }
+      ],
+      "evidence": [
+        "cfctl classify waiting_room <operation>",
+        "cfctl guide waiting_room <operation>"
+      ]
+    },
+    "worker.script": {
+      "stance": "source-repo-owned with control-plane inventory here",
+      "standards": [
+        {
+          "id": "worker.script.source-repo-is-ssot",
+          "level": "required",
+          "title": "Treat the source repo as the Worker code source of truth",
+          "summary": "This runtime inventories and governs Cloudflare posture, but Worker code and wrangler config should live with the Worker source."
+        },
+        {
+          "id": "worker.script.bindings-explicit",
+          "level": "required",
+          "title": "Bindings should be explicit and named intentionally",
+          "summary": "D1/KV/R2/Queue/AI bindings should be deliberate and discoverable, not inferred from undocumented deploy state."
+        }
+      ],
+      "evidence": [
+        "cfctl list worker.script",
+        "./scripts/cf_wrangler.sh whoami"
+      ]
+    },
+    "worker.runtime": {
+      "stance": "explicit runtime posture and public exposure",
+      "audit_features": [
+        "compatibility",
+        "compatibility_flags",
+        "workers_dev",
+        "upload_source_maps"
+      ],
+      "standards": [
+        {
+          "id": "worker.runtime.compatibility-date-required",
+          "level": "required",
+          "title": "Keep compatibility_date explicit",
+          "summary": "Every active Worker or Pages config should pin a compatibility_date so runtime changes are deliberate."
+        },
+        {
+          "id": "worker.runtime.flags-deliberate",
+          "level": "recommended",
+          "title": "Use compatibility flags deliberately",
+          "summary": "compatibility_flags should appear only when the runtime mode is intentional and understood."
+        },
+        {
+          "id": "worker.runtime.public-exposure-explicit",
+          "level": "required",
+          "title": "Keep workers_dev and public exposure explicit",
+          "summary": "If a Worker is reachable on workers.dev or through custom domains, that exposure should be intentional and visible in config."
+        },
+        {
+          "id": "worker.runtime.source-maps-explicit",
+          "level": "recommended",
+          "title": "Make source-map posture deliberate",
+          "summary": "Operational Workers should decide explicitly whether upload_source_maps is enabled."
+        }
+      ],
+      "evidence": [
+        "cfctl standards audit ~/dev",
+        "wrangler.toml compatibility_date",
+        "wrangler.jsonc upload_source_maps"
+      ]
+    },
+    "worker.build": {
+      "stance": "reproducible build chain and explicit static assets",
+      "audit_features": [
+        "build",
+        "assets"
+      ],
+      "standards": [
+        {
+          "id": "worker.build.command-explicit",
+          "level": "required",
+          "title": "Keep the Worker build command explicit",
+          "summary": "Worker builds should declare the build path in config or the repo's deploy wrapper so arriving agents do not guess."
+        },
+        {
+          "id": "worker.build.reproducible-toolchain",
+          "level": "recommended",
+          "title": "Avoid floating installs inside build commands",
+          "summary": "Build commands should prefer checked-in or pinned toolchain steps instead of network-dependent floating installs."
+        },
+        {
+          "id": "worker.build.assets-explicit",
+          "level": "required",
+          "title": "Keep asset directory and handling explicit",
+          "summary": "If a Worker serves static assets, the directory and any binding or HTML handling should be explicit."
+        }
+      ],
+      "evidence": [
+        "cfctl standards audit ~/dev",
+        "wrangler.toml [build]",
+        "wrangler.toml [assets]"
+      ]
+    },
+    "worker.d1": {
+      "stance": "explicit structural binding with deliberate preview posture",
+      "audit_features": [
+        "d1"
+      ],
+      "standards": [
+        {
+          "id": "worker.d1.binding-identity-explicit",
+          "level": "required",
+          "title": "Keep D1 binding identity explicit",
+          "summary": "Each D1 binding should declare its binding name, database_name, and database_id."
+        },
+        {
+          "id": "worker.d1.preview-posture-deliberate",
+          "level": "recommended",
+          "title": "Make preview database posture deliberate",
+          "summary": "Preview-aware app Workers should decide explicitly whether preview_database_id matches production or uses a dedicated preview database."
+        },
+        {
+          "id": "worker.d1.migrations-explicit",
+          "level": "recommended",
+          "title": "Keep migrations ownership explicit",
+          "summary": "If D1 schema migration is part of the repo contract, migrations_dir or the equivalent migration path should be legible."
+        }
+      ],
+      "evidence": [
+        "cfctl standards audit ~/dev",
+        "wrangler.toml [[d1_databases]]"
+      ]
+    },
+    "worker.errors": {
+      "stance": "fail-closed behavior with observable, debuggable failure paths",
+      "audit_features": [
+        "observability",
+        "upload_source_maps",
+        "triggers",
+        "routes",
+        "workers_dev",
+        "containers"
+      ],
+      "standards": [
+        {
+          "id": "worker.errors.fail-closed-public-behavior",
+          "level": "required",
+          "title": "Fail closed on auth, routing, and policy errors",
+          "summary": "Public Cloudflare workers should return a deliberate failure path when auth, config, or required assets are unavailable. They should not silently degrade into a misleading success path."
+        },
+        {
+          "id": "worker.errors.status-shape-deliberate",
+          "level": "required",
+          "title": "Keep 4xx and 5xx behavior deliberate",
+          "summary": "User-facing Workers should distinguish caller error from server or upstream failure, and should not leak raw stack traces or secrets in responses."
+        },
+        {
+          "id": "worker.errors.observability-explicit",
+          "level": "recommended",
+          "title": "Active workers should have explicit observability",
+          "summary": "If a Worker serves traffic, runs on cron, or fronts a container, logs and failure diagnostics should be explicit in config."
+        },
+        {
+          "id": "worker.errors.debuggability-explicit",
+          "level": "recommended",
+          "title": "Make debuggability deliberate",
+          "summary": "JavaScript and TypeScript Workers should decide explicitly whether upload_source_maps is enabled so real failures can be debugged without guesswork."
+        },
+        {
+          "id": "worker.errors.scheduled-work-idempotent",
+          "level": "recommended",
+          "title": "Treat scheduled error paths as idempotent work",
+          "summary": "Cron-triggered or retryable background work should be safe to rerun and should log enough context to distinguish retry noise from real drift."
+        }
+      ],
+      "evidence": [
+        "cfctl standards audit ~/dev",
+        "wrangler.toml [observability]",
+        "wrangler.jsonc upload_source_maps"
+      ]
+    },
+    "worker.routes": {
+      "stance": "explicit domain ownership and deliberate exposure mode",
+      "audit_features": [
+        "routes",
+        "workers_dev"
+      ],
+      "standards": [
+        {
+          "id": "worker.routes.domain-ownership-explicit",
+          "level": "required",
+          "title": "Keep route and domain ownership explicit",
+          "summary": "Custom domains, route patterns, and workers_dev exposure should be legible in config without dashboard memory."
+        },
+        {
+          "id": "worker.routes.dual-exposure-deliberate",
+          "level": "recommended",
+          "title": "Review dual exposure deliberately",
+          "summary": "If a Worker is reachable on workers.dev and a routed domain, that dual exposure should be intentional."
+        }
+      ],
+      "evidence": [
+        "cfctl standards audit ~/dev",
+        "wrangler.toml [[routes]]",
+        "wrangler.toml workers_dev"
+      ]
+    },
+    "worker.vars": {
+      "stance": "plain deploy vars only, never secrets",
+      "audit_features": [
+        "vars"
+      ],
+      "standards": [
+        {
+          "id": "worker.vars.no-secrets-in-vars",
+          "level": "required",
+          "title": "Keep secrets out of [vars]",
+          "summary": "Secret-bearing values belong in secrets or external sinks, not in plain-text wrangler vars."
+        },
+        {
+          "id": "worker.vars.placeholder-ownership-explicit",
+          "level": "recommended",
+          "title": "Use placeholders only with a real render owner",
+          "summary": "If [vars] contain placeholders, the repo should have an explicit render or deploy contract that owns them."
+        },
+        {
+          "id": "worker.vars.contract-documented",
+          "level": "recommended",
+          "title": "Document the plain-text deploy-var contract",
+          "summary": "Non-secret vars should still have clear ownership and intent."
+        }
+      ],
+      "evidence": [
+        "cfctl standards audit ~/dev",
+        "wrangler.toml [vars]"
+      ]
+    },
+    "worker.observability": {
+      "stance": "public and scheduled workers should be observable by default",
+      "audit_features": [
+        "observability"
+      ],
+      "standards": [
+        {
+          "id": "worker.observability.public-workers-prefer-observability",
+          "level": "recommended",
+          "title": "Prefer explicit observability on public, cron, and container workers",
+          "summary": "If a Worker serves public traffic, runs on cron, or fronts a container, logs and traces posture should be explicit."
+        },
+        {
+          "id": "worker.observability.logs-traces-deliberate",
+          "level": "recommended",
+          "title": "Keep logs and traces deliberate",
+          "summary": "Sampling, persistence, and invocation log posture should be intentional rather than left to remembered defaults."
+        }
+      ],
+      "evidence": [
+        "cfctl standards audit ~/dev",
+        "wrangler.toml [observability]"
+      ]
+    },
+    "worker.triggers": {
+      "stance": "explicit, idempotent schedule ownership",
+      "audit_features": [
+        "triggers"
+      ],
+      "standards": [
+        {
+          "id": "worker.triggers.cron-explicit",
+          "level": "required",
+          "title": "Keep cron schedules explicit",
+          "summary": "Scheduled workers should declare their cron shape clearly in config or a documented render path."
+        },
+        {
+          "id": "worker.triggers.idempotence-documented",
+          "level": "recommended",
+          "title": "Scheduled work should be idempotent by contract",
+          "summary": "A cron-triggered Worker should document or encode why reruns are safe."
+        },
+        {
+          "id": "worker.triggers.placeholder-owned",
+          "level": "recommended",
+          "title": "Placeholder cron values need a named owner",
+          "summary": "If a cron value is a deploy-time placeholder, the render path should be explicit."
+        }
+      ],
+      "evidence": [
+        "cfctl standards audit ~/dev",
+        "wrangler.toml [triggers]"
+      ]
+    },
+    "worker.containers": {
+      "stance": "digest-pinned deploy images or explicit repo-local Dockerfile ownership",
+      "audit_features": [
+        "containers",
+        "do_bindings",
+        "migrations"
+      ],
+      "standards": [
+        {
+          "id": "worker.containers.image-source-explicit",
+          "level": "required",
+          "title": "Make the container image source explicit",
+          "summary": "Container-backed Workers should use digest-pinned registry images or an explicit repo-local Dockerfile build definition. Mutable tag refs should not be the deploy contract."
+        },
+        {
+          "id": "worker.containers.do-binding-explicit",
+          "level": "required",
+          "title": "Keep Durable Object bindings explicit",
+          "summary": "Container-backed DO classes, binding names, and migrations should be legible in config."
+        },
+        {
+          "id": "worker.containers.rollout-explicit",
+          "level": "recommended",
+          "title": "Keep rollout posture explicit",
+          "summary": "rollout_step_percentage and grace posture should be intentional for container Workers."
+        }
+      ],
+      "evidence": [
+        "cfctl standards audit ~/dev",
+        "wrangler.toml [[containers]]",
+        "wrangler.toml [[durable_objects.bindings]]",
+        "wrangler.toml [[migrations]]"
+      ]
+    },
+    "worker.services": {
+      "stance": "explicit service binding names and downstream ownership",
+      "audit_features": [
+        "services"
+      ],
+      "standards": [
+        {
+          "id": "worker.services.binding-explicit",
+          "level": "required",
+          "title": "Keep service binding names and targets explicit",
+          "summary": "Worker service bindings should declare both their binding name and target service clearly."
+        },
+        {
+          "id": "worker.services.downstream-ownership-visible",
+          "level": "recommended",
+          "title": "Make downstream ownership legible",
+          "summary": "When a router Worker binds downstream services, the repo should make those services and ownership boundaries legible to arriving agents."
+        }
+      ],
+      "evidence": [
+        "cfctl standards audit ~/dev",
+        "wrangler.toml [services]",
+        "wrangler.jsonc services"
+      ]
+    },
+    "worker.storage": {
+      "stance": "explicit binding names and deliberate raw-credential exceptions",
+      "audit_features": [
+        "r2"
+      ],
+      "standards": [
+        {
+          "id": "worker.storage.binding-explicit",
+          "level": "required",
+          "title": "Keep storage binding names and targets explicit",
+          "summary": "R2 bindings should declare their binding and bucket_name clearly."
+        },
+        {
+          "id": "worker.storage.raw-credential-exception-deliberate",
+          "level": "recommended",
+          "title": "Treat raw credential access as an explicit exception",
+          "summary": "If a repo bypasses Worker bindings and uses raw storage credentials, that should be documented as an intentional exception."
+        }
+      ],
+      "evidence": [
+        "cfctl standards audit ~/dev",
+        "wrangler.toml [[r2_buckets]]"
+      ]
+    }
+  }
+}

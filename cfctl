@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -h "${SOURCE_PATH}" ]]; do
+  SOURCE_DIR="$(cd -P "$(dirname "${SOURCE_PATH}")" && pwd)"
+  SOURCE_TARGET="$(readlink "${SOURCE_PATH}")"
+  if [[ "${SOURCE_TARGET}" != /* ]]; then
+    SOURCE_PATH="${SOURCE_DIR}/${SOURCE_TARGET}"
+  else
+    SOURCE_PATH="${SOURCE_TARGET}"
+  fi
+done
+
+ROOT_DIR="$(cd -P "$(dirname "${SOURCE_PATH}")" && pwd)"
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/lib/runtime/cfctl.sh"
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/commands/cfctl.sh"
+
+cf_load_cloudflare_env
+cf_require_tools jq curl
+
+trap cfctl_cleanup_runtime_context EXIT
+
+cfctl_main "$@"

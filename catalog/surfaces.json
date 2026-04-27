@@ -1,0 +1,623 @@
+{
+  "version": 1,
+  "surfaces": {
+    "zone": {
+      "description": "Cloudflare zones in the pinned account.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_zones.sh",
+      "permission_family": "Zone",
+      "probe": {
+        "method": "GET",
+        "path_template": "/zones?per_page=1&account.id={account_id}"
+      },
+      "selectors": ["id", "name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list zone",
+        "./cfctl get zone --name example.com"
+      ]
+    },
+    "pages.project": {
+      "description": "Cloudflare Pages projects in the pinned account.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_pages.sh",
+      "permission_family": "Pages",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/pages/projects"
+      },
+      "selectors": ["id", "name", "domain"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"], ["domain"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"], ["domain"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list pages.project",
+        "./cfctl get pages.project --name my-web"
+      ]
+    },
+    "worker.script": {
+      "description": "Workers scripts in the pinned account.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_workers.sh",
+      "permission_family": "Workers",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/workers/scripts"
+      },
+      "selectors": ["id", "name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list worker.script",
+        "./cfctl get worker.script --name founder"
+      ]
+    },
+    "d1.database": {
+      "description": "D1 databases visible to the current account token.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_d1.sh",
+      "permission_family": "D1",
+      "selectors": ["id", "name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list d1.database",
+        "./cfctl get d1.database --name wichita-housing-logistics-db"
+      ]
+    },
+    "r2.bucket": {
+      "description": "R2 buckets visible to the current account token.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_r2.sh",
+      "permission_family": "R2",
+      "selectors": ["name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list r2.bucket",
+        "./cfctl get r2.bucket --name equity-documents"
+      ]
+    },
+    "queue": {
+      "description": "Cloudflare Queues in the pinned account.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_queues.sh",
+      "permission_family": "Queues",
+      "selectors": ["id", "name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list queue",
+        "./cfctl get queue --name poster-generation"
+      ]
+    },
+    "workflow": {
+      "description": "Cloudflare Workflows in the pinned account.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_workflows.sh",
+      "permission_family": "Workflows",
+      "selectors": ["id", "name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list workflow",
+        "./cfctl get workflow --name docs-pdf-render"
+      ]
+    },
+    "access.app": {
+      "description": "Cloudflare Access applications in the pinned account.",
+      "module": "access_app",
+      "standards_ref": "access.app",
+      "docs_topics": ["zero-trust-api", "api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_access.sh",
+      "apply_script": "scripts/cf_mutate_access_app.sh",
+      "permission_family": "Access: Apps and Policies",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/access/apps"
+      },
+      "selectors": ["id", "name", "domain"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"], ["domain"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"], ["domain"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "create": {
+              "risk": "write"
+            },
+            "update": {
+              "risk": "write",
+              "required_selectors": ["id"]
+            },
+            "delete": {
+              "risk": "destructive",
+              "required_selectors": ["id"],
+              "confirm": "delete"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list access.app",
+        "./cfctl get access.app --domain docs.example.org",
+        "./cfctl apply access.app update --id <app-id> --body '{\"session_duration\":\"24h\"}' --plan"
+      ]
+    },
+    "access.policy": {
+      "description": "Application-scoped Access policies attached to Access apps.",
+      "module": "access_policy",
+      "standards_ref": "access.policy",
+      "docs_topics": ["zero-trust-api", "api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_access.sh",
+      "apply_script": "scripts/cf_mutate_access_policy.sh",
+      "permission_family": "Access: Apps and Policies",
+      "selectors": ["app_id", "policy_id", "name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["policy_id"], ["app_id", "name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["policy_id"], ["app_id", "name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "create": {
+              "risk": "write",
+              "required_selectors": ["app_id"]
+            },
+            "update": {
+              "risk": "write",
+              "required_selectors": ["app_id", "policy_id"]
+            },
+            "delete": {
+              "risk": "destructive",
+              "required_selectors": ["app_id", "policy_id"],
+              "confirm": "delete"
+            },
+            "make-reusable": {
+              "risk": "write",
+              "required_selectors": ["app_id", "policy_id"]
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list access.policy",
+        "./cfctl get access.policy --policy-id <policy-id>",
+        "./cfctl apply access.policy create --app-id <app-id> --body-file policy.json --plan"
+      ]
+    },
+    "turnstile.widget": {
+      "description": "Turnstile widgets in the pinned account.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_turnstile.sh",
+      "apply_script": "scripts/cf_mutate_turnstile_widget.sh",
+      "permission_family": "Turnstile",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/challenges/widgets"
+      },
+      "selectors": ["sitekey", "name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["sitekey"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["sitekey"], ["name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "create": {
+              "risk": "write"
+            },
+            "update": {
+              "risk": "write",
+              "required_selectors": ["sitekey"]
+            },
+            "rotate-secret": {
+              "risk": "write",
+              "required_selectors": ["sitekey"]
+            },
+            "delete": {
+              "risk": "destructive",
+              "required_selectors": ["sitekey"],
+              "confirm": "delete"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list turnstile.widget",
+        "./cfctl get turnstile.widget --sitekey <sitekey>",
+        "./cfctl apply turnstile.widget update --sitekey <sitekey> --body-file widget.json --plan"
+      ]
+    },
+    "dns.record": {
+      "description": "DNS records in a specific zone.",
+      "module": "dns_record",
+      "standards_ref": "dns.record",
+      "docs_topics": ["api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_dns.sh",
+      "apply_script": "scripts/cf_mutate_dns_record.sh",
+      "permission_family": "Zone DNS",
+      "selectors": ["zone", "id", "name", "type"],
+      "actions": {
+        "list": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "get": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name", "type"]]
+        },
+        "verify": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name", "type"]]
+        },
+        "can": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "create": {
+              "risk": "write",
+              "required_selectors": ["zone", "name", "type"]
+            },
+            "upsert": {
+              "risk": "write",
+              "required_selectors": ["zone", "name", "type"]
+            },
+            "update": {
+              "risk": "write",
+              "required_selectors": ["zone"],
+              "selectors_any_of": [["id"], ["name", "type"]]
+            },
+            "delete": {
+              "risk": "destructive",
+              "required_selectors": ["zone"],
+              "selectors_any_of": [["id"], ["name", "type"]],
+              "confirm": "delete"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list dns.record --zone example.com",
+        "./cfctl get dns.record --zone example.com --name _ops-smoke.example.com --type TXT",
+        "./cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan"
+      ]
+    },
+    "waiting_room": {
+      "description": "Waiting rooms in a specific zone.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_waiting_rooms.sh",
+      "apply_script": "scripts/cf_mutate_waiting_room.sh",
+      "permission_family": "Waiting Rooms",
+      "selectors": ["zone", "id", "name"],
+      "actions": {
+        "list": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "get": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "create": {
+              "risk": "write",
+              "required_selectors": ["zone"]
+            },
+            "update": {
+              "risk": "write",
+              "required_selectors": ["zone", "id"]
+            },
+            "patch": {
+              "risk": "write",
+              "required_selectors": ["zone", "id"]
+            },
+            "delete": {
+              "risk": "destructive",
+              "required_selectors": ["zone", "id"],
+              "confirm": "delete"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list waiting_room --zone example.com",
+        "./cfctl get waiting_room --zone example.com --id <waiting-room-id>",
+        "./cfctl apply waiting_room patch --zone example.com --id <waiting-room-id> --body '{\"suspended\":true}' --plan"
+      ]
+    },
+    "logpush.job": {
+      "description": "Logpush jobs at account scope or a specific zone scope.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_logpush.sh",
+      "apply_script": "scripts/cf_mutate_logpush_job.sh",
+      "permission_family": "Logpush",
+      "selectors": ["scope", "zone", "id", "name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "create": {
+              "risk": "write"
+            },
+            "update": {
+              "risk": "write",
+              "required_selectors": ["id"]
+            },
+            "delete": {
+              "risk": "destructive",
+              "required_selectors": ["id"],
+              "confirm": "delete"
+            },
+            "ownership": {
+              "risk": "write"
+            },
+            "validate-ownership": {
+              "risk": "write"
+            },
+            "validate-destination": {
+              "risk": "write"
+            },
+            "validate-origin": {
+              "risk": "write"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list logpush.job",
+        "./cfctl list logpush.job --scope zone --zone example.com",
+        "./cfctl apply logpush.job create --body-file logpush.json --plan"
+      ]
+    },
+    "tunnel": {
+      "description": "Cloudflare Tunnels in the pinned account.",
+      "module": "tunnel",
+      "standards_ref": "tunnel",
+      "docs_topics": ["api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_tunnels.sh",
+      "apply_script": "scripts/cf_mutate_tunnel.sh",
+      "permission_family": "Cloudflare Tunnel",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/cfd_tunnel"
+      },
+      "selectors": ["id", "name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "create": {
+              "risk": "write"
+            },
+            "update": {
+              "risk": "write",
+              "required_selectors": ["id"]
+            },
+            "configure": {
+              "risk": "write",
+              "required_selectors": ["id"]
+            },
+            "cleanup-connections": {
+              "risk": "destructive",
+              "required_selectors": ["id"],
+              "confirm": "delete"
+            },
+            "delete": {
+              "risk": "destructive",
+              "required_selectors": ["id"],
+              "confirm": "delete"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list tunnel",
+        "./cfctl apply tunnel create --body '{\"name\":\"api-tunnel\",\"config_src\":\"cloudflare\"}' --plan",
+        "./cfctl apply tunnel delete --id <tunnel-id> --confirm delete --plan"
+      ]
+    }
+  }
+}

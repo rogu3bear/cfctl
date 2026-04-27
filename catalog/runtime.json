@@ -1,0 +1,218 @@
+{
+  "version": 6,
+  "preferred_entrypoint": "./cfctl",
+  "legacy_policy": "shim_then_hide",
+  "public_verbs": [
+    "doctor",
+    "audit",
+    "admin",
+    "lanes",
+    "surfaces",
+    "docs",
+    "previews",
+    "locks",
+    "wrangler",
+    "cloudflared",
+    "standards",
+    "token",
+    "list",
+    "get",
+    "can",
+    "classify",
+    "guide",
+    "apply",
+    "verify",
+    "explain",
+    "snapshot",
+    "diff"
+  ],
+  "landing_flow": [
+    "doctor",
+    "surfaces",
+    "docs",
+    "standards <surface>",
+    "explain <surface>",
+    "classify <surface> <operation>",
+    "guide <surface> <operation>"
+  ],
+  "policy": {
+    "backend_scripts": "backend_only",
+    "direct_script_override_env": "CF_BACKEND_BYPASS_FILE",
+    "legacy_bypass_env": "CF_BACKEND_BYPASS",
+    "legacy_bypass_env_allowed": false,
+    "default_write_policy": "preview_ack_required",
+    "preview_ack_flag": "--ack-plan",
+    "preview_ttl_seconds": 900,
+    "lock_ttl_seconds": 1800,
+    "runtime_lock_dir": "var/runtime/locks",
+    "runtime_admin_dir": "var/runtime/admin",
+    "secret_output_default": "redacted",
+    "token_reveal_flag": "--reveal-token-once",
+    "token_reveal_allowed": false,
+    "token_secure_sink_flag": "--value-out",
+    "secret_sink_policy": {
+      "require_absolute_path": true,
+      "reject_repo_paths": true,
+      "reject_var_paths": true,
+      "reject_symlinks": true
+    },
+    "operation_defaults": {
+      "read": {
+        "preview_required": false,
+        "allowed_lanes": ["dev", "global"],
+        "verification_required": false,
+        "secret_policy": "redacted",
+        "lock_strategy": "none",
+        "preview_ttl_seconds": 0,
+        "public_example": "cfctl list <surface>",
+        "troubleshooting_hint": "Use list/get/snapshot first to confirm selectors and current state before attempting a write."
+      },
+      "write": {
+        "preview_required": true,
+        "allowed_lanes": ["dev", "global"],
+        "verification_required": true,
+        "secret_policy": "redacted",
+        "lock_strategy": "apply",
+        "preview_ttl_seconds": 900,
+        "public_example": "cfctl apply <surface> <operation> --plan",
+        "troubleshooting_hint": "Run the preview first, inspect the emitted artifact, then rerun with --ack-plan <operation-id>."
+      },
+      "destructive": {
+        "preview_required": true,
+        "allowed_lanes": ["dev", "global"],
+        "verification_required": true,
+        "secret_policy": "redacted",
+        "lock_strategy": "lease",
+        "preview_ttl_seconds": 900,
+        "public_example": "cfctl apply <surface> <destructive-operation> --plan",
+        "troubleshooting_hint": "Destructive operations require preview review, explicit confirmation, and a valid lock lease."
+      },
+      "secret_sensitive": {
+        "preview_required": true,
+        "allowed_lanes": ["dev", "global"],
+        "verification_required": true,
+        "secret_policy": "sink_only",
+        "lock_strategy": "lease",
+        "preview_ttl_seconds": 900,
+        "public_example": "cfctl token mint --name <token-name> --plan",
+        "troubleshooting_hint": "Use --value-out <absolute path> for secret delivery. Repo paths, var/, and symlinks are rejected."
+      }
+    },
+    "special_operations": {
+      "sync": {
+        "risk": "write",
+        "preview_required": true,
+        "allowed_lanes": ["dev", "global"],
+        "verification_required": true,
+        "secret_policy": "redacted",
+        "lock_strategy": "apply",
+        "preview_ttl_seconds": 900,
+        "public_example": "cfctl apply <surface> sync --plan",
+        "troubleshooting_hint": "Review the diff summary first and require explicit delete confirmation when sync includes deletes."
+      },
+      "token.mint": {
+        "risk": "secret_sensitive",
+        "preview_required": true,
+        "allowed_lanes": ["dev", "global"],
+        "verification_required": true,
+        "secret_policy": "sink_only",
+        "lock_strategy": "lease",
+        "preview_ttl_seconds": 900,
+        "public_example": "cfctl token mint --name <token-name> --plan",
+        "troubleshooting_hint": "Token mint is sink-first. Use --value-out <absolute path> and inspect previews before acking."
+      }
+    }
+  },
+  "lanes": {
+    "dev": {
+      "credential_env": "CF_DEV_TOKEN",
+      "auth_scheme": "api_token",
+      "wrangler_env": "CLOUDFLARE_API_TOKEN",
+      "intended_use": "default_day_to_day"
+    },
+    "global": {
+      "credential_env": "CF_GLOBAL_TOKEN",
+      "auth_scheme": "global_api_key",
+      "wrangler_env": "CLOUDFLARE_API_KEY",
+      "requires": [
+        "CLOUDFLARE_EMAIL"
+      ],
+      "intended_use": "emergency_wider_scope"
+    }
+  },
+  "tool_wrappers": {
+    "wrangler": {
+      "script": "scripts/cf_wrangler.sh",
+      "backend": "wrangler",
+      "default_args": ["whoami"],
+      "read_only_prefixes": [
+        ["whoami"],
+        ["version"],
+        ["--version"],
+        ["help"],
+        ["--help"],
+        ["tail"]
+      ],
+      "log_category": "wrangler",
+      "summary": "Wraps the repo's Wrangler helper in a cfctl result envelope."
+    },
+    "cloudflared": {
+      "script": "scripts/cf_cloudflared.sh",
+      "backend": "cloudflared",
+      "default_args": ["version"],
+      "read_only_prefixes": [
+        ["version"],
+        ["--version"],
+        ["help"],
+        ["--help"],
+        ["tunnel", "list"],
+        ["tunnel", "info"],
+        ["tunnel", "token"]
+      ],
+      "log_category": "cloudflared",
+      "summary": "Wraps the repo's cloudflared helper in a cfctl result envelope."
+    }
+  },
+  "desired_state": {
+    "access.app": {
+      "supported": true,
+      "sync_supported": true,
+      "state_dir": "state/access.app",
+      "match_selectors": [
+        "id",
+        "name",
+        "domain"
+      ]
+    },
+    "access.policy": {
+      "supported": true,
+      "sync_supported": true,
+      "state_dir": "state/access.policy",
+      "match_selectors": [
+        "app_id",
+        "policy_id",
+        "name"
+      ]
+    },
+    "dns.record": {
+      "supported": true,
+      "sync_supported": true,
+      "state_dir": "state/dns.record",
+      "match_selectors": [
+        "zone",
+        "id",
+        "name",
+        "type"
+      ]
+    },
+    "tunnel": {
+      "supported": true,
+      "sync_supported": true,
+      "state_dir": "state/tunnel",
+      "match_selectors": [
+        "id",
+        "name"
+      ]
+    }
+  }
+}
