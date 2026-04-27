@@ -2,6 +2,18 @@
 
 This walks you from "just cloned" to "first verified read against your Cloudflare account."
 
+## 0. The shortcut: `bootstrap.sh`
+
+If you'd rather not do the steps below by hand:
+
+```bash
+./bootstrap.sh
+```
+
+It checks tools, symlinks `cfctl` into `~/bin`, scaffolds `~/dev/.env` from the template (without overwriting an existing one), and runs `cfctl doctor`. It's idempotent and never installs anything for you. Pass `--check-only` to do a pure preflight, or `--help` for the full flag list.
+
+The manual walkthrough is below if you want to know what each step does.
+
 ## 1. Install dependencies
 
 `cfctl` is bash-first. You need:
