@@ -1322,6 +1322,39 @@ cfctl_collect_surface_items() {
       cfctl_run_backend_script "${script_path}"
       CFCTL_COLLECT_BACKEND="inventory_script"
       ;;
+    api_gateway.operation)
+      cfctl_resolve_zone_context
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_api_gateway.sh"
+      cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}" "ZONE_ID=${CFCTL_ZONE_ID}" "API_GATEWAY_RESOURCE=operations"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
+    api_gateway.schema)
+      cfctl_resolve_zone_context
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_api_gateway.sh"
+      cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}" "ZONE_ID=${CFCTL_ZONE_ID}" "API_GATEWAY_RESOURCE=schemas"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
+    api_gateway.discovery)
+      cfctl_resolve_zone_context
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_api_gateway.sh"
+      cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}" "ZONE_ID=${CFCTL_ZONE_ID}" "API_GATEWAY_RESOURCE=discovery"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
+    vulnerability_scanner.scan)
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_vulnerability_scanner.sh"
+      cfctl_run_backend_script "${script_path}" "VULN_SCANNER_RESOURCE=scans"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
+    vulnerability_scanner.target_environment)
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_vulnerability_scanner.sh"
+      cfctl_run_backend_script "${script_path}" "VULN_SCANNER_RESOURCE=target_environments"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
+    vulnerability_scanner.credential_set)
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_vulnerability_scanner.sh"
+      cfctl_run_backend_script "${script_path}" "VULN_SCANNER_RESOURCE=credential_sets"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
     access.app|access.policy)
       script_path="${CF_REPO_ROOT}/scripts/cf_inventory_access.sh"
       cfctl_run_backend_script "${script_path}"
@@ -1413,6 +1446,43 @@ cfctl_collect_surface_items() {
       ;;
     workflow)
       CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.workflows // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
+      ;;
+    api_gateway.operation)
+      CFCTL_COLLECT_ITEMS_JSON="$(
+        jq -c '
+          . as $root
+          | [
+            (.operations // [])[]
+            | . + {
+                zone_id: $root.zone.id,
+                zone_name: $root.zone.name
+              }
+          ]
+        ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
+      )"
+      ;;
+    api_gateway.schema|api_gateway.discovery)
+      CFCTL_COLLECT_ITEMS_JSON="$(
+        jq -c '
+          . as $root
+          | [
+            (.schemas // [])[]
+            | . + {
+                zone_id: $root.zone.id,
+                zone_name: $root.zone.name
+              }
+          ]
+        ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
+      )"
+      ;;
+    vulnerability_scanner.scan)
+      CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.scans // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
+      ;;
+    vulnerability_scanner.target_environment)
+      CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.target_environments // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
+      ;;
+    vulnerability_scanner.credential_set)
+      CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.credential_sets // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
       ;;
     access.app)
       CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.applications // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
@@ -1625,6 +1695,58 @@ cfctl_filter_surface_items() {
         ]
       ' <<< "${items_json}"
       ;;
+    api_gateway.operation)
+      jq -c --arg id "${CFCTL_ID}" --arg endpoint "${CFCTL_NAME}" --arg domain "${CFCTL_DOMAIN}" --argjson hosts "${CFCTL_HOSTS_JSON}" '
+        [
+          .[]
+          | select(
+              (if $id != "" then .id == $id else true end)
+              and
+              (if $endpoint != "" then .endpoint == $endpoint else true end)
+              and
+              (if $domain != "" then .host == $domain else true end)
+              and
+              (if ($hosts | length) > 0 then (.host as $item_host | any($hosts[]; . == $item_host)) else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
+    api_gateway.schema|api_gateway.discovery)
+      jq -c --arg id "${CFCTL_ID}" --arg name "${CFCTL_NAME}" --arg domain "${CFCTL_DOMAIN}" --argjson hosts "${CFCTL_HOSTS_JSON}" '
+        [
+          .[]
+          | select(
+              (if $id != "" then .id == $id else true end)
+              and
+              (if $name != "" then .title == $name else true end)
+              and
+              (if $domain != "" then .host == $domain else true end)
+              and
+              (if ($hosts | length) > 0 then (.host as $item_host | any($hosts[]; . == $item_host)) else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
+    vulnerability_scanner.scan)
+      jq -c --arg id "${CFCTL_ID}" '
+        [
+          .[]
+          | select(if $id != "" then .id == $id else true end)
+        ]
+      ' <<< "${items_json}"
+      ;;
+    vulnerability_scanner.target_environment|vulnerability_scanner.credential_set)
+      jq -c --arg id "${CFCTL_ID}" --arg name "${CFCTL_NAME}" '
+        [
+          .[]
+          | select(
+              (if $id != "" then .id == $id else true end)
+              and
+              (if $name != "" then .name == $name else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
     access.app)
       jq -c --arg id "${CFCTL_ID}" --arg name "${CFCTL_NAME}" --arg domain "${CFCTL_DOMAIN}" '
         [
@@ -1748,6 +1870,10 @@ cfctl_summary_for_items() {
     tunnel) name_field="name" ;;
     turnstile.widget) name_field="name" ;;
     access.policy) name_field="name" ;;
+    api_gateway.operation) name_field="endpoint" ;;
+    api_gateway.schema|api_gateway.discovery) name_field="host" ;;
+    vulnerability_scanner.scan) name_field="id" ;;
+    vulnerability_scanner.target_environment|vulnerability_scanner.credential_set) name_field="name" ;;
   esac
 
   jq -n \

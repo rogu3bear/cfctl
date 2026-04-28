@@ -72,6 +72,8 @@ bash -n \
   "${ROOT_DIR}/scripts/lib/cloudflare.sh" \
   "${ROOT_DIR}/scripts/cf_wrangler.sh" \
   "${ROOT_DIR}/scripts/cf_cloudflared.sh" \
+  "${ROOT_DIR}/scripts/cf_inventory_api_gateway.sh" \
+  "${ROOT_DIR}/scripts/cf_inventory_vulnerability_scanner.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_worker_routes.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_edge_certificates.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_edge_certificate.sh" \
@@ -101,6 +103,7 @@ assert_jq_file "tool wrapper metadata" '
   and (.tool_wrappers.cloudflared.read_only_prefixes | map(join(" ")) | index("tunnel list")) != null
 ' "${ROOT_DIR}/catalog/runtime.json"
 assert_jq_file "docs bank shape" '.checked_on != null and .refresh_policy.refresh_interval_days > 0 and (.foundation | length) > 0 and (.watch | length) > 0' "${ROOT_DIR}/catalog/cloudflare-doc-bank.json"
+assert_jq_file "docs bank api gateway topic" '(.foundation | any(.id == "api-gateway")) and (.watch | any(.id == "api-shield-vulnerability-scanner"))' "${ROOT_DIR}/catalog/cloudflare-doc-bank.json"
 assert_jq_file "standards shape" '(.universal | length) > 0 and (.surfaces | keys | length) > 0' "${ROOT_DIR}/catalog/standards.json"
 assert_jq_file "compatibility freshness thresholds" '.audit.compatibility_date_freshness.note_after_days == 30 and .audit.compatibility_date_freshness.warning_after_days == 90' "${ROOT_DIR}/catalog/standards.json"
 assert_jq_file "surface registry shape" '(.surfaces | keys | length) > 0' "${ROOT_DIR}/catalog/surfaces.json"
@@ -124,6 +127,21 @@ assert_jq_file "surface module bindings" '
   and .surfaces["tunnel"].module == "tunnel"
   and .surfaces["tunnel"].standards_ref == "tunnel"
   and (.surfaces["tunnel"].docs_topics | index("api-auth")) != null
+  and .surfaces["api_gateway.operation"].actions.apply.supported == false
+  and .surfaces["api_gateway.operation"].actions.list.required_selectors == ["zone"]
+  and (.surfaces["api_gateway.operation"].docs_topics | index("api-gateway")) != null
+  and .surfaces["api_gateway.schema"].actions.apply.supported == false
+  and .surfaces["api_gateway.schema"].actions.list.required_selectors == ["zone"]
+  and (.surfaces["api_gateway.schema"].docs_topics | index("api-gateway")) != null
+  and .surfaces["api_gateway.discovery"].actions.apply.supported == false
+  and .surfaces["api_gateway.discovery"].actions.list.required_selectors == ["zone"]
+  and (.surfaces["api_gateway.discovery"].docs_topics | index("api-gateway")) != null
+  and .surfaces["vulnerability_scanner.scan"].actions.apply.supported == false
+  and (.surfaces["vulnerability_scanner.scan"].docs_topics | index("api-shield-vulnerability-scanner")) != null
+  and .surfaces["vulnerability_scanner.target_environment"].actions.apply.supported == false
+  and (.surfaces["vulnerability_scanner.target_environment"].docs_topics | index("api-shield-vulnerability-scanner")) != null
+  and .surfaces["vulnerability_scanner.credential_set"].actions.apply.supported == false
+  and (.surfaces["vulnerability_scanner.credential_set"].docs_topics | index("api-shield-vulnerability-scanner")) != null
 ' "${ROOT_DIR}/catalog/surfaces.json"
 
 assert_contains "state docs preview ack" "cfctl apply dns.record sync --zone example.com --ack-plan <operation-id>" "${ROOT_DIR}/docs/state.md"

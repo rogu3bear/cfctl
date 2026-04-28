@@ -152,6 +152,28 @@
       ]
     },
     {
+      "id": "api-gateway",
+      "title": "API Gateway and API Shield control plane",
+      "area": "security",
+      "status": "stable",
+      "summary": "API Gateway exposes discovered operations, OpenAPI schema views, and schema-validation surfaces that are useful for API inventory and security posture.",
+      "why_it_matters_here": "This runtime can use API Gateway reads to ground API-surface claims before adding or changing edge protection policy.",
+      "sources": [
+        {
+          "title": "API Gateway schemas",
+          "url": "https://developers.cloudflare.com/api/resources/api_gateway/subresources/schemas/"
+        },
+        {
+          "title": "API Gateway discovery",
+          "url": "https://developers.cloudflare.com/api/resources/api_gateway/subresources/discovery/"
+        },
+        {
+          "title": "API Shield schema validation",
+          "url": "https://developers.cloudflare.com/api-shield/security/schema-validation/"
+        }
+      ]
+    },
+    {
       "id": "zero-trust-api",
       "title": "Zero Trust and Access control plane",
       "area": "zero-trust",
