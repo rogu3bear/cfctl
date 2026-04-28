@@ -78,7 +78,7 @@
       "id": "secrets.no-secret-in-repo",
       "level": "required",
       "title": "Keep secret material out of the repo",
-      "summary": "Secrets stay in ~/dev/.env or approved secret sinks. Runtime artifacts and state specs must remain redacted.",
+      "summary": "Secrets stay in the configured cfctl env file or approved secret sinks. Runtime artifacts and state specs must remain redacted.",
       "why": "This repo is an operational bank, not a credential store.",
       "evidence": [
         "cfctl doctor --strict",
@@ -306,7 +306,7 @@
       ],
       "evidence": [
         "cfctl list pages.project",
-        "cfctl standards audit ~/dev",
+        "cfctl standards audit /path/to/workspace",
         "./scripts/cf_wrangler.sh pages project list"
       ]
     },
@@ -436,7 +436,7 @@
         }
       ],
       "evidence": [
-        "cfctl standards audit ~/dev",
+        "cfctl standards audit /path/to/workspace",
         "wrangler.toml compatibility_date",
         "wrangler.jsonc upload_source_maps"
       ]
@@ -468,7 +468,7 @@
         }
       ],
       "evidence": [
-        "cfctl standards audit ~/dev",
+        "cfctl standards audit /path/to/workspace",
         "wrangler.toml [build]",
         "wrangler.toml [assets]"
       ]
@@ -499,7 +499,7 @@
         }
       ],
       "evidence": [
-        "cfctl standards audit ~/dev",
+        "cfctl standards audit /path/to/workspace",
         "wrangler.toml [[d1_databases]]"
       ]
     },
@@ -546,7 +546,7 @@
         }
       ],
       "evidence": [
-        "cfctl standards audit ~/dev",
+        "cfctl standards audit /path/to/workspace",
         "wrangler.toml [observability]",
         "wrangler.jsonc upload_source_maps"
       ]
@@ -572,7 +572,7 @@
         }
       ],
       "evidence": [
-        "cfctl standards audit ~/dev",
+        "cfctl standards audit /path/to/workspace",
         "wrangler.toml [[routes]]",
         "wrangler.toml workers_dev"
       ]
@@ -628,7 +628,7 @@
         }
       ],
       "evidence": [
-        "cfctl standards audit ~/dev",
+        "cfctl standards audit /path/to/workspace",
         "wrangler.toml [vars]"
       ]
     },
@@ -652,7 +652,7 @@
         }
       ],
       "evidence": [
-        "cfctl standards audit ~/dev",
+        "cfctl standards audit /path/to/workspace",
         "wrangler.toml [observability]"
       ]
     },
@@ -682,7 +682,7 @@
         }
       ],
       "evidence": [
-        "cfctl standards audit ~/dev",
+        "cfctl standards audit /path/to/workspace",
         "wrangler.toml [triggers]"
       ]
     },
@@ -714,7 +714,7 @@
         }
       ],
       "evidence": [
-        "cfctl standards audit ~/dev",
+        "cfctl standards audit /path/to/workspace",
         "wrangler.toml [[containers]]",
         "wrangler.toml [[durable_objects.bindings]]",
         "wrangler.toml [[migrations]]"
@@ -740,7 +740,7 @@
         }
       ],
       "evidence": [
-        "cfctl standards audit ~/dev",
+        "cfctl standards audit /path/to/workspace",
         "wrangler.toml [services]",
         "wrangler.jsonc services"
       ]
@@ -765,7 +765,7 @@
         }
       ],
       "evidence": [
-        "cfctl standards audit ~/dev",
+        "cfctl standards audit /path/to/workspace",
         "wrangler.toml [[r2_buckets]]"
       ]
     }

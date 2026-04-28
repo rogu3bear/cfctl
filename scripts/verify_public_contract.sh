@@ -83,7 +83,8 @@ require_tool jq
 
 unique_suffix="$(date -u +%Y%m%d%H%M%S)-$$"
 token_name="dns-editor-${unique_suffix}"
-contract_zone="${CFCTL_PUBLIC_CONTRACT_ZONE:-jkca.me}"
+contract_zone="${CFCTL_PUBLIC_CONTRACT_ZONE:-}"
+[[ -n "${contract_zone}" ]] || die "CFCTL_PUBLIC_CONTRACT_ZONE must be set for live DNS/token smoke tests"
 contract_record="_ops-smoke.${contract_zone}"
 
 cleanup_previews_json="$(run_json success "previews purge-expired" "${CFCTL}" previews purge-expired)"

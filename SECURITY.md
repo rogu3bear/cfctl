@@ -8,7 +8,7 @@ If you find a security issue — a credential leak, a way to bypass the preview/
 
 Instead, report it privately:
 
-- Open a [private vulnerability report](https://github.com/rogu3bear/cfctl/security/advisories/new) on GitHub, **or**
+- Open a private vulnerability report through the repository's GitHub security advisory page, **or**
 - Email the maintainer at the address listed on the GitHub profile of the repo owner.
 
 Please include:

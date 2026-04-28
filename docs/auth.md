@@ -17,7 +17,7 @@ CF_TOKEN_LANE=global cfctl can dns.record upsert --zone example.com --name _ops-
 ```
 
 Operational rules:
-- load credentials from `~/dev/.env`
+- load credentials from `~/.config/cfctl/.env` or the `CF_SHARED_ENV_FILE` override
 - use `dev` first
 - switch to `global` explicitly when the surface is blocked or the operation is intentionally emergency-scope
 - classify or guide a write before applying it

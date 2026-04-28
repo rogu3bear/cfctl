@@ -103,7 +103,7 @@ Examples:
   cfctl standards dns.record
   cfctl standards worker.runtime
   cfctl standards audit
-  cfctl standards audit ~/dev
+  cfctl standards audit /path/to/workspace
   cfctl previews
   cfctl previews purge-expired
   cfctl locks
@@ -112,9 +112,9 @@ Examples:
   cfctl wrangler deploy --plan
   cfctl cloudflared version
   cfctl cloudflared tunnel create preview-tunnel --plan
-  cfctl hostname verify --file state/hostname/jkca-drive.yaml
-  cfctl hostname diff --file state/hostname/jkca-drive.yaml
-  cfctl hostname plan --file state/hostname/jkca-drive.yaml
+  cfctl hostname verify --file state/hostname/example.yaml
+  cfctl hostname diff --file state/hostname/example.yaml
+  cfctl hostname plan --file state/hostname/example.yaml
   cfctl admin authorizations
   cfctl admin authorize-backend --backend scripts/cf_api_apply.sh --reason "maintainer debug"
   cfctl admin revoke-backend --path var/runtime/admin/backend-bypass-<id>.json

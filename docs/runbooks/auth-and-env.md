@@ -4,7 +4,7 @@
 
 - Primary credential: `CF_DEV_TOKEN`
 - Emergency credential: `CF_GLOBAL_TOKEN`
-- Canonical source: `~/dev/.env`
+- Canonical source: `~/.config/cfctl/.env` unless `CF_SHARED_ENV_FILE` overrides it
 - Account pin: `CLOUDFLARE_ACCOUNT_ID`
 - Lane selector: `CF_TOKEN_LANE=dev|global`
 
@@ -12,7 +12,7 @@ All repo scripts use the shared loader in `scripts/lib/cloudflare.sh`.
 
 Load order:
 
-1. `~/dev/.env`
+1. `~/.config/cfctl/.env` or `CF_SHARED_ENV_FILE`
 2. optional repo-local `.env.local`
 
 After loading, the library selects an active lane and exports:

@@ -66,7 +66,7 @@ cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com -
 cfctl explain access.app
 cfctl list pages.project
 cfctl get access.app --domain docs.example.org
-cfctl hostname verify --file state/hostname/jkca-drive.yaml
+cfctl hostname verify --file state/hostname/example.yaml
 CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
 ```
 
@@ -75,12 +75,12 @@ Advanced Certificate Manager / edge certificate example:
 ```bash
 cfctl standards edge.certificate
 cfctl explain edge.certificate
-cfctl guide edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
-cfctl list edge.certificate --zone jkca.me
-CF_TOKEN_LANE=global cfctl can edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --all-lanes
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --ack-plan <operation-id>
-CF_TOKEN_LANE=global cfctl verify edge.certificate --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
+cfctl list edge.certificate --zone example.com
+CF_TOKEN_LANE=global cfctl can edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --all-lanes
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl verify edge.certificate --zone example.com --host app.example.com --host deep.app.example.com
 ```
 
 Use the default `dev` lane first. If `cfctl can ... --all-lanes` shows the dev lane cannot order SSL certificate packs, explicitly switch to `CF_TOKEN_LANE=global` and keep the same preview, acknowledgement, and verification evidence trail.
@@ -105,7 +105,7 @@ Hostname lifecycle specs live under `state/hostname/`. Use `cfctl hostname verif
 - Default lane: `CF_DEV_TOKEN`
 - Emergency lane: `CF_GLOBAL_TOKEN`
 - Lane selector: `CF_TOKEN_LANE=dev|global`
-- Canonical env source: `~/dev/.env`
+- Canonical env source: `~/.config/cfctl/.env` unless `CF_SHARED_ENV_FILE` overrides it
 
 Rules:
 
@@ -130,7 +130,7 @@ Do not teach other agents the flat `scripts/` surface as the primary interface. 
 - Read current state before writing.
 - Use `cfctl explain <surface>` before working on an unfamiliar surface.
 - Use `cfctl standards <surface>` to load the canonical configuration standards before designing a change.
-- Use `cfctl standards audit` when the task depends on the actual Wrangler shape across `~/dev`, not just one Cloudflare control-plane surface.
+- Use `cfctl standards audit` when the task depends on the actual Wrangler shape across a workspace root, not just one Cloudflare control-plane surface.
 - Use `cfctl classify <surface> <operation>` before assuming a write is supported or safe on the current lane.
 - Use `cfctl guide <surface> <operation>` when a write is non-trivial or unfamiliar.
 - Use `cfctl previews` and `cfctl locks` when a preview/apply flow looks blocked or stale.

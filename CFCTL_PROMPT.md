@@ -44,10 +44,10 @@ Behavior rules:
 
 High-signal examples:
 - To order an Advanced Certificate Manager certificate for a subdomain and a deeper hostname, accept:
-  `CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan`
+  `CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan`
 - To execute it, require the same command shape with `--ack-plan <operation-id>`.
 - To verify it, accept:
-  `CF_TOKEN_LANE=global cfctl verify edge.certificate --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me`
+  `CF_TOKEN_LANE=global cfctl verify edge.certificate --zone example.com --host app.example.com --host deep.app.example.com`
 
 Now receive your first command.
 ```

@@ -2,7 +2,7 @@
 
 When an agent lands in this directory, the default posture is:
 
-1. Load `CF_DEV_TOKEN` from `~/dev/.env`.
+1. Load `CF_DEV_TOKEN` from `~/.config/cfctl/.env` or the `CF_SHARED_ENV_FILE` override.
 2. Run `cfctl doctor`.
 3. Use `cfctl` from `PATH` as the public interface. The local `./cfctl` is equivalent when standing in this directory.
 4. Read current state before writing.
@@ -50,7 +50,7 @@ cfctl snapshot tunnel
 cfctl list pages.project
 cfctl list edge.certificate --zone example.com
 cfctl get access.app --domain docs.example.org
-cfctl hostname verify --file state/hostname/jkca-drive.yaml
+cfctl hostname verify --file state/hostname/example.yaml
 CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
 ./scripts/cf_compare_token_coverage.sh
 ./scripts/cf_auth_check.sh
@@ -78,8 +78,8 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 For hostname cutovers, use the composite read path before planning component writes:
 
 ```bash
-cfctl hostname verify --file state/hostname/jkca-drive.yaml
-cfctl hostname plan --file state/hostname/jkca-drive.yaml
+cfctl hostname verify --file state/hostname/example.yaml
+cfctl hostname plan --file state/hostname/example.yaml
 ```
 
 To actually execute a reviewed write:
@@ -92,17 +92,17 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 
 ## Advanced Certificate Manager
 
-For an Edge certificate backed by Cloudflare Advanced Certificate Manager, use the `edge.certificate` surface. This is the path for hostnames like `sub.jkca.me` plus `child.sub.jkca.me`.
+For an Edge certificate backed by Cloudflare Advanced Certificate Manager, use the `edge.certificate` surface. This is the path for hostnames like `app.example.com` plus `deep.app.example.com`.
 
 ```bash
 cfctl standards edge.certificate
 cfctl explain edge.certificate
-cfctl guide edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
-cfctl list edge.certificate --zone jkca.me
-CF_TOKEN_LANE=global cfctl can edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --all-lanes
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --ack-plan <operation-id>
-CF_TOKEN_LANE=global cfctl verify edge.certificate --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
+cfctl list edge.certificate --zone example.com
+CF_TOKEN_LANE=global cfctl can edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --all-lanes
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl verify edge.certificate --zone example.com --host app.example.com --host deep.app.example.com
 ```
 
 Run the capability check before applying. If the dev lane is blocked and the global lane is allowed, say that explicitly in the operator notes and keep the same preview/apply/verify artifact chain.

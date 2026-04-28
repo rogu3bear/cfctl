@@ -15,10 +15,10 @@ If you've ever found yourself stitching together `wrangler`, `cloudflared`, raw 
 See [QUICKSTART.md](QUICKSTART.md) for install, credential setup, and your first `cfctl` commands. The shortest path:
 
 ```bash
-git clone https://github.com/rogu3bear/cfctl.git
+git clone https://github.com/your-org/cfctl.git
 cd cfctl
-./bootstrap.sh           # checks tools, symlinks cfctl, scaffolds ~/dev/.env, runs doctor
-$EDITOR ~/dev/.env       # fill in CF_DEV_TOKEN + CLOUDFLARE_ACCOUNT_ID
+./bootstrap.sh                    # checks tools, symlinks cfctl, scaffolds ~/.config/cfctl/.env, runs doctor
+$EDITOR ~/.config/cfctl/.env      # fill in CF_DEV_TOKEN + CLOUDFLARE_ACCOUNT_ID
 cfctl doctor
 cfctl surfaces
 ```
@@ -48,7 +48,7 @@ Wrangler is excellent for Workers and Pages. `cloudflared` is excellent for tunn
 | Emergency lane | `CF_GLOBAL_TOKEN` (global API key + `CLOUDFLARE_EMAIL`) |
 | Lane selector | `CF_TOKEN_LANE=dev|global` |
 | Account pin | `CLOUDFLARE_ACCOUNT_ID` |
-| Env source | `~/dev/.env` (loader: [scripts/lib/cloudflare.sh](scripts/lib/cloudflare.sh)) |
+| Env source | `~/.config/cfctl/.env` by default, or `CF_SHARED_ENV_FILE` (loader: [scripts/lib/cloudflare.sh](scripts/lib/cloudflare.sh)) |
 
 Lane behavior:
 
@@ -69,7 +69,7 @@ cfctl explain access.app
 cfctl classify dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT
 cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120
 cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
-cfctl hostname verify --file state/hostname/jkca-drive.yaml
+cfctl hostname verify --file state/hostname/example.yaml
 ```
 
 Useful reads:
@@ -98,24 +98,24 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 
 ## Advanced Certificate Manager
 
-Use `edge.certificate` when you need a Cloudflare Advanced Certificate Manager certificate pack for a zone, including a primary subdomain plus a deeper hostname such as `sub.jkca.me` and `child.sub.jkca.me`.
+Use `edge.certificate` when you need a Cloudflare Advanced Certificate Manager certificate pack for a zone, including a primary subdomain plus a deeper hostname such as `app.example.com` and `deep.app.example.com`.
 
 Read and plan first:
 
 ```bash
 cfctl standards edge.certificate
 cfctl explain edge.certificate
-cfctl guide edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
-cfctl list edge.certificate --zone jkca.me
-CF_TOKEN_LANE=global cfctl can edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --all-lanes
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
+cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
+cfctl list edge.certificate --zone example.com
+CF_TOKEN_LANE=global cfctl can edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --all-lanes
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
 ```
 
 After reviewing the preview artifact, execute and verify:
 
 ```bash
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --ack-plan <operation-id>
-CF_TOKEN_LANE=global cfctl verify edge.certificate --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl verify edge.certificate --zone example.com --host app.example.com --host deep.app.example.com
 ```
 
 The runtime includes the zone apex automatically in the certificate-pack host list. The default auth lane may not have SSL certificate-pack permission; use `cfctl can ... --all-lanes` to prove whether the global lane is required before applying.
@@ -125,9 +125,9 @@ The runtime includes the zone apex automatically in the certificate-pack host li
 Use `cfctl hostname verify|diff|plan` with specs under [state/hostname](state/hostname) when a hostname set needs DNS, Worker route, Access, Advanced Certificate Manager, Worker deployment, app response, D1, and R2 checked together.
 
 ```bash
-cfctl hostname verify --file state/hostname/jkca-drive.yaml
-cfctl hostname diff --file state/hostname/jkca-drive.yaml
-cfctl hostname plan --file state/hostname/jkca-drive.yaml
+cfctl hostname verify --file state/hostname/example.yaml
+cfctl hostname diff --file state/hostname/example.yaml
+cfctl hostname plan --file state/hostname/example.yaml
 ```
 
 This tranche is read-only. `hostname plan` emits proposed component operations, but composite `hostname apply` is blocked until each component write path is present as a preview-gated public surface.
@@ -265,4 +265,4 @@ See [SECURITY.md](SECURITY.md). Please do not file public issues for vulnerabili
 
 ## License
 
-MIT — see [LICENSE](LICENSE). `cfctl` was created by [James KC Auchterlonie](https://github.com/rogu3bear).
+MIT — see [LICENSE](LICENSE).

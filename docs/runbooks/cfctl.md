@@ -57,8 +57,8 @@ cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zo
 cfctl classify dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT
 cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120
 cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
-cfctl hostname verify --file state/hostname/jkca-drive.yaml
-cfctl hostname plan --file state/hostname/jkca-drive.yaml
+cfctl hostname verify --file state/hostname/example.yaml
+cfctl hostname plan --file state/hostname/example.yaml
 cfctl list surfaces
 cfctl explain access.app
 cfctl list pages.project
@@ -117,17 +117,17 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 
 ## Advanced Certificate Manager
 
-Use `edge.certificate` for Cloudflare Advanced Certificate Manager certificate packs. This supports adding a hostname and a deeper hostname in one order, for example `sub.jkca.me` and `child.sub.jkca.me`.
+Use `edge.certificate` for Cloudflare Advanced Certificate Manager certificate packs. This supports adding a hostname and a deeper hostname in one order, for example `app.example.com` and `deep.app.example.com`.
 
 ```bash
 cfctl standards edge.certificate
 cfctl explain edge.certificate
-cfctl guide edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
-cfctl list edge.certificate --zone jkca.me
-CF_TOKEN_LANE=global cfctl can edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --all-lanes
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --ack-plan <operation-id>
-CF_TOKEN_LANE=global cfctl verify edge.certificate --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
+cfctl list edge.certificate --zone example.com
+CF_TOKEN_LANE=global cfctl can edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --all-lanes
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl verify edge.certificate --zone example.com --host app.example.com --host deep.app.example.com
 ```
 
 The order backend automatically includes the zone apex in the host list. If `CF_DEV_TOKEN` lacks SSL certificate-pack permission, switch explicitly with `CF_TOKEN_LANE=global`; do not hide the lane switch.
@@ -137,9 +137,9 @@ The order backend automatically includes the zone apex in the host list. If `CF_
 Use `hostname` when the question is whether Cloudflare is ready for a hostname set, not whether one isolated Cloudflare resource exists.
 
 ```bash
-cfctl hostname verify --file state/hostname/jkca-drive.yaml
-cfctl hostname diff --file state/hostname/jkca-drive.yaml
-cfctl hostname plan --file state/hostname/jkca-drive.yaml
+cfctl hostname verify --file state/hostname/example.yaml
+cfctl hostname diff --file state/hostname/example.yaml
+cfctl hostname plan --file state/hostname/example.yaml
 ```
 
 The current implementation is read-only. It emits evidence for each component surface and proposed operations for any gap; it does not mutate DNS, Access, routes, certificates, Workers, D1, or R2.

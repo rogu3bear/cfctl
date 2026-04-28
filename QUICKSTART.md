@@ -10,7 +10,7 @@ If you'd rather not do the steps below by hand:
 ./bootstrap.sh
 ```
 
-It checks tools, symlinks `cfctl` into `~/bin`, scaffolds `~/dev/.env` from the template (without overwriting an existing one), and runs `cfctl doctor`. It's idempotent and never installs anything for you. Pass `--check-only` to do a pure preflight, or `--help` for the full flag list.
+It checks tools, symlinks `cfctl` into `~/bin`, scaffolds `~/.config/cfctl/.env` from the template (without overwriting an existing one), and runs `cfctl doctor`. It's idempotent and never installs anything for you. Pass `--check-only` to do a pure preflight, or `--help` for the full flag list.
 
 The manual walkthrough is below if you want to know what each step does.
 
@@ -44,7 +44,7 @@ sudo apt install jq curl python3
 ## 2. Clone and put `cfctl` on your PATH
 
 ```bash
-git clone https://github.com/rogu3bear/cfctl.git
+git clone https://github.com/your-org/cfctl.git
 cd cfctl
 mkdir -p ~/bin
 ln -s "$(pwd)/cfctl" ~/bin/cfctl
@@ -55,7 +55,7 @@ You can also invoke `./cfctl` directly from inside the repo without the symlink 
 
 ## 3. Set up credentials
 
-`cfctl` reads credentials from `~/dev/.env` by default (this is configurable; the loader is in [scripts/lib/cloudflare.sh](scripts/lib/cloudflare.sh)). The minimum:
+`cfctl` reads credentials from `~/.config/cfctl/.env` by default (this is configurable with `CF_SHARED_ENV_FILE`; the loader is in [scripts/lib/cloudflare.sh](scripts/lib/cloudflare.sh)). The minimum:
 
 ```env
 CF_DEV_TOKEN=<your scoped Cloudflare API token>
@@ -151,7 +151,7 @@ cfctl token mint \
 | Symptom | First thing to check |
 |---|---|
 | `cfctl doctor` reports tool missing | `which jq curl python3` |
-| `auth_lane` is red | `~/dev/.env` exists and has `CF_DEV_TOKEN` set; `CLOUDFLARE_ACCOUNT_ID` is the right account |
+| `auth_lane` is red | `~/.config/cfctl/.env` exists, or `CF_SHARED_ENV_FILE` points to an env file with `CF_DEV_TOKEN` set; `CLOUDFLARE_ACCOUNT_ID` is the right account |
 | `unsupported_surface` | `cfctl surfaces` for the canonical list; surface names are namespaced (e.g. `dns.record`, not `dns_record`) |
 | Preview gate keeps blocking writes | Run with `--plan`, capture the `operation_id`, then rerun with `--ack-plan <operation_id>` |
 | Lock errors | `cfctl locks` to inspect, `cfctl locks clear-stale` if the lock is owned by a dead process |
