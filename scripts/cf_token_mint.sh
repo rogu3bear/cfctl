@@ -842,7 +842,7 @@ report_json="$(
               request: ($response.request // null)
             }
           end
-        }
+        )
       }
     '
 )"

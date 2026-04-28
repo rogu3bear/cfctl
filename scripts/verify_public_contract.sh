@@ -83,6 +83,8 @@ require_tool jq
 
 unique_suffix="$(date -u +%Y%m%d%H%M%S)-$$"
 token_name="dns-editor-${unique_suffix}"
+contract_zone="${CFCTL_PUBLIC_CONTRACT_ZONE:-jkca.me}"
+contract_record="_ops-smoke.${contract_zone}"
 
 cleanup_previews_json="$(run_json success "previews purge-expired" "${CFCTL}" previews purge-expired)"
 assert_artifact_exists "previews purge-expired" "${cleanup_previews_json}"
@@ -171,7 +173,7 @@ assert_json "token permission-groups" '.ok == true and .action == "token.permiss
 classify_dns_json="$(
   run_json success \
     "classify dns.record upsert" \
-    "${CFCTL}" classify dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT
+    "${CFCTL}" classify dns.record upsert --zone "${contract_zone}" --name "${contract_record}" --type TXT
 )"
 assert_artifact_exists "classify dns.record upsert" "${classify_dns_json}"
 assert_json "classify dns.record upsert" '.ok == true and .result.selector_readiness.ready == true and .permission_status.basis != "selector_incomplete"' "${classify_dns_json}"
@@ -179,7 +181,7 @@ assert_json "classify dns.record upsert" '.ok == true and .result.selector_readi
 can_dns_json="$(
   run_json success \
     "can dns.record upsert --all-lanes" \
-    env CF_TOKEN_LANE=global "${CFCTL}" can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
+    env CF_TOKEN_LANE=global "${CFCTL}" can dns.record upsert --zone "${contract_zone}" --name "${contract_record}" --type TXT --all-lanes
 )"
 assert_artifact_exists "can dns.record upsert --all-lanes" "${can_dns_json}"
 assert_json "can dns.record upsert --all-lanes" '.ok == true and ((.result.summary.allowed_lanes | index("global")) != null) and ((.result.lanes | map(select(.lane == "global" and .permission.state == "allowed")) | length) == 1)' "${can_dns_json}"
@@ -187,7 +189,7 @@ assert_json "can dns.record upsert --all-lanes" '.ok == true and ((.result.summa
 token_plan_json="$(
   run_json success \
     "token mint --plan" \
-    "${CFCTL}" token mint --name "${token_name}" --permission "DNS Write" --zone example.com --ttl-hours 24 --plan
+    "${CFCTL}" token mint --name "${token_name}" --permission "DNS Write" --zone "${contract_zone}" --ttl-hours 24 --plan
 )"
 assert_artifact_exists "token mint --plan" "${token_plan_json}"
 assert_json "token mint --plan" '.ok == true and .action == "token.mint" and .planned == true and (.operation_id | type == "string")' "${token_plan_json}"
