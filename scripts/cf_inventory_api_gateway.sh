@@ -39,6 +39,13 @@ case "${API_GATEWAY_RESOURCE}" in
         --arg zone_name "${ZONE_NAME}" \
         --argjson response "${RAW_JSON}" \
         '
+          def normalize_operation:
+            if ((.id // "") == "" and (.operation_id // "") != "") then
+              . + {id: .operation_id}
+            else
+              .
+            end;
+
           {
             generated_at: $generated_at,
             resource: "operations",
@@ -47,7 +54,10 @@ case "${API_GATEWAY_RESOURCE}" in
               name: $zone_name
             },
             response: $response,
-            operations: ($response.result // []),
+            operations: [
+              ($response.result // [])[]
+              | normalize_operation
+            ],
             summary: {
               operation_count: (($response.result // []) | length),
               hosts: (($response.result // []) | map(.host // empty) | unique | sort),
@@ -68,9 +78,9 @@ case "${API_GATEWAY_RESOURCE}" in
         --argjson response "${RAW_JSON}" \
         '
           def schema_host:
-            ((.servers // [])[0].url // "")
+            (((.servers // [])[0].url // "")
             | sub("^https?://"; "")
-            | split("/")[0];
+            | split("/")[0]) // "";
 
           {
             generated_at: $generated_at,
@@ -81,11 +91,16 @@ case "${API_GATEWAY_RESOURCE}" in
             },
             response: $response,
             schemas: [
-              ($response.result.schemas // [])[]
-              | . as $schema
+              ($response.result.schemas // [] | to_entries[])
+              | .key as $idx
+              | .value as $schema
               | ($schema | schema_host) as $host
               | {
-                  id: (if $host != "" then $host else ($schema.info.title // "schema") end),
+                  id: (
+                    $schema.id
+                    // $schema.schema_id
+                    // (((if $host != "" then $host elif (($schema.info.title // "") != "") then $schema.info.title else "schema" end) + "#" + ($idx | tostring)))
+                  ),
                   host: $host,
                   title: ($schema.info.title // null),
                   version: ($schema.info.version // null),
@@ -117,9 +132,9 @@ case "${API_GATEWAY_RESOURCE}" in
         --argjson response "${RAW_JSON}" \
         '
           def schema_host:
-            ((.servers // [])[0].url // "")
+            (((.servers // [])[0].url // "")
             | sub("^https?://"; "")
-            | split("/")[0];
+            | split("/")[0]) // "";
 
           {
             generated_at: $generated_at,
@@ -130,11 +145,16 @@ case "${API_GATEWAY_RESOURCE}" in
             },
             response: $response,
             schemas: [
-              ($response.result.schemas // [])[]
-              | . as $schema
+              ($response.result.schemas // [] | to_entries[])
+              | .key as $idx
+              | .value as $schema
               | ($schema | schema_host) as $host
               | {
-                  id: (if $host != "" then $host else ($schema.info.title // "discovered-schema") end),
+                  id: (
+                    $schema.id
+                    // $schema.schema_id
+                    // (((if $host != "" then $host elif (($schema.info.title // "") != "") then $schema.info.title else "discovered-schema" end) + "#" + ($idx | tostring)))
+                  ),
                   host: $host,
                   title: ($schema.info.title // null),
                   version: ($schema.info.version // null),

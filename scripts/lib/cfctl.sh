@@ -1700,7 +1700,7 @@ cfctl_filter_surface_items() {
         [
           .[]
           | select(
-              (if $id != "" then .id == $id else true end)
+              (if $id != "" then ((.id // .operation_id // "") == $id) else true end)
               and
               (if $endpoint != "" then .endpoint == $endpoint else true end)
               and
