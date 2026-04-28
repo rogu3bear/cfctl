@@ -24,7 +24,23 @@ cfctl apply tunnel create --body '{"name":"example","config_src":"cloudflare"}' 
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
 CF_TOKEN_LANE=global cfctl apply dns.record sync --zone example.com --plan
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
 ```
+
+Advanced Certificate Manager public flow:
+
+```bash
+cfctl standards edge.certificate
+cfctl explain edge.certificate
+cfctl guide edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+cfctl list edge.certificate --zone jkca.me
+CF_TOKEN_LANE=global cfctl can edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --all-lanes
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl verify edge.certificate --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+```
+
+Use repeated `--host` flags for each certificate hostname. The runtime adds the zone apex automatically, then submits an Advanced Certificate Manager `type=advanced` certificate-pack order.
 
 The script-level wrappers below remain the backend contract, but mutation backends are backend-only and require `cfctl admin authorize-backend` plus `CF_BACKEND_BYPASS_FILE=<authorization-path>` for direct maintainer/debug use.
 
@@ -100,6 +116,19 @@ WAITING_ROOM_ID=<waiting-room-id> \
 OPERATION=patch \
 BODY_JSON='{"suspended":true}' \
 ./scripts/cf_mutate_waiting_room.sh
+```
+
+Advanced Certificate Manager edge certificate order:
+
+```bash
+CF_BACKEND_BYPASS_FILE=/absolute/path/to/backend-bypass.json \
+ZONE_NAME=example.com \
+OPERATION=order \
+HOSTS_JSON='["app.example.com","deep.app.example.com"]' \
+VALIDATION_METHOD=txt \
+CERTIFICATE_AUTHORITY=lets_encrypt \
+VALIDITY_DAYS=90 \
+./scripts/cf_mutate_edge_certificate.sh
 ```
 
 Logpush job update:

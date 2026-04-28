@@ -38,6 +38,7 @@ cfctl docs
 cfctl docs watch
 cfctl standards audit
 cfctl standards dns.record
+cfctl standards edge.certificate
 cfctl standards worker.errors
 cfctl standards worker.runtime
 cfctl wrangler --version
@@ -47,7 +48,9 @@ cfctl classify tunnel create
 CF_TOKEN_LANE=global cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
 cfctl snapshot tunnel
 cfctl list pages.project
+cfctl list edge.certificate --zone example.com
 cfctl get access.app --domain docs.example.org
+cfctl hostname verify --file state/hostname/jkca-drive.yaml
 CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
 ./scripts/cf_compare_token_coverage.sh
 ./scripts/cf_auth_check.sh
@@ -69,6 +72,14 @@ cfctl apply access.policy create --app-id <app-id> --body-file policy.json --pla
 cfctl apply tunnel create --body '{"name":"example","config_src":"cloudflare"}' --plan
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
 CF_TOKEN_LANE=global cfctl apply dns.record sync --zone example.com --plan
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
+```
+
+For hostname cutovers, use the composite read path before planning component writes:
+
+```bash
+cfctl hostname verify --file state/hostname/jkca-drive.yaml
+cfctl hostname plan --file state/hostname/jkca-drive.yaml
 ```
 
 To actually execute a reviewed write:
@@ -76,7 +87,25 @@ To actually execute a reviewed write:
 ```bash
 cfctl apply access.app update --id <app-id> --body-file app.json --ack-plan <operation-id>
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --ack-plan <operation-id>
 ```
+
+## Advanced Certificate Manager
+
+For an Edge certificate backed by Cloudflare Advanced Certificate Manager, use the `edge.certificate` surface. This is the path for hostnames like `sub.jkca.me` plus `child.sub.jkca.me`.
+
+```bash
+cfctl standards edge.certificate
+cfctl explain edge.certificate
+cfctl guide edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+cfctl list edge.certificate --zone jkca.me
+CF_TOKEN_LANE=global cfctl can edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --all-lanes
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl verify edge.certificate --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+```
+
+Run the capability check before applying. If the dev lane is blocked and the global lane is allowed, say that explicitly in the operator notes and keep the same preview/apply/verify artifact chain.
 
 ## Tool Choice
 

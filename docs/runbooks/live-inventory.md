@@ -74,6 +74,7 @@ Use `cfctl` when you want a stable public interface:
 ```bash
 cfctl list zone
 cfctl list worker.script
+cfctl list worker.route --zone example.com
 cfctl list pages.project
 cfctl list d1.database
 cfctl list r2.bucket

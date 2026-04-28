@@ -67,6 +67,8 @@ cfctl cloudflared version       # wrapped cloudflared
 cfctl explain access.app
 cfctl classify dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT
 cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120
+cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
+cfctl hostname verify --file state/hostname/jkca-drive.yaml
 ```
 
 Useful reads:
@@ -75,6 +77,8 @@ Useful reads:
 cfctl snapshot tunnel
 cfctl list pages.project
 cfctl get access.app --domain docs.example.org
+cfctl list edge.certificate --zone example.com
+cfctl list worker.route --zone example.com
 CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
 ```
 
@@ -85,7 +89,44 @@ cfctl apply access.policy create --app-id <app-id> --body-file policy.json --pla
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
 CF_TOKEN_LANE=global cfctl apply dns.record sync --zone example.com --plan
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
 ```
+
+## Advanced Certificate Manager
+
+Use `edge.certificate` when you need a Cloudflare Advanced Certificate Manager certificate pack for a zone, including a primary subdomain plus a deeper hostname such as `sub.jkca.me` and `child.sub.jkca.me`.
+
+Read and plan first:
+
+```bash
+cfctl standards edge.certificate
+cfctl explain edge.certificate
+cfctl guide edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+cfctl list edge.certificate --zone jkca.me
+CF_TOKEN_LANE=global cfctl can edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --all-lanes
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
+```
+
+After reviewing the preview artifact, execute and verify:
+
+```bash
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl verify edge.certificate --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+```
+
+The runtime includes the zone apex automatically in the certificate-pack host list. The default auth lane may not have SSL certificate-pack permission; use `cfctl can ... --all-lanes` to prove whether the global lane is required before applying.
+
+## Hostname lifecycle
+
+Use `cfctl hostname verify|diff|plan` with specs under [state/hostname](state/hostname) when a hostname set needs DNS, Worker route, Access, Advanced Certificate Manager, Worker deployment, app response, D1, and R2 checked together.
+
+```bash
+cfctl hostname verify --file state/hostname/jkca-drive.yaml
+cfctl hostname diff --file state/hostname/jkca-drive.yaml
+cfctl hostname plan --file state/hostname/jkca-drive.yaml
+```
+
+This tranche is read-only. `hostname plan` emits proposed component operations, but composite `hostname apply` is blocked until each component write path is present as a preview-gated public surface.
 
 Token minting:
 
@@ -116,7 +157,7 @@ lib/runtime/       - auth, result envelopes, lanes, desired-state helpers
 lib/backends/      - backend wrappers
 lib/surfaces/      - runtime catalog access and surface metadata
 catalog/           - surface registry, runtime policy, standards, doc bank
-state/             - selective desired-state specs (access.app, access.policy, dns.record, tunnel)
+state/             - selective desired-state specs (access.app, access.policy, dns.record, hostname, tunnel)
 compat/            - legacy script -> cfctl mapping
 legacy/            - older workflows kept for reference
 scripts/           - inventory, mutation, wrangler/cloudflared wrappers, email-routing helpers
@@ -129,7 +170,7 @@ var/logs/          - command logs (gitignored)
 
 Desired state is selective, not universal — it exists where repeated drift justifies `diff` and `sync`, not as a blanket declarative layer.
 
-Currently supported: `access.app`, `access.policy`, `dns.record`, `tunnel`.
+Currently supported: `access.app`, `access.policy`, `dns.record`, `hostname` verify/diff/plan, `tunnel`.
 
 Use:
 

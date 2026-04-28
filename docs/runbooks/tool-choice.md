@@ -36,6 +36,7 @@ Mutation backends currently wrapped by `cfctl`:
 - `./scripts/cf_mutate_access_policy.sh`
 - `./scripts/cf_mutate_turnstile_widget.sh`
 - `./scripts/cf_mutate_waiting_room.sh`
+- `./scripts/cf_mutate_edge_certificate.sh`
 - `./scripts/cf_mutate_logpush_job.sh`
 - `./scripts/cf_mutate_tunnel.sh`
 

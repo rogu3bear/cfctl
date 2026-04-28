@@ -66,8 +66,24 @@ cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com -
 cfctl explain access.app
 cfctl list pages.project
 cfctl get access.app --domain docs.example.org
+cfctl hostname verify --file state/hostname/jkca-drive.yaml
 CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
 ```
+
+Advanced Certificate Manager / edge certificate example:
+
+```bash
+cfctl standards edge.certificate
+cfctl explain edge.certificate
+cfctl guide edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+cfctl list edge.certificate --zone jkca.me
+CF_TOKEN_LANE=global cfctl can edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --all-lanes
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl verify edge.certificate --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+```
+
+Use the default `dev` lane first. If `cfctl can ... --all-lanes` shows the dev lane cannot order SSL certificate packs, explicitly switch to `CF_TOKEN_LANE=global` and keep the same preview, acknowledgement, and verification evidence trail.
 
 The bare `cfctl` command is expected to be installed in the user shell path. If `PATH` is degraded while standing in this directory, `./cfctl` is the equivalent local implementation:
 
@@ -81,6 +97,8 @@ For a broad read-only bank refresh:
 ```bash
 ./scripts/cf_agent_bootstrap.sh
 ```
+
+Hostname lifecycle specs live under `state/hostname/`. Use `cfctl hostname verify|diff|plan --file <spec>` when one hostname set needs DNS, Worker route, Access, certificate, Worker script, app response, and storage proven together. Composite `hostname apply` is blocked until the component write surfaces are individually preview-gated.
 
 ## Auth Lanes
 
@@ -137,6 +155,7 @@ Currently supported:
 - `access.app`
 - `access.policy`
 - `dns.record`
+- `hostname` (verify/diff/plan only)
 - `tunnel`
 
 Use:
@@ -186,6 +205,6 @@ Do not infer live Cloudflare truth from a passing source-config audit; use live 
 
 ## Repo Reality
 
-- This directory is currently not a git repo. Do not use branch, PR, or commit workflows here; leave evidence through `cfctl` artifacts and runtime logs.
+- This directory may be a normal git checkout. Verify live git state before committing or publishing, and do not assume branch state from this document.
 - The original email-routing workflows still exist, but they are part of the broader runtime now.
 - If you need the detailed human-facing overview, start with `README.md`. If you need the operational contract, start with this file and `cfctl`.

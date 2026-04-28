@@ -43,6 +43,7 @@ cfctl docs watch
 cfctl docs ai-search
 cfctl standards audit
 cfctl standards dns.record
+cfctl standards edge.certificate
 cfctl standards worker.errors
 cfctl standards worker.runtime
 cfctl wrangler --version
@@ -54,15 +55,20 @@ cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zo
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --ack-plan <operation-id> --value-out /tmp/dns-editor.token
 cfctl classify dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT
 cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120
+cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
+cfctl hostname verify --file state/hostname/jkca-drive.yaml
+cfctl hostname plan --file state/hostname/jkca-drive.yaml
 cfctl list surfaces
 cfctl explain access.app
 cfctl list pages.project
 cfctl get access.app --domain docs.example.org
+cfctl list worker.route --zone example.com
 cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
 CF_TOKEN_LANE=global cfctl snapshot tunnel
 CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
 CF_TOKEN_LANE=global cfctl apply dns.record sync --zone example.com --plan
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
 ```
 
 ## Semantics
@@ -98,9 +104,40 @@ CF_TOKEN_LANE=global cfctl apply dns.record sync --zone example.com --plan
 - `admin authorizations` lists active and expired backend authorizations
 - `admin revoke-backend --path ...` removes one authorization artifact
 - `apply <surface> sync` performs selective desired-state reconciliation on supported surfaces
+- `hostname verify|diff|plan` checks one YAML hostname lifecycle spec across DNS, TLS, Worker route, Access, Worker script, HTTP response, D1, and R2
+- `hostname apply` is blocked until composite mutation is backed by preview-gated component surfaces
 - destructive operations require explicit confirmation such as `--confirm delete`
 - blocked surfaces fail with structured permission results instead of raw Cloudflare API blobs
 - ambiguous target resolution is a hard failure
+
+## Advanced Certificate Manager
+
+Use `edge.certificate` for Cloudflare Advanced Certificate Manager certificate packs. This supports adding a hostname and a deeper hostname in one order, for example `sub.jkca.me` and `child.sub.jkca.me`.
+
+```bash
+cfctl standards edge.certificate
+cfctl explain edge.certificate
+cfctl guide edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+cfctl list edge.certificate --zone jkca.me
+CF_TOKEN_LANE=global cfctl can edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --all-lanes
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl verify edge.certificate --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+```
+
+The order backend automatically includes the zone apex in the host list. If `CF_DEV_TOKEN` lacks SSL certificate-pack permission, switch explicitly with `CF_TOKEN_LANE=global`; do not hide the lane switch.
+
+## Hostname Lifecycle
+
+Use `hostname` when the question is whether Cloudflare is ready for a hostname set, not whether one isolated Cloudflare resource exists.
+
+```bash
+cfctl hostname verify --file state/hostname/jkca-drive.yaml
+cfctl hostname diff --file state/hostname/jkca-drive.yaml
+cfctl hostname plan --file state/hostname/jkca-drive.yaml
+```
+
+The current implementation is read-only. It emits evidence for each component surface and proposed operations for any gap; it does not mutate DNS, Access, routes, certificates, Workers, D1, or R2.
 
 ## Result Envelope
 
