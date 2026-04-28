@@ -10,6 +10,9 @@ cfctl_reset_flags() {
   CFCTL_ID=""
   CFCTL_NAME=""
   CFCTL_DOMAIN=""
+  CFCTL_FILE=""
+  CFCTL_PATTERN=""
+  CFCTL_SERVICE=""
   CFCTL_ZONE_NAME=""
   CFCTL_ZONE_ID=""
   CFCTL_TYPE=""
@@ -20,6 +23,11 @@ cfctl_reset_flags() {
   CFCTL_SCOPE="account"
   CFCTL_BODY_JSON=""
   CFCTL_BODY_FILE=""
+  CFCTL_HOSTS_JSON="[]"
+  CFCTL_CERTIFICATE_AUTHORITY=""
+  CFCTL_VALIDATION_METHOD=""
+  CFCTL_VALIDITY_DAYS=""
+  CFCTL_CLOUDFLARE_BRANDING=""
   CFCTL_CONFIRM=""
   CFCTL_ACK_PLAN=""
   CFCTL_PLAN="0"
@@ -59,6 +67,12 @@ cfctl_parse_flags() {
       --name=*) CFCTL_NAME="${1#*=}"; shift ;;
       --domain) CFCTL_DOMAIN="$2"; shift 2 ;;
       --domain=*) CFCTL_DOMAIN="${1#*=}"; shift ;;
+      --file) CFCTL_FILE="$2"; shift 2 ;;
+      --file=*) CFCTL_FILE="${1#*=}"; shift ;;
+      --pattern) CFCTL_PATTERN="$2"; shift 2 ;;
+      --pattern=*) CFCTL_PATTERN="${1#*=}"; shift ;;
+      --service) CFCTL_SERVICE="$2"; shift 2 ;;
+      --service=*) CFCTL_SERVICE="${1#*=}"; shift ;;
       --zone) CFCTL_ZONE_NAME="$2"; shift 2 ;;
       --zone=*) CFCTL_ZONE_NAME="${1#*=}"; shift ;;
       --zone-id) CFCTL_ZONE_ID="$2"; shift 2 ;;
@@ -79,6 +93,18 @@ cfctl_parse_flags() {
       --body=*) CFCTL_BODY_JSON="${1#*=}"; shift ;;
       --body-file) CFCTL_BODY_FILE="$2"; shift 2 ;;
       --body-file=*) CFCTL_BODY_FILE="${1#*=}"; shift ;;
+      --host) CFCTL_HOSTS_JSON="$(jq -c --arg host "$2" '. + [$host]' <<< "${CFCTL_HOSTS_JSON}")"; shift 2 ;;
+      --host=*) CFCTL_HOSTS_JSON="$(jq -c --arg host "${1#*=}" '. + [$host]' <<< "${CFCTL_HOSTS_JSON}")"; shift ;;
+      --hosts-json) CFCTL_HOSTS_JSON="$(jq -c '.' <<< "$2")"; shift 2 ;;
+      --hosts-json=*) CFCTL_HOSTS_JSON="$(jq -c '.' <<< "${1#*=}")"; shift ;;
+      --certificate-authority) CFCTL_CERTIFICATE_AUTHORITY="$2"; shift 2 ;;
+      --certificate-authority=*) CFCTL_CERTIFICATE_AUTHORITY="${1#*=}"; shift ;;
+      --validation-method) CFCTL_VALIDATION_METHOD="$2"; shift 2 ;;
+      --validation-method=*) CFCTL_VALIDATION_METHOD="${1#*=}"; shift ;;
+      --validity-days) CFCTL_VALIDITY_DAYS="$2"; shift 2 ;;
+      --validity-days=*) CFCTL_VALIDITY_DAYS="${1#*=}"; shift ;;
+      --cloudflare-branding) CFCTL_CLOUDFLARE_BRANDING="$2"; shift 2 ;;
+      --cloudflare-branding=*) CFCTL_CLOUDFLARE_BRANDING="${1#*=}"; shift ;;
       --confirm) CFCTL_CONFIRM="$2"; shift 2 ;;
       --confirm=*) CFCTL_CONFIRM="${1#*=}"; shift ;;
       --ack-plan) CFCTL_ACK_PLAN="$2"; shift 2 ;;
@@ -497,7 +523,15 @@ cfctl_current_operation_request_json() {
     --arg operation "${operation}" \
     --argjson target "$(cfctl_target_json)" \
     --argjson body "${resolved_body}" \
+    --argjson hosts "${CFCTL_HOSTS_JSON}" \
+    --arg certificate_authority "${CFCTL_CERTIFICATE_AUTHORITY}" \
+    --arg validation_method "${CFCTL_VALIDATION_METHOD}" \
+    --arg validity_days "${CFCTL_VALIDITY_DAYS}" \
+    --arg cloudflare_branding "${CFCTL_CLOUDFLARE_BRANDING}" \
     --arg content "${CFCTL_CONTENT}" \
+    --arg file "${CFCTL_FILE}" \
+    --arg pattern "${CFCTL_PATTERN}" \
+    --arg service "${CFCTL_SERVICE}" \
     --arg ttl "${CFCTL_TTL}" \
     --arg proxied "${CFCTL_PROXIED}" \
     --arg priority "${CFCTL_PRIORITY}" \
@@ -513,7 +547,15 @@ cfctl_current_operation_request_json() {
         operation: (if $operation == "" then null else $operation end),
         target: $target,
         body: $body,
+        hosts: $hosts,
+        certificate_authority: (if $certificate_authority == "" then null else $certificate_authority end),
+        validation_method: (if $validation_method == "" then null else $validation_method end),
+        validity_days: (if $validity_days == "" then null else $validity_days end),
+        cloudflare_branding: (if $cloudflare_branding == "" then null else $cloudflare_branding end),
         content: (if $content == "" then null else $content end),
+        file: (if $file == "" then null else $file end),
+        pattern: (if $pattern == "" then null else $pattern end),
+        service: (if $service == "" then null else $service end),
         ttl: (if $ttl == "" then null else $ttl end),
         proxied: (if $proxied == "" then null else $proxied end),
         priority: (if $priority == "" then null else $priority end),
@@ -732,6 +774,9 @@ cfctl_current_args_shell() {
   [[ -n "${CFCTL_ID}" ]] && args+=(--id "${CFCTL_ID}")
   [[ -n "${CFCTL_NAME}" ]] && args+=(--name "${CFCTL_NAME}")
   [[ -n "${CFCTL_DOMAIN}" ]] && args+=(--domain "${CFCTL_DOMAIN}")
+  [[ -n "${CFCTL_FILE}" ]] && args+=(--file "${CFCTL_FILE}")
+  [[ -n "${CFCTL_PATTERN}" ]] && args+=(--pattern "${CFCTL_PATTERN}")
+  [[ -n "${CFCTL_SERVICE}" ]] && args+=(--service "${CFCTL_SERVICE}")
   [[ -n "${CFCTL_ZONE_NAME}" ]] && args+=(--zone "${CFCTL_ZONE_NAME}")
   [[ -n "${CFCTL_ZONE_ID}" ]] && args+=(--zone-id "${CFCTL_ZONE_ID}")
   [[ -n "${CFCTL_TYPE}" ]] && args+=(--type "${CFCTL_TYPE}")
@@ -742,6 +787,13 @@ cfctl_current_args_shell() {
   [[ -n "${CFCTL_SCOPE}" && "${CFCTL_SCOPE}" != "account" ]] && args+=(--scope "${CFCTL_SCOPE}")
   [[ -n "${CFCTL_BODY_JSON}" ]] && args+=(--body "${CFCTL_BODY_JSON}")
   [[ -n "${CFCTL_BODY_FILE}" ]] && args+=(--body-file "${CFCTL_BODY_FILE}")
+  while IFS= read -r host; do
+    [[ -n "${host}" ]] && args+=(--host "${host}")
+  done < <(jq -r '.[]?' <<< "${CFCTL_HOSTS_JSON}")
+  [[ -n "${CFCTL_CERTIFICATE_AUTHORITY}" ]] && args+=(--certificate-authority "${CFCTL_CERTIFICATE_AUTHORITY}")
+  [[ -n "${CFCTL_VALIDATION_METHOD}" ]] && args+=(--validation-method "${CFCTL_VALIDATION_METHOD}")
+  [[ -n "${CFCTL_VALIDITY_DAYS}" ]] && args+=(--validity-days "${CFCTL_VALIDITY_DAYS}")
+  [[ -n "${CFCTL_CLOUDFLARE_BRANDING}" ]] && args+=(--cloudflare-branding "${CFCTL_CLOUDFLARE_BRANDING}")
   [[ -n "${CFCTL_CONTENT}" ]] && args+=(--content "${CFCTL_CONTENT}")
   [[ -n "${CFCTL_TTL}" ]] && args+=(--ttl "${CFCTL_TTL}")
   [[ -n "${CFCTL_PROXIED}" ]] && args+=(--proxied "${CFCTL_PROXIED}")
@@ -772,6 +824,9 @@ cfctl_current_selector_args_shell() {
   [[ -n "${CFCTL_ID}" ]] && args+=(--id "${CFCTL_ID}")
   [[ -n "${CFCTL_NAME}" ]] && args+=(--name "${CFCTL_NAME}")
   [[ -n "${CFCTL_DOMAIN}" ]] && args+=(--domain "${CFCTL_DOMAIN}")
+  [[ -n "${CFCTL_FILE}" ]] && args+=(--file "${CFCTL_FILE}")
+  [[ -n "${CFCTL_PATTERN}" ]] && args+=(--pattern "${CFCTL_PATTERN}")
+  [[ -n "${CFCTL_SERVICE}" ]] && args+=(--service "${CFCTL_SERVICE}")
   [[ -n "${CFCTL_ZONE_NAME}" ]] && args+=(--zone "${CFCTL_ZONE_NAME}")
   [[ -n "${CFCTL_ZONE_ID}" ]] && args+=(--zone-id "${CFCTL_ZONE_ID}")
   [[ -n "${CFCTL_TYPE}" ]] && args+=(--type "${CFCTL_TYPE}")
@@ -782,6 +837,9 @@ cfctl_current_selector_args_shell() {
   [[ -n "${CFCTL_SCOPE}" && "${CFCTL_SCOPE}" != "account" ]] && args+=(--scope "${CFCTL_SCOPE}")
   [[ -n "${CFCTL_TUNNEL_ID}" ]] && args+=(--tunnel-id "${CFCTL_TUNNEL_ID}")
   [[ -n "${CFCTL_CLIENT_ID}" ]] && args+=(--client-id "${CFCTL_CLIENT_ID}")
+  while IFS= read -r host; do
+    [[ -n "${host}" ]] && args+=(--host "${host}")
+  done < <(jq -r '.[]?' <<< "${CFCTL_HOSTS_JSON}")
   [[ "${CFCTL_INCLUDE_RECORDS}" != "1" ]] && args+=(--include-records "${CFCTL_INCLUDE_RECORDS}")
   [[ "${CFCTL_INCLUDE_CONFIG}" != "0" ]] && args+=(--include-config "${CFCTL_INCLUDE_CONFIG}")
   [[ -n "${CFCTL_STATE_DIR}" ]] && args+=(--state-dir "${CFCTL_STATE_DIR}")
@@ -799,6 +857,8 @@ cfctl_selector_presence_json() {
     --arg id "${CFCTL_ID}" \
     --arg name "${CFCTL_NAME}" \
     --arg domain "${CFCTL_DOMAIN}" \
+    --arg pattern "${CFCTL_PATTERN}" \
+    --arg service "${CFCTL_SERVICE}" \
     --arg zone_name "${CFCTL_ZONE_NAME}" \
     --arg zone_id "${CFCTL_ZONE_ID}" \
     --arg type "${CFCTL_TYPE}" \
@@ -809,11 +869,14 @@ cfctl_selector_presence_json() {
     --arg scope "${CFCTL_SCOPE}" \
     --arg tunnel_id "${CFCTL_TUNNEL_ID}" \
     --arg client_id "${CFCTL_CLIENT_ID}" \
+    --argjson hosts "${CFCTL_HOSTS_JSON}" \
     '
       {
         id: ($id | length > 0),
         name: ($name | length > 0),
         domain: ($domain | length > 0),
+        pattern: ($pattern | length > 0),
+        service: ($service | length > 0),
         zone: (($zone_name | length > 0) or ($zone_id | length > 0)),
         zone_id: ($zone_id | length > 0),
         type: ($type | length > 0),
@@ -823,7 +886,8 @@ cfctl_selector_presence_json() {
         job_id: ($job_id | length > 0),
         scope: ($scope | length > 0),
         tunnel_id: ($tunnel_id | length > 0),
-        client_id: ($client_id | length > 0)
+        client_id: ($client_id | length > 0),
+        host: (($hosts | length) > 0)
       }
     '
 }
@@ -926,6 +990,9 @@ cfctl_target_json() {
     --arg id "${CFCTL_ID}" \
     --arg name "${CFCTL_NAME}" \
     --arg domain "${CFCTL_DOMAIN}" \
+    --arg file "${CFCTL_FILE}" \
+    --arg pattern "${CFCTL_PATTERN}" \
+    --arg service "${CFCTL_SERVICE}" \
     --arg zone "${CFCTL_ZONE_NAME}" \
     --arg zone_id "${CFCTL_ZONE_ID}" \
     --arg type "${CFCTL_TYPE}" \
@@ -936,11 +1003,15 @@ cfctl_target_json() {
     --arg scope "${CFCTL_SCOPE}" \
     --arg tunnel_id "${CFCTL_TUNNEL_ID}" \
     --arg client_id "${CFCTL_CLIENT_ID}" \
+    --argjson hosts "${CFCTL_HOSTS_JSON}" \
     '
       {
         id: (if $id == "" then null else $id end),
         name: (if $name == "" then null else $name end),
         domain: (if $domain == "" then null else $domain end),
+        file: (if $file == "" then null else $file end),
+        pattern: (if $pattern == "" then null else $pattern end),
+        service: (if $service == "" then null else $service end),
         zone: (if $zone == "" then null else $zone end),
         zone_id: (if $zone_id == "" then null else $zone_id end),
         type: (if $type == "" then null else $type end),
@@ -950,7 +1021,8 @@ cfctl_target_json() {
         job_id: (if $job_id == "" then null else $job_id end),
         scope: (if $scope == "" then null else $scope end),
         tunnel_id: (if $tunnel_id == "" then null else $tunnel_id end),
-        client_id: (if $client_id == "" then null else $client_id end)
+        client_id: (if $client_id == "" then null else $client_id end),
+        hosts: (if ($hosts | length) == 0 then null else $hosts end)
       }
       | with_entries(select(.value != null))
     '
@@ -1224,6 +1296,12 @@ cfctl_collect_surface_items() {
       cfctl_run_backend_script "${script_path}"
       CFCTL_COLLECT_BACKEND="inventory_script"
       ;;
+    worker.route)
+      cfctl_resolve_zone_context
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_worker_routes.sh"
+      cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}" "ZONE_ID=${CFCTL_ZONE_ID}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
     d1.database)
       script_path="${CF_REPO_ROOT}/scripts/cf_inventory_d1.sh"
       cfctl_run_backend_script "${script_path}"
@@ -1266,6 +1344,12 @@ cfctl_collect_surface_items() {
       cfctl_run_backend_script "${script_path}"
       CFCTL_COLLECT_BACKEND="inventory_script"
       ;;
+    edge.certificate)
+      cfctl_resolve_zone_context
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_edge_certificates.sh"
+      cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}" "ZONE_ID=${CFCTL_ZONE_ID}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
     logpush.job)
       cfctl_resolve_zone_context
       script_path="${CF_REPO_ROOT}/scripts/cf_inventory_logpush.sh"
@@ -1302,6 +1386,21 @@ cfctl_collect_surface_items() {
       ;;
     worker.script)
       CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.workers // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
+      ;;
+    worker.route)
+      CFCTL_COLLECT_ITEMS_JSON="$(
+        jq -c '
+          . as $root
+          | [
+            (.routes.result // [])[]
+            | . + {
+                zone_id: $root.zone.id,
+                zone_name: $root.zone.name,
+                service: (.script // null)
+              }
+          ]
+        ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
+      )"
       ;;
     d1.database)
       CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.databases // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
@@ -1368,6 +1467,21 @@ cfctl_collect_surface_items() {
               | . + {
                   zone_id: $zone.zone.id,
                   zone_name: $zone.zone.name
+                }
+            ]
+          ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
+      )"
+      ;;
+    edge.certificate)
+      CFCTL_COLLECT_ITEMS_JSON="$(
+        jq -c \
+          '
+            . as $root
+            | [
+              (.certificate_packs.result // [])[]
+              | . + {
+                  zone_id: $root.zone.id,
+                  zone_name: $root.zone.name
                 }
             ]
           ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
@@ -1449,6 +1563,20 @@ cfctl_filter_surface_items() {
               (if $id != "" then .id == $id else true end)
               and
               (if $name != "" then .id == $name else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
+    worker.route)
+      jq -c --arg id "${CFCTL_ID}" --arg pattern "${CFCTL_PATTERN:-${CFCTL_NAME}}" --arg service "${CFCTL_SERVICE}" '
+        [
+          .[]
+          | select(
+              (if $id != "" then .id == $id else true end)
+              and
+              (if $pattern != "" then .pattern == $pattern else true end)
+              and
+              (if $service != "" then (.script // .service // "") == $service else true end)
             )
         ]
       ' <<< "${items_json}"
@@ -1563,6 +1691,19 @@ cfctl_filter_surface_items() {
         ]
       ' <<< "${items_json}"
       ;;
+    edge.certificate)
+      jq -c --arg id "${CFCTL_ID}" --argjson hosts "${CFCTL_HOSTS_JSON}" '
+        [
+          .[]
+          | (.hosts // []) as $item_hosts
+          | select(
+              (if $id != "" then .id == $id else true end)
+              and
+              (if ($hosts | length) > 0 then all($hosts[]; . as $host | $item_hosts | index($host) != null) else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
     logpush.job)
       jq -c --arg id "${CFCTL_JOB_ID:-${CFCTL_ID}}" --arg name "${CFCTL_NAME}" '
         [
@@ -1600,6 +1741,7 @@ cfctl_summary_for_items() {
 
   case "${surface}" in
     worker.script) name_field="id" ;;
+    worker.route) name_field="pattern" ;;
     d1.database) name_field="name" ;;
     r2.bucket) name_field="name" ;;
     queue) name_field="queue_name" ;;

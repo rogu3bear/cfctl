@@ -103,6 +103,43 @@
         "./cfctl get worker.script --name founder"
       ]
     },
+    "worker.route": {
+      "description": "Worker route patterns in a specific zone.",
+      "module": "worker_route",
+      "standards_ref": "worker.route",
+      "docs_topics": ["workers-routes", "api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_worker_routes.sh",
+      "permission_family": "Workers Routes",
+      "selectors": ["zone", "id", "pattern", "service"],
+      "actions": {
+        "list": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "get": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["pattern"]]
+        },
+        "verify": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["pattern"]]
+        },
+        "can": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list worker.route --zone example.com",
+        "./cfctl get worker.route --zone example.com --pattern \"*.example.com/*\""
+      ]
+    },
     "d1.database": {
       "description": "D1 databases visible to the current account token.",
       "backend": "inventory_script",
@@ -442,6 +479,51 @@
         "./cfctl list dns.record --zone example.com",
         "./cfctl get dns.record --zone example.com --name _ops-smoke.example.com --type TXT",
         "./cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan"
+      ]
+    },
+    "edge.certificate": {
+      "description": "Advanced Certificate Manager edge certificate packs in a specific zone.",
+      "module": "edge_certificate",
+      "standards_ref": "edge.certificate",
+      "docs_topics": ["advanced-certificates", "api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_edge_certificates.sh",
+      "apply_script": "scripts/cf_mutate_edge_certificate.sh",
+      "permission_family": "SSL and Certificates",
+      "selectors": ["zone", "id", "host"],
+      "actions": {
+        "list": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "get": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["host"]]
+        },
+        "verify": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["host"]]
+        },
+        "can": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "order": {
+              "risk": "write",
+              "required_selectors": ["zone"]
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list edge.certificate --zone example.com",
+        "./cfctl get edge.certificate --zone example.com --host app.example.com",
+        "./cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan"
       ]
     },
     "waiting_room": {

@@ -46,6 +46,7 @@ Usage:
   cfctl locks clear-stale
   cfctl wrangler [wrangler args]
   cfctl cloudflared [cloudflared args]
+  cfctl hostname verify|diff|plan|apply [--file state/hostname/<name>.yaml]
   cfctl token permission-groups [--name <filter>] [--scope <scope>]
   cfctl token mint --name <token-name> [token options]
   cfctl list surfaces
@@ -72,6 +73,7 @@ Verb intent:
   locks     Inspect write locks and clear stale ones.
   wrangler  Run Wrangler through the cfctl envelope, logs, and preview gate for mutating commands.
   cloudflared Run cloudflared through the cfctl envelope, logs, and preview gate for mutating commands.
+  hostname Composite hostname lifecycle evidence from checked-in state/hostname specs.
   token     List token permission groups or mint a new account-owned API token.
   list      List surfaces or resources.
   explain   Show the contract for one surface.
@@ -110,6 +112,9 @@ Examples:
   cfctl wrangler deploy --plan
   cfctl cloudflared version
   cfctl cloudflared tunnel create preview-tunnel --plan
+  cfctl hostname verify --file state/hostname/jkca-drive.yaml
+  cfctl hostname diff --file state/hostname/jkca-drive.yaml
+  cfctl hostname plan --file state/hostname/jkca-drive.yaml
   cfctl admin authorizations
   cfctl admin authorize-backend --backend scripts/cf_api_apply.sh --reason "maintainer debug"
   cfctl admin revoke-backend --path var/runtime/admin/backend-bypass-<id>.json
@@ -118,16 +123,19 @@ Examples:
   cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --ack-plan <operation-id> --value-out /tmp/dns-editor.token
   cfctl classify dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT
   cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120
+  cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
   cfctl list surfaces
   cfctl standards access.app
   cfctl standards worker.build
   cfctl explain access.app
   cfctl list pages.project
   cfctl get access.app --domain docs.example.org
+  cfctl list worker.route --zone example.com
   cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
   CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
   CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
   CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --ack-plan <operation-id>
+  CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --plan
 
 Broad read-only bank refresh:
   ${CF_REPO_ROOT}/scripts/cf_agent_bootstrap.sh
@@ -136,6 +144,7 @@ Desired-state surfaces:
   access.app
   access.policy
   dns.record
+  hostname
   tunnel
 
 Need more context?
@@ -220,6 +229,7 @@ cfctl_backend_guard_report_json() {
     "scripts/cf_mutate_dns_record.sh"
     "scripts/cf_mutate_turnstile_widget.sh"
     "scripts/cf_mutate_waiting_room.sh"
+    "scripts/cf_mutate_edge_certificate.sh"
     "scripts/cf_mutate_logpush_job.sh"
     "scripts/cf_mutate_tunnel.sh"
   )
@@ -2603,6 +2613,60 @@ cfctl_handle_get_like() {
     "${CFCTL_COLLECT_BACKEND_ARTIFACT_PATH}"
 }
 
+cfctl_handle_hostname() {
+  local hostname_action="${1:-verify}"
+  local output
+  local status
+  local artifact_path
+  local result_json
+  local performed="true"
+  local error_code=""
+  local error_message=""
+
+  case "${hostname_action}" in
+    verify|diff|plan|apply) ;;
+    *)
+      cfctl_emit_failure "hostname" "hostname" "hostname_lifecycle" '{"state":"not_applicable","basis":"hostname_lifecycle","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' "unsupported_operation" "Unsupported hostname action: ${hostname_action}" "${hostname_action}"
+      exit 1
+      ;;
+  esac
+
+  set +e
+  output="$(
+    env \
+      HOSTNAME_ACTION="${hostname_action}" \
+      SPEC_FILE="${CFCTL_FILE}" \
+      python3 "${CF_REPO_ROOT}/scripts/cf_hostname_lifecycle.py" 2>&1
+  )"
+  status="$?"
+  set -e
+
+  artifact_path="$(printf '%s\n' "${output}" | tail -n 1)"
+  if [[ "${status}" -ne 0 || ! -f "${artifact_path}" ]]; then
+    performed="false"
+    error_code="execution_failed"
+    error_message="${output}"
+    result_json="null"
+  else
+    result_json="$(cat "${artifact_path}")"
+  fi
+
+  cfctl_emit_result \
+    "$([[ "${performed}" == "true" ]] && echo true || echo false)" \
+    "hostname" \
+    "hostname" \
+    "hostname_lifecycle" \
+    "${performed}" \
+    '{"state":"not_applicable","basis":"hostname_lifecycle","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
+    "$([[ "${performed}" == "true" ]] && jq '{state: (if .ready then "verified" else "drift" end)}' <<< "${result_json}" || echo '{"state":"not_applicable"}')" \
+    "$([[ "${performed}" == "true" ]] && jq '{spec_path, ready, operation_count: .plan.operation_count, mutation_enabled: .plan.mutation_enabled}' <<< "${result_json}" || jq -n --arg message "${error_message}" '{message: $message}')" \
+    "${result_json}" \
+    "$([[ "${performed}" == "true" ]] && printf '%s' "${artifact_path}" || printf '')" \
+    "${error_code}" \
+    "${error_message}" \
+    "${hostname_action}"
+}
+
 cfctl_required_confirmation() {
   local surface="$1"
   local operation="$2"
@@ -2998,6 +3062,20 @@ cfctl_handle_apply() {
         "ZONE_NAME=${CFCTL_ZONE_NAME}" \
         "ZONE_ID=${CFCTL_ZONE_ID}" \
         "WAITING_ROOM_ID=${id_value}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
+    edge.certificate)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "ZONE_NAME=${CFCTL_ZONE_NAME}" \
+        "ZONE_ID=${CFCTL_ZONE_ID}" \
+        "HOSTS_JSON=${CFCTL_HOSTS_JSON}" \
+        "CERTIFICATE_AUTHORITY=${CFCTL_CERTIFICATE_AUTHORITY}" \
+        "VALIDATION_METHOD=${CFCTL_VALIDATION_METHOD}" \
+        "VALIDITY_DAYS=${CFCTL_VALIDITY_DAYS}" \
+        "CLOUDFLARE_BRANDING=${CFCTL_CLOUDFLARE_BRANDING}" \
         "BODY_JSON=${CFCTL_BODY_JSON}" \
         "BODY_FILE=${CFCTL_BODY_FILE}"
       ;;
@@ -3650,6 +3728,14 @@ cfctl_main() {
       ;;
     wrangler|cloudflared)
       cfctl_handle_tool_wrapper "${action}" "$@"
+      ;;
+    hostname)
+      local hostname_action="${1:-verify}"
+      if [[ "$#" -gt 0 ]]; then
+        shift
+      fi
+      cfctl_parse_flags "$@"
+      cfctl_handle_hostname "${hostname_action}"
       ;;
     token)
       cfctl_handle_token "$@"

@@ -155,6 +155,34 @@
         "cfctl apply access.policy sync --plan"
       ]
     },
+    "hostname": {
+      "stance": "composite hostname lifecycle evidence before mutation",
+      "standards": [
+        {
+          "id": "hostname.state-owns-complete-path",
+          "level": "required",
+          "title": "One spec owns the hostname path",
+          "summary": "A hostname lifecycle spec should declare hosts, DNS placeholder posture, Worker route/service, Access audience, certificate expectation, and storage dependencies together."
+        },
+        {
+          "id": "hostname.verify-before-apply",
+          "level": "required",
+          "title": "Verify every dependency before planning writes",
+          "summary": "Hostname readiness must prove DNS, TLS, route, Access, Worker deployment, app response, and storage status with live evidence artifacts."
+        },
+        {
+          "id": "hostname.apply-composite-only-after-components",
+          "level": "required",
+          "title": "Do not composite-apply before component surfaces exist",
+          "summary": "Composite mutation should remain blocked until DNS, Worker route, Access, certificate, and storage operations are individually cataloged and preview-gated."
+        }
+      ],
+      "evidence": [
+        "cfctl hostname verify --file state/hostname/<name>.yaml",
+        "cfctl hostname diff --file state/hostname/<name>.yaml",
+        "cfctl hostname plan --file state/hostname/<name>.yaml"
+      ]
+    },
     "dns.record": {
       "stance": "desired-state preferred for repeated, platform, and routing-critical records",
       "standards": [
@@ -187,6 +215,41 @@
         "cfctl classify dns.record upsert --zone <zone> --name <name> --type <type>",
         "cfctl diff dns.record --zone <zone>",
         "cfctl apply dns.record sync --zone <zone> --plan"
+      ]
+    },
+    "edge.certificate": {
+      "stance": "preview-first ACM certificate ordering with explicit hostname coverage",
+      "standards": [
+        {
+          "id": "edge.certificate.hosts-explicit",
+          "level": "required",
+          "title": "Declare every covered hostname deliberately",
+          "summary": "Advanced certificates can cover deeper subdomains, but each requested hostname or wildcard should be intentional and visible in the preview body."
+        },
+        {
+          "id": "edge.certificate.zone-apex-included",
+          "level": "required",
+          "title": "Keep the zone apex in generated orders",
+          "summary": "The Cloudflare certificate-pack order API expects the zone apex in the host list. cfctl-generated orders include it automatically."
+        },
+        {
+          "id": "edge.certificate.validation-method-explicit",
+          "level": "required",
+          "title": "Choose validation method explicitly",
+          "summary": "Use TXT validation by default for automation and make non-default HTTP or email validation a deliberate choice."
+        },
+        {
+          "id": "edge.certificate.post-order-verify",
+          "level": "required",
+          "title": "Verify the certificate pack after ordering",
+          "summary": "A successful order can still be pending validation, issuance, or deployment. Post-change evidence should cite the certificate-pack readback."
+        }
+      ],
+      "evidence": [
+        "cfctl explain edge.certificate",
+        "cfctl classify edge.certificate order --zone <zone> --host <hostname>",
+        "cfctl apply edge.certificate order --zone <zone> --host <hostname> --plan",
+        "cfctl verify edge.certificate --zone <zone> --id <certificate-pack-id>"
       ]
     },
     "logpush.job": {
@@ -512,6 +575,31 @@
         "cfctl standards audit ~/dev",
         "wrangler.toml [[routes]]",
         "wrangler.toml workers_dev"
+      ]
+    },
+    "worker.route": {
+      "stance": "live Worker route inventory as a first-class route surface",
+      "audit_features": [
+        "routes",
+        "workers_dev"
+      ],
+      "standards": [
+        {
+          "id": "worker.route.route-to-script-visible",
+          "level": "required",
+          "title": "Route patterns must resolve to an explicit Worker",
+          "summary": "A route is not ready unless the live route pattern points at the intended Worker script."
+        },
+        {
+          "id": "worker.route.zone-scoped-evidence",
+          "level": "required",
+          "title": "Read routes from the target zone",
+          "summary": "Worker route claims should cite live zone-scoped route inventory, not only Wrangler source config."
+        }
+      ],
+      "evidence": [
+        "cfctl list worker.route --zone <zone>",
+        "cfctl verify worker.route --zone <zone> --pattern <pattern>"
       ]
     },
     "worker.vars": {
