@@ -1,0 +1,17 @@
+zone: jkca.me
+hosts:
+  - drive.jkca.me
+  - devaughnjames.drive.jkca.me
+dns:
+  proxied_placeholder: true
+worker:
+  route: "*.jkca.me/*"
+  service: jkca-web-edge-router
+access:
+  required: true
+  audience: drive-approved
+certificate:
+  advanced: true
+storage:
+  d1: jkca-drive
+  r2: jkca-drive-objects
