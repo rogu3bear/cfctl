@@ -90,7 +90,7 @@ if [[ -z "${BODY_JSON}" && -z "${BODY_FILE}" ]]; then
       --arg cloudflare_branding "${CLOUDFLARE_BRANDING}" \
       --argjson hosts "${HOSTS_JSON}" \
       '
-        ($hosts + [$zone_name] | unique) as $covered_hosts
+        ($hosts | unique) as $covered_hosts
         | {
             type: "advanced",
             hosts: $covered_hosts,

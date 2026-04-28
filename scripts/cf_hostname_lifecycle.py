@@ -240,6 +240,15 @@ def planned_operations(spec: dict[str, Any], checks: dict[str, Any]) -> list[dic
     certificate = spec.get("certificate") or {}
     storage = spec.get("storage") or {}
 
+    if not checks["access_template"]["ok"]:
+        operations.append({
+            "surface": "access.template",
+            "operation": "define",
+            "template": access.get("audience"),
+            "reason": checks["access_template"]["detail"],
+            "blocked": "access templates are named patterns and must be defined before composite apply",
+        })
+
     for host, host_checks in checks["hosts"].items():
         if not host_checks["dns"]["ok"]:
             operations.append({"surface": "dns.record", "operation": "upsert", "zone": zone, "host": host, "reason": host_checks["dns"]["detail"]})

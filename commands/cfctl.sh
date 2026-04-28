@@ -144,8 +144,10 @@ Desired-state surfaces:
   access.app
   access.policy
   dns.record
-  hostname
   tunnel
+
+Composite lifecycle state:
+  hostname
 
 Need more context?
   ${CF_REPO_ROOT}/AGENTS.md
