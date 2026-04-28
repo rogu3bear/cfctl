@@ -13,6 +13,7 @@
     "locks",
     "wrangler",
     "cloudflared",
+    "hostname",
     "standards",
     "token",
     "list",
@@ -203,6 +204,16 @@
         "id",
         "name",
         "type"
+      ]
+    },
+    "hostname": {
+      "supported": true,
+      "sync_supported": false,
+      "state_dir": "state/hostname",
+      "match_selectors": [
+        "file",
+        "zone",
+        "host"
       ]
     },
     "tunnel": {

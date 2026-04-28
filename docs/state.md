@@ -20,11 +20,13 @@ Important:
 - Support means the desired-state engine exists for that surface.
 - Managed specs are still opt-in; a supported surface may currently have zero checked-in specs.
 - `sync` follows the same preview/ack flow as other writes.
+- `hostname` is a composite lifecycle command, not a generic resource surface.
 
 Supported surfaces:
 - `access.app`
 - `access.policy`
 - `dns.record`
+- `hostname` (verify/diff/plan only)
 - `tunnel`
 
 State specs live under [state](state/README.md).
@@ -34,3 +36,4 @@ Rules:
 - `diff` shows managed specs and unmanaged actual resources
 - `sync` only acts on registered desired-state surfaces
 - delete syncs require explicit destructive confirmation
+- hostname lifecycle specs are YAML under `state/hostname/` and composite apply is blocked until component mutations are preview-gated

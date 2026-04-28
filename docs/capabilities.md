@@ -12,6 +12,7 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | `access.policy` | yes | yes | yes | `access.policy` | `zero-trust-api, api-auth` | `access_policy` |
 | `d1.database` | yes | no | no | `-` | `-` | `-` |
 | `dns.record` | yes | yes | yes | `dns.record` | `api-auth` | `dns_record` |
+| `edge.certificate` | yes | yes | no | `edge.certificate` | `advanced-certificates, api-auth` | `edge_certificate` |
 | `logpush.job` | yes | yes | no | `-` | `-` | `-` |
 | `pages.project` | yes | no | no | `-` | `-` | `-` |
 | `queue` | yes | no | no | `-` | `-` | `-` |
@@ -19,9 +20,16 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | `tunnel` | yes | yes | yes | `tunnel` | `api-auth` | `tunnel` |
 | `turnstile.widget` | yes | yes | no | `-` | `-` | `-` |
 | `waiting_room` | yes | yes | no | `-` | `-` | `-` |
+| `worker.route` | yes | no | no | `worker.route` | `workers-routes, api-auth` | `worker_route` |
 | `worker.script` | yes | no | no | `-` | `-` | `-` |
 | `workflow` | yes | no | no | `-` | `-` | `-` |
 | `zone` | yes | no | no | `-` | `-` | `-` |
+
+Composite lifecycle commands:
+- `cfctl hostname verify --file state/hostname/<name>.yaml`
+- `cfctl hostname diff --file state/hostname/<name>.yaml`
+- `cfctl hostname plan --file state/hostname/<name>.yaml`
+- `cfctl hostname apply --file state/hostname/<name>.yaml` is intentionally blocked until component mutations are preview-gated.
 
 Lane-aware commands:
 - `cfctl doctor`

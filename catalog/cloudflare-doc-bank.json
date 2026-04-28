@@ -90,6 +90,28 @@
       ]
     },
     {
+      "id": "advanced-certificates",
+      "title": "Advanced Certificate Manager edge certificates",
+      "area": "ssl",
+      "status": "stable",
+      "summary": "Advanced Certificate Manager can order advanced edge certificate packs for a zone, including deeper subdomain coverage, selectable CA, validation method, and validity period.",
+      "why_it_matters_here": "This runtime now exposes ACM certificate-pack ordering as a preview-gated edge.certificate surface rather than ad hoc raw API calls.",
+      "sources": [
+        {
+          "title": "Advanced certificates",
+          "url": "https://developers.cloudflare.com/ssl/edge-certificates/advanced-certificate-manager/"
+        },
+        {
+          "title": "Order Advanced Certificate Manager Certificate Pack",
+          "url": "https://developers.cloudflare.com/api/resources/ssl/subresources/certificate_packs/methods/create/"
+        },
+        {
+          "title": "Certificate Packs API",
+          "url": "https://developers.cloudflare.com/api/resources/ssl/subresources/certificate_packs/"
+        }
+      ]
+    },
+    {
       "id": "wrangler",
       "title": "Wrangler as the product runtime hinge",
       "area": "workers",
@@ -108,6 +130,24 @@
         {
           "title": "Wrangler system environment variables",
           "url": "https://developers.cloudflare.com/workers/wrangler/system-environment-variables/"
+        }
+      ]
+    },
+    {
+      "id": "workers-routes",
+      "title": "Workers routes",
+      "area": "workers",
+      "status": "stable",
+      "summary": "Worker route patterns connect hostnames and paths in a zone to a Worker script and are part of the hostname readiness chain.",
+      "why_it_matters_here": "Hostname lifecycle verification needs live route-to-script evidence instead of source-config-only route claims.",
+      "sources": [
+        {
+          "title": "Routes",
+          "url": "https://developers.cloudflare.com/workers/configuration/routing/routes/"
+        },
+        {
+          "title": "Workers Routes API",
+          "url": "https://developers.cloudflare.com/api/resources/workers/subresources/routes/"
         }
       ]
     },

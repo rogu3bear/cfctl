@@ -52,11 +52,14 @@ The catalog currently defines deeper standards for:
 - `access.app`
 - `access.policy`
 - `dns.record`
+- `edge.certificate`
+- `hostname`
 - `worker.errors`
 - `worker.runtime`
 - `worker.build`
 - `worker.d1`
 - `worker.routes`
+- `worker.route`
 - `worker.vars`
 - `worker.observability`
 - `worker.triggers`
@@ -78,6 +81,12 @@ Examples:
   explicit identity-provider posture and desired state for durable apps
 - `tunnel`
   remote-managed default and desired state for long-lived topology
+- `edge.certificate`
+  explicit ACM hostname coverage, zone-apex inclusion, validation-method choice, and post-order verification
+- `hostname`
+  read-only composite verification across DNS, route, Access, TLS, Worker, response, and storage
+- `worker.route`
+  live zone route inventory and route-to-script verification
 - `worker.runtime`
   explicit compatibility date, compatibility flags, workers_dev posture, and source-map policy
 - `worker.errors`

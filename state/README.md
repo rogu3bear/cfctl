@@ -6,15 +6,19 @@ Primary purpose:
 - capture repeatable intent for a few high-value Cloudflare surfaces
 - diff desired vs actual with `./cfctl diff <surface>`
 - reconcile with `./cfctl apply <surface> sync`
+- verify composite hostname lifecycle specs with `./cfctl hostname verify`
 
 Current supported surfaces:
 - `access.app`
 - `access.policy`
 - `dns.record`
+- `hostname` (verify/diff/plan only; composite apply is blocked)
 - `tunnel`
 
-Managed specs are opt-in. A surface being listed here means the engine can diff
-and sync that surface, not that this repo already has checked-in specs for it.
+Managed specs are opt-in. A generic surface being listed here means the engine
+can diff and sync that surface, not that this repo already has checked-in specs
+for it. `hostname` is the exception: it is a composite lifecycle command backed
+by YAML specs, and composite apply is blocked.
 
 General spec shape:
 
@@ -37,3 +41,5 @@ Rules:
 - Only the keys present in `body` are compared for drift.
 
 Surface-specific examples live under the per-surface directories.
+Hostname lifecycle specs live under `state/hostname/` and verify the full
+DNS/TLS/route/Access/Worker/storage path from one YAML document.
