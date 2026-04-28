@@ -7,6 +7,7 @@ Use it through the runtime:
 ```bash
 cfctl docs
 cfctl docs watch
+cfctl docs api-gateway
 cfctl docs browser-run
 cfctl docs ai-search
 ```

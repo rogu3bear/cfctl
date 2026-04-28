@@ -40,6 +40,7 @@ cfctl locks clear-stale
 cfctl surfaces
 cfctl docs
 cfctl docs watch
+cfctl docs api-gateway
 cfctl docs ai-search
 cfctl standards audit
 cfctl standards dns.record
@@ -63,6 +64,9 @@ cfctl explain access.app
 cfctl list pages.project
 cfctl get access.app --domain docs.example.org
 cfctl list worker.route --zone example.com
+cfctl list api_gateway.operation --zone example.com
+cfctl list api_gateway.schema --zone example.com
+cfctl list vulnerability_scanner.scan
 cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
 CF_TOKEN_LANE=global cfctl snapshot tunnel
 CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
@@ -81,6 +85,7 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - `standards audit` scans the active Wrangler footprint under a root and reports standards coverage plus per-file findings
 - `standards audit` reports `compatibility_date` aging and stale counts using the catalog thresholds
 - `standards audit` is source-config evidence; use live reads for dashboard, Access, DNS, or edge-state claims
+- `api_gateway.*` and `vulnerability_scanner.*` are read-only API-security inventory surfaces; they do not create scans, upload schemas, or change schema validation
 - `CF_TOKEN_LANE=global` switches `cfctl` onto the emergency token lane for that invocation
 - `--all-lanes` compares lane-specific permission truth where supported
 - `cfctl audit trust` is an alias for `cfctl doctor`
