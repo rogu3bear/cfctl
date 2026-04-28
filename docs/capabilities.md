@@ -10,6 +10,9 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | --- | --- | --- | --- | --- | --- | --- |
 | `access.app` | yes | yes | yes | `access.app` | `zero-trust-api, api-auth` | `access_app` |
 | `access.policy` | yes | yes | yes | `access.policy` | `zero-trust-api, api-auth` | `access_policy` |
+| `api_gateway.discovery` | yes | no | no | `-` | `api-gateway, api-auth` | `-` |
+| `api_gateway.operation` | yes | no | no | `-` | `api-gateway, api-auth` | `-` |
+| `api_gateway.schema` | yes | no | no | `-` | `api-gateway, api-auth` | `-` |
 | `d1.database` | yes | no | no | `-` | `-` | `-` |
 | `dns.record` | yes | yes | yes | `dns.record` | `api-auth` | `dns_record` |
 | `edge.certificate` | yes | yes | no | `edge.certificate` | `advanced-certificates, api-auth` | `edge_certificate` |
@@ -19,6 +22,9 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | `r2.bucket` | yes | no | no | `-` | `-` | `-` |
 | `tunnel` | yes | yes | yes | `tunnel` | `api-auth` | `tunnel` |
 | `turnstile.widget` | yes | yes | no | `-` | `-` | `-` |
+| `vulnerability_scanner.credential_set` | yes | no | no | `-` | `api-shield-vulnerability-scanner, api-auth` | `-` |
+| `vulnerability_scanner.scan` | yes | no | no | `-` | `api-shield-vulnerability-scanner, api-auth` | `-` |
+| `vulnerability_scanner.target_environment` | yes | no | no | `-` | `api-shield-vulnerability-scanner, api-auth` | `-` |
 | `waiting_room` | yes | yes | no | `-` | `-` | `-` |
 | `worker.route` | yes | no | no | `worker.route` | `workers-routes, api-auth` | `worker_route` |
 | `worker.script` | yes | no | no | `-` | `-` | `-` |

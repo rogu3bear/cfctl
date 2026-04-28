@@ -260,6 +260,229 @@
         "./cfctl get workflow --name docs-pdf-render"
       ]
     },
+    "api_gateway.operation": {
+      "description": "API Gateway discovered operations for a specific zone.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_api_gateway.sh",
+      "permission_family": "API Gateway",
+      "docs_topics": ["api-gateway", "api-auth"],
+      "probe": {
+        "method": "GET",
+        "path_template": "/zones/{zone_id}/api_gateway/operations?per_page=5"
+      },
+      "selectors": ["zone", "id", "name", "domain", "host"],
+      "actions": {
+        "list": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "get": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name"], ["domain"], ["host"]]
+        },
+        "verify": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name"], ["domain"], ["host"]]
+        },
+        "can": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list api_gateway.operation --zone example.com",
+        "./cfctl get api_gateway.operation --zone example.com --id <operation-id>",
+        "./cfctl list api_gateway.operation --zone example.com --domain api.example.com"
+      ]
+    },
+    "api_gateway.schema": {
+      "description": "API Gateway OpenAPI schemas and schema-derived features for a specific zone.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_api_gateway.sh",
+      "permission_family": "API Gateway",
+      "docs_topics": ["api-gateway", "api-auth"],
+      "probe": {
+        "method": "GET",
+        "path_template": "/zones/{zone_id}/api_gateway/schemas"
+      },
+      "selectors": ["zone", "id", "name", "domain", "host"],
+      "actions": {
+        "list": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "get": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name"], ["domain"], ["host"]]
+        },
+        "verify": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name"], ["domain"], ["host"]]
+        },
+        "can": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list api_gateway.schema --zone example.com",
+        "./cfctl get api_gateway.schema --zone example.com --domain api.example.com"
+      ]
+    },
+    "api_gateway.discovery": {
+      "description": "API Gateway discovered operations rendered as OpenAPI schemas for a specific zone.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_api_gateway.sh",
+      "permission_family": "API Gateway",
+      "docs_topics": ["api-gateway", "api-auth"],
+      "probe": {
+        "method": "GET",
+        "path_template": "/zones/{zone_id}/api_gateway/discovery"
+      },
+      "selectors": ["zone", "id", "name", "domain", "host"],
+      "actions": {
+        "list": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "get": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name"], ["domain"], ["host"]]
+        },
+        "verify": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name"], ["domain"], ["host"]]
+        },
+        "can": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list api_gateway.discovery --zone example.com",
+        "./cfctl get api_gateway.discovery --zone example.com --domain api.example.com"
+      ]
+    },
+    "vulnerability_scanner.scan": {
+      "description": "API Shield Vulnerability Scanner scans in the pinned account.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_vulnerability_scanner.sh",
+      "permission_family": "API Gateway",
+      "docs_topics": ["api-shield-vulnerability-scanner", "api-auth"],
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/vuln_scanner/scans"
+      },
+      "selectors": ["id"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list vulnerability_scanner.scan",
+        "./cfctl get vulnerability_scanner.scan --id <scan-id>"
+      ]
+    },
+    "vulnerability_scanner.target_environment": {
+      "description": "API Shield Vulnerability Scanner target environments in the pinned account.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_vulnerability_scanner.sh",
+      "permission_family": "API Gateway",
+      "docs_topics": ["api-shield-vulnerability-scanner", "api-auth"],
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/vuln_scanner/target_environments"
+      },
+      "selectors": ["id", "name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list vulnerability_scanner.target_environment",
+        "./cfctl get vulnerability_scanner.target_environment --name staging-api"
+      ]
+    },
+    "vulnerability_scanner.credential_set": {
+      "description": "API Shield Vulnerability Scanner credential sets in the pinned account.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_vulnerability_scanner.sh",
+      "permission_family": "API Gateway",
+      "docs_topics": ["api-shield-vulnerability-scanner", "api-auth"],
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/vuln_scanner/credential_sets"
+      },
+      "selectors": ["id", "name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list vulnerability_scanner.credential_set",
+        "./cfctl get vulnerability_scanner.credential_set --name owner"
+      ]
+    },
     "access.app": {
       "description": "Cloudflare Access applications in the pinned account.",
       "module": "access_app",

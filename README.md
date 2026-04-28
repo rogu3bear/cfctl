@@ -36,6 +36,7 @@ Wrangler is excellent for Workers and Pages. `cloudflared` is excellent for tunn
 - Lane-aware auth (default scoped lane, emergency global lane) with explicit lane switching per command.
 - Standards audits across your local Wrangler configs, including `compatibility_date` freshness.
 - A desired-state engine for the surfaces where drift actually matters.
+- Read-only API-security inventory for API Gateway discovery/schemas/operations and API Shield Vulnerability Scanner state.
 - Wrapped `wrangler` and `cloudflared` so you get the same logs, artifacts, and preview gating you get on raw API calls.
 
 ## The contract
@@ -79,6 +80,9 @@ cfctl list pages.project
 cfctl get access.app --domain docs.example.org
 cfctl list edge.certificate --zone example.com
 cfctl list worker.route --zone example.com
+cfctl list api_gateway.operation --zone example.com
+cfctl list api_gateway.schema --zone example.com
+cfctl list vulnerability_scanner.scan
 CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
 ```
 
