@@ -92,6 +92,16 @@ done
 python3 "${ROOT_DIR}/scripts/render_capabilities_doc.py" --check "${ROOT_DIR}/docs/capabilities.md" >/dev/null
 python3 "${ROOT_DIR}/scripts/verify_permission_catalog.py" >/dev/null
 
+assert_jq_file "permission profile minimality policy" '
+  .profiles.read.allowed_surfaces != null
+  and (.profiles.read.forbidden_permissions | index("* Write")) != null
+  and (.profiles["security-audit"].forbidden_permissions | index("* Write")) != null
+  and .profiles.dns.allowed_surfaces == ["dns.record", "zone"]
+  and (.profiles.hostname.allowed_surfaces | index("edge.certificate")) != null
+  and (.profiles.deploy.allowed_surfaces | index("wrangler")) != null
+  and .profiles["full-operator"].allowed_surfaces == ["*"]
+  and (.profiles["full-operator"].forbidden_permissions | index("Account API Tokens *")) != null
+' "${ROOT_DIR}/catalog/permissions.json"
 assert_jq_file "runtime public verbs" '(.public_verbs | index("docs")) != null and (.public_verbs | index("wrangler")) != null and (.public_verbs | index("cloudflared")) != null and (.public_verbs | index("hostname")) != null and (.landing_flow | index("docs")) != null' "${ROOT_DIR}/catalog/runtime.json"
 assert_jq_file "tool wrapper metadata" '
   .tool_wrappers.wrangler.script == "scripts/cf_wrangler.sh"

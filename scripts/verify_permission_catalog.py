@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import fnmatch
 import json
 import os
 import subprocess
@@ -155,7 +156,19 @@ def validate_catalog_shape(catalog: dict, surfaces: dict, runtime: dict) -> None
         require_string(profile.get("summary"), f"profiles.{profile_name}.summary")
         ttl_hours = require_int(profile.get("ttl_hours"), f"profiles.{profile_name}.ttl_hours")
         risk = require_string(profile.get("risk"), f"profiles.{profile_name}.risk")
+        allowed_surfaces = require_string_list(profile.get("allowed_surfaces"), f"profiles.{profile_name}.allowed_surfaces")
+        require_string_list(profile.get("forbidden_permissions"), f"profiles.{profile_name}.forbidden_permissions")
         require_string_list(profile.get("verification"), f"profiles.{profile_name}.verification")
+
+        missing_allowed_surfaces = sorted(
+            surface for surface in allowed_surfaces if surface != "*" and surface not in surface_aliases
+        )
+        require(
+            not missing_allowed_surfaces,
+            f"profiles.{profile_name}.allowed_surfaces references unknown surfaces: {missing_allowed_surfaces}",
+        )
+        if profile_name != "full-operator":
+            require("*" not in allowed_surfaces, f"profile {profile_name} must not use wildcard allowed_surfaces")
 
         if risk == "read":
             require(ttl_hours <= 720, f"read profile {profile_name} ttl_hours must be <= 720")
@@ -188,6 +201,7 @@ def validate_catalog_shape(catalog: dict, surfaces: dict, runtime: dict) -> None
     for profile_name in profiles:
         selected = profile_permissions(catalog, profile_name)
         require(selected, f"profile {profile_name} must select at least one permission")
+        validate_profile_minimality(profile_name, profiles[profile_name], selected)
         if profile_name == "full-operator":
             require(
                 not any(permission["name"].startswith(TOKEN_MINT_PERMISSION_PREFIX) for permission in selected),
@@ -222,6 +236,38 @@ def validate_operator_permission(
     selected_profiles = require_string_list(permission.get("profiles"), f"permissions[{index}].profiles")
     missing_profiles = sorted(profile for profile in selected_profiles if profile not in profiles)
     require(not missing_profiles, f"permissions[{index}] {name} references unknown profiles: {missing_profiles}")
+
+
+def permission_matches_any(name: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
+def validate_profile_minimality(profile_name: str, profile: dict, permissions: list[dict]) -> None:
+    allowed_surfaces = set(profile["allowed_surfaces"])
+    forbidden_permissions = profile["forbidden_permissions"]
+    risk = profile["risk"]
+
+    for permission in permissions:
+        name = permission["name"]
+        surfaces = set(permission["surfaces"])
+
+        if "*" not in allowed_surfaces:
+            extra_surfaces = sorted(surfaces - allowed_surfaces)
+            require(
+                not extra_surfaces,
+                f"profile {profile_name} includes {name} outside allowed_surfaces: {extra_surfaces}",
+            )
+
+        require(
+            not permission_matches_any(name, forbidden_permissions),
+            f"profile {profile_name} includes forbidden permission {name}",
+        )
+
+        if risk == "read":
+            require(
+                not permission_matches_any(name, ["* Write", "* Revoke", "* Run"]),
+                f"read profile {profile_name} includes non-read permission {name}",
+            )
 
 
 def validate_command_fixtures(catalog: dict) -> list[dict]:

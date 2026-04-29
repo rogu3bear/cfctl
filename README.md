@@ -157,6 +157,8 @@ Use the default `read` profile for inventory and audits, then choose a narrower
 write profile such as `dns`, `hostname`, or `deploy` for preview-gated work.
 The temporary bootstrap credential should only have token-minting permissions
 long enough to mint the day-to-day `CF_DEV_TOKEN`.
+Each profile also declares `allowed_surfaces` and `forbidden_permissions`; the
+verifier fails when a profile gains a permission outside its declared boundary.
 
 `./scripts/verify_static_contract.sh` validates the permission catalog schema
 and deterministic profile command fixtures. `./scripts/verify_public_contract.sh`
