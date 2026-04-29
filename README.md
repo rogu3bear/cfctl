@@ -172,9 +172,11 @@ permission-group inventory. For a credentialless runtime-output check, run
 
 The GitHub Actions workflow in [.github/workflows/cfctl-contract.yml](.github/workflows/cfctl-contract.yml)
 runs static contract checks on pull requests. Its scheduled and manual live
-job requires `CF_DEV_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and
-`CFCTL_PUBLIC_CONTRACT_ZONE` as repository secrets or variables, then runs the
-live permission-group drift and public-contract smoke tests.
+job runs through the `cfctl-live` protected environment and requires
+`CF_DEV_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CFCTL_PUBLIC_CONTRACT_ZONE`, then
+runs the live permission-group drift and public-contract smoke tests. The
+operator policy for these credentials is in
+[docs/permission-doctrine.md](docs/permission-doctrine.md).
 
 See [docs/runbooks/cfctl.md](docs/runbooks/cfctl.md) and [docs/capabilities.md](docs/capabilities.md) for the full reference.
 
