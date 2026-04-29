@@ -11,13 +11,14 @@ This command is the public Cloudflare control-plane interface for:
 
 If you are an agent landing here, do this first:
   1. cfctl doctor
-  2. cfctl surfaces
-  3. cfctl docs
-  4. cfctl standards <surface>
-  5. cfctl standards audit
-  6. cfctl explain <surface>
-  7. cfctl classify <surface> <operation>
-  8. cfctl guide <surface> <operation>
+  2. cfctl bootstrap permissions
+  3. cfctl surfaces
+  4. cfctl docs
+  5. cfctl standards <surface>
+  6. cfctl standards audit
+  7. cfctl explain <surface>
+  8. cfctl classify <surface> <operation>
+  9. cfctl guide <surface> <operation>
 
 Core rules:
   - Use cfctl first. Do not improvise from random scripts.
@@ -35,6 +36,7 @@ Usage:
   cfctl admin authorize-backend --backend <path> --reason <why> [--ttl-minutes <n>]
   cfctl admin authorizations
   cfctl admin revoke-backend --path <authorization-path>
+  cfctl bootstrap permissions
   cfctl lanes
   cfctl surfaces
   cfctl docs [topic]
@@ -65,6 +67,7 @@ Verb intent:
   doctor    Validate trust health, lane health, registry policy, locks, previews, and artifact secrecy.
   audit     Alias for trust-focused doctor checks.
   admin     Inspect or issue scoped maintainer authorizations for backend-only workflows.
+  bootstrap Show the credential and permission plan required to bootstrap cfctl.
   lanes     Show configured auth lanes and whether they work.
   surfaces  List supported surfaces with read/write support, lane fit, and desired-state support.
   docs      Show the compact official Cloudflare docs bank and tracked incoming capabilities.
@@ -95,6 +98,7 @@ Examples:
   cfctl doctor --strict
   cfctl doctor --repair-hints
   cfctl audit trust
+  cfctl bootstrap permissions
   cfctl lanes
   cfctl surfaces
   cfctl docs
@@ -3465,6 +3469,438 @@ EOF
   esac
 }
 
+cfctl_bootstrap_permissions_catalog_json() {
+  cat "${CF_REPO_ROOT}/catalog/permissions.json"
+}
+
+cfctl_bootstrap_default_profile() {
+  jq -r '.default_profile // "read"' <<< "$(cfctl_bootstrap_permissions_catalog_json)"
+}
+
+cfctl_bootstrap_supported_profiles_json() {
+  jq -c '.profiles | keys | sort' <<< "$(cfctl_bootstrap_permissions_catalog_json)"
+}
+
+cfctl_bootstrap_profile_exists() {
+  local profile="$1"
+  jq -e --arg profile "${profile}" '.profiles[$profile] != null' <<< "$(cfctl_bootstrap_permissions_catalog_json)" >/dev/null
+}
+
+cfctl_bootstrap_permissions_for_profile_json() {
+  local profile="$1"
+  jq -c \
+    --arg profile "${profile}" \
+    '
+      .permissions
+      | map(select((.profiles // []) | index($profile)))
+      | unique_by(.scope, .name)
+      | sort_by(.scope, .name)
+    ' <<< "$(cfctl_bootstrap_permissions_catalog_json)"
+}
+
+cfctl_bootstrap_profile_verification_json() {
+  local profile="$1"
+  local zone="${2:-}"
+  jq -c \
+    --arg profile "${profile}" \
+    --arg zone "${zone}" \
+    '
+      (.profiles[$profile].verification // [])
+      | map(
+          if $zone == "" then
+            .
+          else
+            gsub("<zone>"; $zone)
+          end
+        )
+    ' <<< "$(cfctl_bootstrap_permissions_catalog_json)"
+}
+
+cfctl_bootstrap_permission_requirements_json() {
+  local profile="$1"
+  local selected_permissions_json
+
+  selected_permissions_json="$(cfctl_bootstrap_permissions_for_profile_json "${profile}")"
+  jq -n \
+    --arg profile "${profile}" \
+    --argjson catalog "$(cfctl_bootstrap_permissions_catalog_json)" \
+    --argjson selected_permissions "${selected_permissions_json}" \
+    '
+      {
+        profile: $profile,
+        supported_profiles: ($catalog.profiles | keys | sort),
+        bootstrap_creator: $catalog.bootstrap_creator,
+        operator_token: {
+          purpose: "Day-to-day cfctl credential for the selected permission profile.",
+          profile: $profile,
+          profile_meta: $catalog.profiles[$profile],
+          resource_scope: (
+            if ($selected_permissions | map(select(.scope == "zone")) | length) > 0 then
+              "current account plus selected zone resources"
+            else
+              "current account"
+            end
+          ),
+          permissions: $selected_permissions
+        }
+      }
+    '
+}
+
+cfctl_bootstrap_permission_validation_json() {
+  local requirements_json="$1"
+  local lane="${CF_TOKEN_LANE:-${CF_TOKEN_LANE_DEFAULT}}"
+  local groups_capture
+  local requirements_list_json
+
+  requirements_list_json="$(
+    jq '
+      [
+        (.bootstrap_creator.permissions[] | {name, scope, stage: "bootstrap_creator"}),
+        (.operator_token.permissions[] | {name, scope, stage: "operator_token"})
+      ]
+      | unique_by(.name, .scope, .stage)
+    ' <<< "${requirements_json}"
+  )"
+
+  if [[ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+    jq -n \
+      --arg lane "${lane}" \
+      --arg reason "CLOUDFLARE_ACCOUNT_ID missing" \
+      --argjson requirements "${requirements_list_json}" \
+      '{validated: false, lane: $lane, reason: $reason, required: $requirements, matched: [], missing: $requirements}'
+    return
+  fi
+
+  if ! cf_token_available_for_lane "${lane}"; then
+    jq -n \
+      --arg lane "${lane}" \
+      --arg reason "credential_missing" \
+      --argjson requirements "${requirements_list_json}" \
+      '{validated: false, lane: $lane, reason: $reason, required: $requirements, matched: [], missing: $requirements}'
+    return
+  fi
+
+  cf_select_active_token
+  groups_capture="$(cf_api_capture GET "/accounts/${CLOUDFLARE_ACCOUNT_ID}/tokens/permission_groups")"
+  if [[ "$(jq -r '.success // false' <<< "${groups_capture}")" != "true" ]]; then
+    jq -n \
+      --arg lane "${lane}" \
+      --argjson requirements "${requirements_list_json}" \
+      --argjson response "${groups_capture}" \
+      '{validated: false, lane: $lane, reason: "permission_group_lookup_failed", required: $requirements, matched: [], missing: $requirements, response: {status_code: $response.status_code, errors: ($response.errors // [])}}'
+    return
+  fi
+
+  jq -n \
+    --arg lane "${lane}" \
+    --argjson requirements "${requirements_list_json}" \
+    --argjson groups "${groups_capture}" \
+    '
+      ($groups.result // []) as $available
+      | (
+          $requirements
+          | map(
+              . as $requirement
+              | (
+                  if $requirement.scope == "account" then
+                    "com.cloudflare.api.account"
+                  elif $requirement.scope == "zone" then
+                    "com.cloudflare.api.account.zone"
+                  else
+                    $requirement.scope
+                  end
+                ) as $cloudflare_scope
+              | {
+                  requirement: $requirement,
+                  group: (
+                    $available
+                    | map(select(.name == $requirement.name and ((.scopes // []) | index($cloudflare_scope))))
+                    | .[0] // null
+                  )
+                }
+            )
+        ) as $rows
+      | {
+          validated: true,
+          lane: $lane,
+          reason: null,
+          required: $requirements,
+          matched: ($rows | map(select(.group != null) | (.requirement + {id: .group.id, scopes: (.group.scopes // [])}))),
+          missing: ($rows | map(select(.group == null) | .requirement))
+        }
+    '
+}
+
+cfctl_bootstrap_resource_flags() {
+  local permissions_json="$1"
+  local zone="${2:-}"
+  local zone_id="${3:-}"
+
+  if [[ "$(jq 'map(select(.scope == "zone")) | length > 0' <<< "${permissions_json}")" != "true" ]]; then
+    printf ''
+    return
+  fi
+
+  if [[ -n "${zone}" ]]; then
+    printf ' --zone %s' "$(jq -nr --arg value "${zone}" '$value | @sh')"
+    return
+  fi
+
+  if [[ -n "${zone_id}" ]]; then
+    printf ' --zone-id %s' "$(jq -nr --arg value "${zone_id}" '$value | @sh')"
+    return
+  fi
+
+  printf ' --all-zones-in-account'
+}
+
+cfctl_bootstrap_permission_flags() {
+  local permissions_json="$1"
+  local validation_json="$2"
+  local use_ids="false"
+
+  if [[ "$(jq -r '.validated == true and ((.missing // []) | length == 0)' <<< "${validation_json}")" == "true" ]]; then
+    use_ids="true"
+  fi
+
+  if [[ "${use_ids}" == "true" ]]; then
+    jq -r '
+      [.matched[] | select(.stage == "operator_token") | .id]
+      | unique
+      | map("--permission-id " + (. | @sh))
+      | join(" ")
+    ' <<< "${validation_json}"
+    return
+  fi
+
+  jq -r '
+    [.[] | .name]
+    | unique
+    | map("--permission " + (. | @sh))
+    | join(" ")
+  ' <<< "${permissions_json}"
+}
+
+cfctl_bootstrap_verification_matrix_json() {
+  local profile="$1"
+  local zone="${2:-}"
+  local verification_json
+
+  verification_json="$(cfctl_bootstrap_profile_verification_json "${profile}" "${zone}")"
+  jq -n \
+    --arg profile "${profile}" \
+    --arg zone "${zone}" \
+    --argjson commands "${verification_json}" \
+    '
+      {
+        profile: $profile,
+        zone: (if $zone == "" then null else $zone end),
+        runnable_now: ($zone != ""),
+        commands: $commands,
+        blocked: (
+          if $zone == "" and (($commands | map(select(test("<zone>"))) | length) > 0) then
+            [{
+              code: "zone_required",
+              message: "Pass --zone <zone> to render all profile verification commands."
+            }]
+          else
+            []
+          end
+        )
+      }
+    '
+}
+
+cfctl_handle_bootstrap() {
+  local subcommand="${1:-permissions}"
+  shift || true
+  local profile=""
+  local zone=""
+  local zone_id=""
+  local requirements_json
+  local validation_json
+  local result_json
+  local summary_json
+  local token_name=""
+  local ttl_hours=""
+  local token_name_shell
+  local permission_flags
+  local resource_flags
+  local plan_command
+  local apply_command
+  local permissions_json
+  local verification_matrix_json
+
+  case "${subcommand}" in
+    permissions|verify|"")
+      while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+          --profile)
+            profile="$2"
+            shift 2
+            ;;
+          --profile=*)
+            profile="${1#*=}"
+            shift
+            ;;
+          --zone)
+            zone="$2"
+            shift 2
+            ;;
+          --zone=*)
+            zone="${1#*=}"
+            shift
+            ;;
+          --zone-id)
+            zone_id="$2"
+            shift 2
+            ;;
+          --zone-id=*)
+            zone_id="${1#*=}"
+            shift
+            ;;
+          --ttl-hours)
+            ttl_hours="$2"
+            shift 2
+            ;;
+          --ttl-hours=*)
+            ttl_hours="${1#*=}"
+            shift
+            ;;
+          --name)
+            token_name="$2"
+            shift 2
+            ;;
+          --name=*)
+            token_name="${1#*=}"
+            shift
+            ;;
+          *)
+            echo "Unknown bootstrap ${subcommand} argument: $1" >&2
+            exit 1
+            ;;
+        esac
+      done
+
+      if [[ -z "${profile}" ]]; then
+        profile="${CFCTL_BOOTSTRAP_PROFILE:-$(cfctl_bootstrap_default_profile)}"
+      fi
+
+      if ! cfctl_bootstrap_profile_exists "${profile}"; then
+        cfctl_emit_failure "bootstrap" "permissions" "catalog" '{"state":"unknown","basis":"unsupported_profile","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' "unsupported_profile" "Unsupported bootstrap profile: ${profile}"
+        exit 1
+      fi
+
+      requirements_json="$(cfctl_bootstrap_permission_requirements_json "${profile}")"
+      validation_json="$(cfctl_bootstrap_permission_validation_json "${requirements_json}")"
+      permissions_json="$(jq -c '.operator_token.permissions' <<< "${requirements_json}")"
+      verification_matrix_json="$(cfctl_bootstrap_verification_matrix_json "${profile}" "${zone}")"
+      if [[ -z "${token_name}" ]]; then
+        token_name="${CFCTL_BOOTSTRAP_TOKEN_NAME:-cfctl-${profile}-operator}"
+      fi
+      if [[ -z "${ttl_hours}" ]]; then
+        ttl_hours="${CFCTL_BOOTSTRAP_TTL_HOURS:-$(jq -r '.operator_token.profile_meta.ttl_hours // 720' <<< "${requirements_json}")}"
+      fi
+      token_name_shell="$(jq -nr --arg token_name "${token_name}" '$token_name | @sh')"
+      permission_flags="$(cfctl_bootstrap_permission_flags "${permissions_json}" "${validation_json}")"
+      resource_flags="$(cfctl_bootstrap_resource_flags "${permissions_json}" "${zone}" "${zone_id}")"
+      plan_command="cfctl token mint --name ${token_name_shell} ${permission_flags}${resource_flags} --ttl-hours ${ttl_hours} --plan"
+      apply_command="cfctl token mint --name ${token_name_shell} ${permission_flags}${resource_flags} --ttl-hours ${ttl_hours} --ack-plan <operation-id> --value-out <secure-path>"
+      result_json="$(
+        jq -n \
+          --arg profile "${profile}" \
+          --arg env_file "${CF_SHARED_ENV_FILE:-${CF_SHARED_ENV_FILE_DEFAULT}}" \
+          --arg token_name "${token_name}" \
+          --arg ttl_hours "${ttl_hours}" \
+          --arg zone "${zone}" \
+          --arg zone_id "${zone_id}" \
+          --arg plan_command "${plan_command}" \
+          --arg apply_command "${apply_command}" \
+          --argjson requirements "${requirements_json}" \
+          --argjson validation "${validation_json}" \
+          --argjson verification_matrix "${verification_matrix_json}" \
+          '
+            {
+              profile: $profile,
+              env_file: $env_file,
+              resource_target: {
+                zone: (if $zone == "" then null else $zone end),
+                zone_id: (if $zone_id == "" then null else $zone_id end)
+              },
+              stages: {
+                bootstrap_creator: $requirements.bootstrap_creator,
+                operator_token: ($requirements.operator_token + {
+                  name: $token_name,
+                  ttl_hours: ($ttl_hours | tonumber? // $ttl_hours)
+                })
+              },
+              commands: {
+                mint_operator_token_plan: $plan_command,
+                mint_operator_token_apply: $apply_command
+              },
+              validation: $validation,
+              verification: $verification_matrix,
+              install_steps: [
+                "Create or authorize a temporary bootstrap credential with the bootstrap_creator permissions.",
+                "Set CF_DEV_TOKEN and CLOUDFLARE_ACCOUNT_ID in the cfctl env file.",
+                "Run the mint_operator_token_plan command and review the artifact.",
+                "Run the mint_operator_token_apply command with --ack-plan and --value-out.",
+                "Replace CF_DEV_TOKEN with the minted operator token, then revoke the temporary bootstrap credential."
+              ],
+              notes: [
+                "This report is generated from catalog/permissions.json and the current cfctl public surface contract.",
+                "The operator token intentionally excludes Account API Tokens Write; keep token-minting power in a short-lived bootstrap credential.",
+                "When live permission-group lookup succeeds, generated commands prefer --permission-id over permission names."
+              ]
+            }
+          '
+      )"
+      summary_json="$(
+        jq '
+          {
+            bootstrap_creator_permission_count: (.stages.bootstrap_creator.permissions | length),
+            operator_permission_count: (.stages.operator_token.permissions | length),
+            profile: .profile,
+            validation: {
+              validated: .validation.validated,
+              missing_count: (.validation.missing | length),
+              reason: .validation.reason
+            },
+            plan_command: .commands.mint_operator_token_plan
+          }
+        ' <<< "${result_json}"
+      )"
+      cfctl_emit_result \
+        "true" \
+        "bootstrap" \
+        "${subcommand:-permissions}" \
+        "catalog" \
+        "true" \
+        '{"state":"not_applicable","basis":"bootstrap_permissions","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
+        '{"state":"not_applicable"}' \
+        "${summary_json}" \
+        "${result_json}" \
+        ""
+      ;;
+    -h|--help|help)
+      cat <<'EOF'
+Usage:
+  cfctl bootstrap permissions [--profile read|dns|hostname|deploy|security-audit|full-operator] [--zone <zone>] [--ttl-hours <n>]
+  cfctl bootstrap verify [--profile read|dns|hostname|deploy|security-audit|full-operator] [--zone <zone>]
+
+Print the temporary bootstrap credential requirements and the exact token-mint
+plan/apply commands for the narrower day-to-day CF_DEV_TOKEN. The default
+profile is read.
+EOF
+      ;;
+    *)
+      echo "Unknown bootstrap subcommand: ${subcommand}" >&2
+      exit 1
+      ;;
+  esac
+}
+
 cfctl_handle_audit() {
   local subcommand="${1:-trust}"
 
@@ -3689,6 +4125,9 @@ cfctl_main() {
       ;;
     admin)
       cfctl_handle_admin "$@"
+      ;;
+    bootstrap)
+      cfctl_handle_bootstrap "$@"
       ;;
     surfaces)
       cfctl_parse_flags "$@"

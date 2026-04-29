@@ -35,6 +35,8 @@ When you land here, do this first:
 
 ```bash
 cfctl doctor
+cfctl bootstrap permissions
+cfctl bootstrap permissions --profile hostname --zone example.com
 cfctl surfaces
 cfctl docs
 cfctl docs watch
@@ -51,6 +53,8 @@ Common examples:
 
 ```bash
 cfctl doctor
+cfctl bootstrap permissions
+cfctl bootstrap permissions --profile hostname --zone example.com
 cfctl surfaces
 cfctl docs
 cfctl docs watch

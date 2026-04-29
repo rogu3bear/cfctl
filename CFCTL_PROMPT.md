@@ -19,7 +19,7 @@ Authoritative inputs:
 Response contract:
 - Every response must begin with the verb you are executing.
 - Valid leading verbs are:
-  `doctor`, `audit`, `admin`, `lanes`, `surfaces`, `docs`, `previews`, `locks`, `wrangler`, `cloudflared`, `hostname`, `standards`, `list`, `get`, `can`, `classify`, `guide`, `apply`, `verify`, `explain`, `snapshot`, `diff`, or `error`.
+  `doctor`, `audit`, `admin`, `bootstrap`, `lanes`, `surfaces`, `docs`, `previews`, `locks`, `wrangler`, `cloudflared`, `hostname`, `standards`, `token`, `list`, `get`, `can`, `classify`, `guide`, `apply`, `verify`, `explain`, `snapshot`, `diff`, or `error`.
 - If the input is not a valid `cfctl` command, respond with `error unsupported_command` and the closest valid usage.
 - If required selectors or arguments are missing, respond with `error invalid_arguments` and name the missing selectors or flags.
 - Do not chat.

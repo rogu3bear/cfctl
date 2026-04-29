@@ -13,6 +13,7 @@ It is built for agent and operator use:
 - `docs` for the curated Cloudflare docs bank and incoming capability watchlist
 - `standards` for canonical configuration guidance
 - `lanes` for auth-lane health and availability
+- `bootstrap` for the initial credential and operator-token permission plan
 - `token` for token permission-group discovery and token minting
 - `list` for collections
 - `get` for exact resources
@@ -29,6 +30,8 @@ It is built for agent and operator use:
 
 ```bash
 cfctl doctor
+cfctl bootstrap permissions
+cfctl bootstrap permissions --profile hostname --zone example.com
 cfctl doctor --strict
 cfctl doctor --repair-hints
 ./scripts/verify_static_contract.sh
@@ -105,6 +108,8 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - real token mint execution must be rerun with `--ack-plan <operation-id>`
 - `token mint --value-out <path>` writes the raw secret to a file and keeps it out of normal stdout JSON
 - `token mint --reveal-token-once` remains policy-gated and is disabled in the default runtime policy
+- `bootstrap permissions` reads `catalog/permissions.json` and emits the temporary bootstrap credential requirements plus profile-scoped operator-token mint commands
+- `bootstrap permissions --profile <profile>` supports `read`, `dns`, `hostname`, `deploy`, `security-audit`, and `full-operator`
 - `admin authorize-backend` issues a short-lived backend authorization file for maintainer/debug direct script use
 - `admin authorizations` lists active and expired backend authorizations
 - `admin revoke-backend --path ...` removes one authorization artifact

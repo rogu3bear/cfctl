@@ -59,6 +59,8 @@ Lane behavior:
 
 ```bash
 cfctl doctor                    # tooling, auth, runtime trust check
+cfctl bootstrap permissions     # default read-profile operator-token plan
+cfctl bootstrap permissions --profile hostname --zone example.com
 cfctl surfaces                  # what cfctl can operate today
 cfctl docs                      # compact Cloudflare doc bank
 cfctl docs watch                # incoming Cloudflare capability tracking
@@ -145,10 +147,16 @@ cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zo
 Defined in [catalog/runtime.json](catalog/runtime.json):
 
 ```
-doctor    audit     admin     lanes     surfaces  docs      previews  locks
+doctor    audit     admin     bootstrap lanes     surfaces  docs      previews  locks
 wrangler  cloudflared standards token   list      get       can       classify
 guide     apply     verify    explain   snapshot  diff
 ```
+
+Bootstrap permission profiles are defined in [catalog/permissions.json](catalog/permissions.json).
+Use the default `read` profile for inventory and audits, then choose a narrower
+write profile such as `dns`, `hostname`, or `deploy` for preview-gated work.
+The temporary bootstrap credential should only have token-minting permissions
+long enough to mint the day-to-day `CF_DEV_TOKEN`.
 
 See [docs/runbooks/cfctl.md](docs/runbooks/cfctl.md) and [docs/capabilities.md](docs/capabilities.md) for the full reference.
 
