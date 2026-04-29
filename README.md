@@ -145,6 +145,8 @@ Token minting:
 cfctl token permission-groups --name "DNS"
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --plan
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --ack-plan <operation-id> --value-out /tmp/dns-editor.token
+cfctl token revoke --id <token-id> --plan
+cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete
 ```
 
 ## Public verbs
@@ -161,7 +163,9 @@ Bootstrap permission profiles are defined in [catalog/permissions.json](catalog/
 Use the default `read` profile for inventory and audits, then choose a narrower
 write profile such as `dns`, `hostname`, or `deploy` for preview-gated work.
 The temporary bootstrap credential should only have token-minting permissions
-long enough to mint the day-to-day `CF_DEV_TOKEN`.
+long enough to mint the day-to-day `CF_DEV_TOKEN`, then use
+`cfctl token revoke` to close the bootstrap or one-off deploy token early when
+its token id is known.
 Each profile also declares `allowed_surfaces` and `forbidden_permissions`; the
 verifier fails when a profile gains a permission outside its declared boundary.
 

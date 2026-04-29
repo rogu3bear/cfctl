@@ -67,6 +67,8 @@ cfctl standards worker.runtime
 cfctl token permission-groups --name "DNS"
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --plan
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --ack-plan <operation-id> --value-out /tmp/dns-editor.token
+cfctl token revoke --id <token-id> --plan
+cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete
 cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120
 cfctl explain access.app
 cfctl list pages.project
@@ -145,6 +147,8 @@ Do not teach other agents the flat `scripts/` surface as the primary interface. 
   clearly read-only subcommands can run directly, and everything else must go through `--plan` then `--ack-plan <operation-id>`.
 - Token minting follows the same review gate:
   run `cfctl token mint ... --plan`, then rerun with `--ack-plan <operation-id>` and `--value-out <path>`. Stdout reveal is disabled unless runtime policy explicitly re-enables it.
+- Token revocation follows the same review gate:
+  run `cfctl token revoke --id <token-id> --plan`, then rerun with `--ack-plan <operation-id> --confirm delete`.
 - Destructive operations require explicit confirmation such as `--confirm delete`.
 - For desired-state-backed surfaces, use `diff` and `apply <surface> sync` instead of ad hoc repeated edits.
 - Desired-state support means the engine exists for that surface. Managed specs are still opt-in and may be absent until they are checked into `state/`.

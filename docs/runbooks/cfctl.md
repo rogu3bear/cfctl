@@ -59,6 +59,8 @@ cfctl cloudflared tunnel create preview-tunnel --plan
 cfctl token permission-groups --name "DNS"
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --plan
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --ack-plan <operation-id> --value-out /tmp/dns-editor.token
+cfctl token revoke --id <token-id> --plan
+cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete
 cfctl classify dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT
 cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120
 cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
@@ -113,6 +115,9 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - real token mint execution must be rerun with `--ack-plan <operation-id>`
 - `token mint --value-out <path>` writes the raw secret to a file and keeps it out of normal stdout JSON
 - `token mint --reveal-token-once` remains policy-gated and is disabled in the default runtime policy
+- `token revoke --plan` reads token id/name/status/expiry metadata and prepares deletion without revoking it
+- real token revoke execution must be rerun with `--ack-plan <operation-id> --confirm delete`
+- token revoke artifacts record metadata and Cloudflare response only; they must never contain token secret values
 - `bootstrap permissions` reads `catalog/permissions.json` and emits the temporary bootstrap credential requirements plus profile-scoped operator-token mint commands
 - `bootstrap permissions --profile <profile>` supports `read`, `dns`, `hostname`, `deploy`, `security-audit`, and `full-operator`
 - each bootstrap profile declares `allowed_surfaces` and `forbidden_permissions`; catalog verification fails when selected permissions cross those boundaries
@@ -210,4 +215,6 @@ Token commands:
 cfctl token permission-groups --name "DNS"
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --plan
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --ack-plan <operation-id> --value-out /tmp/dns-editor.token
+cfctl token revoke --id <token-id> --plan
+cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete
 ```

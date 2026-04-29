@@ -138,6 +138,14 @@ cfctl token mint \
 
 `--value-out` is required for the secret to leave the runtime — stdout reveal is policy-disabled by default. The path must be absolute, outside the repo, and not under `var/`.
 
+After a temporary token has served its purpose, revoke it through the same
+preview gate:
+
+```bash
+cfctl token revoke --id <token-id> --plan
+cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete
+```
+
 ## 8. Where to go next
 
 - [README.md](README.md) — public contract and architecture overview

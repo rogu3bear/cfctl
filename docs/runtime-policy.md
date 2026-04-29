@@ -46,6 +46,15 @@ cfctl token mint ... --value-out <secure-path>
 
 Stdout reveal stays disabled unless runtime policy explicitly allows it.
 
+`cfctl token revoke` uses the same preview gate before deleting an account-owned
+API token. Plan with the token id first, then ack the reviewed operation and pass
+`--confirm delete`:
+
+```bash
+cfctl token revoke --id <token-id> --plan
+cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete
+```
+
 ## Backend Policy
 
 - `scripts/cf_mutate_*`, `scripts/cf_api_apply.sh`, and `scripts/cf_token_mint.sh` are backend-only.
