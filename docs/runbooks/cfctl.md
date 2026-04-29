@@ -92,6 +92,7 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - `CF_TOKEN_LANE=global` switches `cfctl` onto the emergency token lane for that invocation
 - `--all-lanes` compares lane-specific permission truth where supported
 - `cfctl audit trust` is an alias for `cfctl doctor`
+- `doctor` reports `bootstrap_required` when no token lanes are configured and points at `cfctl bootstrap permissions`
 - `doctor --strict` exits non-zero for degraded trust state, not only unsafe state
 - `doctor --repair-hints` emits exact cleanup and repair commands when trust is degraded
 - `previews` lists actionable, legacy, and expired preview receipts

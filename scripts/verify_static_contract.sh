@@ -92,6 +92,24 @@ done
 python3 "${ROOT_DIR}/scripts/render_capabilities_doc.py" --check "${ROOT_DIR}/docs/capabilities.md" >/dev/null
 python3 "${ROOT_DIR}/scripts/verify_permission_catalog.py" >/dev/null
 
+doctor_bootstrap_json="$(
+  env \
+    -u CF_DEV_TOKEN \
+    -u CF_GLOBAL_TOKEN \
+    -u CLOUDFLARE_API_TOKEN \
+    -u CLOUDFLARE_ACCOUNT_ID \
+    CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    "${ROOT_DIR}/cfctl" doctor
+)"
+jq -e '
+  .ok == true
+  and .action == "doctor"
+  and .summary.status == "bootstrap_required"
+  and .summary.configured_lane_count == 0
+  and (.summary.safe_next_steps | index("cfctl bootstrap permissions")) != null
+' <<< "${doctor_bootstrap_json}" >/dev/null || die "doctor no-auth bootstrap posture assertion failed"
+
 assert_jq_file "permission profile minimality policy" '
   .profiles.read.allowed_surfaces != null
   and (.profiles.read.forbidden_permissions | index("* Write")) != null

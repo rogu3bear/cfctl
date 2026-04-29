@@ -74,6 +74,10 @@ cfctl guide edge.certificate order --zone example.com --host app.example.com --h
 cfctl hostname verify --file state/hostname/example.yaml
 ```
 
+Before credentials exist, `cfctl doctor` reports `bootstrap_required` and points
+at `cfctl bootstrap permissions`; `cfctl doctor --strict` still fails until a
+healthy token lane exists.
+
 Useful reads:
 
 ```bash
@@ -227,6 +231,8 @@ cfctl admin authorizations
 cfctl admin revoke-backend --path <authorization-path>
 ```
 
+- `cfctl doctor` is bootstrap-aware: zero configured token lanes is
+  `bootstrap_required`, while configured-but-unhealthy lanes remain unsafe.
 - Direct API wrappers: account inventory, DNS, Access, tunnels, email routing, targeted writes.
 - `cfctl wrangler ...` via [scripts/cf_wrangler.sh](scripts/cf_wrangler.sh): wrapped wrangler with cfctl logs, artifacts, and preview gating.
 - `cfctl cloudflared ...` via [scripts/cf_cloudflared.sh](scripts/cf_cloudflared.sh): wrapped cloudflared with the same envelope.
