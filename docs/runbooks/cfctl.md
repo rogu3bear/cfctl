@@ -111,6 +111,7 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - `bootstrap permissions` reads `catalog/permissions.json` and emits the temporary bootstrap credential requirements plus profile-scoped operator-token mint commands
 - `bootstrap permissions --profile <profile>` supports `read`, `dns`, `hostname`, `deploy`, `security-audit`, and `full-operator`
 - `scripts/verify_permission_catalog.py` checks the permission catalog shape, profile command fixtures, optional real `cfctl` bootstrap output, and optional live permission-group drift
+- `.github/workflows/cfctl-contract.yml` runs static contract checks on PRs and live permission/public-contract checks on schedule or manual dispatch when the required Cloudflare secrets are configured
 - `admin authorize-backend` issues a short-lived backend authorization file for maintainer/debug direct script use
 - `admin authorizations` lists active and expired backend authorizations
 - `admin revoke-backend --path ...` removes one authorization artifact

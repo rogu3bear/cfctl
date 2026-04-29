@@ -164,6 +164,12 @@ adds a live drift check by comparing the catalog against Cloudflare's current
 permission-group inventory. For a credentialless runtime-output check, run
 `python3 scripts/verify_permission_catalog.py --cfctl ./cfctl`.
 
+The GitHub Actions workflow in [.github/workflows/cfctl-contract.yml](.github/workflows/cfctl-contract.yml)
+runs static contract checks on pull requests. Its scheduled and manual live
+job requires `CF_DEV_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and
+`CFCTL_PUBLIC_CONTRACT_ZONE` as repository secrets or variables, then runs the
+live permission-group drift and public-contract smoke tests.
+
 See [docs/runbooks/cfctl.md](docs/runbooks/cfctl.md) and [docs/capabilities.md](docs/capabilities.md) for the full reference.
 
 ## Layout

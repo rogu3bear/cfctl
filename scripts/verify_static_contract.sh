@@ -176,5 +176,8 @@ assert_contains "capabilities module column" "| Surface | Read | Apply | Desired
 assert_contains "capabilities hostname composite" "Composite lifecycle commands:" "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "docs bank tracked vs operable note" "Tracked here does not automatically mean operable through \`cfctl\` today" "${ROOT_DIR}/docs/cloudflare-doc-bank.md"
 assert_contains "public contract live verifier note" "This is a live account smoke test." "${ROOT_DIR}/scripts/verify_public_contract.sh"
+assert_contains "contract workflow static gate" "python3 scripts/verify_permission_catalog.py --cfctl ./cfctl" "${ROOT_DIR}/.github/workflows/cfctl-contract.yml"
+assert_contains "contract workflow live gate" "./scripts/verify_public_contract.sh" "${ROOT_DIR}/.github/workflows/cfctl-contract.yml"
+assert_contains "contract workflow secret gate" "CF_DEV_TOKEN secret is required" "${ROOT_DIR}/.github/workflows/cfctl-contract.yml"
 
 echo "static-contract verification passed"
