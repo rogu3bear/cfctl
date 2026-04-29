@@ -52,6 +52,7 @@ def render(root: Path) -> str:
         "",
         "Lane-aware commands:",
         "- `cfctl doctor`",
+        "- `cfctl bootstrap permissions`",
         "- `cfctl lanes`",
         "- `cfctl can <surface> <operation> --all-lanes`",
         "- `cfctl classify <surface> <operation>`",

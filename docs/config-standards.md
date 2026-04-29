@@ -18,7 +18,7 @@ cfctl standards audit
 The standards layer exists to answer:
 
 - how a Cloudflare resource should be configured here
-- how recurring Wrangler config shapes in `~/dev` should be configured here
+- how recurring Wrangler config shapes in a workspace root should be configured here
 - when desired state is preferred over ad hoc mutation
 - what evidence should exist after a change
 - which runtime path agents should use before they mutate anything
@@ -96,11 +96,11 @@ Examples:
 
 ## Workspace Audit
 
-Use the standards audit when the question is "what does the real Wrangler footprint in `~/dev` look like relative to our standard?"
+Use the standards audit when the question is "what does the real Wrangler footprint in a workspace root look like relative to our standard?"
 
 ```bash
 cfctl standards audit
-cfctl standards audit ~/dev
+cfctl standards audit /path/to/workspace
 ```
 
 This audit scans active `wrangler.toml` and `wrangler.jsonc` files, matches them to the standards catalog, and reports:

@@ -83,12 +83,17 @@ require_tool jq
 
 unique_suffix="$(date -u +%Y%m%d%H%M%S)-$$"
 token_name="dns-editor-${unique_suffix}"
-contract_zone="${CFCTL_PUBLIC_CONTRACT_ZONE:-jkca.me}"
+contract_zone="${CFCTL_PUBLIC_CONTRACT_ZONE:-}"
+[[ -n "${contract_zone}" ]] || die "CFCTL_PUBLIC_CONTRACT_ZONE must be set for live DNS/token smoke tests"
 contract_record="_ops-smoke.${contract_zone}"
 
 cleanup_previews_json="$(run_json success "previews purge-expired" "${CFCTL}" previews purge-expired)"
 assert_artifact_exists "previews purge-expired" "${cleanup_previews_json}"
 assert_json "previews purge-expired" '.ok == true and .action == "previews"' "${cleanup_previews_json}"
+
+cleanup_legacy_previews_json="$(run_json success "previews purge-inactive-legacy" "${CFCTL}" previews purge-inactive-legacy)"
+assert_artifact_exists "previews purge-inactive-legacy" "${cleanup_legacy_previews_json}"
+assert_json "previews purge-inactive-legacy" '.ok == true and .action == "previews" and (.summary.purged_count // 0) >= 0' "${cleanup_legacy_previews_json}"
 
 cleanup_locks_json="$(run_json success "locks clear-stale" "${CFCTL}" locks clear-stale)"
 assert_artifact_exists "locks clear-stale" "${cleanup_locks_json}"
@@ -166,9 +171,11 @@ audit_json="$(run_json success "audit trust" "${CFCTL}" audit trust)"
 assert_artifact_exists "audit trust" "${audit_json}"
 assert_json "audit trust" '.ok == true and .action == "doctor" and .summary.status != null' "${audit_json}"
 
-permission_groups_json="$(run_json success "token permission-groups" "${CFCTL}" token permission-groups --name DNS)"
+permission_groups_json="$(run_json success "token permission-groups" "${CFCTL}" token permission-groups)"
 assert_artifact_exists "token permission-groups" "${permission_groups_json}"
-assert_json "token permission-groups" '.ok == true and .action == "token.permission-groups" and ((.result.permission_groups | length) > 0)' "${permission_groups_json}"
+assert_json "token permission-groups" '.ok == true and .action == "token.permission-groups" and ((.result.permission_groups | length) > 0) and ((.result.permission_groups | map(select(.name == "DNS Read" or .name == "DNS Write")) | length) >= 2)' "${permission_groups_json}"
+permission_groups_artifact="$(jq -r '.artifact_path' <<< "${permission_groups_json}")"
+python3 "${ROOT_DIR}/scripts/verify_permission_catalog.py" --permission-groups "${permission_groups_artifact}" >/dev/null || die "permission catalog drift check failed"
 
 classify_dns_json="$(
   run_json success \

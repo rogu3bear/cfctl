@@ -72,6 +72,8 @@ bash -n \
   "${ROOT_DIR}/scripts/lib/cloudflare.sh" \
   "${ROOT_DIR}/scripts/cf_wrangler.sh" \
   "${ROOT_DIR}/scripts/cf_cloudflared.sh" \
+  "${ROOT_DIR}/scripts/cf_token_revoke.sh" \
+  "${ROOT_DIR}/scripts/cf_inventory_audit_logs.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_api_gateway.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_vulnerability_scanner.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_worker_routes.sh" \
@@ -90,7 +92,39 @@ for surface_module in \
 done
 
 python3 "${ROOT_DIR}/scripts/render_capabilities_doc.py" --check "${ROOT_DIR}/docs/capabilities.md" >/dev/null
+python3 "${ROOT_DIR}/scripts/verify_permission_catalog.py" >/dev/null
 
+doctor_bootstrap_json="$(
+  env \
+    -u CF_DEV_TOKEN \
+    -u CF_GLOBAL_TOKEN \
+    -u CLOUDFLARE_API_TOKEN \
+    -u CLOUDFLARE_ACCOUNT_ID \
+    CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    "${ROOT_DIR}/cfctl" doctor
+)"
+jq -e '
+  .ok == true
+  and .action == "doctor"
+  and .summary.status == "bootstrap_required"
+  and .summary.configured_lane_count == 0
+  and (.summary.safe_next_steps | index("cfctl bootstrap permissions")) != null
+' <<< "${doctor_bootstrap_json}" >/dev/null || die "doctor no-auth bootstrap posture assertion failed"
+
+assert_jq_file "permission profile minimality policy" '
+  .profiles.read.allowed_surfaces != null
+  and (.profiles.read.allowed_surfaces | index("audit.log")) != null
+  and (.profiles.read.forbidden_permissions | index("* Write")) != null
+  and (.profiles["security-audit"].forbidden_permissions | index("* Write")) != null
+  and (.profiles["security-audit"].allowed_surfaces | index("audit.log")) != null
+  and .profiles.dns.allowed_surfaces == ["dns.record", "zone"]
+  and (.profiles.hostname.allowed_surfaces | index("edge.certificate")) != null
+  and (.profiles.deploy.allowed_surfaces | index("audit.log")) != null
+  and (.profiles.deploy.allowed_surfaces | index("wrangler")) != null
+  and .profiles["full-operator"].allowed_surfaces == ["*"]
+  and (.profiles["full-operator"].forbidden_permissions | index("Account API Tokens *")) != null
+' "${ROOT_DIR}/catalog/permissions.json"
 assert_jq_file "runtime public verbs" '(.public_verbs | index("docs")) != null and (.public_verbs | index("wrangler")) != null and (.public_verbs | index("cloudflared")) != null and (.public_verbs | index("hostname")) != null and (.landing_flow | index("docs")) != null' "${ROOT_DIR}/catalog/runtime.json"
 assert_jq_file "tool wrapper metadata" '
   .tool_wrappers.wrangler.script == "scripts/cf_wrangler.sh"
@@ -103,7 +137,7 @@ assert_jq_file "tool wrapper metadata" '
   and (.tool_wrappers.cloudflared.read_only_prefixes | map(join(" ")) | index("tunnel list")) != null
 ' "${ROOT_DIR}/catalog/runtime.json"
 assert_jq_file "docs bank shape" '.checked_on != null and .refresh_policy.refresh_interval_days > 0 and (.foundation | length) > 0 and (.watch | length) > 0' "${ROOT_DIR}/catalog/cloudflare-doc-bank.json"
-assert_jq_file "docs bank api gateway topic" '(.foundation | any(.id == "api-gateway")) and (.watch | any(.id == "api-shield-vulnerability-scanner"))' "${ROOT_DIR}/catalog/cloudflare-doc-bank.json"
+assert_jq_file "docs bank api gateway topic" '(.foundation | any(.id == "api-gateway")) and (.foundation | any(.id == "audit-logs")) and (.watch | any(.id == "api-shield-vulnerability-scanner"))' "${ROOT_DIR}/catalog/cloudflare-doc-bank.json"
 assert_jq_file "standards shape" '(.universal | length) > 0 and (.surfaces | keys | length) > 0' "${ROOT_DIR}/catalog/standards.json"
 assert_jq_file "compatibility freshness thresholds" '.audit.compatibility_date_freshness.note_after_days == 30 and .audit.compatibility_date_freshness.warning_after_days == 90' "${ROOT_DIR}/catalog/standards.json"
 assert_jq_file "surface registry shape" '(.surfaces | keys | length) > 0' "${ROOT_DIR}/catalog/surfaces.json"
@@ -114,6 +148,10 @@ assert_jq_file "surface module bindings" '
   and .surfaces["access.policy"].module == "access_policy"
   and .surfaces["access.policy"].standards_ref == "access.policy"
   and (.surfaces["access.policy"].docs_topics | index("zero-trust-api")) != null
+  and .surfaces["audit.log"].inventory_script == "scripts/cf_inventory_audit_logs.sh"
+  and .surfaces["audit.log"].permission_family == "Account Settings"
+  and .surfaces["audit.log"].actions.apply.supported == false
+  and (.surfaces["audit.log"].docs_topics | index("audit-logs")) != null
   and .surfaces["dns.record"].module == "dns_record"
   and .surfaces["dns.record"].standards_ref == "dns.record"
   and (.surfaces["dns.record"].docs_topics | index("api-auth")) != null
@@ -149,31 +187,60 @@ assert_not_has_line "state docs stale direct sync" '^cfctl apply dns\.record syn
 assert_contains "state docs scaffolding note" "Support means the desired-state engine exists for that surface." "${ROOT_DIR}/docs/state.md"
 assert_contains "state readme scaffolding note" "Managed specs are opt-in." "${ROOT_DIR}/state/README.md"
 assert_contains "hostname state example" "cfctl hostname verify --file state/hostname/example.yaml" "${ROOT_DIR}/state/hostname/README.md"
-assert_contains "hostname checked-in spec" "service: jkca-web-edge-router" "${ROOT_DIR}/state/hostname/jkca-drive.yaml"
+assert_contains "hostname checked-in spec" "service: example-edge-router" "${ROOT_DIR}/state/hostname/example.yaml"
 assert_contains "cfctl prompt contract" "You are now operating as \`cfctl\`, a strict, catalog-driven Cloudflare control plane." "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt preview ack" "always require \`--plan\` first, then \`--ack-plan <operation-id>\`" "${ROOT_DIR}/CFCTL_PROMPT.md"
-assert_contains "cfctl prompt error verb" "\`doctor\`, \`audit\`, \`admin\`, \`lanes\`, \`surfaces\`, \`docs\`, \`previews\`, \`locks\`, \`wrangler\`, \`cloudflared\`, \`hostname\`, \`standards\`, \`list\`, \`get\`, \`can\`, \`classify\`, \`guide\`, \`apply\`, \`verify\`, \`explain\`, \`snapshot\`, \`diff\`, or \`error\`." "${ROOT_DIR}/CFCTL_PROMPT.md"
+assert_contains "cfctl prompt token revoke" "For token revocation, require \`--plan\` first" "${ROOT_DIR}/CFCTL_PROMPT.md"
+assert_contains "cfctl prompt error verb" "\`doctor\`, \`audit\`, \`admin\`, \`bootstrap\`, \`lanes\`, \`surfaces\`, \`docs\`, \`previews\`, \`locks\`, \`wrangler\`, \`cloudflared\`, \`hostname\`, \`standards\`, \`token\`, \`list\`, \`get\`, \`can\`, \`classify\`, \`guide\`, \`apply\`, \`verify\`, \`explain\`, \`snapshot\`, \`diff\`, or \`error\`." "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt hostname" "For \`hostname\`, treat \`verify\`, \`diff\`, and \`plan\` as read-only composite evidence flows" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt wrapper gating" "For \`wrangler\` and \`cloudflared\`, treat clearly read-only subcommands as direct wrapped executions" "${ROOT_DIR}/CFCTL_PROMPT.md"
+assert_contains "cfctl preview inactive legacy cleanup command" "purge-inactive-legacy" "${ROOT_DIR}/commands/cfctl.sh"
 assert_contains "readme wrapper examples" "cfctl wrangler --version" "${ROOT_DIR}/README.md"
+assert_contains "readme inactive legacy preview cleanup" "cfctl previews purge-inactive-legacy" "${ROOT_DIR}/README.md"
 assert_contains "readme source-live boundary" "Source Config Vs Live State" "${ROOT_DIR}/README.md"
 assert_contains "readme hostname lifecycle" "Hostname lifecycle" "${ROOT_DIR}/README.md"
+assert_contains "readme token revoke" "cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete" "${ROOT_DIR}/README.md"
 assert_contains "readme standards audit freshness" "checked-in Wrangler config alignment, including \`compatibility_date\` freshness" "${ROOT_DIR}/README.md"
 assert_contains "agents wrapper hierarchy" "cfctl wrangler ..." "${ROOT_DIR}/AGENTS.md"
 assert_contains "agents source-live boundary" "A clean standards audit proves source-config alignment, not live edge state." "${ROOT_DIR}/AGENTS.md"
 assert_contains "agents hostname lifecycle" "Hostname lifecycle specs live under \`state/hostname/\`" "${ROOT_DIR}/AGENTS.md"
+assert_contains "agents token revoke" "cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete" "${ROOT_DIR}/AGENTS.md"
 assert_contains "agent landing decision path" "## Decision Path" "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "agent landing source-live boundary" "Do not turn a source-config audit into a live Cloudflare claim." "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "runbook wrapper examples" "cfctl cloudflared version" "${ROOT_DIR}/docs/runbooks/cfctl.md"
-assert_contains "runbook hostname lifecycle" "cfctl hostname verify --file state/hostname/jkca-drive.yaml" "${ROOT_DIR}/docs/runbooks/cfctl.md"
+assert_contains "runbook inactive legacy preview cleanup" "previews purge-inactive-legacy" "${ROOT_DIR}/docs/runbooks/cfctl.md"
+assert_contains "runbook audit log read" "cfctl list audit.log" "${ROOT_DIR}/docs/runbooks/cfctl.md"
+assert_contains "runbook hostname lifecycle" "cfctl hostname verify --file state/hostname/example.yaml" "${ROOT_DIR}/docs/runbooks/cfctl.md"
+assert_contains "runbook token revoke" "token revoke --plan\` reads token id/name/status/expiry metadata" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook compatibility freshness" "standards audit\` reports \`compatibility_date\` aging and stale counts" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook standards audit source evidence" "standards audit\` is source-config evidence" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "config standards compatibility freshness" "Compatibility-date freshness is intentionally advisory" "${ROOT_DIR}/docs/config-standards.md"
+assert_contains "runtime policy inactive legacy preview cleanup" "cfctl previews purge-inactive-legacy" "${ROOT_DIR}/docs/runtime-policy.md"
 assert_contains "capabilities operable note" "This table is the operable runtime surface." "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities generated note" "_Generated from \`catalog/surfaces.json\` and \`catalog/runtime.json\`." "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities module column" "| Surface | Read | Apply | Desired State | Standards | Docs Topics | Module |" "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities hostname composite" "Composite lifecycle commands:" "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "docs bank tracked vs operable note" "Tracked here does not automatically mean operable through \`cfctl\` today" "${ROOT_DIR}/docs/cloudflare-doc-bank.md"
+assert_contains "docs bank audit logs" "Audit Logs v2" "${ROOT_DIR}/docs/cloudflare-doc-bank.md"
 assert_contains "public contract live verifier note" "This is a live account smoke test." "${ROOT_DIR}/scripts/verify_public_contract.sh"
+assert_contains "contract workflow static gate" "python3 scripts/verify_permission_catalog.py --cfctl ./cfctl" "${ROOT_DIR}/.github/workflows/cfctl-contract.yml"
+assert_contains "contract workflow live gate" "./scripts/verify_public_contract.sh" "${ROOT_DIR}/.github/workflows/cfctl-contract.yml"
+assert_contains "contract workflow secret gate" "CF_DEV_TOKEN secret is required" "${ROOT_DIR}/.github/workflows/cfctl-contract.yml"
+assert_contains "contract workflow protected environment" "environment: cfctl-live" "${ROOT_DIR}/.github/workflows/cfctl-contract.yml"
+assert_contains "public contract inactive legacy preview cleanup" "previews purge-inactive-legacy" "${ROOT_DIR}/scripts/verify_public_contract.sh"
+assert_contains "permission doctrine source" "Cloudflare API token permissions are resource-scoped" "${ROOT_DIR}/docs/permission-doctrine.md"
+assert_contains "permission doctrine environment" "cfctl-live" "${ROOT_DIR}/docs/permission-doctrine.md"
+assert_contains "permission doctrine bootstrap creator" "Account API Tokens Write" "${ROOT_DIR}/docs/permission-doctrine.md"
+assert_contains "permission doctrine profile read" "- \`read\`: default inventory and audit profile, including \`audit.log\`." "${ROOT_DIR}/docs/permission-doctrine.md"
+assert_contains "permission doctrine profile dns" "- \`dns\`: DNS record read/write profile" "${ROOT_DIR}/docs/permission-doctrine.md"
+assert_contains "permission doctrine profile hostname" "- \`hostname\`: composite hostname lifecycle profile" "${ROOT_DIR}/docs/permission-doctrine.md"
+assert_contains "permission doctrine profile deploy" "- \`deploy\`: Worker, Pages, D1, R2, Queues" "${ROOT_DIR}/docs/permission-doctrine.md"
+assert_contains "permission doctrine profile security audit" "- \`security-audit\`: read-only API-security" "${ROOT_DIR}/docs/permission-doctrine.md"
+assert_contains "permission doctrine profile full operator" "- \`full-operator\`: broad local operator profile" "${ROOT_DIR}/docs/permission-doctrine.md"
+assert_contains "permission doctrine token exclusion" "Operator profiles must not include \`Account API Tokens *\` permissions." "${ROOT_DIR}/docs/permission-doctrine.md"
+assert_contains "permission doctrine read forbidden" "Read-risk profiles must not include \`* Write\`, \`* Revoke\`, or \`* Run\`" "${ROOT_DIR}/docs/permission-doctrine.md"
+assert_contains "permission doctrine account settings blast radius" "\`Account Settings Read\` is the coarse Cloudflare permission behind" "${ROOT_DIR}/docs/permission-doctrine.md"
+assert_contains "readme permission doctrine" "docs/permission-doctrine.md" "${ROOT_DIR}/README.md"
+assert_contains "runbook permission doctrine" "docs/permission-doctrine.md" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 
 echo "static-contract verification passed"

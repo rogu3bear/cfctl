@@ -13,7 +13,7 @@ Thanks for considering a contribution. `cfctl` is a strict, catalog-driven Cloud
 ## Development setup
 
 ```bash
-git clone https://github.com/rogu3bear/cfctl.git
+git clone https://github.com/your-org/cfctl.git
 cd cfctl
 cp .env.example .env  # fill in CF_DEV_TOKEN and CLOUDFLARE_ACCOUNT_ID
 ./scripts/verify_static_contract.sh  # offline structural checks
@@ -55,4 +55,4 @@ See [SECURITY.md](SECURITY.md). Please do not file public issues for vulnerabili
 
 ## Credit
 
-`cfctl` was created by James KC Auchterlonie. Contributions are welcome under the MIT license; you retain copyright on your contributions.
+Contributions are welcome under the MIT license; you retain copyright on your contributions.

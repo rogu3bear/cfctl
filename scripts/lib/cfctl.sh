@@ -40,6 +40,12 @@ cfctl_reset_flags() {
   CFCTL_DATA_JSON=""
   CFCTL_TUNNEL_ID=""
   CFCTL_CLIENT_ID=""
+  CFCTL_SINCE=""
+  CFCTL_BEFORE=""
+  CFCTL_ACTOR=""
+  CFCTL_ACTION_TYPE=""
+  CFCTL_RESOURCE_TYPE=""
+  CFCTL_LIMIT=""
   CFCTL_INCLUDE_RECORDS="1"
   CFCTL_INCLUDE_CONFIG="0"
   CFCTL_ALL_LANES="0"
@@ -128,6 +134,20 @@ cfctl_parse_flags() {
       --tunnel-id=*) CFCTL_TUNNEL_ID="${1#*=}"; shift ;;
       --client-id) CFCTL_CLIENT_ID="$2"; shift 2 ;;
       --client-id=*) CFCTL_CLIENT_ID="${1#*=}"; shift ;;
+      --since) CFCTL_SINCE="$2"; shift 2 ;;
+      --since=*) CFCTL_SINCE="${1#*=}"; shift ;;
+      --before) CFCTL_BEFORE="$2"; shift 2 ;;
+      --before=*) CFCTL_BEFORE="${1#*=}"; shift ;;
+      --actor) CFCTL_ACTOR="$2"; shift 2 ;;
+      --actor=*) CFCTL_ACTOR="${1#*=}"; shift ;;
+      --action-type) CFCTL_ACTION_TYPE="$2"; shift 2 ;;
+      --action-type=*) CFCTL_ACTION_TYPE="${1#*=}"; shift ;;
+      --resource-type) CFCTL_RESOURCE_TYPE="$2"; shift 2 ;;
+      --resource-type=*) CFCTL_RESOURCE_TYPE="${1#*=}"; shift ;;
+      --limit) CFCTL_LIMIT="$2"; shift 2 ;;
+      --limit=*) CFCTL_LIMIT="${1#*=}"; shift ;;
+      --per-page) CFCTL_LIMIT="$2"; shift 2 ;;
+      --per-page=*) CFCTL_LIMIT="${1#*=}"; shift ;;
       --include-records) CFCTL_INCLUDE_RECORDS="$2"; shift 2 ;;
       --include-records=*) CFCTL_INCLUDE_RECORDS="${1#*=}"; shift ;;
       --include-config) CFCTL_INCLUDE_CONFIG="$2"; shift 2 ;;
@@ -434,6 +454,8 @@ cfctl_operation_policy_json() {
 
   if [[ "${surface}" == "token" && "${operation}" == "mint" ]]; then
     special_operation_key="token.mint"
+  elif [[ "${surface}" == "token" && "${operation}" == "revoke" ]]; then
+    special_operation_key="token.revoke"
   elif [[ "${operation}" == "sync" ]]; then
     special_operation_key="sync"
   fi
@@ -464,7 +486,7 @@ cfctl_operation_policy_json() {
           preview_required: (
             ($special_defaults.preview_required // $meta.preview_required // $risk_defaults.preview_required // false)
           ),
-          confirmation: ($meta.confirm // null),
+          confirmation: ($special_defaults.confirmation // $meta.confirm // null),
           allowed_lanes: ($special_defaults.allowed_lanes // $meta.allowed_lanes // $risk_defaults.allowed_lanes // ["dev", "global"]),
           verification_required: ($special_defaults.verification_required // $meta.verification_required // $risk_defaults.verification_required // false),
           secret_policy: ($special_defaults.secret_policy // $meta.secret_policy // $risk_defaults.secret_policy // "redacted"),
@@ -541,6 +563,12 @@ cfctl_current_operation_request_json() {
     --arg scope "${CFCTL_SCOPE}" \
     --arg confirm "${CFCTL_CONFIRM}" \
     --arg client_id "${CFCTL_CLIENT_ID}" \
+    --arg since "${CFCTL_SINCE}" \
+    --arg before "${CFCTL_BEFORE}" \
+    --arg actor "${CFCTL_ACTOR}" \
+    --arg action_type "${CFCTL_ACTION_TYPE}" \
+    --arg resource_type "${CFCTL_RESOURCE_TYPE}" \
+    --arg limit "${CFCTL_LIMIT}" \
     '
       {
         surface: $surface,
@@ -564,6 +592,12 @@ cfctl_current_operation_request_json() {
         data: $data,
         scope: (if $scope == "" then null else $scope end),
         client_id: (if $client_id == "" then null else $client_id end),
+        since: (if $since == "" then null else $since end),
+        before: (if $before == "" then null else $before end),
+        actor: (if $actor == "" then null else $actor end),
+        action_type: (if $action_type == "" then null else $action_type end),
+        resource_type: (if $resource_type == "" then null else $resource_type end),
+        limit: (if $limit == "" then null else $limit end),
         confirm: (if $confirm == "" then null else $confirm end)
       }
       | with_entries(select(.value != null))
@@ -803,6 +837,12 @@ cfctl_current_args_shell() {
   [[ -n "${CFCTL_DATA_JSON}" ]] && args+=(--data-json "${CFCTL_DATA_JSON}")
   [[ -n "${CFCTL_TUNNEL_ID}" ]] && args+=(--tunnel-id "${CFCTL_TUNNEL_ID}")
   [[ -n "${CFCTL_CLIENT_ID}" ]] && args+=(--client-id "${CFCTL_CLIENT_ID}")
+  [[ -n "${CFCTL_SINCE}" ]] && args+=(--since "${CFCTL_SINCE}")
+  [[ -n "${CFCTL_BEFORE}" ]] && args+=(--before "${CFCTL_BEFORE}")
+  [[ -n "${CFCTL_ACTOR}" ]] && args+=(--actor "${CFCTL_ACTOR}")
+  [[ -n "${CFCTL_ACTION_TYPE}" ]] && args+=(--action-type "${CFCTL_ACTION_TYPE}")
+  [[ -n "${CFCTL_RESOURCE_TYPE}" ]] && args+=(--resource-type "${CFCTL_RESOURCE_TYPE}")
+  [[ -n "${CFCTL_LIMIT}" ]] && args+=(--limit "${CFCTL_LIMIT}")
   [[ "${CFCTL_INCLUDE_RECORDS}" != "1" ]] && args+=(--include-records "${CFCTL_INCLUDE_RECORDS}")
   [[ "${CFCTL_INCLUDE_CONFIG}" != "0" ]] && args+=(--include-config "${CFCTL_INCLUDE_CONFIG}")
   [[ -n "${CFCTL_STATE_DIR}" ]] && args+=(--state-dir "${CFCTL_STATE_DIR}")
@@ -837,6 +877,12 @@ cfctl_current_selector_args_shell() {
   [[ -n "${CFCTL_SCOPE}" && "${CFCTL_SCOPE}" != "account" ]] && args+=(--scope "${CFCTL_SCOPE}")
   [[ -n "${CFCTL_TUNNEL_ID}" ]] && args+=(--tunnel-id "${CFCTL_TUNNEL_ID}")
   [[ -n "${CFCTL_CLIENT_ID}" ]] && args+=(--client-id "${CFCTL_CLIENT_ID}")
+  [[ -n "${CFCTL_SINCE}" ]] && args+=(--since "${CFCTL_SINCE}")
+  [[ -n "${CFCTL_BEFORE}" ]] && args+=(--before "${CFCTL_BEFORE}")
+  [[ -n "${CFCTL_ACTOR}" ]] && args+=(--actor "${CFCTL_ACTOR}")
+  [[ -n "${CFCTL_ACTION_TYPE}" ]] && args+=(--action-type "${CFCTL_ACTION_TYPE}")
+  [[ -n "${CFCTL_RESOURCE_TYPE}" ]] && args+=(--resource-type "${CFCTL_RESOURCE_TYPE}")
+  [[ -n "${CFCTL_LIMIT}" ]] && args+=(--limit "${CFCTL_LIMIT}")
   while IFS= read -r host; do
     [[ -n "${host}" ]] && args+=(--host "${host}")
   done < <(jq -r '.[]?' <<< "${CFCTL_HOSTS_JSON}")
@@ -869,6 +915,12 @@ cfctl_selector_presence_json() {
     --arg scope "${CFCTL_SCOPE}" \
     --arg tunnel_id "${CFCTL_TUNNEL_ID}" \
     --arg client_id "${CFCTL_CLIENT_ID}" \
+    --arg since "${CFCTL_SINCE}" \
+    --arg before "${CFCTL_BEFORE}" \
+    --arg actor "${CFCTL_ACTOR}" \
+    --arg action_type "${CFCTL_ACTION_TYPE}" \
+    --arg resource_type "${CFCTL_RESOURCE_TYPE}" \
+    --arg limit "${CFCTL_LIMIT}" \
     --argjson hosts "${CFCTL_HOSTS_JSON}" \
     '
       {
@@ -887,6 +939,12 @@ cfctl_selector_presence_json() {
         scope: ($scope | length > 0),
         tunnel_id: ($tunnel_id | length > 0),
         client_id: ($client_id | length > 0),
+        since: ($since | length > 0),
+        before: ($before | length > 0),
+        actor: ($actor | length > 0),
+        action_type: ($action_type | length > 0),
+        resource_type: ($resource_type | length > 0),
+        limit: ($limit | length > 0),
         host: (($hosts | length) > 0)
       }
     '
@@ -968,6 +1026,10 @@ cfctl_validate_requirements() {
 }
 
 cfctl_resolve_zone_context() {
+  if [[ -z "${CF_ACTIVE_AUTH_SCHEME:-}" || -z "${CF_ACTIVE_AUTH_SECRET:-}" ]]; then
+    return
+  fi
+
   if [[ -n "${CFCTL_ZONE_NAME}" && -z "${CFCTL_ZONE_ID}" ]]; then
     CFCTL_ZONE_ID="$(cf_resolve_zone_id "${CFCTL_ZONE_NAME}")"
   fi
@@ -1003,6 +1065,12 @@ cfctl_target_json() {
     --arg scope "${CFCTL_SCOPE}" \
     --arg tunnel_id "${CFCTL_TUNNEL_ID}" \
     --arg client_id "${CFCTL_CLIENT_ID}" \
+    --arg since "${CFCTL_SINCE}" \
+    --arg before "${CFCTL_BEFORE}" \
+    --arg actor "${CFCTL_ACTOR}" \
+    --arg action_type "${CFCTL_ACTION_TYPE}" \
+    --arg resource_type "${CFCTL_RESOURCE_TYPE}" \
+    --arg limit "${CFCTL_LIMIT}" \
     --argjson hosts "${CFCTL_HOSTS_JSON}" \
     '
       {
@@ -1022,6 +1090,12 @@ cfctl_target_json() {
         scope: (if $scope == "" then null else $scope end),
         tunnel_id: (if $tunnel_id == "" then null else $tunnel_id end),
         client_id: (if $client_id == "" then null else $client_id end),
+        since: (if $since == "" then null else $since end),
+        before: (if $before == "" then null else $before end),
+        actor: (if $actor == "" then null else $actor end),
+        action_type: (if $action_type == "" then null else $action_type end),
+        resource_type: (if $resource_type == "" then null else $resource_type end),
+        limit: (if $limit == "" then null else $limit end),
         hosts: (if ($hosts | length) == 0 then null else $hosts end)
       }
       | with_entries(select(.value != null))
@@ -1224,6 +1298,24 @@ cfctl_probe_permission() {
     return
   fi
 
+  if [[ -z "${CF_ACTIVE_AUTH_SCHEME:-}" || -z "${CF_ACTIVE_AUTH_SECRET:-}" ]]; then
+    jq -n \
+      --arg permission_family "$(jq -r '.permission_family' <<< "${spec}")" \
+      --argjson selector_readiness "${requirement_json}" \
+      '
+        {
+          state: "unknown",
+          permission_family: $permission_family,
+          basis: "credential_missing",
+          status_code: null,
+          errors: [],
+          request: null,
+          selector_readiness: $selector_readiness
+        }
+      '
+    return
+  fi
+
   capture="$(cf_api_capture "${method}" "${path}")"
   jq -n \
     --arg permission_family "$(jq -r '.permission_family' <<< "${spec}")" \
@@ -1381,6 +1473,18 @@ cfctl_collect_surface_items() {
       cfctl_resolve_zone_context
       script_path="${CF_REPO_ROOT}/scripts/cf_inventory_edge_certificates.sh"
       cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}" "ZONE_ID=${CFCTL_ZONE_ID}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
+    audit.log)
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_audit_logs.sh"
+      cfctl_run_backend_script \
+        "${script_path}" \
+        "AUDIT_LOGS_SINCE=${CFCTL_SINCE}" \
+        "AUDIT_LOGS_BEFORE=${CFCTL_BEFORE}" \
+        "AUDIT_LOGS_ACTOR=${CFCTL_ACTOR}" \
+        "AUDIT_LOGS_ACTION_TYPE=${CFCTL_ACTION_TYPE}" \
+        "AUDIT_LOGS_RESOURCE_TYPE=${CFCTL_RESOURCE_TYPE}" \
+        "AUDIT_LOGS_LIMIT=${CFCTL_LIMIT}"
       CFCTL_COLLECT_BACKEND="inventory_script"
       ;;
     logpush.job)
@@ -1556,6 +1660,9 @@ cfctl_collect_surface_items() {
             ]
           ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
       )"
+      ;;
+    audit.log)
+      CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.events // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
       ;;
     logpush.job)
       if [[ "${CFCTL_SCOPE}" == "zone" ]]; then
@@ -1826,6 +1933,27 @@ cfctl_filter_surface_items() {
         ]
       ' <<< "${items_json}"
       ;;
+    audit.log)
+      jq -c \
+        --arg id "${CFCTL_ID}" \
+        --arg actor "${CFCTL_ACTOR}" \
+        --arg action_type "${CFCTL_ACTION_TYPE}" \
+        --arg resource_type "${CFCTL_RESOURCE_TYPE}" \
+        '
+          [
+            .[]
+            | select(
+                (if $id != "" then .id == $id else true end)
+                and
+                (if $actor != "" then ((.actor.email // .actor.id // .actor.name // "") == $actor) else true end)
+                and
+                (if $action_type != "" then ((.action.type // .action // "") == $action_type) else true end)
+                and
+                (if $resource_type != "" then ((.resource.type // .resource_type // "") == $resource_type) else true end)
+              )
+          ]
+        ' <<< "${items_json}"
+      ;;
     logpush.job)
       jq -c --arg id "${CFCTL_JOB_ID:-${CFCTL_ID}}" --arg name "${CFCTL_NAME}" '
         [
@@ -1872,6 +2000,7 @@ cfctl_summary_for_items() {
     access.policy) name_field="name" ;;
     api_gateway.operation) name_field="endpoint" ;;
     api_gateway.schema|api_gateway.discovery) name_field="host" ;;
+    audit.log) name_field="id" ;;
     vulnerability_scanner.scan) name_field="id" ;;
     vulnerability_scanner.target_environment|vulnerability_scanner.credential_set) name_field="name" ;;
   esac

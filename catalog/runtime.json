@@ -6,6 +6,7 @@
     "doctor",
     "audit",
     "admin",
+    "bootstrap",
     "lanes",
     "surfaces",
     "docs",
@@ -29,6 +30,7 @@
   ],
   "landing_flow": [
     "doctor",
+    "bootstrap permissions",
     "surfaces",
     "docs",
     "standards <surface>",
@@ -121,6 +123,18 @@
         "preview_ttl_seconds": 900,
         "public_example": "cfctl token mint --name <token-name> --plan",
         "troubleshooting_hint": "Token mint is sink-first. Use --value-out <absolute path> and inspect previews before acking."
+      },
+      "token.revoke": {
+        "risk": "destructive",
+        "preview_required": true,
+        "allowed_lanes": ["dev", "global"],
+        "verification_required": true,
+        "secret_policy": "redacted",
+        "lock_strategy": "lease",
+        "preview_ttl_seconds": 900,
+        "confirmation": "delete",
+        "public_example": "cfctl token revoke --id <token-id> --plan",
+        "troubleshooting_hint": "Token revoke deletes an account-owned API token by id. Preview first, then ack with --confirm delete."
       }
     }
   },

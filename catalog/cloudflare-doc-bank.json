@@ -1,7 +1,7 @@
 {
   "version": 1,
   "title": "Cloudflare Docs Bank",
-  "checked_on": "2026-04-22",
+  "checked_on": "2026-04-29",
   "intent": "Compact official-doc bank for stable Cloudflare references and incoming capabilities worth tracking in this runtime.",
   "source_policy": {
     "allowed_domains": [
@@ -86,6 +86,24 @@
         {
           "title": "Create tokens via API",
           "url": "https://developers.cloudflare.com/fundamentals/api/how-to/create-via-api/"
+        }
+      ]
+    },
+    {
+      "id": "audit-logs",
+      "title": "Account Audit Logs v2",
+      "area": "account-security",
+      "status": "stable",
+      "summary": "Audit Logs v2 exposes account activity through the Cloudflare API at /accounts/{account_id}/logs/audit and requires Account Settings Read or Write.",
+      "why_it_matters_here": "This runtime needs an evidence surface for operator activity and mutation review without granting token-minting power.",
+      "sources": [
+        {
+          "title": "Audit Logs v2",
+          "url": "https://developers.cloudflare.com/fundamentals/account/account-security/audit-logs/"
+        },
+        {
+          "title": "Get account audit logs (Version 2)",
+          "url": "https://developers.cloudflare.com/api/resources/accounts/subresources/logs/subresources/audit/methods/list/"
         }
       ]
     },

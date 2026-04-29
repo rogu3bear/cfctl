@@ -1,0 +1,17 @@
+zone: example.com
+hosts:
+  - app.example.com
+  - admin.app.example.com
+dns:
+  proxied_placeholder: true
+worker:
+  route: "*.example.com/*"
+  service: example-edge-router
+access:
+  required: true
+  audience: example-approved
+certificate:
+  advanced: true
+storage:
+  d1: example-db
+  r2: example-objects

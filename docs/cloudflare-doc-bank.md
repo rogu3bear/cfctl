@@ -50,8 +50,9 @@ in the bank tell you how fresh that curation is supposed to be.
 
 ## Current Watch Areas
 
-As of `2026-04-22`, the bank intentionally tracks:
+As of `2026-04-29`, the bank intentionally tracks:
 
+- Audit Logs v2
 - managed Cloudflare MCP servers
 - AI Search
 - Browser Run

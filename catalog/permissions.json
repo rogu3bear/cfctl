@@ -1,0 +1,375 @@
+{
+  "version": 1,
+  "default_profile": "read",
+  "bootstrap_creator": {
+    "purpose": "Temporary credential used only to mint narrower cfctl operator tokens.",
+    "recommended_lifetime": "short-lived; revoke after the operator token is installed",
+    "permissions": [
+      {
+        "name": "Account API Tokens Read",
+        "scope": "account",
+        "reason": "Discover live permission group IDs before token minting."
+      },
+      {
+        "name": "Account API Tokens Write",
+        "scope": "account",
+        "reason": "Create account-owned operator API tokens."
+      },
+      {
+        "name": "Account Settings Read",
+        "scope": "account",
+        "reason": "Verify the pinned account during bootstrap."
+      }
+    ]
+  },
+  "profiles": {
+    "read": {
+      "summary": "Inventory and audit reads across the current cfctl public surfaces.",
+      "ttl_hours": 720,
+      "risk": "read",
+      "allowed_surfaces": [
+        "access.app",
+        "access.policy",
+        "api_gateway.discovery",
+        "api_gateway.operation",
+        "api_gateway.schema",
+        "audit.log",
+        "d1.database",
+        "dns.record",
+        "doctor",
+        "edge.certificate",
+        "lanes",
+        "logpush.job",
+        "pages.project",
+        "queue",
+        "r2.bucket",
+        "tunnel",
+        "turnstile.widget",
+        "vulnerability_scanner.credential_set",
+        "vulnerability_scanner.scan",
+        "vulnerability_scanner.target_environment",
+        "waiting_room",
+        "worker.route",
+        "worker.script",
+        "workflow",
+        "zone"
+      ],
+      "forbidden_permissions": ["* Write", "* Revoke", "* Run", "Account API Tokens *"],
+      "verification": [
+        "cfctl doctor",
+        "cfctl lanes",
+        "cfctl list audit.log",
+        "cfctl list zone",
+        "cfctl list pages.project",
+        "cfctl list worker.script"
+      ]
+    },
+    "dns": {
+      "summary": "DNS record reads and preview-gated DNS record writes.",
+      "ttl_hours": 168,
+      "risk": "write",
+      "allowed_surfaces": ["dns.record", "zone"],
+      "forbidden_permissions": ["Account API Tokens *"],
+      "verification": [
+        "cfctl doctor",
+        "cfctl can dns.record upsert --zone <zone> --name _ops-smoke.<zone> --type TXT --all-lanes"
+      ]
+    },
+    "hostname": {
+      "summary": "Composite hostname lifecycle work: DNS, Worker routes, Access, and certificates.",
+      "ttl_hours": 168,
+      "risk": "write",
+      "allowed_surfaces": [
+        "access.app",
+        "access.policy",
+        "dns.record",
+        "edge.certificate",
+        "worker.route",
+        "worker.script",
+        "workflow",
+        "wrangler",
+        "zone"
+      ],
+      "forbidden_permissions": ["Account API Tokens *"],
+      "verification": [
+        "cfctl doctor",
+        "cfctl can dns.record upsert --zone <zone> --name _ops-smoke.<zone> --type TXT --all-lanes",
+        "cfctl can edge.certificate order --zone <zone> --host app.<zone> --all-lanes",
+        "cfctl list worker.route --zone <zone>",
+        "cfctl list access.app"
+      ]
+    },
+    "deploy": {
+      "summary": "Worker, Pages, D1, R2, Queues, and route operations used by deploy lanes.",
+      "ttl_hours": 168,
+      "risk": "write",
+      "allowed_surfaces": [
+        "d1.database",
+        "audit.log",
+        "doctor",
+        "lanes",
+        "pages.project",
+        "queue",
+        "r2.bucket",
+        "worker.route",
+        "worker.script",
+        "workflow",
+        "wrangler",
+        "zone"
+      ],
+      "forbidden_permissions": ["Account API Tokens *"],
+      "verification": [
+        "cfctl doctor",
+        "cfctl wrangler --version",
+        "cfctl list worker.script",
+        "cfctl list pages.project",
+        "cfctl list d1.database"
+      ]
+    },
+    "security-audit": {
+      "summary": "Read-only API security, Access, logging, and edge posture inventory.",
+      "ttl_hours": 720,
+      "risk": "read",
+      "allowed_surfaces": [
+        "access.app",
+        "access.policy",
+        "api_gateway.discovery",
+        "api_gateway.operation",
+        "api_gateway.schema",
+        "audit.log",
+        "dns.record",
+        "doctor",
+        "edge.certificate",
+        "lanes",
+        "logpush.job",
+        "turnstile.widget",
+        "vulnerability_scanner.credential_set",
+        "vulnerability_scanner.scan",
+        "vulnerability_scanner.target_environment",
+        "waiting_room",
+        "zone"
+      ],
+      "forbidden_permissions": ["* Write", "* Revoke", "* Run", "Account API Tokens *"],
+      "verification": [
+        "cfctl doctor",
+        "cfctl list audit.log",
+        "cfctl list access.app",
+        "cfctl list vulnerability_scanner.scan",
+        "cfctl list logpush.job"
+      ]
+    },
+    "full-operator": {
+      "summary": "All currently cataloged cfctl read/write surfaces. Use only for trusted local operators.",
+      "ttl_hours": 168,
+      "risk": "broad_write",
+      "allowed_surfaces": ["*"],
+      "forbidden_permissions": ["Account API Tokens *"],
+      "verification": [
+        "cfctl doctor",
+        "cfctl lanes",
+        "cfctl surfaces",
+        "cfctl can dns.record upsert --zone <zone> --name _ops-smoke.<zone> --type TXT --all-lanes"
+      ]
+    }
+  },
+  "permissions": [
+    {
+      "name": "Access: Apps and Policies Read",
+      "scope": "account",
+      "surfaces": ["access.app", "access.policy"],
+      "profiles": ["read", "hostname", "security-audit", "full-operator"]
+    },
+    {
+      "name": "Access: Apps and Policies Write",
+      "scope": "account",
+      "surfaces": ["access.app", "access.policy"],
+      "profiles": ["hostname", "full-operator"]
+    },
+    {
+      "name": "Account API Gateway Read",
+      "scope": "account",
+      "surfaces": ["vulnerability_scanner.scan", "vulnerability_scanner.target_environment", "vulnerability_scanner.credential_set"],
+      "profiles": ["read", "security-audit", "full-operator"]
+    },
+    {
+      "name": "Account Settings Read",
+      "scope": "account",
+      "surfaces": ["audit.log", "doctor", "lanes"],
+      "profiles": ["read", "deploy", "security-audit", "full-operator"]
+    },
+    {
+      "name": "Cloudflare Tunnel Read",
+      "scope": "account",
+      "surfaces": ["tunnel"],
+      "profiles": ["read", "full-operator"]
+    },
+    {
+      "name": "Cloudflare Tunnel Write",
+      "scope": "account",
+      "surfaces": ["tunnel"],
+      "profiles": ["full-operator"]
+    },
+    {
+      "name": "D1 Metadata Read",
+      "scope": "account",
+      "surfaces": ["d1.database"],
+      "profiles": ["read", "deploy", "full-operator"]
+    },
+    {
+      "name": "D1 Read",
+      "scope": "account",
+      "surfaces": ["d1.database"],
+      "profiles": ["read", "deploy", "full-operator"]
+    },
+    {
+      "name": "D1 Write",
+      "scope": "account",
+      "surfaces": ["wrangler"],
+      "profiles": ["deploy", "full-operator"]
+    },
+    {
+      "name": "Logs Read",
+      "scope": "account",
+      "surfaces": ["logpush.job"],
+      "profiles": ["read", "security-audit", "full-operator"]
+    },
+    {
+      "name": "Logs Write",
+      "scope": "account",
+      "surfaces": ["logpush.job"],
+      "profiles": ["full-operator"]
+    },
+    {
+      "name": "Pages Read",
+      "scope": "account",
+      "surfaces": ["pages.project"],
+      "profiles": ["read", "deploy", "full-operator"]
+    },
+    {
+      "name": "Pages Write",
+      "scope": "account",
+      "surfaces": ["wrangler"],
+      "profiles": ["deploy", "full-operator"]
+    },
+    {
+      "name": "Queues Read",
+      "scope": "account",
+      "surfaces": ["queue"],
+      "profiles": ["read", "deploy", "full-operator"]
+    },
+    {
+      "name": "Queues Write",
+      "scope": "account",
+      "surfaces": ["wrangler"],
+      "profiles": ["deploy", "full-operator"]
+    },
+    {
+      "name": "Turnstile Sites Read",
+      "scope": "account",
+      "surfaces": ["turnstile.widget"],
+      "profiles": ["read", "security-audit", "full-operator"]
+    },
+    {
+      "name": "Turnstile Sites Write",
+      "scope": "account",
+      "surfaces": ["turnstile.widget"],
+      "profiles": ["full-operator"]
+    },
+    {
+      "name": "Workers R2 Storage Read",
+      "scope": "account",
+      "surfaces": ["r2.bucket"],
+      "profiles": ["read", "deploy", "full-operator"]
+    },
+    {
+      "name": "Workers R2 Storage Write",
+      "scope": "account",
+      "surfaces": ["wrangler"],
+      "profiles": ["deploy", "full-operator"]
+    },
+    {
+      "name": "Workers Scripts Read",
+      "scope": "account",
+      "surfaces": ["worker.script", "workflow"],
+      "profiles": ["read", "hostname", "deploy", "full-operator"]
+    },
+    {
+      "name": "Workers Scripts Write",
+      "scope": "account",
+      "surfaces": ["wrangler"],
+      "profiles": ["deploy", "full-operator"]
+    },
+    {
+      "name": "DNS Read",
+      "scope": "zone",
+      "surfaces": ["dns.record"],
+      "profiles": ["read", "dns", "hostname", "security-audit", "full-operator"]
+    },
+    {
+      "name": "DNS Write",
+      "scope": "zone",
+      "surfaces": ["dns.record"],
+      "profiles": ["dns", "hostname", "full-operator"]
+    },
+    {
+      "name": "Domain API Gateway Read",
+      "scope": "zone",
+      "surfaces": ["api_gateway.operation", "api_gateway.schema", "api_gateway.discovery"],
+      "profiles": ["read", "security-audit", "full-operator"]
+    },
+    {
+      "name": "Logs Read",
+      "scope": "zone",
+      "surfaces": ["logpush.job"],
+      "profiles": ["read", "security-audit", "full-operator"]
+    },
+    {
+      "name": "Logs Write",
+      "scope": "zone",
+      "surfaces": ["logpush.job"],
+      "profiles": ["full-operator"]
+    },
+    {
+      "name": "SSL and Certificates Read",
+      "scope": "zone",
+      "surfaces": ["edge.certificate"],
+      "profiles": ["read", "hostname", "security-audit", "full-operator"]
+    },
+    {
+      "name": "SSL and Certificates Write",
+      "scope": "zone",
+      "surfaces": ["edge.certificate"],
+      "profiles": ["hostname", "full-operator"]
+    },
+    {
+      "name": "Waiting Rooms Read",
+      "scope": "zone",
+      "surfaces": ["waiting_room"],
+      "profiles": ["read", "security-audit", "full-operator"]
+    },
+    {
+      "name": "Waiting Rooms Write",
+      "scope": "zone",
+      "surfaces": ["waiting_room"],
+      "profiles": ["full-operator"]
+    },
+    {
+      "name": "Workers Routes Read",
+      "scope": "zone",
+      "surfaces": ["worker.route"],
+      "profiles": ["read", "hostname", "deploy", "full-operator"]
+    },
+    {
+      "name": "Workers Routes Write",
+      "scope": "zone",
+      "surfaces": ["wrangler"],
+      "profiles": ["hostname", "deploy", "full-operator"]
+    },
+    {
+      "name": "Zone Read",
+      "scope": "zone",
+      "surfaces": ["zone"],
+      "profiles": ["read", "dns", "hostname", "deploy", "security-audit", "full-operator"]
+    }
+  ]
+}

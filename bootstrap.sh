@@ -7,9 +7,10 @@
 #   2. Checks required tools: bash, jq, curl, python3.
 #   3. Checks optional tools: wrangler, cloudflared.
 #   4. Symlinks cfctl into ~/bin (or $CFCTL_BIN_DIR) if not already there.
-#   5. Scaffolds an env file at $CFCTL_ENV_FILE (default ~/dev/.env) from
+#   5. Scaffolds an env file at $CFCTL_ENV_FILE (default ~/.config/cfctl/.env) from
 #      .env.example with mode 600, but never overwrites an existing file.
-#   6. Runs `cfctl doctor` as a smoke test.
+#   6. Prints the bootstrap permission plan for the operator token.
+#   7. Runs `cfctl doctor` as a smoke test.
 #
 # What this does NOT do:
 #   - Install anything. Tool installation is up to you (homebrew, apt, etc.).
@@ -22,7 +23,7 @@
 #
 # Environment overrides:
 #   CFCTL_BIN_DIR    Where to symlink cfctl. Default: ~/bin
-#   CFCTL_ENV_FILE   Where to scaffold the env file. Default: ~/dev/.env
+#   CFCTL_ENV_FILE   Where to scaffold the env file. Default: ~/.config/cfctl/.env
 #
 # Re-running this script is safe: every step is idempotent.
 
@@ -45,7 +46,8 @@ _resolve_script() {
 SCRIPT_PATH="$(_resolve_script)"
 ROOT_DIR="$(cd -P "$(dirname "${SCRIPT_PATH}")" && pwd)"
 CFCTL_BIN_DIR="${CFCTL_BIN_DIR:-${HOME}/bin}"
-CFCTL_ENV_FILE="${CFCTL_ENV_FILE:-${HOME}/dev/.env}"
+CFCTL_CONFIG_HOME="${CFCTL_CONFIG_HOME:-${XDG_CONFIG_HOME:-${HOME}/.config}/cfctl}"
+CFCTL_ENV_FILE="${CFCTL_ENV_FILE:-${CFCTL_CONFIG_HOME}/.env}"
 CHECK_ONLY=0
 
 # ---------- output helpers (diagnostics go to stderr; stdout reserved for data) ----------
@@ -80,9 +82,10 @@ What it does (in order):
   2. Checks required tools: bash, jq, curl, python3.
   3. Checks optional tools: wrangler, cloudflared.
   4. Symlinks cfctl into ~/bin (or $CFCTL_BIN_DIR) if not already there.
-  5. Scaffolds an env file at $CFCTL_ENV_FILE (default ~/dev/.env) from
+  5. Scaffolds an env file at $CFCTL_ENV_FILE (default ~/.config/cfctl/.env) from
      .env.example with mode 600, but never overwrites an existing file.
-  6. Runs `cfctl doctor` as a smoke test.
+  6. Prints the bootstrap permission plan for the operator token.
+  7. Runs `cfctl doctor` as a smoke test.
 
 Flags:
   --check-only  Only run the tool checks; do not modify the filesystem.
@@ -90,7 +93,7 @@ Flags:
 
 Environment overrides:
   CFCTL_BIN_DIR    Where to symlink cfctl. Default: ~/bin
-  CFCTL_ENV_FILE   Where to scaffold the env file. Default: ~/dev/.env
+  CFCTL_ENV_FILE   Where to scaffold the env file. Default: ~/.config/cfctl/.env
 
 Re-running this script is safe: every step is idempotent.
 EOF
@@ -233,12 +236,31 @@ else
   info "open with your editor of choice, e.g.: \$EDITOR ${CFCTL_ENV_FILE}"
 fi
 
+# ---------- permission bootstrap plan ----------
+
+step "Planning Cloudflare permissions"
+CFCTL_BIN="${ROOT_DIR}/cfctl"
+PERMISSIONS_OUT="$(mktemp -t cfctl-bootstrap-permissions.XXXXXX)"
+if "${CFCTL_BIN}" bootstrap permissions >"${PERMISSIONS_OUT}" 2>&1; then
+  ok "bootstrap permission plan generated"
+  info "temporary bootstrap credential needs: Account API Tokens Read, Account API Tokens Write, Account Settings Read"
+  info "operator token mint plan:"
+  jq -r '.summary.plan_command' "${PERMISSIONS_OUT}" >&2
+  info "full permission evidence: $(jq -r '.artifact_path' "${PERMISSIONS_OUT}")"
+else
+  warn "could not generate bootstrap permission plan — output below:"
+  printf '%s\n' "----- permission output -----" >&2
+  cat "${PERMISSIONS_OUT}" >&2
+  printf '%s\n' "-----------------------------" >&2
+  WARNINGS=$((WARNINGS + 1))
+fi
+
 # ---------- doctor ----------
 
 step "Running cfctl doctor"
 DOCTOR_BIN="${ROOT_DIR}/cfctl"
 DOCTOR_OUT="$(mktemp -t cfctl-bootstrap-doctor.XXXXXX)"
-trap 'rm -f "${DOCTOR_OUT}"' EXIT
+trap 'rm -f "${DOCTOR_OUT}" "${PERMISSIONS_OUT:-}"' EXIT
 if "${DOCTOR_BIN}" doctor >"${DOCTOR_OUT}" 2>&1; then
   ok "cfctl doctor reports green"
 else

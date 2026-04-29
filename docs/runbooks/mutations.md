@@ -32,12 +32,12 @@ Advanced Certificate Manager public flow:
 ```bash
 cfctl standards edge.certificate
 cfctl explain edge.certificate
-cfctl guide edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
-cfctl list edge.certificate --zone jkca.me
-CF_TOKEN_LANE=global cfctl can edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --all-lanes
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me --ack-plan <operation-id>
-CF_TOKEN_LANE=global cfctl verify edge.certificate --zone jkca.me --host sub.jkca.me --host child.sub.jkca.me
+cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
+cfctl list edge.certificate --zone example.com
+CF_TOKEN_LANE=global cfctl can edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --all-lanes
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
+CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl verify edge.certificate --zone example.com --host app.example.com --host deep.app.example.com
 ```
 
 Use repeated `--host` flags for each certificate hostname. The runtime adds the zone apex automatically, then submits an Advanced Certificate Manager `type=advanced` certificate-pack order.
