@@ -11,6 +11,10 @@ Cloudflare account.
   zone categories, and Cloudflare recommends the permission-groups endpoint for
   the current permission IDs:
   <https://developers.cloudflare.com/fundamentals/api/reference/permissions/>.
+- Cloudflare Audit Logs v2 is an account API endpoint that accepts
+  `Account Settings Read` or `Account Settings Write` and supports bounded
+  `since`, `before`, and `limit` queries:
+  <https://developers.cloudflare.com/api/resources/accounts/subresources/logs/subresources/audit/methods/list/>.
 - GitHub Actions environment secrets and protection rules gate a job before it
   can access environment secrets:
   <https://docs.github.com/en/actions/concepts/workflows-and-actions/deployment-environments>.
@@ -53,7 +57,7 @@ Actions, or reused for day-to-day operations.
 
 Profile names are fixed by `catalog/permissions.json`:
 
-- `read`: default inventory and audit profile.
+- `read`: default inventory and audit profile, including `audit.log`.
 - `dns`: DNS record read/write profile for preview-gated DNS work.
 - `hostname`: composite hostname lifecycle profile for DNS, Access, routes,
   Worker, and certificate work.
@@ -75,6 +79,9 @@ Maximum TTLs are catalog-enforced:
   permissions.
 - Any new permission added to a profile must fit that profile's
   `allowed_surfaces`.
+- `Account Settings Read` is the coarse Cloudflare permission behind
+  `doctor`, `lanes`, and `audit.log`; any profile carrying it must be reviewed
+  as capable of account audit-log reads.
 - A new profile requires docs, catalog entries, verifier coverage, and a clear
   owner/use case.
 - `full-operator` is a break-glass profile. Prefer a narrower profile first,

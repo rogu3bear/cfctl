@@ -82,6 +82,7 @@ Useful reads:
 
 ```bash
 cfctl snapshot tunnel
+cfctl list audit.log
 cfctl list pages.project
 cfctl get access.app --domain docs.example.org
 cfctl list edge.certificate --zone example.com

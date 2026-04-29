@@ -35,6 +35,42 @@
         "./cfctl get zone --name example.com"
       ]
     },
+    "audit.log": {
+      "description": "Account Audit Logs v2 events for the pinned account.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_audit_logs.sh",
+      "permission_family": "Account Settings",
+      "docs_topics": ["audit-logs", "api-auth"],
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/logs/audit?limit=1"
+      },
+      "selectors": ["id", "since", "before", "actor", "action_type", "resource_type", "limit"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list audit.log",
+        "./cfctl list audit.log --since 2026-04-28T00:00:00Z --before 2026-04-29T00:00:00Z --limit 25",
+        "./cfctl get audit.log --id <audit-log-id>"
+      ]
+    },
     "pages.project": {
       "description": "Cloudflare Pages projects in the pinned account.",
       "backend": "inventory_script",

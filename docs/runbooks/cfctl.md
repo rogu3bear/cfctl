@@ -46,6 +46,7 @@ cfctl docs
 cfctl docs watch
 cfctl docs api-gateway
 cfctl docs ai-search
+cfctl list audit.log
 cfctl standards audit
 cfctl standards dns.record
 cfctl standards edge.certificate
@@ -64,6 +65,7 @@ cfctl guide edge.certificate order --zone example.com --host app.example.com --h
 cfctl hostname verify --file state/hostname/example.yaml
 cfctl hostname plan --file state/hostname/example.yaml
 cfctl list surfaces
+cfctl list audit.log
 cfctl explain access.app
 cfctl list pages.project
 cfctl get access.app --domain docs.example.org

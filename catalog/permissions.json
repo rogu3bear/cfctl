@@ -33,6 +33,7 @@
         "api_gateway.discovery",
         "api_gateway.operation",
         "api_gateway.schema",
+        "audit.log",
         "d1.database",
         "dns.record",
         "doctor",
@@ -57,6 +58,7 @@
       "verification": [
         "cfctl doctor",
         "cfctl lanes",
+        "cfctl list audit.log",
         "cfctl list zone",
         "cfctl list pages.project",
         "cfctl list worker.script"
@@ -103,6 +105,7 @@
       "risk": "write",
       "allowed_surfaces": [
         "d1.database",
+        "audit.log",
         "doctor",
         "lanes",
         "pages.project",
@@ -133,6 +136,7 @@
         "api_gateway.discovery",
         "api_gateway.operation",
         "api_gateway.schema",
+        "audit.log",
         "dns.record",
         "doctor",
         "edge.certificate",
@@ -148,6 +152,7 @@
       "forbidden_permissions": ["* Write", "* Revoke", "* Run", "Account API Tokens *"],
       "verification": [
         "cfctl doctor",
+        "cfctl list audit.log",
         "cfctl list access.app",
         "cfctl list vulnerability_scanner.scan",
         "cfctl list logpush.job"
@@ -189,7 +194,7 @@
     {
       "name": "Account Settings Read",
       "scope": "account",
-      "surfaces": ["doctor", "lanes"],
+      "surfaces": ["audit.log", "doctor", "lanes"],
       "profiles": ["read", "deploy", "security-audit", "full-operator"]
     },
     {

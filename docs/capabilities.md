@@ -13,6 +13,7 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | `api_gateway.discovery` | yes | no | no | `-` | `api-gateway, api-auth` | `-` |
 | `api_gateway.operation` | yes | no | no | `-` | `api-gateway, api-auth` | `-` |
 | `api_gateway.schema` | yes | no | no | `-` | `api-gateway, api-auth` | `-` |
+| `audit.log` | yes | no | no | `-` | `audit-logs, api-auth` | `-` |
 | `d1.database` | yes | no | no | `-` | `-` | `-` |
 | `dns.record` | yes | yes | yes | `dns.record` | `api-auth` | `dns_record` |
 | `edge.certificate` | yes | yes | no | `edge.certificate` | `advanced-certificates, api-auth` | `edge_certificate` |

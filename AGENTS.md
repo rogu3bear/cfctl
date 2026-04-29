@@ -59,6 +59,7 @@ cfctl surfaces
 cfctl docs
 cfctl docs watch
 cfctl docs ai-search
+cfctl list audit.log
 cfctl standards audit
 cfctl standards dns.record
 cfctl standards worker.errors
