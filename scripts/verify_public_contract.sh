@@ -167,9 +167,11 @@ audit_json="$(run_json success "audit trust" "${CFCTL}" audit trust)"
 assert_artifact_exists "audit trust" "${audit_json}"
 assert_json "audit trust" '.ok == true and .action == "doctor" and .summary.status != null' "${audit_json}"
 
-permission_groups_json="$(run_json success "token permission-groups" "${CFCTL}" token permission-groups --name DNS)"
+permission_groups_json="$(run_json success "token permission-groups" "${CFCTL}" token permission-groups)"
 assert_artifact_exists "token permission-groups" "${permission_groups_json}"
-assert_json "token permission-groups" '.ok == true and .action == "token.permission-groups" and ((.result.permission_groups | length) > 0)' "${permission_groups_json}"
+assert_json "token permission-groups" '.ok == true and .action == "token.permission-groups" and ((.result.permission_groups | length) > 0) and ((.result.permission_groups | map(select(.name == "DNS Read" or .name == "DNS Write")) | length) >= 2)' "${permission_groups_json}"
+permission_groups_artifact="$(jq -r '.artifact_path' <<< "${permission_groups_json}")"
+python3 "${ROOT_DIR}/scripts/verify_permission_catalog.py" --permission-groups "${permission_groups_artifact}" >/dev/null || die "permission catalog drift check failed"
 
 classify_dns_json="$(
   run_json success \

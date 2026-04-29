@@ -90,6 +90,7 @@ for surface_module in \
 done
 
 python3 "${ROOT_DIR}/scripts/render_capabilities_doc.py" --check "${ROOT_DIR}/docs/capabilities.md" >/dev/null
+python3 "${ROOT_DIR}/scripts/verify_permission_catalog.py" >/dev/null
 
 assert_jq_file "runtime public verbs" '(.public_verbs | index("docs")) != null and (.public_verbs | index("wrangler")) != null and (.public_verbs | index("cloudflared")) != null and (.public_verbs | index("hostname")) != null and (.landing_flow | index("docs")) != null' "${ROOT_DIR}/catalog/runtime.json"
 assert_jq_file "tool wrapper metadata" '
