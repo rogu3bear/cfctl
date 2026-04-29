@@ -221,15 +221,32 @@ cf_current_auth_state_json() {
     '
 }
 
+cf_clear_active_token() {
+  unset CF_ACTIVE_TOKEN_LANE
+  unset CF_ACTIVE_TOKEN_ENV
+  unset CF_ACTIVE_AUTH_SCHEME
+  unset CF_ACTIVE_AUTH_SECRET
+  unset CF_ACTIVE_API_TOKEN
+  unset CLOUDFLARE_API_TOKEN
+  unset CLOUDFLARE_API_KEY
+}
+
 cf_restore_auth_state_json() {
   local state_json="$1"
 
   local token_lane
+  local token_env
   token_lane="$(jq -r '.CF_TOKEN_LANE // empty' <<< "${state_json}")"
+  token_env="$(jq -r '.CF_ACTIVE_TOKEN_ENV // empty' <<< "${state_json}")"
   if [[ -n "${token_lane}" ]]; then
     export CF_TOKEN_LANE="${token_lane}"
   else
     unset CF_TOKEN_LANE
+  fi
+
+  if [[ -z "${token_env}" ]]; then
+    cf_clear_active_token
+    return
   fi
 
   cf_select_active_token
@@ -832,6 +849,11 @@ cf_build_curl_auth_args() {
 }
 
 cf_load_cloudflare_env() {
+  cf_load_cloudflare_env_files
+  cf_select_active_token
+}
+
+cf_load_cloudflare_env_files() {
   local shared_env_file="${CF_SHARED_ENV_FILE:-${CF_SHARED_ENV_FILE_DEFAULT}}"
   local repo_env_file="${CF_REPO_ENV_FILE:-${CF_REPO_ENV_FILE_DEFAULT}}"
 
@@ -848,8 +870,6 @@ cf_load_cloudflare_env() {
     source "${repo_env_file}"
     set +a
   fi
-
-  cf_select_active_token
 }
 
 cf_require_var() {
@@ -1003,6 +1023,31 @@ cf_api_capture() {
   local url="${path_or_url}"
   if [[ "${url}" != http://* && "${url}" != https://* ]]; then
     url="${CF_API_BASE}${path_or_url}"
+  fi
+
+  if [[ -z "${CF_ACTIVE_AUTH_SCHEME:-}" || -z "${CF_ACTIVE_AUTH_SECRET:-}" ]]; then
+    jq -n \
+      --arg method "${method}" \
+      --arg url "${url}" \
+      '
+        {
+          success: false,
+          errors: [
+            {
+              code: "credential_missing",
+              message: "No active Cloudflare credential is selected."
+            }
+          ],
+          messages: [],
+          result: null,
+          request: {
+            method: $method,
+            url: $url
+          },
+          status_code: null
+        }
+      '
+    return
   fi
 
   cf_build_curl_auth_args

@@ -19,7 +19,15 @@ source "${ROOT_DIR}/lib/runtime/cfctl.sh"
 # shellcheck disable=SC1091
 source "${ROOT_DIR}/commands/cfctl.sh"
 
-cf_load_cloudflare_env
+case "${1:-help}" in
+  help|-h|--help|doctor|audit|admin|bootstrap|surfaces|docs|standards|previews|locks|lanes|classify|guide|explain|can|wrangler|cloudflared)
+    cf_load_cloudflare_env_files
+    ;;
+  *)
+    cf_load_cloudflare_env
+    ;;
+esac
+
 cf_require_tools jq curl
 
 trap cfctl_cleanup_runtime_context EXIT

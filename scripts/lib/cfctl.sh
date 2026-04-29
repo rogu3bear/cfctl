@@ -968,6 +968,10 @@ cfctl_validate_requirements() {
 }
 
 cfctl_resolve_zone_context() {
+  if [[ -z "${CF_ACTIVE_AUTH_SCHEME:-}" || -z "${CF_ACTIVE_AUTH_SECRET:-}" ]]; then
+    return
+  fi
+
   if [[ -n "${CFCTL_ZONE_NAME}" && -z "${CFCTL_ZONE_ID}" ]]; then
     CFCTL_ZONE_ID="$(cf_resolve_zone_id "${CFCTL_ZONE_NAME}")"
   fi
@@ -1219,6 +1223,24 @@ cfctl_probe_permission() {
           status_code: null,
           errors: [],
           request: null
+        }
+      '
+    return
+  fi
+
+  if [[ -z "${CF_ACTIVE_AUTH_SCHEME:-}" || -z "${CF_ACTIVE_AUTH_SECRET:-}" ]]; then
+    jq -n \
+      --arg permission_family "$(jq -r '.permission_family' <<< "${spec}")" \
+      --argjson selector_readiness "${requirement_json}" \
+      '
+        {
+          state: "unknown",
+          permission_family: $permission_family,
+          basis: "credential_missing",
+          status_code: null,
+          errors: [],
+          request: null,
+          selector_readiness: $selector_readiness
         }
       '
     return
