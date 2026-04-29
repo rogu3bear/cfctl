@@ -38,6 +38,7 @@ cfctl doctor --repair-hints
 ./scripts/verify_public_contract.sh
 cfctl previews
 cfctl previews purge-expired
+cfctl previews purge-inactive-legacy
 cfctl locks
 cfctl locks clear-stale
 cfctl surfaces
@@ -97,6 +98,7 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - `doctor --repair-hints` emits exact cleanup and repair commands when trust is degraded
 - `previews` lists actionable, legacy, and expired preview receipts
 - `previews purge-expired` removes expired preview receipts only
+- `previews purge-inactive-legacy` removes only legacy preview receipts that lack complete trust metadata
 - `locks` lists active write locks and their stale/orphaned state
 - `locks clear-stale` removes stale/orphaned locks only
 - `wrangler` and `cloudflared` wrap the repo helpers under `cfctl` so they emit runtime artifacts and log paths

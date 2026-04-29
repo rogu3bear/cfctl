@@ -44,6 +44,7 @@ Usage:
   cfctl standards audit [root]
   cfctl previews
   cfctl previews purge-expired
+  cfctl previews purge-inactive-legacy
   cfctl locks
   cfctl locks clear-stale
   cfctl wrangler [wrangler args]
@@ -110,6 +111,7 @@ Examples:
   cfctl standards audit /path/to/workspace
   cfctl previews
   cfctl previews purge-expired
+  cfctl previews purge-inactive-legacy
   cfctl locks
   cfctl locks clear-stale
   cfctl wrangler --version
@@ -837,6 +839,30 @@ cfctl_preview_purge_expired_json() {
     '
 }
 
+cfctl_preview_purge_inactive_legacy_json() {
+  local previews_json
+  local results='[]'
+  local path
+
+  previews_json="$(cfctl_preview_rows_json)"
+  while IFS= read -r path; do
+    [[ -n "${path}" ]] || continue
+    if [[ -f "${path}" ]]; then
+      rm -f "${path}"
+      results="$(jq --arg path "${path}" '. + [{artifact_path: $path, removed: true}]' <<< "${results}")"
+    fi
+  done < <(jq -r '.previews[] | select(.expired != true and .trust_complete != true) | .artifact_path' <<< "${previews_json}")
+
+  jq -n \
+    --argjson results "${results}" \
+    '
+      {
+        purged_count: ($results | length),
+        results: $results
+      }
+    '
+}
+
 cfctl_lock_rows_json() {
   local lock_health_json
 
@@ -1381,11 +1407,26 @@ cfctl_handle_previews() {
         "${purge_json}" \
         ""
       ;;
+    purge-inactive-legacy)
+      purge_json="$(cfctl_preview_purge_inactive_legacy_json)"
+      cfctl_emit_result \
+        "true" \
+        "previews" \
+        "runtime" \
+        "runtime" \
+        "true" \
+        '{"state":"not_applicable","basis":"preview_cleanup","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
+        '{"state":"not_applicable"}' \
+        "$(jq '{purged_count: .purged_count}' <<< "${purge_json}")" \
+        "${purge_json}" \
+        ""
+      ;;
     -h|--help|help)
       cat <<'EOF'
 Usage:
   cfctl previews
   cfctl previews purge-expired
+  cfctl previews purge-inactive-legacy
 EOF
       ;;
     *)

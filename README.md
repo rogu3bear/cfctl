@@ -225,6 +225,7 @@ cfctl doctor --repair-hints
 ./scripts/verify_public_contract.sh
 cfctl previews
 cfctl previews purge-expired
+cfctl previews purge-inactive-legacy
 cfctl locks
 cfctl locks clear-stale
 cfctl admin authorizations
@@ -233,6 +234,8 @@ cfctl admin revoke-backend --path <authorization-path>
 
 - `cfctl doctor` is bootstrap-aware: zero configured token lanes is
   `bootstrap_required`, while configured-but-unhealthy lanes remain unsafe.
+- `cfctl previews purge-inactive-legacy` removes only legacy preview receipts
+  without complete trust metadata; active trusted previews are not targeted.
 - Direct API wrappers: account inventory, DNS, Access, tunnels, email routing, targeted writes.
 - `cfctl wrangler ...` via [scripts/cf_wrangler.sh](scripts/cf_wrangler.sh): wrapped wrangler with cfctl logs, artifacts, and preview gating.
 - `cfctl cloudflared ...` via [scripts/cf_cloudflared.sh](scripts/cf_cloudflared.sh): wrapped cloudflared with the same envelope.

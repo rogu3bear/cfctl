@@ -91,6 +91,10 @@ cleanup_previews_json="$(run_json success "previews purge-expired" "${CFCTL}" pr
 assert_artifact_exists "previews purge-expired" "${cleanup_previews_json}"
 assert_json "previews purge-expired" '.ok == true and .action == "previews"' "${cleanup_previews_json}"
 
+cleanup_legacy_previews_json="$(run_json success "previews purge-inactive-legacy" "${CFCTL}" previews purge-inactive-legacy)"
+assert_artifact_exists "previews purge-inactive-legacy" "${cleanup_legacy_previews_json}"
+assert_json "previews purge-inactive-legacy" '.ok == true and .action == "previews" and (.summary.purged_count // 0) >= 0' "${cleanup_legacy_previews_json}"
+
 cleanup_locks_json="$(run_json success "locks clear-stale" "${CFCTL}" locks clear-stale)"
 assert_artifact_exists "locks clear-stale" "${cleanup_locks_json}"
 assert_json "locks clear-stale" '.ok == true and .action == "locks"' "${cleanup_locks_json}"
