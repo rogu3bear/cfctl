@@ -454,6 +454,8 @@ cfctl_operation_policy_json() {
 
   if [[ "${surface}" == "token" && "${operation}" == "mint" ]]; then
     special_operation_key="token.mint"
+  elif [[ "${surface}" == "token" && "${operation}" == "revoke" ]]; then
+    special_operation_key="token.revoke"
   elif [[ "${operation}" == "sync" ]]; then
     special_operation_key="sync"
   fi
@@ -484,7 +486,7 @@ cfctl_operation_policy_json() {
           preview_required: (
             ($special_defaults.preview_required // $meta.preview_required // $risk_defaults.preview_required // false)
           ),
-          confirmation: ($meta.confirm // null),
+          confirmation: ($special_defaults.confirmation // $meta.confirm // null),
           allowed_lanes: ($special_defaults.allowed_lanes // $meta.allowed_lanes // $risk_defaults.allowed_lanes // ["dev", "global"]),
           verification_required: ($special_defaults.verification_required // $meta.verification_required // $risk_defaults.verification_required // false),
           secret_policy: ($special_defaults.secret_policy // $meta.secret_policy // $risk_defaults.secret_policy // "redacted"),

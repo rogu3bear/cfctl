@@ -29,6 +29,7 @@ Core rules:
   - High-risk previews and writes are lock-governed; do not bypass those locks.
   - Leave evidence in var/inventory/runtime/ and related var/inventory paths.
   - Token minting is sink-first. Use --value-out; stdout reveal is disabled unless runtime policy explicitly allows it.
+  - Token revocation is preview-gated and requires --confirm delete for the real mutation.
 
 Usage:
   cfctl doctor [--strict] [--repair-hints]
@@ -52,6 +53,7 @@ Usage:
   cfctl hostname verify|diff|plan|apply [--file state/hostname/<name>.yaml]
   cfctl token permission-groups [--name <filter>] [--scope <scope>]
   cfctl token mint --name <token-name> [token options]
+  cfctl token revoke --id <token-id> [--plan|--ack-plan <operation-id> --confirm delete]
   cfctl list surfaces
   cfctl explain <surface>
   cfctl classify <surface> <operation>
@@ -78,7 +80,7 @@ Verb intent:
   wrangler  Run Wrangler through the cfctl envelope, logs, and preview gate for mutating commands.
   cloudflared Run cloudflared through the cfctl envelope, logs, and preview gate for mutating commands.
   hostname Composite hostname lifecycle evidence from checked-in state/hostname specs.
-  token     List token permission groups or mint a new account-owned API token.
+  token     List token permission groups, mint, or revoke account-owned API tokens.
   list      List surfaces or resources.
   explain   Show the contract for one surface.
   classify  Explain write policy, lane fit, and confirmation rules for an operation.
@@ -127,6 +129,8 @@ Examples:
   cfctl token permission-groups --name "DNS"
   cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --plan
   cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --ack-plan <operation-id> --value-out /tmp/dns-editor.token
+  cfctl token revoke --id <token-id> --plan
+  cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete
   cfctl classify dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT
   cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120
   cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
@@ -232,6 +236,7 @@ cfctl_backend_guard_report_json() {
   local script_paths=(
     "scripts/cf_api_apply.sh"
     "scripts/cf_token_mint.sh"
+    "scripts/cf_token_revoke.sh"
     "scripts/cf_mutate_access_app.sh"
     "scripts/cf_mutate_access_policy.sh"
     "scripts/cf_mutate_dns_record.sh"
@@ -736,11 +741,11 @@ cfctl_preview_rows_json() {
   local preview_expires_epoch=""
   local trust_complete="false"
 
-  for file in "${CF_REPO_ROOT}"/var/inventory/runtime/*.json "${CF_REPO_ROOT}"/var/inventory/auth/token-mint-*.json; do
+  for file in "${CF_REPO_ROOT}"/var/inventory/runtime/*.json "${CF_REPO_ROOT}"/var/inventory/auth/token-mint-*.json "${CF_REPO_ROOT}"/var/inventory/auth/token-revoke-*.json; do
     [[ -f "${file}" ]] || continue
     if ! jq -e '
       (.action == "apply" and (.summary.plan_mode // false) == true)
-      or (.action == "token.mint" and (.planned // false) == true)
+      or ((.action == "token.mint" or .action == "token.revoke") and (.planned // false) == true)
     ' "${file}" >/dev/null 2>&1; then
       continue
     fi
@@ -773,7 +778,7 @@ cfctl_preview_rows_json() {
             artifact_path: $artifact_path,
             action: ($artifact.action // null),
             surface: (
-              if ($artifact.action // "") == "token.mint" then
+              if (($artifact.action // "") == "token.mint" or ($artifact.action // "") == "token.revoke") then
                 "token"
               else
                 ($artifact.surface // null)
@@ -782,6 +787,8 @@ cfctl_preview_rows_json() {
             operation: (
               if ($artifact.action // "") == "token.mint" then
                 "mint"
+              elif ($artifact.action // "") == "token.revoke" then
+                "revoke"
               else
                 ($artifact.operation // null)
               end
@@ -1123,30 +1130,33 @@ cfctl_registry_integrity_json() {
     ' "$(cf_runtime_catalog_path)"
   )
 
-  policy_json="$(cfctl_operation_policy_json "token" "apply" "mint")"
-  reports="$(
-    jq \
-      --argjson policy "${policy_json}" \
-      '
-        . + [{
-          surface: "token",
-          operation: "mint",
-          policy: $policy,
-          complete: (
-            ($policy.risk // null) != null
-            and ($policy.preview_required // null) != null
-            and ($policy.allowed_lanes | type == "array" and ($policy.allowed_lanes | length) > 0)
-            and ($policy.verification_required // null) != null
-            and ($policy.secret_policy // null) != null
-            and ($policy.lock_strategy // null) != null
-            and ($policy.preview_ttl_seconds // null) != null
-            and ($policy.public_example // null) != null
-            and ($policy.troubleshooting_hint // null) != null
-          )
-        }]
-      ' \
-      <<< "${reports}"
-  )"
+  for operation in mint revoke; do
+    policy_json="$(cfctl_operation_policy_json "token" "apply" "${operation}")"
+    reports="$(
+      jq \
+        --arg operation "${operation}" \
+        --argjson policy "${policy_json}" \
+        '
+          . + [{
+            surface: "token",
+            operation: $operation,
+            policy: $policy,
+            complete: (
+              ($policy.risk // null) != null
+              and ($policy.preview_required // null) != null
+              and ($policy.allowed_lanes | type == "array" and ($policy.allowed_lanes | length) > 0)
+              and ($policy.verification_required // null) != null
+              and ($policy.secret_policy // null) != null
+              and ($policy.lock_strategy // null) != null
+              and ($policy.preview_ttl_seconds // null) != null
+              and ($policy.public_example // null) != null
+              and ($policy.troubleshooting_hint // null) != null
+            )
+          }]
+        ' \
+        <<< "${reports}"
+    )"
+  done
 
   jq -n \
     --argjson checks "${reports}" \
@@ -1164,11 +1174,11 @@ cfctl_preview_receipt_health_json() {
   local preview_expires_at
   local expired
 
-  for file in "${CF_REPO_ROOT}"/var/inventory/runtime/*.json "${CF_REPO_ROOT}"/var/inventory/auth/token-mint-*.json; do
+  for file in "${CF_REPO_ROOT}"/var/inventory/runtime/*.json "${CF_REPO_ROOT}"/var/inventory/auth/token-mint-*.json "${CF_REPO_ROOT}"/var/inventory/auth/token-revoke-*.json; do
     [[ -f "${file}" ]] || continue
     if ! jq -e '
       (.action == "apply" and (.summary.plan_mode // false) == true)
-      or (.action == "token.mint" and (.planned // false) == true)
+      or ((.action == "token.mint" or .action == "token.revoke") and (.planned // false) == true)
     ' "${file}" >/dev/null 2>&1; then
       continue
     fi
@@ -1499,20 +1509,26 @@ cfctl_handle_classify() {
   local target_action="apply"
   local operation="${requested_operation}"
 
-  if [[ "${surface}" == "token" && "${requested_operation}" == "mint" ]]; then
-    policy_json="$(cfctl_operation_policy_json "token" "apply" "mint")"
-    public_example="$(jq -r '.public_example // "cfctl token mint --name <token-name> --permission \"<Permission>\" --ttl-hours 24 --plan"' <<< "${policy_json}")"
-    troubleshooting_hint="$(jq -r '.troubleshooting_hint // "Use --value-out <absolute path> for real token delivery. Stdout reveal is policy-gated."' <<< "${policy_json}")"
+  if [[ "${surface}" == "token" && ( "${requested_operation}" == "mint" || "${requested_operation}" == "revoke" ) ]]; then
+    policy_json="$(cfctl_operation_policy_json "token" "apply" "${requested_operation}")"
+    if [[ "${requested_operation}" == "mint" ]]; then
+      public_example="$(jq -r '.public_example // "cfctl token mint --name <token-name> --permission \"<Permission>\" --ttl-hours 24 --plan"' <<< "${policy_json}")"
+      troubleshooting_hint="$(jq -r '.troubleshooting_hint // "Use --value-out <absolute path> for real token delivery. Stdout reveal is policy-gated."' <<< "${policy_json}")"
+    else
+      public_example="$(jq -r '.public_example // "cfctl token revoke --id <token-id> --plan"' <<< "${policy_json}")"
+      troubleshooting_hint="$(jq -r '.troubleshooting_hint // "Preview the token metadata first, then ack with --confirm delete."' <<< "${policy_json}")"
+    fi
     result_json="$(
       jq -n \
       --argjson policy "${policy_json}" \
+      --arg operation "${requested_operation}" \
       --arg public_example "${public_example}" \
       --arg troubleshooting_hint "${troubleshooting_hint}" \
         '
           {
             surface: "token",
             action: "token",
-            operation: "mint",
+            operation: $operation,
             policy: $policy,
             lane_comparison: null,
             current_permission_probe: null,
@@ -1536,7 +1552,7 @@ cfctl_handle_classify() {
       "" \
       "" \
       "" \
-      "mint"
+      "${requested_operation}"
     return
   fi
 
@@ -1721,6 +1737,54 @@ cfctl_handle_guide() {
       "" \
       "" \
       "mint"
+    return
+  fi
+
+  if [[ "${surface}" == "token" && "${requested_operation}" == "revoke" ]]; then
+    local token_policy_json
+    token_policy_json="$(cfctl_operation_policy_json "token" "apply" "revoke")"
+    preview_command="cfctl token revoke${args_shell} --plan"
+    apply_command="cfctl token revoke${args_shell} --ack-plan <operation-id> --confirm delete"
+    troubleshooting_hint="$(jq -r '.troubleshooting_hint // "Preview the token metadata first, then ack with --confirm delete."' <<< "${token_policy_json}")"
+    guide_json="$(
+      jq -n \
+        --arg preview_command "${preview_command}" \
+        --arg apply_command "${apply_command}" \
+        --argjson policy "${token_policy_json}" \
+        --arg troubleshooting_hint "${troubleshooting_hint}" \
+        '
+          {
+            surface: "token",
+            operation: "revoke",
+            policy: $policy,
+            steps: [
+              "Resolve the account API token id from private deployment notes or token inventory.",
+              "Run the preview command and inspect token id/name/status/expiry metadata.",
+              "For a real revocation, rerun with --ack-plan and --confirm delete.",
+              "Use the emitted artifact as revocation proof; it must not contain token secret values."
+            ],
+            troubleshooting_hint: $troubleshooting_hint,
+            commands: {
+              preview: $preview_command,
+              apply: $apply_command
+            }
+          }
+        '
+    )"
+    cfctl_emit_result \
+      "true" \
+      "guide" \
+      "token" \
+      "registry" \
+      "true" \
+      '{"state":"not_applicable","basis":"token_policy","errors":[],"request":null,"status_code":null,"permission_family":"Account API Tokens"}' \
+      '{"state":"not_applicable"}' \
+      "$(jq '.commands' <<< "${guide_json}")" \
+      "${guide_json}" \
+      "" \
+      "" \
+      "" \
+      "revoke"
     return
   fi
 
@@ -3507,17 +3571,24 @@ cfctl_handle_token() {
       shift || true
       exec env CF_RUNTIME_CALLER=cfctl "${CF_REPO_ROOT}/scripts/cf_token_mint.sh" "$@"
       ;;
+    revoke)
+      shift || true
+      exec env CF_RUNTIME_CALLER=cfctl "${CF_REPO_ROOT}/scripts/cf_token_revoke.sh" "$@"
+      ;;
     ""|-h|--help|help)
       cat <<'EOF'
 Usage:
   cfctl token permission-groups [--name <filter>] [--scope <scope>]
   cfctl token mint --name <token-name> [token options]
+  cfctl token revoke --id <token-id> [--plan|--ack-plan <operation-id> --confirm delete]
 
 Examples:
   cfctl token permission-groups --name "DNS"
   cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --plan
   cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --ack-plan <operation-id> --value-out /tmp/dns-editor.token
   cfctl token mint --name account-audit --permission "Account Settings Read" --ttl-hours 24 --plan
+  cfctl token revoke --id <token-id> --plan
+  cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete
 EOF
       ;;
     *)
