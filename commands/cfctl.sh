@@ -3693,23 +3693,44 @@ cfctl_bootstrap_verification_matrix_json() {
     --arg zone "${zone}" \
     --argjson commands "${verification_json}" \
     '
+      (
+        if $zone == "" and (($commands | map(select(test("<zone>"))) | length) > 0) then
+          [{
+            code: "zone_required",
+            message: "Pass --zone <zone> to render all profile verification commands."
+          }]
+        else
+          []
+        end
+      ) as $blocked
+      |
       {
         profile: $profile,
         zone: (if $zone == "" then null else $zone end),
-        runnable_now: ($zone != ""),
+        runnable_now: (($blocked | length) == 0),
         commands: $commands,
-        blocked: (
-          if $zone == "" and (($commands | map(select(test("<zone>"))) | length) > 0) then
-            [{
-              code: "zone_required",
-              message: "Pass --zone <zone> to render all profile verification commands."
-            }]
-          else
-            []
-          end
-        )
+        blocked: $blocked
       }
     '
+}
+
+cfctl_bootstrap_require_value() {
+  local flag="$1"
+  local value="${2:-}"
+
+  if [[ -z "${value}" || "${value}" == --* ]]; then
+    echo "${flag} requires a value" >&2
+    exit 1
+  fi
+}
+
+cfctl_bootstrap_validate_ttl_hours() {
+  local ttl_hours="$1"
+
+  if ! [[ "${ttl_hours}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--ttl-hours must be a positive integer" >&2
+    exit 1
+  fi
 }
 
 cfctl_handle_bootstrap() {
@@ -3737,43 +3758,55 @@ cfctl_handle_bootstrap() {
       while [[ "$#" -gt 0 ]]; do
         case "$1" in
           --profile)
+            cfctl_bootstrap_require_value "$1" "${2:-}"
             profile="$2"
             shift 2
             ;;
           --profile=*)
             profile="${1#*=}"
+            cfctl_bootstrap_require_value "--profile" "${profile}"
             shift
             ;;
           --zone)
+            cfctl_bootstrap_require_value "$1" "${2:-}"
             zone="$2"
             shift 2
             ;;
           --zone=*)
             zone="${1#*=}"
+            cfctl_bootstrap_require_value "--zone" "${zone}"
             shift
             ;;
           --zone-id)
+            cfctl_bootstrap_require_value "$1" "${2:-}"
             zone_id="$2"
             shift 2
             ;;
           --zone-id=*)
             zone_id="${1#*=}"
+            cfctl_bootstrap_require_value "--zone-id" "${zone_id}"
             shift
             ;;
           --ttl-hours)
+            cfctl_bootstrap_require_value "$1" "${2:-}"
             ttl_hours="$2"
+            cfctl_bootstrap_validate_ttl_hours "${ttl_hours}"
             shift 2
             ;;
           --ttl-hours=*)
             ttl_hours="${1#*=}"
+            cfctl_bootstrap_require_value "--ttl-hours" "${ttl_hours}"
+            cfctl_bootstrap_validate_ttl_hours "${ttl_hours}"
             shift
             ;;
           --name)
+            cfctl_bootstrap_require_value "$1" "${2:-}"
             token_name="$2"
             shift 2
             ;;
           --name=*)
             token_name="${1#*=}"
+            cfctl_bootstrap_require_value "--name" "${token_name}"
             shift
             ;;
           *)
@@ -3785,6 +3818,12 @@ cfctl_handle_bootstrap() {
 
       if [[ -z "${profile}" ]]; then
         profile="${CFCTL_BOOTSTRAP_PROFILE:-$(cfctl_bootstrap_default_profile)}"
+      fi
+      cfctl_bootstrap_require_value "profile" "${profile}"
+
+      if [[ -n "${zone}" && -n "${zone_id}" ]]; then
+        echo "Pass only one of --zone or --zone-id" >&2
+        exit 1
       fi
 
       if ! cfctl_bootstrap_profile_exists "${profile}"; then
@@ -3802,6 +3841,7 @@ cfctl_handle_bootstrap() {
       if [[ -z "${ttl_hours}" ]]; then
         ttl_hours="${CFCTL_BOOTSTRAP_TTL_HOURS:-$(jq -r '.operator_token.profile_meta.ttl_hours // 720' <<< "${requirements_json}")}"
       fi
+      cfctl_bootstrap_validate_ttl_hours "${ttl_hours}"
       token_name_shell="$(jq -nr --arg token_name "${token_name}" '$token_name | @sh')"
       permission_flags="$(cfctl_bootstrap_permission_flags "${permissions_json}" "${validation_json}")"
       resource_flags="$(cfctl_bootstrap_resource_flags "${permissions_json}" "${zone}" "${zone_id}")"

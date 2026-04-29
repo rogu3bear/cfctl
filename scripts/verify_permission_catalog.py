@@ -2,7 +2,10 @@
 
 import argparse
 import json
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -221,14 +224,29 @@ def validate_operator_permission(
     require(not missing_profiles, f"permissions[{index}] {name} references unknown profiles: {missing_profiles}")
 
 
-def validate_command_fixtures(catalog: dict) -> None:
-    expected = {
-        ("dns", "example.com", "", "", None): (
+def validate_command_fixtures(catalog: dict) -> list[dict]:
+    fixtures = [
+        {
+            "profile": "dns",
+            "zone": "example.com",
+            "zone_id": "",
+            "token_name": "",
+            "ttl_hours": None,
+            "args": ["bootstrap", "permissions", "--profile", "dns", "--zone", "example.com"],
+            "expected": (
             "cfctl token mint --name 'cfctl-dns-operator' --permission 'DNS Read' "
             "--permission 'DNS Write' --permission 'Zone Read' --zone 'example.com' "
             "--ttl-hours 168 --plan"
-        ),
-        ("hostname", "example.com", "", "", None): (
+            ),
+        },
+        {
+            "profile": "hostname",
+            "zone": "example.com",
+            "zone_id": "",
+            "token_name": "",
+            "ttl_hours": None,
+            "args": ["bootstrap", "permissions", "--profile", "hostname", "--zone", "example.com"],
+            "expected": (
             "cfctl token mint --name 'cfctl-hostname-operator' "
             "--permission 'Access: Apps and Policies Read' "
             "--permission 'Access: Apps and Policies Write' --permission 'DNS Read' "
@@ -236,8 +254,23 @@ def validate_command_fixtures(catalog: dict) -> None:
             "--permission 'SSL and Certificates Write' --permission 'Workers Routes Read' "
             "--permission 'Workers Routes Write' --permission 'Workers Scripts Read' "
             "--permission 'Zone Read' --zone 'example.com' --ttl-hours 168 --plan"
-        ),
-        ("deploy", "", "023e105f4ecef8ad9ca31a8372d0c353", "", None): (
+            ),
+        },
+        {
+            "profile": "deploy",
+            "zone": "",
+            "zone_id": "023e105f4ecef8ad9ca31a8372d0c353",
+            "token_name": "",
+            "ttl_hours": None,
+            "args": [
+                "bootstrap",
+                "permissions",
+                "--profile",
+                "deploy",
+                "--zone-id",
+                "023e105f4ecef8ad9ca31a8372d0c353",
+            ],
+            "expected": (
             "cfctl token mint --name 'cfctl-deploy-operator' --permission 'Account Settings Read' "
             "--permission 'D1 Metadata Read' --permission 'D1 Read' --permission 'D1 Write' "
             "--permission 'Pages Read' --permission 'Pages Write' --permission 'Queues Read' "
@@ -246,19 +279,23 @@ def validate_command_fixtures(catalog: dict) -> None:
             "--permission 'Workers Routes Write' --permission 'Workers Scripts Read' "
             "--permission 'Workers Scripts Write' --permission 'Zone Read' "
             "--zone-id '023e105f4ecef8ad9ca31a8372d0c353' --ttl-hours 168 --plan"
-        ),
-    }
+            ),
+        },
+    ]
 
-    for (profile, zone, zone_id, token_name, ttl_hours), expected_command in expected.items():
+    for fixture in fixtures:
         command = render_plan_command(
             catalog,
-            profile,
-            zone=zone,
-            zone_id=zone_id,
-            token_name=token_name,
-            ttl_hours=ttl_hours,
+            fixture["profile"],
+            zone=fixture["zone"],
+            zone_id=fixture["zone_id"],
+            token_name=fixture["token_name"],
+            ttl_hours=fixture["ttl_hours"],
         )
-        require(command == expected_command, f"{profile} fixture drifted:\nexpected: {expected_command}\nactual:   {command}")
+        require(
+            command == fixture["expected"],
+            f"{fixture['profile']} fixture drifted:\nexpected: {fixture['expected']}\nactual:   {command}",
+        )
 
     read_command = render_plan_command(catalog, "read")
     require("--all-zones-in-account" in read_command, "read fixture must include zone resource coverage")
@@ -268,6 +305,113 @@ def validate_command_fixtures(catalog: dict) -> None:
     full_operator_command = render_plan_command(catalog, "full-operator")
     require("Account API Tokens" not in full_operator_command, "full-operator fixture must not include token-minting permissions")
     require("--ttl-hours 168 --plan" in full_operator_command, "full-operator fixture must use 168-hour ttl")
+
+    return fixtures
+
+
+def credentialless_cfctl_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for key in (
+        "CF_DEV_TOKEN",
+        "CF_GLOBAL_TOKEN",
+        "CLOUDFLARE_ACCOUNT_ID",
+        "CLOUDFLARE_API_TOKEN",
+        "CLOUDFLARE_API_KEY",
+        "CF_ACTIVE_AUTH_SECRET",
+        "CF_ACTIVE_AUTH_SCHEME",
+        "CF_ACTIVE_TOKEN_ENV",
+        "CF_ACTIVE_TOKEN_LANE",
+    ):
+        env.pop(key, None)
+    return env
+
+
+def run_cfctl_json(cfctl: Path, args: list[str], env: dict[str, str]) -> dict:
+    process = subprocess.run(
+        [str(cfctl), *args],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    require(
+        process.returncode == 0,
+        f"cfctl {' '.join(args)} failed with exit {process.returncode}: {process.stderr.strip()}",
+    )
+    try:
+        return json.loads(process.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f"cfctl {' '.join(args)} did not return JSON: {exc}: {process.stdout[:500]}")
+
+
+def run_cfctl_failure(cfctl: Path, args: list[str], env: dict[str, str], expected_stderr: str) -> None:
+    process = subprocess.run(
+        [str(cfctl), *args],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    require(process.returncode != 0, f"cfctl {' '.join(args)} unexpectedly succeeded")
+    require(
+        expected_stderr in process.stderr,
+        f"cfctl {' '.join(args)} stderr did not include {expected_stderr!r}: {process.stderr.strip()}",
+    )
+
+
+def validate_cfctl_fixtures(catalog: dict, cfctl: Path) -> None:
+    fixtures = validate_command_fixtures(catalog)
+    require(cfctl.exists(), f"cfctl path does not exist: {cfctl}")
+
+    with tempfile.TemporaryDirectory(prefix="cfctl-permission-catalog.") as tmp_dir:
+        env = credentialless_cfctl_env()
+        shared_env = Path(tmp_dir) / "empty.env"
+        shared_env.write_text("")
+        env["CF_SHARED_ENV_FILE"] = str(shared_env)
+        env["CF_REPO_ENV_FILE"] = str(Path(tmp_dir) / "missing.env")
+
+        for fixture in fixtures:
+            payload = run_cfctl_json(cfctl, fixture["args"], env)
+            plan_command = payload.get("summary", {}).get("plan_command")
+            require(
+                plan_command == fixture["expected"],
+                (
+                    f"cfctl fixture {fixture['profile']} drifted:\n"
+                    f"expected: {fixture['expected']}\nactual:   {plan_command}"
+                ),
+            )
+
+        read_payload = run_cfctl_json(cfctl, ["bootstrap", "verify", "--profile", "read"], env)
+        require(
+            read_payload.get("result", {}).get("verification", {}).get("runnable_now") is True,
+            "read-profile bootstrap verification should be runnable without a zone",
+        )
+
+        run_cfctl_failure(cfctl, ["bootstrap", "permissions", "--profile"], env, "--profile requires a value")
+        run_cfctl_failure(
+            cfctl,
+            ["bootstrap", "permissions", "--profile", "dns", "--zone", "example.com", "--zone-id", "023e105f4ecef8ad9ca31a8372d0c353"],
+            env,
+            "Pass only one of --zone or --zone-id",
+        )
+        run_cfctl_failure(
+            cfctl,
+            ["bootstrap", "permissions", "--profile", "dns", "--ttl-hours", "24 --reveal-token-once"],
+            env,
+            "--ttl-hours must be a positive integer",
+        )
+        env_with_bad_ttl = env.copy()
+        env_with_bad_ttl["CFCTL_BOOTSTRAP_TTL_HOURS"] = "24 --reveal-token-once"
+        run_cfctl_failure(
+            cfctl,
+            ["bootstrap", "permissions", "--profile", "dns"],
+            env_with_bad_ttl,
+            "--ttl-hours must be a positive integer",
+        )
 
 
 def extract_permission_groups(path: Path) -> list[dict]:
@@ -311,6 +455,11 @@ def main() -> None:
         type=Path,
         help="Optional cfctl token permission-groups artifact used for live drift validation.",
     )
+    parser.add_argument(
+        "--cfctl",
+        type=Path,
+        help="Optional cfctl executable used to compare command fixtures against real bootstrap output.",
+    )
     args = parser.parse_args()
 
     catalog = load_json(CATALOG_PATH)
@@ -321,6 +470,8 @@ def main() -> None:
     validate_command_fixtures(catalog)
     if args.permission_groups is not None:
         validate_against_permission_groups(catalog, args.permission_groups)
+    if args.cfctl is not None:
+        validate_cfctl_fixtures(catalog, args.cfctl)
 
     print("permission-catalog verification passed")
 

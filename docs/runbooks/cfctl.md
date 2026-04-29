@@ -110,7 +110,7 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - `token mint --reveal-token-once` remains policy-gated and is disabled in the default runtime policy
 - `bootstrap permissions` reads `catalog/permissions.json` and emits the temporary bootstrap credential requirements plus profile-scoped operator-token mint commands
 - `bootstrap permissions --profile <profile>` supports `read`, `dns`, `hostname`, `deploy`, `security-audit`, and `full-operator`
-- `scripts/verify_permission_catalog.py` checks the permission catalog shape, profile command fixtures, and optional live permission-group drift
+- `scripts/verify_permission_catalog.py` checks the permission catalog shape, profile command fixtures, optional real `cfctl` bootstrap output, and optional live permission-group drift
 - `admin authorize-backend` issues a short-lived backend authorization file for maintainer/debug direct script use
 - `admin authorizations` lists active and expired backend authorizations
 - `admin revoke-backend --path ...` removes one authorization artifact

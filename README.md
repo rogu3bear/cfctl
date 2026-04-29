@@ -161,7 +161,8 @@ long enough to mint the day-to-day `CF_DEV_TOKEN`.
 `./scripts/verify_static_contract.sh` validates the permission catalog schema
 and deterministic profile command fixtures. `./scripts/verify_public_contract.sh`
 adds a live drift check by comparing the catalog against Cloudflare's current
-permission-group inventory.
+permission-group inventory. For a credentialless runtime-output check, run
+`python3 scripts/verify_permission_catalog.py --cfctl ./cfctl`.
 
 See [docs/runbooks/cfctl.md](docs/runbooks/cfctl.md) and [docs/capabilities.md](docs/capabilities.md) for the full reference.
 
