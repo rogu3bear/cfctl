@@ -365,6 +365,7 @@ def run_cfctl_failure(cfctl: Path, args: list[str], env: dict[str, str], expecte
 
 def validate_cfctl_fixtures(catalog: dict, cfctl: Path) -> None:
     fixtures = validate_command_fixtures(catalog)
+    cfctl = cfctl.resolve()
     require(cfctl.exists(), f"cfctl path does not exist: {cfctl}")
 
     with tempfile.TemporaryDirectory(prefix="cfctl-permission-catalog.") as tmp_dir:
