@@ -26,6 +26,26 @@ assert_jq_file() {
   jq -e "${expr}" "${file}" >/dev/null || die "${label}: assertion failed for ${file}: ${expr}"
 }
 
+assert_cross_catalog_empty() {
+  local label="$1"
+  local expr="$2"
+  local failures
+
+  failures="$(
+    jq -c -n \
+      --slurpfile runtime "${ROOT_DIR}/catalog/runtime.json" \
+      --slurpfile surfaces "${ROOT_DIR}/catalog/surfaces.json" \
+      --slurpfile standards "${ROOT_DIR}/catalog/standards.json" \
+      --slurpfile docs "${ROOT_DIR}/catalog/cloudflare-doc-bank.json" \
+      --slurpfile ownership "${ROOT_DIR}/state/ownership/resources.json" \
+      "${expr}"
+  )"
+
+  if ! jq -e 'length == 0' <<< "${failures}" >/dev/null; then
+    die "${label}: ${failures}"
+  fi
+}
+
 assert_contains() {
   local label="$1"
   local needle="$2"
@@ -126,6 +146,20 @@ assert_jq_file "permission profile minimality policy" '
   and (.profiles["full-operator"].forbidden_permissions | index("Account API Tokens *")) != null
 ' "${ROOT_DIR}/catalog/permissions.json"
 assert_jq_file "runtime public verbs" '(.public_verbs | index("docs")) != null and (.public_verbs | index("wrangler")) != null and (.public_verbs | index("cloudflared")) != null and (.public_verbs | index("hostname")) != null and (.landing_flow | index("docs")) != null' "${ROOT_DIR}/catalog/runtime.json"
+assert_jq_file "runtime backend guard catalog" '
+  .policy.backend_guard_scripts == ["scripts/cf_api_apply.sh"]
+  and .policy.special_operations["token.mint"].backend_script == "scripts/cf_token_mint.sh"
+  and .policy.special_operations["token.revoke"].backend_script == "scripts/cf_token_revoke.sh"
+' "${ROOT_DIR}/catalog/runtime.json"
+assert_jq_file "runtime ownership registry catalog" '
+  .ownership_registry.path == "state/ownership/resources.json"
+  and .ownership_registry.duplicate_resource_policy == "fail"
+  and (.ownership_registry.proof_classes | index("source_config")) != null
+  and (.ownership_registry.proof_classes | index("live_control_plane_read")) != null
+  and (.ownership_registry.proof_classes | index("preview_artifact")) != null
+  and (.ownership_registry.proof_classes | index("apply_artifact")) != null
+  and (.ownership_registry.proof_classes | index("post_change_verification")) != null
+' "${ROOT_DIR}/catalog/runtime.json"
 assert_jq_file "tool wrapper metadata" '
   .tool_wrappers.wrangler.script == "scripts/cf_wrangler.sh"
   and .tool_wrappers.wrangler.backend == "wrangler"
@@ -135,12 +169,224 @@ assert_jq_file "tool wrapper metadata" '
   and .tool_wrappers.cloudflared.backend == "cloudflared"
   and (.tool_wrappers.cloudflared.default_args | index("version")) != null
   and (.tool_wrappers.cloudflared.read_only_prefixes | map(join(" ")) | index("tunnel list")) != null
+  and (.tool_wrappers.cloudflared.read_only_prefixes | map(join(" ")) | index("tunnel token")) == null
 ' "${ROOT_DIR}/catalog/runtime.json"
 assert_jq_file "docs bank shape" '.checked_on != null and .refresh_policy.refresh_interval_days > 0 and (.foundation | length) > 0 and (.watch | length) > 0' "${ROOT_DIR}/catalog/cloudflare-doc-bank.json"
 assert_jq_file "docs bank api gateway topic" '(.foundation | any(.id == "api-gateway")) and (.foundation | any(.id == "audit-logs")) and (.watch | any(.id == "api-shield-vulnerability-scanner"))' "${ROOT_DIR}/catalog/cloudflare-doc-bank.json"
 assert_jq_file "standards shape" '(.universal | length) > 0 and (.surfaces | keys | length) > 0' "${ROOT_DIR}/catalog/standards.json"
 assert_jq_file "compatibility freshness thresholds" '.audit.compatibility_date_freshness.note_after_days == 30 and .audit.compatibility_date_freshness.warning_after_days == 90' "${ROOT_DIR}/catalog/standards.json"
 assert_jq_file "surface registry shape" '(.surfaces | keys | length) > 0' "${ROOT_DIR}/catalog/surfaces.json"
+assert_jq_file "ownership registry shape" '
+  .version == 1
+  and (.resources | type == "array")
+  and (.resources | length) > 0
+' "${ROOT_DIR}/state/ownership/resources.json"
+assert_cross_catalog_empty "ownership resource ids are unique" '
+  [
+    ($ownership[0].resources // [])
+    | group_by(.id)
+    | .[]?
+    | select(length > 1)
+    | {id: .[0].id, duplicate_count: length}
+  ]
+'
+assert_cross_catalog_empty "ownership resource keys are unique" '
+  [
+    ($ownership[0].resources // [])
+    | group_by(.resource_key)
+    | .[]?
+    | select(length > 1)
+    | {resource_key: .[0].resource_key, owners: map(.owner)}
+  ]
+'
+assert_cross_catalog_empty "ownership resources are complete" '
+  ($runtime[0].ownership_registry.proof_classes // []) as $proof_classes
+  | [
+      ($ownership[0].resources // [])[] as $entry
+      | $entry
+      | select(
+          (.id // "") == ""
+          or (.resource_key // "") == ""
+          or (.resource.cloudflare_surface // "") == ""
+          or (.owner.system // "") == ""
+          or (.owner.repo // "") == ""
+          or (.deploy_lane.default // "") == ""
+          or ((.secrets.env // []) | length) == 0
+          or (.authority.control_plane // "") != "cfctl"
+          or ((.authority.allowed_change_commands // []) | length) == 0
+          or (.authority.verifier // "") == ""
+          or (($proof_classes | index($entry.authority.proof_class // "")) == null)
+          or (.incident_runbook // "") == ""
+        )
+      | {resource: (.id // null), issue: "incomplete_ownership_entry"}
+    ]
+'
+assert_cross_catalog_empty "ownership surfaces resolve" '
+  ($surfaces[0].surfaces // {}) as $surface_catalog
+  | ($runtime[0].desired_state // {}) as $desired_state
+  | [
+      ($ownership[0].resources // [])[]
+      | .resource.cloudflare_surface as $surface
+      | select($surface_catalog[$surface] == null and $desired_state[$surface] == null)
+      | {resource: .id, missing_surface: $surface}
+    ]
+'
+assert_cross_catalog_empty "ownership command path is cfctl" '
+  [
+    ($ownership[0].resources // [])[] as $entry
+    | $entry.id as $id
+    | (
+        ($entry.authority.allowed_change_commands // [])[]
+        | select(test("^(CF_TOKEN_LANE=[a-z]+ )?(\\./)?cfctl ") | not)
+        | {resource: $id, invalid_change_command: .}
+      ),
+      (
+        ($entry.authority.verifier // "")
+        | select(test("^(CF_TOKEN_LANE=[a-z]+ )?(\\./)?cfctl ") | not)
+        | {resource: $id, invalid_verifier: .}
+      )
+    ]
+'
+assert_cross_catalog_empty "ownership repo ids are portable" '
+  [
+    ($ownership[0].resources // [])[]
+    | select((.owner.repo // "") | test("^/|^~|/Users/"))
+    | {resource: .id, repo: .owner.repo}
+  ]
+'
+assert_cross_catalog_empty "surface docs topics resolve to docs bank" '
+  (
+    ["foundation", "watch"]
+    + (($docs[0].foundation // []) | map(.id))
+    + (($docs[0].watch // []) | map(.id))
+    | unique
+  ) as $known_topics
+  | [
+      ($surfaces[0].surfaces // {})
+      | to_entries[]
+      | .key as $surface
+      | (.value.docs_topics // [])[]?
+      | select(($known_topics | index(.)) == null)
+      | {surface: $surface, missing_docs_topic: .}
+    ]
+'
+assert_cross_catalog_empty "docs bank topic ids are unique" '
+  [
+    (($docs[0].foundation // []) + ($docs[0].watch // []))
+    | group_by(.id)
+    | .[]?
+    | select(length > 1)
+    | {docs_topic: .[0].id, duplicate_count: length}
+  ]
+'
+assert_cross_catalog_empty "surface standards refs resolve to standards catalog" '
+  ($standards[0].surfaces // {}) as $standards_surfaces
+  | [
+      ($surfaces[0].surfaces // {})
+      | to_entries[]
+      | select((.value.standards_ref // "") != "")
+      | select($standards_surfaces[.value.standards_ref] == null)
+      | {surface: .key, missing_standards_ref: .value.standards_ref}
+    ]
+'
+assert_cross_catalog_empty "desired-state surfaces resolve to public surface catalog" '
+  ($surfaces[0].surfaces // {}) as $surface_catalog
+  | [
+      ($runtime[0].desired_state // {})
+      | to_entries[]
+      | select(.key != "hostname")
+      | select($surface_catalog[.key] == null)
+      | {desired_state_surface: .key, issue: "missing_surface_catalog_entry"}
+    ]
+'
+assert_cross_catalog_empty "desired-state state dirs are unique" '
+  [
+    ($runtime[0].desired_state // {})
+    | to_entries
+    | group_by(.value.state_dir)
+    | .[]?
+    | select(length > 1)
+    | {state_dir: .[0].value.state_dir, surfaces: map(.key)}
+  ]
+'
+assert_cross_catalog_empty "cataloged backend guard scripts are unique" '
+  [
+    (
+      [
+        ($runtime[0].policy.backend_guard_scripts // [])[],
+        (
+          ($runtime[0].policy.special_operations // {})
+          | to_entries[]
+          | .value.backend_script // empty
+        ),
+        (
+          ($surfaces[0].surfaces // {})
+          | to_entries[]
+          | select(.value.actions.apply.supported == true)
+          | .value.apply_script // empty
+        )
+      ]
+    )
+    | group_by(.)
+    | .[]?
+    | select(length > 1)
+    | {backend_script: .[0], duplicate_count: length}
+  ]
+'
+assert_cross_catalog_empty "cataloged writable surfaces declare backend scripts" '
+  [
+    ($surfaces[0].surfaces // {})
+    | to_entries[]
+    | select(.value.actions.apply.supported == true)
+    | select((.value.apply_script // "") == "")
+    | {surface: .key, issue: "missing_apply_script"}
+  ]
+'
+while IFS=$'\t' read -r source_key backend_script; do
+  [[ -n "${source_key}" ]] || continue
+  [[ -f "${ROOT_DIR}/${backend_script}" ]] || die "cataloged backend script ${source_key}: missing ${backend_script}"
+  if command -v rg >/dev/null 2>&1; then
+    rg -q 'cf_require_backend_dispatch' "${ROOT_DIR}/${backend_script}" || die "cataloged backend script ${source_key}: ${backend_script} lacks cf_require_backend_dispatch"
+  else
+    grep -q 'cf_require_backend_dispatch' "${ROOT_DIR}/${backend_script}" || die "cataloged backend script ${source_key}: ${backend_script} lacks cf_require_backend_dispatch"
+  fi
+done < <(
+  jq -r -n \
+    --slurpfile runtime "${ROOT_DIR}/catalog/runtime.json" \
+    --slurpfile surfaces "${ROOT_DIR}/catalog/surfaces.json" \
+    '
+      (
+        [
+          ($runtime[0].policy.backend_guard_scripts // [])[]
+          | ["runtime.backend_guard_scripts", .]
+        ]
+        + [
+          ($runtime[0].policy.special_operations // {})
+          | to_entries[]
+          | select((.value.backend_script // "") != "")
+          | ["runtime.special_operations." + .key, .value.backend_script]
+        ]
+        + [
+          ($surfaces[0].surfaces // {})
+          | to_entries[]
+          | select(.value.actions.apply.supported == true)
+          | [.key, .value.apply_script]
+        ]
+      )
+      | .[]
+      | @tsv
+    '
+)
+while IFS= read -r state_dir; do
+  [[ -n "${state_dir}" ]] || continue
+  [[ -d "${ROOT_DIR}/${state_dir}" ]] || die "desired-state state_dir missing: ${state_dir}"
+done < <(
+  jq -r '
+    (.desired_state // {})
+    | to_entries[]
+    | .value.state_dir // empty
+  ' "${ROOT_DIR}/catalog/runtime.json"
+)
 assert_jq_file "surface module bindings" '
   .surfaces["access.app"].module == "access_app"
   and .surfaces["access.app"].standards_ref == "access.app"

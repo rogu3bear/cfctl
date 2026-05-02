@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 7,
   "preferred_entrypoint": "./cfctl",
   "legacy_policy": "shim_then_hide",
   "public_verbs": [
@@ -40,6 +40,9 @@
   ],
   "policy": {
     "backend_scripts": "backend_only",
+    "backend_guard_scripts": [
+      "scripts/cf_api_apply.sh"
+    ],
     "direct_script_override_env": "CF_BACKEND_BYPASS_FILE",
     "legacy_bypass_env": "CF_BACKEND_BYPASS",
     "legacy_bypass_env_allowed": false,
@@ -115,6 +118,7 @@
       },
       "token.mint": {
         "risk": "secret_sensitive",
+        "backend_script": "scripts/cf_token_mint.sh",
         "preview_required": true,
         "allowed_lanes": ["dev", "global"],
         "verification_required": true,
@@ -126,6 +130,7 @@
       },
       "token.revoke": {
         "risk": "destructive",
+        "backend_script": "scripts/cf_token_revoke.sh",
         "preview_required": true,
         "allowed_lanes": ["dev", "global"],
         "verification_required": true,
@@ -181,8 +186,7 @@
         ["help"],
         ["--help"],
         ["tunnel", "list"],
-        ["tunnel", "info"],
-        ["tunnel", "token"]
+        ["tunnel", "info"]
       ],
       "log_category": "cloudflared",
       "summary": "Wraps the repo's cloudflared helper in a cfctl result envelope."
@@ -239,5 +243,16 @@
         "name"
       ]
     }
+  },
+  "ownership_registry": {
+    "path": "state/ownership/resources.json",
+    "proof_classes": [
+      "source_config",
+      "live_control_plane_read",
+      "preview_artifact",
+      "apply_artifact",
+      "post_change_verification"
+    ],
+    "duplicate_resource_policy": "fail"
   }
 }
