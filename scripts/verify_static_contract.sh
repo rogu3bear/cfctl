@@ -247,6 +247,13 @@ assert_cross_catalog_empty "ownership command path is cfctl" '
       )
     ]
 '
+assert_cross_catalog_empty "ownership repo ids are portable" '
+  [
+    ($ownership[0].resources // [])[]
+    | select((.owner.repo // "") | test("^/|^~|/Users/"))
+    | {resource: .id, repo: .owner.repo}
+  ]
+'
 assert_cross_catalog_empty "surface docs topics resolve to docs bank" '
   (
     ["foundation", "watch"]

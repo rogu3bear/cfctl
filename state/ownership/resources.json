@@ -13,7 +13,7 @@
       },
       "owner": {
         "system": "cfctl",
-        "repo": "/Users/star/dev/cloudflare",
+        "repo": "rogu3bear/cfctl",
         "role": "cloudflare-control-plane"
       },
       "deploy_lane": {
@@ -50,7 +50,7 @@
       },
       "owner": {
         "system": "cfctl",
-        "repo": "/Users/star/dev/cloudflare",
+        "repo": "rogu3bear/cfctl",
         "role": "cloudflare-control-plane"
       },
       "deploy_lane": {
@@ -87,7 +87,7 @@
       },
       "owner": {
         "system": "cfctl",
-        "repo": "/Users/star/dev/cloudflare",
+        "repo": "rogu3bear/cfctl",
         "role": "cloudflare-control-plane"
       },
       "deploy_lane": {
@@ -124,7 +124,7 @@
       },
       "owner": {
         "system": "cfctl",
-        "repo": "/Users/star/dev/cloudflare",
+        "repo": "rogu3bear/cfctl",
         "role": "cloudflare-control-plane"
       },
       "deploy_lane": {
@@ -162,7 +162,7 @@
       },
       "owner": {
         "system": "cfctl",
-        "repo": "/Users/star/dev/cloudflare",
+        "repo": "rogu3bear/cfctl",
         "role": "cloudflare-control-plane"
       },
       "deploy_lane": {
