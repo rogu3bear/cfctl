@@ -233,30 +233,20 @@ cfctl_action_permission_gate() {
 }
 
 cfctl_backend_guard_report_json() {
-  local script_paths=(
-    "scripts/cf_api_apply.sh"
-    "scripts/cf_token_mint.sh"
-    "scripts/cf_token_revoke.sh"
-    "scripts/cf_mutate_access_app.sh"
-    "scripts/cf_mutate_access_policy.sh"
-    "scripts/cf_mutate_dns_record.sh"
-    "scripts/cf_mutate_turnstile_widget.sh"
-    "scripts/cf_mutate_waiting_room.sh"
-    "scripts/cf_mutate_edge_certificate.sh"
-    "scripts/cf_mutate_logpush_job.sh"
-    "scripts/cf_mutate_tunnel.sh"
-  )
   local report='[]'
   local path
 
-  for path in "${script_paths[@]}"; do
+  while IFS= read -r path; do
+    [[ -n "${path}" ]] || continue
     local guarded="false"
-    if command -v rg >/dev/null 2>&1; then
-      if rg -q 'cf_require_backend_dispatch' "${CF_REPO_ROOT}/${path}"; then
+    if [[ -f "${CF_REPO_ROOT}/${path}" ]]; then
+      if command -v rg >/dev/null 2>&1; then
+        if rg -q 'cf_require_backend_dispatch' "${CF_REPO_ROOT}/${path}"; then
+          guarded="true"
+        fi
+      elif grep -q 'cf_require_backend_dispatch' "${CF_REPO_ROOT}/${path}"; then
         guarded="true"
       fi
-    elif grep -q 'cf_require_backend_dispatch' "${CF_REPO_ROOT}/${path}"; then
-      guarded="true"
     fi
     report="$(
       jq \
@@ -265,7 +255,24 @@ cfctl_backend_guard_report_json() {
         '. + [{path: $path, guarded: $guarded}]' \
         <<< "${report}"
     )"
-  done
+  done < <(
+    jq -r '
+      [
+        (.policy.backend_guard_scripts // [])[],
+        (
+          .policy.special_operations
+          | to_entries[]
+          | .value.backend_script // empty
+        )
+      ] | .[]
+    ' "$(cf_runtime_catalog_path)"
+    jq -r '
+      .surfaces
+      | to_entries[]
+      | select(.value.actions.apply.supported == true)
+      | .value.apply_script // empty
+    ' "${CFCTL_REGISTRY_PATH}"
+  )
 
   printf '%s\n' "${report}"
 }
@@ -1307,15 +1314,15 @@ cfctl_handle_doctor() {
     overall_status="unsafe"
   fi
 
-  if [[ "${overall_status}" != "unsafe" && "$(jq '(.expired_preview_count // 0) > 0' <<< "${preview_health_json}")" == "true" ]]; then
+  if [[ "${overall_status}" != "unsafe" && "${overall_status}" != "bootstrap_required" && "$(jq '(.expired_preview_count // 0) > 0' <<< "${preview_health_json}")" == "true" ]]; then
     overall_status="degraded"
   fi
 
-  if [[ "${overall_status}" != "unsafe" && "$(jq '(.stale_lock_count // 0) > 0' <<< "${lock_health_json}")" == "true" ]]; then
+  if [[ "${overall_status}" != "unsafe" && "${overall_status}" != "bootstrap_required" && "$(jq '(.stale_lock_count // 0) > 0' <<< "${lock_health_json}")" == "true" ]]; then
     overall_status="degraded"
   fi
 
-  if [[ "${overall_status}" != "unsafe" && "$(jq '(.authorization_health.expired_count // 0) > 0' <<< "${bypass_health_json}")" == "true" ]]; then
+  if [[ "${overall_status}" != "unsafe" && "${overall_status}" != "bootstrap_required" && "$(jq '(.authorization_health.expired_count // 0) > 0' <<< "${bypass_health_json}")" == "true" ]]; then
     overall_status="degraded"
   fi
 

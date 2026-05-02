@@ -14,6 +14,7 @@ Current supported surfaces:
 - `dns.record`
 - `hostname` (verify/diff/plan only; composite apply is blocked)
 - `tunnel`
+- `ownership` (cross-surface owner/proof registry; verified by the static contract)
 
 Managed specs are opt-in. A generic surface being listed here means the engine
 can diff and sync that surface, not that this repo already has checked-in specs
@@ -43,3 +44,13 @@ Rules:
 Surface-specific examples live under the per-surface directories.
 Hostname lifecycle specs live under `state/hostname/` and verify the full
 DNS/TLS/route/Access/Worker/storage path from one YAML document.
+
+Ownership registry:
+- `state/ownership/resources.json` maps cfctl-managed resource classes to one
+  owner, deploy lane, secret source, allowed change command, verifier, proof
+  class, and incident runbook.
+- Duplicate `resource_key` entries are invalid. If two systems claim authority
+  over the same Cloudflare resource class, `./scripts/verify_static_contract.sh`
+  fails before that drift becomes operating doctrine.
+- The registry records control-plane authority. It does not replace live reads;
+  live Cloudflare claims still require `cfctl list|get|snapshot|verify`.
