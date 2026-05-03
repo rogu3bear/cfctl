@@ -28,7 +28,8 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | `vulnerability_scanner.target_environment` | yes | no | no | `-` | `api-shield-vulnerability-scanner, api-auth` | `-` |
 | `waiting_room` | yes | yes | no | `-` | `-` | `-` |
 | `worker.route` | yes | no | no | `worker.route` | `workers-routes, api-auth` | `worker_route` |
-| `worker.script` | yes | no | no | `-` | `-` | `-` |
+| `worker.script` | yes | yes | no | `-` | `-` | `worker_script` |
+| `worker.secret` | yes | yes | no | `-` | `-` | `worker_secret` |
 | `workflow` | yes | no | no | `-` | `-` | `-` |
 | `zone` | yes | no | no | `-` | `-` | `-` |
 
