@@ -106,15 +106,17 @@
       ]
     },
     "worker.script": {
-      "description": "Workers scripts in the pinned account.",
+      "description": "Workers scripts in the pinned account. Upsert uploads a multipart bundle (metadata.json + main module). Container/DO migrations live in the metadata payload; the operator owns bundling (e.g. via bun build) before invoking apply.",
+      "module": "worker_script",
       "backend": "inventory_script",
       "inventory_script": "scripts/cf_inventory_workers.sh",
+      "apply_script": "scripts/cf_mutate_worker_script.sh",
       "permission_family": "Workers",
       "probe": {
         "method": "GET",
         "path_template": "/accounts/{account_id}/workers/scripts"
       },
-      "selectors": ["id", "name"],
+      "selectors": ["id", "name", "metadata", "module"],
       "actions": {
         "list": {
           "supported": true
@@ -131,12 +133,80 @@
           "supported": true
         },
         "apply": {
-          "supported": false
+          "supported": true,
+          "operations": {
+            "upsert": {
+              "risk": "write",
+              "required_selectors": ["name", "metadata", "module"]
+            },
+            "delete": {
+              "risk": "destructive",
+              "required_selectors": ["name"],
+              "confirm": "delete"
+            }
+          }
         }
       },
       "examples": [
         "./cfctl list worker.script",
-        "./cfctl get worker.script --name founder"
+        "./cfctl get worker.script --name founder",
+        "./cfctl apply worker.script upsert --name hello --metadata /tmp/meta.json --module /tmp/index.js --plan",
+        "./cfctl apply worker.script upsert --name hello --metadata /tmp/meta.json --module /tmp/index.js --ack-plan <operation-id>",
+        "./cfctl apply worker.script delete --name hello --plan",
+        "./cfctl apply worker.script delete --name hello --ack-plan <operation-id> --confirm delete"
+      ]
+    },
+    "worker.secret": {
+      "description": "Secrets bound to a Workers script in the pinned account.",
+      "module": "worker_secret",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_worker_secrets.sh",
+      "apply_script": "scripts/cf_mutate_worker_secret.sh",
+      "permission_family": "Workers",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/workers/scripts/{script}/secrets"
+      },
+      "selectors": ["script", "name"],
+      "actions": {
+        "list": {
+          "supported": true,
+          "required_selectors": ["script"]
+        },
+        "get": {
+          "supported": true,
+          "required_selectors": ["script", "name"]
+        },
+        "verify": {
+          "supported": true,
+          "required_selectors": ["script", "name"]
+        },
+        "can": {
+          "supported": true,
+          "required_selectors": ["script"]
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "upsert": {
+              "risk": "write",
+              "required_selectors": ["script", "name"]
+            },
+            "delete": {
+              "risk": "destructive",
+              "required_selectors": ["script", "name"],
+              "confirm": "delete"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list worker.secret --script founder",
+        "./cfctl get worker.secret --script founder --name MLN_FOUNDER_D1_API_TOKEN",
+        "./cfctl apply worker.secret upsert --script founder --name MY_SECRET --file /secure/value.txt --plan",
+        "./cfctl apply worker.secret upsert --script founder --name MY_SECRET --file /secure/value.txt --ack-plan <operation-id>",
+        "./cfctl apply worker.secret delete --script founder --name MY_SECRET --plan",
+        "./cfctl apply worker.secret delete --script founder --name MY_SECRET --ack-plan <operation-id> --confirm delete"
       ]
     },
     "worker.route": {

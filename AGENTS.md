@@ -38,6 +38,7 @@ cfctl doctor
 cfctl bootstrap permissions
 cfctl bootstrap permissions --profile hostname --zone example.com
 cfctl surfaces
+cfctl ownership check
 cfctl docs
 cfctl docs watch
 cfctl standards audit
@@ -56,6 +57,8 @@ cfctl doctor
 cfctl bootstrap permissions
 cfctl bootstrap permissions --profile hostname --zone example.com
 cfctl surfaces
+cfctl ownership list
+cfctl ownership check
 cfctl docs
 cfctl docs watch
 cfctl docs ai-search
@@ -194,6 +197,7 @@ cfctl doctor --repair-hints
 ./scripts/verify_static_contract.sh
 cfctl previews purge-expired
 cfctl locks clear-stale
+cfctl ownership check
 cfctl admin authorizations
 ```
 

@@ -40,11 +40,15 @@ cfctl_reset_flags() {
   CFCTL_DATA_JSON=""
   CFCTL_TUNNEL_ID=""
   CFCTL_CLIENT_ID=""
+  CFCTL_SCRIPT=""
+  CFCTL_METADATA=""
+  CFCTL_MODULE=""
   CFCTL_SINCE=""
   CFCTL_BEFORE=""
   CFCTL_ACTOR=""
   CFCTL_ACTION_TYPE=""
   CFCTL_RESOURCE_TYPE=""
+  CFCTL_RESOURCE_KEY=""
   CFCTL_LIMIT=""
   CFCTL_INCLUDE_RECORDS="1"
   CFCTL_INCLUDE_CONFIG="0"
@@ -134,6 +138,12 @@ cfctl_parse_flags() {
       --tunnel-id=*) CFCTL_TUNNEL_ID="${1#*=}"; shift ;;
       --client-id) CFCTL_CLIENT_ID="$2"; shift 2 ;;
       --client-id=*) CFCTL_CLIENT_ID="${1#*=}"; shift ;;
+      --script) CFCTL_SCRIPT="$2"; shift 2 ;;
+      --script=*) CFCTL_SCRIPT="${1#*=}"; shift ;;
+      --metadata) CFCTL_METADATA="$2"; shift 2 ;;
+      --metadata=*) CFCTL_METADATA="${1#*=}"; shift ;;
+      --module) CFCTL_MODULE="$2"; shift 2 ;;
+      --module=*) CFCTL_MODULE="${1#*=}"; shift ;;
       --since) CFCTL_SINCE="$2"; shift 2 ;;
       --since=*) CFCTL_SINCE="${1#*=}"; shift ;;
       --before) CFCTL_BEFORE="$2"; shift 2 ;;
@@ -144,6 +154,8 @@ cfctl_parse_flags() {
       --action-type=*) CFCTL_ACTION_TYPE="${1#*=}"; shift ;;
       --resource-type) CFCTL_RESOURCE_TYPE="$2"; shift 2 ;;
       --resource-type=*) CFCTL_RESOURCE_TYPE="${1#*=}"; shift ;;
+      --resource-key) CFCTL_RESOURCE_KEY="$2"; shift 2 ;;
+      --resource-key=*) CFCTL_RESOURCE_KEY="${1#*=}"; shift ;;
       --limit) CFCTL_LIMIT="$2"; shift 2 ;;
       --limit=*) CFCTL_LIMIT="${1#*=}"; shift ;;
       --per-page) CFCTL_LIMIT="$2"; shift 2 ;;
@@ -915,6 +927,9 @@ cfctl_selector_presence_json() {
     --arg scope "${CFCTL_SCOPE}" \
     --arg tunnel_id "${CFCTL_TUNNEL_ID}" \
     --arg client_id "${CFCTL_CLIENT_ID}" \
+    --arg script "${CFCTL_SCRIPT}" \
+    --arg metadata "${CFCTL_METADATA}" \
+    --arg module "${CFCTL_MODULE}" \
     --arg since "${CFCTL_SINCE}" \
     --arg before "${CFCTL_BEFORE}" \
     --arg actor "${CFCTL_ACTOR}" \
@@ -939,6 +954,9 @@ cfctl_selector_presence_json() {
         scope: ($scope | length > 0),
         tunnel_id: ($tunnel_id | length > 0),
         client_id: ($client_id | length > 0),
+        script: ($script | length > 0),
+        metadata: ($metadata | length > 0),
+        module: ($module | length > 0),
         since: ($since | length > 0),
         before: ($before | length > 0),
         actor: ($actor | length > 0),
@@ -1065,6 +1083,9 @@ cfctl_target_json() {
     --arg scope "${CFCTL_SCOPE}" \
     --arg tunnel_id "${CFCTL_TUNNEL_ID}" \
     --arg client_id "${CFCTL_CLIENT_ID}" \
+    --arg script "${CFCTL_SCRIPT}" \
+    --arg metadata "${CFCTL_METADATA}" \
+    --arg module "${CFCTL_MODULE}" \
     --arg since "${CFCTL_SINCE}" \
     --arg before "${CFCTL_BEFORE}" \
     --arg actor "${CFCTL_ACTOR}" \
@@ -1388,6 +1409,11 @@ cfctl_collect_surface_items() {
       cfctl_run_backend_script "${script_path}"
       CFCTL_COLLECT_BACKEND="inventory_script"
       ;;
+    worker.secret)
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_worker_secrets.sh"
+      cfctl_run_backend_script "${script_path}" "WORKER_SCRIPT=${CFCTL_SCRIPT}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
     worker.route)
       cfctl_resolve_zone_context
       script_path="${CF_REPO_ROOT}/scripts/cf_inventory_worker_routes.sh"
@@ -1523,6 +1549,9 @@ cfctl_collect_surface_items() {
       ;;
     worker.script)
       CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.workers // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
+      ;;
+    worker.secret)
+      CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.secrets // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
       ;;
     worker.route)
       CFCTL_COLLECT_ITEMS_JSON="$(
@@ -1740,6 +1769,18 @@ cfctl_filter_surface_items() {
               (if $id != "" then .id == $id else true end)
               and
               (if $name != "" then .id == $name else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
+    worker.secret)
+      jq -c --arg name "${CFCTL_NAME}" --arg script "${CFCTL_SCRIPT}" '
+        [
+          .[]
+          | select(
+              (if $name != "" then .name == $name else true end)
+              and
+              (if $script != "" then .script == $script else true end)
             )
         ]
       ' <<< "${items_json}"
@@ -1991,6 +2032,7 @@ cfctl_summary_for_items() {
 
   case "${surface}" in
     worker.script) name_field="id" ;;
+    worker.secret) name_field="name" ;;
     worker.route) name_field="pattern" ;;
     d1.database) name_field="name" ;;
     r2.bucket) name_field="name" ;;

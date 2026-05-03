@@ -20,7 +20,7 @@ source "${ROOT_DIR}/lib/runtime/cfctl.sh"
 source "${ROOT_DIR}/commands/cfctl.sh"
 
 case "${1:-help}" in
-  help|-h|--help|doctor|audit|admin|bootstrap|surfaces|docs|standards|previews|locks|lanes|classify|guide|explain|can|wrangler|cloudflared)
+  help|-h|--help|doctor|audit|admin|bootstrap|surfaces|docs|standards|previews|locks|lanes|classify|guide|explain|can|wrangler|cloudflared|ownership)
     cf_load_cloudflare_env_files
     ;;
   *)

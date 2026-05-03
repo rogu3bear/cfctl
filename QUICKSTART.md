@@ -78,6 +78,8 @@ This checks: tooling presence, env loading, both auth lanes, account pin, runtim
 
 ```bash
 cfctl surfaces                          # what cfctl knows how to operate
+cfctl ownership check                   # checked-in ownership registry integrity
+cfctl ownership get --resource-key cloudflare:dns.record:*
 cfctl docs                              # compact official Cloudflare doc bank
 cfctl list zone                         # zones in your pinned account
 cfctl get zone --name example.com       # one zone (use one of yours)

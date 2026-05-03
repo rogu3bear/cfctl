@@ -48,6 +48,9 @@ Usage:
   cfctl previews purge-inactive-legacy
   cfctl locks
   cfctl locks clear-stale
+  cfctl ownership list
+  cfctl ownership get --resource-key cloudflare:dns.record:*
+  cfctl ownership check
   cfctl wrangler [wrangler args]
   cfctl cloudflared [cloudflared args]
   cfctl hostname verify|diff|plan|apply [--file state/hostname/<name>.yaml]
@@ -77,6 +80,7 @@ Verb intent:
   standards Show the canonical configuration standards for this runtime, one surface, or a workspace audit.
   previews  Inspect actionable, legacy, and expired preview receipts, and purge expired ones.
   locks     Inspect write locks and clear stale ones.
+  ownership Read and verify the checked-in Cloudflare ownership authority registry.
   wrangler  Run Wrangler through the cfctl envelope, logs, and preview gate for mutating commands.
   cloudflared Run cloudflared through the cfctl envelope, logs, and preview gate for mutating commands.
   hostname Composite hostname lifecycle evidence from checked-in state/hostname specs.
@@ -116,6 +120,9 @@ Examples:
   cfctl previews purge-inactive-legacy
   cfctl locks
   cfctl locks clear-stale
+  cfctl ownership list
+  cfctl ownership get --resource-key cloudflare:dns.record:*
+  cfctl ownership check
   cfctl wrangler --version
   cfctl wrangler deploy --plan
   cfctl cloudflared version
@@ -957,10 +964,10 @@ cfctl_doctor_repair_hints_json() {
 
 cfctl_safe_next_steps_json() {
   local overall_status="${1:-healthy}"
-  local steps='["cfctl surfaces","cfctl explain <surface>","cfctl classify <surface> <operation>"]'
+  local steps='["cfctl surfaces","cfctl ownership check","cfctl explain <surface>","cfctl classify <surface> <operation>"]'
 
   if [[ "${overall_status}" == "bootstrap_required" ]]; then
-    steps='["cfctl bootstrap permissions","cfctl bootstrap verify --profile read","cfctl surfaces"]'
+    steps='["cfctl bootstrap permissions","cfctl bootstrap verify --profile read","cfctl surfaces","cfctl ownership check"]'
   elif [[ "${overall_status}" != "healthy" ]]; then
     steps='["cfctl doctor --repair-hints","cfctl previews","cfctl locks"]'
   fi
@@ -1496,6 +1503,340 @@ EOF
       ;;
     *)
       echo "Unknown locks subcommand: ${subcommand}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+cfctl_ownership_registry_relpath() {
+  jq -r '.ownership_registry.path // "state/ownership/resources.json"' "$(cf_runtime_catalog_path)"
+}
+
+cfctl_ownership_registry_path() {
+  local registry_path
+  registry_path="$(cfctl_ownership_registry_relpath)"
+  if [[ "${registry_path}" == /* ]]; then
+    printf '%s\n' "${registry_path}"
+    return
+  fi
+  printf '%s/%s\n' "${CF_REPO_ROOT}" "${registry_path}"
+}
+
+cfctl_ownership_registry_json() {
+  cat "$(cfctl_ownership_registry_path)"
+}
+
+cfctl_ownership_permission_json() {
+  jq -n '
+    {
+      state: "not_applicable",
+      basis: "checked_in_ownership_registry",
+      errors: [],
+      request: null,
+      status_code: null,
+      permission_family: "Cloudflare ownership registry"
+    }
+  '
+}
+
+cfctl_ownership_integrity_json() {
+  local registry_path
+  local registry_relpath
+
+  registry_relpath="$(cfctl_ownership_registry_relpath)"
+  registry_path="$(cfctl_ownership_registry_path)"
+
+  jq -n \
+    --arg registry_path "${registry_relpath}" \
+    --slurpfile runtime "$(cf_runtime_catalog_path)" \
+    --slurpfile surfaces "${CFCTL_REGISTRY_PATH}" \
+    --slurpfile ownership "${registry_path}" \
+    '
+      ($runtime[0].ownership_registry.proof_classes // []) as $proof_classes
+      | ($surfaces[0].surfaces // {}) as $surface_catalog
+      | ($runtime[0].desired_state // {}) as $desired_state
+      | ($ownership[0].resources // []) as $resources
+      | [
+          (
+            $resources
+            | group_by(.id)
+            | .[]?
+            | select(length > 1)
+            | {
+                issue_class: "duplicate_resource_id",
+                resource_id: (.[0].id // null),
+                duplicate_count: length
+              }
+          ),
+          (
+            $resources
+            | group_by(.resource_key)
+            | .[]?
+            | select(length > 1)
+            | {
+                issue_class: "duplicate_owner",
+                resource_key: (.[0].resource_key // null),
+                duplicate_count: length,
+                owners: map(.owner)
+              }
+          ),
+          (
+            $resources[]? as $entry
+            | (
+                [
+                  (if (($entry.id // "") == "") then "id" else empty end),
+                  (if (($entry.resource_key // "") == "") then "resource_key" else empty end),
+                  (if (($entry.resource.cloudflare_surface // "") == "") then "resource.cloudflare_surface" else empty end),
+                  (if (($entry.owner.system // "") == "") then "owner.system" else empty end),
+                  (if (($entry.owner.repo // "") == "") then "owner.repo" else empty end),
+                  (if (($entry.deploy_lane.default // "") == "") then "deploy_lane.default" else empty end),
+                  (if ((($entry.secrets.env // []) | length) == 0) then "secrets.env" else empty end),
+                  (if (($entry.authority.control_plane // "") != "cfctl") then "authority.control_plane" else empty end),
+                  (if ((($entry.authority.allowed_change_commands // []) | length) == 0) then "authority.allowed_change_commands" else empty end),
+                  (if (($entry.authority.verifier // "") == "") then "authority.verifier" else empty end),
+                  (if (($proof_classes | index($entry.authority.proof_class // "")) == null) then "authority.proof_class" else empty end),
+                  (if (($entry.incident_runbook // "") == "") then "incident_runbook" else empty end)
+                ]
+              ) as $missing_fields
+            | select(($missing_fields | length) > 0)
+            | {
+                issue_class: "missing_ownership_fields",
+                resource: ($entry.id // null),
+                resource_key: ($entry.resource_key // null),
+                missing_fields: $missing_fields
+              }
+          ),
+          (
+            $resources[]?
+            | (.resource.cloudflare_surface // "") as $surface
+            | select($surface != "" and $surface_catalog[$surface] == null and $desired_state[$surface] == null)
+            | {
+                issue_class: "unknown_surface",
+                resource: (.id // null),
+                resource_key: (.resource_key // null),
+                cloudflare_surface: $surface
+              }
+          ),
+          (
+            $resources[]? as $entry
+            | [
+                (
+                  ($entry.authority.allowed_change_commands // [])[]
+                  | select(test("^(CF_TOKEN_LANE=[a-z]+ )?(\\./)?cfctl ") | not)
+                  | {
+                      issue_class: "non_cfctl_command",
+                      resource: ($entry.id // null),
+                      resource_key: ($entry.resource_key // null),
+                      field: "authority.allowed_change_commands",
+                      command: .
+                    }
+                ),
+                (
+                  ($entry.authority.verifier // "")
+                  | select(test("^(CF_TOKEN_LANE=[a-z]+ )?(\\./)?cfctl ") | not)
+                  | {
+                      issue_class: "non_cfctl_command",
+                      resource: ($entry.id // null),
+                      resource_key: ($entry.resource_key // null),
+                      field: "authority.verifier",
+                      command: .
+                    }
+                )
+              ][]
+          ),
+          (
+            $resources[]?
+            | select((.owner.repo // "") | test("^/|^~|/Users/"))
+            | {
+                issue_class: "non_portable_repo_id",
+                resource: (.id // null),
+                resource_key: (.resource_key // null),
+                repo: (.owner.repo // null)
+              }
+          )
+        ] as $issues
+      | {
+          registry_path: $registry_path,
+          version: ($ownership[0].version // null),
+          resource_count: ($resources | length),
+          proof_classes: $proof_classes,
+          issue_count: ($issues | length),
+          issue_classes: (
+            $issues
+            | group_by(.issue_class)
+            | map({issue_class: .[0].issue_class, count: length})
+            | sort_by(.issue_class)
+          ),
+          duplicate_owner_count: ($issues | map(select(.issue_class == "duplicate_owner")) | length),
+          missing_field_count: ($issues | map(select(.issue_class == "missing_ownership_fields")) | length),
+          unknown_surface_count: ($issues | map(select(.issue_class == "unknown_surface")) | length),
+          non_cfctl_command_count: ($issues | map(select(.issue_class == "non_cfctl_command")) | length),
+          non_portable_repo_id_count: ($issues | map(select(.issue_class == "non_portable_repo_id")) | length),
+          issues: $issues
+        }
+    '
+}
+
+cfctl_handle_ownership() {
+  local subcommand="${1:-list}"
+  local registry_json
+  local result_json
+  local integrity_json
+  local matches_json
+  local match_count
+
+  case "${subcommand}" in
+    list|"")
+      registry_json="$(cfctl_ownership_registry_json)"
+      result_json="$(
+        jq -n \
+          --arg registry_path "$(cfctl_ownership_registry_relpath)" \
+          --argjson registry "${registry_json}" \
+          '
+            {
+              registry_path: $registry_path,
+              version: ($registry.version // null),
+              resource_count: (($registry.resources // []) | length),
+              resources: ($registry.resources // [])
+            }
+          '
+      )"
+      cfctl_emit_result \
+        "true" \
+        "ownership" \
+        "ownership" \
+        "registry" \
+        "true" \
+        "$(cfctl_ownership_permission_json)" \
+        '{"state":"not_applicable"}' \
+        "$(jq '{registry_path: .registry_path, version: .version, resource_count: .resource_count}' <<< "${result_json}")" \
+        "${result_json}" \
+        "" \
+        "" \
+        "" \
+        "list"
+      ;;
+    get)
+      if [[ -z "${CFCTL_RESOURCE_KEY}" ]]; then
+        cfctl_emit_result \
+          "false" \
+          "ownership" \
+          "ownership" \
+          "registry" \
+          "false" \
+          "$(cfctl_ownership_permission_json)" \
+          '{"state":"not_applicable"}' \
+          '{"resource_key": null, "found": false}' \
+          "null" \
+          "" \
+          "invalid_arguments" \
+          "ownership get requires --resource-key" \
+          "get"
+        exit 1
+      fi
+      registry_json="$(cfctl_ownership_registry_json)"
+      matches_json="$(jq -c --arg resource_key "${CFCTL_RESOURCE_KEY}" '[.resources[]? | select(.resource_key == $resource_key)]' <<< "${registry_json}")"
+      match_count="$(jq -r 'length' <<< "${matches_json}")"
+      if [[ "${match_count}" -eq 0 ]]; then
+        cfctl_emit_result \
+          "false" \
+          "ownership" \
+          "ownership" \
+          "registry" \
+          "true" \
+          "$(cfctl_ownership_permission_json)" \
+          '{"state":"not_applicable"}' \
+          "$(jq -n --arg resource_key "${CFCTL_RESOURCE_KEY}" '{resource_key: $resource_key, found: false, match_count: 0}')" \
+          "$(jq -n --arg registry_path "$(cfctl_ownership_registry_relpath)" --arg resource_key "${CFCTL_RESOURCE_KEY}" '{registry_path: $registry_path, resource_key: $resource_key, matches: []}')" \
+          "" \
+          "ownership_resource_not_found" \
+          "No ownership resource matched --resource-key ${CFCTL_RESOURCE_KEY}" \
+          "get"
+        exit 1
+      fi
+      if [[ "${match_count}" -gt 1 ]]; then
+        cfctl_emit_result \
+          "false" \
+          "ownership" \
+          "ownership" \
+          "registry" \
+          "true" \
+          "$(cfctl_ownership_permission_json)" \
+          '{"state":"not_applicable"}' \
+          "$(jq -n --arg resource_key "${CFCTL_RESOURCE_KEY}" --argjson match_count "${match_count}" '{resource_key: $resource_key, found: true, ambiguous: true, match_count: $match_count}')" \
+          "$(jq -n --arg registry_path "$(cfctl_ownership_registry_relpath)" --arg resource_key "${CFCTL_RESOURCE_KEY}" --argjson matches "${matches_json}" '{registry_path: $registry_path, resource_key: $resource_key, matches: $matches}')" \
+          "" \
+          "ownership_resource_ambiguous" \
+          "Multiple ownership resources matched --resource-key ${CFCTL_RESOURCE_KEY}" \
+          "get"
+        exit 1
+      fi
+      result_json="$(
+        jq -n \
+          --arg registry_path "$(cfctl_ownership_registry_relpath)" \
+          --arg resource_key "${CFCTL_RESOURCE_KEY}" \
+          --argjson matches "${matches_json}" \
+          '{registry_path: $registry_path, resource_key: $resource_key, resource: $matches[0]}'
+      )"
+      cfctl_emit_result \
+        "true" \
+        "ownership" \
+        "ownership" \
+        "registry" \
+        "true" \
+        "$(cfctl_ownership_permission_json)" \
+        '{"state":"not_applicable"}' \
+        "$(jq '{resource_key: .resource_key, found: true, resource_id: .resource.id, owner: .resource.owner}' <<< "${result_json}")" \
+        "${result_json}" \
+        "" \
+        "" \
+        "" \
+        "get"
+      ;;
+    check)
+      integrity_json="$(cfctl_ownership_integrity_json)"
+      if [[ "$(jq -r '.issue_count' <<< "${integrity_json}")" != "0" ]]; then
+        cfctl_emit_result \
+          "false" \
+          "ownership" \
+          "ownership" \
+          "registry" \
+          "true" \
+          "$(cfctl_ownership_permission_json)" \
+          "$(jq '{state: "failed", issue_count: .issue_count, issue_classes: .issue_classes}' <<< "${integrity_json}")" \
+          "$(jq '{registry_path: .registry_path, resource_count: .resource_count, issue_count: .issue_count, issue_classes: .issue_classes, duplicate_owner_count: .duplicate_owner_count, missing_field_count: .missing_field_count, unknown_surface_count: .unknown_surface_count, non_cfctl_command_count: .non_cfctl_command_count, non_portable_repo_id_count: .non_portable_repo_id_count}' <<< "${integrity_json}")" \
+          "${integrity_json}" \
+          "" \
+          "ownership_integrity_failed" \
+          "Ownership registry integrity check failed" \
+          "check"
+        exit 1
+      fi
+      cfctl_emit_result \
+        "true" \
+        "ownership" \
+        "ownership" \
+        "registry" \
+        "true" \
+        "$(cfctl_ownership_permission_json)" \
+        '{"state":"passed"}' \
+        "$(jq '{registry_path: .registry_path, resource_count: .resource_count, issue_count: .issue_count, issue_classes: .issue_classes, duplicate_owner_count: .duplicate_owner_count, missing_field_count: .missing_field_count, unknown_surface_count: .unknown_surface_count, non_cfctl_command_count: .non_cfctl_command_count, non_portable_repo_id_count: .non_portable_repo_id_count}' <<< "${integrity_json}")" \
+        "${integrity_json}" \
+        "" \
+        "" \
+        "" \
+        "check"
+      ;;
+    -h|--help|help)
+      cat <<'EOF'
+Usage:
+  cfctl ownership list
+  cfctl ownership get --resource-key cloudflare:dns.record:*
+  cfctl ownership check
+EOF
+      ;;
+    *)
+      echo "Unknown ownership subcommand: ${subcommand}" >&2
       exit 1
       ;;
   esac
@@ -3234,6 +3575,26 @@ cfctl_handle_apply() {
         "BODY_JSON=${CFCTL_BODY_JSON}" \
         "BODY_FILE=${CFCTL_BODY_FILE}"
       ;;
+    worker.secret)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "WORKER_SCRIPT=${CFCTL_SCRIPT}" \
+        "SECRET_NAME=${CFCTL_NAME}" \
+        "VALUE_FILE=${CFCTL_FILE}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
+    worker.script)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "SCRIPT_NAME=${CFCTL_NAME:-${id_value}}" \
+        "METADATA_FILE=${CFCTL_METADATA}" \
+        "MODULE_FILE=${CFCTL_MODULE}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
     *)
       cfctl_emit_failure "apply" "${surface}" "registry" "${CFCTL_PERMISSION_JSON}" "unsupported_operation" "No apply dispatcher registered for ${surface}" "${operation}"
       exit 1
@@ -4342,6 +4703,14 @@ cfctl_main() {
     locks)
       cfctl_parse_flags
       cfctl_handle_locks_view "${1:-list}"
+      ;;
+    ownership)
+      local ownership_subcommand="${1:-list}"
+      if [[ "$#" -gt 0 ]]; then
+        shift
+      fi
+      cfctl_parse_flags "$@"
+      cfctl_handle_ownership "${ownership_subcommand}"
       ;;
     wrangler|cloudflared)
       cfctl_handle_tool_wrapper "${action}" "$@"

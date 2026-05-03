@@ -14,7 +14,7 @@ Current supported surfaces:
 - `dns.record`
 - `hostname` (verify/diff/plan only; composite apply is blocked)
 - `tunnel`
-- `ownership` (cross-surface owner/proof registry; verified by the static contract)
+- `ownership` (cross-surface owner/proof registry; exposed through `cfctl ownership list|get|check`)
 
 Managed specs are opt-in. A generic surface being listed here means the engine
 can diff and sync that surface, not that this repo already has checked-in specs
@@ -49,6 +49,9 @@ Ownership registry:
 - `state/ownership/resources.json` maps cfctl-managed resource classes to one
   owner, deploy lane, secret source, allowed change command, verifier, proof
   class, and incident runbook.
+- Use `cfctl ownership list`, `cfctl ownership get --resource-key <key>`, and
+  `cfctl ownership check` as the public operator path. Do not scrape this file
+  directly from app repos.
 - Duplicate `resource_key` entries are invalid. If two systems claim authority
   over the same Cloudflare resource class, `./scripts/verify_static_contract.sh`
   fails before that drift becomes operating doctrine.

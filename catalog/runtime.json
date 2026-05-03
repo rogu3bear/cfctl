@@ -1,5 +1,5 @@
 {
-  "version": 7,
+  "version": 8,
   "preferred_entrypoint": "./cfctl",
   "legacy_policy": "shim_then_hide",
   "public_verbs": [
@@ -12,6 +12,7 @@
     "docs",
     "previews",
     "locks",
+    "ownership",
     "wrangler",
     "cloudflared",
     "hostname",
@@ -32,6 +33,7 @@
     "doctor",
     "bootstrap permissions",
     "surfaces",
+    "ownership check",
     "docs",
     "standards <surface>",
     "explain <surface>",
