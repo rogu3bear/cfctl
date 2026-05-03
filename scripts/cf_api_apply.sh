@@ -23,6 +23,13 @@ APPLY="${APPLY:-0}"
 BODY_JSON="${BODY_JSON:-}"
 BODY_FILE="${BODY_FILE:-}"
 ALLOW_EMPTY_BODY="${ALLOW_EMPTY_BODY:-0}"
+# Optional multipart upload mode. JSON array of parts:
+#   [{"name":"metadata","file":"/abs/path","type":"application/json"},
+#    {"name":"index.js","file":"/abs/path/bundle.js","type":"application/javascript+module"}]
+# When set, the mutation request uses multipart/form-data instead of
+# application/json. BODY_JSON/BODY_FILE are ignored for the mutation
+# request (curl -F handles boundary + content-type per-part).
+MULTIPART_PARTS="${MULTIPART_PARTS:-}"
 
 if [[ -z "${REQUEST_METHOD}" ]]; then
   echo "REQUEST_METHOD must be set" >&2
@@ -38,10 +45,27 @@ REQUEST_METHOD="$(printf '%s' "${REQUEST_METHOD}" | tr '[:lower:]' '[:upper:]')"
 VERIFY_METHOD="$(printf '%s' "${VERIFY_METHOD}" | tr '[:lower:]' '[:upper:]')"
 REQUEST_BODY="$(cf_resolve_json_payload "${BODY_JSON}" "${BODY_FILE}")"
 
+# Validate multipart parts up front (before any API call) so plan-mode
+# operators see file-not-found errors early. Parts referencing missing
+# files would otherwise fail mid-upload with a confusing curl error.
+if [[ -n "${MULTIPART_PARTS}" ]]; then
+  if ! jq -e 'type == "array" and length > 0' <<< "${MULTIPART_PARTS}" >/dev/null 2>&1; then
+    echo "MULTIPART_PARTS must be a non-empty JSON array of {name, file, type}" >&2
+    exit 1
+  fi
+  while IFS= read -r _part_path; do
+    [[ -n "${_part_path}" ]] || continue
+    if [[ ! -r "${_part_path}" ]]; then
+      echo "MULTIPART_PARTS references unreadable file: ${_part_path}" >&2
+      exit 1
+    fi
+  done < <(jq -r '.[].file' <<< "${MULTIPART_PARTS}")
+fi
+
 case "${REQUEST_METHOD}" in
   POST|PUT|PATCH)
-    if [[ -z "${REQUEST_BODY}" && "${ALLOW_EMPTY_BODY}" != "1" ]]; then
-      echo "${REQUEST_METHOD} requests require BODY_JSON or BODY_FILE" >&2
+    if [[ -z "${REQUEST_BODY}" && -z "${MULTIPART_PARTS}" && "${ALLOW_EMPTY_BODY}" != "1" ]]; then
+      echo "${REQUEST_METHOD} requests require BODY_JSON, BODY_FILE, or MULTIPART_PARTS" >&2
       exit 1
     fi
     ;;
@@ -128,7 +152,30 @@ perform_request() {
   fi
 }
 
-MUTATION_RESPONSE="$(perform_request "${REQUEST_METHOD}" "${REQUEST_PATH}" "${REQUEST_BODY}")"
+perform_multipart_request() {
+  local method="$1"
+  local path="$2"
+  local parts_json="$3"
+
+  local -a curl_args=()
+  local part_name part_file part_type
+  while IFS=$'\t' read -r part_name part_file part_type; do
+    [[ -n "${part_name}" ]] || continue
+    if [[ -n "${part_type}" && "${part_type}" != "null" ]]; then
+      curl_args+=(-F "${part_name}=@${part_file};type=${part_type}")
+    else
+      curl_args+=(-F "${part_name}=@${part_file}")
+    fi
+  done < <(jq -r '.[] | [.name, .file, (.type // "")] | @tsv' <<< "${parts_json}")
+
+  cf_api_capture "${method}" "${path}" "${curl_args[@]}"
+}
+
+if [[ -n "${MULTIPART_PARTS}" ]]; then
+  MUTATION_RESPONSE="$(perform_multipart_request "${REQUEST_METHOD}" "${REQUEST_PATH}" "${MULTIPART_PARTS}")"
+else
+  MUTATION_RESPONSE="$(perform_request "${REQUEST_METHOD}" "${REQUEST_PATH}" "${REQUEST_BODY}")"
+fi
 MUTATION_RESPONSE_REDACTED="$(cf_redact_json "${MUTATION_RESPONSE}")"
 MUTATION_SUCCESS="$(jq -r '.success == true' <<< "${MUTATION_RESPONSE}")"
 

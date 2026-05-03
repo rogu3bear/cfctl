@@ -51,6 +51,7 @@
         "waiting_room",
         "worker.route",
         "worker.script",
+        "worker.secret",
         "workflow",
         "zone"
       ],
@@ -86,6 +87,7 @@
         "edge.certificate",
         "worker.route",
         "worker.script",
+        "worker.secret",
         "workflow",
         "wrangler",
         "zone"
@@ -113,6 +115,7 @@
         "r2.bucket",
         "worker.route",
         "worker.script",
+        "worker.secret",
         "workflow",
         "wrangler",
         "zone"
