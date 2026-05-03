@@ -7,6 +7,7 @@ It is built for agent and operator use:
 - `doctor` for runtime trust checks
 - `previews` for preview-receipt inspection and cleanup
 - `locks` for write-lock inspection and cleanup
+- `ownership` for the checked-in Cloudflare resource authority registry
 - `wrangler` for wrapped Wrangler commands with logs and preview gating
 - `cloudflared` for wrapped cloudflared commands with logs and preview gating
 - `surfaces` for a fast surface inventory
@@ -41,6 +42,9 @@ cfctl previews purge-expired
 cfctl previews purge-inactive-legacy
 cfctl locks
 cfctl locks clear-stale
+cfctl ownership list
+cfctl ownership get --resource-key cloudflare:dns.record:*
+cfctl ownership check
 cfctl surfaces
 cfctl docs
 cfctl docs watch
@@ -105,6 +109,9 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - `previews purge-inactive-legacy` removes only legacy preview receipts that lack complete trust metadata
 - `locks` lists active write locks and their stale/orphaned state
 - `locks clear-stale` removes stale/orphaned locks only
+- `ownership list` emits the checked-in owner, lane, verifier, proof, and runbook registry as a normal cfctl evidence envelope
+- `ownership get --resource-key <key>` resolves one exact ownership entry, such as `cloudflare:dns.record:*`
+- `ownership check` verifies duplicate owners, required owner/verifier/proof fields, known surfaces, cfctl-only command paths, and portable repo ids
 - `wrangler` and `cloudflared` wrap the repo helpers under `cfctl` so they emit runtime artifacts and log paths
 - clearly read-only wrapped subcommands can run directly
 - non-read-only wrapped subcommands must go through `--plan` then `--ack-plan <operation-id>`

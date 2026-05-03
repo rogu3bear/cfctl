@@ -62,9 +62,11 @@ cfctl doctor                    # tooling, auth, runtime trust check
 cfctl bootstrap permissions     # default read-profile operator-token plan
 cfctl bootstrap permissions --profile hostname --zone example.com
 cfctl surfaces                  # what cfctl can operate today
+cfctl ownership check           # checked-in ownership registry integrity
 cfctl docs                      # compact Cloudflare doc bank
 cfctl docs watch                # incoming Cloudflare capability tracking
 cfctl standards audit           # scan local Wrangler configs against standards
+cfctl ownership list            # read the Cloudflare ownership authority registry
 cfctl wrangler --version        # wrapped wrangler
 cfctl cloudflared version       # wrapped cloudflared
 cfctl explain access.app
@@ -155,7 +157,7 @@ Defined in [catalog/runtime.json](catalog/runtime.json):
 
 ```
 doctor    audit     admin     bootstrap lanes     surfaces  docs      previews  locks
-wrangler  cloudflared standards token   list      get       can       classify
+ownership wrangler  cloudflared standards token   list      get       can       classify
 guide     apply     verify    explain   snapshot  diff
 ```
 
@@ -169,8 +171,14 @@ its token id is known.
 Each profile also declares `allowed_surfaces` and `forbidden_permissions`; the
 verifier fails when a profile gains a permission outside its declared boundary.
 
+`cfctl ownership list|get|check` exposes [state/ownership/resources.json](state/ownership/resources.json)
+as a read-only public control-plane interface. Use it instead of scraping the
+JSON file directly when checking which repo owns a Cloudflare resource class,
+for example `cfctl ownership get --resource-key cloudflare:dns.record:*`.
+
 `./scripts/verify_static_contract.sh` validates the permission catalog schema
-and deterministic profile command fixtures. `./scripts/verify_public_contract.sh`
+and deterministic profile command fixtures, including the public ownership
+envelopes. `./scripts/verify_public_contract.sh`
 adds a live drift check by comparing the catalog against Cloudflare's current
 permission-group inventory. For a credentialless runtime-output check, run
 `python3 scripts/verify_permission_catalog.py --cfctl ./cfctl`.
@@ -194,7 +202,7 @@ lib/runtime/       - auth, result envelopes, lanes, desired-state helpers
 lib/backends/      - backend wrappers
 lib/surfaces/      - runtime catalog access and surface metadata
 catalog/           - surface registry, runtime policy, standards, doc bank
-state/             - selective desired-state specs (access.app, access.policy, dns.record, hostname, tunnel)
+state/             - selective desired-state specs plus ownership and hostname lifecycle registries
 compat/            - legacy script -> cfctl mapping
 legacy/            - older workflows kept for reference
 scripts/           - inventory, mutation, wrangler/cloudflared wrappers, email-routing helpers

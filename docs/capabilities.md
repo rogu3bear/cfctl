@@ -38,6 +38,11 @@ Composite lifecycle commands:
 - `cfctl hostname plan --file state/hostname/<name>.yaml`
 - `cfctl hostname apply --file state/hostname/<name>.yaml` is intentionally blocked until component mutations are preview-gated.
 
+Ownership authority commands:
+- `cfctl ownership list`
+- `cfctl ownership get --resource-key cloudflare:dns.record:*`
+- `cfctl ownership check`
+
 Lane-aware commands:
 - `cfctl doctor`
 - `cfctl bootstrap permissions`

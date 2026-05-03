@@ -145,7 +145,7 @@ assert_jq_file "permission profile minimality policy" '
   and .profiles["full-operator"].allowed_surfaces == ["*"]
   and (.profiles["full-operator"].forbidden_permissions | index("Account API Tokens *")) != null
 ' "${ROOT_DIR}/catalog/permissions.json"
-assert_jq_file "runtime public verbs" '(.public_verbs | index("docs")) != null and (.public_verbs | index("wrangler")) != null and (.public_verbs | index("cloudflared")) != null and (.public_verbs | index("hostname")) != null and (.landing_flow | index("docs")) != null' "${ROOT_DIR}/catalog/runtime.json"
+assert_jq_file "runtime public verbs" '(.public_verbs | index("docs")) != null and (.public_verbs | index("wrangler")) != null and (.public_verbs | index("cloudflared")) != null and (.public_verbs | index("hostname")) != null and (.public_verbs | index("ownership")) != null and (.landing_flow | index("ownership check")) != null and (.landing_flow | index("docs")) != null' "${ROOT_DIR}/catalog/runtime.json"
 assert_jq_file "runtime backend guard catalog" '
   .policy.backend_guard_scripts == ["scripts/cf_api_apply.sh"]
   and .policy.special_operations["token.mint"].backend_script == "scripts/cf_token_mint.sh"
@@ -254,6 +254,44 @@ assert_cross_catalog_empty "ownership repo ids are portable" '
     | {resource: .id, repo: .owner.repo}
   ]
 '
+ownership_check_json="$(
+  env \
+    -u CF_DEV_TOKEN \
+    -u CF_GLOBAL_TOKEN \
+    -u CLOUDFLARE_API_TOKEN \
+    -u CLOUDFLARE_ACCOUNT_ID \
+    CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    "${ROOT_DIR}/cfctl" ownership check
+)"
+jq -e '
+  .ok == true
+  and .action == "ownership"
+  and .surface == "ownership"
+  and .operation == "check"
+  and .summary.issue_count == 0
+  and .result.resource_count > 0
+  and (.result.proof_classes | index("post_change_verification")) != null
+' <<< "${ownership_check_json}" >/dev/null || die "ownership check envelope assertion failed"
+ownership_get_json="$(
+  env \
+    -u CF_DEV_TOKEN \
+    -u CF_GLOBAL_TOKEN \
+    -u CLOUDFLARE_API_TOKEN \
+    -u CLOUDFLARE_ACCOUNT_ID \
+    CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    "${ROOT_DIR}/cfctl" ownership get --resource-key "cloudflare:dns.record:*"
+)"
+jq -e '
+  .ok == true
+  and .action == "ownership"
+  and .surface == "ownership"
+  and .operation == "get"
+  and .summary.resource_key == "cloudflare:dns.record:*"
+  and .result.resource.resource.cloudflare_surface == "dns.record"
+  and .result.resource.authority.control_plane == "cfctl"
+' <<< "${ownership_get_json}" >/dev/null || die "ownership get envelope assertion failed"
 assert_cross_catalog_empty "surface docs topics resolve to docs bank" '
   (
     ["foundation", "watch"]
@@ -437,7 +475,7 @@ assert_contains "hostname checked-in spec" "service: example-edge-router" "${ROO
 assert_contains "cfctl prompt contract" "You are now operating as \`cfctl\`, a strict, catalog-driven Cloudflare control plane." "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt preview ack" "always require \`--plan\` first, then \`--ack-plan <operation-id>\`" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt token revoke" "For token revocation, require \`--plan\` first" "${ROOT_DIR}/CFCTL_PROMPT.md"
-assert_contains "cfctl prompt error verb" "\`doctor\`, \`audit\`, \`admin\`, \`bootstrap\`, \`lanes\`, \`surfaces\`, \`docs\`, \`previews\`, \`locks\`, \`wrangler\`, \`cloudflared\`, \`hostname\`, \`standards\`, \`token\`, \`list\`, \`get\`, \`can\`, \`classify\`, \`guide\`, \`apply\`, \`verify\`, \`explain\`, \`snapshot\`, \`diff\`, or \`error\`." "${ROOT_DIR}/CFCTL_PROMPT.md"
+assert_contains "cfctl prompt error verb" "\`doctor\`, \`audit\`, \`admin\`, \`bootstrap\`, \`lanes\`, \`surfaces\`, \`docs\`, \`previews\`, \`locks\`, \`ownership\`, \`wrangler\`, \`cloudflared\`, \`hostname\`, \`standards\`, \`token\`, \`list\`, \`get\`, \`can\`, \`classify\`, \`guide\`, \`apply\`, \`verify\`, \`explain\`, \`snapshot\`, \`diff\`, or \`error\`." "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt hostname" "For \`hostname\`, treat \`verify\`, \`diff\`, and \`plan\` as read-only composite evidence flows" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt wrapper gating" "For \`wrangler\` and \`cloudflared\`, treat clearly read-only subcommands as direct wrapped executions" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl preview inactive legacy cleanup command" "purge-inactive-legacy" "${ROOT_DIR}/commands/cfctl.sh"
