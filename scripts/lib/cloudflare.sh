@@ -1113,12 +1113,20 @@ cf_api_capture() {
 
 cf_prepare_wrangler_env() {
   local wrangler_root="${CF_WRANGLER_HOME:-${CF_REPO_ROOT}/var/wrangler-home}"
+  local operator_mise_data="${MISE_DATA_DIR:-${CF_OPERATOR_HOME}/.local/share/mise}"
+  local operator_mise_config="${MISE_CONFIG_DIR:-${CF_OPERATOR_HOME}/.config/mise}"
 
   mkdir -p "${wrangler_root}/home" "${wrangler_root}/xdg-config" "${wrangler_root}/tmp"
 
   export HOME="${wrangler_root}/home"
   export XDG_CONFIG_HOME="${wrangler_root}/xdg-config"
   export TMPDIR="${wrangler_root}/tmp"
+  if [[ -d "${operator_mise_data}" ]]; then
+    export MISE_DATA_DIR="${operator_mise_data}"
+  fi
+  if [[ -d "${operator_mise_config}" ]]; then
+    export MISE_CONFIG_DIR="${operator_mise_config}"
+  fi
 
   if [[ "${CF_ACTIVE_AUTH_SCHEME}" == "api_token" ]]; then
     export CLOUDFLARE_API_TOKEN="${CF_ACTIVE_AUTH_SECRET}"
