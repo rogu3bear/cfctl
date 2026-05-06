@@ -15,7 +15,7 @@ If you've ever found yourself stitching together `wrangler`, `cloudflared`, raw 
 See [QUICKSTART.md](QUICKSTART.md) for install, credential setup, and your first `cfctl` commands. The shortest path:
 
 ```bash
-git clone https://github.com/your-org/cfctl.git
+git clone https://github.com/rogu3bear/cfctl.git
 cd cfctl
 ./bootstrap.sh                    # checks tools, symlinks cfctl, scaffolds ~/.config/cfctl/.env, runs doctor
 $EDITOR ~/.config/cfctl/.env      # fill in CF_DEV_TOKEN + CLOUDFLARE_ACCOUNT_ID
