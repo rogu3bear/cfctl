@@ -856,6 +856,12 @@ cf_load_cloudflare_env() {
 cf_load_cloudflare_env_files() {
   local shared_env_file="${CF_SHARED_ENV_FILE:-${CF_SHARED_ENV_FILE_DEFAULT}}"
   local repo_env_file="${CF_REPO_ENV_FILE:-${CF_REPO_ENV_FILE_DEFAULT}}"
+  local explicit_token_lane_is_set=0
+  local explicit_token_lane="${CF_TOKEN_LANE:-}"
+
+  if [[ "${CF_TOKEN_LANE+x}" == "x" ]]; then
+    explicit_token_lane_is_set=1
+  fi
 
   if [[ -f "${shared_env_file}" ]]; then
     set -a
@@ -869,6 +875,10 @@ cf_load_cloudflare_env_files() {
     # shellcheck disable=SC1090
     source "${repo_env_file}"
     set +a
+  fi
+
+  if [[ "${explicit_token_lane_is_set}" == "1" ]]; then
+    export CF_TOKEN_LANE="${explicit_token_lane}"
   fi
 }
 

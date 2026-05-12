@@ -292,6 +292,33 @@ jq -e '
   and .result.resource.resource.cloudflare_surface == "dns.record"
   and .result.resource.authority.control_plane == "cfctl"
 ' <<< "${ownership_get_json}" >/dev/null || die "ownership get envelope assertion failed"
+
+lane_precedence_dir="$(mktemp -d "${TMPDIR:-/tmp}/cfctl-lane-precedence.XXXXXX")"
+trap 'rm -rf "${lane_precedence_dir}"' EXIT
+lane_precedence_shared_env="${lane_precedence_dir}/shared.env"
+lane_precedence_repo_env="${lane_precedence_dir}/repo.env"
+printf '%s\n' \
+  'CF_DEV_TOKEN=dev-token' \
+  'CF_GLOBAL_TOKEN=global-token' \
+  'CLOUDFLARE_EMAIL=operator@example.com' \
+  'CF_TOKEN_LANE=dev' \
+  > "${lane_precedence_shared_env}"
+printf '%s\n' \
+  'CLOUDFLARE_ACCOUNT_ID=account-id' \
+  > "${lane_precedence_repo_env}"
+lane_precedence_json="$(
+  env \
+    CF_TOKEN_LANE=global \
+    CF_SHARED_ENV_FILE="${lane_precedence_shared_env}" \
+    CF_REPO_ENV_FILE="${lane_precedence_repo_env}" \
+    bash -c 'source "$1"; cf_load_cloudflare_env; cf_current_auth_state_json' bash "${ROOT_DIR}/scripts/lib/cloudflare.sh"
+)"
+jq -e '
+  .CF_TOKEN_LANE == "global"
+  and .CF_ACTIVE_TOKEN_ENV == "CF_GLOBAL_TOKEN"
+  and .CF_ACTIVE_AUTH_SCHEME == "global_api_key"
+' <<< "${lane_precedence_json}" >/dev/null || die "explicit CF_TOKEN_LANE was not preserved over env files"
+
 assert_cross_catalog_empty "surface docs topics resolve to docs bank" '
   (
     ["foundation", "watch"]
