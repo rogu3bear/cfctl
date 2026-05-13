@@ -48,6 +48,7 @@ Usage:
   cfctl previews purge-inactive-legacy
   cfctl locks
   cfctl locks clear-stale
+  cfctl env run [--lane dev|global] -- <command> [args...]
   cfctl ownership list
   cfctl ownership get --resource-key cloudflare:dns.record:*
   cfctl ownership check
@@ -80,6 +81,7 @@ Verb intent:
   standards Show the canonical configuration standards for this runtime, one surface, or a workspace audit.
   previews  Inspect actionable, legacy, and expired preview receipts, and purge expired ones.
   locks     Inspect write locks and clear stale ones.
+  env       Run an external argv command with lane-derived Cloudflare auth and redacted output.
   ownership Read and verify the checked-in Cloudflare ownership authority registry.
   wrangler  Run Wrangler through the cfctl envelope, logs, and preview gate for mutating commands.
   cloudflared Run cloudflared through the cfctl envelope, logs, and preview gate for mutating commands.
@@ -120,6 +122,7 @@ Examples:
   cfctl previews purge-inactive-legacy
   cfctl locks
   cfctl locks clear-stale
+  cfctl env run --lane dev -- env
   cfctl ownership list
   cfctl ownership get --resource-key cloudflare:dns.record:*
   cfctl ownership check
@@ -3704,6 +3707,270 @@ cfctl_handle_lanes() {
     ""
 }
 
+cfctl_redact_file_to_stream() {
+  local file="$1"
+  local secret="${CF_ACTIVE_AUTH_SECRET:-}"
+  local line
+  local redaction
+
+  [[ -f "${file}" ]] || return 0
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ -n "${secret}" ]]; then
+      line="${line//${secret}/[redacted]}"
+    fi
+    if [[ -n "${CFCTL_REDACT_VALUES_FILE:-}" && -f "${CFCTL_REDACT_VALUES_FILE}" ]]; then
+      while IFS= read -r redaction || [[ -n "${redaction}" ]]; do
+        [[ -n "${redaction}" ]] || continue
+        line="${line//${redaction}/[redacted]}"
+      done < "${CFCTL_REDACT_VALUES_FILE}"
+    fi
+    printf '%s\n' "${line}"
+  done < "${file}"
+}
+
+cfctl_env_file_var_names() {
+  local path="$1"
+  [[ -f "${path}" ]] || return 0
+
+  sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' "${path}"
+}
+
+cfctl_env_run_usage() {
+  cat <<'EOF'
+Usage:
+  cfctl env run [--lane dev|global] -- <command> [args...]
+
+Run an external argv command with cfctl-selected Cloudflare auth. The child
+receives only the lane-derived tool auth env, such as CLOUDFLARE_API_TOKEN for
+the dev lane. Parent lane secrets are stripped, child output is redacted, and a
+runtime artifact records the lane/env mapping without cfctl token values.
+Command argv is recorded for evidence; do not pass secrets as command args.
+EOF
+}
+
+cfctl_handle_env() {
+  local subcommand="${1:-}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+
+  case "${subcommand}" in
+    ""|-h|--help|help)
+      cfctl_env_run_usage
+      return 0
+      ;;
+  esac
+
+  if [[ "${subcommand}" != "run" ]]; then
+    cfctl_emit_failure \
+      "env" \
+      "runtime" \
+      "env_run" \
+      '{"state":"not_applicable","basis":"env_run","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
+      "invalid_arguments" \
+      "Usage: cfctl env run [--lane dev|global] -- <command> [args...]" \
+      "run"
+    exit 2
+  fi
+
+  local lane="${CF_TOKEN_LANE:-dev}"
+  local saw_separator=0
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -h|--help|help)
+        cfctl_env_run_usage
+        return 0
+        ;;
+      --lane)
+        lane="${2:-}"
+        [[ -n "${lane}" ]] || {
+          cfctl_emit_failure "env" "runtime" "env_run" '{"state":"not_applicable","basis":"env_run","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' "invalid_arguments" "--lane requires dev or global" "run"
+          exit 2
+        }
+        shift 2
+        ;;
+      --)
+        saw_separator=1
+        shift
+        break
+        ;;
+      *)
+        cfctl_emit_failure \
+          "env" \
+          "runtime" \
+          "env_run" \
+          '{"state":"not_applicable","basis":"env_run","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
+          "invalid_arguments" \
+          "cfctl env run accepts options before -- only; shell strings are not supported" \
+          "run"
+        exit 2
+        ;;
+    esac
+  done
+
+  if [[ "${saw_separator}" -ne 1 || "$#" -eq 0 ]]; then
+    cfctl_emit_failure \
+      "env" \
+      "runtime" \
+      "env_run" \
+      '{"state":"not_applicable","basis":"env_run","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
+      "invalid_arguments" \
+      "Usage: cfctl env run [--lane dev|global] -- <command> [args...]" \
+      "run"
+    exit 2
+  fi
+
+  cf_use_token_lane "${lane}"
+
+  local stdout_file
+  local stderr_file
+  local redaction_file
+  local child_status
+  stdout_file="$(mktemp "${TMPDIR:-/tmp}/cfctl-env-run-stdout.XXXXXX")"
+  stderr_file="$(mktemp "${TMPDIR:-/tmp}/cfctl-env-run-stderr.XXXXXX")"
+  redaction_file="$(mktemp "${TMPDIR:-/tmp}/cfctl-env-run-redact.XXXXXX")"
+  CFCTL_REDACT_VALUES_FILE="${redaction_file}"
+  export CFCTL_REDACT_VALUES_FILE
+
+  local shared_env_file="${CF_SHARED_ENV_FILE:-${CF_SHARED_ENV_FILE_DEFAULT}}"
+  local repo_env_file="${CF_REPO_ENV_FILE:-${CF_REPO_ENV_FILE_DEFAULT}}"
+  local loaded_env_names
+  local name
+  local unset_args=()
+  local child_env_args=()
+
+  loaded_env_names="$(
+    {
+      cfctl_env_file_var_names "${shared_env_file}"
+      cfctl_env_file_var_names "${repo_env_file}"
+    } | sort -u
+  )"
+
+  while IFS= read -r name; do
+    [[ -n "${name}" ]] || continue
+    unset_args+=(-u "${name}")
+    if [[ -n "${!name:-}" ]]; then
+      printf '%s\n' "${!name}" >> "${redaction_file}"
+    fi
+  done <<< "${loaded_env_names}"
+
+  unset_args+=(
+    -u CF_DEV_TOKEN
+    -u CF_GLOBAL_TOKEN
+    -u CF_ACTIVE_TOKEN_LANE
+    -u CF_ACTIVE_TOKEN_ENV
+    -u CF_ACTIVE_AUTH_SCHEME
+    -u CF_ACTIVE_AUTH_SECRET
+    -u CF_ACTIVE_API_TOKEN
+    -u CF_API_TOKEN_OVERRIDE
+    -u CFCTL_REDACT_VALUES_FILE
+  )
+
+  child_env_args+=("CF_TOKEN_LANE=${CF_ACTIVE_TOKEN_LANE:-${lane}}")
+  if [[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+    child_env_args+=("CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}")
+  fi
+  if [[ "${CF_ACTIVE_AUTH_SCHEME:-}" == "global_api_key" ]]; then
+    child_env_args+=("CLOUDFLARE_API_KEY=${CF_ACTIVE_AUTH_SECRET}")
+    if [[ -n "${CLOUDFLARE_EMAIL:-}" ]]; then
+      child_env_args+=("CLOUDFLARE_EMAIL=${CLOUDFLARE_EMAIL}")
+    fi
+  else
+    child_env_args+=("CLOUDFLARE_API_TOKEN=${CF_ACTIVE_AUTH_SECRET}")
+  fi
+
+  set +e
+  env "${unset_args[@]}" "${child_env_args[@]}" "$@" >"${stdout_file}" 2>"${stderr_file}"
+  child_status="$?"
+  set -e
+
+  cfctl_redact_file_to_stream "${stdout_file}"
+  cfctl_redact_file_to_stream "${stderr_file}" >&2
+
+  rm -f "${stdout_file}" "${stderr_file}" "${redaction_file}"
+  unset CFCTL_REDACT_VALUES_FILE
+
+  local command_json
+  local summary_json
+  local result_json
+  local ok
+  command_json="$(jq -nc '$ARGS.positional' --args -- "$@")"
+  summary_json="$(
+    jq -n \
+      --arg lane "${CF_ACTIVE_TOKEN_LANE:-}" \
+      --arg credential_env "${CF_ACTIVE_TOKEN_ENV:-}" \
+      --arg wrangler_env "$(if [[ "${CF_ACTIVE_AUTH_SCHEME:-}" == "global_api_key" ]]; then echo CLOUDFLARE_API_KEY; else echo CLOUDFLARE_API_TOKEN; fi)" \
+      --argjson exit_status "${child_status}" \
+      --argjson command_argc "$#" \
+      '{
+        lane: $lane,
+        credential_env: $credential_env,
+        exported_child_auth_env: $wrangler_env,
+        command_argc: $command_argc,
+        exit_status: $exit_status,
+        child_output_redacted: true
+      }'
+  )"
+  result_json="$(
+    jq -n \
+      --arg lane "${CF_ACTIVE_TOKEN_LANE:-}" \
+      --arg credential_env "${CF_ACTIVE_TOKEN_ENV:-}" \
+      --arg wrangler_env "$(if [[ "${CF_ACTIVE_AUTH_SCHEME:-}" == "global_api_key" ]]; then echo CLOUDFLARE_API_KEY; else echo CLOUDFLARE_API_TOKEN; fi)" \
+      --arg auth_scheme "${CF_ACTIVE_AUTH_SCHEME:-}" \
+      --argjson command "${command_json}" \
+      '{
+        command: $command,
+        env_mapping: {
+          lane: $lane,
+          credential_env: $credential_env,
+          auth_scheme: $auth_scheme,
+          exported_child_auth_env: $wrangler_env
+        },
+        stripped_child_env: [
+          "CF_DEV_TOKEN",
+          "CF_GLOBAL_TOKEN",
+          "CF_ACTIVE_TOKEN_LANE",
+          "CF_ACTIVE_TOKEN_ENV",
+          "CF_ACTIVE_AUTH_SCHEME",
+          "CF_ACTIVE_AUTH_SECRET",
+          "CF_ACTIVE_API_TOKEN",
+          "CF_API_TOKEN_OVERRIDE"
+        ],
+        secret_policy: {
+          token_values_in_artifact: false,
+          child_output_redacted: true,
+          shell_eval_allowed: false
+        }
+      }'
+  )"
+
+  if [[ "${child_status}" -eq 0 ]]; then
+    ok="true"
+  else
+    ok="false"
+  fi
+
+  set +e
+  cfctl_emit_result \
+    "${ok}" \
+    "env" \
+    "runtime" \
+    "env_run" \
+    "true" \
+    '{"state":"not_applicable","basis":"env_run","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
+    '{"state":"not_applicable"}' \
+    "${summary_json}" \
+    "${result_json}" \
+    "" \
+    "$([[ "${ok}" == "true" ]] && printf '' || printf 'child_failed')" \
+    "$([[ "${ok}" == "true" ]] && printf '' || printf 'Child command exited non-zero')" \
+    "run"
+  set -e
+
+  return "${child_status}"
+}
+
 cfctl_handle_tool_wrapper() {
   local tool="$1"
   shift
@@ -4724,6 +4991,9 @@ cfctl_main() {
     locks)
       cfctl_parse_flags
       cfctl_handle_locks_view "${1:-list}"
+      ;;
+    env)
+      cfctl_handle_env "$@"
       ;;
     ownership)
       local ownership_subcommand="${1:-list}"

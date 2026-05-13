@@ -12,6 +12,7 @@
     "docs",
     "previews",
     "locks",
+    "env",
     "ownership",
     "wrangler",
     "cloudflared",
@@ -161,6 +162,23 @@
       ],
       "intended_use": "emergency_wider_scope"
     }
+  },
+  "env_run": {
+    "default_lane": "dev",
+    "requires_argv_separator": true,
+    "shell_eval_allowed": false,
+    "redact_child_output": true,
+    "stripped_child_env": [
+      "CF_DEV_TOKEN",
+      "CF_GLOBAL_TOKEN",
+      "CF_ACTIVE_TOKEN_LANE",
+      "CF_ACTIVE_TOKEN_ENV",
+      "CF_ACTIVE_AUTH_SCHEME",
+      "CF_ACTIVE_AUTH_SECRET",
+      "CF_ACTIVE_API_TOKEN",
+      "CF_API_TOKEN_OVERRIDE"
+    ],
+    "summary": "Runs an external argv command under a cfctl-selected auth lane, exporting only the lane-derived tool env and recording a redacted runtime artifact."
   },
   "tool_wrappers": {
     "wrangler": {

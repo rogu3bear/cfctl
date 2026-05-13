@@ -20,6 +20,8 @@ Start by naming the job class:
   run `cfctl standards audit <repo>` and the target repo's own Cloudflare contract checks. Treat the result as checked-in config truth only.
 - Live edge/account inspection:
   run `cfctl list`, `cfctl get`, `cfctl snapshot`, `cfctl can`, or `cfctl verify` and cite the runtime artifact.
+- External command auth bridge:
+  run `cfctl env run --lane dev -- <command> [args...]` when another repo owns deploy semantics but `cfctl` owns Cloudflare credential hydration. Never pass secrets as command args because argv is recorded as evidence.
 - Mutation:
   read state, load standards, classify, guide, preview with `--plan`, apply with `--ack-plan <operation-id>`, then verify.
 - Runtime development:
@@ -43,6 +45,7 @@ cfctl standards worker.errors
 cfctl standards worker.runtime
 cfctl wrangler --version
 cfctl cloudflared version
+cfctl env run --lane dev -- env
 cfctl explain access.app
 cfctl classify tunnel create
 CF_TOKEN_LANE=global cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes

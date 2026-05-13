@@ -37,6 +37,9 @@ cfctl guide <surface> <operation> ...
 ## Secret Policy
 
 - Runtime artifacts and backend artifacts are redacted by default.
+- `cfctl env run` strips parent lane secrets, exports only the selected lane's
+  tool auth env to the child, and records command argv as evidence. Do not pass
+  secrets as command args.
 - `cfctl token mint` does not print the token secret by default.
 - For real token delivery, prefer:
 

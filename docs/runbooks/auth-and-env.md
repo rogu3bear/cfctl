@@ -25,6 +25,23 @@ After loading, the library selects an active lane and exports:
 
 That keeps direct API calls and Wrangler on the same credential.
 
+External repo deploy scripts should not source cfctl env files themselves.
+Use `cfctl env run` when an app repo owns deploy semantics but cfctl owns
+credential hydration:
+
+```bash
+CF_SHARED_ENV_FILE=/Users/star/dev/.env cfctl env run --lane dev -- \
+  /Users/star/dev/jkca-web/scripts/deploy-all.sh --only edge-router
+```
+
+The child process receives the lane-derived Cloudflare tool env, such as
+`CLOUDFLARE_API_TOKEN` on the `dev` lane. Parent lane secrets such as
+`CF_DEV_TOKEN`, `CF_GLOBAL_TOKEN`, and `CF_ACTIVE_AUTH_SECRET` are stripped from
+the child environment. Child output is redacted before it reaches the terminal,
+and the runtime artifact records the lane/env mapping and command argv without
+cfctl token values. Because argv is evidence, do not pass secrets as command
+arguments.
+
 In this workspace, `CF_DEV_TOKEN` may be an account-scoped API token rather than a user-scoped token. The auth probe handles that by verifying the currently active lane against:
 
 - `/accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify` first when account context is available
@@ -52,6 +69,7 @@ Run:
 ```bash
 cfctl doctor
 cfctl lanes
+CF_SHARED_ENV_FILE=/Users/star/dev/.env cfctl env run --lane dev -- env
 cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
 CF_TOKEN_LANE=global cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
 ./scripts/cf_auth_check.sh

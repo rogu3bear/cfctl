@@ -7,6 +7,7 @@ It is built for agent and operator use:
 - `doctor` for runtime trust checks
 - `previews` for preview-receipt inspection and cleanup
 - `locks` for write-lock inspection and cleanup
+- `env` for running external argv commands with lane-derived Cloudflare auth
 - `ownership` for the checked-in Cloudflare resource authority registry
 - `wrangler` for wrapped Wrangler commands with logs and preview gating
 - `cloudflared` for wrapped cloudflared commands with logs and preview gating
@@ -42,6 +43,7 @@ cfctl previews purge-expired
 cfctl previews purge-inactive-legacy
 cfctl locks
 cfctl locks clear-stale
+cfctl env run --lane dev -- env
 cfctl ownership list
 cfctl ownership get --resource-key cloudflare:dns.record:*
 cfctl ownership check
@@ -109,6 +111,8 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - `previews purge-inactive-legacy` removes only legacy preview receipts that lack complete trust metadata
 - `locks` lists active write locks and their stale/orphaned state
 - `locks clear-stale` removes stale/orphaned locks only
+- `env run --lane dev -- <command> [args...]` runs an external argv command with lane-derived Cloudflare auth, strips parent lane secrets, redacts child output, and records a runtime artifact
+- `env run` records command argv as evidence; do not pass secrets as command args
 - `ownership list` emits the checked-in owner, lane, verifier, proof, and runbook registry as a normal cfctl evidence envelope
 - `ownership get --resource-key <key>` resolves one exact ownership entry, such as `cloudflare:dns.record:*`
 - `ownership check` verifies duplicate owners, required owner/verifier/proof fields, known surfaces, cfctl-only command paths, and portable repo ids

@@ -147,7 +147,15 @@ assert_jq_file "permission profile minimality policy" '
   and .profiles["full-operator"].allowed_surfaces == ["*"]
   and (.profiles["full-operator"].forbidden_permissions | index("Account API Tokens *")) != null
 ' "${ROOT_DIR}/catalog/permissions.json"
-assert_jq_file "runtime public verbs" '(.public_verbs | index("docs")) != null and (.public_verbs | index("wrangler")) != null and (.public_verbs | index("cloudflared")) != null and (.public_verbs | index("hostname")) != null and (.public_verbs | index("ownership")) != null and (.landing_flow | index("ownership check")) != null and (.landing_flow | index("docs")) != null' "${ROOT_DIR}/catalog/runtime.json"
+assert_jq_file "runtime public verbs" '(.public_verbs | index("docs")) != null and (.public_verbs | index("env")) != null and (.public_verbs | index("wrangler")) != null and (.public_verbs | index("cloudflared")) != null and (.public_verbs | index("hostname")) != null and (.public_verbs | index("ownership")) != null and (.landing_flow | index("ownership check")) != null and (.landing_flow | index("docs")) != null' "${ROOT_DIR}/catalog/runtime.json"
+assert_jq_file "runtime env run policy" '
+  .env_run.default_lane == "dev"
+  and .env_run.requires_argv_separator == true
+  and .env_run.shell_eval_allowed == false
+  and .env_run.redact_child_output == true
+  and (.env_run.stripped_child_env | index("CF_DEV_TOKEN")) != null
+  and (.env_run.stripped_child_env | index("CF_ACTIVE_AUTH_SECRET")) != null
+' "${ROOT_DIR}/catalog/runtime.json"
 assert_jq_file "runtime backend guard catalog" '
   .policy.backend_guard_scripts == ["scripts/cf_api_apply.sh"]
   and .policy.special_operations["token.mint"].backend_script == "scripts/cf_token_mint.sh"
@@ -320,6 +328,42 @@ jq -e '
   and .CF_ACTIVE_TOKEN_ENV == "CF_GLOBAL_TOKEN"
   and .CF_ACTIVE_AUTH_SCHEME == "global_api_key"
 ' <<< "${lane_precedence_json}" >/dev/null || die "explicit CF_TOKEN_LANE was not preserved over env files"
+
+env_run_shared_env="${lane_precedence_dir}/env-run.env"
+printf '%s\n' \
+  'CF_DEV_TOKEN=dev-token-for-env-run-static-test' \
+  'CLOUDFLARE_ACCOUNT_ID=account-id' \
+  > "${env_run_shared_env}"
+env_run_output="$(
+  env \
+    -u CF_GLOBAL_TOKEN \
+    -u CLOUDFLARE_API_TOKEN \
+    CF_SHARED_ENV_FILE="${env_run_shared_env}" \
+    CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+      "${ROOT_DIR}/cfctl" env run --lane dev -- env
+)"
+env_run_help_output="$("${ROOT_DIR}/cfctl" env run --help)"
+env_run_json="$(awk 'found { print } /^\{$/ { found=1; print }' <<< "${env_run_output}")"
+grep -Fq 'cfctl env run [--lane dev|global] -- <command> [args...]' <<< "${env_run_help_output}" || die "env run help missing usage"
+grep -Fq 'do not pass secrets as command args' <<< "${env_run_help_output}" || die "env run help missing argv secrecy warning"
+grep -Fq 'CLOUDFLARE_API_TOKEN=[redacted]' <<< "${env_run_output}" || die "env run did not prove redacted child CLOUDFLARE_API_TOKEN"
+if grep -Fq 'dev-token-for-env-run-static-test' <<< "${env_run_output}"; then
+  die "env run leaked token value"
+fi
+if grep -Eq '^CF_DEV_TOKEN=' <<< "${env_run_output}"; then
+  die "env run exposed parent CF_DEV_TOKEN to child env"
+fi
+jq -e '
+  .ok == true
+  and .action == "env"
+  and .surface == "runtime"
+  and .operation == "run"
+  and .summary.lane == "dev"
+  and .summary.exported_child_auth_env == "CLOUDFLARE_API_TOKEN"
+  and .summary.child_output_redacted == true
+  and .result.secret_policy.token_values_in_artifact == false
+  and .result.secret_policy.shell_eval_allowed == false
+' <<< "${env_run_json}" >/dev/null || die "env run artifact assertion failed"
 
 assert_cross_catalog_empty "surface docs topics resolve to docs bank" '
   (
@@ -504,11 +548,15 @@ assert_contains "hostname checked-in spec" "service: example-edge-router" "${ROO
 assert_contains "cfctl prompt contract" "You are now operating as \`cfctl\`, a strict, catalog-driven Cloudflare control plane." "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt preview ack" "always require \`--plan\` first, then \`--ack-plan <operation-id>\`" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt token revoke" "For token revocation, require \`--plan\` first" "${ROOT_DIR}/CFCTL_PROMPT.md"
-assert_contains "cfctl prompt error verb" "\`doctor\`, \`audit\`, \`admin\`, \`bootstrap\`, \`lanes\`, \`surfaces\`, \`docs\`, \`previews\`, \`locks\`, \`ownership\`, \`wrangler\`, \`cloudflared\`, \`hostname\`, \`standards\`, \`token\`, \`list\`, \`get\`, \`can\`, \`classify\`, \`guide\`, \`apply\`, \`verify\`, \`explain\`, \`snapshot\`, \`diff\`, or \`error\`." "${ROOT_DIR}/CFCTL_PROMPT.md"
+assert_contains "cfctl prompt error verb" "\`doctor\`, \`audit\`, \`admin\`, \`bootstrap\`, \`lanes\`, \`surfaces\`, \`docs\`, \`previews\`, \`locks\`, \`env\`, \`ownership\`, \`wrangler\`, \`cloudflared\`, \`hostname\`, \`standards\`, \`token\`, \`list\`, \`get\`, \`can\`, \`classify\`, \`guide\`, \`apply\`, \`verify\`, \`explain\`, \`snapshot\`, \`diff\`, or \`error\`." "${ROOT_DIR}/CFCTL_PROMPT.md"
+assert_contains "cfctl prompt env run" "For \`env run\`, require \`--\` followed by argv command tokens." "${ROOT_DIR}/CFCTL_PROMPT.md"
+assert_contains "cfctl prompt env run argv secrecy" "refuse requests that pass secrets as command args" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt hostname" "For \`hostname\`, treat \`verify\`, \`diff\`, and \`plan\` as read-only composite evidence flows" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt wrapper gating" "For \`wrangler\` and \`cloudflared\`, treat clearly read-only subcommands as direct wrapped executions" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl preview inactive legacy cleanup command" "purge-inactive-legacy" "${ROOT_DIR}/commands/cfctl.sh"
 assert_contains "readme wrapper examples" "cfctl wrangler --version" "${ROOT_DIR}/README.md"
+assert_contains "readme env run" "cfctl env run --lane dev -- <command> [args...]" "${ROOT_DIR}/README.md"
+assert_contains "readme env run argv secrecy" "do not pass secrets as command-line arguments" "${ROOT_DIR}/README.md"
 assert_contains "readme inactive legacy preview cleanup" "cfctl previews purge-inactive-legacy" "${ROOT_DIR}/README.md"
 assert_contains "readme source-live boundary" "Source Config Vs Live State" "${ROOT_DIR}/README.md"
 assert_contains "readme hostname lifecycle" "Hostname lifecycle" "${ROOT_DIR}/README.md"
@@ -520,7 +568,14 @@ assert_contains "agents hostname lifecycle" "Hostname lifecycle specs live under
 assert_contains "agents token revoke" "cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete" "${ROOT_DIR}/AGENTS.md"
 assert_contains "agent landing decision path" "## Decision Path" "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "agent landing source-live boundary" "Do not turn a source-config audit into a live Cloudflare claim." "${ROOT_DIR}/docs/agent-landing.md"
+assert_contains "agent landing env run" "External command auth bridge" "${ROOT_DIR}/docs/agent-landing.md"
+assert_contains "agent landing env run argv secrecy" "Never pass secrets as command args because argv is recorded as evidence." "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "runbook wrapper examples" "cfctl cloudflared version" "${ROOT_DIR}/docs/runbooks/cfctl.md"
+assert_contains "runbook env run" "cfctl env run --lane dev -- env" "${ROOT_DIR}/docs/runbooks/cfctl.md"
+assert_contains "runbook env run argv secrecy" "\`env run\` records command argv as evidence; do not pass secrets as command args" "${ROOT_DIR}/docs/runbooks/cfctl.md"
+assert_contains "auth runbook env run" "CF_SHARED_ENV_FILE=/Users/star/dev/.env cfctl env run --lane dev --" "${ROOT_DIR}/docs/runbooks/auth-and-env.md"
+assert_contains "auth runbook env run argv secrecy" "Because argv is evidence, do not pass secrets as command" "${ROOT_DIR}/docs/runbooks/auth-and-env.md"
+assert_contains "runtime policy env run" "\`cfctl env run\` strips parent lane secrets" "${ROOT_DIR}/docs/runtime-policy.md"
 assert_contains "runbook inactive legacy preview cleanup" "previews purge-inactive-legacy" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook audit log read" "cfctl list audit.log" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook hostname lifecycle" "cfctl hostname verify --file state/hostname/example.yaml" "${ROOT_DIR}/docs/runbooks/cfctl.md"

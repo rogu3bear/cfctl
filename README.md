@@ -157,8 +157,8 @@ Defined in [catalog/runtime.json](catalog/runtime.json):
 
 ```
 doctor    audit     admin     bootstrap lanes     surfaces  docs      previews  locks
-ownership wrangler  cloudflared standards token   list      get       can       classify
-guide     apply     verify    explain   snapshot  diff
+env       ownership wrangler  cloudflared standards token   list      get       can
+classify  guide     apply     verify    explain   snapshot  diff
 ```
 
 Bootstrap permission profiles are defined in [catalog/permissions.json](catalog/permissions.json).
@@ -175,6 +175,19 @@ verifier fails when a profile gains a permission outside its declared boundary.
 as a read-only public control-plane interface. Use it instead of scraping the
 JSON file directly when checking which repo owns a Cloudflare resource class,
 for example `cfctl ownership get --resource-key cloudflare:dns.record:*`.
+
+`cfctl env run --lane dev -- <command> [args...]` is the bridge for external
+deploy scripts that need lane-derived auth without learning cfctl token internals.
+It loads the normal env files, selects the requested lane, exports the mapped
+Cloudflare tool env to the child, strips parent lane secrets from the child
+environment, redacts child output, and writes a runtime artifact naming the
+lane/env mapping without cfctl token values. The artifact records command argv
+for evidence, so do not pass secrets as command-line arguments:
+
+```bash
+CF_SHARED_ENV_FILE=/Users/star/dev/.env cfctl env run --lane dev -- \
+  /Users/star/dev/jkca-web/scripts/deploy-all.sh --only edge-router
+```
 
 `./scripts/verify_static_contract.sh` validates the permission catalog schema
 and deterministic profile command fixtures, including the public ownership
