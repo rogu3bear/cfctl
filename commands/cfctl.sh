@@ -3454,7 +3454,7 @@ cfctl_handle_apply() {
   fi
 
   required_confirm="$(cfctl_required_confirmation "${surface}" "${operation}")"
-  if [[ -n "${required_confirm}" && "${CFCTL_CONFIRM}" != "${required_confirm}" ]]; then
+  if [[ "${CFCTL_PLAN}" != "1" && -n "${required_confirm}" && "${CFCTL_CONFIRM}" != "${required_confirm}" ]]; then
     cfctl_emit_failure "apply" "${surface}" "registry" '{"state":"unknown","basis":"confirmation_required","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' "invalid_arguments" "Operation ${operation} on ${surface} requires --confirm ${required_confirm}" "${operation}"
     exit 1
   fi
@@ -3520,6 +3520,17 @@ cfctl_handle_apply() {
         "COMMENT=${CFCTL_COMMENT}" \
         "TAGS_JSON=${CFCTL_TAGS_JSON}" \
         "DATA_JSON=${CFCTL_DATA_JSON}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
+    worker.route)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "ZONE_NAME=${CFCTL_ZONE_NAME}" \
+        "ZONE_ID=${CFCTL_ZONE_ID}" \
+        "ROUTE_ID=${id_value}" \
+        "ROUTE_PATTERN=${CFCTL_PATTERN}" \
         "BODY_JSON=${CFCTL_BODY_JSON}" \
         "BODY_FILE=${CFCTL_BODY_FILE}"
       ;;

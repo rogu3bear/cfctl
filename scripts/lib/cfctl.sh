@@ -573,7 +573,6 @@ cfctl_current_operation_request_json() {
     --argjson tags "$(if [[ -n "${CFCTL_TAGS_JSON}" ]]; then printf '%s\n' "${CFCTL_TAGS_JSON}"; else echo 'null'; fi)" \
     --argjson data "$(if [[ -n "${CFCTL_DATA_JSON}" ]]; then printf '%s\n' "${CFCTL_DATA_JSON}"; else echo 'null'; fi)" \
     --arg scope "${CFCTL_SCOPE}" \
-    --arg confirm "${CFCTL_CONFIRM}" \
     --arg client_id "${CFCTL_CLIENT_ID}" \
     --arg since "${CFCTL_SINCE}" \
     --arg before "${CFCTL_BEFORE}" \
@@ -609,8 +608,7 @@ cfctl_current_operation_request_json() {
         actor: (if $actor == "" then null else $actor end),
         action_type: (if $action_type == "" then null else $action_type end),
         resource_type: (if $resource_type == "" then null else $resource_type end),
-        limit: (if $limit == "" then null else $limit end),
-        confirm: (if $confirm == "" then null else $confirm end)
+        limit: (if $limit == "" then null else $limit end)
       }
       | with_entries(select(.value != null))
     '
