@@ -216,6 +216,7 @@
       "docs_topics": ["workers-routes", "api-auth"],
       "backend": "inventory_script",
       "inventory_script": "scripts/cf_inventory_worker_routes.sh",
+      "apply_script": "scripts/cf_mutate_worker_route.sh",
       "permission_family": "Workers Routes",
       "selectors": ["zone", "id", "pattern", "service"],
       "actions": {
@@ -238,12 +239,22 @@
           "required_selectors": ["zone"]
         },
         "apply": {
-          "supported": false
+          "supported": true,
+          "operations": {
+            "delete": {
+              "risk": "destructive",
+              "required_selectors": ["zone"],
+              "selectors_any_of": [["id"], ["pattern"]],
+              "confirm": "delete"
+            }
+          }
         }
       },
       "examples": [
         "./cfctl list worker.route --zone example.com",
-        "./cfctl get worker.route --zone example.com --pattern \"*.example.com/*\""
+        "./cfctl get worker.route --zone example.com --pattern \"*.example.com/*\"",
+        "./cfctl apply worker.route delete --zone example.com --pattern \"*.example.com/*\" --plan",
+        "./cfctl apply worker.route delete --zone example.com --pattern \"*.example.com/*\" --ack-plan <operation-id> --confirm delete"
       ]
     },
     "d1.database": {

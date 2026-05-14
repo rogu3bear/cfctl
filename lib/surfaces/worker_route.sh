@@ -4,9 +4,18 @@ set -euo pipefail
 
 cfctl_surface_worker_route_permission_spec_json() {
   local permission_family="$1"
+  local method="GET"
+
+  if [[ "${CFCTL_ACTION:-}" == "apply" ]]; then
+    case "${CFCTL_OPERATION:-}" in
+      delete)
+        method="DELETE"
+        ;;
+    esac
+  fi
 
   jq -n \
-    --arg method "GET" \
+    --arg method "${method}" \
     --arg path "/zones/${CFCTL_ZONE_ID}/workers/routes" \
     --arg permission_family "${permission_family}" \
     '{method: $method, path: $path, permission_family: $permission_family, inference: "surface_read_probe"}'

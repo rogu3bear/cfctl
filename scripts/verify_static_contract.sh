@@ -99,6 +99,7 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_inventory_worker_routes.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_edge_certificates.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_edge_certificate.sh" \
+  "${ROOT_DIR}/scripts/cf_mutate_worker_route.sh" \
   "${ROOT_DIR}/scripts/verify_public_contract.sh" \
   "${ROOT_DIR}/scripts/verify_static_contract.sh"
 for surface_module in \
