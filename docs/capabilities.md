@@ -32,6 +32,7 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | `worker.secret` | yes | yes | no | `-` | `-` | `worker_secret` |
 | `workflow` | yes | no | no | `-` | `-` | `-` |
 | `zone` | yes | no | no | `-` | `-` | `-` |
+| `zone.ruleset` | yes | yes | no | `-` | `ruleset-engine, api-auth` | `-` |
 
 Composite lifecycle commands:
 - `cfctl hostname verify --file state/hostname/<name>.yaml`

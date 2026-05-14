@@ -12,6 +12,7 @@ cfctl_reset_flags() {
   CFCTL_DOMAIN=""
   CFCTL_FILE=""
   CFCTL_PATTERN=""
+  CFCTL_PHASE=""
   CFCTL_SERVICE=""
   CFCTL_ZONE_NAME=""
   CFCTL_ZONE_ID=""
@@ -81,6 +82,8 @@ cfctl_parse_flags() {
       --file=*) CFCTL_FILE="${1#*=}"; shift ;;
       --pattern) CFCTL_PATTERN="$2"; shift 2 ;;
       --pattern=*) CFCTL_PATTERN="${1#*=}"; shift ;;
+      --phase) CFCTL_PHASE="$2"; shift 2 ;;
+      --phase=*) CFCTL_PHASE="${1#*=}"; shift ;;
       --service) CFCTL_SERVICE="$2"; shift 2 ;;
       --service=*) CFCTL_SERVICE="${1#*=}"; shift ;;
       --zone) CFCTL_ZONE_NAME="$2"; shift 2 ;;
@@ -565,6 +568,7 @@ cfctl_current_operation_request_json() {
     --arg content "${CFCTL_CONTENT}" \
     --arg file "${CFCTL_FILE}" \
     --arg pattern "${CFCTL_PATTERN}" \
+    --arg phase "${CFCTL_PHASE}" \
     --arg service "${CFCTL_SERVICE}" \
     --arg ttl "${CFCTL_TTL}" \
     --arg proxied "${CFCTL_PROXIED}" \
@@ -594,6 +598,7 @@ cfctl_current_operation_request_json() {
         content: (if $content == "" then null else $content end),
         file: (if $file == "" then null else $file end),
         pattern: (if $pattern == "" then null else $pattern end),
+        phase: (if $phase == "" then null else $phase end),
         service: (if $service == "" then null else $service end),
         ttl: (if $ttl == "" then null else $ttl end),
         proxied: (if $proxied == "" then null else $proxied end),
@@ -914,6 +919,7 @@ cfctl_selector_presence_json() {
     --arg name "${CFCTL_NAME}" \
     --arg domain "${CFCTL_DOMAIN}" \
     --arg pattern "${CFCTL_PATTERN}" \
+    --arg phase "${CFCTL_PHASE}" \
     --arg service "${CFCTL_SERVICE}" \
     --arg zone_name "${CFCTL_ZONE_NAME}" \
     --arg zone_id "${CFCTL_ZONE_ID}" \
@@ -941,6 +947,7 @@ cfctl_selector_presence_json() {
         name: ($name | length > 0),
         domain: ($domain | length > 0),
         pattern: ($pattern | length > 0),
+        phase: ($phase | length > 0),
         service: ($service | length > 0),
         zone: (($zone_name | length > 0) or ($zone_id | length > 0)),
         zone_id: ($zone_id | length > 0),
@@ -1418,6 +1425,12 @@ cfctl_collect_surface_items() {
       cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}" "ZONE_ID=${CFCTL_ZONE_ID}"
       CFCTL_COLLECT_BACKEND="inventory_script"
       ;;
+    zone.ruleset)
+      cfctl_resolve_zone_context
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_zone_security.sh"
+      cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
     d1.database)
       script_path="${CF_REPO_ROOT}/scripts/cf_inventory_d1.sh"
       cfctl_run_backend_script "${script_path}"
@@ -1561,6 +1574,20 @@ cfctl_collect_surface_items() {
                 zone_id: $root.zone.id,
                 zone_name: $root.zone.name,
                 service: (.script // null)
+              }
+          ]
+        ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
+      )"
+      ;;
+    zone.ruleset)
+      CFCTL_COLLECT_ITEMS_JSON="$(
+        jq -c '
+          . as $root
+          | [
+            (.rulesets.result // [])[]
+            | . + {
+                zone_id: $root.zone.id,
+                zone_name: $root.zone.name
               }
           ]
         ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
@@ -1793,6 +1820,20 @@ cfctl_filter_surface_items() {
               (if $pattern != "" then .pattern == $pattern else true end)
               and
               (if $service != "" then (.script // .service // "") == $service else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
+    zone.ruleset)
+      jq -c --arg id "${CFCTL_ID}" --arg name "${CFCTL_NAME}" --arg phase "${CFCTL_PHASE:-}" '
+        [
+          .[]
+          | select(
+              (if $id != "" then .id == $id else true end)
+              and
+              (if $name != "" then .name == $name else true end)
+              and
+              (if $phase != "" then .phase == $phase else true end)
             )
         ]
       ' <<< "${items_json}"
@@ -2032,6 +2073,7 @@ cfctl_summary_for_items() {
     worker.script) name_field="id" ;;
     worker.secret) name_field="name" ;;
     worker.route) name_field="pattern" ;;
+    zone.ruleset) name_field="name" ;;
     d1.database) name_field="name" ;;
     r2.bucket) name_field="name" ;;
     queue) name_field="queue_name" ;;
