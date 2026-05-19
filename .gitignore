@@ -29,3 +29,13 @@ secrets-out/
 # Local overrides
 *.local
 local.*
+
+# Local operator/agent strategy files. Keep these useful in private checkouts
+# but out of public control-plane releases.
+AGENTS.md
+CLAUDE.md
+NORTH_STAR.md
+ANCHOR.md
+.agents/
+.claude/
+*.local.md
