@@ -295,7 +295,7 @@ The defaults in those scripts are placeholders — set `DESTINATION_ADDRESSES_JS
 ## Docs
 
 - [QUICKSTART.md](QUICKSTART.md) — install + first commands
-- [AGENTS.md](AGENTS.md) — operational landing for autonomous agents
+- [docs/agent-landing.md](docs/agent-landing.md) — public operational landing for autonomous agents
 - [CFCTL_PROMPT.md](CFCTL_PROMPT.md) — strict embedding prompt for tool integrators
 - [docs/agent-landing.md](docs/agent-landing.md)
 - [docs/auth.md](docs/auth.md)
