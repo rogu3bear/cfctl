@@ -17,6 +17,7 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | `d1.database` | yes | no | no | `-` | `-` | `-` |
 | `dns.record` | yes | yes | yes | `dns.record` | `api-auth` | `dns_record` |
 | `edge.certificate` | yes | yes | no | `edge.certificate` | `advanced-certificates, api-auth` | `edge_certificate` |
+| `email.routing_rule` | yes | yes | no | `-` | `email-routing, api-auth` | `-` |
 | `logpush.job` | yes | yes | no | `-` | `-` | `-` |
 | `pages.project` | yes | no | no | `-` | `-` | `-` |
 | `queue` | yes | no | no | `-` | `-` | `-` |
