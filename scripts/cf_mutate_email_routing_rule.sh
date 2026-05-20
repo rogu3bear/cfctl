@@ -137,6 +137,24 @@ printf '%s\n' "${mutation_report}"
 
 report_file="$(printf '%s\n' "${mutation_report}" | tail -n 1)"
 if [[ "${APPLY}" == "1" && "${status}" -eq 0 && -f "${report_file}" ]]; then
+  if [[ -n "${BODY_JSON:-}" || -n "${BODY_FILE:-}" ]]; then
+    if jq -e --arg address "${RULE_ADDRESS}" '
+      (.verification.response.result // [])
+      | any(
+          .[]?;
+          (
+            any(.matchers[]?; .field == "to" and (.value | ascii_downcase) == ($address | ascii_downcase))
+            and (.enabled == true)
+          )
+        )
+    ' "${report_file}" >/dev/null; then
+      exit 0
+    fi
+
+    echo "Email Routing rule verification failed for ${RULE_ADDRESS}" >&2
+    exit 1
+  fi
+
   if jq -e --arg address "${RULE_ADDRESS}" --arg worker_name "${WORKER_NAME}" '
     (.verification.response.result // [])
     | any(
