@@ -3537,6 +3537,19 @@ cfctl_handle_apply() {
         "BODY_JSON=${CFCTL_BODY_JSON}" \
         "BODY_FILE=${CFCTL_BODY_FILE}"
       ;;
+    email.routing_rule)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "ZONE_NAME=${CFCTL_ZONE_NAME}" \
+        "ZONE_ID=${CFCTL_ZONE_ID}" \
+        "RULE_ID=${id_value}" \
+        "RULE_ADDRESS=${CFCTL_NAME}" \
+        "WORKER_NAME=${CFCTL_SERVICE}" \
+        "PRIORITY=${CFCTL_PRIORITY}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
     zone.ruleset)
       cfctl_run_backend_script "${script_path}" \
         "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \

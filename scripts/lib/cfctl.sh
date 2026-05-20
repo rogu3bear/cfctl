@@ -1425,6 +1425,12 @@ cfctl_collect_surface_items() {
       cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}" "ZONE_ID=${CFCTL_ZONE_ID}"
       CFCTL_COLLECT_BACKEND="inventory_script"
       ;;
+    email.routing_rule)
+      cfctl_resolve_zone_context
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_email_routing_rules.sh"
+      cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}" "ZONE_ID=${CFCTL_ZONE_ID}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
     zone.ruleset)
       cfctl_resolve_zone_context
       script_path="${CF_REPO_ROOT}/scripts/cf_inventory_zone_security.sh"
@@ -1574,6 +1580,22 @@ cfctl_collect_surface_items() {
                 zone_id: $root.zone.id,
                 zone_name: $root.zone.name,
                 service: (.script // null)
+              }
+          ]
+        ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
+      )"
+      ;;
+    email.routing_rule)
+      CFCTL_COLLECT_ITEMS_JSON="$(
+        jq -c '
+          . as $root
+          | [
+            (.rules.result // [])[]
+            | . + {
+                zone_id: $root.zone.id,
+                zone_name: $root.zone.name,
+                recipient: ([.matchers[]? | select(.field == "to") | .value][0] // null),
+                service: ([.actions[]? | select(.type == "worker") | (.value // [])[]][0] // null)
               }
           ]
         ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
@@ -1820,6 +1842,20 @@ cfctl_filter_surface_items() {
               (if $pattern != "" then .pattern == $pattern else true end)
               and
               (if $service != "" then (.script // .service // "") == $service else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
+    email.routing_rule)
+      jq -c --arg id "${CFCTL_ID}" --arg address "${CFCTL_NAME}" --arg service "${CFCTL_SERVICE}" '
+        [
+          .[]
+          | select(
+              (if $id != "" then .id == $id else true end)
+              and
+              (if $address != "" then ((.recipient // "") | ascii_downcase) == ($address | ascii_downcase) else true end)
+              and
+              (if $service != "" then (.service // "") == $service else true end)
             )
         ]
       ' <<< "${items_json}"
@@ -2073,6 +2109,7 @@ cfctl_summary_for_items() {
     worker.script) name_field="id" ;;
     worker.secret) name_field="name" ;;
     worker.route) name_field="pattern" ;;
+    email.routing_rule) name_field="recipient" ;;
     zone.ruleset) name_field="name" ;;
     d1.database) name_field="name" ;;
     r2.bucket) name_field="name" ;;
