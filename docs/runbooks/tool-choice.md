@@ -14,6 +14,12 @@ It gives agents and operators:
 - structured runtime results
 - consistent verification semantics
 
+Use [../capabilities.md](../capabilities.md) when the first question is which
+surface owns a task, whether that surface is read-only, whether an operation is
+preview-gated or destructive, and which selectors are required. The matrix is
+generated from `catalog/surfaces.json` and `catalog/runtime.json`, not hand-kept
+operator prose.
+
 ## Use Direct API Wrappers For
 
 - account-wide inventory

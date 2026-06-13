@@ -67,6 +67,11 @@ cfctl snapshot tunnel
 CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
 ```
 
+For the repo-wide read/write boundary, use
+[../capabilities.md](../capabilities.md). It is generated from the catalogs and
+separates read-only inventory surfaces from preview-gated apply and
+desired-state sync surfaces.
+
 ## Runtime-First Reads
 
 Use `cfctl` when you want a stable public interface:

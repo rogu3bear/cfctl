@@ -28,6 +28,11 @@ It is built for agent and operator use:
 - `explain` for the machine-readable contract of a surface
 - `diff` for selective desired-state comparison
 
+[docs/capabilities.md](../capabilities.md) is the generated repo-wide contract
+matrix. Use it before writing to see read-only surfaces, preview requirements,
+destructive confirmations, allowed lanes, selector requirements, verification
+expectations, and desired-state sync support in one place.
+
 ## Core Examples
 
 ```bash
@@ -99,6 +104,7 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - commands emit a stable JSON result envelope
 - every result includes active auth lane and auth scheme
 - `standards` returns the canonical configuration standards catalog or one surface-specific standard set
+- `docs/capabilities.md` is generated from `catalog/surfaces.json` and `catalog/runtime.json`; edit the catalogs when the public contract changes
 - `docs` returns the curated official Cloudflare docs bank, either as a compact overview or one tracked topic
 - `docs` includes freshness metadata so the bank does not masquerade as auto-refreshed truth
 - `standards audit` scans the active Wrangler footprint under a root and reports standards coverage plus per-file findings

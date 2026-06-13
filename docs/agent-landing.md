@@ -23,7 +23,7 @@ Start by naming the job class:
 - External command auth bridge:
   run `cfctl env run --lane dev -- <command> [args...]` when another repo owns deploy semantics but `cfctl` owns Cloudflare credential hydration. Never pass secrets as command args because argv is recorded as evidence.
 - Mutation:
-  read state, load standards, classify, guide, preview with `--plan`, apply with `--ack-plan <operation-id>`, then verify.
+  read state, scan the generated matrix in [docs/capabilities.md](capabilities.md), load standards, classify, guide, preview with `--plan`, apply with `--ack-plan <operation-id>`, then verify.
 - Runtime development:
   change `cfctl`, catalogs, docs, and contract checks together; do not document a public capability before it exists in the catalog and command surface.
 - Degraded trust:
@@ -36,6 +36,7 @@ Do not turn a source-config audit into a live Cloudflare claim. If the question 
 ```bash
 cfctl doctor
 cfctl surfaces
+cfctl explain surfaces
 cfctl docs
 cfctl docs watch
 cfctl standards audit
