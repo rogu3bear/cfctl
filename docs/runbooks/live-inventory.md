@@ -75,6 +75,7 @@ Use `cfctl` when you want a stable public interface:
 cfctl list zone
 cfctl list worker.script
 cfctl list worker.route --zone example.com
+CF_TOKEN_LANE=global cfctl list email.routing_rule --zone example.com
 cfctl list pages.project
 cfctl list d1.database
 cfctl list r2.bucket
@@ -120,6 +121,7 @@ Use backend inventory scripts when you need the broader living bank or a surface
 ./scripts/cf_inventory_ssl_posture.sh
 ./scripts/cf_inventory_waiting_rooms.sh
 ./scripts/cf_inventory_logpush.sh
+CF_TOKEN_LANE=global ./scripts/audit_email_routing.sh
 ./scripts/cf_probe_token_permissions.sh
 ./scripts/cf_inventory_open_beta.sh
 ./scripts/cf_inventory_containers.sh
@@ -134,6 +136,7 @@ Single zone:
 
 ```bash
 ZONE_NAME=example.com ./scripts/cf_inventory_dns.sh
+CF_TOKEN_LANE=global cfctl list email.routing_rule --zone example.com
 ```
 
 Summary-only DNS:

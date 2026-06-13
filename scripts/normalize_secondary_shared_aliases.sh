@@ -19,6 +19,7 @@ EXCLUDE_REGEX="${EXCLUDE_REGEX:-^$}"
 ALIASES_JSON="${ALIASES_JSON:-[\"support\",\"hello\",\"founders\"]}"
 DESTINATION_ADDRESSES_JSON="${DESTINATION_ADDRESSES_JSON:-[\"primary@example.com\",\"backup@example.com\"]}"
 ZONE_NAMES_JSON="${ZONE_NAMES_JSON:-}"
+WORKER_DOMAINS_JSON="${WORKER_DOMAINS_JSON:-}"
 
 echo "Loading target zones"
 ZONES_JSON="$(
@@ -49,8 +50,7 @@ DESTINATION_STATE="$(
 echo "${DESTINATION_STATE}" | jq '{success, result: [.result[] | {email, verified, created}]}'
 
 missing_or_unverified="$(
-  echo "${DESTINATION_STATE}" \
-  | jq -r \
+  jq -r \
       --argjson destinations "${DESTINATION_ADDRESSES_JSON}" '
         . as $state |
         [
@@ -73,6 +73,18 @@ if [[ -n "${missing_or_unverified}" ]]; then
   exit 1
 fi
 
+if [[ -n "${WORKER_DOMAINS_JSON}" ]]; then
+  WORKER_DOMAINS_SOURCE_JSON="$(
+    jq -n \
+      --argjson domains "${WORKER_DOMAINS_JSON}" \
+      '$domains'
+  )"
+else
+  WORKER_DOMAINS_SOURCE_JSON="$(
+    jq '[.[].name]' <<< "${ZONES_JSON}"
+  )"
+fi
+
 TEMP_WORKER="$(mktemp)"
 TEMP_METADATA="$(mktemp)"
 TEMP_CONFIG="$(mktemp)"
@@ -87,12 +99,14 @@ jq -n \
 jq -n \
   --argjson destinations "${DESTINATION_ADDRESSES_JSON}" \
   --argjson aliases "${ALIASES_JSON}" \
-  --argjson zones "${ZONES_JSON}" \
+  --argjson worker_domains "${WORKER_DOMAINS_SOURCE_JSON}" \
+  --arg worker_name "${WORKER_NAME}" \
   '
     {
       destinations: $destinations,
       aliases: $aliases,
-      domains: ($zones | map(.name))
+      domains: $worker_domains,
+      worker_name: $worker_name
     }
   ' > "${TEMP_CONFIG}"
 
@@ -119,7 +133,7 @@ jq -r '
   "        destination,\n" +
   "        new Headers({\n" +
   "          \"X-Original-Envelope-To\": message.to,\n" +
-  "          \"X-Forwarded-By-Worker\": \"shared-collab-fanout\",\n" +
+  "          \"X-Forwarded-By-Worker\": \"\($cfg.worker_name)\",\n" +
   "        }),\n" +
   "      );\n" +
   "    }\n" +
@@ -133,6 +147,7 @@ jq -n \
   --argjson aliases "${ALIASES_JSON}" \
   --argjson destinations "${DESTINATION_ADDRESSES_JSON}" \
   --argjson zones "${ZONES_JSON}" \
+  --argjson worker_domains "${WORKER_DOMAINS_SOURCE_JSON}" \
   '
     {
       apply: env.APPLY,
@@ -140,15 +155,17 @@ jq -n \
       alias_count: ($aliases | length),
       destination_count: ($destinations | length),
       zone_count: ($zones | length),
+      worker_domain_count: ($worker_domains | length),
       aliases: $aliases,
       destinations: $destinations,
+      worker_domains: $worker_domains,
       zones: ($zones | map(.name))
     }
   '
 
 if [[ "${APPLY}" != "1" ]]; then
   echo "Dry run only. Set APPLY=1 to upload the Worker and normalize rules."
-  echo "Build log written to ${LOG_FILE}"
+  cf_print_log_footer
   exit 0
 fi
 

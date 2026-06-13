@@ -38,6 +38,7 @@ cfctl doctor --strict
 cfctl doctor --repair-hints
 ./scripts/verify_static_contract.sh
 ./scripts/verify_public_contract.sh
+CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_public_contract.sh
 cfctl previews
 cfctl previews purge-expired
 cfctl previews purge-inactive-legacy
@@ -78,13 +79,17 @@ cfctl explain access.app
 cfctl list pages.project
 cfctl get access.app --domain docs.example.org
 cfctl list worker.route --zone example.com
+CF_TOKEN_LANE=global cfctl list email.routing_rule --zone example.com
+CF_TOKEN_LANE=global cfctl get email.routing_rule --zone example.com --name role@example.com
 cfctl list api_gateway.operation --zone example.com
 cfctl list api_gateway.schema --zone example.com
 cfctl list vulnerability_scanner.scan
 cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
+CF_TOKEN_LANE=global cfctl can email.routing_rule --zone example.com
 CF_TOKEN_LANE=global cfctl snapshot tunnel
 CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
+CF_TOKEN_LANE=global cfctl apply email.routing_rule upsert --zone example.com --name role@example.com --service maildesk-cf-router --plan
 CF_TOKEN_LANE=global cfctl apply dns.record sync --zone example.com --plan
 CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
 ```
@@ -102,6 +107,8 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - `api_gateway.*` and `vulnerability_scanner.*` are read-only API-security inventory surfaces; they do not create scans, upload schemas, or change schema validation
 - `CF_TOKEN_LANE=global` switches `cfctl` onto the emergency token lane for that invocation
 - `--all-lanes` compares lane-specific permission truth where supported
+- `can <surface>` checks the surface-level probe when no operation is supplied;
+  `can <surface> <operation>` checks the operation policy and permission probe
 - `cfctl audit trust` is an alias for `cfctl doctor`
 - `doctor` reports `bootstrap_required` when no token lanes are configured and points at `cfctl bootstrap permissions`
 - `doctor --strict` exits non-zero for degraded trust state, not only unsafe state

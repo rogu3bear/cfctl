@@ -91,18 +91,39 @@ resolve_rule_id() {
   fi
 
   local rules
+  local matches
+  local match_count
   rules="$(cf_api_capture GET "/zones/${ZONE_ID}/email/routing/rules")"
-  if jq -e '.success == true' <<< "${rules}" >/dev/null 2>&1; then
-    jq -r --arg address "${RULE_ADDRESS}" '
-      (.result // [])
-      | map(
-          select(
-            any(.matchers[]?; .field == "to" and (.value | ascii_downcase) == ($address | ascii_downcase))
-          )
-        )
-      | if length == 1 then .[0].id else empty end
-    ' <<< "${rules}"
+  if ! jq -e '.success == true' <<< "${rules}" >/dev/null 2>&1; then
+    echo "Unable to read existing Email Routing rules before upsert" >&2
+    exit 1
   fi
+
+  matches="$(
+    jq -c --arg address "${RULE_ADDRESS}" '
+      [
+        (.result // [])[]
+        | select(
+            any(.matchers[]?; .field == "to" and (.value | ascii_downcase) == ($address | ascii_downcase))
+        )
+      ]
+    ' <<< "${rules}"
+  )"
+  match_count="$(jq -r 'length' <<< "${matches}")"
+
+  case "${match_count}" in
+    0)
+      echo ""
+      ;;
+    1)
+      jq -r '.[0].id' <<< "${matches}"
+      ;;
+    *)
+      echo "Ambiguous Email Routing rule selector: ${RULE_ADDRESS} matched ${match_count} rules" >&2
+      jq -c '[.[] | {id, name, enabled, priority}]' <<< "${matches}" >&2
+      exit 1
+      ;;
+  esac
 }
 
 TARGET_RULE_ID="$(resolve_rule_id)"
@@ -113,7 +134,8 @@ export APPLY="${APPLY:-0}"
 
 case "${OPERATION}" in
   upsert)
-    export BODY_JSON="$(build_payload)"
+    BODY_JSON="$(build_payload)"
+    export BODY_JSON
     if [[ -n "${TARGET_RULE_ID}" ]]; then
       export REQUEST_METHOD="PUT"
       export REQUEST_PATH="/zones/${ZONE_ID}/email/routing/rules/${TARGET_RULE_ID}"

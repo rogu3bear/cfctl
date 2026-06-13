@@ -201,6 +201,10 @@ runs static contract checks on pull requests. Its scheduled and manual live
 job runs through the `cfctl-live` protected environment and requires
 `CF_DEV_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CFCTL_PUBLIC_CONTRACT_ZONE`, then
 runs the live permission-group drift and public-contract smoke tests. The
+selected token lane must be able to operate on `CFCTL_PUBLIC_CONTRACT_ZONE`; run
+local smoke tests with an explicit lane when the default lane cannot see that
+zone, such as `CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com
+./scripts/verify_public_contract.sh`. The
 operator policy for these credentials is in
 [docs/permission-doctrine.md](docs/permission-doctrine.md).
 
@@ -251,6 +255,7 @@ cfctl doctor --strict
 cfctl doctor --repair-hints
 ./scripts/verify_static_contract.sh
 ./scripts/verify_public_contract.sh
+CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_public_contract.sh
 cfctl previews
 cfctl previews purge-expired
 cfctl previews purge-inactive-legacy
@@ -280,7 +285,14 @@ Compatibility map: [compat/script-entrypoints.json](compat/script-entrypoints.js
 
 ## Email routing
 
-The original email-routing workflows that seeded this repo still ship — they're useful as templates and as a reference for stitching Workers + Email Routing rules + verified destinations into one operation:
+Email Routing rule reads and targeted rule upserts are first-class `cfctl`
+operations through `email.routing_rule`. Use
+[docs/runbooks/email-routing.md](docs/runbooks/email-routing.md) for the
+operator model, commands, evidence locations, and troubleshooting rules.
+
+The original email-routing workflows that seeded this repo still ship. They are
+useful as templates and as account-wide audit helpers, but they are not the
+primary public interface for targeted rule work:
 
 - [scripts/deploy_accounts_fanout.sh](scripts/deploy_accounts_fanout.sh)
 - [scripts/provision_shared_aliases.sh](scripts/provision_shared_aliases.sh)
@@ -290,7 +302,11 @@ The original email-routing workflows that seeded this repo still ship — they'r
 - [scripts/audit_email_routing.sh](scripts/audit_email_routing.sh)
 - [workers/accounts-fanout/index.js](workers/accounts-fanout/index.js)
 
-The defaults in those scripts are placeholders — set `DESTINATION_ADDRESSES_JSON` and `ROUTES_JSON` (or edit the script) before applying.
+The defaults in those scripts are placeholders. Set
+`DESTINATION_ADDRESSES_JSON` and the target aliases/zones before applying.
+When retrying `normalize_secondary_shared_aliases.sh` for a subset of zones,
+pass `WORKER_DOMAINS_JSON` with the full Worker recipient-domain allowlist so a
+targeted retry does not shrink accepted domains to only the retry subset.
 
 ## Docs
 
@@ -306,6 +322,7 @@ The defaults in those scripts are placeholders — set `DESTINATION_ADDRESSES_JS
 - [docs/state.md](docs/state.md)
 - [docs/compat.md](docs/compat.md)
 - [docs/runbooks/cfctl.md](docs/runbooks/cfctl.md)
+- [docs/runbooks/email-routing.md](docs/runbooks/email-routing.md)
 - [docs/runbooks/tool-choice.md](docs/runbooks/tool-choice.md)
 - [docs/runbooks/mutations.md](docs/runbooks/mutations.md)
 - [docs/runbooks/live-inventory.md](docs/runbooks/live-inventory.md)

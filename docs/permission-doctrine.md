@@ -35,6 +35,14 @@ Required environment secrets and variables:
 - `CFCTL_PUBLIC_CONTRACT_ZONE`: a disposable zone or zone name used only for
   contract smoke tests.
 
+`CFCTL_PUBLIC_CONTRACT_ZONE` must be visible to the active token lane. Locally,
+set `CF_TOKEN_LANE` explicitly when the default lane does not own the smoke
+zone, for example:
+
+```bash
+CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_public_contract.sh
+```
+
 The live job is intentionally not run on pull requests. It runs on
 `workflow_dispatch` and the scheduled contract lane after the protected
 environment releases the job.

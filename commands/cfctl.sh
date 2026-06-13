@@ -323,7 +323,19 @@ cfctl_secret_scan_json() {
   fi
 
   if [[ -n "${raw_matches}" ]]; then
-    matches="$(printf '%s\n' "${raw_matches}" | jq -R . | jq -s 'map(select(length > 0)) | .[:50]')"
+    matches="$(
+      printf '%s\n' "${raw_matches}" \
+        | jq -R '
+            select(length > 0)
+            | capture("^(?<path>.*?):(?<line>[0-9]+):(?<match>.*)$")? // {path: ., line: null}
+            | if .line == null then
+                .path
+              else
+                "\(.path):\(.line):<redacted>"
+              end
+          ' \
+        | jq -s '.[:50]'
+    )"
   fi
 
   for artifact_path in "${CF_REPO_ROOT}"/var/inventory/auth/token-mint-*.json; do
@@ -682,6 +694,24 @@ cfctl_recommended_lane_from_comparison() {
   jq -r '.summary.allowed_lanes[0] // empty' <<< "${comparison_json}"
 }
 
+cfctl_select_requested_lane_if_available() {
+  local requested_lane="${CF_TOKEN_LANE:-${CF_TOKEN_LANE_DEFAULT}}"
+
+  if [[ -n "${CF_ACTIVE_AUTH_SCHEME:-}" && -n "${CF_ACTIVE_AUTH_SECRET:-}" ]]; then
+    return
+  fi
+
+  if ! cf_token_available_for_lane "${requested_lane}"; then
+    return
+  fi
+
+  if [[ "${requested_lane}" == "global" && -z "${CLOUDFLARE_EMAIL:-}" ]]; then
+    return
+  fi
+
+  cf_select_active_token
+}
+
 cfctl_surface_mode() {
   local surface="$1"
 
@@ -951,7 +981,7 @@ cfctl_doctor_repair_hints_json() {
   fi
 
   if [[ "$(jq '(.leak_count // 0) > 0' <<< "${secret_scan_json}")" == "true" ]]; then
-    hints="$(jq '. + ["rg -n -S '\''cfat_|cfk_|Authorization: Bearer |X-Auth-Key: '\'' var"]' <<< "${hints}")"
+    hints="$(jq '. + ["Inspect .result.secret_scan.sample_matches from cfctl doctor output; entries are path/line only with match text redacted"]' <<< "${hints}")"
   fi
 
   if [[ "$(jq '(.unsafe_secret_sink_count // 0) > 0' <<< "${secret_scan_json}")" == "true" ]]; then
@@ -2929,6 +2959,7 @@ cfctl_handle_can() {
   local current_lane
 
   cfctl_require_surface "${surface}"
+  cfctl_select_requested_lane_if_available
 
   if cfctl_action_supported "${surface}" "${requested_operation}"; then
     target_action="${requested_operation}"
@@ -2974,8 +3005,8 @@ cfctl_handle_can() {
     "true" \
     "${permission_json}" \
     '{"state":"not_applicable"}' \
-    "$(jq -n --arg operation "${requested_operation}" '{operation: $operation}')" \
-    "$(jq -n --arg operation "${requested_operation}" '{operation: $operation}')" \
+    "$(jq -n --arg operation "${requested_operation}" --argjson permission "${permission_json}" '{operation: $operation, permission_state: ($permission.state // "unknown"), basis: ($permission.basis // null)}')" \
+    "$(jq -n --arg operation "${requested_operation}" --argjson permission "${permission_json}" '{operation: $operation, permission: $permission}')" \
     "" \
     "" \
     "" \
@@ -5065,13 +5096,17 @@ cfctl_main() {
       cfctl_handle_explain "${surface}"
       ;;
     can)
-      if [[ "$#" -lt 2 ]]; then
+      if [[ "$#" -lt 1 ]]; then
         cfctl_usage
         exit 1
       fi
       local surface="$1"
-      local operation="$2"
-      shift 2
+      local operation="can"
+      shift
+      if [[ "$#" -gt 0 && "${1}" != --* ]]; then
+        operation="$1"
+        shift
+      fi
       cfctl_parse_flags "$@"
       cfctl_handle_can "${surface}" "${operation}"
       ;;

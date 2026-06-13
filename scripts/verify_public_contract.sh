@@ -87,6 +87,19 @@ contract_zone="${CFCTL_PUBLIC_CONTRACT_ZONE:-}"
 [[ -n "${contract_zone}" ]] || die "CFCTL_PUBLIC_CONTRACT_ZONE must be set for live DNS/token smoke tests"
 contract_record="_ops-smoke.${contract_zone}"
 
+active_lane_zone_json="$(
+  run_json success \
+    "active lane public contract zone" \
+    "${CFCTL}" can dns.record upsert --zone "${contract_zone}" --name "${contract_record}" --type TXT
+)"
+assert_artifact_exists "active lane public contract zone" "${active_lane_zone_json}"
+active_lane_zone_state="$(jq -r '.permission_status.state // "unknown"' <<< "${active_lane_zone_json}")"
+active_lane_zone_basis="$(jq -r '.permission_status.basis // "unknown"' <<< "${active_lane_zone_json}")"
+active_lane_name="$(jq -r '.auth.lane // "default"' <<< "${active_lane_zone_json}")"
+if [[ "${active_lane_zone_state}" != "allowed" ]]; then
+  die "CFCTL_PUBLIC_CONTRACT_ZONE=${contract_zone} is not usable by active lane ${active_lane_name}: permission_state=${active_lane_zone_state}, basis=${active_lane_zone_basis}. Set CF_TOKEN_LANE to a lane that can operate on the smoke zone or choose a zone visible to the active lane."
+fi
+
 cleanup_previews_json="$(run_json success "previews purge-expired" "${CFCTL}" previews purge-expired)"
 assert_artifact_exists "previews purge-expired" "${cleanup_previews_json}"
 assert_json "previews purge-expired" '.ok == true and .action == "previews"' "${cleanup_previews_json}"

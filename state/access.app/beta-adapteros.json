@@ -1,0 +1,21 @@
+{
+  "match": { "domain": "beta.adapteros.com" },
+  "body": {
+    "name": "adapterOS Beta",
+    "type": "self_hosted",
+    "domain": "beta.adapteros.com",
+    "self_hosted_domains": ["beta.adapteros.com"],
+    "destinations": [{ "type": "public", "uri": "beta.adapteros.com" }],
+    "app_launcher_visible": false,
+    "allowed_idps": ["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"],
+    "auto_redirect_to_identity": true,
+    "session_duration": "24h",
+    "enable_binding_cookie": true,
+    "http_only_cookie_attribute": true,
+    "same_site_cookie_attribute": "lax",
+    "options_preflight_bypass": false,
+    "policies": [
+      { "id": "d07a924a-ea93-450f-85e9-b60778540809", "precedence": 1 }
+    ]
+  }
+}
