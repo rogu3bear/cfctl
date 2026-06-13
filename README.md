@@ -76,6 +76,11 @@ cfctl guide edge.certificate order --zone example.com --host app.example.com --h
 cfctl hostname verify --file state/hostname/example.yaml
 ```
 
+Before choosing a write path, scan [docs/capabilities.md](docs/capabilities.md).
+It is generated from the catalogs and shows the read/plan/apply/verify contract,
+including preview requirements, destructive confirmations, lane policy,
+selectors, and desired-state sync support.
+
 Before credentials exist, `cfctl doctor` reports `bootstrap_required` and points
 at `cfctl bootstrap permissions`; `cfctl doctor --strict` still fails until a
 healthy token lane exists.
@@ -208,7 +213,7 @@ zone, such as `CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com
 operator policy for these credentials is in
 [docs/permission-doctrine.md](docs/permission-doctrine.md).
 
-See [docs/runbooks/cfctl.md](docs/runbooks/cfctl.md) and [docs/capabilities.md](docs/capabilities.md) for the full reference.
+See [docs/runbooks/cfctl.md](docs/runbooks/cfctl.md) and [docs/capabilities.md](docs/capabilities.md) for the full reference. `docs/capabilities.md` is generated from the catalogs and is the fastest way to see which surfaces are read-only, which operations are preview-gated, which destructive operations require confirmation, and which surfaces support desired-state sync.
 
 ## Layout
 
@@ -315,7 +320,7 @@ targeted retry does not shrink accepted domains to only the retry subset.
 - [CFCTL_PROMPT.md](CFCTL_PROMPT.md) — strict embedding prompt for tool integrators
 - [docs/agent-landing.md](docs/agent-landing.md)
 - [docs/auth.md](docs/auth.md)
-- [docs/capabilities.md](docs/capabilities.md) — generated from catalogs
+- [docs/capabilities.md](docs/capabilities.md) — generated from catalogs; includes the read/plan/apply/verify operation matrix
 - [docs/config-standards.md](docs/config-standards.md)
 - [docs/cloudflare-doc-bank.md](docs/cloudflare-doc-bank.md)
 - [docs/runtime-policy.md](docs/runtime-policy.md)
