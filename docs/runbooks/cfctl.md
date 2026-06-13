@@ -38,6 +38,7 @@ cfctl doctor --strict
 cfctl doctor --repair-hints
 ./scripts/verify_static_contract.sh
 ./scripts/verify_public_contract.sh
+CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_public_contract.sh
 cfctl previews
 cfctl previews purge-expired
 cfctl previews purge-inactive-legacy

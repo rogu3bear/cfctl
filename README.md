@@ -201,6 +201,10 @@ runs static contract checks on pull requests. Its scheduled and manual live
 job runs through the `cfctl-live` protected environment and requires
 `CF_DEV_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CFCTL_PUBLIC_CONTRACT_ZONE`, then
 runs the live permission-group drift and public-contract smoke tests. The
+selected token lane must be able to operate on `CFCTL_PUBLIC_CONTRACT_ZONE`; run
+local smoke tests with an explicit lane when the default lane cannot see that
+zone, such as `CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com
+./scripts/verify_public_contract.sh`. The
 operator policy for these credentials is in
 [docs/permission-doctrine.md](docs/permission-doctrine.md).
 
@@ -251,6 +255,7 @@ cfctl doctor --strict
 cfctl doctor --repair-hints
 ./scripts/verify_static_contract.sh
 ./scripts/verify_public_contract.sh
+CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_public_contract.sh
 cfctl previews
 cfctl previews purge-expired
 cfctl previews purge-inactive-legacy
