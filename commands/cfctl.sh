@@ -323,7 +323,19 @@ cfctl_secret_scan_json() {
   fi
 
   if [[ -n "${raw_matches}" ]]; then
-    matches="$(printf '%s\n' "${raw_matches}" | jq -R . | jq -s 'map(select(length > 0)) | .[:50]')"
+    matches="$(
+      printf '%s\n' "${raw_matches}" \
+        | jq -R '
+            select(length > 0)
+            | capture("^(?<path>.*?):(?<line>[0-9]+):(?<match>.*)$")? // {path: ., line: null}
+            | if .line == null then
+                .path
+              else
+                "\(.path):\(.line):<redacted>"
+              end
+          ' \
+        | jq -s '.[:50]'
+    )"
   fi
 
   for artifact_path in "${CF_REPO_ROOT}"/var/inventory/auth/token-mint-*.json; do
@@ -969,7 +981,7 @@ cfctl_doctor_repair_hints_json() {
   fi
 
   if [[ "$(jq '(.leak_count // 0) > 0' <<< "${secret_scan_json}")" == "true" ]]; then
-    hints="$(jq '. + ["rg -n -S '\''cfat_|cfk_|Authorization: Bearer |X-Auth-Key: '\'' var"]' <<< "${hints}")"
+    hints="$(jq '. + ["Inspect .result.secret_scan.sample_matches from cfctl doctor output; entries are path/line only with match text redacted"]' <<< "${hints}")"
   fi
 
   if [[ "$(jq '(.unsafe_secret_sink_count // 0) > 0' <<< "${secret_scan_json}")" == "true" ]]; then
