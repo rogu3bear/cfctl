@@ -97,7 +97,9 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_inventory_api_gateway.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_vulnerability_scanner.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_worker_routes.sh" \
+  "${ROOT_DIR}/scripts/cf_inventory_email_routing_rules.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_edge_certificates.sh" \
+  "${ROOT_DIR}/scripts/cf_mutate_email_routing_rule.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_edge_certificate.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_worker_route.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_zone_ruleset.sh" \
@@ -116,6 +118,7 @@ done
 python3 "${ROOT_DIR}/scripts/render_capabilities_doc.py" --check "${ROOT_DIR}/docs/capabilities.md" >/dev/null
 python3 "${ROOT_DIR}/scripts/verify_permission_catalog.py" >/dev/null
 
+set +e
 doctor_bootstrap_json="$(
   env \
     -u CF_DEV_TOKEN \
@@ -126,13 +129,84 @@ doctor_bootstrap_json="$(
     CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
     "${ROOT_DIR}/cfctl" doctor
 )"
+doctor_bootstrap_status=$?
+set -e
+if [[ -z "${doctor_bootstrap_json}" ]]; then
+  die "doctor no-auth lane posture produced no JSON"
+fi
+jq -e '
+  .action == "doctor"
+  and .summary.configured_lane_count == 0
+  and (.result.lanes.summary.configured_lane_count // 0) == 0
+  and all(.result.lanes.lanes[]; .available == false and .error == "credential_missing")
+  and (
+    (
+      .ok == true
+      and .summary.status == "bootstrap_required"
+      and (.summary.safe_next_steps | index("cfctl bootstrap permissions")) != null
+    )
+    or
+    (
+      .ok == false
+      and .summary.status == "unsafe"
+      and .error.code == "runtime_health_failed"
+      and (
+        ((.summary.secret_leak_count // 0) > 0)
+        or ((.summary.unsafe_secret_sink_count // 0) > 0)
+        or ((.summary.missing_backend_guards // 0) > 0)
+        or ((.summary.registry_policy_gaps // 0) > 0)
+        or (.summary.legacy_bypass_active == true)
+      )
+    )
+  )
+' <<< "${doctor_bootstrap_json}" >/dev/null || die "doctor no-auth lane posture assertion failed"
+if jq -e '.ok == true' <<< "${doctor_bootstrap_json}" >/dev/null; then
+  [[ "${doctor_bootstrap_status}" -eq 0 ]] || die "doctor bootstrap posture returned non-zero for ok response"
+else
+  [[ "${doctor_bootstrap_status}" -ne 0 ]] || die "doctor unsafe posture returned zero for failed response"
+fi
+
+can_bootstrap_json="$(
+  env \
+    -u CF_DEV_TOKEN \
+    -u CF_GLOBAL_TOKEN \
+    -u CLOUDFLARE_API_TOKEN \
+    -u CLOUDFLARE_ACCOUNT_ID \
+    CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    "${ROOT_DIR}/cfctl" can email.routing_rule --zone example.com
+)"
 jq -e '
   .ok == true
-  and .action == "doctor"
-  and .summary.status == "bootstrap_required"
-  and .summary.configured_lane_count == 0
-  and (.summary.safe_next_steps | index("cfctl bootstrap permissions")) != null
-' <<< "${doctor_bootstrap_json}" >/dev/null || die "doctor no-auth bootstrap posture assertion failed"
+  and .action == "can"
+  and .surface == "email.routing_rule"
+  and .operation == "can"
+  and .target.zone == "example.com"
+  and .permission_status.basis == "credential_missing"
+  and .permission_status.selector_readiness.ready == true
+' <<< "${can_bootstrap_json}" >/dev/null || die "can no-auth surface posture assertion failed"
+
+can_upsert_bootstrap_json="$(
+  env \
+    -u CF_DEV_TOKEN \
+    -u CF_GLOBAL_TOKEN \
+    -u CLOUDFLARE_API_TOKEN \
+    -u CLOUDFLARE_ACCOUNT_ID \
+    CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    "${ROOT_DIR}/cfctl" can email.routing_rule upsert --zone example.com --name role@example.com --service maildesk-cf-router
+)"
+jq -e '
+  .ok == true
+  and .action == "can"
+  and .surface == "email.routing_rule"
+  and .operation == "upsert"
+  and .target.zone == "example.com"
+  and .target.name == "role@example.com"
+  and .target.service == "maildesk-cf-router"
+  and .permission_status.basis == "credential_missing"
+  and .permission_status.selector_readiness.ready == true
+' <<< "${can_upsert_bootstrap_json}" >/dev/null || die "can no-auth upsert posture assertion failed"
 
 assert_jq_file "permission profile minimality policy" '
   .profiles.read.allowed_surfaces != null

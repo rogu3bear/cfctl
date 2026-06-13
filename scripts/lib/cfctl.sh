@@ -1053,8 +1053,16 @@ cfctl_resolve_zone_context() {
     return
   fi
 
+  if [[ "${CFCTL_ZONE_ID}" == "null" ]]; then
+    CFCTL_ZONE_ID=""
+  fi
+
   if [[ -n "${CFCTL_ZONE_NAME}" && -z "${CFCTL_ZONE_ID}" ]]; then
     CFCTL_ZONE_ID="$(cf_resolve_zone_id "${CFCTL_ZONE_NAME}")"
+  fi
+
+  if [[ "${CFCTL_ZONE_ID}" == "null" ]]; then
+    CFCTL_ZONE_ID=""
   fi
 
   if [[ -n "${CFCTL_ZONE_ID}" && -z "${CFCTL_ZONE_NAME}" ]]; then
@@ -1333,6 +1341,24 @@ cfctl_probe_permission() {
           state: "unknown",
           permission_family: $permission_family,
           basis: "credential_missing",
+          status_code: null,
+          errors: [],
+          request: null,
+          selector_readiness: $selector_readiness
+        }
+      '
+    return
+  fi
+
+  if [[ "${path}" == *"/zones//"* || "${path}" == *"/zones/null/"* ]]; then
+    jq -n \
+      --arg permission_family "$(jq -r '.permission_family' <<< "${spec}")" \
+      --argjson selector_readiness "${requirement_json}" \
+      '
+        {
+          state: "unknown",
+          permission_family: $permission_family,
+          basis: "zone_resolution_failed",
           status_code: null,
           errors: [],
           request: null,
