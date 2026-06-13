@@ -280,7 +280,14 @@ Compatibility map: [compat/script-entrypoints.json](compat/script-entrypoints.js
 
 ## Email routing
 
-The original email-routing workflows that seeded this repo still ship — they're useful as templates and as a reference for stitching Workers + Email Routing rules + verified destinations into one operation:
+Email Routing rule reads and targeted rule upserts are first-class `cfctl`
+operations through `email.routing_rule`. Use
+[docs/runbooks/email-routing.md](docs/runbooks/email-routing.md) for the
+operator model, commands, evidence locations, and troubleshooting rules.
+
+The original email-routing workflows that seeded this repo still ship. They are
+useful as templates and as account-wide audit helpers, but they are not the
+primary public interface for targeted rule work:
 
 - [scripts/deploy_accounts_fanout.sh](scripts/deploy_accounts_fanout.sh)
 - [scripts/provision_shared_aliases.sh](scripts/provision_shared_aliases.sh)
@@ -290,7 +297,11 @@ The original email-routing workflows that seeded this repo still ship — they'r
 - [scripts/audit_email_routing.sh](scripts/audit_email_routing.sh)
 - [workers/accounts-fanout/index.js](workers/accounts-fanout/index.js)
 
-The defaults in those scripts are placeholders — set `DESTINATION_ADDRESSES_JSON` and `ROUTES_JSON` (or edit the script) before applying.
+The defaults in those scripts are placeholders. Set
+`DESTINATION_ADDRESSES_JSON` and the target aliases/zones before applying.
+When retrying `normalize_secondary_shared_aliases.sh` for a subset of zones,
+pass `WORKER_DOMAINS_JSON` with the full Worker recipient-domain allowlist so a
+targeted retry does not shrink accepted domains to only the retry subset.
 
 ## Docs
 
@@ -306,6 +317,7 @@ The defaults in those scripts are placeholders — set `DESTINATION_ADDRESSES_JS
 - [docs/state.md](docs/state.md)
 - [docs/compat.md](docs/compat.md)
 - [docs/runbooks/cfctl.md](docs/runbooks/cfctl.md)
+- [docs/runbooks/email-routing.md](docs/runbooks/email-routing.md)
 - [docs/runbooks/tool-choice.md](docs/runbooks/tool-choice.md)
 - [docs/runbooks/mutations.md](docs/runbooks/mutations.md)
 - [docs/runbooks/live-inventory.md](docs/runbooks/live-inventory.md)

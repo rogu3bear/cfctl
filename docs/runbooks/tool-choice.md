@@ -21,7 +21,7 @@ It gives agents and operators:
 - Access applications and policies
 - tunnel inventory and configuration reads
 - DNS and zone-level config work
-- email routing
+- account-wide email routing audits when a per-zone `cfctl` read is not enough
 - backend implementation for targeted writes through `cf_api_apply.sh` and `cf_mutate_*.sh`
 - any workflow that needs a durable JSON snapshot under `var/inventory/`
 
@@ -37,6 +37,7 @@ Mutation backends currently wrapped by `cfctl`:
 - `./scripts/cf_mutate_turnstile_widget.sh`
 - `./scripts/cf_mutate_waiting_room.sh`
 - `./scripts/cf_mutate_edge_certificate.sh`
+- `./scripts/cf_mutate_email_routing_rule.sh`
 - `./scripts/cf_mutate_logpush_job.sh`
 - `./scripts/cf_mutate_tunnel.sh`
 
