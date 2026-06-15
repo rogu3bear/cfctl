@@ -74,6 +74,17 @@ esac
 REQUEST_BODY_REDACTED="null"
 if [[ -n "${REQUEST_BODY}" ]]; then
   REQUEST_BODY_REDACTED="$(cf_redact_json "${REQUEST_BODY}")"
+  # Opt-in extra redaction for surfaces whose body carries a raw secret under a
+  # generic key (Pages env_vars use "value", Worker secrets use "text") that
+  # cf_redact_json's key list does not cover. Keeps secret values out of the
+  # local evidence artifact. Only the artifact copy is masked; the real value
+  # still flows to the API via REQUEST_BODY.
+  if [[ "${SECRET_BODY:-0}" == "1" && "${REQUEST_BODY_REDACTED}" != "null" ]]; then
+    REQUEST_BODY_REDACTED="$(
+      jq 'walk(if type == "object" then with_entries(if (.key | test("^(value|text)$"; "i")) then .value = "REDACTED" else . end) else . end)' \
+        <<< "${REQUEST_BODY_REDACTED}"
+    )"
+  fi
 fi
 
 REPORT_FILE="$(cf_inventory_file "operations" "${OUTPUT_STEM}")"
@@ -178,6 +189,25 @@ else
 fi
 MUTATION_RESPONSE_REDACTED="$(cf_redact_json "${MUTATION_RESPONSE}")"
 MUTATION_SUCCESS="$(jq -r '.success == true' <<< "${MUTATION_RESPONSE}")"
+
+# Optional one-time secret delivery: extract a value from the RAW (pre-redaction)
+# response and write it to a validated, non-repo sink. Used by mints whose
+# secret is returned exactly once (e.g. Access service-token client_secret),
+# so the secret reaches an operator-controlled file but never stdout/artifact.
+if [[ "${MUTATION_SUCCESS}" == "true" && -n "${SECRET_SINK_PATH:-}" && -n "${SECRET_SINK_JQ:-}" ]]; then
+  SINK_CHECK_JSON="$(cf_runtime_secret_sink_check_json "${SECRET_SINK_PATH}")"
+  if [[ "$(jq -r '.ok' <<< "${SINK_CHECK_JSON}")" != "true" ]]; then
+    echo "Secret sink rejected: $(jq -r '.message' <<< "${SINK_CHECK_JSON}")" >&2
+    exit 1
+  fi
+  SINK_VALUE="$(jq -r "${SECRET_SINK_JQ} // empty" <<< "${MUTATION_RESPONSE}")"
+  if [[ -z "${SINK_VALUE}" ]]; then
+    echo "SECRET_SINK_JQ (${SECRET_SINK_JQ}) produced no value from the mutation response" >&2
+    exit 1
+  fi
+  ( umask 077; printf '%s' "${SINK_VALUE}" > "${SECRET_SINK_PATH}" )
+  cf_runtime_secret_sink_verify_permissions "${SECRET_SINK_PATH}"
+fi
 
 RESOLVED_VERIFY_PATH="${VERIFY_PATH}"
 if [[ "${MUTATION_SUCCESS}" == "true" && -z "${RESOLVED_VERIFY_PATH}" && -n "${VERIFY_JQ}" ]]; then

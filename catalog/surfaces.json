@@ -257,6 +257,67 @@
         "./cfctl apply worker.secret delete --script founder --name MY_SECRET --ack-plan <operation-id> --confirm delete"
       ]
     },
+    "access.service_token": {
+      "description": "Cloudflare Access service tokens (non-identity machine credentials) in the pinned account. Minted client_secret is delivered once to a --value-out sink.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_access_service_tokens.sh",
+      "apply_script": "scripts/cf_mutate_access_service_token.sh",
+      "permission_family": "Access: Service Tokens",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/access/service_tokens"
+      },
+      "selectors": ["id", "name", "client_id"],
+      "actions": {
+        "list": { "supported": true },
+        "get": { "supported": true, "selectors_any_of": [["id"], ["name"], ["client_id"]] },
+        "verify": { "supported": true, "selectors_any_of": [["id"], ["name"], ["client_id"]] },
+        "can": { "supported": true },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "create": { "risk": "write", "required_selectors": ["name"] },
+            "delete": { "risk": "destructive", "required_selectors": ["id"], "confirm": "delete" }
+          }
+        }
+      },
+      "examples": [
+        "CF_TOKEN_LANE=global ./cfctl list access.service_token",
+        "CF_TOKEN_LANE=global ./cfctl apply access.service_token create --name founder-lead-ingest-forwarders --value-out /tmp/li_st_secret --plan",
+        "CF_TOKEN_LANE=global ./cfctl apply access.service_token create --name founder-lead-ingest-forwarders --value-out /tmp/li_st_secret --ack-plan <operation-id>",
+        "CF_TOKEN_LANE=global ./cfctl apply access.service_token delete --id <token-id> --plan"
+      ]
+    },
+    "pages.secret": {
+      "description": "Cloudflare Pages project environment secrets (deployment_configs env_vars of type secret_text) in the pinned account. Binds on the project's next deployment.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_pages_secrets.sh",
+      "apply_script": "scripts/cf_mutate_pages_secret.sh",
+      "permission_family": "Pages",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/pages/projects/{project}"
+      },
+      "selectors": ["project", "name"],
+      "actions": {
+        "list": { "supported": true, "required_selectors": ["project"] },
+        "get": { "supported": true, "required_selectors": ["project", "name"] },
+        "verify": { "supported": true, "required_selectors": ["project", "name"] },
+        "can": { "supported": true, "required_selectors": ["project"] },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "upsert": { "risk": "write", "required_selectors": ["project", "name"] },
+            "delete": { "risk": "destructive", "required_selectors": ["project", "name"], "confirm": "delete" }
+          }
+        }
+      },
+      "examples": [
+        "CF_TOKEN_LANE=global ./cfctl list pages.secret --project mln-web",
+        "CF_TOKEN_LANE=global ./cfctl apply pages.secret upsert --project mln-web --name LEAD_INGEST_SECRET --file /tmp/li_secret --plan",
+        "CF_TOKEN_LANE=global ./cfctl apply pages.secret upsert --project mln-web --name LEAD_INGEST_SECRET --file /tmp/li_secret --ack-plan <operation-id>"
+      ]
+    },
     "worker.route": {
       "description": "Worker route patterns in a specific zone.",
       "module": "worker_route",

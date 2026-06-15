@@ -3663,6 +3663,26 @@ cfctl_handle_apply() {
         "BODY_JSON=${CFCTL_BODY_JSON}" \
         "BODY_FILE=${CFCTL_BODY_FILE}"
       ;;
+    access.service_token)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "TOKEN_ID=${id_value}" \
+        "SECRET_NAME=${CFCTL_NAME}" \
+        "VALUE_OUT=${CFCTL_VALUE_OUT}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
+    pages.secret)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "PAGES_PROJECT=${CFCTL_PROJECT}" \
+        "SECRET_NAME=${CFCTL_NAME}" \
+        "VALUE_FILE=${CFCTL_FILE}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
     *)
       cfctl_emit_failure "apply" "${surface}" "registry" "${CFCTL_PERMISSION_JSON}" "unsupported_operation" "No apply dispatcher registered for ${surface}" "${operation}"
       exit 1

@@ -44,6 +44,8 @@ cfctl_reset_flags() {
   CFCTL_SCRIPT=""
   CFCTL_METADATA=""
   CFCTL_MODULE=""
+  CFCTL_PROJECT=""
+  CFCTL_VALUE_OUT=""
   CFCTL_SINCE=""
   CFCTL_BEFORE=""
   CFCTL_ACTOR=""
@@ -147,6 +149,10 @@ cfctl_parse_flags() {
       --metadata=*) CFCTL_METADATA="${1#*=}"; shift ;;
       --module) CFCTL_MODULE="$2"; shift 2 ;;
       --module=*) CFCTL_MODULE="${1#*=}"; shift ;;
+      --project) CFCTL_PROJECT="$2"; shift 2 ;;
+      --project=*) CFCTL_PROJECT="${1#*=}"; shift ;;
+      --value-out) CFCTL_VALUE_OUT="$2"; shift 2 ;;
+      --value-out=*) CFCTL_VALUE_OUT="${1#*=}"; shift ;;
       --since) CFCTL_SINCE="$2"; shift 2 ;;
       --since=*) CFCTL_SINCE="${1#*=}"; shift ;;
       --before) CFCTL_BEFORE="$2"; shift 2 ;;
@@ -824,6 +830,7 @@ cfctl_current_args_shell() {
   [[ -n "${CFCTL_NAME}" ]] && args+=(--name "${CFCTL_NAME}")
   [[ -n "${CFCTL_DOMAIN}" ]] && args+=(--domain "${CFCTL_DOMAIN}")
   [[ -n "${CFCTL_FILE}" ]] && args+=(--file "${CFCTL_FILE}")
+  [[ -n "${CFCTL_PROJECT}" ]] && args+=(--project "${CFCTL_PROJECT}")
   [[ -n "${CFCTL_PATTERN}" ]] && args+=(--pattern "${CFCTL_PATTERN}")
   [[ -n "${CFCTL_SERVICE}" ]] && args+=(--service "${CFCTL_SERVICE}")
   [[ -n "${CFCTL_ZONE_NAME}" ]] && args+=(--zone "${CFCTL_ZONE_NAME}")
@@ -880,6 +887,7 @@ cfctl_current_selector_args_shell() {
   [[ -n "${CFCTL_NAME}" ]] && args+=(--name "${CFCTL_NAME}")
   [[ -n "${CFCTL_DOMAIN}" ]] && args+=(--domain "${CFCTL_DOMAIN}")
   [[ -n "${CFCTL_FILE}" ]] && args+=(--file "${CFCTL_FILE}")
+  [[ -n "${CFCTL_PROJECT}" ]] && args+=(--project "${CFCTL_PROJECT}")
   [[ -n "${CFCTL_PATTERN}" ]] && args+=(--pattern "${CFCTL_PATTERN}")
   [[ -n "${CFCTL_SERVICE}" ]] && args+=(--service "${CFCTL_SERVICE}")
   [[ -n "${CFCTL_ZONE_NAME}" ]] && args+=(--zone "${CFCTL_ZONE_NAME}")
@@ -934,6 +942,7 @@ cfctl_selector_presence_json() {
     --arg script "${CFCTL_SCRIPT}" \
     --arg metadata "${CFCTL_METADATA}" \
     --arg module "${CFCTL_MODULE}" \
+    --arg project "${CFCTL_PROJECT}" \
     --arg since "${CFCTL_SINCE}" \
     --arg before "${CFCTL_BEFORE}" \
     --arg actor "${CFCTL_ACTOR}" \
@@ -962,6 +971,7 @@ cfctl_selector_presence_json() {
         script: ($script | length > 0),
         metadata: ($metadata | length > 0),
         module: ($module | length > 0),
+        project: ($project | length > 0),
         since: ($since | length > 0),
         before: ($before | length > 0),
         actor: ($actor | length > 0),
@@ -1099,6 +1109,7 @@ cfctl_target_json() {
     --arg script "${CFCTL_SCRIPT}" \
     --arg metadata "${CFCTL_METADATA}" \
     --arg module "${CFCTL_MODULE}" \
+    --arg project "${CFCTL_PROJECT}" \
     --arg since "${CFCTL_SINCE}" \
     --arg before "${CFCTL_BEFORE}" \
     --arg actor "${CFCTL_ACTOR}" \
@@ -1124,6 +1135,7 @@ cfctl_target_json() {
         scope: (if $scope == "" then null else $scope end),
         tunnel_id: (if $tunnel_id == "" then null else $tunnel_id end),
         client_id: (if $client_id == "" then null else $client_id end),
+        project: (if $project == "" then null else $project end),
         since: (if $since == "" then null else $since end),
         before: (if $before == "" then null else $before end),
         actor: (if $actor == "" then null else $actor end),
@@ -1521,6 +1533,16 @@ cfctl_collect_surface_items() {
       cfctl_run_backend_script "${script_path}"
       CFCTL_COLLECT_BACKEND="inventory_script"
       ;;
+    access.service_token)
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_access_service_tokens.sh"
+      cfctl_run_backend_script "${script_path}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
+    pages.secret)
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_pages_secrets.sh"
+      cfctl_run_backend_script "${script_path}" "PAGES_PROJECT=${CFCTL_PROJECT}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
     turnstile.widget)
       script_path="${CF_REPO_ROOT}/scripts/cf_inventory_turnstile.sh"
       cfctl_run_backend_script "${script_path}"
@@ -1592,6 +1614,12 @@ cfctl_collect_surface_items() {
       ;;
     worker.script)
       CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.workers // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
+      ;;
+    access.service_token)
+      CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.service_tokens // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
+      ;;
+    pages.secret)
+      CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.secrets // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
       ;;
     worker.secret)
       CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.secrets // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
