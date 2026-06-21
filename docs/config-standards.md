@@ -50,6 +50,7 @@ Universal standards currently include:
 The catalog currently defines deeper standards for:
 
 - `access.app`
+- `access.login_method`
 - `access.policy`
 - `dns.record`
 - `edge.certificate`
@@ -79,6 +80,8 @@ Examples:
   explicit TTL, explicit proxy posture, selector-complete classification, desired state for durable routing records
 - `access.app`
   explicit identity-provider posture and desired state for durable apps
+- `access.login_method`
+  preview-gated reconciliation to exactly one existing Access identity provider with readback proof
 - `tunnel`
   remote-managed default and desired state for long-lived topology
 - `edge.certificate`
@@ -115,7 +118,11 @@ Compatibility-date freshness is intentionally advisory until the target repo upd
 - note after 30 days
 - warning after 90 days
 
-If a date is old, either refresh it in the owning app repo or record why that runtime intentionally lags. The audit is about checked-in config; use live `cfctl` reads before claiming deployed edge posture.
+If a date is old, either refresh it in the owning app repo or record why that runtime intentionally lags. File-local documentation such as "mirrors live project" or "do not bump casually" downgrades the stale-date warning to a note, so the audit stays actionable without pushing blind runtime bumps.
+
+Container image zero digests remain warnings unless the config clearly documents the lane as scaffolded, experimental, not production, or waiting on a first pushed digest. Documented placeholders are still reported as notes and must be replaced before the lane becomes production.
+
+The audit is about checked-in config; use live `cfctl` reads before claiming deployed edge posture.
 
 ## Source Of Truth
 

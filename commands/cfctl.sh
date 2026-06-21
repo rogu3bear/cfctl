@@ -148,8 +148,11 @@ Examples:
   cfctl standards access.app
   cfctl standards worker.build
   cfctl explain access.app
+  cfctl list access.login_method
+  cfctl guide access.login_method set --provider-type onetimepin
   cfctl list pages.project
   cfctl get access.app --domain docs.example.org
+  cfctl apply access.login_method set --provider-type onetimepin --plan
   cfctl list worker.route --zone example.com
   cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
   CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
@@ -780,15 +783,37 @@ cfctl_surface_write_risks_json() {
     "${CFCTL_REGISTRY_PATH}"
 }
 
+cfctl_preview_candidate_files() {
+  local roots=()
+  local root
+
+  for root in "${CF_REPO_ROOT}/var/inventory/runtime" "${CF_REPO_ROOT}/var/inventory/auth"; do
+    [[ -d "${root}" ]] || continue
+    roots+=("${root}")
+  done
+
+  [[ "${#roots[@]}" -gt 0 ]] || return 0
+
+  if command -v rg >/dev/null 2>&1; then
+    {
+      rg -l --hidden -g '*.json' \
+        -e '"plan_mode"[[:space:]]*:[[:space:]]*true' \
+        -e '"planned"[[:space:]]*:[[:space:]]*true' \
+        "${roots[@]}" 2>/dev/null || true
+    } | sort -u
+  else
+    find "${roots[@]}" -type f -name '*.json' -print 2>/dev/null | sort
+  fi
+}
+
 cfctl_preview_rows_json() {
-  local rows='[]'
   local file
   local expired="false"
   local preview_expires_at=""
   local preview_expires_epoch=""
   local trust_complete="false"
 
-  for file in "${CF_REPO_ROOT}"/var/inventory/runtime/*.json "${CF_REPO_ROOT}"/var/inventory/auth/token-mint-*.json "${CF_REPO_ROOT}"/var/inventory/auth/token-revoke-*.json; do
+  while IFS= read -r file; do
     [[ -f "${file}" ]] || continue
     if ! jq -e '
       (.action == "apply" and (.summary.plan_mode // false) == true)
@@ -814,57 +839,51 @@ cfctl_preview_rows_json() {
       ' "${file}" >/dev/null 2>&1 && echo true || echo false
     )"
 
-    rows="$(
-      jq \
-        --arg artifact_path "${file}" \
-        --argjson artifact "$(cat "${file}")" \
-        --argjson expired "${expired}" \
-        --argjson trust_complete "${trust_complete}" \
-        '
-          . + [{
+    jq \
+      --arg artifact_path "${file}" \
+      --argjson expired "${expired}" \
+      --argjson trust_complete "${trust_complete}" \
+      '
+          {
             artifact_path: $artifact_path,
-            action: ($artifact.action // null),
+            action: (.action // null),
             surface: (
-              if (($artifact.action // "") == "token.mint" or ($artifact.action // "") == "token.revoke") then
+              if ((.action // "") == "token.mint" or (.action // "") == "token.revoke") then
                 "token"
               else
-                ($artifact.surface // null)
+                (.surface // null)
               end
             ),
             operation: (
-              if ($artifact.action // "") == "token.mint" then
+              if (.action // "") == "token.mint" then
                 "mint"
-              elif ($artifact.action // "") == "token.revoke" then
+              elif (.action // "") == "token.revoke" then
                 "revoke"
               else
-                ($artifact.operation // null)
+                (.operation // null)
               end
             ),
-            operation_id: ($artifact.operation_id // null),
-            generated_at: ($artifact.generated_at // null),
-            lane: ($artifact.auth.lane // $artifact.trust.lane // null),
-            preview_expires_at: ($artifact.trust.preview_expires_at // null),
-            lock_mode: ($artifact.trust.lock_mode // null),
-            lock_key: ($artifact.trust.lock_key // null),
+            operation_id: (.operation_id // null),
+            generated_at: (.generated_at // null),
+            lane: (.auth.lane // .trust.lane // null),
+            preview_expires_at: (.trust.preview_expires_at // null),
+            lock_mode: (.trust.lock_mode // null),
+            lock_key: (.trust.lock_key // null),
             trust_complete: $trust_complete,
             expired: $expired
-          }]
-        ' \
-        <<< "${rows}"
-    )"
-  done
-
-  jq -n \
-    --argjson previews "${rows}" \
+          }
+      ' "${file}"
+  done < <(cfctl_preview_candidate_files) \
+    | jq -s \
     '
       {
-        preview_count: ($previews | length),
-        active_count: ($previews | map(select(.expired != true and .trust_complete == true)) | length),
-        actionable_count: ($previews | map(select(.expired != true and .trust_complete == true)) | length),
-        expired_count: ($previews | map(select(.expired == true)) | length),
-        legacy_count: ($previews | map(select(.trust_complete != true)) | length),
-        inactive_legacy_count: ($previews | map(select(.expired != true and .trust_complete != true)) | length),
-        previews: ($previews | sort_by(.generated_at // "") | reverse)
+        preview_count: length,
+        active_count: (map(select(.expired != true and .trust_complete == true)) | length),
+        actionable_count: (map(select(.expired != true and .trust_complete == true)) | length),
+        expired_count: (map(select(.expired == true)) | length),
+        legacy_count: (map(select(.trust_complete != true)) | length),
+        inactive_legacy_count: (map(select(.expired != true and .trust_complete != true)) | length),
+        previews: (sort_by(.generated_at // "") | reverse)
       }
     '
 }
@@ -1216,12 +1235,11 @@ cfctl_registry_integrity_json() {
 }
 
 cfctl_preview_receipt_health_json() {
-  local reports='[]'
   local file
   local preview_expires_at
   local expired
 
-  for file in "${CF_REPO_ROOT}"/var/inventory/runtime/*.json "${CF_REPO_ROOT}"/var/inventory/auth/token-mint-*.json "${CF_REPO_ROOT}"/var/inventory/auth/token-revoke-*.json; do
+  while IFS= read -r file; do
     [[ -f "${file}" ]] || continue
     if ! jq -e '
       (.action == "apply" and (.summary.plan_mode // false) == true)
@@ -1238,30 +1256,25 @@ cfctl_preview_receipt_health_json() {
       fi
     fi
 
-    reports="$(
-      jq \
-        --arg path "${file}" \
-        --arg preview_expires_at "${preview_expires_at}" \
-        --argjson expired "${expired}" \
-        --argjson has_trust "$(jq '.trust != null' "${file}")" \
-        '. + [{
-          path: $path,
-          has_trust: $has_trust,
-          preview_expires_at: (if $preview_expires_at == "" then null else $preview_expires_at end),
-          expired: $expired
-        }]' \
-        <<< "${reports}"
-    )"
-  done
-
-  jq -n \
-    --argjson previews "${reports}" \
+    jq -n \
+      --arg path "${file}" \
+      --arg preview_expires_at "${preview_expires_at}" \
+      --argjson expired "${expired}" \
+      --argjson has_trust "$(jq '.trust != null' "${file}")" \
+      '{
+        path: $path,
+        has_trust: $has_trust,
+        preview_expires_at: (if $preview_expires_at == "" then null else $preview_expires_at end),
+        expired: $expired
+      }'
+  done < <(cfctl_preview_candidate_files) \
+    | jq -s \
     '
       {
-        preview_count: ($previews | length),
-        legacy_preview_count: ($previews | map(select(.has_trust != true)) | length),
-        expired_preview_count: ($previews | map(select(.expired == true)) | length),
-        previews: $previews
+        preview_count: length,
+        legacy_preview_count: (map(select(.has_trust != true)) | length),
+        expired_preview_count: (map(select(.expired == true)) | length),
+        previews: .
       }
     '
 }
@@ -3529,6 +3542,17 @@ cfctl_handle_apply() {
         "BODY_JSON=${CFCTL_BODY_JSON}" \
         "BODY_FILE=${CFCTL_BODY_FILE}"
       ;;
+    access.login_method)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "APP_ID=${id_value}" \
+        "APP_NAME=${CFCTL_NAME}" \
+        "APP_DOMAIN=${CFCTL_DOMAIN}" \
+        "PROVIDER_ID=${CFCTL_PROVIDER_ID}" \
+        "PROVIDER_TYPE=${CFCTL_PROVIDER_TYPE}" \
+        "PROVIDER_NAME=${CFCTL_PROVIDER_NAME}"
+      ;;
     access.policy)
       cfctl_run_backend_script "${script_path}" \
         "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
@@ -3715,6 +3739,10 @@ cfctl_handle_apply() {
           preview_ack: (if $plan_mode == true then null else true end),
           mutation_success: ($backend.mutation_response.success // null),
           verification_success: ($backend.verification.response.success // null),
+          target_count: ($backend.summary.target_count // null),
+          update_count: ($backend.summary.update_count // null),
+          noop_count: ($backend.summary.noop_count // null),
+          failure_count: ($backend.summary.failure_count // null),
           request: ($backend.request // null)
         }
       '

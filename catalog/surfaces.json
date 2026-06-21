@@ -810,6 +810,53 @@
         "./cfctl apply access.app update --id <app-id> --body '{\"session_duration\":\"24h\"}' --plan"
       ]
     },
+    "access.login_method": {
+      "description": "Cloudflare Access application login-method posture, joining apps with configured identity providers.",
+      "module": "access_login_method",
+      "standards_ref": "access.login_method",
+      "docs_topics": ["zero-trust-api", "api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_access_login_methods.sh",
+      "apply_script": "scripts/cf_mutate_access_login_method.sh",
+      "permission_family": "Access: Apps, Policies, and Identity Providers",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/access/apps"
+      },
+      "selectors": ["id", "name", "domain", "provider_id", "provider_type", "provider_name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"], ["domain"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"], ["domain"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "set": {
+              "risk": "write",
+              "selectors_any_of": [["provider_id"], ["provider_type"], ["provider_name"]]
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list access.login_method",
+        "./cfctl list access.login_method --domain docs.example.org",
+        "./cfctl apply access.login_method set --provider-type onetimepin --plan",
+        "./cfctl apply access.login_method set --provider-id <provider-id> --ack-plan <operation-id>",
+        "./cfctl apply access.login_method set --provider-name 'One-time PIN' --plan"
+      ]
+    },
     "access.policy": {
       "description": "Application-scoped Access policies attached to Access apps.",
       "module": "access_policy",

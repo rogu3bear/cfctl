@@ -48,7 +48,9 @@ cfctl wrangler --version
 cfctl cloudflared version
 cfctl env run --lane dev -- env
 cfctl explain access.app
+cfctl list access.login_method
 cfctl classify tunnel create
+cfctl guide access.login_method set --provider-type onetimepin
 CF_TOKEN_LANE=global cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
 cfctl snapshot tunnel
 cfctl list pages.project
@@ -73,6 +75,7 @@ For writes, start with a dry run:
 cfctl guide access.app update --id <app-id> --body-file app.json
 cfctl apply access.app update --id <app-id> --body-file app.json --plan
 cfctl apply access.policy create --app-id <app-id> --body-file policy.json --plan
+CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-type onetimepin --plan
 cfctl apply tunnel create --body '{"name":"example","config_src":"cloudflare"}' --plan
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
 CF_TOKEN_LANE=global cfctl apply dns.record sync --zone example.com --plan
@@ -90,6 +93,7 @@ To actually execute a reviewed write:
 
 ```bash
 cfctl apply access.app update --id <app-id> --body-file app.json --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-id <provider-id> --ack-plan <operation-id>
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --ack-plan <operation-id>
 CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --ack-plan <operation-id>
 ```

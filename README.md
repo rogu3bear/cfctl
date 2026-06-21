@@ -70,6 +70,7 @@ cfctl ownership list            # read the Cloudflare ownership authority regist
 cfctl wrangler --version        # wrapped wrangler
 cfctl cloudflared version       # wrapped cloudflared
 cfctl explain access.app
+cfctl list access.login_method
 cfctl classify dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT
 cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120
 cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
@@ -91,6 +92,7 @@ Useful reads:
 cfctl snapshot tunnel
 cfctl list audit.log
 cfctl list pages.project
+cfctl list access.login_method
 cfctl get access.app --domain docs.example.org
 cfctl list edge.certificate --zone example.com
 cfctl list worker.route --zone example.com
@@ -104,6 +106,7 @@ Useful safe write plans:
 
 ```bash
 cfctl apply access.policy create --app-id <app-id> --body-file policy.json --plan
+CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-type onetimepin --plan
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
 CF_TOKEN_LANE=global cfctl apply dns.record sync --zone example.com --plan
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --ack-plan <operation-id>

@@ -295,7 +295,9 @@ def validate_command_fixtures(catalog: dict) -> list[dict]:
             "expected": (
             "cfctl token mint --name 'cfctl-hostname-operator' "
             "--permission 'Access: Apps and Policies Read' "
-            "--permission 'Access: Apps and Policies Write' --permission 'DNS Read' "
+            "--permission 'Access: Apps and Policies Write' "
+            "--permission 'Access: Organizations, Identity Providers, and Groups Read' "
+            "--permission 'DNS Read' "
             "--permission 'DNS Write' --permission 'SSL and Certificates Read' "
             "--permission 'SSL and Certificates Write' --permission 'Workers Routes Read' "
             "--permission 'Workers Routes Write' --permission 'Workers Scripts Read' "

@@ -93,12 +93,15 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_wrangler.sh" \
   "${ROOT_DIR}/scripts/cf_cloudflared.sh" \
   "${ROOT_DIR}/scripts/cf_token_revoke.sh" \
+  "${ROOT_DIR}/scripts/verify_access_login_method_contract.sh" \
+  "${ROOT_DIR}/scripts/cf_inventory_access_login_methods.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_audit_logs.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_api_gateway.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_vulnerability_scanner.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_worker_routes.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_email_routing_rules.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_edge_certificates.sh" \
+  "${ROOT_DIR}/scripts/cf_mutate_access_login_method.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_email_routing_rule.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_edge_certificate.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_worker_route.sh" \
@@ -107,6 +110,7 @@ bash -n \
   "${ROOT_DIR}/scripts/verify_static_contract.sh"
 for surface_module in \
   "${ROOT_DIR}/lib/surfaces/access_app.sh" \
+  "${ROOT_DIR}/lib/surfaces/access_login_method.sh" \
   "${ROOT_DIR}/lib/surfaces/access_policy.sh" \
   "${ROOT_DIR}/lib/surfaces/dns_record.sh" \
   "${ROOT_DIR}/lib/surfaces/edge_certificate.sh" \
@@ -117,6 +121,7 @@ done
 
 python3 "${ROOT_DIR}/scripts/render_capabilities_doc.py" --check "${ROOT_DIR}/docs/capabilities.md" >/dev/null
 python3 "${ROOT_DIR}/scripts/verify_permission_catalog.py" >/dev/null
+"${ROOT_DIR}/scripts/verify_access_login_method_contract.sh" >/dev/null
 
 set +e
 doctor_bootstrap_json="$(
@@ -576,6 +581,11 @@ assert_jq_file "surface module bindings" '
   .surfaces["access.app"].module == "access_app"
   and .surfaces["access.app"].standards_ref == "access.app"
   and (.surfaces["access.app"].docs_topics | index("zero-trust-api")) != null
+  and .surfaces["access.login_method"].module == "access_login_method"
+  and .surfaces["access.login_method"].standards_ref == "access.login_method"
+  and .surfaces["access.login_method"].inventory_script == "scripts/cf_inventory_access_login_methods.sh"
+  and .surfaces["access.login_method"].apply_script == "scripts/cf_mutate_access_login_method.sh"
+  and (.surfaces["access.login_method"].actions.apply.operations.set.selectors_any_of | any(. == ["provider_type"]))
   and .surfaces["access.policy"].module == "access_policy"
   and .surfaces["access.policy"].standards_ref == "access.policy"
   and (.surfaces["access.policy"].docs_topics | index("zero-trust-api")) != null

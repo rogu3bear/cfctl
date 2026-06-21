@@ -18,8 +18,20 @@ SECRET_LIKE_KEY_RE = re.compile(
 SAFE_PUBLIC_KEY_RE = re.compile(r"(PUBLIC_|SITEKEY$)", re.IGNORECASE)
 PLACEHOLDER_RE = re.compile(r"__[A-Z0-9_]+__")
 ZERO_SHA_RE = re.compile(r"@sha256:0{64}$")
+INTENTIONAL_COMPATIBILITY_LAG_RE = re.compile(
+    r"(do not bump|intentionally lags?|mirrors? .{0,80}live|live .{0,80}mirrors?)",
+    re.IGNORECASE,
+)
+CONTAINER_PLACEHOLDER_DOCUMENTED_RE = re.compile(
+    r"(experimental|scaffolded|not part of .{0,80}primary|not in production|replace digest after first successful)",
+    re.IGNORECASE,
+)
 DEFAULT_COMPATIBILITY_DATE_NOTE_AFTER_DAYS = 30
 DEFAULT_COMPATIBILITY_DATE_WARNING_AFTER_DAYS = 90
+
+
+def audit_evidence_text(raw_text: str) -> str:
+    return re.sub(r"\s+", " ", raw_text.replace("#", " "))
 
 
 def strip_jsonc_comments(text: str) -> str:
@@ -73,8 +85,8 @@ def strip_jsonc_comments(text: str) -> str:
 def read_config(path: Path):
     raw = path.read_text(errors="ignore")
     if path.suffix == ".toml":
-        return tomllib.loads(raw), "toml"
-    return json.loads(strip_jsonc_comments(raw)), "jsonc"
+        return tomllib.loads(raw), "toml", raw
+    return json.loads(strip_jsonc_comments(raw)), "jsonc", raw
 
 
 def parse_compatibility_date(value):
@@ -198,7 +210,13 @@ def service_missing_fields(config: dict):
     return missing
 
 
-def compatibility_date_findings(config: dict, kind: str, today: date, freshness_policy: dict):
+def compatibility_date_findings(
+    config: dict,
+    kind: str,
+    today: date,
+    freshness_policy: dict,
+    raw_text: str,
+):
     if "compatibility_date" not in config:
         return []
 
@@ -249,6 +267,18 @@ def compatibility_date_findings(config: dict, kind: str, today: date, freshness_
         ]
 
     if age_days > warning_after_days:
+        if INTENTIONAL_COMPATIBILITY_LAG_RE.search(audit_evidence_text(raw_text)):
+            return [
+                {
+                    **base,
+                    "level": "note",
+                    "code": "compatibility_date_intentional_lag",
+                    "message": (
+                        f"compatibility_date is {age_days} days old, but this config "
+                        "records why the runtime intentionally lags."
+                    ),
+                }
+            ]
         return [
             {
                 **base,
@@ -284,7 +314,7 @@ def build_command(config: dict):
     return ""
 
 
-def container_findings(config: dict):
+def container_findings(config: dict, raw_text: str):
     findings = []
     containers = config.get("containers") or []
     for idx, item in enumerate(containers):
@@ -310,6 +340,18 @@ def container_findings(config: dict):
                 }
             )
         elif ZERO_SHA_RE.search(image):
+            if CONTAINER_PLACEHOLDER_DOCUMENTED_RE.search(audit_evidence_text(raw_text)):
+                findings.append(
+                    {
+                        "level": "note",
+                        "code": "container_image_placeholder_documented",
+                        "message": (
+                            f"Container {idx} image uses a documented placeholder zero digest: {image}"
+                        ),
+                        "standard_surface": "worker.containers",
+                    }
+                )
+                continue
             findings.append(
                 {
                     "level": "warning",
@@ -327,7 +369,13 @@ def cron_values(config: dict):
     return [cron for cron in crons if isinstance(cron, str)]
 
 
-def file_findings(config: dict, features, today: date, compatibility_freshness_policy: dict):
+def file_findings(
+    config: dict,
+    features,
+    today: date,
+    compatibility_freshness_policy: dict,
+    raw_text: str,
+):
     findings = []
     kind = project_type(config)
     main_path = config.get("main") or ""
@@ -356,6 +404,7 @@ def file_findings(config: dict, features, today: date, compatibility_freshness_p
             kind,
             today,
             compatibility_freshness_policy,
+            raw_text,
         )
     )
 
@@ -470,7 +519,7 @@ def file_findings(config: dict, features, today: date, compatibility_freshness_p
             }
         )
 
-    findings.extend(container_findings(config))
+    findings.extend(container_findings(config, raw_text))
 
     if "containers" in features and "do_bindings" not in features:
         findings.append(
@@ -643,7 +692,7 @@ def main():
     files_json = []
 
     for path in files:
-        config, fmt = read_config(path)
+        config, fmt, raw_text = read_config(path)
         features = detect_features(config)
         for feature in features:
             feature_counts[feature] += 1
@@ -660,6 +709,7 @@ def main():
             features,
             today,
             compatibility_freshness_policy,
+            raw_text,
         )
         for finding in findings:
             finding_counts[finding["level"]] += 1
