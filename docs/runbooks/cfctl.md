@@ -81,6 +81,7 @@ cfctl hostname plan --file state/hostname/example.yaml
 cfctl list surfaces
 cfctl list audit.log
 cfctl explain access.app
+cfctl list access.login_method
 cfctl list pages.project
 cfctl get access.app --domain docs.example.org
 cfctl list worker.route --zone example.com

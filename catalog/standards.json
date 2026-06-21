@@ -127,6 +127,34 @@
         "cfctl apply access.app sync --plan"
       ]
     },
+    "access.login_method": {
+      "stance": "preview-gated reconciliation for Access application login methods",
+      "standards": [
+        {
+          "id": "access.login_method.existing-provider-only",
+          "level": "required",
+          "title": "Resolve an existing identity provider before mutation",
+          "summary": "Login-method reconciliation must target an existing Access identity provider by exact id, type, or name; it must not create, delete, or mutate providers."
+        },
+        {
+          "id": "access.login_method.full-app-put",
+          "level": "required",
+          "title": "Update Access apps with full mutable bodies",
+          "summary": "Access app login-method changes must build PUT bodies from live app JSON, preserve unrelated settings, remove read-only fields, and normalize policies to id plus precedence."
+        },
+        {
+          "id": "access.login_method.readback",
+          "level": "required",
+          "title": "Verify exact allowed_idps readback",
+          "summary": "After apply, every targeted app must read back with allowed_idps set to exactly the resolved provider id."
+        }
+      ],
+      "evidence": [
+        "cfctl list access.login_method",
+        "cfctl apply access.login_method set --provider-type onetimepin --plan",
+        "cfctl apply access.login_method set --provider-id <provider-id> --ack-plan <operation-id>"
+      ]
+    },
     "access.policy": {
       "stance": "desired-state preferred for shared and high-value policies",
       "standards": [

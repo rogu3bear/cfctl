@@ -9,7 +9,9 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | Surface | Read | Can | Apply | Verify | Desired State | Standards | Docs Topics | Module |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `access.app` | yes | yes | yes | yes | yes | `access.app` | `zero-trust-api, api-auth` | `access_app` |
+| `access.login_method` | yes | yes | yes | yes | no | `access.login_method` | `zero-trust-api, api-auth` | `access_login_method` |
 | `access.policy` | yes | yes | yes | yes | yes | `access.policy` | `zero-trust-api, api-auth` | `access_policy` |
+| `access.service_token` | yes | yes | yes | yes | no | `-` | `-` | `-` |
 | `api_gateway.discovery` | yes | yes | no | yes | no | `-` | `api-gateway, api-auth` | `-` |
 | `api_gateway.operation` | yes | yes | no | yes | no | `-` | `api-gateway, api-auth` | `-` |
 | `api_gateway.schema` | yes | yes | no | yes | no | `-` | `api-gateway, api-auth` | `-` |
@@ -20,6 +22,7 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | `email.routing_rule` | yes | yes | yes | yes | no | `-` | `email-routing, api-auth` | `-` |
 | `logpush.job` | yes | yes | yes | yes | no | `-` | `-` | `-` |
 | `pages.project` | yes | yes | no | yes | no | `-` | `-` | `-` |
+| `pages.secret` | yes | yes | yes | yes | no | `-` | `-` | `-` |
 | `queue` | yes | yes | no | yes | no | `-` | `-` | `-` |
 | `r2.bucket` | yes | yes | no | yes | no | `-` | `-` | `-` |
 | `tunnel` | yes | yes | yes | yes | yes | `tunnel` | `api-auth` | `tunnel` |
@@ -45,11 +48,14 @@ This matrix is derived from the same catalogs used by `cfctl explain`, `cfctl cl
 | `access.app` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: id |
 | `access.app` | `update` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: id |
 | `access.app` | `sync` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | state match: id, name, domain |
+| `access.login_method` | `set` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | one of: provider_id / provider_type / provider_name |
 | `access.policy` | `create` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: app_id |
 | `access.policy` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: app_id, policy_id |
 | `access.policy` | `make-reusable` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: app_id, policy_id |
 | `access.policy` | `update` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: app_id, policy_id |
 | `access.policy` | `sync` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | state match: app_id, policy_id, name |
+| `access.service_token` | `create` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: name |
+| `access.service_token` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: id |
 | `dns.record` | `create` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: zone, name, type |
 | `dns.record` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: zone; one of: id / name, type |
 | `dns.record` | `update` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: zone; one of: id / name, type |
@@ -64,6 +70,8 @@ This matrix is derived from the same catalogs used by `cfctl explain`, `cfctl cl
 | `logpush.job` | `validate-destination` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |
 | `logpush.job` | `validate-origin` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |
 | `logpush.job` | `validate-ownership` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |
+| `pages.secret` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: project, name |
+| `pages.secret` | `upsert` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: project, name |
 | `tunnel` | `cleanup-connections` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: id |
 | `tunnel` | `configure` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: id |
 | `tunnel` | `create` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |

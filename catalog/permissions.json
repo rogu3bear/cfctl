@@ -29,6 +29,7 @@
       "risk": "read",
       "allowed_surfaces": [
         "access.app",
+        "access.login_method",
         "access.policy",
         "api_gateway.discovery",
         "api_gateway.operation",
@@ -82,6 +83,7 @@
       "risk": "write",
       "allowed_surfaces": [
         "access.app",
+        "access.login_method",
         "access.policy",
         "dns.record",
         "edge.certificate",
@@ -98,7 +100,8 @@
         "cfctl can dns.record upsert --zone <zone> --name _ops-smoke.<zone> --type TXT --all-lanes",
         "cfctl can edge.certificate order --zone <zone> --host app.<zone> --all-lanes",
         "cfctl list worker.route --zone <zone>",
-        "cfctl list access.app"
+        "cfctl list access.app",
+        "cfctl list access.login_method"
       ]
     },
     "deploy": {
@@ -135,6 +138,7 @@
       "risk": "read",
       "allowed_surfaces": [
         "access.app",
+        "access.login_method",
         "access.policy",
         "api_gateway.discovery",
         "api_gateway.operation",
@@ -179,14 +183,20 @@
     {
       "name": "Access: Apps and Policies Read",
       "scope": "account",
-      "surfaces": ["access.app", "access.policy"],
+      "surfaces": ["access.app", "access.login_method", "access.policy"],
       "profiles": ["read", "hostname", "security-audit", "full-operator"]
     },
     {
       "name": "Access: Apps and Policies Write",
       "scope": "account",
-      "surfaces": ["access.app", "access.policy"],
+      "surfaces": ["access.app", "access.login_method", "access.policy"],
       "profiles": ["hostname", "full-operator"]
+    },
+    {
+      "name": "Access: Organizations, Identity Providers, and Groups Read",
+      "scope": "account",
+      "surfaces": ["access.login_method"],
+      "profiles": ["read", "hostname", "security-audit", "full-operator"]
     },
     {
       "name": "Account API Gateway Read",

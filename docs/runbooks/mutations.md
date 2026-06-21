@@ -20,6 +20,7 @@ cfctl can access.app update
 cfctl classify access.app update
 cfctl apply access.app update --id <app-id> --body-file app.json --plan
 cfctl apply access.policy create --app-id <app-id> --body-file policy.json --plan
+CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-type onetimepin --plan
 cfctl apply tunnel create --body '{"name":"example","config_src":"cloudflare"}' --plan
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
 CF_TOKEN_LANE=global cfctl apply dns.record sync --zone example.com --plan
@@ -43,6 +44,17 @@ CF_TOKEN_LANE=global cfctl verify edge.certificate --zone example.com --host app
 Use repeated `--host` flags for each certificate hostname. The runtime adds the zone apex automatically, then submits an Advanced Certificate Manager `type=advanced` certificate-pack order.
 
 The script-level wrappers below remain the backend contract, but mutation backends are backend-only and require `cfctl admin authorize-backend` plus `CF_BACKEND_BYPASS_FILE=<authorization-path>` for direct maintainer/debug use.
+
+Access login-method reconciliation pins targeted apps to exactly one existing identity provider. It never creates, deletes, or mutates identity providers.
+
+```bash
+cfctl list access.login_method
+cfctl guide access.login_method set --provider-type onetimepin
+CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-type onetimepin --plan
+CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-id <provider-id> --ack-plan <operation-id>
+```
+
+Add `--id`, `--name`, or `--domain` to narrow the app target. Without an app selector, the target is all Access applications.
 
 Example authorization flow:
 
@@ -95,6 +107,15 @@ APP_ID=<access-app-id> \
 OPERATION=create \
 BODY_JSON='{"name":"Allow Example","decision":"allow","include":[{"email_domain":{"domain":"example.com"}}],"exclude":[],"require":[]}' \
 ./scripts/cf_mutate_access_policy.sh
+```
+
+Access login-method set:
+
+```bash
+CF_BACKEND_BYPASS_FILE=/absolute/path/to/backend-bypass.json \
+OPERATION=set \
+PROVIDER_TYPE=onetimepin \
+./scripts/cf_mutate_access_login_method.sh
 ```
 
 Turnstile widget update:

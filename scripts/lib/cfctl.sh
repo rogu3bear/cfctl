@@ -17,6 +17,9 @@ cfctl_reset_flags() {
   CFCTL_ZONE_NAME=""
   CFCTL_ZONE_ID=""
   CFCTL_TYPE=""
+  CFCTL_PROVIDER_ID=""
+  CFCTL_PROVIDER_TYPE=""
+  CFCTL_PROVIDER_NAME=""
   CFCTL_SITEKEY=""
   CFCTL_APP_ID=""
   CFCTL_POLICY_ID=""
@@ -94,6 +97,12 @@ cfctl_parse_flags() {
       --zone-id=*) CFCTL_ZONE_ID="${1#*=}"; shift ;;
       --type) CFCTL_TYPE="$2"; shift 2 ;;
       --type=*) CFCTL_TYPE="${1#*=}"; shift ;;
+      --provider-id) CFCTL_PROVIDER_ID="$2"; shift 2 ;;
+      --provider-id=*) CFCTL_PROVIDER_ID="${1#*=}"; shift ;;
+      --provider-type) CFCTL_PROVIDER_TYPE="$2"; shift 2 ;;
+      --provider-type=*) CFCTL_PROVIDER_TYPE="${1#*=}"; shift ;;
+      --provider-name) CFCTL_PROVIDER_NAME="$2"; shift 2 ;;
+      --provider-name=*) CFCTL_PROVIDER_NAME="${1#*=}"; shift ;;
       --sitekey) CFCTL_SITEKEY="$2"; shift 2 ;;
       --sitekey=*) CFCTL_SITEKEY="${1#*=}"; shift ;;
       --app-id) CFCTL_APP_ID="$2"; shift 2 ;;
@@ -584,6 +593,9 @@ cfctl_current_operation_request_json() {
     --argjson data "$(if [[ -n "${CFCTL_DATA_JSON}" ]]; then printf '%s\n' "${CFCTL_DATA_JSON}"; else echo 'null'; fi)" \
     --arg scope "${CFCTL_SCOPE}" \
     --arg client_id "${CFCTL_CLIENT_ID}" \
+    --arg provider_id "${CFCTL_PROVIDER_ID}" \
+    --arg provider_type "${CFCTL_PROVIDER_TYPE}" \
+    --arg provider_name "${CFCTL_PROVIDER_NAME}" \
     --arg since "${CFCTL_SINCE}" \
     --arg before "${CFCTL_BEFORE}" \
     --arg actor "${CFCTL_ACTOR}" \
@@ -614,6 +626,9 @@ cfctl_current_operation_request_json() {
         data: $data,
         scope: (if $scope == "" then null else $scope end),
         client_id: (if $client_id == "" then null else $client_id end),
+        provider_id: (if $provider_id == "" then null else $provider_id end),
+        provider_type: (if $provider_type == "" then null else $provider_type end),
+        provider_name: (if $provider_name == "" then null else $provider_name end),
         since: (if $since == "" then null else $since end),
         before: (if $before == "" then null else $before end),
         actor: (if $actor == "" then null else $actor end),
@@ -836,6 +851,9 @@ cfctl_current_args_shell() {
   [[ -n "${CFCTL_ZONE_NAME}" ]] && args+=(--zone "${CFCTL_ZONE_NAME}")
   [[ -n "${CFCTL_ZONE_ID}" ]] && args+=(--zone-id "${CFCTL_ZONE_ID}")
   [[ -n "${CFCTL_TYPE}" ]] && args+=(--type "${CFCTL_TYPE}")
+  [[ -n "${CFCTL_PROVIDER_ID}" ]] && args+=(--provider-id "${CFCTL_PROVIDER_ID}")
+  [[ -n "${CFCTL_PROVIDER_TYPE}" ]] && args+=(--provider-type "${CFCTL_PROVIDER_TYPE}")
+  [[ -n "${CFCTL_PROVIDER_NAME}" ]] && args+=(--provider-name "${CFCTL_PROVIDER_NAME}")
   [[ -n "${CFCTL_SITEKEY}" ]] && args+=(--sitekey "${CFCTL_SITEKEY}")
   [[ -n "${CFCTL_APP_ID}" ]] && args+=(--app-id "${CFCTL_APP_ID}")
   [[ -n "${CFCTL_POLICY_ID}" ]] && args+=(--policy-id "${CFCTL_POLICY_ID}")
@@ -893,6 +911,9 @@ cfctl_current_selector_args_shell() {
   [[ -n "${CFCTL_ZONE_NAME}" ]] && args+=(--zone "${CFCTL_ZONE_NAME}")
   [[ -n "${CFCTL_ZONE_ID}" ]] && args+=(--zone-id "${CFCTL_ZONE_ID}")
   [[ -n "${CFCTL_TYPE}" ]] && args+=(--type "${CFCTL_TYPE}")
+  [[ -n "${CFCTL_PROVIDER_ID}" ]] && args+=(--provider-id "${CFCTL_PROVIDER_ID}")
+  [[ -n "${CFCTL_PROVIDER_TYPE}" ]] && args+=(--provider-type "${CFCTL_PROVIDER_TYPE}")
+  [[ -n "${CFCTL_PROVIDER_NAME}" ]] && args+=(--provider-name "${CFCTL_PROVIDER_NAME}")
   [[ -n "${CFCTL_SITEKEY}" ]] && args+=(--sitekey "${CFCTL_SITEKEY}")
   [[ -n "${CFCTL_APP_ID}" ]] && args+=(--app-id "${CFCTL_APP_ID}")
   [[ -n "${CFCTL_POLICY_ID}" ]] && args+=(--policy-id "${CFCTL_POLICY_ID}")
@@ -932,6 +953,9 @@ cfctl_selector_presence_json() {
     --arg zone_name "${CFCTL_ZONE_NAME}" \
     --arg zone_id "${CFCTL_ZONE_ID}" \
     --arg type "${CFCTL_TYPE}" \
+    --arg provider_id "${CFCTL_PROVIDER_ID}" \
+    --arg provider_type "${CFCTL_PROVIDER_TYPE}" \
+    --arg provider_name "${CFCTL_PROVIDER_NAME}" \
     --arg sitekey "${CFCTL_SITEKEY}" \
     --arg app_id "${CFCTL_APP_ID}" \
     --arg policy_id "${CFCTL_POLICY_ID}" \
@@ -961,6 +985,9 @@ cfctl_selector_presence_json() {
         zone: (($zone_name | length > 0) or ($zone_id | length > 0)),
         zone_id: ($zone_id | length > 0),
         type: ($type | length > 0),
+        provider_id: ($provider_id | length > 0),
+        provider_type: ($provider_type | length > 0),
+        provider_name: ($provider_name | length > 0),
         sitekey: ($sitekey | length > 0),
         app_id: ($app_id | length > 0),
         policy_id: ($policy_id | length > 0),
@@ -1099,6 +1126,9 @@ cfctl_target_json() {
     --arg zone "${CFCTL_ZONE_NAME}" \
     --arg zone_id "${CFCTL_ZONE_ID}" \
     --arg type "${CFCTL_TYPE}" \
+    --arg provider_id "${CFCTL_PROVIDER_ID}" \
+    --arg provider_type "${CFCTL_PROVIDER_TYPE}" \
+    --arg provider_name "${CFCTL_PROVIDER_NAME}" \
     --arg sitekey "${CFCTL_SITEKEY}" \
     --arg app_id "${CFCTL_APP_ID}" \
     --arg policy_id "${CFCTL_POLICY_ID}" \
@@ -1128,6 +1158,9 @@ cfctl_target_json() {
         zone: (if $zone == "" then null else $zone end),
         zone_id: (if $zone_id == "" then null else $zone_id end),
         type: (if $type == "" then null else $type end),
+        provider_id: (if $provider_id == "" then null else $provider_id end),
+        provider_type: (if $provider_type == "" then null else $provider_type end),
+        provider_name: (if $provider_name == "" then null else $provider_name end),
         sitekey: (if $sitekey == "" then null else $sitekey end),
         app_id: (if $app_id == "" then null else $app_id end),
         policy_id: (if $policy_id == "" then null else $policy_id end),
@@ -1533,6 +1566,11 @@ cfctl_collect_surface_items() {
       cfctl_run_backend_script "${script_path}"
       CFCTL_COLLECT_BACKEND="inventory_script"
       ;;
+    access.login_method)
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_access_login_methods.sh"
+      cfctl_run_backend_script "${script_path}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
     access.service_token)
       script_path="${CF_REPO_ROOT}/scripts/cf_inventory_access_service_tokens.sh"
       cfctl_run_backend_script "${script_path}"
@@ -1719,6 +1757,9 @@ cfctl_collect_surface_items() {
       CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.credential_sets // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
       ;;
     access.app)
+      CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.applications // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
+      ;;
+    access.login_method)
       CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.applications // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
       ;;
     access.policy)
@@ -2038,6 +2079,20 @@ cfctl_filter_surface_items() {
         ]
       ' <<< "${items_json}"
       ;;
+    access.login_method)
+      jq -c --arg id "${CFCTL_ID}" --arg name "${CFCTL_NAME}" --arg domain "${CFCTL_DOMAIN}" '
+        [
+          .[]
+          | select(
+              (if $id != "" then .id == $id else true end)
+              and
+              (if $name != "" then .name == $name else true end)
+              and
+              (if $domain != "" then .domain == $domain else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
     access.policy)
       jq -c --arg app_id "${CFCTL_APP_ID}" --arg policy_id "${CFCTL_POLICY_ID:-${CFCTL_ID}}" --arg name "${CFCTL_NAME}" '
         [
@@ -2170,6 +2225,7 @@ cfctl_summary_for_items() {
     queue) name_field="queue_name" ;;
     tunnel) name_field="name" ;;
     turnstile.widget) name_field="name" ;;
+    access.login_method) name_field="name" ;;
     access.policy) name_field="name" ;;
     api_gateway.operation) name_field="endpoint" ;;
     api_gateway.schema|api_gateway.discovery) name_field="host" ;;
@@ -2193,6 +2249,21 @@ cfctl_summary_for_items() {
           | .[:10]
         )
       }
+      | if $surface == "access.login_method" then
+          . + {
+            single_provider_count: ($items | map(select((.allowed_idps // []) | length == 1)) | length),
+            multi_provider_count: ($items | map(select((.allowed_idps // []) | length > 1)) | length),
+            no_provider_count: ($items | map(select((.allowed_idps // []) | length == 0)) | length),
+            provider_types: (
+              $items
+              | map(.allowed_provider_types // [])
+              | add // []
+              | unique
+            )
+          }
+        else
+          .
+        end
     '
 }
 
