@@ -1,0 +1,22 @@
+{
+  "match": { "domain": "developers.adapteros.com" },
+  "body": {
+    "name": "adapterOS Developers",
+    "type": "self_hosted",
+    "domain": "developers.adapteros.com",
+    "self_hosted_domains": ["developers.adapteros.com"],
+    "destinations": [{ "type": "public", "uri": "developers.adapteros.com" }],
+    "app_launcher_visible": false,
+    "allowed_idps": ["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"],
+    "auto_redirect_to_identity": true,
+    "session_duration": "8h",
+    "enable_binding_cookie": true,
+    "http_only_cookie_attribute": true,
+    "same_site_cookie_attribute": "lax",
+    "options_preflight_bypass": false,
+    "policies": [
+      { "id": "54961ddc-c486-490b-9b25-17d0f1217ca6", "precedence": 1 },
+      { "id": "b9a25b2c-0ba1-4e40-8e2e-e6640ed3eeff", "precedence": 2 }
+    ]
+  }
+}

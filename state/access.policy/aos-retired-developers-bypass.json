@@ -1,0 +1,14 @@
+{
+  "match": {
+    "app_id": "ae406410-c300-4032-ba07-5e0f63ed3892",
+    "name": "Bypass retired Pages redirect"
+  },
+  "body": {
+    "name": "Bypass retired Pages redirect",
+    "decision": "bypass",
+    "include": [{ "everyone": {} }],
+    "exclude": [],
+    "require": [],
+    "precedence": 1
+  }
+}
