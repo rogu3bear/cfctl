@@ -15,7 +15,8 @@
     "same_site_cookie_attribute": "lax",
     "options_preflight_bypass": false,
     "policies": [
-      { "id": "d07a924a-ea93-450f-85e9-b60778540809", "precedence": 1 }
+      { "id": "87544dc1-74f2-43fd-aa29-aacd5560eb34", "precedence": 1 },
+      { "id": "d07a924a-ea93-450f-85e9-b60778540809", "precedence": 2 }
     ]
   }
 }

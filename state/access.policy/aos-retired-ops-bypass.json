@@ -1,0 +1,14 @@
+{
+  "match": {
+    "app_id": "d71cec38-645b-4506-8cc0-65fb8d6e295c",
+    "name": "Bypass retired Pages redirect"
+  },
+  "body": {
+    "name": "Bypass retired Pages redirect",
+    "decision": "bypass",
+    "include": [{ "everyone": {} }],
+    "exclude": [],
+    "require": [],
+    "precedence": 1
+  }
+}

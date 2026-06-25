@@ -138,13 +138,63 @@ cfctl_pick_actual_subset_for_desired() {
     --argjson actual "${actual_json}" \
     --argjson desired "${desired_json}" \
     '
+      def actual_value($key):
+        if $actual | has($key) then
+          $actual[$key]
+        else
+          null
+        end;
+
+      def matching_policy($actual_policies; $desired_policy):
+        (
+          $actual_policies[]?
+          | select(
+              (($desired_policy.id // "") != "" and .id == $desired_policy.id)
+              or (($desired_policy.name // "") != "" and .name == $desired_policy.name)
+            )
+        ) // {};
+
+      def actual_policy_subset($desired_policy):
+        (matching_policy(($actual.policies // []); $desired_policy)) as $actual_policy
+        | reduce ($desired_policy | keys_unsorted[]) as $policy_key
+            ({};
+              . + {
+                ($policy_key): (
+                  if $actual_policy | has($policy_key) then
+                    $actual_policy[$policy_key]
+                  else
+                    null
+                  end
+                )
+              }
+            );
+
       reduce ($desired | keys_unsorted[]) as $key
         ({};
           . + {
-            ($key): ($actual[$key] // null)
+            ($key): (
+              if $key == "policies" and ($desired[$key] | type) == "array" then
+                [$desired[$key][] | actual_policy_subset(.)]
+              else
+                actual_value($key)
+              end
+            )
           }
         )
     '
+}
+
+cfctl_prepare_sync_body() {
+  local surface="$1"
+  local spec_json="$2"
+  local prepared=""
+
+  if prepared="$(cfctl_surface_call_module "${surface}" "prepare_sync_body" "${spec_json}" 2>/dev/null)"; then
+    printf '%s\n' "${prepared}"
+    return
+  fi
+
+  jq '(.body // {})' <<< "${spec_json}"
 }
 
 cfctl_diff_surface_json() {
