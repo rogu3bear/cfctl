@@ -9,10 +9,25 @@ die() {
   exit 1
 }
 
+require_source_line() {
+  local label="$1"
+  local needle="$2"
+  local file="$3"
+
+  if ! grep -Fq -- "${needle}" "${file}"; then
+    die "${label}: expected source line '${needle}' in ${file}"
+  fi
+}
+
 fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-fixture.XXXXXX")"
 missing_fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-missing-fixture.XXXXXX")"
 unverified_sender_fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-unverified-sender.XXXXXX")"
 trap 'rm -f "${fixture_file}" "${missing_fixture_file}" "${unverified_sender_fixture_file}"' EXIT
+
+require_source_line "worker evidence lane" '"worker.script": run_cfctl(["list", "worker.script"], lane="global"),' "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
+require_source_line "d1 evidence lane" '"d1.database": run_cfctl(["list", "d1.database"], lane="global"),' "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
+require_source_line "r2 evidence lane" '"r2.bucket": run_cfctl(["list", "r2.bucket"], lane="global"),' "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
+require_source_line "queue evidence lane" '"queue": run_cfctl(["list", "queue"], lane="global"),' "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
 
 cat >"${fixture_file}" <<'JSON'
 {
