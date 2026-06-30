@@ -1050,67 +1050,88 @@ cfctl_failure_guidance_json() {
   local comparison_json="{}"
   local base_command=""
   local requirement_json="{}"
+  local permission_basis=""
 
   if [[ "${surface}" != "runtime" && "${surface}" != "token" ]] && cfctl_has_surface "${surface}"; then
     comparison_json="$(cfctl_compare_permission_all_lanes "${surface}" "${action}" "${operation}")"
     recommended_lane="$(cfctl_recommended_lane_from_comparison "${comparison_json}")"
   fi
 
-  case "${error_code}" in
-    permission_denied|lane_not_allowed)
-      if [[ "${action}" == "apply" && -n "${operation}" ]]; then
-        base_command="$(cfctl_build_apply_command "${surface}" "${operation}" " --plan")"
-      elif [[ "${action}" == "classify" || "${action}" == "guide" || "${action}" == "can" ]] && [[ -n "${operation}" ]]; then
-        base_command="$(cfctl_build_verb_command "${action}" "${surface}" "${operation}")"
-      else
-        base_command="$(cfctl_build_verb_command "${action}" "${surface}" "${operation}")"
-      fi
-      if [[ -n "${recommended_lane}" ]]; then
-        recommendation_command="$(cfctl_command_with_lane_prefix "${recommended_lane}" "${base_command}")"
-        next_step="Retry on the recommended lane."
-      else
-        recommendation_command="${base_command}"
-        next_step="Current credentials do not cover this surface; inspect lanes and token scope."
-      fi
-      ;;
-    preview_required)
-      recommendation_command="$(cfctl_command_with_lane_prefix "${recommended_lane}" "$(cfctl_build_apply_command "${surface}" "${operation}" " --plan")")"
-      next_step="Run the preview first and review the emitted operation_id."
-      ;;
-    preview_receipt_missing)
-      recommendation_command="cfctl previews"
-      next_step="List current preview receipts, then rerun the preview if the expected operation_id is absent."
-      ;;
-    preview_payload_mismatch)
-      recommendation_command="$(cfctl_command_with_lane_prefix "${recommended_lane}" "$(cfctl_build_apply_command "${surface}" "${operation}" " --plan")")"
-      next_step="Selectors, payload, lane, or runtime policy changed. Mint a fresh preview and ack that new operation_id."
-      ;;
-    preview_lane_mismatch)
-      recommendation_command="$(cfctl_command_with_lane_prefix "${recommended_lane}" "$(cfctl_build_apply_command "${surface}" "${operation}" " --plan")")"
-      next_step="Re-run the preview on the same lane you intend to use for the real apply."
-      ;;
-    preview_version_mismatch|preview_expired)
-      recommendation_command="$(cfctl_command_with_lane_prefix "${recommended_lane}" "$(cfctl_build_apply_command "${surface}" "${operation}" " --plan")")"
-      next_step="The reviewed preview is no longer valid. Generate a fresh preview and use its operation_id."
-      ;;
-    lock_unavailable)
-      recommendation_command="cfctl locks"
-      next_step="Inspect active locks and clear only stale ones."
-      ;;
-    unsafe_secret_sink)
-      recommendation_command="cfctl token mint ... --value-out /tmp/cloudflare-token.secret"
-      next_step="Use an absolute non-repo path with mode 600. Repo paths, var/, and symlinks are rejected."
-      ;;
-    invalid_arguments)
-      if [[ "${surface}" != "runtime" && "${surface}" != "token" ]] && cfctl_has_surface "${surface}"; then
-        requirement_json="$(cfctl_requirement_check_json "${surface}" "${action}" "${operation}")"
-        next_step="Add the missing selectors or choose a valid selector set."
-        recommendation_command="$(cfctl_build_verb_command "explain" "${surface}")"
-      fi
-      ;;
-    *)
-      ;;
-  esac
+  permission_basis="$(jq -r '.basis // empty' <<< "${permission_json}")"
+
+  if [[ "${permission_basis}" == "zone_resolution_failed" ]]; then
+    if [[ "${action}" == "apply" && -n "${operation}" ]]; then
+      base_command="$(cfctl_build_apply_command "${surface}" "${operation}" " --plan")"
+    elif [[ "${action}" == "classify" || "${action}" == "guide" || "${action}" == "can" ]] && [[ -n "${operation}" ]]; then
+      base_command="$(cfctl_build_verb_command "${action}" "${surface}" "${operation}")"
+    else
+      base_command="$(cfctl_build_verb_command "${action}" "${surface}" "${operation}")"
+    fi
+
+    if [[ -n "${recommended_lane}" ]]; then
+      recommendation_command="$(cfctl_command_with_lane_prefix "${recommended_lane}" "${base_command}")"
+      next_step="Retry on a lane that can resolve the zone, or correct the zone selector if it still fails."
+    else
+      recommendation_command="$(cfctl_build_verb_command "can" "${surface}" "${operation}" " --all-lanes")"
+      next_step="The zone selector could not be resolved on the current lane. Verify the zone selector and compare available lanes."
+    fi
+  else
+    case "${error_code}" in
+      permission_denied|lane_not_allowed)
+        if [[ "${action}" == "apply" && -n "${operation}" ]]; then
+          base_command="$(cfctl_build_apply_command "${surface}" "${operation}" " --plan")"
+        elif [[ "${action}" == "classify" || "${action}" == "guide" || "${action}" == "can" ]] && [[ -n "${operation}" ]]; then
+          base_command="$(cfctl_build_verb_command "${action}" "${surface}" "${operation}")"
+        else
+          base_command="$(cfctl_build_verb_command "${action}" "${surface}" "${operation}")"
+        fi
+        if [[ -n "${recommended_lane}" ]]; then
+          recommendation_command="$(cfctl_command_with_lane_prefix "${recommended_lane}" "${base_command}")"
+          next_step="Retry on the recommended lane."
+        else
+          recommendation_command="${base_command}"
+          next_step="Current credentials do not cover this surface; inspect lanes and token scope."
+        fi
+        ;;
+      preview_required)
+        recommendation_command="$(cfctl_command_with_lane_prefix "${recommended_lane}" "$(cfctl_build_apply_command "${surface}" "${operation}" " --plan")")"
+        next_step="Run the preview first and review the emitted operation_id."
+        ;;
+      preview_receipt_missing)
+        recommendation_command="cfctl previews"
+        next_step="List current preview receipts, then rerun the preview if the expected operation_id is absent."
+        ;;
+      preview_payload_mismatch)
+        recommendation_command="$(cfctl_command_with_lane_prefix "${recommended_lane}" "$(cfctl_build_apply_command "${surface}" "${operation}" " --plan")")"
+        next_step="Selectors, payload, lane, or runtime policy changed. Mint a fresh preview and ack that new operation_id."
+        ;;
+      preview_lane_mismatch)
+        recommendation_command="$(cfctl_command_with_lane_prefix "${recommended_lane}" "$(cfctl_build_apply_command "${surface}" "${operation}" " --plan")")"
+        next_step="Re-run the preview on the same lane you intend to use for the real apply."
+        ;;
+      preview_version_mismatch|preview_expired)
+        recommendation_command="$(cfctl_command_with_lane_prefix "${recommended_lane}" "$(cfctl_build_apply_command "${surface}" "${operation}" " --plan")")"
+        next_step="The reviewed preview is no longer valid. Generate a fresh preview and use its operation_id."
+        ;;
+      lock_unavailable)
+        recommendation_command="cfctl locks"
+        next_step="Inspect active locks and clear only stale ones."
+        ;;
+      unsafe_secret_sink)
+        recommendation_command="cfctl token mint ... --value-out /tmp/cloudflare-token.secret"
+        next_step="Use an absolute non-repo path with mode 600. Repo paths, var/, and symlinks are rejected."
+        ;;
+      invalid_arguments)
+        if [[ "${surface}" != "runtime" && "${surface}" != "token" ]] && cfctl_has_surface "${surface}"; then
+          requirement_json="$(cfctl_requirement_check_json "${surface}" "${action}" "${operation}")"
+          next_step="Add the missing selectors or choose a valid selector set."
+          recommendation_command="$(cfctl_build_verb_command "explain" "${surface}")"
+        fi
+        ;;
+      *)
+        ;;
+    esac
+  fi
 
   jq -n \
     --arg next_step "${next_step}" \
@@ -3743,6 +3764,7 @@ cfctl_handle_apply() {
   local backend_result="null"
   local verification_json
   local summary_json
+  local guidance_json
   local id_value
 
   cfctl_require_surface "${surface}"
@@ -4037,6 +4059,7 @@ cfctl_handle_apply() {
   )"
 
   if [[ "${CFCTL_BACKEND_STATUS}" -ne 0 ]]; then
+    guidance_json="$(cfctl_failure_guidance_json "apply" "${surface}" "mutation_script" "${CFCTL_PERMISSION_JSON}" "execution_failed" "Mutation backend returned a failure" "${operation}")"
     cfctl_emit_result \
       "false" \
       "apply" \
@@ -4050,7 +4073,8 @@ cfctl_handle_apply() {
       "${CFCTL_PLAN_RECEIPT_PATH:-${CFCTL_BACKEND_ARTIFACT_PATH}}" \
       "execution_failed" \
       "Mutation backend returned a failure" \
-      "${operation}"
+      "${operation}" \
+      "${guidance_json}"
     exit 1
   fi
 
