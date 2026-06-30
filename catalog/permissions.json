@@ -44,6 +44,7 @@
         "pages.project",
         "queue",
         "r2.bucket",
+        "sender_domain",
         "tunnel",
         "turnstile.widget",
         "vulnerability_scanner.credential_set",
@@ -119,6 +120,7 @@
         "pages.project",
         "queue",
         "r2.bucket",
+        "sender_domain",
         "worker.route",
         "worker.script",
         "worker.secret",
@@ -280,6 +282,12 @@
       "scope": "account",
       "surfaces": ["wrangler"],
       "profiles": ["deploy", "full-operator"]
+    },
+    {
+      "name": "Email Sending Read",
+      "scope": "zone",
+      "surfaces": ["sender_domain"],
+      "profiles": ["read", "deploy", "full-operator"]
     },
     {
       "name": "Turnstile Sites Read",

@@ -101,6 +101,7 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_inventory_vulnerability_scanner.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_worker_routes.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_email_routing_rules.sh" \
+  "${ROOT_DIR}/scripts/cf_inventory_sender_domains.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_edge_certificates.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_zone_settings.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_security_txt.sh" \
@@ -717,6 +718,12 @@ assert_jq_file "surface module bindings" '
   and .surfaces["maildesk-cf"].actions.provision.required_selectors == ["file"]
   and .surfaces["maildesk-cf"].actions.apply.supported == false
   and (.surfaces["maildesk-cf"].docs_topics | index("email-routing")) != null
+  and .surfaces["sender_domain"].inventory_script == "scripts/cf_inventory_sender_domains.sh"
+  and .surfaces["sender_domain"].permission_family == "Email Sending"
+  and .surfaces["sender_domain"].actions.list.required_selectors == ["zone"]
+  and .surfaces["sender_domain"].actions.get.selectors_any_of == [["id"], ["name"]]
+  and .surfaces["sender_domain"].actions.verify.selectors_any_of == [["id"], ["name"]]
+  and .surfaces["sender_domain"].actions.apply.supported == false
   and .surfaces["worker.route"].module == "worker_route"
   and .surfaces["worker.route"].standards_ref == "worker.route"
   and (.surfaces["worker.route"].docs_topics | index("workers-routes")) != null

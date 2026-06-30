@@ -539,6 +539,40 @@
         "./cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan"
       ]
     },
+    "sender_domain": {
+      "description": "Cloudflare Email Sending sender subdomains in a specific zone.",
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_sender_domains.sh",
+      "permission_family": "Email Sending",
+      "selectors": ["id", "name", "zone"],
+      "actions": {
+        "list": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "get": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl list sender_domain --zone example.com",
+        "./cfctl get sender_domain --zone example.com --name example.com"
+      ]
+    },
     "d1.database": {
       "description": "D1 databases visible to the current account token.",
       "backend": "inventory_script",

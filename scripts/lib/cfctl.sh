@@ -1504,6 +1504,12 @@ cfctl_collect_surface_items() {
       cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}" "ZONE_ID=${CFCTL_ZONE_ID}"
       CFCTL_COLLECT_BACKEND="inventory_script"
       ;;
+    sender_domain)
+      cfctl_resolve_zone_context
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_sender_domains.sh"
+      cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}" "ZONE_ID=${CFCTL_ZONE_ID}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
     zone.ruleset)
       cfctl_resolve_zone_context
       script_path="${CF_REPO_ROOT}/scripts/cf_inventory_zone_security.sh"
@@ -1706,6 +1712,9 @@ cfctl_collect_surface_items() {
           ]
         ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
       )"
+      ;;
+    sender_domain)
+      CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.sender_domains // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
       ;;
     zone.ruleset)
       CFCTL_COLLECT_ITEMS_JSON="$(
@@ -2002,6 +2011,18 @@ cfctl_filter_surface_items() {
         ]
       ' <<< "${items_json}"
       ;;
+    sender_domain)
+      jq -c --arg id "${CFCTL_ID}" --arg name "${CFCTL_NAME}" '
+        [
+          .[]
+          | select(
+              (if $id != "" then .id == $id else true end)
+              and
+              (if $name != "" then ((.name // .domain // "") | ascii_downcase) == ($name | ascii_downcase) else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
     zone.ruleset)
       jq -c --arg id "${CFCTL_ID}" --arg name "${CFCTL_NAME}" --arg phase "${CFCTL_PHASE:-}" '
         [
@@ -2285,6 +2306,7 @@ cfctl_summary_for_items() {
     worker.secret) name_field="name" ;;
     worker.route) name_field="pattern" ;;
     email.routing_rule) name_field="recipient" ;;
+    sender_domain) name_field="name" ;;
     zone.ruleset) name_field="name" ;;
     security.txt) name_field="zone_name" ;;
     d1.database) name_field="name" ;;
