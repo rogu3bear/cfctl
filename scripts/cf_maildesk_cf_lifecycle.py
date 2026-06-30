@@ -259,10 +259,10 @@ def collect_live_evidence(domains: list[dict[str, Any]]) -> dict[str, Any]:
     sender_domains: list[dict[str, Any]] = []
     sender_errors: dict[str, Any] = {}
     evidence: dict[str, Any] = {
-        "worker.script": run_cfctl(["list", "worker.script"]),
-        "d1.database": run_cfctl(["list", "d1.database"]),
-        "r2.bucket": run_cfctl(["list", "r2.bucket"]),
-        "queue": run_cfctl(["list", "queue"]),
+        "worker.script": run_cfctl(["list", "worker.script"], lane="global"),
+        "d1.database": run_cfctl(["list", "d1.database"], lane="global"),
+        "r2.bucket": run_cfctl(["list", "r2.bucket"], lane="global"),
+        "queue": run_cfctl(["list", "queue"], lane="global"),
         "domains": {},
         "sender": {
             "provider": "cloudflare_email_service",
