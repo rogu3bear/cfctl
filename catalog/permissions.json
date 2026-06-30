@@ -54,7 +54,8 @@
         "worker.script",
         "worker.secret",
         "workflow",
-        "zone"
+        "zone",
+        "zone.setting"
       ],
       "forbidden_permissions": ["* Write", "* Revoke", "* Run", "Account API Tokens *"],
       "verification": [
@@ -92,13 +93,15 @@
         "worker.secret",
         "workflow",
         "wrangler",
-        "zone"
+        "zone",
+        "zone.setting"
       ],
       "forbidden_permissions": ["Account API Tokens *"],
       "verification": [
         "cfctl doctor",
         "cfctl can dns.record upsert --zone <zone> --name _ops-smoke.<zone> --type TXT --all-lanes",
         "cfctl can edge.certificate order --zone <zone> --host app.<zone> --all-lanes",
+        "cfctl list zone.setting --zone <zone>",
         "cfctl list worker.route --zone <zone>",
         "cfctl list access.app",
         "cfctl list access.login_method"
@@ -154,13 +157,15 @@
         "vulnerability_scanner.scan",
         "vulnerability_scanner.target_environment",
         "waiting_room",
-        "zone"
+        "zone",
+        "zone.setting"
       ],
       "forbidden_permissions": ["* Write", "* Revoke", "* Run", "Account API Tokens *"],
       "verification": [
         "cfctl doctor",
         "cfctl list audit.log",
         "cfctl list access.app",
+        "cfctl list zone.setting --zone <zone>",
         "cfctl list vulnerability_scanner.scan",
         "cfctl list logpush.job"
       ]
@@ -352,6 +357,18 @@
       "name": "SSL and Certificates Write",
       "scope": "zone",
       "surfaces": ["edge.certificate"],
+      "profiles": ["hostname", "full-operator"]
+    },
+    {
+      "name": "Zone Settings Read",
+      "scope": "zone",
+      "surfaces": ["zone.setting"],
+      "profiles": ["read", "hostname", "security-audit", "full-operator"]
+    },
+    {
+      "name": "Zone Settings Write",
+      "scope": "zone",
+      "surfaces": ["zone.setting"],
       "profiles": ["hostname", "full-operator"]
     },
     {

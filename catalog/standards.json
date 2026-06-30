@@ -26,6 +26,23 @@
       "/_wt/",
       "/archive/",
       "/fixtures/"
+    ],
+    "noncanonical_path_tokens": [
+      {
+        "token": "/worktrees/",
+        "authority": "worktree",
+        "reason": "separate worktree lanes are not canonical repo source of truth"
+      },
+      {
+        "token": "-deploy-dryrun/",
+        "authority": "deploy_copy",
+        "reason": "dry-run deploy copies are evidence or staging lanes, not canonical source of truth"
+      },
+      {
+        "token": "-main-asset-baseline/",
+        "authority": "baseline_copy",
+        "reason": "asset baseline copies are comparison lanes, not canonical source of truth"
+      }
     ]
   },
   "universal": [
@@ -243,6 +260,70 @@
         "cfctl classify dns.record upsert --zone <zone> --name <name> --type <type>",
         "cfctl diff dns.record --zone <zone>",
         "cfctl apply dns.record sync --zone <zone> --plan"
+      ]
+    },
+    "zone.setting": {
+      "stance": "governed edge security baseline for zone-level TLS, HTTPS, and transport settings",
+      "standards": [
+        {
+          "id": "zone.setting.preview-gated",
+          "level": "required",
+          "title": "Change zone settings through cfctl previews",
+          "summary": "Zone settings can alter all traffic on a domain. Read current state, classify the setting, preview the API body, apply only with an operation id, and verify the setting readback."
+        },
+        {
+          "id": "zone.setting.ssl-strict",
+          "level": "recommended",
+          "title": "Use Full strict SSL where origins support it",
+          "summary": "Owned HTTPS zones should use strict origin certificate validation unless a documented origin limitation requires a weaker mode."
+        },
+        {
+          "id": "zone.setting.https-hsts",
+          "level": "recommended",
+          "title": "Keep HTTPS redirects and HSTS deliberate",
+          "summary": "Public HTTPS zones should generally enable Always Use HTTPS and HSTS after confirming every active subdomain supports HTTPS."
+        },
+        {
+          "id": "zone.setting.min-tls-current",
+          "level": "recommended",
+          "title": "Keep minimum TLS current",
+          "summary": "Use the account's modern minimum TLS baseline on owned web zones, with exceptions only for documented legacy clients."
+        }
+      ],
+      "evidence": [
+        "cfctl list zone.setting --zone <zone>",
+        "cfctl classify zone.setting set --zone <zone> --name ssl",
+        "cfctl apply zone.setting set --zone <zone> --name ssl --content strict --plan",
+        "cfctl verify zone.setting --zone <zone> --name ssl"
+      ]
+    },
+    "security.txt": {
+      "stance": "state-backed public vulnerability disclosure only where a contact is proven",
+      "standards": [
+        {
+          "id": "security.txt.preview-gated",
+          "level": "required",
+          "title": "Change managed security.txt through cfctl previews",
+          "summary": "Cloudflare serves security.txt from a zone-level Security Center API. Preview the exact contact/canonical/policy body before enabling or deleting it."
+        },
+        {
+          "id": "security.txt.contact-proven",
+          "level": "required",
+          "title": "Use only proven public contacts",
+          "summary": "Do not invent a vulnerability mailbox. Desired state must cite repo or account evidence for every public contact URI."
+        },
+        {
+          "id": "security.txt.canonical-explicit",
+          "level": "recommended",
+          "title": "Keep canonical URL explicit",
+          "summary": "Managed zones should name the expected /.well-known/security.txt URL so dashboard, API, and public readback agree."
+        }
+      ],
+      "evidence": [
+        "cfctl get security.txt --zone <zone>",
+        "cfctl diff security.txt --zone <zone>",
+        "cfctl apply security.txt sync --zone <zone> --plan",
+        "cfctl verify security.txt --zone <zone>"
       ]
     },
     "edge.certificate": {

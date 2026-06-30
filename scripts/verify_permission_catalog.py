@@ -301,7 +301,8 @@ def validate_command_fixtures(catalog: dict) -> list[dict]:
             "--permission 'DNS Write' --permission 'SSL and Certificates Read' "
             "--permission 'SSL and Certificates Write' --permission 'Workers Routes Read' "
             "--permission 'Workers Routes Write' --permission 'Workers Scripts Read' "
-            "--permission 'Zone Read' --zone 'example.com' --ttl-hours 168 --plan"
+            "--permission 'Zone Read' --permission 'Zone Settings Read' "
+            "--permission 'Zone Settings Write' --zone 'example.com' --ttl-hours 168 --plan"
             ),
         },
         {

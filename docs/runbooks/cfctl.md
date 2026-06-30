@@ -75,9 +75,12 @@ cfctl token revoke --id <token-id> --plan
 cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete
 cfctl classify dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT
 cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120
+cfctl guide zone.setting set --zone example.com --name ssl --content strict
 cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
 cfctl hostname verify --file state/hostname/example.yaml
 cfctl hostname plan --file state/hostname/example.yaml
+cfctl maildesk-cf verify --file state/maildesk-cf/example.json
+cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
 cfctl list surfaces
 cfctl list audit.log
 cfctl explain access.app
@@ -85,6 +88,7 @@ cfctl list access.login_method
 cfctl list pages.project
 cfctl get access.app --domain docs.example.org
 cfctl list worker.route --zone example.com
+cfctl list zone.setting --zone example.com
 CF_TOKEN_LANE=global cfctl list email.routing_rule --zone example.com
 CF_TOKEN_LANE=global cfctl get email.routing_rule --zone example.com --name role@example.com
 cfctl list api_gateway.operation --zone example.com
@@ -95,6 +99,8 @@ CF_TOKEN_LANE=global cfctl can email.routing_rule --zone example.com
 CF_TOKEN_LANE=global cfctl snapshot tunnel
 CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
+CF_TOKEN_LANE=global cfctl apply zone.setting set --zone example.com --name ssl --content strict --plan
+CF_TOKEN_LANE=global cfctl apply zone.setting set --zone example.com --name min_tls_version --content 1.3 --plan
 CF_TOKEN_LANE=global cfctl apply email.routing_rule upsert --zone example.com --name role@example.com --service maildesk-cf-router --plan
 CF_TOKEN_LANE=global cfctl apply dns.record sync --zone example.com --plan
 CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
@@ -110,6 +116,7 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - `docs` includes freshness metadata so the bank does not masquerade as auto-refreshed truth
 - `standards audit` scans the active Wrangler footprint under a root and reports standards coverage plus per-file findings
 - `standards audit` reports `compatibility_date` aging and stale counts using the catalog thresholds
+- `standards audit` separates canonical repo config from worktree, dry-run deploy, and baseline-copy config through `source_context_summary`
 - `standards audit` is source-config evidence; use live reads for dashboard, Access, DNS, or edge-state claims
 - `api_gateway.*` and `vulnerability_scanner.*` are read-only API-security inventory surfaces; they do not create scans, upload schemas, or change schema validation
 - `CF_TOKEN_LANE=global` switches `cfctl` onto the emergency token lane for that invocation
@@ -146,15 +153,18 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - `bootstrap permissions` reads `catalog/permissions.json` and emits the temporary bootstrap credential requirements plus profile-scoped operator-token mint commands
 - `bootstrap permissions --profile <profile>` supports `read`, `dns`, `hostname`, `deploy`, `security-audit`, and `full-operator`
 - each bootstrap profile declares `allowed_surfaces` and `forbidden_permissions`; catalog verification fails when selected permissions cross those boundaries
-- `docs/permission-doctrine.md` defines the operator policy for bootstrap credentials, profile TTLs, break-glass use, and the `cfctl-live` GitHub Actions environment
+- `docs/permission-doctrine.md` defines the operator policy for bootstrap credentials, profile TTLs, break-glass use, and local live-contract inputs
 - `scripts/verify_permission_catalog.py` checks the permission catalog shape, profile minimality boundaries, profile command fixtures, optional real `cfctl` bootstrap output, and optional live permission-group drift
-- `.github/workflows/cfctl-contract.yml` runs static contract checks on PRs and live permission/public-contract checks on schedule or manual dispatch when the required Cloudflare secrets are configured
+- `LOCAL_CI.md` records the local contract gate; remote CI is intentionally absent
 - `admin authorize-backend` issues a short-lived backend authorization file for maintainer/debug direct script use
 - `admin authorizations` lists active and expired backend authorizations
 - `admin revoke-backend --path ...` removes one authorization artifact
 - `apply <surface> sync` performs selective desired-state reconciliation on supported surfaces
 - `hostname verify|diff|plan` checks one YAML hostname lifecycle spec across DNS, TLS, Worker route, Access, Worker script, HTTP response, D1, and R2
 - `hostname apply` is blocked until composite mutation is backed by preview-gated component surfaces
+- `maildesk-cf init|verify|snapshot|diff|plan|provision --plan` checks one JSON maildesk spec across Email Routing aliases, Workers, D1, R2, Queues, DNS sender authentication, and outbound identity readback
+- `maildesk-cf provision --ack-plan <operation-id>` is blocked until composite mutation is backed by preview-gated component surfaces
+- `maildesk-cf` does not perform broad live sends; targeted delivery proof must be requested explicitly
 - destructive operations require explicit confirmation such as `--confirm delete`
 - blocked surfaces fail with structured permission results instead of raw Cloudflare API blobs
 - ambiguous target resolution is a hard failure
@@ -187,6 +197,24 @@ cfctl hostname plan --file state/hostname/example.yaml
 ```
 
 The current implementation is read-only. It emits evidence for each component surface and proposed operations for any gap; it does not mutate DNS, Access, routes, certificates, Workers, D1, or R2.
+
+## maildesk-cf Lifecycle
+
+Use `maildesk-cf` when the question is whether a maildesk deployment is ready across inbound routing, storage, Workers, sender authentication, and outbound identity, not whether one isolated Cloudflare resource exists.
+
+```bash
+cfctl maildesk-cf init --domain example.com
+cfctl maildesk-cf verify --file state/maildesk-cf/example.json
+cfctl maildesk-cf snapshot --file state/maildesk-cf/example.json
+cfctl maildesk-cf diff --file state/maildesk-cf/example.json
+cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
+```
+
+The current implementation is read-only. `provision --plan` emits a preview
+operation id plus proposed component operations; `provision --ack-plan` is
+blocked until each component mutation is present as a public preview-gated
+surface. Sender readiness uses DNS/authentication and provider readback
+evidence. Broad live sends are never attempted by default.
 
 ## Result Envelope
 
@@ -224,6 +252,8 @@ Supported surfaces:
 - `access.app`
 - `access.policy`
 - `dns.record`
+- `zone.setting`
+- `security.txt`
 - `tunnel`
 
 Supported commands:
@@ -232,6 +262,12 @@ Supported commands:
 cfctl diff dns.record --zone example.com
 cfctl apply dns.record sync --zone example.com --plan
 cfctl apply dns.record sync --zone example.com --ack-plan <operation-id>
+cfctl diff zone.setting --zone example.com
+cfctl apply zone.setting sync --zone example.com --plan
+cfctl apply zone.setting sync --zone example.com --ack-plan <operation-id>
+cfctl diff security.txt --zone example.com
+cfctl apply security.txt sync --zone example.com --plan
+cfctl apply security.txt sync --zone example.com --ack-plan <operation-id>
 ```
 
 Token commands:

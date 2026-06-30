@@ -1,0 +1,53 @@
+{
+  "project": {
+    "name": "maildesk-cf",
+    "account_id_env": "CLOUDFLARE_ACCOUNT_ID"
+  },
+  "domains": [
+    {
+      "name": "example.com",
+      "inbound_mx_provider": "cloudflare_email_routing",
+      "role_aliases": [
+        "abuse",
+        "dmarc",
+        "founders",
+        "info",
+        "legal",
+        "noreply",
+        "postmaster",
+        "security"
+      ],
+      "personal_aliases": [
+        "operator-a",
+        "operator-b"
+      ]
+    }
+  ],
+  "workers": {
+    "mail_api": {
+      "script_name": "maildesk-cf",
+      "config": "wrangler.toml"
+    },
+    "mail_router": {
+      "script_name": "maildesk-cf-router",
+      "config": "wrangler.mail-router.toml"
+    }
+  },
+  "storage": {
+    "d1_database": "maildesk-cf-db",
+    "d1_preview_database": "maildesk-cf-preview-db",
+    "r2_raw_mail_bucket": "maildesk-cf-raw-mail",
+    "r2_raw_mail_preview_bucket": "maildesk-cf-raw-mail-preview",
+    "queue": "maildesk-cf-jobs"
+  },
+  "sender": {
+    "mode": "cloudflare_first",
+    "authenticated_domains": [
+      "example.com"
+    ]
+  },
+  "verification": {
+    "allow_broad_live_sends": false,
+    "targeted_send_required": false
+  }
+}

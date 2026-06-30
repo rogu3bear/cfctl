@@ -176,6 +176,6 @@ BODY_JSON='{"name":"example-tunnel","config_src":"cloudflare"}' \
 
 - With the default `CF_DEV_TOKEN`, DNS dry runs may still be unable to pre-resolve an existing record id.
 - If a write is blocked on the primary lane, retry the same command with `CF_TOKEN_LANE=global`.
-- `apply <surface> sync` is only supported for `access.app`, `access.policy`, `dns.record`, and `tunnel`.
+- `apply <surface> sync` is only supported for `access.app`, `access.policy`, `dns.record`, `zone.setting`, and `tunnel`.
 - `cf_api_apply.sh` expects a fully expanded Cloudflare API path in `REQUEST_PATH` and `VERIFY_PATH`.
 - `cf_api_apply.sh` is the backend escape hatch for API Shield, rate limits, Access policies, and other surfaces that do not yet have a dedicated wrapper.

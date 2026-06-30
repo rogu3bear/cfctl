@@ -73,6 +73,7 @@ The catalog currently defines deeper standards for:
 - `turnstile.widget`
 - `logpush.job`
 - `waiting_room`
+- `security.txt`
 
 Examples:
 
@@ -88,6 +89,8 @@ Examples:
   explicit ACM hostname coverage, zone-apex inclusion, validation-method choice, and post-order verification
 - `hostname`
   read-only composite verification across DNS, route, Access, TLS, Worker, response, and storage
+- `security.txt`
+  preview-gated Cloudflare-managed vulnerability disclosure contact, enabled only where a public contact is proven by repo or account evidence
 - `worker.route`
   live zone route inventory and route-to-script verification
 - `worker.runtime`
@@ -109,9 +112,16 @@ cfctl standards audit /path/to/workspace
 This audit scans active `wrangler.toml` and `wrangler.jsonc` files, matches them to the standards catalog, and reports:
 
 - recurring config classes actually present
+- source authority for each file: canonical repo config versus worktree, dry-run deploy copy, or baseline copy
 - which config classes are covered by standards
 - `compatibility_date` freshness against the catalog thresholds
 - per-file findings such as placeholder vars, missing observability on active workers, dual exposure, or container-image issues
+
+Workspace-wide scans keep noncanonical files visible, but split them from the
+canonical signal. The total `warning_count` / `note_count` still includes every
+discovered config file for auditability. The `canonical_warning_count`,
+`canonical_note_count`, and `source_context_summary` fields are the right
+operator signal when a repo forest contains worktrees or deploy-copy lanes.
 
 Compatibility-date freshness is intentionally advisory until the target repo updates its config. The default thresholds are:
 

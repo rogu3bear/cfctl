@@ -1,0 +1,32 @@
+{
+  "match": {
+    "domain": "founder.mlnavigator.com/api/public-surveys"
+  },
+  "intent": {
+    "classification": "intentional_public_carveout",
+    "source_repo": "/Users/star/dev/mln-web",
+    "source_evidence": [
+      "crates/founder/src/server/router/api_routes.rs",
+      "crates/founder/tests/integration_api.rs"
+    ],
+    "rationale": "The founder Worker exposes GET /api/public-surveys/{id} as an unauthenticated public route while the parent founder host remains Access protected."
+  },
+  "body": {
+    "name": "Founder Public Survey API",
+    "type": "self_hosted",
+    "domain": "founder.mlnavigator.com/api/public-surveys",
+    "self_hosted_domains": [
+      "founder.mlnavigator.com/api/public-surveys"
+    ],
+    "destinations": [
+      {
+        "type": "public",
+        "uri": "founder.mlnavigator.com/api/public-surveys"
+      }
+    ],
+    "allowed_idps": [
+      "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+    ],
+    "session_duration": "24h"
+  }
+}

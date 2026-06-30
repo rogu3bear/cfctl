@@ -55,6 +55,7 @@ Usage:
   cfctl wrangler [wrangler args]
   cfctl cloudflared [cloudflared args]
   cfctl hostname verify|diff|plan|apply [--file state/hostname/<name>.yaml]
+  cfctl maildesk-cf init|verify|snapshot|diff|plan|provision [--file state/maildesk-cf/<name>.json] [--domain example.com]
   cfctl token permission-groups [--name <filter>] [--scope <scope>]
   cfctl token mint --name <token-name> [token options]
   cfctl token revoke --id <token-id> [--plan|--ack-plan <operation-id> --confirm delete]
@@ -86,6 +87,7 @@ Verb intent:
   wrangler  Run Wrangler through the cfctl envelope, logs, and preview gate for mutating commands.
   cloudflared Run cloudflared through the cfctl envelope, logs, and preview gate for mutating commands.
   hostname Composite hostname lifecycle evidence from checked-in state/hostname specs.
+  maildesk-cf Composite maildesk-cf provisioning readiness from checked-in state/maildesk-cf specs.
   token     List token permission groups, mint, or revoke account-owned API tokens.
   list      List surfaces or resources.
   explain   Show the contract for one surface.
@@ -133,6 +135,8 @@ Examples:
   cfctl hostname verify --file state/hostname/example.yaml
   cfctl hostname diff --file state/hostname/example.yaml
   cfctl hostname plan --file state/hostname/example.yaml
+  cfctl maildesk-cf verify --file state/maildesk-cf/example.json
+  cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
   cfctl admin authorizations
   cfctl admin authorize-backend --backend scripts/cf_api_apply.sh --reason "maintainer debug"
   cfctl admin revoke-backend --path var/runtime/admin/backend-bypass-<id>.json
@@ -143,6 +147,7 @@ Examples:
   cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete
   cfctl classify dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT
   cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120
+  cfctl guide zone.setting set --zone example.com --name ssl --content strict
   cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
   cfctl list surfaces
   cfctl standards access.app
@@ -154,9 +159,11 @@ Examples:
   cfctl get access.app --domain docs.example.org
   cfctl apply access.login_method set --provider-type onetimepin --plan
   cfctl list worker.route --zone example.com
+  cfctl list zone.setting --zone example.com
   cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
   CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
   CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
+  CF_TOKEN_LANE=global cfctl apply zone.setting set --zone example.com --name ssl --content strict --plan
   CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --ack-plan <operation-id>
   CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --plan
 
@@ -167,10 +174,12 @@ Desired-state surfaces:
   access.app
   access.policy
   dns.record
+  zone.setting
   tunnel
 
 Composite lifecycle state:
   hostname
+  maildesk-cf
 
 Need more context?
   ${CF_REPO_ROOT}/AGENTS.md
@@ -311,14 +320,14 @@ cfctl_secret_scan_json() {
           -g '*.log' \
           -e 'cfat_[A-Za-z0-9_-]+' \
           -e 'cfk_[A-Za-z0-9_-]+' \
-          -e 'Authorization: Bearer ' \
-          -e 'X-Auth-Key: ' \
+	          -e 'Authorization: Bearer [A-Za-z0-9._~+/=-]{8,}' \
+	          -e 'X-Auth-Key: [A-Za-z0-9._~+/=-]{8,}' \
           "${artifact_root}" 2>/dev/null
       )"
     else
       raw_matches="$(
         grep -R -n -E \
-          'cfat_[A-Za-z0-9_-]+|cfk_[A-Za-z0-9_-]+|Authorization: Bearer |X-Auth-Key: ' \
+	          'cfat_[A-Za-z0-9_-]+|cfk_[A-Za-z0-9_-]+|Authorization: Bearer [A-Za-z0-9._~+/=-]{8,}|X-Auth-Key: [A-Za-z0-9._~+/=-]{8,}' \
           "${artifact_root}" 2>/dev/null
       )"
     fi
@@ -2810,12 +2819,20 @@ cfctl_handle_standards_audit() {
       {
         root: .root,
         config_file_count: .config_file_count,
+        canonical_config_file_count: (.source_context_summary.canonical_config_file_count // .config_file_count),
+        noncanonical_config_file_count: (.source_context_summary.noncanonical_config_file_count // 0),
         covered_feature_count: .coverage.covered_feature_count,
         uncovered_feature_count: .coverage.uncovered_feature_count,
         compatibility_date_aging_count: (.compatibility_date_freshness.aging_count // 0),
         compatibility_date_stale_count: (.compatibility_date_freshness.stale_count // 0),
+        canonical_compatibility_date_aging_count: (.source_context_summary.canonical_compatibility_date_freshness.aging_count // 0),
+        canonical_compatibility_date_stale_count: (.source_context_summary.canonical_compatibility_date_freshness.stale_count // 0),
         warning_count: .findings_summary.warning_count,
-        note_count: .findings_summary.note_count
+        note_count: .findings_summary.note_count,
+        canonical_warning_count: (.source_context_summary.canonical_findings_summary.warning_count // .findings_summary.warning_count),
+        canonical_note_count: (.source_context_summary.canonical_findings_summary.note_count // .findings_summary.note_count),
+        noncanonical_warning_count: (.source_context_summary.noncanonical_findings_summary.warning_count // 0),
+        noncanonical_note_count: (.source_context_summary.noncanonical_findings_summary.note_count // 0)
       }
     ' <<< "${result_json}"
   )"
@@ -3188,6 +3205,120 @@ cfctl_handle_hostname() {
     "${error_code}" \
     "${error_message}" \
     "${hostname_action}"
+}
+
+cfctl_find_maildesk_cf_plan_receipt_path() {
+  local ack_plan="$1"
+  local runtime_dir="${CF_REPO_ROOT}/var/inventory/runtime"
+  local candidate
+
+  if [[ ! -d "${runtime_dir}" ]]; then
+    return 1
+  fi
+
+  for candidate in "${runtime_dir}"/*.json; do
+    [[ -f "${candidate}" ]] || continue
+    if jq -e \
+      --arg ack_plan "${ack_plan}" \
+      '
+        (.operation_id // "") == $ack_plan
+        and .action == "maildesk-cf"
+        and .surface == "maildesk-cf"
+        and .operation == "provision"
+        and (.summary.plan_mode // false) == true
+      ' \
+      "${candidate}" >/dev/null 2>&1; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+cfctl_handle_maildesk_cf() {
+  local maildesk_action="${1:-verify}"
+  local output
+  local status
+  local artifact_path
+  local result_json
+  local performed="true"
+  local ok="true"
+  local error_code=""
+  local error_message=""
+  local receipt_path=""
+
+  case "${maildesk_action}" in
+    init|verify|snapshot|diff|plan|provision) ;;
+    *)
+      cfctl_emit_failure "maildesk-cf" "maildesk-cf" "maildesk_cf_lifecycle" '{"state":"not_applicable","basis":"maildesk_cf_lifecycle","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' "unsupported_operation" "Unsupported maildesk-cf action: ${maildesk_action}" "${maildesk_action}"
+      exit 1
+      ;;
+  esac
+
+  if [[ "${maildesk_action}" == "provision" ]]; then
+    if [[ "${CFCTL_PLAN}" == "1" ]]; then
+      CFCTL_OPERATION_ID="${CFCTL_OPERATION_ID:-$(cf_runtime_operation_id)}"
+    elif [[ -n "${CFCTL_ACK_PLAN}" ]]; then
+      if ! receipt_path="$(cfctl_find_maildesk_cf_plan_receipt_path "${CFCTL_ACK_PLAN}")"; then
+        cfctl_emit_failure "maildesk-cf" "maildesk-cf" "maildesk_cf_lifecycle" '{"state":"not_applicable","basis":"preview_receipt_missing","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' "preview_receipt_missing" "No matching maildesk-cf provision preview receipt was found for --ack-plan ${CFCTL_ACK_PLAN}" "${maildesk_action}"
+        exit 1
+      fi
+      CFCTL_OPERATION_ID="${CFCTL_ACK_PLAN}"
+      CFCTL_PLAN_RECEIPT_PATH="${receipt_path}"
+    else
+      cfctl_emit_failure "maildesk-cf" "maildesk-cf" "maildesk_cf_lifecycle" '{"state":"not_applicable","basis":"preview_required","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' "preview_required" "maildesk-cf provision requires --plan first, then --ack-plan <operation-id>." "${maildesk_action}"
+      exit 1
+    fi
+  elif [[ "${maildesk_action}" == "plan" ]]; then
+    CFCTL_OPERATION_ID="${CFCTL_OPERATION_ID:-$(cf_runtime_operation_id)}"
+  fi
+
+  set +e
+  output="$(
+    env \
+      MAILDESK_CF_ACTION="${maildesk_action}" \
+      MAILDESK_CF_DOMAIN="${CFCTL_DOMAIN}" \
+      MAILDESK_CF_PLAN="${CFCTL_PLAN}" \
+      MAILDESK_CF_ACK_PLAN="${CFCTL_ACK_PLAN}" \
+      MAILDESK_CF_PLAN_RECEIPT="${receipt_path}" \
+      SPEC_FILE="${CFCTL_FILE}" \
+      python3 "${CF_REPO_ROOT}/scripts/cf_maildesk_cf_lifecycle.py" 2>&1
+  )"
+  status="$?"
+  set -e
+
+  artifact_path="$(printf '%s\n' "${output}" | tail -n 1)"
+  if [[ "${status}" -ne 0 || ! -f "${artifact_path}" ]]; then
+    ok="false"
+    performed="false"
+    error_code="execution_failed"
+    error_message="${output}"
+    result_json="null"
+  else
+    result_json="$(cat "${artifact_path}")"
+    if [[ "$(jq -r '(.plan.blocked // "") != "" and (.plan.acknowledged_operation_id // "") != ""' <<< "${result_json}")" == "true" ]]; then
+      ok="false"
+      performed="false"
+      error_code="unsupported_operation"
+      error_message="$(jq -r '.plan.blocked' <<< "${result_json}")"
+    fi
+  fi
+
+  cfctl_emit_result \
+    "${ok}" \
+    "maildesk-cf" \
+    "maildesk-cf" \
+    "maildesk_cf_lifecycle" \
+    "${performed}" \
+    '{"state":"not_applicable","basis":"maildesk_cf_lifecycle","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
+    "$([[ "${ok}" == "true" ]] && jq '{state: (if .readiness.mail_ready then "verified" else "drift" end)}' <<< "${result_json}" || echo '{"state":"blocked"}')" \
+    "$([[ "${result_json}" != "null" ]] && jq '{spec_path, template_ready: .readiness.template_ready, instance_ready: .readiness.instance_ready, edge_ready: .readiness.edge_ready, mail_ready: .readiness.mail_ready, drift_count: (.drifts | length), drift_classes, operation_count: .plan.operation_count, mutation_enabled: .plan.mutation_enabled, plan_mode: .plan.plan_mode}' <<< "${result_json}" || jq -n --arg message "${error_message}" '{message: $message}')" \
+    "${result_json}" \
+    "$([[ "${result_json}" != "null" ]] && printf '%s' "${artifact_path}" || printf '')" \
+    "${error_code}" \
+    "${error_message}" \
+    "${maildesk_action}"
 }
 
 cfctl_required_confirmation() {
@@ -3612,6 +3743,26 @@ cfctl_handle_apply() {
         "ZONE_NAME=${CFCTL_ZONE_NAME}" \
         "ZONE_ID=${CFCTL_ZONE_ID}" \
         "RULESET_ID=${id_value}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
+    zone.setting)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "ZONE_NAME=${CFCTL_ZONE_NAME}" \
+        "ZONE_ID=${CFCTL_ZONE_ID}" \
+        "SETTING_NAME=${CFCTL_NAME:-${id_value}}" \
+        "SETTING_VALUE=${CFCTL_CONTENT}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
+    security.txt)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "ZONE_NAME=${CFCTL_ZONE_NAME}" \
+        "ZONE_ID=${CFCTL_ZONE_ID}" \
         "BODY_JSON=${CFCTL_BODY_JSON}" \
         "BODY_FILE=${CFCTL_BODY_FILE}"
       ;;
@@ -5105,6 +5256,14 @@ cfctl_main() {
       fi
       cfctl_parse_flags "$@"
       cfctl_handle_hostname "${hostname_action}"
+      ;;
+    maildesk-cf)
+      local maildesk_action="${1:-verify}"
+      if [[ "$#" -gt 0 ]]; then
+        shift
+      fi
+      cfctl_parse_flags "$@"
+      cfctl_handle_maildesk_cf "${maildesk_action}"
       ;;
     token)
       cfctl_handle_token "$@"

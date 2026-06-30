@@ -15,12 +15,6 @@ Cloudflare account.
   `Account Settings Read` or `Account Settings Write` and supports bounded
   `since`, `before`, and `limit` queries:
   <https://developers.cloudflare.com/api/resources/accounts/subresources/logs/subresources/audit/methods/list/>.
-- GitHub Actions environment secrets and protection rules gate a job before it
-  can access environment secrets:
-  <https://docs.github.com/en/actions/concepts/workflows-and-actions/deployment-environments>.
-- GitHub Actions required reviewers can block protected-environment jobs until
-  an allowed reviewer approves them:
-  <https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments#required-reviewers>.
 
 ## Live Contract Environment
 
@@ -45,7 +39,8 @@ CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_pub
 
 The live job is intentionally not run on pull requests. It runs on
 `workflow_dispatch` and the scheduled contract lane after the protected
-environment releases the job.
+environment releases the job. Local smoke checks may still run from the
+checkout with equivalent explicit shell inputs.
 
 ## Bootstrap Creator
 
@@ -58,8 +53,8 @@ Allowed bootstrap creator permissions:
 - `Account API Tokens Write`
 - `Account Settings Read`
 
-The bootstrap creator must not be installed as `CF_DEV_TOKEN`, stored in GitHub
-Actions, or reused for day-to-day operations.
+The bootstrap creator must not be installed as `CF_DEV_TOKEN`, stored in hosted
+CI, or reused for day-to-day operations.
 
 ## Operator Profiles
 
@@ -68,7 +63,7 @@ Profile names are fixed by `catalog/permissions.json`:
 - `read`: default inventory and audit profile, including `audit.log`.
 - `dns`: DNS record read/write profile for preview-gated DNS work.
 - `hostname`: composite hostname lifecycle profile for DNS, Access, routes,
-  Worker, and certificate work.
+  Worker, certificates, and zone-level TLS/HTTPS settings.
 - `deploy`: Worker, Pages, D1, R2, Queues, route, and wrangler deploy profile.
 - `security-audit`: read-only API-security, Access, logging, and edge posture
   inventory profile.
@@ -110,3 +105,5 @@ Before merging permission or live-contract changes:
 - `python3 scripts/verify_permission_catalog.py --permission-groups <live-artifact>`
 - Manual `cfctl contract` workflow dispatch against the `cfctl-live`
   environment after secrets are configured.
+- Optional local live-contract smoke with explicit local inputs, for example
+  `CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_public_contract.sh`.

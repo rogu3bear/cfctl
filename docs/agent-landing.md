@@ -57,6 +57,7 @@ cfctl list pages.project
 cfctl list edge.certificate --zone example.com
 cfctl get access.app --domain docs.example.org
 cfctl hostname verify --file state/hostname/example.yaml
+cfctl maildesk-cf verify --file state/maildesk-cf/example.json
 CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
 ./scripts/cf_compare_token_coverage.sh
 ./scripts/cf_auth_check.sh
@@ -78,8 +79,10 @@ cfctl apply access.policy create --app-id <app-id> --body-file policy.json --pla
 CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-type onetimepin --plan
 cfctl apply tunnel create --body '{"name":"example","config_src":"cloudflare"}' --plan
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
+CF_TOKEN_LANE=global cfctl apply zone.setting set --zone example.com --name ssl --content strict --plan
 CF_TOKEN_LANE=global cfctl apply dns.record sync --zone example.com --plan
 CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
+cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
 ```
 
 For hostname cutovers, use the composite read path before planning component writes:
@@ -89,12 +92,22 @@ cfctl hostname verify --file state/hostname/example.yaml
 cfctl hostname plan --file state/hostname/example.yaml
 ```
 
+For maildesk-cf deployments, use the composite read path before planning
+component writes:
+
+```bash
+cfctl maildesk-cf verify --file state/maildesk-cf/example.json
+cfctl maildesk-cf diff --file state/maildesk-cf/example.json
+cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
+```
+
 To actually execute a reviewed write:
 
 ```bash
 cfctl apply access.app update --id <app-id> --body-file app.json --ack-plan <operation-id>
 CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-id <provider-id> --ack-plan <operation-id>
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --ack-plan <operation-id>
+CF_TOKEN_LANE=global cfctl apply zone.setting set --zone example.com --name ssl --content strict --ack-plan <operation-id>
 CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --ack-plan <operation-id>
 ```
 

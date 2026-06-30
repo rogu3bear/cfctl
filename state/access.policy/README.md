@@ -27,3 +27,6 @@ Example:
 Recommended match keys:
 - `app_id` with `name`
 - `policy_id`
+
+Managed specs:
+- `founder-public-surveys-bypass.json`: explicit public bypass policy for the founder public-surveys carve-out.

@@ -1,0 +1,9 @@
+{
+  "match": {
+    "zone": "leakbar.com",
+    "name": "ssl"
+  },
+  "body": {
+    "value": "strict"
+  }
+}

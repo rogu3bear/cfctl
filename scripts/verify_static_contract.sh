@@ -94,6 +94,7 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_cloudflared.sh" \
   "${ROOT_DIR}/scripts/cf_token_revoke.sh" \
   "${ROOT_DIR}/scripts/verify_access_login_method_contract.sh" \
+  "${ROOT_DIR}/scripts/verify_maildesk_cf_contract.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_access_login_methods.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_audit_logs.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_api_gateway.sh" \
@@ -101,10 +102,14 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_inventory_worker_routes.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_email_routing_rules.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_edge_certificates.sh" \
+  "${ROOT_DIR}/scripts/cf_inventory_zone_settings.sh" \
+  "${ROOT_DIR}/scripts/cf_inventory_security_txt.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_access_login_method.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_email_routing_rule.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_edge_certificate.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_worker_route.sh" \
+  "${ROOT_DIR}/scripts/cf_mutate_zone_setting.sh" \
+  "${ROOT_DIR}/scripts/cf_mutate_security_txt.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_zone_ruleset.sh" \
   "${ROOT_DIR}/scripts/verify_public_contract.sh" \
   "${ROOT_DIR}/scripts/verify_static_contract.sh"
@@ -114,6 +119,8 @@ for surface_module in \
   "${ROOT_DIR}/lib/surfaces/access_policy.sh" \
   "${ROOT_DIR}/lib/surfaces/dns_record.sh" \
   "${ROOT_DIR}/lib/surfaces/edge_certificate.sh" \
+  "${ROOT_DIR}/lib/surfaces/security_txt.sh" \
+  "${ROOT_DIR}/lib/surfaces/zone_setting.sh" \
   "${ROOT_DIR}/lib/surfaces/worker_route.sh" \
   "${ROOT_DIR}/lib/surfaces/tunnel.sh"; do
   bash -n "${surface_module}"
@@ -121,7 +128,9 @@ done
 
 python3 "${ROOT_DIR}/scripts/render_capabilities_doc.py" --check "${ROOT_DIR}/docs/capabilities.md" >/dev/null
 python3 "${ROOT_DIR}/scripts/verify_permission_catalog.py" >/dev/null
+python3 -m py_compile "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
 "${ROOT_DIR}/scripts/verify_access_login_method_contract.sh" >/dev/null
+"${ROOT_DIR}/scripts/verify_maildesk_cf_contract.sh" >/dev/null
 
 set +e
 doctor_bootstrap_json="$(
@@ -221,12 +230,17 @@ assert_jq_file "permission profile minimality policy" '
   and (.profiles["security-audit"].allowed_surfaces | index("audit.log")) != null
   and .profiles.dns.allowed_surfaces == ["dns.record", "zone"]
   and (.profiles.hostname.allowed_surfaces | index("edge.certificate")) != null
+  and (.profiles.hostname.allowed_surfaces | index("zone.setting")) != null
+  and (.profiles.read.allowed_surfaces | index("zone.setting")) != null
+  and (.profiles["security-audit"].allowed_surfaces | index("zone.setting")) != null
+  and (.permissions[] | select(.name == "Zone Settings Read" and .scope == "zone" and (.surfaces | index("zone.setting")) != null))
+  and (.permissions[] | select(.name == "Zone Settings Write" and .scope == "zone" and (.profiles | index("hostname")) != null))
   and (.profiles.deploy.allowed_surfaces | index("audit.log")) != null
   and (.profiles.deploy.allowed_surfaces | index("wrangler")) != null
   and .profiles["full-operator"].allowed_surfaces == ["*"]
   and (.profiles["full-operator"].forbidden_permissions | index("Account API Tokens *")) != null
 ' "${ROOT_DIR}/catalog/permissions.json"
-assert_jq_file "runtime public verbs" '(.public_verbs | index("docs")) != null and (.public_verbs | index("env")) != null and (.public_verbs | index("wrangler")) != null and (.public_verbs | index("cloudflared")) != null and (.public_verbs | index("hostname")) != null and (.public_verbs | index("ownership")) != null and (.landing_flow | index("ownership check")) != null and (.landing_flow | index("docs")) != null' "${ROOT_DIR}/catalog/runtime.json"
+assert_jq_file "runtime public verbs" '(.public_verbs | index("docs")) != null and (.public_verbs | index("env")) != null and (.public_verbs | index("wrangler")) != null and (.public_verbs | index("cloudflared")) != null and (.public_verbs | index("hostname")) != null and (.public_verbs | index("maildesk-cf")) != null and (.public_verbs | index("ownership")) != null and (.landing_flow | index("ownership check")) != null and (.landing_flow | index("docs")) != null' "${ROOT_DIR}/catalog/runtime.json"
 assert_jq_file "runtime env run policy" '
   .env_run.default_lane == "dev"
   and .env_run.requires_argv_separator == true
@@ -264,6 +278,11 @@ assert_jq_file "docs bank shape" '.checked_on != null and .refresh_policy.refres
 assert_jq_file "docs bank api gateway topic" '(.foundation | any(.id == "api-gateway")) and (.foundation | any(.id == "audit-logs")) and (.watch | any(.id == "api-shield-vulnerability-scanner"))' "${ROOT_DIR}/catalog/cloudflare-doc-bank.json"
 assert_jq_file "standards shape" '(.universal | length) > 0 and (.surfaces | keys | length) > 0' "${ROOT_DIR}/catalog/standards.json"
 assert_jq_file "compatibility freshness thresholds" '.audit.compatibility_date_freshness.note_after_days == 30 and .audit.compatibility_date_freshness.warning_after_days == 90' "${ROOT_DIR}/catalog/standards.json"
+assert_jq_file "standards audit source-context tokens" '
+  (.audit.noncanonical_path_tokens | map(.token) | index("/worktrees/")) != null
+  and (.audit.noncanonical_path_tokens | map(.token) | index("-deploy-dryrun/")) != null
+  and (.audit.noncanonical_path_tokens | map(.token) | index("-main-asset-baseline/")) != null
+' "${ROOT_DIR}/catalog/standards.json"
 assert_jq_file "surface registry shape" '(.surfaces | keys | length) > 0' "${ROOT_DIR}/catalog/surfaces.json"
 assert_jq_file "ownership registry shape" '
   .version == 1
@@ -383,7 +402,19 @@ jq -e '
 ' <<< "${ownership_get_json}" >/dev/null || die "ownership get envelope assertion failed"
 
 lane_precedence_dir="$(mktemp -d "${TMPDIR:-/tmp}/cfctl-lane-precedence.XXXXXX")"
-trap 'rm -rf "${lane_precedence_dir}"' EXIT
+cleanup_lane_precedence_dir() {
+  local base
+  if [[ -z "${lane_precedence_dir:-}" || ! -d "${lane_precedence_dir}" ]]; then
+    return
+  fi
+  base="$(basename "${lane_precedence_dir}")"
+  if [[ "${base}" != cfctl-lane-precedence.* || "${lane_precedence_dir}" == "${ROOT_DIR}" || "${lane_precedence_dir}" == "${ROOT_DIR}/"* ]]; then
+    printf 'refusing to remove unexpected lane precedence temp dir: %s\n' "${lane_precedence_dir}" >&2
+    return 1
+  fi
+  rm -rf -- "${lane_precedence_dir}"
+}
+trap cleanup_lane_precedence_dir EXIT
 lane_precedence_shared_env="${lane_precedence_dir}/shared.env"
 lane_precedence_repo_env="${lane_precedence_dir}/repo.env"
 printf '%s\n' \
@@ -442,7 +473,9 @@ jq -e '
   and .summary.child_output_redacted == true
   and .result.secret_policy.token_values_in_artifact == false
   and .result.secret_policy.shell_eval_allowed == false
-' <<< "${env_run_json}" >/dev/null || die "env run artifact assertion failed"
+	' <<< "${env_run_json}" >/dev/null || die "env run artifact assertion failed"
+assert_contains "secret scan bearer requires token value" "Authorization: Bearer [A-Za-z0-9._~+/=-]{8,}" "${ROOT_DIR}/commands/cfctl.sh"
+assert_contains "secret scan auth key requires token value" "X-Auth-Key: [A-Za-z0-9._~+/=-]{8,}" "${ROOT_DIR}/commands/cfctl.sh"
 
 assert_cross_catalog_empty "surface docs topics resolve to docs bank" '
   (
@@ -484,7 +517,7 @@ assert_cross_catalog_empty "desired-state surfaces resolve to public surface cat
   | [
       ($runtime[0].desired_state // {})
       | to_entries[]
-      | select(.key != "hostname")
+      | select((.key | IN("hostname", "maildesk-cf")) | not)
       | select($surface_catalog[.key] == null)
       | {desired_state_surface: .key, issue: "missing_surface_catalog_entry"}
     ]
@@ -577,6 +610,12 @@ done < <(
     | .value.state_dir // empty
   ' "${ROOT_DIR}/catalog/runtime.json"
 )
+assert_jq_file "zone setting desired state" '
+  .desired_state["zone.setting"].supported == true
+  and .desired_state["zone.setting"].sync_supported == true
+  and .desired_state["zone.setting"].state_dir == "state/zone.setting"
+  and .desired_state["zone.setting"].match_selectors == ["zone", "id", "name"]
+' "${ROOT_DIR}/catalog/runtime.json"
 assert_jq_file "surface module bindings" '
   .surfaces["access.app"].module == "access_app"
   and .surfaces["access.app"].standards_ref == "access.app"
@@ -596,10 +635,17 @@ assert_jq_file "surface module bindings" '
   and .surfaces["dns.record"].module == "dns_record"
   and .surfaces["dns.record"].standards_ref == "dns.record"
   and (.surfaces["dns.record"].docs_topics | index("api-auth")) != null
+  and .surfaces["zone.setting"].module == "zone_setting"
+  and .surfaces["zone.setting"].standards_ref == "zone.setting"
+  and .surfaces["zone.setting"].inventory_script == "scripts/cf_inventory_zone_settings.sh"
+  and .surfaces["zone.setting"].apply_script == "scripts/cf_mutate_zone_setting.sh"
+  and .surfaces["zone.setting"].actions.apply.operations.set.required_selectors == ["zone", "name"]
+  and (.surfaces["zone.setting"].docs_topics | index("ssl-tls")) != null
   and .surfaces["edge.certificate"].module == "edge_certificate"
   and .surfaces["edge.certificate"].standards_ref == "edge.certificate"
   and (.surfaces["edge.certificate"].docs_topics | index("advanced-certificates")) != null
   and (.surfaces["hostname"] == null)
+  and (.surfaces["maildesk-cf"] == null)
   and .surfaces["worker.route"].module == "worker_route"
   and .surfaces["worker.route"].standards_ref == "worker.route"
   and (.surfaces["worker.route"].docs_topics | index("workers-routes")) != null
@@ -629,13 +675,16 @@ assert_contains "state docs scaffolding note" "Support means the desired-state e
 assert_contains "state readme scaffolding note" "Managed specs are opt-in." "${ROOT_DIR}/state/README.md"
 assert_contains "hostname state example" "cfctl hostname verify --file state/hostname/example.yaml" "${ROOT_DIR}/state/hostname/README.md"
 assert_contains "hostname checked-in spec" "service: example-edge-router" "${ROOT_DIR}/state/hostname/example.yaml"
+assert_contains "maildesk state example" "cfctl maildesk-cf verify --file state/maildesk-cf/example.json" "${ROOT_DIR}/state/maildesk-cf/README.md"
+assert_contains "maildesk checked-in spec" "\"script_name\": \"maildesk-cf-router\"" "${ROOT_DIR}/state/maildesk-cf/example.json"
 assert_contains "cfctl prompt contract" "You are now operating as \`cfctl\`, a strict, catalog-driven Cloudflare control plane." "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt preview ack" "always require \`--plan\` first, then \`--ack-plan <operation-id>\`" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt token revoke" "For token revocation, require \`--plan\` first" "${ROOT_DIR}/CFCTL_PROMPT.md"
-assert_contains "cfctl prompt error verb" "\`doctor\`, \`audit\`, \`admin\`, \`bootstrap\`, \`lanes\`, \`surfaces\`, \`docs\`, \`previews\`, \`locks\`, \`env\`, \`ownership\`, \`wrangler\`, \`cloudflared\`, \`hostname\`, \`standards\`, \`token\`, \`list\`, \`get\`, \`can\`, \`classify\`, \`guide\`, \`apply\`, \`verify\`, \`explain\`, \`snapshot\`, \`diff\`, or \`error\`." "${ROOT_DIR}/CFCTL_PROMPT.md"
+assert_contains "cfctl prompt error verb" "\`doctor\`, \`audit\`, \`admin\`, \`bootstrap\`, \`lanes\`, \`surfaces\`, \`docs\`, \`previews\`, \`locks\`, \`env\`, \`ownership\`, \`wrangler\`, \`cloudflared\`, \`hostname\`, \`maildesk-cf\`, \`standards\`, \`token\`, \`list\`, \`get\`, \`can\`, \`classify\`, \`guide\`, \`apply\`, \`verify\`, \`explain\`, \`snapshot\`, \`diff\`, or \`error\`." "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt env run" "For \`env run\`, require \`--\` followed by argv command tokens." "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt env run argv secrecy" "refuse requests that pass secrets as command args" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt hostname" "For \`hostname\`, treat \`verify\`, \`diff\`, and \`plan\` as read-only composite evidence flows" "${ROOT_DIR}/CFCTL_PROMPT.md"
+assert_contains "cfctl prompt maildesk" "For \`maildesk-cf\`, treat \`init\`, \`verify\`, \`snapshot\`, \`diff\`, \`plan\`, and \`provision --plan\` as read-only composite evidence flows" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt wrapper gating" "For \`wrangler\` and \`cloudflared\`, treat clearly read-only subcommands as direct wrapped executions" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl preview inactive legacy cleanup command" "purge-inactive-legacy" "${ROOT_DIR}/commands/cfctl.sh"
 assert_contains "readme wrapper examples" "cfctl wrangler --version" "${ROOT_DIR}/README.md"
@@ -644,11 +693,14 @@ assert_contains "readme env run argv secrecy" "do not pass secrets as command-li
 assert_contains "readme inactive legacy preview cleanup" "cfctl previews purge-inactive-legacy" "${ROOT_DIR}/README.md"
 assert_contains "readme source-live boundary" "Source Config Vs Live State" "${ROOT_DIR}/README.md"
 assert_contains "readme hostname lifecycle" "Hostname lifecycle" "${ROOT_DIR}/README.md"
+assert_contains "readme maildesk lifecycle" "maildesk-cf lifecycle" "${ROOT_DIR}/README.md"
 assert_contains "readme token revoke" "cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete" "${ROOT_DIR}/README.md"
 assert_contains "readme standards audit freshness" "checked-in Wrangler config alignment, including \`compatibility_date\` freshness" "${ROOT_DIR}/README.md"
+assert_contains "readme standards audit source authority" "classify source authority" "${ROOT_DIR}/README.md"
 assert_contains "public agent landing wrapper hierarchy" "cfctl wrangler ..." "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "public agent landing source-live boundary" "Do not turn a source-config audit into a live Cloudflare claim." "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "public readme hostname lifecycle" "Hostname lifecycle" "${ROOT_DIR}/README.md"
+assert_contains "public readme maildesk lifecycle" "cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan" "${ROOT_DIR}/README.md"
 assert_contains "public readme token revoke" "cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete" "${ROOT_DIR}/README.md"
 assert_contains "agent landing decision path" "## Decision Path" "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "agent landing source-live boundary" "Do not turn a source-config audit into a live Cloudflare claim." "${ROOT_DIR}/docs/agent-landing.md"
@@ -663,10 +715,13 @@ assert_contains "runtime policy env run" "\`cfctl env run\` strips parent lane s
 assert_contains "runbook inactive legacy preview cleanup" "previews purge-inactive-legacy" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook audit log read" "cfctl list audit.log" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook hostname lifecycle" "cfctl hostname verify --file state/hostname/example.yaml" "${ROOT_DIR}/docs/runbooks/cfctl.md"
+assert_contains "runbook maildesk lifecycle" "cfctl maildesk-cf verify --file state/maildesk-cf/example.json" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook token revoke" "token revoke --plan\` reads token id/name/status/expiry metadata" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook compatibility freshness" "standards audit\` reports \`compatibility_date\` aging and stale counts" "${ROOT_DIR}/docs/runbooks/cfctl.md"
+assert_contains "runbook source context summary" "\`source_context_summary\`" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook standards audit source evidence" "standards audit\` is source-config evidence" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "config standards compatibility freshness" "Compatibility-date freshness is intentionally advisory" "${ROOT_DIR}/docs/config-standards.md"
+assert_contains "config standards canonical notes" "\`canonical_warning_count\`" "${ROOT_DIR}/docs/config-standards.md"
 assert_contains "runtime policy inactive legacy preview cleanup" "cfctl previews purge-inactive-legacy" "${ROOT_DIR}/docs/runtime-policy.md"
 assert_contains "capabilities operable note" "This table is the operable runtime surface." "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities generated note" "_Generated from \`catalog/surfaces.json\` and \`catalog/runtime.json\`." "${ROOT_DIR}/docs/capabilities.md"
@@ -674,9 +729,61 @@ assert_contains "capabilities module column" "| Surface | Read | Can | Apply | V
 assert_contains "capabilities contract matrix" "## Operation Contract Matrix" "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities destructive contract" "| \`dns.record\` | \`delete\` | \`destructive\` | yes | \`lease\` | yes | \`delete\` | \`dev\`, \`global\` | required: zone; one of: id / name, type |" "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities email routing contract" "| \`email.routing_rule\` | \`upsert\` | \`write\` | yes | \`apply\` | yes | \`-\` | \`dev\`, \`global\` | required: zone, name, service |" "${ROOT_DIR}/docs/capabilities.md"
+assert_contains "capabilities zone setting contract" "| \`zone.setting\` | \`set\` | \`write\` | yes | \`apply\` | yes | \`-\` | \`dev\`, \`global\` | required: zone, name |" "${ROOT_DIR}/docs/capabilities.md"
+assert_contains "capabilities zone setting sync contract" "| \`zone.setting\` | \`sync\` | \`write\` | yes | \`apply\` | yes | \`-\` | \`dev\`, \`global\` | state match: zone, id, name |" "${ROOT_DIR}/docs/capabilities.md"
+assert_contains "capabilities security txt contract" "| \`security.txt\` | \`upsert\` | \`write\` | yes | \`apply\` | yes | \`-\` | \`dev\`, \`global\` | required: zone |" "${ROOT_DIR}/docs/capabilities.md"
+assert_contains "capabilities security txt sync contract" "| \`security.txt\` | \`sync\` | \`write\` | yes | \`apply\` | yes | \`-\` | \`dev\`, \`global\` | state match: zone |" "${ROOT_DIR}/docs/capabilities.md"
+assert_contains "state docs zone setting" "- \`zone.setting\`" "${ROOT_DIR}/docs/state.md"
+assert_contains "state readme zone setting" "- \`zone.setting\`" "${ROOT_DIR}/state/README.md"
+assert_contains "state docs security txt" "- \`security.txt\`" "${ROOT_DIR}/docs/state.md"
+assert_contains "state readme security txt" "- \`security.txt\`" "${ROOT_DIR}/state/README.md"
+assert_jq_file "mlnavigator reply spf desired state" '
+  .match.zone == "mlnavigator.com"
+  and .match.name == "reply.mlnavigator.com"
+  and .match.type == "TXT"
+  and .body.content == "v=spf1 include:_spf.mx.cloudflare.net ~all"
+  and .body.ttl == 300
+  and .body.proxied == false
+' "${ROOT_DIR}/state/dns.record/mlnavigator-reply-spf.json"
+assert_jq_file "founder public surveys access app state" '
+  .match.domain == "founder.mlnavigator.com/api/public-surveys"
+  and .intent.classification == "intentional_public_carveout"
+  and .body.name == "Founder Public Survey API"
+  and .body.type == "self_hosted"
+  and .body.domain == "founder.mlnavigator.com/api/public-surveys"
+' "${ROOT_DIR}/state/access.app/founder-public-surveys.json"
+assert_jq_file "mlnavigator survey retire access app state" '
+  .match.domain == "survey.mlnavigator.com"
+  and .intent.classification == "retire_legacy_public_surface"
+  and .delete == true
+' "${ROOT_DIR}/state/access.app/mlnavigator-survey-retire.json"
+assert_jq_file "founder public surveys bypass policy state" '
+  .match.app_id == "ef0898ec-1d46-4515-8326-6a244ea8c54e"
+  and .match.name == "Bypass Everyone"
+  and .intent.classification == "intentional_public_carveout_policy"
+  and .body.decision == "bypass"
+  and .body.include == [{"everyone": {}}]
+  and .body.exclude == []
+  and .body.require == []
+  and .body.precedence == 1
+' "${ROOT_DIR}/state/access.policy/founder-public-surveys-bypass.json"
+assert_jq_file "adapteros security txt state" '
+  .match.zone == "adapteros.com"
+  and .body.enabled == true
+  and .body.contact == ["mailto:security@adapteros.com"]
+  and .body.canonical == ["https://adapteros.com/.well-known/security.txt"]
+  and .body.policy == ["https://adapteros.com/security"]
+' "${ROOT_DIR}/state/security.txt/adapteros-com.json"
+assert_jq_file "mlnavigator security txt state" '
+  .match.zone == "mlnavigator.com"
+  and .body.enabled == true
+  and .body.contact == ["mailto:security@mlnavigator.com"]
+  and .body.canonical == ["https://mlnavigator.com/.well-known/security.txt"]
+' "${ROOT_DIR}/state/security.txt/mlnavigator-com.json"
 assert_contains "capabilities read-only surfaces" "## Read-Only Surfaces" "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities read-only warning" "Mutation should not be inferred from an inventory script alone." "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities hostname composite" "Composite lifecycle commands:" "${ROOT_DIR}/docs/capabilities.md"
+assert_contains "capabilities maildesk composite" "cfctl maildesk-cf provision --file state/maildesk-cf/<name>.json --plan" "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "docs bank tracked vs operable note" "Tracked here does not automatically mean operable through \`cfctl\` today" "${ROOT_DIR}/docs/cloudflare-doc-bank.md"
 assert_contains "docs bank audit logs" "Audit Logs v2" "${ROOT_DIR}/docs/cloudflare-doc-bank.md"
 assert_contains "public contract live verifier note" "This is a live account smoke test." "${ROOT_DIR}/scripts/verify_public_contract.sh"

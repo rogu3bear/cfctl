@@ -1508,6 +1508,18 @@ cfctl_collect_surface_items() {
       cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}"
       CFCTL_COLLECT_BACKEND="inventory_script"
       ;;
+    zone.setting)
+      cfctl_resolve_zone_context
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_zone_settings.sh"
+      cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}" "ZONE_ID=${CFCTL_ZONE_ID}" "SETTING_NAME=${CFCTL_NAME:-${CFCTL_ID}}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
+    security.txt)
+      cfctl_resolve_zone_context
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_security_txt.sh"
+      cfctl_run_backend_script "${script_path}" "ZONE_NAME=${CFCTL_ZONE_NAME}" "ZONE_ID=${CFCTL_ZONE_ID}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
     d1.database)
       script_path="${CF_REPO_ROOT}/scripts/cf_inventory_d1.sh"
       cfctl_run_backend_script "${script_path}"
@@ -1798,6 +1810,39 @@ cfctl_collect_surface_items() {
           ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
       )"
       ;;
+    zone.setting)
+      CFCTL_COLLECT_ITEMS_JSON="$(
+        jq -c \
+          --arg zone_id "${CFCTL_ZONE_ID}" \
+          --arg zone_name "${CFCTL_ZONE_NAME}" \
+          '
+            [
+              (.settings // [])[]
+              | . + {
+                  zone_id: (.zone_id // $zone_id),
+                  zone_name: (.zone_name // $zone_name),
+                  name: (.name // .id // null)
+                }
+            ]
+          ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
+      )"
+      ;;
+    security.txt)
+      CFCTL_COLLECT_ITEMS_JSON="$(
+        jq -c \
+          --arg zone_id "${CFCTL_ZONE_ID}" \
+          --arg zone_name "${CFCTL_ZONE_NAME}" \
+          '
+            [
+              (.security_txt // [])[]
+              | . + {
+                  zone_id: (.zone_id // $zone_id),
+                  zone_name: (.zone_name // $zone_name)
+                }
+            ]
+          ' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}"
+      )"
+      ;;
     waiting_room)
       CFCTL_COLLECT_ITEMS_JSON="$(
         jq -c \
@@ -1966,6 +2011,25 @@ cfctl_filter_surface_items() {
               and
               (if $phase != "" then .phase == $phase else true end)
             )
+        ]
+      ' <<< "${items_json}"
+      ;;
+    zone.setting)
+      jq -c --arg id "${CFCTL_ID}" --arg name "${CFCTL_NAME}" '
+        [
+          .[]
+          | select(
+              (if $id != "" then .id == $id else true end)
+              and
+              (if $name != "" then ((.name // .id // "") == $name) else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
+    security.txt)
+      jq -c '
+        [
+          .[]
         ]
       ' <<< "${items_json}"
       ;;
@@ -2220,6 +2284,7 @@ cfctl_summary_for_items() {
     worker.route) name_field="pattern" ;;
     email.routing_rule) name_field="recipient" ;;
     zone.ruleset) name_field="name" ;;
+    security.txt) name_field="zone_name" ;;
     d1.database) name_field="name" ;;
     r2.bucket) name_field="name" ;;
     queue) name_field="queue_name" ;;
