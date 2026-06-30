@@ -303,7 +303,8 @@ assert_jq_file "permission profile minimality policy" '
   and (.profiles["security-audit"].allowed_surfaces | index("zone.setting")) != null
   and (.permissions[] | select(.name == "Zone Settings Read" and .scope == "zone" and (.surfaces | index("zone.setting")) != null))
   and (.permissions[] | select(.name == "Zone Settings Write" and .scope == "zone" and (.profiles | index("hostname")) != null))
-  and (.permissions[] | select(.name == "Email Sending Write" and .scope == "zone" and (.surfaces | index("sender_domain")) != null and (.profiles | index("deploy")) != null))
+  and (.permissions[] | select(.name == "Email Sending Read" and .scope == "account" and (.surfaces | index("sender_domain")) != null and (.profiles | index("deploy")) != null))
+  and (.permissions[] | select(.name == "Email Sending Write" and .scope == "account" and (.surfaces | index("sender_domain")) != null and (.profiles | index("deploy")) != null))
   and (.profiles.deploy.allowed_surfaces | index("audit.log")) != null
   and (.profiles.deploy.allowed_surfaces | index("wrangler")) != null
   and .profiles["full-operator"].allowed_surfaces == ["*"]
