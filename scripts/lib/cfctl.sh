@@ -961,6 +961,7 @@ cfctl_selector_presence_json() {
     --arg policy_id "${CFCTL_POLICY_ID}" \
     --arg job_id "${CFCTL_JOB_ID}" \
     --arg scope "${CFCTL_SCOPE}" \
+    --arg file "${CFCTL_FILE}" \
     --arg tunnel_id "${CFCTL_TUNNEL_ID}" \
     --arg client_id "${CFCTL_CLIENT_ID}" \
     --arg script "${CFCTL_SCRIPT}" \
@@ -993,6 +994,7 @@ cfctl_selector_presence_json() {
         policy_id: ($policy_id | length > 0),
         job_id: ($job_id | length > 0),
         scope: ($scope | length > 0),
+        file: ($file | length > 0),
         tunnel_id: ($tunnel_id | length > 0),
         client_id: ($client_id | length > 0),
         script: ($script | length > 0),

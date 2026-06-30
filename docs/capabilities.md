@@ -21,6 +21,7 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | `edge.certificate` | yes | yes | yes | yes | no | `edge.certificate` | `advanced-certificates, api-auth` | `edge_certificate` |
 | `email.routing_rule` | yes | yes | yes | yes | no | `-` | `email-routing, api-auth` | `-` |
 | `logpush.job` | yes | yes | yes | yes | no | `-` | `-` | `-` |
+| `maildesk-cf` | no | no | no | no | yes | `maildesk-cf` | `email-routing, email-workers, d1, r2, queues, api-auth` | `-` |
 | `pages.project` | yes | yes | no | yes | no | `-` | `-` | `-` |
 | `pages.secret` | yes | yes | yes | yes | no | `-` | `-` | `-` |
 | `queue` | yes | yes | no | yes | no | `-` | `-` | `-` |

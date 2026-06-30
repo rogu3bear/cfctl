@@ -126,6 +126,43 @@ jq -e '
   and .summary.mail_ready == false
 ' <<< "${cfctl_output}" >/dev/null || die "cfctl provision --plan envelope did not match"
 
+standards_output="$("${ROOT_DIR}/cfctl" standards maildesk-cf)"
+jq -e '
+  .ok == true
+  and .action == "standards"
+  and .surface == "maildesk-cf"
+  and .summary.standard_count >= 4
+  and .summary.desired_state_supported == true
+  and .result.runtime.backend == "maildesk_cf_lifecycle"
+' <<< "${standards_output}" >/dev/null || die "maildesk-cf standards envelope did not match"
+
+classify_output="$(
+  "${ROOT_DIR}/cfctl" classify maildesk-cf provision --file "${ROOT_DIR}/state/maildesk-cf/example.json"
+)"
+jq -e '
+  .ok == true
+  and .action == "classify"
+  and .surface == "maildesk-cf"
+  and .operation == "provision"
+  and .summary.preview_required == true
+  and .summary.selector_ready == true
+  and .result.policy.public_example == "cfctl maildesk-cf provision --file state/maildesk-cf/<name>.json --plan"
+' <<< "${classify_output}" >/dev/null || die "maildesk-cf classify envelope did not match"
+
+guide_output="$(
+  "${ROOT_DIR}/cfctl" guide maildesk-cf provision --file "${ROOT_DIR}/state/maildesk-cf/example.json"
+)"
+jq -e '
+  .ok == true
+  and .action == "guide"
+  and .surface == "maildesk-cf"
+  and .operation == "provision"
+  and (.result.commands.preview | contains("cfctl maildesk-cf provision"))
+  and (.result.commands.preview | contains("--plan"))
+  and (.result.commands.apply_blocked | contains("--ack-plan <operation-id>"))
+  and any(.result.steps[]; contains("Do not run the ack command"))
+' <<< "${guide_output}" >/dev/null || die "maildesk-cf guide envelope did not match"
+
 set +e
 ack_output="$(
   MAILDESK_CF_EVIDENCE_FILE="${fixture_file}" \

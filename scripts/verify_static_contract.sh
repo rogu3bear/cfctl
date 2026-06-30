@@ -517,7 +517,7 @@ assert_cross_catalog_empty "desired-state surfaces resolve to public surface cat
   | [
       ($runtime[0].desired_state // {})
       | to_entries[]
-      | select((.key | IN("hostname", "maildesk-cf")) | not)
+      | select((.key | IN("hostname")) | not)
       | select($surface_catalog[.key] == null)
       | {desired_state_surface: .key, issue: "missing_surface_catalog_entry"}
     ]
@@ -645,7 +645,12 @@ assert_jq_file "surface module bindings" '
   and .surfaces["edge.certificate"].standards_ref == "edge.certificate"
   and (.surfaces["edge.certificate"].docs_topics | index("advanced-certificates")) != null
   and (.surfaces["hostname"] == null)
-  and (.surfaces["maildesk-cf"] == null)
+  and .surfaces["maildesk-cf"].backend == "maildesk_cf_lifecycle"
+  and .surfaces["maildesk-cf"].standards_ref == "maildesk-cf"
+  and .surfaces["maildesk-cf"].actions.provision.supported == true
+  and .surfaces["maildesk-cf"].actions.provision.required_selectors == ["file"]
+  and .surfaces["maildesk-cf"].actions.apply.supported == false
+  and (.surfaces["maildesk-cf"].docs_topics | index("email-routing")) != null
   and .surfaces["worker.route"].module == "worker_route"
   and .surfaces["worker.route"].standards_ref == "worker.route"
   and (.surfaces["worker.route"].docs_topics | index("workers-routes")) != null
