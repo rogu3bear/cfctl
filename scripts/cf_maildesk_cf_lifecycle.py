@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import time
@@ -148,6 +149,17 @@ def expected_storage(spec: dict[str, Any]) -> dict[str, str]:
         "queue",
     ]
     return {key: str(storage.get(key) or "") for key in keys if storage.get(key)}
+
+
+def storage_preview_command(key: str, name: str) -> str | None:
+    quoted_name = shlex.quote(name)
+    if key in {"d1_database", "d1_preview_database"}:
+        return f"cfctl wrangler d1 create {quoted_name} --plan"
+    if key in {"r2_raw_mail_bucket", "r2_raw_mail_preview_bucket"}:
+        return f"cfctl wrangler r2 bucket create {quoted_name} --plan"
+    if key == "queue":
+        return f"cfctl wrangler queues create {quoted_name} --plan"
+    return None
 
 
 def normalize_alias(alias: Any, domain: str) -> str:
@@ -538,6 +550,7 @@ def build_checks(
                     "Storage resource is missing",
                     expected,
                     sorted(present_names),
+                    storage_preview_command(key, expected),
                 )
             )
 

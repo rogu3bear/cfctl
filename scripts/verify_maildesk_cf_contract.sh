@@ -109,6 +109,11 @@ jq -e '
   and (.drift_classes | index("missing_resource")) != null
   and (.drift_classes | index("email_routing_alias_drift")) != null
   and (.drift_classes | index("dns_authentication_drift")) != null
+  and any(.plan.operations[]; .surface == "d1.database" and .preview_command == "cfctl wrangler d1 create maildesk-cf-db --plan" and .blocked == null)
+  and any(.plan.operations[]; .surface == "d1.database" and .preview_command == "cfctl wrangler d1 create maildesk-cf-preview-db --plan" and .blocked == null)
+  and any(.plan.operations[]; .surface == "r2.bucket" and .preview_command == "cfctl wrangler r2 bucket create maildesk-cf-raw-mail --plan" and .blocked == null)
+  and any(.plan.operations[]; .surface == "r2.bucket" and .preview_command == "cfctl wrangler r2 bucket create maildesk-cf-raw-mail-preview --plan" and .blocked == null)
+  and any(.plan.operations[]; .surface == "queue" and .preview_command == "cfctl wrangler queues create maildesk-cf-jobs --plan" and .blocked == null)
 ' "${missing_artifact_path}" >/dev/null || die "missing-resource drift classes did not match"
 
 cfctl_output="$(
