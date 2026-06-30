@@ -3895,6 +3895,16 @@ cfctl_handle_apply() {
         "BODY_JSON=${CFCTL_BODY_JSON}" \
         "BODY_FILE=${CFCTL_BODY_FILE}"
       ;;
+    sender_domain)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "ZONE_NAME=${CFCTL_ZONE_NAME}" \
+        "ZONE_ID=${CFCTL_ZONE_ID}" \
+        "SENDER_DOMAIN=${CFCTL_NAME}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
     zone.ruleset)
       cfctl_run_backend_script "${script_path}" \
         "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \

@@ -290,6 +290,12 @@
       "profiles": ["read", "deploy", "full-operator"]
     },
     {
+      "name": "Email Sending Write",
+      "scope": "zone",
+      "surfaces": ["sender_domain"],
+      "profiles": ["deploy", "full-operator"]
+    },
+    {
       "name": "Turnstile Sites Read",
       "scope": "account",
       "surfaces": ["turnstile.widget"],

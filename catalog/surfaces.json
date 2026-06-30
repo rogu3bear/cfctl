@@ -543,6 +543,7 @@
       "description": "Cloudflare Email Sending sender subdomains in a specific zone.",
       "backend": "inventory_script",
       "inventory_script": "scripts/cf_inventory_sender_domains.sh",
+      "apply_script": "scripts/cf_mutate_sender_domain.sh",
       "permission_family": "Email Sending",
       "selectors": ["id", "name", "zone"],
       "actions": {
@@ -565,12 +566,24 @@
           "required_selectors": ["zone"]
         },
         "apply": {
-          "supported": false
+          "supported": true,
+          "risk": "write",
+          "preview_required": true,
+          "verification_required": true,
+          "operations": {
+            "enable": {
+              "risk": "write",
+              "required_selectors": ["zone", "name"],
+              "public_example": "cfctl apply sender_domain enable --zone example.com --name example.com --plan"
+            }
+          }
         }
       },
       "examples": [
         "./cfctl list sender_domain --zone example.com",
-        "./cfctl get sender_domain --zone example.com --name example.com"
+        "./cfctl get sender_domain --zone example.com --name example.com",
+        "./cfctl apply sender_domain enable --zone example.com --name example.com --plan",
+        "./cfctl apply sender_domain enable --zone example.com --name example.com --ack-plan <operation-id>"
       ]
     },
     "d1.database": {
