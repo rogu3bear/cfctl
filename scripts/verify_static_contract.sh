@@ -105,6 +105,7 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_inventory_edge_certificates.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_zone_settings.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_security_txt.sh" \
+  "${ROOT_DIR}/scripts/cf_mutate_sender_domain.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_access_login_method.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_email_routing_rule.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_edge_certificate.sh" \
@@ -302,6 +303,7 @@ assert_jq_file "permission profile minimality policy" '
   and (.profiles["security-audit"].allowed_surfaces | index("zone.setting")) != null
   and (.permissions[] | select(.name == "Zone Settings Read" and .scope == "zone" and (.surfaces | index("zone.setting")) != null))
   and (.permissions[] | select(.name == "Zone Settings Write" and .scope == "zone" and (.profiles | index("hostname")) != null))
+  and (.permissions[] | select(.name == "Email Sending Write" and .scope == "zone" and (.surfaces | index("sender_domain")) != null and (.profiles | index("deploy")) != null))
   and (.profiles.deploy.allowed_surfaces | index("audit.log")) != null
   and (.profiles.deploy.allowed_surfaces | index("wrangler")) != null
   and .profiles["full-operator"].allowed_surfaces == ["*"]
@@ -720,10 +722,14 @@ assert_jq_file "surface module bindings" '
   and (.surfaces["maildesk-cf"].docs_topics | index("email-routing")) != null
   and .surfaces["sender_domain"].inventory_script == "scripts/cf_inventory_sender_domains.sh"
   and .surfaces["sender_domain"].permission_family == "Email Sending"
+  and .surfaces["sender_domain"].apply_script == "scripts/cf_mutate_sender_domain.sh"
   and .surfaces["sender_domain"].actions.list.required_selectors == ["zone"]
   and .surfaces["sender_domain"].actions.get.selectors_any_of == [["id"], ["name"]]
   and .surfaces["sender_domain"].actions.verify.selectors_any_of == [["id"], ["name"]]
-  and .surfaces["sender_domain"].actions.apply.supported == false
+  and .surfaces["sender_domain"].actions.apply.supported == true
+  and .surfaces["sender_domain"].actions.apply.preview_required == true
+  and .surfaces["sender_domain"].actions.apply.verification_required == true
+  and .surfaces["sender_domain"].actions.apply.operations.enable.required_selectors == ["zone", "name"]
   and .surfaces["worker.route"].module == "worker_route"
   and .surfaces["worker.route"].standards_ref == "worker.route"
   and (.surfaces["worker.route"].docs_topics | index("workers-routes")) != null

@@ -178,7 +178,7 @@ jq -e '
   and .readiness.mail_ready == false
   and (.drift_classes | index("sender_domain_drift")) != null
   and (.drift_classes | index("provider_status_unavailable")) == null
-  and any(.plan.operations[]; .surface == "sender_domain" and .blocked == "sender-domain authentication is not yet a cfctl mutation surface")
+  and any(.plan.operations[]; .surface == "sender_domain" and .preview_command == "cfctl apply sender_domain enable --zone example.com --name example.com --plan" and .blocked == null)
 ' "${unverified_sender_artifact_path}" >/dev/null || die "unverified sender-domain drift contract did not match"
 
 cfctl_output="$(

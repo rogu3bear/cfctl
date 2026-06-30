@@ -464,6 +464,14 @@ def sender_readback_available(sender: dict[str, Any]) -> bool:
     return provider_readback not in {"", "not_available", "unavailable", "unknown"}
 
 
+def sender_domain_enable_plan_command(domain: str) -> str:
+    quoted_domain = shlex.quote(domain)
+    return (
+        "cfctl apply sender_domain enable "
+        f"--zone {quoted_domain} --name {quoted_domain} --plan"
+    )
+
+
 def normalize_sender_mode(mode: str) -> str:
     normalized = (mode or "disabled").lower()
     if normalized in {"cloudflare_first", "cloudflare", "cloudflare_email_service"}:
@@ -757,6 +765,7 @@ def append_sender_checks(
                     "Sender-provider domain is not present in readback",
                     "verified",
                     {"provider": mode, "domains": sender_evidence.get("domains") or []},
+                    sender_domain_enable_plan_command(domain),
                 )
             )
         elif not provider_verified:
@@ -768,6 +777,7 @@ def append_sender_checks(
                     "Sender-provider domain is not verified",
                     "verified",
                     provider_status,
+                    sender_domain_enable_plan_command(domain),
                 )
             )
 
