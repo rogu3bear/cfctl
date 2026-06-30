@@ -1,0 +1,9 @@
+{
+  "match": {
+    "zone": "counterlinkedin.com",
+    "name": "always_use_https"
+  },
+  "body": {
+    "value": "on"
+  }
+}

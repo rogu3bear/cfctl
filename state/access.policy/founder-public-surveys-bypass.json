@@ -1,0 +1,27 @@
+{
+  "match": {
+    "app_id": "ef0898ec-1d46-4515-8326-6a244ea8c54e",
+    "name": "Bypass Everyone"
+  },
+  "intent": {
+    "classification": "intentional_public_carveout_policy",
+    "source_repo": "/Users/star/dev/mln-web",
+    "source_evidence": [
+      "crates/founder/src/server/router/api_routes.rs",
+      "crates/founder/tests/integration_api.rs"
+    ],
+    "rationale": "This bypass is limited to the founder public-surveys Access app so the unauthenticated GET endpoint remains reachable under the otherwise Access-protected founder host."
+  },
+  "body": {
+    "name": "Bypass Everyone",
+    "decision": "bypass",
+    "include": [
+      {
+        "everyone": {}
+      }
+    ],
+    "exclude": [],
+    "require": [],
+    "precedence": 1
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "match": {
+    "zone": "mlnavigator.com",
+    "name": "reply.mlnavigator.com",
+    "type": "TXT"
+  },
+  "body": {
+    "content": "v=spf1 include:_spf.mx.cloudflare.net ~all",
+    "ttl": 300,
+    "proxied": false
+  }
+}

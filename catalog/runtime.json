@@ -1,5 +1,5 @@
 {
-  "version": 8,
+  "version": 9,
   "preferred_entrypoint": "./cfctl",
   "legacy_policy": "shim_then_hide",
   "public_verbs": [
@@ -17,6 +17,7 @@
     "wrangler",
     "cloudflared",
     "hostname",
+    "maildesk-cf",
     "standards",
     "token",
     "list",
@@ -244,14 +245,41 @@
         "type"
       ]
     },
-    "hostname": {
-      "supported": true,
+  "zone.setting": {
+    "supported": true,
+    "sync_supported": true,
+    "state_dir": "state/zone.setting",
+    "match_selectors": [
+      "zone",
+      "id",
+      "name"
+    ]
+  },
+  "security.txt": {
+    "supported": true,
+    "sync_supported": true,
+    "state_dir": "state/security.txt",
+    "match_selectors": [
+      "zone"
+    ]
+  },
+  "hostname": {
+    "supported": true,
       "sync_supported": false,
       "state_dir": "state/hostname",
       "match_selectors": [
         "file",
         "zone",
         "host"
+      ]
+    },
+    "maildesk-cf": {
+      "supported": true,
+      "sync_supported": false,
+      "state_dir": "state/maildesk-cf",
+      "match_selectors": [
+        "file",
+        "domain"
       ]
     },
     "tunnel": {

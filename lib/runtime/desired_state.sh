@@ -251,13 +251,13 @@ cfctl_diff_surface_json() {
         status="missing_actual"
         proposed_operation="create"
       fi
-      desired_body="$(cfctl_prepare_sync_body "${surface}" "${spec_row}")"
+      desired_body="$(cfctl_surface_prepare_sync_body "${surface}" "${spec_row}")"
       actual_subset="null"
       differing_fields='[]'
     elif [[ "${match_count}" != "1" ]]; then
       status="ambiguous_actual"
       proposed_operation="review"
-      desired_body="$(cfctl_prepare_sync_body "${surface}" "${spec_row}")"
+      desired_body="$(cfctl_surface_prepare_sync_body "${surface}" "${spec_row}")"
       actual_subset="null"
       differing_fields='[]'
     else
@@ -270,7 +270,7 @@ cfctl_diff_surface_json() {
         actual_subset="${actual_item}"
         differing_fields='[]'
       else
-        desired_body="$(cfctl_prepare_sync_body "${surface}" "${spec_row}")"
+        desired_body="$(cfctl_surface_prepare_sync_body "${surface}" "${spec_row}")"
         actual_subset="$(cfctl_pick_actual_subset_for_desired "${actual_item}" "${desired_body}")"
         differing_fields="$(
           jq -n \
@@ -418,6 +418,21 @@ cfctl_execute_sync_action() {
         cfctl_run_backend_script "${script_path}" "APPLY=1" "OPERATION=delete" "ZONE_NAME=$(jq -r '.match.zone' <<< "${diff_entry_json}")" "RECORD_ID=$(jq -r '.id' <<< "${actual_item}")"
       else
         cfctl_run_backend_script "${script_path}" "APPLY=1" "OPERATION=upsert" "ZONE_NAME=$(jq -r '.match.zone' <<< "${diff_entry_json}")" "BODY_JSON=${body_json}"
+      fi
+      ;;
+    zone.setting)
+      if [[ "${operation}" == "update" ]]; then
+        cfctl_run_backend_script "${script_path}" "APPLY=1" "OPERATION=set" "ZONE_NAME=$(jq -r '.match.zone' <<< "${diff_entry_json}")" "SETTING_NAME=$(jq -r '.match.name // .match.id' <<< "${diff_entry_json}")" "BODY_JSON=${body_json}"
+      else
+        echo "Desired-state sync for zone.setting only supports updating existing settings" >&2
+        return 1
+      fi
+      ;;
+    security.txt)
+      if [[ "${operation}" == "create" || "${operation}" == "update" ]]; then
+        cfctl_run_backend_script "${script_path}" "APPLY=1" "OPERATION=upsert" "ZONE_NAME=$(jq -r '.match.zone' <<< "${diff_entry_json}")" "BODY_JSON=${body_json}"
+      elif [[ "${operation}" == "delete" ]]; then
+        cfctl_run_backend_script "${script_path}" "APPLY=1" "OPERATION=delete" "ZONE_NAME=$(jq -r '.match.zone' <<< "${diff_entry_json}")"
       fi
       ;;
     tunnel)

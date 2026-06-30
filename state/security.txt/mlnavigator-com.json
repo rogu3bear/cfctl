@@ -1,0 +1,19 @@
+{
+  "intent": {
+    "classification": "public_vulnerability_disclosure_contact",
+    "source_evidence": "/Users/star/dev/open-core-paperwork/SECURITY.md and Google Admin receipts reference security@mlnavigator.com."
+  },
+  "match": {
+    "zone": "mlnavigator.com"
+  },
+  "body": {
+    "enabled": true,
+    "contact": [
+      "mailto:security@mlnavigator.com"
+    ],
+    "canonical": [
+      "https://mlnavigator.com/.well-known/security.txt"
+    ],
+    "preferred_languages": "en"
+  }
+}

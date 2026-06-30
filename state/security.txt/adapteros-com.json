@@ -1,0 +1,22 @@
+{
+  "intent": {
+    "classification": "public_vulnerability_disclosure_contact",
+    "source_evidence": "/Users/star/dev/aos-web/CONTENT.md and /Users/star/dev/aos-web/crates/site/src/pages/security.rs reference security@adapteros.com."
+  },
+  "match": {
+    "zone": "adapteros.com"
+  },
+  "body": {
+    "enabled": true,
+    "contact": [
+      "mailto:security@adapteros.com"
+    ],
+    "canonical": [
+      "https://adapteros.com/.well-known/security.txt"
+    ],
+    "policy": [
+      "https://adapteros.com/security"
+    ],
+    "preferred_languages": "en"
+  }
+}

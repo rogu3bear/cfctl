@@ -1,0 +1,17 @@
+{
+  "match": {
+    "zone": "leakbar.com",
+    "name": "security_header"
+  },
+  "body": {
+    "value": {
+      "strict_transport_security": {
+        "enabled": true,
+        "max_age": 31536000,
+        "include_subdomains": true,
+        "preload": false,
+        "nosniff": true
+      }
+    }
+  }
+}

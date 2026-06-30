@@ -587,6 +587,32 @@ def discover_configs(root: Path, config_names, exclude_tokens):
     return sorted(set(files))
 
 
+def source_context_for_path(path: Path, noncanonical_tokens):
+    normalized = path.as_posix()
+    for entry in noncanonical_tokens:
+        if isinstance(entry, str):
+            token = entry
+            authority = "noncanonical"
+            reason = "path matched a noncanonical audit token"
+        else:
+            token = entry.get("token") or ""
+            authority = entry.get("authority") or "noncanonical"
+            reason = entry.get("reason") or "path matched a noncanonical audit token"
+        if token and token in normalized:
+            return {
+                "authority": authority,
+                "canonical": False,
+                "matched_token": token,
+                "reason": reason,
+            }
+    return {
+        "authority": "canonical",
+        "canonical": True,
+        "matched_token": None,
+        "reason": "no noncanonical audit token matched",
+    }
+
+
 def standards_feature_map(standards: dict):
     mapping = defaultdict(list)
     for surface, meta in (standards.get("surfaces") or {}).items():
@@ -667,6 +693,70 @@ def summarize_compatibility_date_freshness(files_json, freshness_policy: dict):
     }
 
 
+def summarize_source_context(files_json, freshness_policy: dict):
+    authority_counts = Counter()
+    canonical_finding_counts = Counter()
+    noncanonical_finding_counts = Counter()
+    canonical_files = []
+    noncanonical_files = []
+
+    for item in files_json:
+        context = item.get("source_context") or {}
+        authority = context.get("authority") or "unknown"
+        authority_counts[authority] += 1
+        if context.get("canonical") is False:
+            noncanonical_files.append(
+                {
+                    "path": item["path"],
+                    "authority": authority,
+                    "reason": context.get("reason"),
+                }
+            )
+            target_counter = noncanonical_finding_counts
+        else:
+            canonical_files.append(item["path"])
+            target_counter = canonical_finding_counts
+
+        for finding in item.get("findings") or []:
+            target_counter[finding["level"]] += 1
+
+    canonical_items = [
+        item
+        for item in files_json
+        if (item.get("source_context") or {}).get("canonical") is not False
+    ]
+    noncanonical_items = [
+        item
+        for item in files_json
+        if (item.get("source_context") or {}).get("canonical") is False
+    ]
+
+    return {
+        "authority_counts": dict(sorted(authority_counts.items())),
+        "canonical_config_file_count": len(canonical_items),
+        "noncanonical_config_file_count": len(noncanonical_items),
+        "canonical_findings_summary": {
+            "warning_count": canonical_finding_counts.get("warning", 0),
+            "note_count": canonical_finding_counts.get("note", 0),
+            "error_count": canonical_finding_counts.get("error", 0),
+        },
+        "noncanonical_findings_summary": {
+            "warning_count": noncanonical_finding_counts.get("warning", 0),
+            "note_count": noncanonical_finding_counts.get("note", 0),
+            "error_count": noncanonical_finding_counts.get("error", 0),
+        },
+        "canonical_compatibility_date_freshness": summarize_compatibility_date_freshness(
+            canonical_items,
+            freshness_policy,
+        ),
+        "noncanonical_compatibility_date_freshness": summarize_compatibility_date_freshness(
+            noncanonical_items,
+            freshness_policy,
+        ),
+        "noncanonical_files": noncanonical_files,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -682,6 +772,7 @@ def main():
     audit_meta = standards.get("audit") or {}
     config_names = audit_meta.get("config_names") or ["wrangler.toml", "wrangler.jsonc"]
     exclude_tokens = audit_meta.get("exclude_path_tokens") or []
+    noncanonical_tokens = audit_meta.get("noncanonical_path_tokens") or []
     compatibility_freshness_policy = audit_meta.get("compatibility_date_freshness") or {}
 
     files = discover_configs(root, config_names, exclude_tokens)
@@ -719,6 +810,7 @@ def main():
                 "path": path.as_posix(),
                 "format": fmt,
                 "project_type": kind,
+                "source_context": source_context_for_path(path, noncanonical_tokens),
                 "name": config.get("name"),
                 "features": sorted(features),
                 "standards": sorted(applicable_standards),
@@ -743,6 +835,10 @@ def main():
         "project_type_counts": dict(project_type_counts),
         "feature_counts": dict(sorted(feature_counts.items())),
         "compatibility_date_freshness": summarize_compatibility_date_freshness(
+            files_json,
+            compatibility_freshness_policy,
+        ),
+        "source_context_summary": summarize_source_context(
             files_json,
             compatibility_freshness_policy,
         ),

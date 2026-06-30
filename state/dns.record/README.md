@@ -22,3 +22,6 @@ Recommended match keys:
 - `zone`
 - `id`
 - `name` with `type`
+
+Managed specs:
+- `mlnavigator-reply-spf.json`: Cloudflare Email Routing SPF for `reply.mlnavigator.com`.

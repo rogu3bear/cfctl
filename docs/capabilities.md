@@ -25,6 +25,7 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | `pages.secret` | yes | yes | yes | yes | no | `-` | `-` | `-` |
 | `queue` | yes | yes | no | yes | no | `-` | `-` | `-` |
 | `r2.bucket` | yes | yes | no | yes | no | `-` | `-` | `-` |
+| `security.txt` | yes | yes | yes | yes | yes | `security.txt` | `security-center-securitytxt, api-auth` | `security_txt` |
 | `tunnel` | yes | yes | yes | yes | yes | `tunnel` | `api-auth` | `tunnel` |
 | `turnstile.widget` | yes | yes | yes | yes | no | `-` | `-` | `-` |
 | `vulnerability_scanner.credential_set` | yes | yes | no | yes | no | `-` | `api-shield-vulnerability-scanner, api-auth` | `-` |
@@ -37,6 +38,7 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | `workflow` | yes | yes | no | yes | no | `-` | `-` | `-` |
 | `zone` | yes | yes | no | yes | no | `-` | `-` | `-` |
 | `zone.ruleset` | yes | yes | yes | yes | no | `-` | `ruleset-engine, api-auth` | `-` |
+| `zone.setting` | yes | yes | yes | yes | yes | `zone.setting` | `ssl-tls, api-auth` | `zone_setting` |
 
 ## Operation Contract Matrix
 
@@ -72,6 +74,9 @@ This matrix is derived from the same catalogs used by `cfctl explain`, `cfctl cl
 | `logpush.job` | `validate-ownership` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |
 | `pages.secret` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: project, name |
 | `pages.secret` | `upsert` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: project, name |
+| `security.txt` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: zone |
+| `security.txt` | `upsert` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: zone |
+| `security.txt` | `sync` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | state match: zone |
 | `tunnel` | `cleanup-connections` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: id |
 | `tunnel` | `configure` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: id |
 | `tunnel` | `create` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |
@@ -92,6 +97,8 @@ This matrix is derived from the same catalogs used by `cfctl explain`, `cfctl cl
 | `worker.secret` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: script, name |
 | `worker.secret` | `upsert` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: script, name |
 | `zone.ruleset` | `update` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: zone, id |
+| `zone.setting` | `set` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: zone, name |
+| `zone.setting` | `sync` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | state match: zone, id, name |
 
 ## Read-Only Surfaces
 
@@ -118,6 +125,12 @@ Composite lifecycle commands:
 - `cfctl hostname diff --file state/hostname/<name>.yaml`
 - `cfctl hostname plan --file state/hostname/<name>.yaml`
 - `cfctl hostname apply --file state/hostname/<name>.yaml` is intentionally blocked until component mutations are preview-gated.
+- `cfctl maildesk-cf init --domain example.com` emits a starter desired-state template without mutating Cloudflare.
+- `cfctl maildesk-cf verify --file state/maildesk-cf/<name>.json`
+- `cfctl maildesk-cf snapshot --file state/maildesk-cf/<name>.json`
+- `cfctl maildesk-cf diff --file state/maildesk-cf/<name>.json`
+- `cfctl maildesk-cf provision --file state/maildesk-cf/<name>.json --plan` emits a preview operation id and proposed component operations.
+- `cfctl maildesk-cf provision --file state/maildesk-cf/<name>.json --ack-plan <operation-id>` is intentionally blocked until component mutations are preview-gated.
 
 Ownership authority commands:
 - `cfctl ownership list`

@@ -73,8 +73,10 @@ cfctl explain access.app
 cfctl list access.login_method
 cfctl classify dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT
 cfctl guide dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120
+cfctl guide zone.setting set --zone example.com --name ssl --content strict
 cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
 cfctl hostname verify --file state/hostname/example.yaml
+cfctl maildesk-cf verify --file state/maildesk-cf/example.json
 ```
 
 Before choosing a write path, scan [docs/capabilities.md](docs/capabilities.md).
@@ -95,7 +97,9 @@ cfctl list pages.project
 cfctl list access.login_method
 cfctl get access.app --domain docs.example.org
 cfctl list edge.certificate --zone example.com
+cfctl list zone.setting --zone example.com
 cfctl list worker.route --zone example.com
+cfctl maildesk-cf snapshot --file state/maildesk-cf/example.json
 cfctl list api_gateway.operation --zone example.com
 cfctl list api_gateway.schema --zone example.com
 cfctl list vulnerability_scanner.scan
@@ -107,8 +111,12 @@ Useful safe write plans:
 ```bash
 cfctl apply access.policy create --app-id <app-id> --body-file policy.json --plan
 CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-type onetimepin --plan
+cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
+CF_TOKEN_LANE=global cfctl apply zone.setting set --zone example.com --name ssl --content strict --plan
+CF_TOKEN_LANE=global cfctl apply zone.setting set --zone example.com --name always_use_https --content on --plan
 CF_TOKEN_LANE=global cfctl apply dns.record sync --zone example.com --plan
+CF_TOKEN_LANE=global cfctl apply zone.setting sync --zone example.com --plan
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --ack-plan <operation-id>
 CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
 ```
@@ -149,6 +157,20 @@ cfctl hostname plan --file state/hostname/example.yaml
 
 This tranche is read-only. `hostname plan` emits proposed component operations, but composite `hostname apply` is blocked until each component write path is present as a preview-gated public surface.
 
+## maildesk-cf lifecycle
+
+Use `cfctl maildesk-cf verify|snapshot|diff|plan|provision --plan` with JSON specs under [state/maildesk-cf](state/maildesk-cf) when a maildesk deployment needs Email Routing aliases, Workers, D1, R2, Queues, DNS sender authentication, and outbound identity readiness checked together.
+
+```bash
+cfctl maildesk-cf init --domain example.com
+cfctl maildesk-cf verify --file state/maildesk-cf/example.json
+cfctl maildesk-cf snapshot --file state/maildesk-cf/example.json
+cfctl maildesk-cf diff --file state/maildesk-cf/example.json
+cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
+```
+
+`maildesk-cf provision --plan` emits a local operation id and proposed component operations. `maildesk-cf provision --ack-plan <operation-id>` is blocked until those component writes are each available through preview-gated public `cfctl` surfaces. The verifier does not perform broad live sends; sender readiness comes from DNS/authentication and provider readback evidence unless a human explicitly asks for targeted delivery proof.
+
 Token minting:
 
 ```bash
@@ -165,8 +187,8 @@ Defined in [catalog/runtime.json](catalog/runtime.json):
 
 ```
 doctor    audit     admin     bootstrap lanes     surfaces  docs      previews  locks
-env       ownership wrangler  cloudflared standards token   list      get       can
-classify  guide     apply     verify    explain   snapshot  diff
+env       ownership wrangler  cloudflared hostname  maildesk-cf standards token list
+get       can       classify  guide      apply     verify    explain snapshot diff
 ```
 
 Bootstrap permission profiles are defined in [catalog/permissions.json](catalog/permissions.json).
@@ -204,16 +226,14 @@ adds a live drift check by comparing the catalog against Cloudflare's current
 permission-group inventory. For a credentialless runtime-output check, run
 `python3 scripts/verify_permission_catalog.py --cfctl ./cfctl`.
 
-The GitHub Actions workflow in [.github/workflows/cfctl-contract.yml](.github/workflows/cfctl-contract.yml)
-runs static contract checks on pull requests. Its scheduled and manual live
-job runs through the `cfctl-live` protected environment and requires
-`CF_DEV_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CFCTL_PUBLIC_CONTRACT_ZONE`, then
-runs the live permission-group drift and public-contract smoke tests. The
+Remote CI is intentionally absent from this checkout. Use
+[LOCAL_CI.md](LOCAL_CI.md) for the local contract gate. Live permission-group
+drift and public-contract smoke tests require local operator credentials:
+`CF_DEV_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CFCTL_PUBLIC_CONTRACT_ZONE`. The
 selected token lane must be able to operate on `CFCTL_PUBLIC_CONTRACT_ZONE`; run
 local smoke tests with an explicit lane when the default lane cannot see that
 zone, such as `CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com
-./scripts/verify_public_contract.sh`. The
-operator policy for these credentials is in
+./scripts/verify_public_contract.sh`. The operator policy for these credentials is in
 [docs/permission-doctrine.md](docs/permission-doctrine.md).
 
 See [docs/runbooks/cfctl.md](docs/runbooks/cfctl.md) and [docs/capabilities.md](docs/capabilities.md) for the full reference. `docs/capabilities.md` is generated from the catalogs and is the fastest way to see which surfaces are read-only, which operations are preview-gated, which destructive operations require confirmation, and which surfaces support desired-state sync.
@@ -227,7 +247,7 @@ lib/runtime/       - auth, result envelopes, lanes, desired-state helpers
 lib/backends/      - backend wrappers
 lib/surfaces/      - runtime catalog access and surface metadata
 catalog/           - surface registry, runtime policy, standards, doc bank
-state/             - selective desired-state specs plus ownership and hostname lifecycle registries
+state/             - selective desired-state specs plus ownership, hostname, and maildesk-cf lifecycle registries
 compat/            - legacy script -> cfctl mapping
 legacy/            - older workflows kept for reference
 scripts/           - inventory, mutation, wrangler/cloudflared wrappers, email-routing helpers
@@ -240,7 +260,7 @@ var/logs/          - command logs (gitignored)
 
 Desired state is selective, not universal — it exists where repeated drift justifies `diff` and `sync`, not as a blanket declarative layer.
 
-Currently supported: `access.app`, `access.policy`, `dns.record`, `hostname` verify/diff/plan, `tunnel`.
+Currently supported: `access.app`, `access.policy`, `dns.record`, `zone.setting`, `security.txt`, `hostname` verify/diff/plan, `maildesk-cf` verify/snapshot/diff/plan/provision-plan, `tunnel`.
 
 Use:
 
@@ -283,7 +303,7 @@ cfctl admin revoke-backend --path <authorization-path>
 
 ## Source Config Vs Live State
 
-`cfctl standards audit` performs checked-in Wrangler config alignment, including `compatibility_date` freshness — it finds missing or stale `compatibility_date`, missing observability, plaintext secret-like vars, binding shape drift. **It does not inspect the Cloudflare dashboard.** For live assertions, use `cfctl list`, `cfctl get`, `cfctl snapshot`, `cfctl can`, or `cfctl verify` and cite the emitted artifact.
+`cfctl standards audit` performs checked-in Wrangler config alignment, including `compatibility_date` freshness — it finds missing or stale `compatibility_date`, missing observability, plaintext secret-like vars, binding shape drift. Workspace-wide scans also classify source authority so canonical repo config can be separated from worktree, dry-run deploy, and baseline-copy config without hiding those files. **It does not inspect the Cloudflare dashboard.** For live assertions, use `cfctl list`, `cfctl get`, `cfctl snapshot`, `cfctl can`, or `cfctl verify` and cite the emitted artifact.
 
 ## Compatibility
 

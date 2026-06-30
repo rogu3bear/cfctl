@@ -1,0 +1,16 @@
+{
+  "match": {
+    "domain": "survey.mlnavigator.com"
+  },
+  "intent": {
+    "classification": "retire_legacy_public_surface",
+    "source_repo": "/Users/star/dev/mln-web",
+    "source_evidence": [
+      "AGENTS.md",
+      "cloudflare-surfaces.toml",
+      "crates/founder/src/pages/admin/surveys/builder.rs"
+    ],
+    "rationale": "The legacy survey Pages custom domain is deprecated, is not controlled as the current live share target, and app code points operators to the live funding contact intake instead."
+  },
+  "delete": true
+}

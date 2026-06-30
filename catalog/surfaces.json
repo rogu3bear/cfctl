@@ -83,6 +83,104 @@
         "./cfctl apply zone.ruleset update --zone example.com --id <ruleset-id> --body-file /secure/ruleset.json --ack-plan <operation-id>"
       ]
     },
+    "zone.setting": {
+      "description": "Zone-level Cloudflare settings such as SSL mode, Always Use HTTPS, HSTS, minimum TLS version, TLS 1.3, and Automatic HTTPS Rewrites.",
+      "module": "zone_setting",
+      "standards_ref": "zone.setting",
+      "docs_topics": ["ssl-tls", "api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_zone_settings.sh",
+      "apply_script": "scripts/cf_mutate_zone_setting.sh",
+      "permission_family": "Zone Settings",
+      "selectors": ["zone", "id", "name"],
+      "actions": {
+        "list": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "get": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "required_selectors": ["zone"],
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "set": {
+              "risk": "write",
+              "required_selectors": ["zone", "name"]
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list zone.setting --zone example.com",
+        "./cfctl get zone.setting --zone example.com --name ssl",
+        "./cfctl apply zone.setting set --zone example.com --name ssl --content strict --plan",
+        "./cfctl apply zone.setting set --zone example.com --name security_header --body '{\"value\":{\"strict_transport_security\":{\"enabled\":true,\"max_age\":31536000,\"include_subdomains\":true,\"preload\":false,\"nosniff\":true}}}' --plan"
+      ]
+    },
+    "security.txt": {
+      "description": "Zone-managed /.well-known/security.txt configuration from Cloudflare Security Center.",
+      "module": "security_txt",
+      "standards_ref": "security.txt",
+      "docs_topics": ["security-center-securitytxt", "api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_security_txt.sh",
+      "apply_script": "scripts/cf_mutate_security_txt.sh",
+      "permission_family": "Zone Settings",
+      "probe": {
+        "method": "GET",
+        "path_template": "/zones/{zone_id}/security-center/securitytxt"
+      },
+      "selectors": ["zone"],
+      "actions": {
+        "list": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "get": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "verify": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "can": {
+          "supported": true,
+          "required_selectors": ["zone"]
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "upsert": {
+              "risk": "write",
+              "required_selectors": ["zone"]
+            },
+            "delete": {
+              "risk": "destructive",
+              "required_selectors": ["zone"],
+              "confirm": "delete"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl get security.txt --zone example.com",
+        "./cfctl apply security.txt upsert --zone example.com --body '{\"enabled\":true,\"contact\":[\"mailto:security@example.com\"],\"canonical\":[\"https://example.com/.well-known/security.txt\"],\"preferred_languages\":\"en\"}' --plan",
+        "./cfctl apply security.txt sync --zone example.com --plan"
+      ]
+    },
     "audit.log": {
       "description": "Account Audit Logs v2 events for the pinned account.",
       "backend": "inventory_script",
