@@ -322,8 +322,8 @@ def validate_command_fixtures(catalog: dict) -> list[dict]:
             "expected": (
             "cfctl token mint --name 'cfctl-deploy-operator' --permission 'Account Settings Read' "
             "--permission 'D1 Metadata Read' --permission 'D1 Read' --permission 'D1 Write' "
-            "--permission 'Pages Read' --permission 'Pages Write' --permission 'Queues Read' "
-            "--permission 'Queues Write' --permission 'Workers R2 Storage Read' "
+            "--permission 'Email Sending Read' --permission 'Pages Read' --permission 'Pages Write' "
+            "--permission 'Queues Read' --permission 'Queues Write' --permission 'Workers R2 Storage Read' "
             "--permission 'Workers R2 Storage Write' --permission 'Workers Routes Read' "
             "--permission 'Workers Routes Write' --permission 'Workers Scripts Read' "
             "--permission 'Workers Scripts Write' --permission 'Zone Read' "

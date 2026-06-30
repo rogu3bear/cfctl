@@ -256,16 +256,31 @@ def load_fixture_evidence(path: Path, domains: list[dict[str, Any]]) -> dict[str
 
 
 def collect_live_evidence(domains: list[dict[str, Any]]) -> dict[str, Any]:
+    sender_domains: list[dict[str, Any]] = []
+    sender_errors: dict[str, Any] = {}
     evidence: dict[str, Any] = {
         "worker.script": run_cfctl(["list", "worker.script"]),
         "d1.database": run_cfctl(["list", "d1.database"]),
         "r2.bucket": run_cfctl(["list", "r2.bucket"]),
         "queue": run_cfctl(["list", "queue"]),
         "domains": {},
-        "sender": {"provider_readback": "not_available"},
+        "sender": {
+            "provider": "cloudflare_email_service",
+            "domains": sender_domains,
+            "errors": sender_errors,
+        },
     }
     for domain_spec in domains:
         domain = str(domain_spec.get("name") or "")
+        sender_payload = run_cfctl(["list", "sender_domain", "--zone", domain], lane="global")
+        if sender_payload.get("ok") is True:
+            sender_domains.extend(items(sender_payload))
+        else:
+            sender_errors[domain] = {
+                "command": sender_payload.get("_command"),
+                "error": sender_payload.get("error"),
+                "returncode": sender_payload.get("_returncode"),
+            }
         evidence["domains"][domain] = {
             "email.routing_rule": run_cfctl(["list", "email.routing_rule", "--zone", domain], lane="global"),
             "email.routing": {},
@@ -440,6 +455,13 @@ def sender_domain_status(sender: dict[str, Any], domain: str) -> dict[str, Any] 
             if isinstance(item, dict) and str(item.get("domain") or item.get("name") or "") == domain:
                 return item
     return None
+
+
+def sender_readback_available(sender: dict[str, Any]) -> bool:
+    if "domains" in sender or "authenticated_domains" in sender:
+        return True
+    provider_readback = str(sender.get("provider_readback") or "").lower()
+    return provider_readback not in {"", "not_available", "unavailable", "unknown"}
 
 
 def normalize_sender_mode(mode: str) -> str:
@@ -715,7 +737,7 @@ def append_sender_checks(
                     [dns_name(record) for record in dns_items],
                 )
             )
-        if domain_status is None:
+        if domain_status is None and not sender_readback_available(sender_evidence):
             drifts.append(
                 drift(
                     "provider_status_unavailable",
@@ -724,6 +746,17 @@ def append_sender_checks(
                     "Sender-provider domain status readback is not available",
                     {"provider": mode, "domain": domain},
                     None,
+                )
+            )
+        elif domain_status is None:
+            drifts.append(
+                drift(
+                    "sender_domain_drift",
+                    "error",
+                    f"sender_domain:{domain}",
+                    "Sender-provider domain is not present in readback",
+                    "verified",
+                    {"provider": mode, "domains": sender_evidence.get("domains") or []},
                 )
             )
         elif not provider_verified:
@@ -811,7 +844,9 @@ def planned_operations(drifts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             operation["blocked"] = "resource creation must use the owning primitive cfctl surface or app deploy lane"
         elif drift_class == "wrong_binding":
             operation["blocked"] = "Worker bindings are owned by the app repo config and deploy lane"
-        elif drift_class in {"dns_authentication_drift", "sender_domain_drift", "provider_status_unavailable"}:
+        elif drift_class == "sender_domain_drift":
+            operation["blocked"] = "sender-domain authentication is not yet a cfctl mutation surface"
+        elif drift_class in {"dns_authentication_drift", "provider_status_unavailable"}:
             operation["blocked"] = "sender-domain authentication/provider readback is not yet a cfctl mutation surface"
         elif drift_class == "policy_config_drift":
             operation["blocked"] = "policy config is owned by the app repo"

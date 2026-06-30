@@ -9,9 +9,10 @@ die() {
   exit 1
 }
 
-fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-fixture.XXXXXX.json")"
-missing_fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-missing-fixture.XXXXXX.json")"
-trap 'rm -f "${fixture_file}" "${missing_fixture_file}"' EXIT
+fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-fixture.XXXXXX")"
+missing_fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-missing-fixture.XXXXXX")"
+unverified_sender_fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-unverified-sender.XXXXXX")"
+trap 'rm -f "${fixture_file}" "${missing_fixture_file}" "${unverified_sender_fixture_file}"' EXIT
 
 cat >"${fixture_file}" <<'JSON'
 {
@@ -52,7 +53,9 @@ cat >"${fixture_file}" <<'JSON'
     }
   },
   "sender": {
-    "provider_readback": "not_available"
+    "domains": [
+      {"domain": "example.com", "name": "example.com", "status": "verified", "enabled": true}
+    ]
   }
 }
 JSON
@@ -76,6 +79,51 @@ cat >"${missing_fixture_file}" <<'JSON'
 }
 JSON
 
+cat >"${unverified_sender_fixture_file}" <<'JSON'
+{
+  "workers": [
+    {"id": "maildesk-cf"},
+    {"id": "maildesk-cf-router"}
+  ],
+  "d1": [
+    {"name": "maildesk-cf-db"},
+    {"name": "maildesk-cf-preview-db"}
+  ],
+  "r2": [
+    {"name": "maildesk-cf-raw-mail"},
+    {"name": "maildesk-cf-raw-mail-preview"}
+  ],
+  "queues": [
+    {"queue_name": "maildesk-cf-jobs"}
+  ],
+  "domains": {
+    "example.com": {
+      "email_routing": {"enabled": true},
+      "email_routing_rules": [
+        {"recipient": "abuse@example.com", "service": "maildesk-cf-router"},
+        {"recipient": "dmarc@example.com", "service": "maildesk-cf-router"},
+        {"recipient": "founders@example.com", "service": "maildesk-cf-router"},
+        {"recipient": "info@example.com", "service": "maildesk-cf-router"},
+        {"recipient": "legal@example.com", "service": "maildesk-cf-router"},
+        {"recipient": "noreply@example.com", "service": "maildesk-cf-router"},
+        {"recipient": "postmaster@example.com", "service": "maildesk-cf-router"},
+        {"recipient": "security@example.com", "service": "maildesk-cf-router"},
+        {"recipient": "operator-a@example.com", "service": "maildesk-cf-router"},
+        {"recipient": "operator-b@example.com", "service": "maildesk-cf-router"}
+      ],
+      "dns_records": [
+        {"type": "TXT", "name": "example.com", "content": "v=spf1 include:_spf.mx.cloudflare.net ~all"},
+        {"type": "TXT", "name": "_dmarc.example.com", "content": "v=DMARC1; p=none; rua=mailto:dmarc@example.com"}
+      ]
+    }
+  },
+  "sender": {
+    "provider": "cloudflare_email_service",
+    "domains": []
+  }
+}
+JSON
+
 output="$(
   MAILDESK_CF_EVIDENCE_FILE="${fixture_file}" \
   MAILDESK_CF_ACTION=verify \
@@ -89,10 +137,10 @@ jq -e '
   .readiness.template_ready == true
   and .readiness.instance_ready == true
   and .readiness.edge_ready == true
-  and .readiness.mail_ready == false
-  and (.drift_classes | index("provider_status_unavailable")) != null
+  and .readiness.mail_ready == true
+  and (.drift_classes | index("provider_status_unavailable")) == null
   and (.drift_classes | index("optional_live_send_not_requested")) != null
-  and (.plan.operations | length) == 1
+  and (.plan.operations | length) == 0
 ' "${artifact_path}" >/dev/null || die "fixture readiness contract did not match"
 
 missing_output="$(
@@ -116,6 +164,23 @@ jq -e '
   and any(.plan.operations[]; .surface == "queue" and .preview_command == "cfctl wrangler queues create maildesk-cf-jobs --plan" and .blocked == null)
 ' "${missing_artifact_path}" >/dev/null || die "missing-resource drift classes did not match"
 
+unverified_sender_output="$(
+  MAILDESK_CF_EVIDENCE_FILE="${unverified_sender_fixture_file}" \
+  MAILDESK_CF_ACTION=verify \
+  SPEC_FILE="${ROOT_DIR}/state/maildesk-cf/example.json" \
+  python3 "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
+)"
+unverified_sender_artifact_path="$(printf '%s\n' "${unverified_sender_output}" | tail -n 1)"
+[[ -f "${unverified_sender_artifact_path}" ]] || die "unverified-sender artifact was not written"
+
+jq -e '
+  .readiness.edge_ready == true
+  and .readiness.mail_ready == false
+  and (.drift_classes | index("sender_domain_drift")) != null
+  and (.drift_classes | index("provider_status_unavailable")) == null
+  and any(.plan.operations[]; .surface == "sender_domain" and .blocked == "sender-domain authentication is not yet a cfctl mutation surface")
+' "${unverified_sender_artifact_path}" >/dev/null || die "unverified sender-domain drift contract did not match"
+
 cfctl_output="$(
   MAILDESK_CF_EVIDENCE_FILE="${fixture_file}" \
   "${ROOT_DIR}/cfctl" maildesk-cf provision --file "${ROOT_DIR}/state/maildesk-cf/example.json" --plan
@@ -128,7 +193,7 @@ jq -e '
   and .operation == "provision"
   and .summary.plan_mode == true
   and .summary.edge_ready == true
-  and .summary.mail_ready == false
+  and .summary.mail_ready == true
 ' <<< "${cfctl_output}" >/dev/null || die "cfctl provision --plan envelope did not match"
 
 standards_output="$("${ROOT_DIR}/cfctl" standards maildesk-cf)"

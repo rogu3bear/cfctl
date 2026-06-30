@@ -27,6 +27,7 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | `queue` | yes | yes | no | yes | no | `-` | `-` | `-` |
 | `r2.bucket` | yes | yes | no | yes | no | `-` | `-` | `-` |
 | `security.txt` | yes | yes | yes | yes | yes | `security.txt` | `security-center-securitytxt, api-auth` | `security_txt` |
+| `sender_domain` | yes | yes | no | yes | no | `-` | `-` | `-` |
 | `tunnel` | yes | yes | yes | yes | yes | `tunnel` | `api-auth` | `tunnel` |
 | `turnstile.widget` | yes | yes | yes | yes | no | `-` | `-` | `-` |
 | `vulnerability_scanner.credential_set` | yes | yes | no | yes | no | `-` | `api-shield-vulnerability-scanner, api-auth` | `-` |
@@ -115,6 +116,7 @@ These surfaces are first-class read surfaces but do not expose `apply` or desire
 | `pages.project` | `list`, `get`, `verify`, `can` | - | `scripts/cf_inventory_pages.sh` |
 | `queue` | `list`, `get`, `verify`, `can` | - | `scripts/cf_inventory_queues.sh` |
 | `r2.bucket` | `list`, `get`, `verify`, `can` | - | `scripts/cf_inventory_r2.sh` |
+| `sender_domain` | `list`, `get`, `verify`, `can` | required: zone | `scripts/cf_inventory_sender_domains.sh` |
 | `vulnerability_scanner.credential_set` | `list`, `get`, `verify`, `can` | - | `scripts/cf_inventory_vulnerability_scanner.sh` |
 | `vulnerability_scanner.scan` | `list`, `get`, `verify`, `can` | - | `scripts/cf_inventory_vulnerability_scanner.sh` |
 | `vulnerability_scanner.target_environment` | `list`, `get`, `verify`, `can` | - | `scripts/cf_inventory_vulnerability_scanner.sh` |
