@@ -285,13 +285,13 @@
     },
     {
       "name": "Email Sending Read",
-      "scope": "zone",
+      "scope": "account",
       "surfaces": ["sender_domain"],
       "profiles": ["read", "deploy", "full-operator"]
     },
     {
       "name": "Email Sending Write",
-      "scope": "zone",
+      "scope": "account",
       "surfaces": ["sender_domain"],
       "profiles": ["deploy", "full-operator"]
     },
