@@ -222,6 +222,72 @@ jq -e '
   and .permission_status.selector_readiness.ready == true
 ' <<< "${can_upsert_bootstrap_json}" >/dev/null || die "can no-auth upsert posture assertion failed"
 
+email_routing_zone_guidance_json="$(
+  ROOT_DIR="${ROOT_DIR}" bash <<'BASH'
+set -euo pipefail
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/lib/runtime/cfctl.sh"
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/commands/cfctl.sh"
+
+cfctl_compare_permission_all_lanes() {
+  jq -n '
+    {
+      active_lane: "dev",
+      lanes: [
+        {
+          lane: "dev",
+          available: true,
+          permission: {
+            state: "unknown",
+            basis: "zone_resolution_failed",
+            errors: [],
+            request: null,
+            status_code: null,
+            permission_family: "Email Routing Write"
+          }
+        },
+        {
+          lane: "global",
+          available: true,
+          permission: {
+            state: "allowed",
+            basis: "surface_read_probe",
+            errors: [],
+            request: {},
+            status_code: 200,
+            permission_family: "Email Routing Write"
+          }
+        }
+      ],
+      summary: {
+        allowed_lanes: ["global"],
+        denied_lanes: [],
+        unknown_lanes: ["dev"]
+      }
+    }
+  '
+}
+
+cfctl_reset_flags
+CF_ACTIVE_TOKEN_LANE="dev"
+CFCTL_ZONE_NAME="example.com"
+CFCTL_NAME="role@example.com"
+CFCTL_SERVICE="maildesk-cf-router"
+permission_json='{"state":"unknown","basis":"zone_resolution_failed","errors":[],"request":null,"status_code":null,"permission_family":"Email Routing Write"}'
+cfctl_failure_guidance_json "apply" "email.routing_rule" "mutation_script" "${permission_json}" "execution_failed" "Mutation backend returned a failure" "upsert"
+BASH
+)"
+jq -e '
+  .recommended_lane == "global"
+  and (.next_step | type == "string" and contains("zone"))
+  and (.recommended_command | startswith("CF_TOKEN_LANE=global cfctl apply email.routing_rule upsert "))
+  and (.recommended_command | contains("--zone example.com"))
+  and (.recommended_command | contains("--name role@example.com"))
+  and (.recommended_command | contains("--service maildesk-cf-router"))
+  and (.recommended_command | contains("--plan"))
+' <<< "${email_routing_zone_guidance_json}" >/dev/null || die "email routing zone resolution lane guidance assertion failed"
+
 assert_jq_file "permission profile minimality policy" '
   .profiles.read.allowed_surfaces != null
   and (.profiles.read.allowed_surfaces | index("audit.log")) != null
