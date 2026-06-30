@@ -512,6 +512,33 @@
         "./cfctl apply email.routing_rule upsert --zone example.com --name founders@example.com --service maildesk-cf-router --ack-plan <operation-id>"
       ]
     },
+    "maildesk-cf": {
+      "description": "Composite maildesk-cf lifecycle readiness across Email Routing aliases, Workers, D1, R2, Queues, sender authentication, and outbound identity evidence.",
+      "standards_ref": "maildesk-cf",
+      "docs_topics": ["email-routing", "email-workers", "d1", "r2", "queues", "api-auth"],
+      "backend": "maildesk_cf_lifecycle",
+      "permission_family": "Maildesk lifecycle",
+      "selectors": ["file", "domain"],
+      "actions": {
+        "provision": {
+          "supported": true,
+          "risk": "write",
+          "preview_required": true,
+          "verification_required": true,
+          "required_selectors": ["file"],
+          "public_example": "cfctl maildesk-cf provision --file state/maildesk-cf/<name>.json --plan",
+          "troubleshooting_hint": "Composite provision apply remains blocked until each component write is available through preview-gated public cfctl surfaces."
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl maildesk-cf verify --file state/maildesk-cf/example.json",
+        "./cfctl maildesk-cf diff --file state/maildesk-cf/example.json",
+        "./cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan"
+      ]
+    },
     "d1.database": {
       "description": "D1 databases visible to the current account token.",
       "backend": "inventory_script",

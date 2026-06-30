@@ -228,6 +228,40 @@
         "cfctl hostname plan --file state/hostname/<name>.yaml"
       ]
     },
+    "maildesk-cf": {
+      "stance": "composite maildesk lifecycle evidence before provisioning",
+      "standards": [
+        {
+          "id": "maildesk-cf.state-owns-complete-path",
+          "level": "required",
+          "title": "One spec owns the maildesk path",
+          "summary": "A maildesk lifecycle spec should declare domains, role aliases, personal aliases, Workers, D1, R2, Queues, sender authentication, and outbound policy together."
+        },
+        {
+          "id": "maildesk-cf.verify-before-provision",
+          "level": "required",
+          "title": "Verify every dependency before planning provisioning",
+          "summary": "Maildesk readiness must prove template validation, instance policy, Worker/storage bindings, Email Routing aliases, sender authentication, provider status, and outbound proof posture with evidence artifacts."
+        },
+        {
+          "id": "maildesk-cf.component-writes-preview-gated",
+          "level": "required",
+          "title": "Do not composite-apply before component writes are gated",
+          "summary": "Composite provisioning must remain plan-only until Worker, D1, R2, Queue, Email Routing, DNS authentication, and sender-provider operations are each available through preview-gated public cfctl surfaces."
+        },
+        {
+          "id": "maildesk-cf.targeted-mail-proof-only",
+          "level": "recommended",
+          "title": "Avoid broad live mail smoke tests",
+          "summary": "Prefer configuration checks, provider state reads, and single targeted probes. Live delivery proof should be explicit, bounded, and never substitute for routing/audit readiness."
+        }
+      ],
+      "evidence": [
+        "cfctl maildesk-cf verify --file state/maildesk-cf/<name>.json",
+        "cfctl maildesk-cf diff --file state/maildesk-cf/<name>.json",
+        "cfctl maildesk-cf provision --file state/maildesk-cf/<name>.json --plan"
+      ]
+    },
     "dns.record": {
       "stance": "desired-state preferred for repeated, platform, and routing-critical records",
       "standards": [

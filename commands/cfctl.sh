@@ -1959,6 +1959,71 @@ cfctl_handle_classify() {
     return
   fi
 
+  if [[ "${surface}" == "maildesk-cf" && "${requested_operation}" == "provision" ]]; then
+    cfctl_require_surface "${surface}"
+    policy_json="$(cfctl_operation_policy_json "${surface}" "provision" "")"
+    selector_requirements_json="$(cfctl_requirement_check_json "${surface}" "provision" "")"
+    public_example="$(jq -r '.public_example // "cfctl maildesk-cf provision --file state/maildesk-cf/<name>.json --plan"' <<< "${policy_json}")"
+    troubleshooting_hint="$(jq -r '.troubleshooting_hint // "Composite provision apply remains blocked until component writes are preview-gated."' <<< "${policy_json}")"
+    lane_hint_json="$(
+      jq -n \
+        --arg current_lane "${CF_ACTIVE_TOKEN_LANE:-}" \
+        '{
+          current_lane: (if $current_lane == "" then null else $current_lane end),
+          recommended_lane: null,
+          retry_on_recommended_lane: false
+        }'
+    )"
+    result_json="$(
+      jq -n \
+        --argjson target "$(cfctl_target_json)" \
+        --argjson policy "${policy_json}" \
+        --argjson selector_readiness "${selector_requirements_json}" \
+        --argjson lane_hint "${lane_hint_json}" \
+        --arg public_example "${public_example}" \
+        --arg troubleshooting_hint "${troubleshooting_hint}" \
+        '
+          {
+            surface: "maildesk-cf",
+            action: "maildesk-cf",
+            requested_operation: "provision",
+            target: $target,
+            policy: $policy,
+            lane_comparison: null,
+            current_permission_probe: null,
+            selector_readiness: $selector_readiness,
+            lane_hint: $lane_hint,
+            public_example: $public_example,
+            troubleshooting_hint: $troubleshooting_hint,
+            likely_failure_class: (
+              if $selector_readiness.ready != true then
+                "invalid_arguments"
+              elif ($policy.preview_required // false) == true then
+                "preview_required"
+              else
+                null
+              end
+            )
+          }
+        '
+    )"
+    cfctl_emit_result \
+      "true" \
+      "classify" \
+      "maildesk-cf" \
+      "registry" \
+      "true" \
+      '{"state":"not_applicable","basis":"maildesk_cf_lifecycle","errors":[],"request":null,"status_code":null,"permission_family":"Maildesk lifecycle"}' \
+      '{"state":"not_applicable"}' \
+      "$(jq '{risk: .policy.risk, preview_required: .policy.preview_required, selector_ready: .selector_readiness.ready, likely_failure_class: .likely_failure_class}' <<< "${result_json}")" \
+      "${result_json}" \
+      "" \
+      "" \
+      "" \
+      "${requested_operation}"
+    return
+  fi
+
   cfctl_require_surface "${surface}"
 
   if cfctl_action_supported "${surface}" "${requested_operation}"; then
@@ -2188,6 +2253,78 @@ cfctl_handle_guide() {
       "" \
       "" \
       "revoke"
+    return
+  fi
+
+  if [[ "${surface}" == "maildesk-cf" && "${requested_operation}" == "provision" ]]; then
+    local maildesk_policy_json
+    local maildesk_args_shell
+    local maildesk_verify_args_shell
+
+    maildesk_policy_json="$(cfctl_operation_policy_json "maildesk-cf" "provision" "")"
+    maildesk_args_shell="$(cfctl_current_args_shell)"
+    maildesk_verify_args_shell="${maildesk_args_shell}"
+    if [[ -z "${CFCTL_FILE}" ]]; then
+      maildesk_args_shell="${maildesk_args_shell} --file state/maildesk-cf/<name>.json"
+      maildesk_verify_args_shell="${maildesk_verify_args_shell} --file state/maildesk-cf/<name>.json"
+    fi
+    preview_command="cfctl maildesk-cf provision${maildesk_args_shell} --plan"
+    apply_command="cfctl maildesk-cf provision${maildesk_args_shell} --ack-plan <operation-id>"
+    discovery_command="cfctl maildesk-cf verify${maildesk_verify_args_shell}"
+    verify_command="cfctl maildesk-cf verify${maildesk_verify_args_shell}"
+    troubleshooting_hint="$(jq -r '.troubleshooting_hint // "Composite provision apply remains blocked until component writes are preview-gated."' <<< "${maildesk_policy_json}")"
+    public_example="$(jq -r '.public_example // "cfctl maildesk-cf provision --file state/maildesk-cf/<name>.json --plan"' <<< "${maildesk_policy_json}")"
+    guide_json="$(
+      jq -n \
+        --arg discovery_command "${discovery_command}" \
+        --arg preview_command "${preview_command}" \
+        --arg apply_command "${apply_command}" \
+        --arg verify_command "${verify_command}" \
+        --arg public_example "${public_example}" \
+        --arg troubleshooting_hint "${troubleshooting_hint}" \
+        --argjson policy "${maildesk_policy_json}" \
+        --argjson selector_readiness "$(cfctl_requirement_check_json "maildesk-cf" "provision" "")" \
+        '
+          {
+            surface: "maildesk-cf",
+            operation: "provision",
+            module: null,
+            standards_ref: "maildesk-cf",
+            docs_topics: ["email-routing", "email-workers", "d1", "r2", "queues", "api-auth"],
+            policy: $policy,
+            selector_readiness: $selector_readiness,
+            lane_hint: {current_lane: null, recommended_lane: null},
+            steps: [
+              "Run the verification command first to read current template, instance, edge, and mail readiness.",
+              "Run the preview command and inspect its operation_id plus component operation list.",
+              "Do not run the ack command until every component write path is available through preview-gated public cfctl surfaces.",
+              "After component provisioning is complete, run the verification command again."
+            ],
+            public_example: $public_example,
+            troubleshooting_hint: $troubleshooting_hint,
+            commands: {
+              discovery: $discovery_command,
+              preview: $preview_command,
+              apply_blocked: $apply_command,
+              verify: $verify_command
+            }
+          }
+        '
+    )"
+    cfctl_emit_result \
+      "true" \
+      "guide" \
+      "maildesk-cf" \
+      "registry" \
+      "true" \
+      '{"state":"not_applicable","basis":"maildesk_cf_lifecycle","errors":[],"request":null,"status_code":null,"permission_family":"Maildesk lifecycle"}' \
+      '{"state":"not_applicable"}' \
+      "$(jq '.commands' <<< "${guide_json}")" \
+      "${guide_json}" \
+      "" \
+      "" \
+      "" \
+      "provision"
     return
   fi
 
