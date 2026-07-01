@@ -42,9 +42,12 @@ def default_spec_file() -> Path:
 def resolve_spec_path(value: str | None) -> Path:
     if value:
         path = Path(value)
-        if not path.is_absolute():
-            path = ROOT / path
-        return path
+        if path.is_absolute():
+            return path
+        caller_path = Path.cwd() / path
+        if caller_path.exists():
+            return caller_path
+        return ROOT / path
     return default_spec_file()
 
 

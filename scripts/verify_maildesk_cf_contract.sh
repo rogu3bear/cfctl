@@ -22,7 +22,8 @@ require_source_line() {
 fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-fixture.XXXXXX")"
 missing_fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-missing-fixture.XXXXXX")"
 unverified_sender_fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-unverified-sender.XXXXXX")"
-trap 'rm -f "${fixture_file}" "${missing_fixture_file}" "${unverified_sender_fixture_file}"' EXIT
+caller_spec_dir="$(mktemp -d "${TMPDIR:-/tmp}/maildesk-cf-caller-spec.XXXXXX")"
+trap 'rm -f "${fixture_file}" "${missing_fixture_file}" "${unverified_sender_fixture_file}"; rm -rf "${caller_spec_dir}"' EXIT
 
 require_source_line "worker evidence lane" '"worker.script": run_cfctl(["list", "worker.script"], lane="global"),' "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
 require_source_line "d1 evidence lane" '"d1.database": run_cfctl(["list", "d1.database"], lane="global"),' "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
@@ -210,6 +211,22 @@ jq -e '
   and .summary.edge_ready == true
   and .summary.mail_ready == true
 ' <<< "${cfctl_output}" >/dev/null || die "cfctl provision --plan envelope did not match"
+
+cp "${ROOT_DIR}/state/maildesk-cf/example.json" "${caller_spec_dir}/caller-relative.json"
+caller_spec_physical_dir="$(cd -P "${caller_spec_dir}" && pwd)"
+caller_relative_output="$(
+  cd "${caller_spec_dir}"
+  MAILDESK_CF_EVIDENCE_FILE="${fixture_file}" \
+    "${ROOT_DIR}/cfctl" maildesk-cf verify --file caller-relative.json
+)"
+jq -e \
+  --arg expected_spec "${caller_spec_physical_dir}/caller-relative.json" \
+  '
+    .ok == true
+    and .summary.spec_path == $expected_spec
+    and .summary.edge_ready == true
+    and .summary.mail_ready == true
+  ' <<< "${caller_relative_output}" >/dev/null || die "caller-relative maildesk-cf spec path did not resolve"
 
 standards_output="$("${ROOT_DIR}/cfctl" standards maildesk-cf)"
 jq -e '
