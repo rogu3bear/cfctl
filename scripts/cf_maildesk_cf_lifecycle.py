@@ -470,7 +470,7 @@ def sender_readback_available(sender: dict[str, Any]) -> bool:
 def sender_domain_enable_plan_command(domain: str) -> str:
     quoted_domain = shlex.quote(domain)
     return (
-        "cfctl apply sender_domain enable "
+        "CF_TOKEN_LANE=global cfctl apply sender_domain enable "
         f"--zone {quoted_domain} --name {quoted_domain} --plan"
     )
 
