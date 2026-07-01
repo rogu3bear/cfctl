@@ -16,31 +16,31 @@ Cloudflare account.
   `since`, `before`, and `limit` queries:
   <https://developers.cloudflare.com/api/resources/accounts/subresources/logs/subresources/audit/methods/list/>.
 
-## Live Contract Environment
+## Local Live Contract
 
-The live Cloudflare contract job must run in the `cfctl-live` GitHub Actions
-environment. Configure that environment with required reviewers and store the
-live contract credentials there, not as broadly accessible repository secrets.
+Remote CI is intentionally absent from this checkout. Live Cloudflare contract
+checks are local operator smoke tests, run only from a prepared checkout with
+explicit local credentials.
 
-Required environment secrets and variables:
+Required local environment inputs:
 
 - `CF_DEV_TOKEN`: a scoped day-to-day operator token, not the bootstrap creator.
 - `CLOUDFLARE_ACCOUNT_ID`: the account pinned for live contract verification.
 - `CFCTL_PUBLIC_CONTRACT_ZONE`: a disposable zone or zone name used only for
   contract smoke tests.
 
-`CFCTL_PUBLIC_CONTRACT_ZONE` must be visible to the active token lane. Locally,
-set `CF_TOKEN_LANE` explicitly when the default lane does not own the smoke
-zone, for example:
+`CFCTL_PUBLIC_CONTRACT_ZONE` must be visible to the active token lane. Set
+`CF_TOKEN_LANE` explicitly when the default lane does not own the smoke zone,
+for example:
 
 ```bash
 CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_public_contract.sh
 ```
 
-The live job is intentionally not run on pull requests. It runs on
-`workflow_dispatch` and the scheduled contract lane after the protected
-environment releases the job. Local smoke checks may still run from the
-checkout with equivalent explicit shell inputs.
+Do not add hosted scheduled jobs or protected-environment live checks without
+an explicit operator decision. Local smoke checks leave evidence in this
+checkout under `var/` and use the same `cfctl` lane and preview/ack rules as
+normal operator work.
 
 ## Bootstrap Creator
 
@@ -103,7 +103,5 @@ Before merging permission or live-contract changes:
 - `python3 scripts/verify_permission_catalog.py`
 - `python3 scripts/verify_permission_catalog.py --cfctl ./cfctl`
 - `python3 scripts/verify_permission_catalog.py --permission-groups <live-artifact>`
-- Manual `cfctl contract` workflow dispatch against the `cfctl-live`
-  environment after secrets are configured.
 - Optional local live-contract smoke with explicit local inputs, for example
   `CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_public_contract.sh`.
