@@ -108,6 +108,10 @@ cleanup_legacy_previews_json="$(run_json success "previews purge-inactive-legacy
 assert_artifact_exists "previews purge-inactive-legacy" "${cleanup_legacy_previews_json}"
 assert_json "previews purge-inactive-legacy" '.ok == true and .action == "previews" and (.summary.purged_count // 0) >= 0' "${cleanup_legacy_previews_json}"
 
+cleanup_duplicate_previews_json="$(run_json success "previews purge-duplicate-active" "${CFCTL}" previews purge-duplicate-active)"
+assert_artifact_exists "previews purge-duplicate-active" "${cleanup_duplicate_previews_json}"
+assert_json "previews purge-duplicate-active" '.ok == true and .action == "previews" and (.summary.purged_count // 0) >= 0 and (.summary.duplicate_group_count // 0) >= 0' "${cleanup_duplicate_previews_json}"
+
 cleanup_locks_json="$(run_json success "locks clear-stale" "${CFCTL}" locks clear-stale)"
 assert_artifact_exists "locks clear-stale" "${cleanup_locks_json}"
 assert_json "locks clear-stale" '.ok == true and .action == "locks"' "${cleanup_locks_json}"

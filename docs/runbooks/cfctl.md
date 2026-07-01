@@ -47,6 +47,7 @@ CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_pub
 cfctl previews
 cfctl previews purge-expired
 cfctl previews purge-inactive-legacy
+cfctl previews purge-duplicate-active
 cfctl locks
 cfctl locks clear-stale
 cfctl env run --lane dev -- env
@@ -130,6 +131,7 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - `previews` lists actionable, legacy, and expired preview receipts
 - `previews purge-expired` removes expired preview receipts only
 - `previews purge-inactive-legacy` removes only legacy preview receipts that lack complete trust metadata
+- `previews purge-duplicate-active` removes older active preview receipts only when a newer trusted receipt exists for the same lane, target, request, and policy
 - `locks` lists active write locks and their stale/orphaned state
 - `locks clear-stale` removes stale/orphaned locks only
 - `env run --lane dev -- <command> [args...]` runs an external argv command with lane-derived Cloudflare auth, strips parent lane secrets, redacts child output, and records a runtime artifact

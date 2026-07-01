@@ -46,6 +46,7 @@ Usage:
   cfctl previews
   cfctl previews purge-expired
   cfctl previews purge-inactive-legacy
+  cfctl previews purge-duplicate-active
   cfctl locks
   cfctl locks clear-stale
   cfctl env run [--lane dev|global] -- <command> [args...]
@@ -80,7 +81,7 @@ Verb intent:
   surfaces  List supported surfaces with read/write support, lane fit, and desired-state support.
   docs      Show the compact official Cloudflare docs bank and tracked incoming capabilities.
   standards Show the canonical configuration standards for this runtime, one surface, or a workspace audit.
-  previews  Inspect actionable, legacy, and expired preview receipts, and purge expired ones.
+  previews  Inspect actionable, legacy, and duplicate preview receipts, and purge safe local preview artifacts.
   locks     Inspect write locks and clear stale ones.
   env       Run an external argv command with lane-derived Cloudflare auth and redacted output.
   ownership Read and verify the checked-in Cloudflare ownership authority registry.
@@ -122,6 +123,7 @@ Examples:
   cfctl previews
   cfctl previews purge-expired
   cfctl previews purge-inactive-legacy
+  cfctl previews purge-duplicate-active
   cfctl locks
   cfctl locks clear-stale
   cfctl env run --lane dev -- env
@@ -898,6 +900,9 @@ cfctl_preview_rows_json() {
             preview_expires_at: (.trust.preview_expires_at // null),
             lock_mode: (.trust.lock_mode // null),
             lock_key: (.trust.lock_key // null),
+            policy_fingerprint: (.trust.policy_fingerprint // null),
+            request_fingerprint: (.trust.request_fingerprint // null),
+            target_fingerprint: (.trust.target_fingerprint // null),
             trust_complete: $trust_complete,
             expired: $expired
           }
@@ -960,6 +965,80 @@ cfctl_preview_purge_inactive_legacy_json() {
     '
       {
         purged_count: ($results | length),
+        results: $results
+      }
+    '
+}
+
+cfctl_preview_purge_duplicate_active_json() {
+  local previews_json
+  local duplicate_json
+  local results='[]'
+  local candidate
+  local path
+  local removed
+
+  previews_json="$(cfctl_preview_rows_json)"
+  duplicate_json="$(
+    jq '
+      [
+        .previews[]
+        | select(.expired != true and .trust_complete == true)
+        | . + {
+            duplicate_key: ([
+              (.action // ""),
+              (.surface // ""),
+              (.operation // ""),
+              (.lane // ""),
+              (.policy_fingerprint // ""),
+              (.request_fingerprint // ""),
+              (.target_fingerprint // "")
+            ] | @json)
+          }
+      ]
+      | group_by(.duplicate_key)
+      | map(
+          select(length > 1)
+          | (sort_by((.generated_at // ""), (.artifact_path // ""))) as $ordered
+          | {
+              duplicate_key: ($ordered[0].duplicate_key // ""),
+              kept_artifact_path: ($ordered[-1].artifact_path // null),
+              kept_operation_id: ($ordered[-1].operation_id // null),
+              removed: $ordered[0:-1]
+            }
+        ) as $groups
+      | {
+          duplicate_group_count: ($groups | length),
+          candidates: ($groups | map(.removed[]) )
+        }
+    ' <<< "${previews_json}"
+  )"
+
+  while IFS= read -r candidate; do
+    [[ -n "${candidate}" ]] || continue
+    path="$(jq -r '.artifact_path // empty' <<< "${candidate}")"
+    [[ -n "${path}" ]] || continue
+    removed="false"
+    if [[ -f "${path}" ]]; then
+      rm -f "${path}"
+      removed="true"
+    fi
+    results="$(
+      jq \
+        --argjson candidate "${candidate}" \
+        --argjson removed "${removed}" \
+        '. + [($candidate + {removed: $removed})]' \
+        <<< "${results}"
+    )"
+  done < <(jq -c '.candidates[]' <<< "${duplicate_json}")
+
+  jq -n \
+    --argjson duplicate_json "${duplicate_json}" \
+    --argjson results "${results}" \
+    '
+      {
+        purged_count: ($results | map(select(.removed == true)) | length),
+        duplicate_group_count: ($duplicate_json.duplicate_group_count // 0),
         results: $results
       }
     '
@@ -1541,12 +1620,27 @@ cfctl_handle_previews() {
         "${purge_json}" \
         ""
       ;;
+    purge-duplicate-active)
+      purge_json="$(cfctl_preview_purge_duplicate_active_json)"
+      cfctl_emit_result \
+        "true" \
+        "previews" \
+        "runtime" \
+        "runtime" \
+        "true" \
+        '{"state":"not_applicable","basis":"preview_cleanup","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
+        '{"state":"not_applicable"}' \
+        "$(jq '{purged_count: .purged_count, duplicate_group_count: .duplicate_group_count}' <<< "${purge_json}")" \
+        "${purge_json}" \
+        ""
+      ;;
     -h|--help|help)
       cat <<'EOF'
 Usage:
   cfctl previews
   cfctl previews purge-expired
   cfctl previews purge-inactive-legacy
+  cfctl previews purge-duplicate-active
 EOF
       ;;
     *)

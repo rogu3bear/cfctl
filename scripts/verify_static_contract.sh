@@ -128,6 +128,117 @@ for surface_module in \
   bash -n "${surface_module}"
 done
 
+preview_dedupe_json="$(
+  ROOT_DIR="${ROOT_DIR}" bash <<'BASH'
+set -euo pipefail
+
+tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/cfctl-preview-dedupe.XXXXXX")"
+cleanup_tmp_root() {
+  local base
+  base="$(basename "${tmp_root}")"
+  if [[ "${base}" == cfctl-preview-dedupe.* && -d "${tmp_root}" ]]; then
+    rm -rf -- "${tmp_root}"
+  fi
+}
+trap cleanup_tmp_root EXIT
+
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/lib/runtime/cfctl.sh"
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/commands/cfctl.sh"
+
+CF_REPO_ROOT="${tmp_root}"
+preview_dir="${CF_REPO_ROOT}/var/inventory/runtime"
+mkdir -p "${preview_dir}"
+
+write_preview() {
+  local path="$1"
+  local operation_id="$2"
+  local generated_at="$3"
+  local request_fingerprint="$4"
+  local target_fingerprint="$5"
+  local policy_fingerprint="$6"
+  local expires_at="$7"
+
+  jq -n \
+    --arg operation_id "${operation_id}" \
+    --arg generated_at "${generated_at}" \
+    --arg request_fingerprint "${request_fingerprint}" \
+    --arg target_fingerprint "${target_fingerprint}" \
+    --arg policy_fingerprint "${policy_fingerprint}" \
+    --arg expires_at "${expires_at}" \
+    '{
+      generated_at: $generated_at,
+      ok: true,
+      action: "apply",
+      surface: "sender_domain",
+      operation: "enable",
+      operation_id: $operation_id,
+      auth: {lane: "global"},
+      summary: {plan_mode: true},
+      trust: {
+        lane: "global",
+        policy_fingerprint: $policy_fingerprint,
+        request_fingerprint: $request_fingerprint,
+        target_fingerprint: $target_fingerprint,
+        preview_expires_at: $expires_at
+      }
+    }' > "${path}"
+}
+
+write_preview "${preview_dir}/duplicate-old.json" "op-old" "2026-01-01T00:00:00Z" "request-a" "target-a" "policy-a" "2099-01-01T00:00:00Z"
+write_preview "${preview_dir}/duplicate-new.json" "op-new" "2026-01-02T00:00:00Z" "request-a" "target-a" "policy-a" "2099-01-01T00:00:00Z"
+write_preview "${preview_dir}/distinct-active.json" "op-distinct" "2026-01-01T12:00:00Z" "request-b" "target-a" "policy-a" "2099-01-01T00:00:00Z"
+write_preview "${preview_dir}/duplicate-expired.json" "op-expired" "2026-01-03T00:00:00Z" "request-a" "target-a" "policy-a" "2000-01-01T00:00:00Z"
+jq -n '{
+  generated_at: "2026-01-01T00:00:00Z",
+  ok: true,
+  action: "apply",
+  surface: "sender_domain",
+  operation: "enable",
+  operation_id: "op-legacy",
+  auth: {lane: "global"},
+  summary: {plan_mode: true}
+}' > "${preview_dir}/legacy.json"
+
+purge_json="$(cfctl_preview_purge_duplicate_active_json)"
+
+jq -n \
+  --argjson purge "${purge_json}" \
+  --arg duplicate_old "${preview_dir}/duplicate-old.json" \
+  --arg duplicate_new "${preview_dir}/duplicate-new.json" \
+  --arg distinct_active "${preview_dir}/distinct-active.json" \
+  --arg duplicate_expired "${preview_dir}/duplicate-expired.json" \
+  --arg legacy "${preview_dir}/legacy.json" \
+  --argjson duplicate_old_exists "$([[ -f "${preview_dir}/duplicate-old.json" ]] && echo true || echo false)" \
+  --argjson duplicate_new_exists "$([[ -f "${preview_dir}/duplicate-new.json" ]] && echo true || echo false)" \
+  --argjson distinct_active_exists "$([[ -f "${preview_dir}/distinct-active.json" ]] && echo true || echo false)" \
+  --argjson duplicate_expired_exists "$([[ -f "${preview_dir}/duplicate-expired.json" ]] && echo true || echo false)" \
+  --argjson legacy_exists "$([[ -f "${preview_dir}/legacy.json" ]] && echo true || echo false)" \
+  '{
+    purge: $purge,
+    files: {
+      duplicate_old: {path: $duplicate_old, exists: $duplicate_old_exists},
+      duplicate_new: {path: $duplicate_new, exists: $duplicate_new_exists},
+      distinct_active: {path: $distinct_active, exists: $distinct_active_exists},
+      duplicate_expired: {path: $duplicate_expired, exists: $duplicate_expired_exists},
+      legacy: {path: $legacy, exists: $legacy_exists}
+    }
+  }'
+BASH
+)"
+jq -e '
+  .purge.purged_count == 1
+  and .purge.duplicate_group_count == 1
+  and (.purge.results | length) == 1
+  and (.purge.results[0].operation_id == "op-old")
+  and (.files.duplicate_old.exists == false)
+  and (.files.duplicate_new.exists == true)
+  and (.files.distinct_active.exists == true)
+  and (.files.duplicate_expired.exists == true)
+  and (.files.legacy.exists == true)
+' <<< "${preview_dedupe_json}" >/dev/null || die "preview duplicate active purge assertion failed"
+
 python3 "${ROOT_DIR}/scripts/render_capabilities_doc.py" --check "${ROOT_DIR}/docs/capabilities.md" >/dev/null
 python3 "${ROOT_DIR}/scripts/verify_permission_catalog.py" >/dev/null
 python3 -m py_compile "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
@@ -793,10 +904,12 @@ assert_contains "cfctl prompt hostname" "For \`hostname\`, treat \`verify\`, \`d
 assert_contains "cfctl prompt maildesk" "For \`maildesk-cf\`, treat \`init\`, \`verify\`, \`snapshot\`, \`diff\`, \`plan\`, and \`provision --plan\` as read-only composite evidence flows" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt wrapper gating" "For \`wrangler\` and \`cloudflared\`, treat clearly read-only subcommands as direct wrapped executions" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl preview inactive legacy cleanup command" "purge-inactive-legacy" "${ROOT_DIR}/commands/cfctl.sh"
+assert_contains "cfctl preview duplicate active cleanup command" "purge-duplicate-active" "${ROOT_DIR}/commands/cfctl.sh"
 assert_contains "readme wrapper examples" "cfctl wrangler --version" "${ROOT_DIR}/README.md"
 assert_contains "readme env run" "cfctl env run --lane dev -- <command> [args...]" "${ROOT_DIR}/README.md"
 assert_contains "readme env run argv secrecy" "do not pass secrets as command-line arguments" "${ROOT_DIR}/README.md"
 assert_contains "readme inactive legacy preview cleanup" "cfctl previews purge-inactive-legacy" "${ROOT_DIR}/README.md"
+assert_contains "readme duplicate active preview cleanup" "cfctl previews purge-duplicate-active" "${ROOT_DIR}/README.md"
 assert_contains "readme source-live boundary" "Source Config Vs Live State" "${ROOT_DIR}/README.md"
 assert_contains "readme hostname lifecycle" "Hostname lifecycle" "${ROOT_DIR}/README.md"
 assert_contains "readme maildesk lifecycle" "maildesk-cf lifecycle" "${ROOT_DIR}/README.md"
@@ -819,6 +932,7 @@ assert_contains "auth runbook env run" "CF_SHARED_ENV_FILE=/Users/star/dev/.env 
 assert_contains "auth runbook env run argv secrecy" "Because argv is evidence, do not pass secrets as command" "${ROOT_DIR}/docs/runbooks/auth-and-env.md"
 assert_contains "runtime policy env run" "\`cfctl env run\` strips parent lane secrets" "${ROOT_DIR}/docs/runtime-policy.md"
 assert_contains "runbook inactive legacy preview cleanup" "previews purge-inactive-legacy" "${ROOT_DIR}/docs/runbooks/cfctl.md"
+assert_contains "runbook duplicate active preview cleanup" "previews purge-duplicate-active" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook audit log read" "cfctl list audit.log" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook hostname lifecycle" "cfctl hostname verify --file state/hostname/example.yaml" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook maildesk lifecycle" "cfctl maildesk-cf verify --file state/maildesk-cf/example.json" "${ROOT_DIR}/docs/runbooks/cfctl.md"
@@ -829,6 +943,7 @@ assert_contains "runbook standards audit source evidence" "standards audit\` is 
 assert_contains "config standards compatibility freshness" "Compatibility-date freshness is intentionally advisory" "${ROOT_DIR}/docs/config-standards.md"
 assert_contains "config standards canonical notes" "\`canonical_warning_count\`" "${ROOT_DIR}/docs/config-standards.md"
 assert_contains "runtime policy inactive legacy preview cleanup" "cfctl previews purge-inactive-legacy" "${ROOT_DIR}/docs/runtime-policy.md"
+assert_contains "runtime policy duplicate active preview cleanup" "cfctl previews purge-duplicate-active" "${ROOT_DIR}/docs/runtime-policy.md"
 assert_contains "capabilities operable note" "This table is the operable runtime surface." "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities generated note" "_Generated from \`catalog/surfaces.json\` and \`catalog/runtime.json\`." "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities module column" "| Surface | Read | Can | Apply | Verify | Desired State | Standards | Docs Topics | Module |" "${ROOT_DIR}/docs/capabilities.md"
@@ -899,6 +1014,7 @@ assert_contains "contract workflow manual secret gate" "Live Cloudflare contract
 assert_contains "contract workflow scheduled secret skip" "Skipping scheduled live Cloudflare contract" "${ROOT_DIR}/.github/workflows/cfctl-contract.yml"
 assert_contains "contract workflow protected environment" "environment: cfctl-live" "${ROOT_DIR}/.github/workflows/cfctl-contract.yml"
 assert_contains "public contract inactive legacy preview cleanup" "previews purge-inactive-legacy" "${ROOT_DIR}/scripts/verify_public_contract.sh"
+assert_contains "public contract duplicate active preview cleanup" "previews purge-duplicate-active" "${ROOT_DIR}/scripts/verify_public_contract.sh"
 assert_contains "permission doctrine source" "Cloudflare API token permissions are resource-scoped" "${ROOT_DIR}/docs/permission-doctrine.md"
 assert_contains "permission doctrine environment" "cfctl-live" "${ROOT_DIR}/docs/permission-doctrine.md"
 assert_contains "permission doctrine bootstrap creator" "Account API Tokens Write" "${ROOT_DIR}/docs/permission-doctrine.md"

@@ -30,7 +30,7 @@ cfctl guide <surface> <operation> ...
 - Preview-required operations must run with `--plan` first.
 - The reviewed preview emits an `operation_id`.
 - The real mutation must repeat the command with `--ack-plan <operation-id>`.
-- Use `cfctl previews` to inspect preview receipts, `cfctl previews purge-expired` to remove expired ones, and `cfctl previews purge-inactive-legacy` to remove only legacy receipts without complete trust metadata.
+- Use `cfctl previews` to inspect preview receipts, `cfctl previews purge-expired` to remove expired ones, `cfctl previews purge-inactive-legacy` to remove only legacy receipts without complete trust metadata, and `cfctl previews purge-duplicate-active` to remove older trusted active receipts only when a newer receipt exists for the same lane, target, request, and policy.
 - Use `cfctl locks` to inspect write locks and `cfctl locks clear-stale` to remove only stale/orphaned locks.
 - Destructive paths still require explicit confirmation such as `--confirm delete`.
 

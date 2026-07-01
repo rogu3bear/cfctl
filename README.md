@@ -287,6 +287,7 @@ CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_pub
 cfctl previews
 cfctl previews purge-expired
 cfctl previews purge-inactive-legacy
+cfctl previews purge-duplicate-active
 cfctl locks
 cfctl locks clear-stale
 cfctl admin authorizations
@@ -297,6 +298,8 @@ cfctl admin revoke-backend --path <authorization-path>
   `bootstrap_required`, while configured-but-unhealthy lanes remain unsafe.
 - `cfctl previews purge-inactive-legacy` removes only legacy preview receipts
   without complete trust metadata; active trusted previews are not targeted.
+- `cfctl previews purge-duplicate-active` removes older active preview receipts
+  when a newer trusted receipt exists for the same lane, target, request, and policy.
 - Direct API wrappers: account inventory, DNS, Access, tunnels, email routing, targeted writes.
 - `cfctl wrangler ...` via [scripts/cf_wrangler.sh](scripts/cf_wrangler.sh): wrapped wrangler with cfctl logs, artifacts, and preview gating.
 - `cfctl cloudflared ...` via [scripts/cf_cloudflared.sh](scripts/cf_cloudflared.sh): wrapped cloudflared with the same envelope.
