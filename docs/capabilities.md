@@ -79,7 +79,7 @@ This matrix is derived from the same catalogs used by `cfctl explain`, `cfctl cl
 | `security.txt` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: zone |
 | `security.txt` | `upsert` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: zone |
 | `security.txt` | `sync` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | state match: zone |
-| `sender_domain` | `enable` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: zone, name |
+| `sender_domain` | `enable` | `write` | yes | `apply` | yes | `-` | `global` | required: zone, name |
 | `tunnel` | `cleanup-connections` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: id |
 | `tunnel` | `configure` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: id |
 | `tunnel` | `create` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |

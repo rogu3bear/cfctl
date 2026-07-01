@@ -290,6 +290,26 @@ jq -e '
   and (.recommended_command | contains("--plan"))
 ' <<< "${email_routing_zone_guidance_json}" >/dev/null || die "email routing zone resolution lane guidance assertion failed"
 
+sender_domain_guide_json="$(
+  env \
+    -u CF_DEV_TOKEN \
+    -u CF_GLOBAL_TOKEN \
+    -u CLOUDFLARE_API_TOKEN \
+    -u CLOUDFLARE_ACCOUNT_ID \
+    CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    "${ROOT_DIR}/cfctl" guide sender_domain enable --zone example.com --name example.com
+)"
+jq -e '
+  .ok == true
+  and .surface == "sender_domain"
+  and .operation == "enable"
+  and .result.lane_hint.recommended_lane == "global"
+  and (.result.commands.preview | startswith("CF_TOKEN_LANE=global cfctl apply sender_domain enable "))
+  and (.result.commands.apply | startswith("CF_TOKEN_LANE=global cfctl apply sender_domain enable "))
+  and (.result.commands.verify | startswith("CF_TOKEN_LANE=global cfctl verify sender_domain "))
+' <<< "${sender_domain_guide_json}" >/dev/null || die "sender-domain guide global lane assertion failed"
+
 assert_jq_file "permission profile minimality policy" '
   .profiles.read.allowed_surfaces != null
   and (.profiles.read.allowed_surfaces | index("audit.log")) != null
@@ -731,6 +751,7 @@ assert_jq_file "surface module bindings" '
   and .surfaces["sender_domain"].actions.apply.preview_required == true
   and .surfaces["sender_domain"].actions.apply.verification_required == true
   and .surfaces["sender_domain"].actions.apply.operations.enable.required_selectors == ["zone", "name"]
+  and .surfaces["sender_domain"].actions.apply.operations.enable.allowed_lanes == ["global"]
   and .surfaces["worker.route"].module == "worker_route"
   and .surfaces["worker.route"].standards_ref == "worker.route"
   and (.surfaces["worker.route"].docs_topics | index("workers-routes")) != null

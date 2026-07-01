@@ -706,6 +706,26 @@ cfctl_recommended_lane_from_comparison() {
   jq -r '.summary.allowed_lanes[0] // empty' <<< "${comparison_json}"
 }
 
+cfctl_recommended_lane_from_policy_or_comparison() {
+  local comparison_json="$1"
+  local policy_json="$2"
+  local recommended_lane
+
+  recommended_lane="$(cfctl_recommended_lane_from_comparison "${comparison_json}")"
+  if [[ -n "${recommended_lane}" ]]; then
+    printf '%s\n' "${recommended_lane}"
+    return
+  fi
+
+  jq -r '
+    if ((.allowed_lanes // []) | length) == 1 then
+      .allowed_lanes[0]
+    else
+      ""
+    end
+  ' <<< "${policy_json}"
+}
+
 cfctl_select_requested_lane_if_available() {
   local requested_lane="${CF_TOKEN_LANE:-${CF_TOKEN_LANE_DEFAULT}}"
 
@@ -2070,7 +2090,7 @@ cfctl_handle_classify() {
   selector_requirements_json="$(cfctl_requirement_check_json "${surface}" "${target_action}" "${operation}")"
   comparison_json="$(cfctl_compare_permission_all_lanes "${surface}" "${target_action}" "${operation}")"
   permission_json="$(jq -c --arg lane "${CF_ACTIVE_TOKEN_LANE:-}" '(.lanes | map(select(.lane == $lane)) | .[0].permission) // {state:"unknown", basis:"lane_unavailable", errors: [], request: null, status_code: null, permission_family: "Cloudflare API"}' <<< "${comparison_json}")"
-  recommended_lane="$(cfctl_recommended_lane_from_comparison "${comparison_json}")"
+  recommended_lane="$(cfctl_recommended_lane_from_policy_or_comparison "${comparison_json}" "${policy_json}")"
   public_example="$(jq -r '.public_example // empty' <<< "${policy_json}")"
   if [[ -z "${public_example}" || "${public_example}" == "null" ]]; then
     if [[ "${target_action}" == "apply" ]]; then
@@ -2146,7 +2166,7 @@ cfctl_handle_classify() {
     "true" \
     "${permission_json}" \
     '{"state":"not_applicable"}' \
-    "$(jq '{risk: .policy.risk, preview_required: .policy.preview_required, confirmation: .policy.confirmation, lock_strategy: .policy.lock_strategy, secret_policy: .policy.secret_policy, allowed_lanes: (.lane_comparison.summary.allowed_lanes // []), selector_ready: .selector_readiness.ready, recommended_lane: .lane_hint.recommended_lane, likely_failure_class: .likely_failure_class}' <<< "${result_json}")" \
+    "$(jq '{risk: .policy.risk, preview_required: .policy.preview_required, confirmation: .policy.confirmation, lock_strategy: .policy.lock_strategy, secret_policy: .policy.secret_policy, allowed_lanes: (if ((.lane_comparison.summary.allowed_lanes // []) | length) > 0 then (.lane_comparison.summary.allowed_lanes // []) else (.policy.allowed_lanes // []) end), selector_ready: .selector_readiness.ready, recommended_lane: .lane_hint.recommended_lane, likely_failure_class: .likely_failure_class}' <<< "${result_json}")" \
     "${result_json}" \
     "" \
     "" \
@@ -2361,11 +2381,11 @@ cfctl_handle_guide() {
   fi
   lane_comparison="$(cfctl_compare_permission_all_lanes "${surface}" "apply" "${requested_operation}")"
   current_lane="${CF_ACTIVE_TOKEN_LANE:-}"
-  recommended_lane="$(jq -r '.summary.allowed_lanes[0] // empty' <<< "${lane_comparison}")"
+  policy_json="$(cfctl_operation_policy_json "${surface}" "apply" "${requested_operation}")"
+  recommended_lane="$(cfctl_recommended_lane_from_policy_or_comparison "${lane_comparison}" "${policy_json}")"
   if [[ -n "${recommended_lane}" && "${recommended_lane}" != "${current_lane}" ]]; then
     command_prefix="CF_TOKEN_LANE=${recommended_lane} "
   fi
-  policy_json="$(cfctl_operation_policy_json "${surface}" "apply" "${requested_operation}")"
 
   preview_command="${command_prefix}$(cfctl_build_apply_command "${surface}" "${requested_operation}" " --plan")"
   apply_command="${command_prefix}$(cfctl_build_apply_command "${surface}" "${requested_operation}" " --ack-plan <operation-id>")"
