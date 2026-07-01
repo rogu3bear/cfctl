@@ -41,10 +41,8 @@
     "queue": "maildesk-cf-jobs"
   },
   "sender": {
-    "mode": "cloudflare_first",
-    "authenticated_domains": [
-      "example.com"
-    ]
+    "mode": "disabled",
+    "authenticated_domains": []
   },
   "verification": {
     "allow_broad_live_sends": false,

@@ -3488,8 +3488,7 @@ cfctl_find_maildesk_cf_plan_receipt_path() {
     return 1
   fi
 
-  for candidate in "${runtime_dir}"/*.json; do
-    [[ -f "${candidate}" ]] || continue
+  while IFS= read -r candidate; do
     if jq -e \
       --arg ack_plan "${ack_plan}" \
       '
@@ -3503,7 +3502,7 @@ cfctl_find_maildesk_cf_plan_receipt_path() {
       printf '%s\n' "${candidate}"
       return 0
     fi
-  done
+  done < <(find "${runtime_dir}" -maxdepth 1 -type f -name 'maildesk-cf-maildesk-cf-*.json' -print | sort -r)
 
   return 1
 }

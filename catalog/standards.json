@@ -235,19 +235,19 @@
           "id": "maildesk-cf.state-owns-complete-path",
           "level": "required",
           "title": "One spec owns the maildesk path",
-          "summary": "A maildesk lifecycle spec should declare domains, role aliases, personal aliases, Workers, D1, R2, Queues, sender authentication, and outbound policy together."
+          "summary": "A maildesk lifecycle spec should declare domains, role aliases, personal aliases, Workers, D1, R2, Queues, sender mode, and outbound policy together."
         },
         {
           "id": "maildesk-cf.verify-before-provision",
           "level": "required",
           "title": "Verify every dependency before planning provisioning",
-          "summary": "Maildesk readiness must prove template validation, instance policy, Worker/storage bindings, Email Routing aliases, sender authentication, provider status, and outbound proof posture with evidence artifacts."
+          "summary": "Maildesk readiness must prove template validation, instance policy, Worker/storage bindings, Email Routing aliases, sender mode, and any enabled provider status with evidence artifacts."
         },
         {
           "id": "maildesk-cf.component-writes-preview-gated",
           "level": "required",
           "title": "Do not composite-apply before component writes are gated",
-          "summary": "Composite provisioning must remain plan-only until Worker, D1, R2, Queue, Email Routing, DNS authentication, and sender-provider operations are each available through preview-gated public cfctl surfaces."
+          "summary": "Composite provisioning must remain plan-only until Worker, D1, R2, Queue, Email Routing, and enabled sender-provider operations are each available through preview-gated public cfctl surfaces."
         },
         {
           "id": "maildesk-cf.targeted-mail-proof-only",

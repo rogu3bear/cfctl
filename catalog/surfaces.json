@@ -513,7 +513,7 @@
       ]
     },
     "maildesk-cf": {
-      "description": "Composite maildesk-cf lifecycle readiness across Email Routing aliases, Workers, D1, R2, Queues, sender authentication, and outbound identity evidence.",
+      "description": "Composite maildesk-cf lifecycle readiness across Email Routing aliases, Workers, D1, R2, Queues, and mode-driven sender evidence.",
       "standards_ref": "maildesk-cf",
       "docs_topics": ["email-routing", "email-workers", "d1", "r2", "queues", "api-auth"],
       "backend": "maildesk_cf_lifecycle",

@@ -96,8 +96,8 @@ def init_spec(domain: str) -> dict[str, Any]:
             "queue": "maildesk-cf-jobs",
         },
         "sender": {
-            "mode": "cloudflare_first",
-            "authenticated_domains": [domain],
+            "mode": "disabled",
+            "authenticated_domains": [],
         },
         "verification": {
             "allow_broad_live_sends": False,
@@ -694,95 +694,84 @@ def append_sender_checks(
         )
         return
     if mode in {"disabled", "receive_only"}:
-        drifts.append(
-            drift(
-                "sender_adapter_receive_only",
-                "error",
-                "sender.mode",
-                "Sender adapter is configured without outbound sending",
-                "outbound sender provider",
-                sender_spec.get("mode"),
+        checks["sender"]["ready"] = True
+    else:
+        for domain in [str(value) for value in authenticated if value]:
+            domain_evidence = (evidence.get("domains") or {}).get(domain) or {}
+            dns_items = items(domain_evidence.get("dns.record"))
+            spf_ok = has_txt(dns_items, domain, "v=spf1")
+            dmarc_ok = has_txt(dns_items, f"_dmarc.{domain}", "v=DMARC1")
+            domain_status = sender_domain_status(sender_evidence, domain)
+            provider_status = domain_status or {}
+            provider_verified = bool(
+                provider_status.get("verified")
+                or str(provider_status.get("status") or "").lower() in {"verified", "active", "ready"}
             )
-        )
-        checks["sender"]["ready"] = False
-        return
-
-    for domain in [str(value) for value in authenticated if value]:
-        domain_evidence = (evidence.get("domains") or {}).get(domain) or {}
-        dns_items = items(domain_evidence.get("dns.record"))
-        spf_ok = has_txt(dns_items, domain, "v=spf1")
-        dmarc_ok = has_txt(dns_items, f"_dmarc.{domain}", "v=DMARC1")
-        domain_status = sender_domain_status(sender_evidence, domain)
-        provider_status = domain_status or {}
-        provider_verified = bool(
-            provider_status.get("verified")
-            or str(provider_status.get("status") or "").lower() in {"verified", "active", "ready"}
-        )
-        domain_check = {
-            "provider": mode,
-            "provider_readback": provider_status if domain_status else None,
-            "spf_dns": spf_ok,
-            "dmarc_dns": dmarc_ok,
-            "provider_verified": provider_verified,
-        }
-        checks["sender"][domain] = domain_check
-        if not spf_ok:
-            drifts.append(
-                drift(
-                    "dns_authentication_drift",
-                    "error",
-                    f"dns.record:{domain}:SPF",
-                    "SPF TXT record is missing for sender authentication",
-                    "TXT v=spf1",
-                    [dns_name(record) for record in dns_items],
+            domain_check = {
+                "provider": mode,
+                "provider_readback": provider_status if domain_status else None,
+                "spf_dns": spf_ok,
+                "dmarc_dns": dmarc_ok,
+                "provider_verified": provider_verified,
+            }
+            checks["sender"][domain] = domain_check
+            if not spf_ok:
+                drifts.append(
+                    drift(
+                        "dns_authentication_drift",
+                        "error",
+                        f"dns.record:{domain}:SPF",
+                        "SPF TXT record is missing for sender authentication",
+                        "TXT v=spf1",
+                        [dns_name(record) for record in dns_items],
+                    )
                 )
-            )
-        if not dmarc_ok:
-            drifts.append(
-                drift(
-                    "dns_authentication_drift",
-                    "error",
-                    f"dns.record:_dmarc.{domain}",
-                    "DMARC TXT record is missing for sender authentication",
-                    "TXT v=DMARC1",
-                    [dns_name(record) for record in dns_items],
+            if not dmarc_ok:
+                drifts.append(
+                    drift(
+                        "dns_authentication_drift",
+                        "error",
+                        f"dns.record:_dmarc.{domain}",
+                        "DMARC TXT record is missing for sender authentication",
+                        "TXT v=DMARC1",
+                        [dns_name(record) for record in dns_items],
+                    )
                 )
-            )
-        if domain_status is None and not sender_readback_available(sender_evidence):
-            drifts.append(
-                drift(
-                    "provider_status_unavailable",
-                    "error",
-                    f"sender_domain:{domain}",
-                    "Sender-provider domain status readback is not available",
-                    {"provider": mode, "domain": domain},
-                    None,
+            if domain_status is None and not sender_readback_available(sender_evidence):
+                drifts.append(
+                    drift(
+                        "provider_status_unavailable",
+                        "error",
+                        f"sender_domain:{domain}",
+                        "Sender-provider domain status readback is not available",
+                        {"provider": mode, "domain": domain},
+                        None,
+                    )
                 )
-            )
-        elif domain_status is None:
-            drifts.append(
-                drift(
-                    "sender_domain_drift",
-                    "error",
-                    f"sender_domain:{domain}",
-                    "Sender-provider domain is not present in readback",
-                    "verified",
-                    {"provider": mode, "domains": sender_evidence.get("domains") or []},
-                    sender_domain_enable_plan_command(domain),
+            elif domain_status is None:
+                drifts.append(
+                    drift(
+                        "sender_domain_drift",
+                        "error",
+                        f"sender_domain:{domain}",
+                        "Sender-provider domain is not present in readback",
+                        "verified",
+                        {"provider": mode, "domains": sender_evidence.get("domains") or []},
+                        sender_domain_enable_plan_command(domain),
+                    )
                 )
-            )
-        elif not provider_verified:
-            drifts.append(
-                drift(
-                    "sender_domain_drift",
-                    "error",
-                    f"sender_domain:{domain}",
-                    "Sender-provider domain is not verified",
-                    "verified",
-                    provider_status,
-                    sender_domain_enable_plan_command(domain),
+            elif not provider_verified:
+                drifts.append(
+                    drift(
+                        "sender_domain_drift",
+                        "error",
+                        f"sender_domain:{domain}",
+                        "Sender-provider domain is not verified",
+                        "verified",
+                        provider_status,
+                        sender_domain_enable_plan_command(domain),
+                    )
                 )
-            )
 
     verification_spec = spec.get("verification") or {}
     if verification_spec.get("targeted_send_required"):
