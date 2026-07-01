@@ -1,8 +1,10 @@
 # maildesk-cf State
 
 `maildesk-cf` specs describe the Cloudflare account resources needed for one
-maildesk deployment: Email Routing aliases, Workers, D1, R2, Queues, sender
-authentication, and outbound identity readiness.
+maildesk deployment: Email Routing aliases, Workers, D1, R2, Queues, and
+mode-driven sender readiness. The public example defaults to receive-only
+outbound mode; sender authentication is required only when a provider is
+enabled in the spec.
 
 Use the composite command when the question is deployment readiness rather than
 one isolated Cloudflare resource:
@@ -19,6 +21,6 @@ operation id. `maildesk-cf provision --ack-plan <operation-id>` is intentionally
 blocked until the component write paths are each preview-gated through public
 `cfctl` surfaces.
 
-The verifier does not perform broad live sends. Sender readiness is based on
+The verifier does not perform broad live sends. Enabled sender providers use
 DNS/authentication and provider readback evidence; targeted send proof remains
 an explicit human-requested check.

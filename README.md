@@ -159,7 +159,7 @@ This tranche is read-only. `hostname plan` emits proposed component operations, 
 
 ## maildesk-cf lifecycle
 
-Use `cfctl maildesk-cf verify|snapshot|diff|plan|provision --plan` with JSON specs under [state/maildesk-cf](state/maildesk-cf) when a maildesk deployment needs Email Routing aliases, Workers, D1, R2, Queues, DNS sender authentication, and outbound identity readiness checked together.
+Use `cfctl maildesk-cf verify|snapshot|diff|plan|provision --plan` with JSON specs under [state/maildesk-cf](state/maildesk-cf) when a maildesk deployment needs Email Routing aliases, Workers, D1, R2, Queues, and mode-driven sender readiness checked together. The public template defaults to receive-only outbound mode; Cloudflare Email Service or Resend sender evidence is required only when the spec enables that provider.
 
 ```bash
 cfctl maildesk-cf init --domain example.com
@@ -169,7 +169,7 @@ cfctl maildesk-cf diff --file state/maildesk-cf/example.json
 cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
 ```
 
-`maildesk-cf provision --plan` emits a local operation id and proposed component operations. `maildesk-cf provision --ack-plan <operation-id>` is blocked until those component writes are each available through preview-gated public `cfctl` surfaces. The verifier does not perform broad live sends; sender readiness comes from DNS/authentication and provider readback evidence unless a human explicitly asks for targeted delivery proof.
+`maildesk-cf provision --plan` emits a local operation id and proposed component operations. `maildesk-cf provision --ack-plan <operation-id>` is blocked until those component writes are each available through preview-gated public `cfctl` surfaces. The verifier does not perform broad live sends; enabled sender providers use DNS/authentication and provider readback evidence unless a human explicitly asks for targeted delivery proof.
 
 Token minting:
 

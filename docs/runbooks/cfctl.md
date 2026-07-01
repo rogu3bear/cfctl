@@ -164,7 +164,7 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - `apply <surface> sync` performs selective desired-state reconciliation on supported surfaces
 - `hostname verify|diff|plan` checks one YAML hostname lifecycle spec across DNS, TLS, Worker route, Access, Worker script, HTTP response, D1, and R2
 - `hostname apply` is blocked until composite mutation is backed by preview-gated component surfaces
-- `maildesk-cf init|verify|snapshot|diff|plan|provision --plan` checks one JSON maildesk spec across Email Routing aliases, Workers, D1, R2, Queues, DNS sender authentication, and outbound identity readback
+- `maildesk-cf init|verify|snapshot|diff|plan|provision --plan` checks one JSON maildesk spec across Email Routing aliases, Workers, D1, R2, Queues, sender mode, and enabled provider readback
 - `maildesk-cf provision --ack-plan <operation-id>` is blocked until composite mutation is backed by preview-gated component surfaces
 - `maildesk-cf` does not perform broad live sends; targeted delivery proof must be requested explicitly
 - destructive operations require explicit confirmation such as `--confirm delete`
@@ -202,7 +202,7 @@ The current implementation is read-only. It emits evidence for each component su
 
 ## maildesk-cf Lifecycle
 
-Use `maildesk-cf` when the question is whether a maildesk deployment is ready across inbound routing, storage, Workers, sender authentication, and outbound identity, not whether one isolated Cloudflare resource exists.
+Use `maildesk-cf` when the question is whether a maildesk deployment is ready across inbound routing, storage, Workers, and mode-driven sender posture, not whether one isolated Cloudflare resource exists.
 
 ```bash
 cfctl maildesk-cf init --domain example.com
@@ -215,8 +215,9 @@ cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
 The current implementation is read-only. `provision --plan` emits a preview
 operation id plus proposed component operations; `provision --ack-plan` is
 blocked until each component mutation is present as a public preview-gated
-surface. Sender readiness uses DNS/authentication and provider readback
-evidence. Broad live sends are never attempted by default.
+surface. The public template defaults to receive-only outbound mode; enabled
+sender providers use DNS/authentication and provider readback evidence. Broad
+live sends are never attempted by default.
 
 ## Result Envelope
 

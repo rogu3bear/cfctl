@@ -22,8 +22,9 @@ require_source_line() {
 fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-fixture.XXXXXX")"
 missing_fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-missing-fixture.XXXXXX")"
 unverified_sender_fixture_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-unverified-sender.XXXXXX")"
+cloudflare_sender_spec_file="$(mktemp "${TMPDIR:-/tmp}/maildesk-cf-cloudflare-sender-spec.XXXXXX")"
 caller_spec_dir="$(mktemp -d "${TMPDIR:-/tmp}/maildesk-cf-caller-spec.XXXXXX")"
-trap 'rm -f "${fixture_file}" "${missing_fixture_file}" "${unverified_sender_fixture_file}"; rm -rf "${caller_spec_dir}"' EXIT
+trap 'rm -f "${fixture_file}" "${missing_fixture_file}" "${unverified_sender_fixture_file}" "${cloudflare_sender_spec_file}"; rm -rf "${caller_spec_dir}"' EXIT
 
 require_source_line "worker evidence lane" '"worker.script": run_cfctl(["list", "worker.script"], lane="global"),' "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
 require_source_line "d1 evidence lane" '"d1.database": run_cfctl(["list", "d1.database"], lane="global"),' "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
@@ -140,6 +141,14 @@ cat >"${unverified_sender_fixture_file}" <<'JSON'
 }
 JSON
 
+jq '.sender = {"mode": "cloudflare_email_service", "authenticated_domains": ["example.com"]}' \
+  "${ROOT_DIR}/state/maildesk-cf/example.json" >"${cloudflare_sender_spec_file}"
+
+jq -e '
+  .sender.mode == "disabled"
+  and (.sender.authenticated_domains | length) == 0
+' "${ROOT_DIR}/state/maildesk-cf/example.json" >/dev/null || die "checked-in maildesk-cf example must default to disabled outbound sender mode"
+
 output="$(
   MAILDESK_CF_EVIDENCE_FILE="${fixture_file}" \
   MAILDESK_CF_ACTION=verify \
@@ -154,7 +163,11 @@ jq -e '
   and .readiness.instance_ready == true
   and .readiness.edge_ready == true
   and .readiness.mail_ready == true
+  and .checks.sender.mode.normalized == "disabled"
+  and .checks.sender.ready == true
   and (.drift_classes | index("provider_status_unavailable")) == null
+  and (.drift_classes | index("sender_adapter_receive_only")) == null
+  and (.drift_classes | index("sender_domain_drift")) == null
   and (.drift_classes | index("optional_live_send_not_requested")) != null
   and (.plan.operations | length) == 0
 ' "${artifact_path}" >/dev/null || die "fixture readiness contract did not match"
@@ -172,7 +185,8 @@ jq -e '
   .readiness.edge_ready == false
   and (.drift_classes | index("missing_resource")) != null
   and (.drift_classes | index("email_routing_alias_drift")) != null
-  and (.drift_classes | index("dns_authentication_drift")) != null
+  and (.drift_classes | index("dns_authentication_drift")) == null
+  and (.drift_classes | index("sender_adapter_receive_only")) == null
   and any(.plan.operations[]; .surface == "d1.database" and .preview_command == "cfctl wrangler d1 create maildesk-cf-db --plan" and .blocked == null)
   and any(.plan.operations[]; .surface == "d1.database" and .preview_command == "cfctl wrangler d1 create maildesk-cf-preview-db --plan" and .blocked == null)
   and any(.plan.operations[]; .surface == "r2.bucket" and .preview_command == "cfctl wrangler r2 bucket create maildesk-cf-raw-mail --plan" and .blocked == null)
@@ -183,7 +197,7 @@ jq -e '
 unverified_sender_output="$(
   MAILDESK_CF_EVIDENCE_FILE="${unverified_sender_fixture_file}" \
   MAILDESK_CF_ACTION=verify \
-  SPEC_FILE="${ROOT_DIR}/state/maildesk-cf/example.json" \
+  SPEC_FILE="${cloudflare_sender_spec_file}" \
   python3 "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
 )"
 unverified_sender_artifact_path="$(printf '%s\n' "${unverified_sender_output}" | tail -n 1)"
