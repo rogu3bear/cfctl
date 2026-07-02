@@ -17,6 +17,7 @@
     "policy": [
       "https://adapteros.com/security"
     ],
-    "preferred_languages": "en"
+    "preferred_languages": "en",
+    "expires": "2027-07-02T00:00:00Z"
   }
 }

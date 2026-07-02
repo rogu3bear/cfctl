@@ -14,6 +14,7 @@
     "canonical": [
       "https://mlnavigator.com/.well-known/security.txt"
     ],
-    "preferred_languages": "en"
+    "preferred_languages": "en",
+    "expires": "2027-07-02T00:00:00Z"
   }
 }
