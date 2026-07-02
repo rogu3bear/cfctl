@@ -18,6 +18,7 @@ cfctl_reset_flags() {
   CFCTL_ZONE_ID=""
   CFCTL_TYPE=""
   CFCTL_PROVIDER_ID=""
+  CFCTL_PROVIDER_IDS_JSON="[]"
   CFCTL_PROVIDER_TYPE=""
   CFCTL_PROVIDER_NAME=""
   CFCTL_SITEKEY=""
@@ -97,8 +98,8 @@ cfctl_parse_flags() {
       --zone-id=*) CFCTL_ZONE_ID="${1#*=}"; shift ;;
       --type) CFCTL_TYPE="$2"; shift 2 ;;
       --type=*) CFCTL_TYPE="${1#*=}"; shift ;;
-      --provider-id) CFCTL_PROVIDER_ID="$2"; shift 2 ;;
-      --provider-id=*) CFCTL_PROVIDER_ID="${1#*=}"; shift ;;
+      --provider-id) CFCTL_PROVIDER_ID="$2"; CFCTL_PROVIDER_IDS_JSON="$(jq -c --arg provider_id "$2" '. + [$provider_id]' <<< "${CFCTL_PROVIDER_IDS_JSON}")"; shift 2 ;;
+      --provider-id=*) CFCTL_PROVIDER_ID="${1#*=}"; CFCTL_PROVIDER_IDS_JSON="$(jq -c --arg provider_id "${1#*=}" '. + [$provider_id]' <<< "${CFCTL_PROVIDER_IDS_JSON}")"; shift ;;
       --provider-type) CFCTL_PROVIDER_TYPE="$2"; shift 2 ;;
       --provider-type=*) CFCTL_PROVIDER_TYPE="${1#*=}"; shift ;;
       --provider-name) CFCTL_PROVIDER_NAME="$2"; shift 2 ;;

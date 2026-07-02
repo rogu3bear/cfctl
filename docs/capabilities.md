@@ -56,7 +56,10 @@ This matrix is derived from the same catalogs used by `cfctl explain`, `cfctl cl
 | `access.idp` | `create` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |
 | `access.idp` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | one of: id / type / name |
 | `access.idp` | `update` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | one of: id / type / name |
+| `access.login_method` | `add` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | one of: provider_id / provider_type / provider_name |
+| `access.login_method` | `remove` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | one of: provider_id / provider_type / provider_name |
 | `access.login_method` | `set` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | one of: provider_id / provider_type / provider_name |
+| `access.login_method` | `set-list` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | one of: provider_id |
 | `access.policy` | `create` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: app_id |
 | `access.policy` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: app_id, policy_id |
 | `access.policy` | `make-reusable` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: app_id, policy_id |

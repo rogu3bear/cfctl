@@ -931,6 +931,9 @@ assert_jq_file "surface module bindings" '
   and .surfaces["access.login_method"].inventory_script == "scripts/cf_inventory_access_login_methods.sh"
   and .surfaces["access.login_method"].apply_script == "scripts/cf_mutate_access_login_method.sh"
   and (.surfaces["access.login_method"].actions.apply.operations.set.selectors_any_of | any(. == ["provider_type"]))
+  and (.surfaces["access.login_method"].actions.apply.operations | keys | sort) == ["add", "remove", "set", "set-list"]
+  and (.surfaces["access.login_method"].actions.apply.operations["set-list"].selectors_any_of | any(. == ["provider_id"]))
+  and (.surfaces["access.login_method"].actions.apply.operations.remove.selectors_any_of | any(. == ["provider_type"]))
   and .surfaces["access.idp"].standards_ref == "access.idp"
   and .surfaces["access.idp"].inventory_script == "scripts/cf_inventory_access_identity_providers.sh"
   and .surfaces["access.idp"].apply_script == "scripts/cf_mutate_access_identity_provider.sh"

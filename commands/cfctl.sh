@@ -3993,6 +3993,7 @@ cfctl_handle_apply() {
         "APP_NAME=${CFCTL_NAME}" \
         "APP_DOMAIN=${CFCTL_DOMAIN}" \
         "PROVIDER_ID=${CFCTL_PROVIDER_ID}" \
+        "PROVIDER_IDS_JSON=${CFCTL_PROVIDER_IDS_JSON}" \
         "PROVIDER_TYPE=${CFCTL_PROVIDER_TYPE}" \
         "PROVIDER_NAME=${CFCTL_PROVIDER_NAME}"
       ;;

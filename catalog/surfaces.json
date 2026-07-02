@@ -1018,6 +1018,18 @@
             "set": {
               "risk": "write",
               "selectors_any_of": [["provider_id"], ["provider_type"], ["provider_name"]]
+            },
+            "set-list": {
+              "risk": "write",
+              "selectors_any_of": [["provider_id"]]
+            },
+            "add": {
+              "risk": "write",
+              "selectors_any_of": [["provider_id"], ["provider_type"], ["provider_name"]]
+            },
+            "remove": {
+              "risk": "write",
+              "selectors_any_of": [["provider_id"], ["provider_type"], ["provider_name"]]
             }
           }
         }
@@ -1027,7 +1039,9 @@
         "./cfctl list access.login_method --domain docs.example.org",
         "./cfctl apply access.login_method set --provider-type onetimepin --plan",
         "./cfctl apply access.login_method set --provider-id <provider-id> --ack-plan <operation-id>",
-        "./cfctl apply access.login_method set --provider-name 'One-time PIN' --plan"
+        "./cfctl apply access.login_method set-list --provider-id <id-a> --provider-id <id-b> --domain docs.example.org --plan",
+        "./cfctl apply access.login_method add --provider-type onetimepin --domain docs.example.org --plan",
+        "./cfctl apply access.login_method remove --provider-type onetimepin --domain docs.example.org --plan"
       ]
     },
     "access.idp": {

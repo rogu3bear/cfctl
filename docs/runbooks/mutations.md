@@ -56,6 +56,21 @@ CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-id <provider
 
 Add `--id`, `--name`, or `--domain` to narrow the app target. Without an app selector, the target is all Access applications.
 
+Beyond single-provider pinning, login methods support explicit multi-IdP sets
+and per-app union/subtraction:
+
+```bash
+cfctl apply access.login_method set-list --provider-id <id-a> --provider-id <id-b> --domain docs.example.org --plan
+cfctl apply access.login_method add --provider-type onetimepin --domain docs.example.org --plan
+cfctl apply access.login_method remove --provider-type onetimepin --domain docs.example.org --plan
+```
+
+`add` and `remove` compute each app's desired set from its current
+`allowed_idps` (idempotent noops included). Any change that would leave an
+app's `allowed_idps` empty is refused — empty means every login method is
+allowed — so removing the last provider requires an explicit `set`/`set-list`
+decision instead.
+
 Identity-provider lifecycle itself lives on `access.idp`. Creating or deleting
 the `onetimepin` provider is the account-wide OTP login-method toggle;
 creating it when it already exists is a noop, and delete is destructive:

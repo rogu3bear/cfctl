@@ -163,13 +163,20 @@
           "id": "access.login_method.readback",
           "level": "required",
           "title": "Verify exact allowed_idps readback",
-          "summary": "After apply, every targeted app must read back with allowed_idps set to exactly the resolved provider id."
+          "summary": "After apply, every targeted app must read back with allowed_idps equal (order-insensitive) to that app's resolved desired provider set — the single pinned provider for set, the explicit list for set-list, or the computed union/subtraction result for add/remove."
+        },
+        {
+          "id": "access.login_method.multi-idp-explicit",
+          "level": "required",
+          "title": "Never let a change empty allowed_idps",
+          "summary": "add/remove/set-list compute a per-app desired provider set and must refuse any change whose result would be an empty allowed_idps (empty means every login method is allowed); use set or set-list to pin an explicit set instead."
         }
       ],
       "evidence": [
         "cfctl list access.login_method",
         "cfctl apply access.login_method set --provider-type onetimepin --plan",
-        "cfctl apply access.login_method set --provider-id <provider-id> --ack-plan <operation-id>"
+        "cfctl apply access.login_method set --provider-id <provider-id> --ack-plan <operation-id>",
+        "cfctl apply access.login_method remove --provider-type onetimepin --domain docs.example.org --plan"
       ]
     },
     "access.idp": {
