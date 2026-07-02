@@ -191,6 +191,30 @@
     ],
     "summary": "Workspace env fallback: strict KEY=VALUE import of lane credentials, lane requirements, and this allowlist; never sourced as shell, never overwrites canonical shared or repo env values."
   },
+  "token_lifecycle": {
+    "state_dir_default": "~/dev/.secrets-state",
+    "state_dir_env": "CF_TOKEN_STATE_DIR",
+    "state_file_pattern": "<consumer>.json",
+    "read_lane": "global",
+    "write_lane": "global",
+    "schema": {
+      "children": "map<purpose, {active: {id, minted_at, expires_on}, pending_revoke: [{id, minted_at, expires_on}]}>"
+    },
+    "purposes_file": {
+      "owner": "consumer",
+      "schema": "{ purposes: [ { purpose, name_prefix, ttl_days, policies: [<cloudflare token policy>] } ] }",
+      "note": "The consumer declares WHAT each scoped child may do; cfctl owns the lifecycle mechanics. Keeps cfctl generic — no app purposes hardcoded. See docs/examples/token-purposes.example.json."
+    },
+    "verbs": {
+      "get": "read a single token's live status/metadata",
+      "verify-state": "read-only drift watchdog — active children must be status:active, pending_revoke children must be dead",
+      "rotate": "mint fresh children for purposes past half their TTL; record active, demote prior to pending_revoke; return a delivery manifest",
+      "revoke-pending": "sweep the pending_revoke queue (previews by default, --commit to execute)"
+    },
+    "ordering_contract": "rotate -> deliver each manifest value_path -> revoke-pending (only after successful delivery, so the prior token stays valid until swept)",
+    "delivery_boundary": "cfctl mints and tracks scoped children and writes each new value to <sink-dir>/<purpose>.token (mode 600, outside the repo); delivering that value to a Worker/Pages/env sink stays consumer-side.",
+    "summary": "Per-consumer scoped-child token lifecycle owned by cfctl: get + verify-state (read), rotate + revoke-pending (write). The state store is shared with the consumer's rotator, which collapses to a thin delivery caller."
+  },
   "tool_wrappers": {
     "wrangler": {
       "script": "scripts/cf_wrangler.sh",
