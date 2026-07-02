@@ -15,20 +15,14 @@ Cloudflare account.
   `Account Settings Read` or `Account Settings Write` and supports bounded
   `since`, `before`, and `limit` queries:
   <https://developers.cloudflare.com/api/resources/accounts/subresources/logs/subresources/audit/methods/list/>.
-- GitHub Actions environment secrets and protection rules gate a job before it
-  can access environment secrets:
-  <https://docs.github.com/en/actions/concepts/workflows-and-actions/deployment-environments>.
-- GitHub Actions required reviewers can block protected-environment jobs until
-  an allowed reviewer approves them:
-  <https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments#required-reviewers>.
 
-## Live Contract Environment
+## Live Contract Inputs
 
-The live Cloudflare contract job must run in the `cfctl-live` GitHub Actions
-environment. Configure that environment with required reviewers and store the
-live contract credentials there, not as broadly accessible repository secrets.
+Live Cloudflare contract checks are local-only in this checkout. Store live
+contract credentials in local operator env files or an explicit shell session,
+not in repository files or hosted CI secrets.
 
-Required environment secrets and variables:
+Required local inputs:
 
 - `CF_DEV_TOKEN`: a scoped day-to-day operator token, not the bootstrap creator.
 - `CLOUDFLARE_ACCOUNT_ID`: the account pinned for live contract verification.
@@ -43,9 +37,9 @@ zone, for example:
 CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_public_contract.sh
 ```
 
-The live job is intentionally not run on pull requests. It runs on
-`workflow_dispatch` and the scheduled contract lane after the protected
-environment releases the job.
+The live check is intentionally not attached to pull requests, pushes,
+schedules, or hosted dispatch. Run it explicitly from the checkout after the
+token lane and smoke zone are known.
 
 ## Bootstrap Creator
 
@@ -58,8 +52,8 @@ Allowed bootstrap creator permissions:
 - `Account API Tokens Write`
 - `Account Settings Read`
 
-The bootstrap creator must not be installed as `CF_DEV_TOKEN`, stored in GitHub
-Actions, or reused for day-to-day operations.
+The bootstrap creator must not be installed as `CF_DEV_TOKEN`, stored in hosted
+CI, or reused for day-to-day operations.
 
 ## Operator Profiles
 
@@ -108,5 +102,5 @@ Before merging permission or live-contract changes:
 - `python3 scripts/verify_permission_catalog.py`
 - `python3 scripts/verify_permission_catalog.py --cfctl ./cfctl`
 - `python3 scripts/verify_permission_catalog.py --permission-groups <live-artifact>`
-- Manual `cfctl contract` workflow dispatch against the `cfctl-live`
-  environment after secrets are configured.
+- Local live-contract smoke with explicit local inputs, for example
+  `CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_public_contract.sh`.

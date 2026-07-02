@@ -204,16 +204,14 @@ adds a live drift check by comparing the catalog against Cloudflare's current
 permission-group inventory. For a credentialless runtime-output check, run
 `python3 scripts/verify_permission_catalog.py --cfctl ./cfctl`.
 
-The GitHub Actions workflow in [.github/workflows/cfctl-contract.yml](.github/workflows/cfctl-contract.yml)
-runs static contract checks on pull requests. Its scheduled and manual live
-job runs through the `cfctl-live` protected environment and requires
-`CF_DEV_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CFCTL_PUBLIC_CONTRACT_ZONE`, then
-runs the live permission-group drift and public-contract smoke tests. The
+Remote CI is intentionally absent from this checkout. Use
+[LOCAL_CI.md](LOCAL_CI.md) for the local contract gate. Live permission-group
+drift and public-contract smoke tests require local operator credentials:
+`CF_DEV_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CFCTL_PUBLIC_CONTRACT_ZONE`. The
 selected token lane must be able to operate on `CFCTL_PUBLIC_CONTRACT_ZONE`; run
 local smoke tests with an explicit lane when the default lane cannot see that
 zone, such as `CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com
-./scripts/verify_public_contract.sh`. The
-operator policy for these credentials is in
+./scripts/verify_public_contract.sh`. The operator policy for these credentials is in
 [docs/permission-doctrine.md](docs/permission-doctrine.md).
 
 See [docs/runbooks/cfctl.md](docs/runbooks/cfctl.md) and [docs/capabilities.md](docs/capabilities.md) for the full reference. `docs/capabilities.md` is generated from the catalogs and is the fastest way to see which surfaces are read-only, which operations are preview-gated, which destructive operations require confirmation, and which surfaces support desired-state sync.
