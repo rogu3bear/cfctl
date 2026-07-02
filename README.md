@@ -188,6 +188,8 @@ Token minting:
 ```bash
 cfctl token get --id <token-id>
 CF_TOKEN_LANE=global cfctl token verify-state --consumer mln-web
+CF_TOKEN_LANE=global cfctl token rotate --consumer mln-web --purposes-file mln-web.purposes.json --sink-dir /run/user/501/cf-rotate
+CF_TOKEN_LANE=global cfctl token revoke-pending --consumer mln-web --commit
 cfctl token permission-groups --name "DNS"
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --plan
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --ack-plan <operation-id> --value-out /tmp/dns-editor.token
