@@ -9,8 +9,10 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | Surface | Read | Can | Apply | Verify | Desired State | Standards | Docs Topics | Module |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `access.app` | yes | yes | yes | yes | yes | `access.app` | `zero-trust-api, api-auth` | `access_app` |
+| `access.group` | yes | yes | yes | yes | no | `access.group` | `zero-trust-api, api-auth` | `-` |
 | `access.idp` | yes | yes | yes | yes | no | `access.idp` | `zero-trust-api, api-auth` | `-` |
 | `access.login_method` | yes | yes | yes | yes | no | `access.login_method` | `zero-trust-api, api-auth` | `access_login_method` |
+| `access.organization` | yes | yes | yes | yes | no | `access.organization` | `zero-trust-api, api-auth` | `-` |
 | `access.policy` | yes | yes | yes | yes | yes | `access.policy` | `zero-trust-api, api-auth` | `access_policy` |
 | `access.service_token` | yes | yes | yes | yes | no | `-` | `-` | `-` |
 | `api_gateway.discovery` | yes | yes | no | yes | no | `-` | `api-gateway, api-auth` | `-` |
@@ -53,6 +55,9 @@ This matrix is derived from the same catalogs used by `cfctl explain`, `cfctl cl
 | `access.app` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: id |
 | `access.app` | `update` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: id |
 | `access.app` | `sync` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | state match: id, name, domain |
+| `access.group` | `create` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |
+| `access.group` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: id |
+| `access.group` | `update` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: id |
 | `access.idp` | `create` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |
 | `access.idp` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | one of: id / type / name |
 | `access.idp` | `update` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | one of: id / type / name |
@@ -60,6 +65,10 @@ This matrix is derived from the same catalogs used by `cfctl explain`, `cfctl cl
 | `access.login_method` | `remove` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | one of: provider_id / provider_type / provider_name |
 | `access.login_method` | `set` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | one of: provider_id / provider_type / provider_name |
 | `access.login_method` | `set-list` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | one of: provider_id |
+| `access.organization` | `set-auto-redirect-to-identity` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |
+| `access.organization` | `set-session-duration` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |
+| `access.organization` | `set-ui-read-only` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |
+| `access.organization` | `update` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |
 | `access.policy` | `create` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: app_id |
 | `access.policy` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: app_id, policy_id |
 | `access.policy` | `make-reusable` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: app_id, policy_id |

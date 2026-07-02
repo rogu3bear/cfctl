@@ -1098,6 +1098,112 @@
         "./cfctl apply access.idp delete --type onetimepin --confirm delete --plan"
       ]
     },
+    "access.group": {
+      "description": "Cloudflare Access groups (reusable include/exclude/require rule groups) in the pinned account.",
+      "standards_ref": "access.group",
+      "docs_topics": ["zero-trust-api", "api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_access_groups.sh",
+      "apply_script": "scripts/cf_mutate_access_group.sh",
+      "permission_family": "Access: Organizations, Identity Providers, and Groups",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/access/groups"
+      },
+      "selectors": ["id", "name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "create": {
+              "risk": "write"
+            },
+            "update": {
+              "risk": "write",
+              "required_selectors": ["id"]
+            },
+            "delete": {
+              "risk": "destructive",
+              "required_selectors": ["id"],
+              "confirm": "delete"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list access.group",
+        "./cfctl get access.group --name operators",
+        "./cfctl apply access.group create --body '{\"name\":\"operators\",\"include\":[{\"email\":{\"email\":\"ops@example.com\"}}]}' --plan",
+        "./cfctl apply access.group update --id <group-id> --body-file group.json --plan",
+        "./cfctl apply access.group delete --id <group-id> --confirm delete --plan"
+      ]
+    },
+    "access.organization": {
+      "description": "Cloudflare Access organization settings (the Zero Trust org singleton): session duration, UI read-only, auto-redirect, login design. Writes are field-scoped read-modify-write, never blind PUTs.",
+      "standards_ref": "access.organization",
+      "docs_topics": ["zero-trust-api", "api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_access_organization.sh",
+      "apply_script": "scripts/cf_mutate_access_organization.sh",
+      "permission_family": "Access: Organizations, Identity Providers, and Groups",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/access/organizations"
+      },
+      "selectors": [],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true
+        },
+        "verify": {
+          "supported": true
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "set-session-duration": {
+              "risk": "write"
+            },
+            "set-ui-read-only": {
+              "risk": "write"
+            },
+            "set-auto-redirect-to-identity": {
+              "risk": "write"
+            },
+            "update": {
+              "risk": "write"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list access.organization",
+        "./cfctl get access.organization",
+        "./cfctl apply access.organization set-session-duration --content 24h --plan",
+        "./cfctl apply access.organization set-ui-read-only --content true --plan",
+        "./cfctl apply access.organization update --body '{\"login_design\":{\"header_text\":\"Ops\"}}' --plan"
+      ]
+    },
     "access.policy": {
       "description": "Application-scoped Access policies attached to Access apps.",
       "module": "access_policy",

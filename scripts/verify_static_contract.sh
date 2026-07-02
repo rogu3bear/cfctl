@@ -100,6 +100,11 @@ bash -n \
   "${ROOT_DIR}/scripts/verify_access_identity_provider_contract.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_access_identity_providers.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_access_identity_provider.sh" \
+  "${ROOT_DIR}/scripts/verify_access_organization_contract.sh" \
+  "${ROOT_DIR}/scripts/cf_inventory_access_groups.sh" \
+  "${ROOT_DIR}/scripts/cf_mutate_access_group.sh" \
+  "${ROOT_DIR}/scripts/cf_inventory_access_organization.sh" \
+  "${ROOT_DIR}/scripts/cf_mutate_access_organization.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_access_login_methods.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_audit_logs.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_api_gateway.sh" \
@@ -251,6 +256,7 @@ python3 -m py_compile "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
 "${ROOT_DIR}/scripts/verify_maildesk_cf_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_env_loader_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_access_identity_provider_contract.sh" >/dev/null
+"${ROOT_DIR}/scripts/verify_access_organization_contract.sh" >/dev/null
 
 set +e
 doctor_bootstrap_json="$(
@@ -944,6 +950,20 @@ assert_jq_file "surface module bindings" '
   and .surfaces["access.idp"].actions.apply.operations.delete.confirm == "delete"
   and .surfaces["access.idp"].actions.apply.operations.delete.risk == "destructive"
   and (.surfaces["access.idp"].actions.apply.operations.delete.selectors_any_of | any(. == ["type"]))
+  and .surfaces["access.group"].standards_ref == "access.group"
+  and .surfaces["access.group"].inventory_script == "scripts/cf_inventory_access_groups.sh"
+  and .surfaces["access.group"].apply_script == "scripts/cf_mutate_access_group.sh"
+  and .surfaces["access.group"].probe.path_template == "/accounts/{account_id}/access/groups"
+  and (.surfaces["access.group"].docs_topics | index("zero-trust-api")) != null
+  and .surfaces["access.group"].actions.apply.operations.update.required_selectors == ["id"]
+  and .surfaces["access.group"].actions.apply.operations.delete.confirm == "delete"
+  and .surfaces["access.organization"].standards_ref == "access.organization"
+  and .surfaces["access.organization"].inventory_script == "scripts/cf_inventory_access_organization.sh"
+  and .surfaces["access.organization"].apply_script == "scripts/cf_mutate_access_organization.sh"
+  and .surfaces["access.organization"].probe.path_template == "/accounts/{account_id}/access/organizations"
+  and (.surfaces["access.organization"].docs_topics | index("zero-trust-api")) != null
+  and (.surfaces["access.organization"].actions.apply.operations | keys | sort) == ["set-auto-redirect-to-identity", "set-session-duration", "set-ui-read-only", "update"]
+  and ([.surfaces["access.organization"].actions.apply.operations[] | .risk] | all(. == "write"))
   and .surfaces["access.policy"].module == "access_policy"
   and .surfaces["access.policy"].standards_ref == "access.policy"
   and (.surfaces["access.policy"].docs_topics | index("zero-trust-api")) != null

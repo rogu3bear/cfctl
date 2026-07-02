@@ -76,6 +76,45 @@
       "incident_runbook": "AGENTS.md#evidence-contract"
     },
     {
+      "id": "cfctl-access-organization-singleton",
+      "resource_key": "cloudflare:access.organization:singleton",
+      "resource": {
+        "cloudflare_surface": "access.organization",
+        "scope": "account",
+        "selectors": {
+          "singleton": true
+        }
+      },
+      "owner": {
+        "system": "cfctl",
+        "repo": "rogu3bear/cfctl",
+        "role": "cloudflare-control-plane"
+      },
+      "deploy_lane": {
+        "default": "CF_DEV_TOKEN",
+        "emergency": "CF_GLOBAL_TOKEN"
+      },
+      "secrets": {
+        "env": ["CF_DEV_TOKEN", "CF_GLOBAL_TOKEN", "CLOUDFLARE_ACCOUNT_ID"],
+        "source": "~/.config/cfctl/.env"
+      },
+      "domain": [],
+      "worker_page": [],
+      "database_storage": [],
+      "authority": {
+        "control_plane": "cfctl",
+        "allowed_change_commands": [
+          "cfctl apply access.organization set-session-duration --content <duration> --plan",
+          "cfctl apply access.organization set-session-duration --content <duration> --ack-plan <operation-id>",
+          "cfctl apply access.organization update --body-file <patch.json> --plan",
+          "cfctl apply access.organization update --body-file <patch.json> --ack-plan <operation-id>"
+        ],
+        "verifier": "cfctl verify access.organization",
+        "proof_class": "post_change_verification"
+      },
+      "incident_runbook": "AGENTS.md#evidence-contract"
+    },
+    {
       "id": "cfctl-dns-record-state",
       "resource_key": "cloudflare:dns.record:*",
       "resource": {

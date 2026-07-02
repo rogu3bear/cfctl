@@ -207,6 +207,50 @@
         "cfctl apply access.idp delete --type onetimepin --confirm delete --plan"
       ]
     },
+    "access.group": {
+      "stance": "preview-gated CRUD for reusable Access rule groups",
+      "standards": [
+        {
+          "id": "access.group.body-driven",
+          "level": "required",
+          "title": "Group writes are explicit body-driven CRUD",
+          "summary": "create and update take an operator-supplied JSON body with name/include/exclude/require; cfctl does not invent or merge rule structures."
+        },
+        {
+          "id": "access.group.delete-by-id",
+          "level": "required",
+          "title": "Delete targets an exact group id",
+          "summary": "delete is destructive, requires --id and --confirm delete, and goes through plan/ack like every account mutation."
+        }
+      ],
+      "evidence": [
+        "cfctl list access.group",
+        "cfctl apply access.group create --body-file group.json --plan",
+        "cfctl apply access.group delete --id <group-id> --confirm delete --plan"
+      ]
+    },
+    "access.organization": {
+      "stance": "field-scoped read-modify-write for the Zero Trust org singleton",
+      "standards": [
+        {
+          "id": "access.organization.field-scoped-writes",
+          "level": "required",
+          "title": "Never blind-PUT the organization",
+          "summary": "Every write merges onto the live org object (field-scoped ops or a recursive body merge) and strips read-only timestamps; equal state is a noop, and changed fields are verified by readback."
+        },
+        {
+          "id": "access.organization.session-duration-deliberate",
+          "level": "recommended",
+          "title": "Treat session duration as account-wide auth policy",
+          "summary": "session_duration and auto_redirect_to_identity affect every Access application; change them deliberately with plan/ack and record the rationale in the operation trail."
+        }
+      ],
+      "evidence": [
+        "cfctl get access.organization",
+        "cfctl apply access.organization set-session-duration --content 24h --plan",
+        "cfctl verify access.organization"
+      ]
+    },
     "access.policy": {
       "stance": "desired-state preferred for shared and high-value policies",
       "standards": [

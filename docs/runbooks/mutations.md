@@ -90,6 +90,24 @@ omits provider config secrets, so cfctl refuses to build read-modify-write
 bodies that would blank them. Secret-like config values are redacted before
 any body reaches a plan artifact.
 
+Access groups are body-driven CRUD, and the Zero Trust organization singleton
+takes field-scoped writes that merge onto live state (never a blind PUT):
+
+```bash
+cfctl list access.group
+cfctl apply access.group create --body-file group.json --plan
+cfctl apply access.group update --id <group-id> --body-file group.json --plan
+cfctl apply access.group delete --id <group-id> --confirm delete --plan
+cfctl get access.organization
+cfctl apply access.organization set-session-duration --content 24h --plan
+cfctl apply access.organization set-ui-read-only --content true --plan
+cfctl apply access.organization update --body '{"login_design":{"header_text":"Ops"}}' --plan
+```
+
+Organization writes read the live org object first, merge the requested
+change, strip read-only timestamps, plan a noop when nothing differs, and
+verify changed fields by readback after apply.
+
 Example authorization flow:
 
 ```bash

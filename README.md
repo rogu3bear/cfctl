@@ -103,6 +103,8 @@ cfctl list audit.log
 cfctl list pages.project
 cfctl list access.login_method
 cfctl list access.idp
+cfctl list access.group
+cfctl get access.organization
 cfctl get access.app --domain docs.example.org
 cfctl list edge.certificate --zone example.com
 cfctl list zone.setting --zone example.com
