@@ -94,6 +94,7 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_cloudflared.sh" \
   "${ROOT_DIR}/scripts/cf_token_revoke.sh" \
   "${ROOT_DIR}/scripts/cf_token_get.sh" \
+  "${ROOT_DIR}/scripts/cf_token_verify_state.sh" \
   "${ROOT_DIR}/scripts/verify_access_login_method_contract.sh" \
   "${ROOT_DIR}/scripts/verify_maildesk_cf_contract.sh" \
   "${ROOT_DIR}/scripts/verify_env_loader_contract.sh" \
