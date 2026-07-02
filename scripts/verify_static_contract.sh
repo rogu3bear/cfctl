@@ -105,6 +105,8 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_mutate_access_group.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_access_organization.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_access_organization.sh" \
+  "${ROOT_DIR}/scripts/cf_audit_access_posture.sh" \
+  "${ROOT_DIR}/scripts/verify_access_posture_contract.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_access_login_methods.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_audit_logs.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_api_gateway.sh" \
@@ -257,6 +259,13 @@ python3 -m py_compile "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
 "${ROOT_DIR}/scripts/verify_env_loader_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_access_identity_provider_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_access_organization_contract.sh" >/dev/null
+"${ROOT_DIR}/scripts/verify_access_posture_contract.sh" >/dev/null
+
+audit_access_help_output="$("${ROOT_DIR}/cfctl" audit --help)"
+grep -Fq 'cfctl audit access [--id <app-id>|--domain <app-domain>] [--strict]' <<< "${audit_access_help_output}" || die "audit help missing access posture usage"
+grep -Fq 'counterpart to source-config' <<< "${audit_access_help_output}" || die "audit help must keep the live-vs-source-config distinction"
+assert_contains "posture audit ties checks to standards ids" 'standard_ref: "access.app.allowed-idps-explicit"' "${ROOT_DIR}/scripts/cf_audit_access_posture.sh"
+assert_contains "posture audit reads desired-state otp intent" 'state/access.app' "${ROOT_DIR}/scripts/cf_audit_access_posture.sh"
 
 set +e
 doctor_bootstrap_json="$(

@@ -320,6 +320,15 @@ cfctl admin revoke-backend --path <authorization-path>
 
 `cfctl standards audit` performs checked-in Wrangler config alignment, including `compatibility_date` freshness — it finds missing or stale `compatibility_date`, missing observability, plaintext secret-like vars, binding shape drift. Workspace-wide scans also classify source authority so canonical repo config can be separated from worktree, dry-run deploy, and baseline-copy config without hiding those files. **It does not inspect the Cloudflare dashboard.** For live assertions, use `cfctl list`, `cfctl get`, `cfctl snapshot`, `cfctl can`, or `cfctl verify` and cite the emitted artifact.
 
+`cfctl audit access` is the live-truth complement for authentication posture:
+it reads the account's Access applications and identity providers and
+evaluates machine pass/fail checks tied to catalog standards — explicit
+`allowed_idps`, onetimepin (OTP) allowed only where a `state/access.app`
+spec records it, launcher visibility, auto-redirect, and allow-policy
+coverage. `--strict` also fails recommended-level warnings; `--id`/`--domain`
+scope the audit to one application. Exit code and `ok` reflect the result, so
+it works as a gate.
+
 ## Compatibility
 
 Legacy `scripts/cf_*` entrypoints remain executable, but mutation-capable backends are backend-only by default and must be reached through `cfctl`. Direct maintainer/debug use requires `CF_BACKEND_BYPASS_FILE=<authorization-path>` from `cfctl admin authorize-backend`.

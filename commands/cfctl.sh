@@ -5350,6 +5350,74 @@ EOF
   esac
 }
 
+cfctl_handle_audit_access() {
+  local script_path="${CF_REPO_ROOT}/scripts/cf_audit_access_posture.sh"
+  local result_json
+  local summary_json
+  local fail_count
+  local warning_count
+  local ok="true"
+
+  cfctl_run_backend_script "${script_path}" \
+    "APP_ID=${CFCTL_ID}" \
+    "APP_DOMAIN=${CFCTL_DOMAIN}"
+
+  if [[ "${CFCTL_BACKEND_STATUS}" -ne 0 || -z "${CFCTL_BACKEND_ARTIFACT_JSON}" || "${CFCTL_BACKEND_ARTIFACT_JSON}" == "null" ]]; then
+    cfctl_emit_failure \
+      "audit" \
+      "access" \
+      "audit_script" \
+      '{"state":"unknown","basis":"execution_failed","errors":[],"request":null,"status_code":null,"permission_family":"Access: Apps and Policies"}' \
+      "execution_failed" \
+      "Access posture audit backend failed; check lane permissions with cfctl can access.app --all-lanes" \
+      "access"
+    exit 1
+  fi
+
+  result_json="${CFCTL_BACKEND_ARTIFACT_JSON}"
+  fail_count="$(jq -r '.summary.fail_count // 0' <<< "${result_json}")"
+  warning_count="$(jq -r '.summary.warning_count // 0' <<< "${result_json}")"
+
+  if [[ "${fail_count}" -gt 0 ]]; then
+    ok="false"
+  fi
+  if [[ "${CFCTL_STRICT}" == "1" && "${warning_count}" -gt 0 ]]; then
+    ok="false"
+  fi
+
+  summary_json="$(
+    jq \
+      --argjson strict "$([[ "${CFCTL_STRICT}" == "1" ]] && echo true || echo false)" \
+      '{
+        status: (if (.summary.fail_count // 0) > 0 then "fail" elif (.summary.warning_count // 0) > 0 then "warn" else "pass" end),
+        strict_mode: $strict,
+        scoped_app_count: (.scoped_app_count // 0),
+        check_count: (.summary.check_count // 0),
+        pass_count: (.summary.pass_count // 0),
+        fail_count: (.summary.fail_count // 0),
+        warning_count: (.summary.warning_count // 0),
+        offender_total: (.summary.offender_total // 0),
+        otp_login_enabled: (.otp.provider_present // false),
+        failing_checks: (.summary.failing_checks // [])
+      }' <<< "${result_json}"
+  )"
+
+  cfctl_emit_result \
+    "${ok}" \
+    "audit" \
+    "access" \
+    "audit_script" \
+    "true" \
+    '{"state":"not_applicable","basis":"live_posture_audit","errors":[],"request":null,"status_code":null,"permission_family":"Access: Apps and Policies"}' \
+    '{"state":"not_applicable"}' \
+    "${summary_json}" \
+    "${result_json}" \
+    "${CFCTL_BACKEND_ARTIFACT_PATH}" \
+    "$([[ "${ok}" == "true" ]] && printf '' || printf 'posture_check_failed')" \
+    "$([[ "${ok}" == "true" ]] && printf '' || printf 'One or more live Access posture checks failed')" \
+    "access"
+}
+
 cfctl_handle_audit() {
   local subcommand="${1:-trust}"
 
@@ -5357,13 +5425,22 @@ cfctl_handle_audit() {
     trust)
       cfctl_handle_doctor
       ;;
+    access)
+      cfctl_handle_audit_access
+      ;;
     ""|-h|--help|help)
       cat <<'EOF'
 Usage:
   cfctl audit trust
+  cfctl audit access [--id <app-id>|--domain <app-domain>] [--strict]
 
 Notes:
   cfctl audit trust is an alias for cfctl doctor.
+  cfctl audit access evaluates live Access posture (allowed_idps shape,
+  onetimepin intent, launcher visibility, auto-redirect, allow policies)
+  as pass/fail checks tied to catalog standards. It reads the live
+  account — the counterpart to source-config `cfctl standards audit`.
+  --strict also fails on recommended-level warnings.
 EOF
       ;;
     *)

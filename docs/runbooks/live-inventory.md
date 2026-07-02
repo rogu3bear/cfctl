@@ -90,6 +90,7 @@ cfctl list access.app
 cfctl list access.idp
 cfctl list access.group
 cfctl get access.organization
+cfctl audit access
 cfctl list tunnel
 ```
 

@@ -50,6 +50,7 @@ cfctl env run --lane dev -- env
 cfctl explain access.app
 cfctl list access.login_method
 cfctl list access.idp
+cfctl audit access
 cfctl classify tunnel create
 cfctl guide access.login_method set --provider-type onetimepin
 CF_TOKEN_LANE=global cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
