@@ -5418,6 +5418,105 @@ cfctl_handle_audit_access() {
     "access"
 }
 
+cfctl_state_audit_surfaces_json() {
+  # Desired-state surfaces that support a diff, catalog-driven so the sweep
+  # auto-extends when a new sync-backed surface lands.
+  jq -c '
+    [ .desired_state // {} | to_entries[]
+      | select(.value.supported == true and .value.sync_supported == true)
+      | .key ]
+  ' "${CFCTL_RUNTIME_CATALOG_PATH:-${CF_REPO_ROOT}/catalog/runtime.json}"
+}
+
+cfctl_state_audit_zones_for_surface() {
+  # Distinct zones a surface's specs target; empty for account-scoped surfaces.
+  local surface="$1"
+  cfctl_load_state_specs "${surface}" \
+    | jq -r '[.[] | .match.zone // empty] | unique | .[]'
+}
+
+cfctl_handle_audit_state() {
+  local cfctl_bin="${CF_REPO_ROOT}/cfctl"
+  local targets_json='[]'
+  local surface
+  local zone
+  local scope
+  local diff_json
+  local diff_status
+  local target_entry
+  local posture_json='null'
+  local ok="true"
+  local converged
+
+  while IFS= read -r surface; do
+    [[ -n "${surface}" ]] || continue
+
+    local zones_json
+    zones_json="$(cfctl_state_audit_zones_for_surface "${surface}" | jq -R . | jq -sc .)"
+
+    if [[ "$(jq 'length' <<< "${zones_json}")" -gt 0 ]]; then
+      scope="zone"
+      while IFS= read -r zone; do
+        [[ -n "${zone}" ]] || continue
+        diff_status=0
+        diff_json="$("${cfctl_bin}" diff "${surface}" --zone "${zone}" 2>/dev/null)" || diff_status=$?
+        target_entry="$(
+          jq -n \
+            --arg surface "${surface}" \
+            --arg scope "${scope}" \
+            --arg zone "${zone}" \
+            --argjson ok "$([[ "${diff_status}" -eq 0 ]] && echo true || echo false)" \
+            --argjson result "$(jq -c '.result // null' <<< "${diff_json:-null}" 2>/dev/null || echo null)" \
+            '{surface: $surface, scope: $scope, zone: $zone, ok: $ok, result: $result, error: (if $ok then null else "diff_failed" end)}'
+        )"
+        targets_json="$(jq -c --argjson entry "${target_entry}" '. + [$entry]' <<< "${targets_json}")"
+      done < <(jq -r '.[]' <<< "${zones_json}")
+    else
+      scope="account"
+      diff_status=0
+      diff_json="$("${cfctl_bin}" diff "${surface}" 2>/dev/null)" || diff_status=$?
+      target_entry="$(
+        jq -n \
+          --arg surface "${surface}" \
+          --arg scope "${scope}" \
+          --argjson ok "$([[ "${diff_status}" -eq 0 ]] && echo true || echo false)" \
+          --argjson result "$(jq -c '.result // null' <<< "${diff_json:-null}" 2>/dev/null || echo null)" \
+          '{surface: $surface, scope: $scope, zone: null, ok: $ok, result: $result, error: (if $ok then null else "diff_failed" end)}'
+      )"
+      targets_json="$(jq -c --argjson entry "${target_entry}" '. + [$entry]' <<< "${targets_json}")"
+    fi
+  done < <(cfctl_state_audit_surfaces_json | jq -r '.[]')
+
+  # Fold in live Access posture (best-effort; absence is reported, not fatal).
+  local posture_status=0
+  local posture_raw
+  posture_raw="$("${cfctl_bin}" audit access 2>/dev/null)" || posture_status=$?
+  posture_json="$(jq -c '.result // null' <<< "${posture_raw:-null}" 2>/dev/null || echo null)"
+
+  local rollup_json
+  rollup_json="$(cfctl_state_audit_rollup_json "${targets_json}" "${posture_json}")"
+
+  converged="$(jq -r '.converged' <<< "${rollup_json}")"
+  if [[ "${converged}" != "true" ]]; then
+    ok="false"
+  fi
+
+  cfctl_emit_result \
+    "${ok}" \
+    "audit" \
+    "state" \
+    "desired_state" \
+    "true" \
+    '{"state":"not_applicable","basis":"live_state_convergence","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
+    '{"state":"not_applicable"}' \
+    "$(jq -c '.summary + {converged: .converged}' <<< "${rollup_json}")" \
+    "${rollup_json}" \
+    "" \
+    "$([[ "${ok}" == "true" ]] && printf '' || printf 'state_not_converged')" \
+    "$([[ "${ok}" == "true" ]] && printf '' || printf 'Live configuration has drifted from recorded desired state or Access posture')" \
+    "state"
+}
+
 cfctl_handle_audit() {
   local subcommand="${1:-trust}"
 
@@ -5428,11 +5527,15 @@ cfctl_handle_audit() {
     access)
       cfctl_handle_audit_access
       ;;
+    state)
+      cfctl_handle_audit_state
+      ;;
     ""|-h|--help|help)
       cat <<'EOF'
 Usage:
   cfctl audit trust
   cfctl audit access [--id <app-id>|--domain <app-domain>] [--strict]
+  cfctl audit state
 
 Notes:
   cfctl audit trust is an alias for cfctl doctor.
@@ -5441,6 +5544,10 @@ Notes:
   as pass/fail checks tied to catalog standards. It reads the live
   account — the counterpart to source-config `cfctl standards audit`.
   --strict also fails on recommended-level warnings.
+  cfctl audit state sweeps every desired-state surface (deriving zones from
+  the specs), folds in Access posture, and reports one convergence verdict
+  with a ready-to-run remediation queue. It reads live account truth and is
+  read-only; ok/exit reflect whether live matches recorded intent.
 EOF
       ;;
     *)

@@ -329,6 +329,15 @@ coverage. `--strict` also fails recommended-level warnings; `--id`/`--domain`
 scope the audit to one application. Exit code and `ok` reflect the result, so
 it works as a gate.
 
+`cfctl audit state` is the one-command convergence sweep: it diffs every
+desired-state surface (deriving the zones to check from the specs
+themselves), folds in the Access posture result, and returns a single
+`converged` verdict plus a `remediation_queue` of ready-to-run
+`cfctl apply <surface> sync --plan` commands. It reads live account truth,
+is read-only, and its exit code reflects whether live matches recorded
+intent — the intended heartbeat for keeping the account from silently
+drifting.
+
 ## Compatibility
 
 Legacy `scripts/cf_*` entrypoints remain executable, but mutation-capable backends are backend-only by default and must be reached through `cfctl`. Direct maintainer/debug use requires `CF_BACKEND_BYPASS_FILE=<authorization-path>` from `cfctl admin authorize-backend`.
