@@ -96,6 +96,7 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_token_get.sh" \
   "${ROOT_DIR}/scripts/cf_token_verify_state.sh" \
   "${ROOT_DIR}/scripts/cf_token_revoke_pending.sh" \
+  "${ROOT_DIR}/scripts/cf_token_rotate.sh" \
   "${ROOT_DIR}/scripts/lib/token_state.sh" \
   "${ROOT_DIR}/scripts/verify_access_login_method_contract.sh" \
   "${ROOT_DIR}/scripts/verify_maildesk_cf_contract.sh" \
