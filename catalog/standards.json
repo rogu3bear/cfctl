@@ -163,13 +163,92 @@
           "id": "access.login_method.readback",
           "level": "required",
           "title": "Verify exact allowed_idps readback",
-          "summary": "After apply, every targeted app must read back with allowed_idps set to exactly the resolved provider id."
+          "summary": "After apply, every targeted app must read back with allowed_idps equal (order-insensitive) to that app's resolved desired provider set — the single pinned provider for set, the explicit list for set-list, or the computed union/subtraction result for add/remove."
+        },
+        {
+          "id": "access.login_method.multi-idp-explicit",
+          "level": "required",
+          "title": "Never let a change empty allowed_idps",
+          "summary": "add/remove/set-list compute a per-app desired provider set and must refuse any change whose result would be an empty allowed_idps (empty means every login method is allowed); use set or set-list to pin an explicit set instead."
         }
       ],
       "evidence": [
         "cfctl list access.login_method",
         "cfctl apply access.login_method set --provider-type onetimepin --plan",
-        "cfctl apply access.login_method set --provider-id <provider-id> --ack-plan <operation-id>"
+        "cfctl apply access.login_method set --provider-id <provider-id> --ack-plan <operation-id>",
+        "cfctl apply access.login_method remove --provider-type onetimepin --domain docs.example.org --plan"
+      ]
+    },
+    "access.idp": {
+      "stance": "preview-gated provider lifecycle; access.idp is the only sanctioned surface for creating, updating, or deleting Access identity providers",
+      "standards": [
+        {
+          "id": "access.idp.otp-deliberate",
+          "level": "required",
+          "title": "Treat onetimepin lifecycle as account-wide auth policy",
+          "summary": "Creating or deleting the onetimepin provider enables or disables the OTP login method for the whole account; it must go through plan/ack, and delete requires --confirm delete."
+        },
+        {
+          "id": "access.idp.existing-target-resolution",
+          "level": "required",
+          "title": "Resolve update/delete targets fail-closed",
+          "summary": "update and delete must resolve exactly one existing provider by id, type, or name; zero or multiple matches stop the write."
+        },
+        {
+          "id": "access.idp.no-secret-in-artifact",
+          "level": "required",
+          "title": "Keep provider config secrets out of artifacts",
+          "summary": "Secret-bearing config values (client_secret and similar) must be redacted before any request body lands in a plan, report, or stdout; non-onetimepin bodies are operator-supplied because live GET omits config secrets."
+        }
+      ],
+      "evidence": [
+        "cfctl list access.idp",
+        "cfctl apply access.idp create --type onetimepin --plan",
+        "cfctl apply access.idp delete --type onetimepin --confirm delete --plan"
+      ]
+    },
+    "access.group": {
+      "stance": "preview-gated CRUD for reusable Access rule groups",
+      "standards": [
+        {
+          "id": "access.group.body-driven",
+          "level": "required",
+          "title": "Group writes are explicit body-driven CRUD",
+          "summary": "create and update take an operator-supplied JSON body with name/include/exclude/require; cfctl does not invent or merge rule structures."
+        },
+        {
+          "id": "access.group.delete-by-id",
+          "level": "required",
+          "title": "Delete targets an exact group id",
+          "summary": "delete is destructive, requires --id and --confirm delete, and goes through plan/ack like every account mutation."
+        }
+      ],
+      "evidence": [
+        "cfctl list access.group",
+        "cfctl apply access.group create --body-file group.json --plan",
+        "cfctl apply access.group delete --id <group-id> --confirm delete --plan"
+      ]
+    },
+    "access.organization": {
+      "stance": "field-scoped read-modify-write for the Zero Trust org singleton",
+      "standards": [
+        {
+          "id": "access.organization.field-scoped-writes",
+          "level": "required",
+          "title": "Never blind-PUT the organization",
+          "summary": "Every write merges onto the live org object (field-scoped ops or a recursive body merge) and strips read-only timestamps; equal state is a noop, and changed fields are verified by readback."
+        },
+        {
+          "id": "access.organization.session-duration-deliberate",
+          "level": "recommended",
+          "title": "Treat session duration as account-wide auth policy",
+          "summary": "session_duration and auto_redirect_to_identity affect every Access application; change them deliberately with plan/ack and record the rationale in the operation trail."
+        }
+      ],
+      "evidence": [
+        "cfctl get access.organization",
+        "cfctl apply access.organization set-session-duration --content 24h --plan",
+        "cfctl verify access.organization"
       ]
     },
     "access.policy": {

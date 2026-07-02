@@ -49,6 +49,9 @@ cfctl cloudflared version
 cfctl env run --lane dev -- env
 cfctl explain access.app
 cfctl list access.login_method
+cfctl list access.idp
+cfctl audit access
+cfctl audit state
 cfctl classify tunnel create
 cfctl guide access.login_method set --provider-type onetimepin
 CF_TOKEN_LANE=global cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
@@ -77,6 +80,10 @@ cfctl guide access.app update --id <app-id> --body-file app.json
 cfctl apply access.app update --id <app-id> --body-file app.json --plan
 cfctl apply access.policy create --app-id <app-id> --body-file policy.json --plan
 CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-type onetimepin --plan
+cfctl apply access.idp create --type onetimepin --plan
+cfctl apply access.idp delete --type onetimepin --confirm delete --plan
+cfctl apply access.group create --body-file group.json --plan
+cfctl apply access.organization set-session-duration --content 24h --plan
 cfctl apply tunnel create --body '{"name":"example","config_src":"cloudflare"}' --plan
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
 CF_TOKEN_LANE=global cfctl apply zone.setting set --zone example.com --name ssl --content strict --plan

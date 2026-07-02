@@ -18,6 +18,7 @@ cfctl_reset_flags() {
   CFCTL_ZONE_ID=""
   CFCTL_TYPE=""
   CFCTL_PROVIDER_ID=""
+  CFCTL_PROVIDER_IDS_JSON="[]"
   CFCTL_PROVIDER_TYPE=""
   CFCTL_PROVIDER_NAME=""
   CFCTL_SITEKEY=""
@@ -97,8 +98,8 @@ cfctl_parse_flags() {
       --zone-id=*) CFCTL_ZONE_ID="${1#*=}"; shift ;;
       --type) CFCTL_TYPE="$2"; shift 2 ;;
       --type=*) CFCTL_TYPE="${1#*=}"; shift ;;
-      --provider-id) CFCTL_PROVIDER_ID="$2"; shift 2 ;;
-      --provider-id=*) CFCTL_PROVIDER_ID="${1#*=}"; shift ;;
+      --provider-id) CFCTL_PROVIDER_ID="$2"; CFCTL_PROVIDER_IDS_JSON="$(jq -c --arg provider_id "$2" '. + [$provider_id]' <<< "${CFCTL_PROVIDER_IDS_JSON}")"; shift 2 ;;
+      --provider-id=*) CFCTL_PROVIDER_ID="${1#*=}"; CFCTL_PROVIDER_IDS_JSON="$(jq -c --arg provider_id "${1#*=}" '. + [$provider_id]' <<< "${CFCTL_PROVIDER_IDS_JSON}")"; shift ;;
       --provider-type) CFCTL_PROVIDER_TYPE="$2"; shift 2 ;;
       --provider-type=*) CFCTL_PROVIDER_TYPE="${1#*=}"; shift ;;
       --provider-name) CFCTL_PROVIDER_NAME="$2"; shift 2 ;;
@@ -1596,6 +1597,21 @@ cfctl_collect_surface_items() {
       cfctl_run_backend_script "${script_path}"
       CFCTL_COLLECT_BACKEND="inventory_script"
       ;;
+    access.idp)
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_access_identity_providers.sh"
+      cfctl_run_backend_script "${script_path}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
+    access.group)
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_access_groups.sh"
+      cfctl_run_backend_script "${script_path}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
+    access.organization)
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_access_organization.sh"
+      cfctl_run_backend_script "${script_path}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
     pages.secret)
       script_path="${CF_REPO_ROOT}/scripts/cf_inventory_pages_secrets.sh"
       cfctl_run_backend_script "${script_path}" "PAGES_PROJECT=${CFCTL_PROJECT}"
@@ -1675,6 +1691,15 @@ cfctl_collect_surface_items() {
       ;;
     access.service_token)
       CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.service_tokens // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
+      ;;
+    access.idp)
+      CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.identity_providers // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
+      ;;
+    access.group)
+      CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.groups // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
+      ;;
+    access.organization)
+      CFCTL_COLLECT_ITEMS_JSON="$(jq -c '[.organization] | map(select(. != null))' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
       ;;
     pages.secret)
       CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.secrets // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
@@ -2176,6 +2201,32 @@ cfctl_filter_surface_items() {
               (if $name != "" then .name == $name else true end)
               and
               (if $domain != "" then .domain == $domain else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
+    access.idp)
+      jq -c --arg id "${CFCTL_ID}" --arg name "${CFCTL_NAME}" --arg type "${CFCTL_TYPE}" '
+        [
+          .[]
+          | select(
+              (if $id != "" then .id == $id else true end)
+              and
+              (if $name != "" then .name == $name else true end)
+              and
+              (if $type != "" then .type == $type else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
+    access.group)
+      jq -c --arg id "${CFCTL_ID}" --arg name "${CFCTL_NAME}" '
+        [
+          .[]
+          | select(
+              (if $id != "" then .id == $id else true end)
+              and
+              (if $name != "" then .name == $name else true end)
             )
         ]
       ' <<< "${items_json}"

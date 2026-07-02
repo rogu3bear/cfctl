@@ -2,6 +2,103 @@
 
 set -euo pipefail
 
+cfctl_state_audit_rollup_json() {
+  # Pure aggregator: given an array of per-target diff results (each a
+  # cfctl_diff_surface_json .result annotated with surface/scope/zone/ok),
+  # optionally an access-posture summary object, produce one consolidated
+  # convergence verdict with a flat, ready-to-run remediation queue. No I/O,
+  # so it is unit-testable offline.
+  local targets_json="$1"
+  local posture_json="${2:-null}"
+
+  jq -n \
+    --argjson targets "${targets_json}" \
+    --argjson posture "${posture_json}" \
+    '
+      def sync_command($surface; $zone):
+        "CF_TOKEN_LANE=global cfctl apply " + $surface + " sync"
+        + (if $zone == null or $zone == "" then "" else " --zone " + $zone end)
+        + " --plan";
+
+      ($targets | map(select(.ok != true))) as $unreadable
+      | (
+          $targets
+          | map(
+              . as $t
+              | (($t.result.desired_specs // [])
+                 | map(select(.proposed_operation != null and .proposed_operation != "noop"))
+                ) as $actionable
+              | {
+                  surface: $t.surface,
+                  scope: $t.scope,
+                  zone: ($t.zone // null),
+                  ok: ($t.ok // false),
+                  drift_count: ($t.result.summary.drift_count // 0),
+                  create_count: ($t.result.summary.create_count // 0),
+                  update_count: ($t.result.summary.update_count // 0),
+                  delete_count: ($t.result.summary.delete_count // 0),
+                  in_sync_count: ($t.result.summary.in_sync_count // 0),
+                  invalid_spec_count: ($t.result.summary.invalid_spec_count // 0),
+                  ambiguous_count: ($t.result.summary.ambiguous_count // 0),
+                  unmanaged_actual_count: ($t.result.summary.unmanaged_actual_count // 0),
+                  actionable_spec_count: ($actionable | length),
+                  sync_command: (if ($actionable | length) > 0 then sync_command($t.surface; $t.zone) else null end)
+                }
+            )
+        ) as $surfaces
+      | (
+          $targets
+          | map(
+              . as $t
+              | (($t.result.desired_specs // [])
+                 | map(select(.proposed_operation != null and .proposed_operation != "noop"))
+                 | map({
+                     surface: $t.surface,
+                     zone: ($t.zone // null),
+                     spec: (.spec_path | split("/") | last),
+                     match: .match,
+                     operation: .proposed_operation,
+                     status: .status,
+                     sync_command: sync_command($t.surface; $t.zone)
+                   })
+                )
+            )
+          | add // []
+        ) as $remediation
+      | ($posture | if . == null then null else {
+            status: (.summary.status // (if (.summary.fail_count // 0) > 0 then "fail" elif (.summary.warning_count // 0) > 0 then "warn" else "pass" end)),
+            fail_count: (.summary.fail_count // 0),
+            warning_count: (.summary.warning_count // 0),
+            failing_checks: (.summary.failing_checks // []),
+            otp_login_enabled: (.otp.provider_present // false)
+          } end) as $posture_summary
+      # state_delta counts each actionable spec once (create/update/delete are
+      # mutually exclusive per spec), so it never double-counts drift+update.
+      | ($remediation | length) as $state_delta
+      | (($surfaces | map(.invalid_spec_count + .ambiguous_count) | add) // 0) as $unresolvable_spec_count
+      | ($unreadable | length) as $unreadable_count
+      | (($posture_summary.fail_count // 0) > 0) as $posture_failed
+      | {
+          converged: ($state_delta == 0 and $unresolvable_spec_count == 0 and $unreadable_count == 0 and ($posture_failed | not)),
+          surfaces: $surfaces,
+          remediation_queue: $remediation,
+          posture: $posture_summary,
+          unreadable_targets: ($unreadable | map({surface: .surface, zone: (.zone // null), error: (.error // "unreadable")})),
+          summary: {
+            surface_target_count: ($targets | length),
+            drifted_target_count: ($surfaces | map(select(.actionable_spec_count > 0)) | length),
+            actionable_spec_count: $state_delta,
+            state_delta_total: $state_delta,
+            unresolvable_spec_count: $unresolvable_spec_count,
+            unreadable_target_count: $unreadable_count,
+            posture_status: ($posture_summary.status // "not_run"),
+            posture_fail_count: ($posture_summary.fail_count // 0),
+            distinct_sync_commands: ($remediation | map(.sync_command) | unique)
+          }
+        }
+    '
+}
+
 cfctl_state_specs_dir() {
   local surface="$1"
   local configured_dir="${CFCTL_STATE_DIR:-}"

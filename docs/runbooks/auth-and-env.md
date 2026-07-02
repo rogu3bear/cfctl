@@ -12,8 +12,38 @@ All repo scripts use the shared loader in `scripts/lib/cloudflare.sh`.
 
 Load order:
 
-1. `~/.config/cfctl/.env` or `CF_SHARED_ENV_FILE`
-2. optional repo-local `.env.local`
+1. `~/.config/cfctl/.env` or `CF_SHARED_ENV_FILE` (shell-sourced, canonical)
+2. optional repo-local `.env.local` (shell-sourced, overrides shared)
+3. workspace fallback `CF_WORKSPACE_ENV_FILE` (default `~/dev/.env`) — strict
+   `KEY=VALUE` import only, never executed as shell, allowlisted to the lane
+   credentials plus lane requirements and `CLOUDFLARE_ACCOUNT_ID`, and it
+   fills gaps only: a value already set by the process env, shared file, or
+   repo file always wins. Unrelated workspace secrets are never imported.
+   Set `CF_WORKSPACE_ENV_FILE=""` to disable the fallback entirely.
+
+The allowlist is derived from `catalog/runtime.json` (`lanes[*].credential_env`,
+`lanes[*].requires`, and `env_import.allowlist`), so adding a lane extends it
+without code changes.
+
+## Provenance And Drift
+
+Because the same credential can legitimately exist in more than one file,
+cfctl tracks where each allowlisted variable came from and flags drift:
+
+- `cfctl env sources` reports, read-only, each tracked variable's winning
+  source and per-file fingerprints (truncated SHA-256, never values).
+- `cfctl doctor` includes the same data under `result.env_health`, reports
+  `summary.credential_drift_count`, and degrades overall status when the same
+  variable differs across sources — the signal that a rotation landed in one
+  file but not the canonical one.
+- Repair stays manual by design: update the canonical shared env file, then
+  re-run `cfctl doctor`. cfctl never syncs secret values between files.
+
+## Stray Files
+
+The repo override file is `.env.local`. A repo-root `.env` is **not** read by
+cfctl; secrets placed there have no consumer, and `cfctl doctor` surfaces a
+hint when one exists.
 
 After loading, the library selects an active lane and exports:
 

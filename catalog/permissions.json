@@ -29,7 +29,10 @@
       "risk": "read",
       "allowed_surfaces": [
         "access.app",
+        "access.group",
+        "access.idp",
         "access.login_method",
+        "access.organization",
         "access.policy",
         "api_gateway.discovery",
         "api_gateway.operation",
@@ -85,7 +88,10 @@
       "risk": "write",
       "allowed_surfaces": [
         "access.app",
+        "access.group",
+        "access.idp",
         "access.login_method",
+        "access.organization",
         "access.policy",
         "dns.record",
         "edge.certificate",
@@ -143,7 +149,10 @@
       "risk": "read",
       "allowed_surfaces": [
         "access.app",
+        "access.group",
+        "access.idp",
         "access.login_method",
+        "access.organization",
         "access.policy",
         "api_gateway.discovery",
         "api_gateway.operation",
@@ -202,8 +211,14 @@
     {
       "name": "Access: Organizations, Identity Providers, and Groups Read",
       "scope": "account",
-      "surfaces": ["access.login_method"],
+      "surfaces": ["access.login_method", "access.idp", "access.group", "access.organization"],
       "profiles": ["read", "hostname", "security-audit", "full-operator"]
+    },
+    {
+      "name": "Access: Organizations, Identity Providers, and Groups Write",
+      "scope": "account",
+      "surfaces": ["access.idp", "access.group", "access.organization"],
+      "profiles": ["full-operator"]
     },
     {
       "name": "Account API Gateway Read",

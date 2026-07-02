@@ -373,6 +373,8 @@ def credentialless_cfctl_env() -> dict[str, str]:
         "CF_ACTIVE_TOKEN_LANE",
     ):
         env.pop(key, None)
+    for key in ("CF_SHARED_ENV_FILE", "CF_REPO_ENV_FILE", "CF_WORKSPACE_ENV_FILE"):
+        env[key] = "/nonexistent/cfctl-empty-env"
     return env
 
 

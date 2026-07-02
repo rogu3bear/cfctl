@@ -56,6 +56,58 @@ CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-id <provider
 
 Add `--id`, `--name`, or `--domain` to narrow the app target. Without an app selector, the target is all Access applications.
 
+Beyond single-provider pinning, login methods support explicit multi-IdP sets
+and per-app union/subtraction:
+
+```bash
+cfctl apply access.login_method set-list --provider-id <id-a> --provider-id <id-b> --domain docs.example.org --plan
+cfctl apply access.login_method add --provider-type onetimepin --domain docs.example.org --plan
+cfctl apply access.login_method remove --provider-type onetimepin --domain docs.example.org --plan
+```
+
+`add` and `remove` compute each app's desired set from its current
+`allowed_idps` (idempotent noops included). Any change that would leave an
+app's `allowed_idps` empty is refused — empty means every login method is
+allowed — so removing the last provider requires an explicit `set`/`set-list`
+decision instead.
+
+Identity-provider lifecycle itself lives on `access.idp`. Creating or deleting
+the `onetimepin` provider is the account-wide OTP login-method toggle;
+creating it when it already exists is a noop, and delete is destructive:
+
+```bash
+cfctl list access.idp
+cfctl get access.idp --type onetimepin
+cfctl apply access.idp create --type onetimepin --plan
+cfctl apply access.idp create --type onetimepin --ack-plan <operation-id>
+cfctl apply access.idp delete --type onetimepin --confirm delete --plan
+cfctl apply access.idp delete --type onetimepin --confirm delete --ack-plan <operation-id>
+```
+
+Only `onetimepin` gets a synthesized create body. Every other provider type
+requires an explicit `--body`/`--body-file` (including `update`): the live GET
+omits provider config secrets, so cfctl refuses to build read-modify-write
+bodies that would blank them. Secret-like config values are redacted before
+any body reaches a plan artifact.
+
+Access groups are body-driven CRUD, and the Zero Trust organization singleton
+takes field-scoped writes that merge onto live state (never a blind PUT):
+
+```bash
+cfctl list access.group
+cfctl apply access.group create --body-file group.json --plan
+cfctl apply access.group update --id <group-id> --body-file group.json --plan
+cfctl apply access.group delete --id <group-id> --confirm delete --plan
+cfctl get access.organization
+cfctl apply access.organization set-session-duration --content 24h --plan
+cfctl apply access.organization set-ui-read-only --content true --plan
+cfctl apply access.organization update --body '{"login_design":{"header_text":"Ops"}}' --plan
+```
+
+Organization writes read the live org object first, merge the requested
+change, strip read-only timestamps, plan a noop when nothing differs, and
+verify changed fields by readback after apply.
+
 Example authorization flow:
 
 ```bash

@@ -49,11 +49,18 @@ Wrangler is excellent for Workers and Pages. `cloudflared` is excellent for tunn
 | Lane selector | `CF_TOKEN_LANE=dev|global` |
 | Account pin | `CLOUDFLARE_ACCOUNT_ID` |
 | Env source | `~/.config/cfctl/.env` by default, or `CF_SHARED_ENV_FILE` (loader: [scripts/lib/cloudflare.sh](scripts/lib/cloudflare.sh)) |
+| Workspace fallback | `CF_WORKSPACE_ENV_FILE` (default `~/dev/.env`) — strict allowlisted `KEY=VALUE` import, fills gaps only, never shell-sourced; `""` disables |
 
 Lane behavior:
 
 - `dev` derives `CLOUDFLARE_API_TOKEN` for wrangler.
 - `global` derives `CLOUDFLARE_API_KEY` and requires `CLOUDFLARE_EMAIL`.
+
+Credential provenance: `cfctl env sources` (and `cfctl doctor` under
+`result.env_health`) reports which file supplied each credential and flags
+drift when the same variable differs across sources — fingerprints only,
+never values. The canonical shared file always wins; the workspace fallback
+only fills gaps.
 
 ## First commands
 
@@ -95,6 +102,9 @@ cfctl snapshot tunnel
 cfctl list audit.log
 cfctl list pages.project
 cfctl list access.login_method
+cfctl list access.idp
+cfctl list access.group
+cfctl get access.organization
 cfctl get access.app --domain docs.example.org
 cfctl list edge.certificate --zone example.com
 cfctl list zone.setting --zone example.com
@@ -111,6 +121,8 @@ Useful safe write plans:
 ```bash
 cfctl apply access.policy create --app-id <app-id> --body-file policy.json --plan
 CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-type onetimepin --plan
+cfctl apply access.idp create --type onetimepin --plan
+cfctl apply access.idp delete --type onetimepin --confirm delete --plan
 cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
 CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
 CF_TOKEN_LANE=global cfctl apply zone.setting set --zone example.com --name ssl --content strict --plan
@@ -307,6 +319,24 @@ cfctl admin revoke-backend --path <authorization-path>
 ## Source Config Vs Live State
 
 `cfctl standards audit` performs checked-in Wrangler config alignment, including `compatibility_date` freshness — it finds missing or stale `compatibility_date`, missing observability, plaintext secret-like vars, binding shape drift. Workspace-wide scans also classify source authority so canonical repo config can be separated from worktree, dry-run deploy, and baseline-copy config without hiding those files. **It does not inspect the Cloudflare dashboard.** For live assertions, use `cfctl list`, `cfctl get`, `cfctl snapshot`, `cfctl can`, or `cfctl verify` and cite the emitted artifact.
+
+`cfctl audit access` is the live-truth complement for authentication posture:
+it reads the account's Access applications and identity providers and
+evaluates machine pass/fail checks tied to catalog standards — explicit
+`allowed_idps`, onetimepin (OTP) allowed only where a `state/access.app`
+spec records it, launcher visibility, auto-redirect, and allow-policy
+coverage. `--strict` also fails recommended-level warnings; `--id`/`--domain`
+scope the audit to one application. Exit code and `ok` reflect the result, so
+it works as a gate.
+
+`cfctl audit state` is the one-command convergence sweep: it diffs every
+desired-state surface (deriving the zones to check from the specs
+themselves), folds in the Access posture result, and returns a single
+`converged` verdict plus a `remediation_queue` of ready-to-run
+`cfctl apply <surface> sync --plan` commands. It reads live account truth,
+is read-only, and its exit code reflects whether live matches recorded
+intent — the intended heartbeat for keeping the account from silently
+drifting.
 
 ## Compatibility
 

@@ -231,9 +231,30 @@ cfctl_action_permission_gate() {
   local operation="${3:-}"
   local permission_json
   local state
+  local basis
 
   permission_json="$(cfctl_probe_permission "${surface}" "${action}" "${operation}")"
   state="$(jq -r '.state' <<< "${permission_json}")"
+  basis="$(jq -r '.basis // empty' <<< "${permission_json}")"
+
+  if [[ "${action}" == "apply" && "${state}" == "unknown" ]] \
+    && [[ "${basis}" == "credential_missing" || "${basis}" == "requirements_unmet" ]]; then
+    cfctl_emit_result \
+      "false" \
+      "${action}" \
+      "${surface}" \
+      "permission_probe" \
+      "false" \
+      "${permission_json}" \
+      '{"state":"not_applicable"}' \
+      "$(jq -n --arg message "No usable Cloudflare credential for the selected lane; refusing to apply blind" '{message: $message}')" \
+      "null" \
+      "" \
+      "credential_missing" \
+      "No usable Cloudflare credential for the selected lane. Run cfctl doctor, configure the lane, then retry." \
+      "${operation}"
+    exit 1
+  fi
 
   if [[ "${state}" == "denied" ]]; then
     cfctl_emit_result \
@@ -739,7 +760,7 @@ cfctl_select_requested_lane_if_available() {
     return
   fi
 
-  if [[ "${requested_lane}" == "global" && -z "${CLOUDFLARE_EMAIL:-}" ]]; then
+  if ! cf_lane_requirements_met "${requested_lane}"; then
     return
   fi
 
@@ -1083,6 +1104,7 @@ cfctl_doctor_repair_hints_json() {
   local secret_scan_json="$4"
   local registry_integrity_json="$5"
   local lanes_json="${6:-null}"
+  local env_health_json="${7:-null}"
   local hints='[]'
 
   if [[ "${lanes_json}" != "null" && "$(jq '(.summary.configured_lane_count // 0) == 0' <<< "${lanes_json}")" == "true" ]]; then
@@ -1117,6 +1139,14 @@ cfctl_doctor_repair_hints_json() {
 
   if [[ "$(jq '(.missing_count // 0) > 0' <<< "${registry_integrity_json}")" == "true" ]]; then
     hints="$(jq '. + ["Fix missing mutable-operation policy fields in catalog/runtime.json or catalog/surfaces.json"]' <<< "${hints}")"
+  fi
+
+  if [[ "${env_health_json}" != "null" && "$(jq '(.provenance.summary.drift_count // 0) > 0' <<< "${env_health_json}")" == "true" ]]; then
+    hints="$(jq '. + ["cfctl env sources","Credential drift: the same variable differs across env sources; update the canonical shared env file so rotations do not go stale"]' <<< "${hints}")"
+  fi
+
+  if [[ "${env_health_json}" != "null" && "$(jq '.hygiene.stray_repo_env.present == true' <<< "${env_health_json}")" == "true" ]]; then
+    hints="$(jq '. + ["Repo-root .env is never read by cfctl (the repo override is .env.local); relocate or remove its secrets deliberately"]' <<< "${hints}")"
   fi
 
   printf '%s\n' "${hints}"
@@ -1450,6 +1480,8 @@ cfctl_handle_doctor() {
   local overall_status="healthy"
   local configured_lane_count
   local healthy_lane_count
+  local env_health_json
+  local credential_drift_count
 
   lanes_json="$(cfctl_collect_lane_health_json)"
   guard_report_json="$(cfctl_backend_guard_report_json)"
@@ -1459,8 +1491,10 @@ cfctl_handle_doctor() {
   preview_health_json="$(cfctl_preview_receipt_health_json)"
   lock_health_json="$(cf_runtime_lock_health_json)"
   bypass_health_json="$(cfctl_bypass_health_json)"
+  env_health_json="$(cfctl_env_health_json)"
   configured_lane_count="$(jq -r '.summary.configured_lane_count // 0' <<< "${lanes_json}")"
   healthy_lane_count="$(jq -r '.summary.healthy_lane_count // 0' <<< "${lanes_json}")"
+  credential_drift_count="$(jq -r '.provenance.summary.drift_count // 0' <<< "${env_health_json}")"
 
   if [[ "${healthy_lane_count}" -eq 0 ]]; then
     if [[ "${configured_lane_count}" -eq 0 ]]; then
@@ -1508,7 +1542,11 @@ cfctl_handle_doctor() {
     overall_status="degraded"
   fi
 
-  repair_hints_json="$(cfctl_doctor_repair_hints_json "${preview_health_json}" "${lock_health_json}" "${bypass_health_json}" "${secret_scan_json}" "${registry_integrity_json}" "${lanes_json}")"
+  if [[ "${overall_status}" != "unsafe" && "${overall_status}" != "bootstrap_required" && "${credential_drift_count}" -gt 0 ]]; then
+    overall_status="degraded"
+  fi
+
+  repair_hints_json="$(cfctl_doctor_repair_hints_json "${preview_health_json}" "${lock_health_json}" "${bypass_health_json}" "${secret_scan_json}" "${registry_integrity_json}" "${lanes_json}" "${env_health_json}")"
   safe_next_steps_json="$(cfctl_safe_next_steps_json "${overall_status}")"
 
   if [[ "${CFCTL_STRICT}" == "1" && "${overall_status}" != "healthy" ]]; then
@@ -1525,6 +1563,7 @@ cfctl_handle_doctor() {
       --argjson preview_receipts "${preview_health_json}" \
       --argjson lock_health "${lock_health_json}" \
       --argjson bypass_health "${bypass_health_json}" \
+      --argjson env_health "${env_health_json}" \
       --argjson repair_hints "${repair_hints_json}" \
       --argjson safe_next_steps "${safe_next_steps_json}" \
       --argjson strict_mode "$([[ "${CFCTL_STRICT}" == "1" ]] && echo true || echo false)" \
@@ -1549,6 +1588,7 @@ cfctl_handle_doctor() {
           preview_receipts: $preview_receipts,
           lock_health: $lock_health,
           bypass_health: $bypass_health,
+          env_health: $env_health,
           secret_scan: $secret_scan,
           safe_next_steps: $safe_next_steps,
           repair_hints: (if $include_repair_hints == true then $repair_hints else [] end),
@@ -1565,7 +1605,7 @@ cfctl_handle_doctor() {
     "true" \
     '{"state":"not_applicable","basis":"runtime_health","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
     '{"state":"not_applicable"}' \
-    "$(jq '{status: .status, strict_mode: .strict_mode, configured_lane_count: (.lanes.summary.configured_lane_count // 0), healthy_lanes: .lanes.summary.healthy_lanes, missing_backend_guards: (.backend_guards.missing | length), registry_policy_gaps: (.registry_integrity.missing_count // 0), secret_leak_count: (.secret_scan.leak_count // 0), unsafe_secret_sink_count: (.secret_scan.unsafe_secret_sink_count // 0), stale_lock_count: (.lock_health.stale_lock_count // 0), orphaned_lock_count: (.lock_health.orphaned_lock_count // 0), expired_preview_count: (.preview_receipts.expired_preview_count // 0), legacy_preview_count: (.preview_receipts.legacy_preview_count // 0), authorization_count: (.bypass_health.authorization_health.authorization_count // 0), expired_authorization_count: (.bypass_health.authorization_health.expired_count // 0), legacy_bypass_active: (.bypass_health.legacy_env_active // false), repair_hint_count: (.repair_hint_count // 0), safe_next_steps: (.safe_next_steps // [])}' <<< "${result_json}")" \
+    "$(jq '{status: .status, strict_mode: .strict_mode, configured_lane_count: (.lanes.summary.configured_lane_count // 0), healthy_lanes: .lanes.summary.healthy_lanes, missing_backend_guards: (.backend_guards.missing | length), registry_policy_gaps: (.registry_integrity.missing_count // 0), secret_leak_count: (.secret_scan.leak_count // 0), unsafe_secret_sink_count: (.secret_scan.unsafe_secret_sink_count // 0), stale_lock_count: (.lock_health.stale_lock_count // 0), orphaned_lock_count: (.lock_health.orphaned_lock_count // 0), expired_preview_count: (.preview_receipts.expired_preview_count // 0), legacy_preview_count: (.preview_receipts.legacy_preview_count // 0), authorization_count: (.bypass_health.authorization_health.authorization_count // 0), expired_authorization_count: (.bypass_health.authorization_health.expired_count // 0), legacy_bypass_active: (.bypass_health.legacy_env_active // false), credential_drift_count: (.env_health.provenance.summary.drift_count // 0), repair_hint_count: (.repair_hint_count // 0), safe_next_steps: (.safe_next_steps // [])}' <<< "${result_json}")" \
     "${result_json}" \
     "" \
     "$([[ "${ok}" == "true" ]] && printf '' || printf 'runtime_health_failed')" \
@@ -3953,6 +3993,7 @@ cfctl_handle_apply() {
         "APP_NAME=${CFCTL_NAME}" \
         "APP_DOMAIN=${CFCTL_DOMAIN}" \
         "PROVIDER_ID=${CFCTL_PROVIDER_ID}" \
+        "PROVIDER_IDS_JSON=${CFCTL_PROVIDER_IDS_JSON}" \
         "PROVIDER_TYPE=${CFCTL_PROVIDER_TYPE}" \
         "PROVIDER_NAME=${CFCTL_PROVIDER_NAME}"
       ;;
@@ -3962,6 +4003,32 @@ cfctl_handle_apply() {
         "OPERATION=${operation}" \
         "APP_ID=${CFCTL_APP_ID}" \
         "POLICY_ID=${CFCTL_POLICY_ID:-${id_value}}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
+    access.idp)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "IDP_ID=${id_value}" \
+        "IDP_TYPE=${CFCTL_TYPE}" \
+        "IDP_NAME=${CFCTL_NAME}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
+    access.group)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "GROUP_ID=${id_value}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
+    access.organization)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "SETTING_VALUE=${CFCTL_CONTENT}" \
         "BODY_JSON=${CFCTL_BODY_JSON}" \
         "BODY_FILE=${CFCTL_BODY_FILE}"
       ;;
@@ -4267,13 +4334,39 @@ cfctl_env_run_usage() {
   cat <<'EOF'
 Usage:
   cfctl env run [--lane dev|global] -- <command> [args...]
+  cfctl env sources
 
 Run an external argv command with cfctl-selected Cloudflare auth. The child
 receives only the lane-derived tool auth env, such as CLOUDFLARE_API_TOKEN for
 the dev lane. Parent lane secrets are stripped, child output is redacted, and a
 runtime artifact records the lane/env mapping without cfctl token values.
 Command argv is recorded for evidence; do not pass secrets as command args.
+
+`env sources` reports, read-only, which env file supplied each allowlisted
+credential (fingerprints only, never values) and flags drift when the same
+variable differs across sources.
 EOF
+}
+
+cfctl_handle_env_sources() {
+  local env_health_json
+
+  env_health_json="$(cfctl_env_health_json)"
+
+  cfctl_emit_result \
+    "true" \
+    "env" \
+    "runtime" \
+    "env_sources" \
+    "true" \
+    '{"state":"not_applicable","basis":"env_sources","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
+    '{"state":"not_applicable"}' \
+    "$(jq '{tracked_var_count: (.provenance.summary.tracked_var_count // 0), set_var_count: (.provenance.summary.set_var_count // 0), drift_count: (.provenance.summary.drift_count // 0), drift_vars: (.provenance.summary.drift_vars // []), stray_repo_env_present: (.hygiene.stray_repo_env.present // false)}' <<< "${env_health_json}")" \
+    "${env_health_json}" \
+    "" \
+    "" \
+    "" \
+    "sources"
 }
 
 cfctl_handle_env() {
@@ -4285,6 +4378,10 @@ cfctl_handle_env() {
   case "${subcommand}" in
     ""|-h|--help|help)
       cfctl_env_run_usage
+      return 0
+      ;;
+    sources)
+      cfctl_handle_env_sources
       return 0
       ;;
   esac
@@ -5253,6 +5350,173 @@ EOF
   esac
 }
 
+cfctl_handle_audit_access() {
+  local script_path="${CF_REPO_ROOT}/scripts/cf_audit_access_posture.sh"
+  local result_json
+  local summary_json
+  local fail_count
+  local warning_count
+  local ok="true"
+
+  cfctl_run_backend_script "${script_path}" \
+    "APP_ID=${CFCTL_ID}" \
+    "APP_DOMAIN=${CFCTL_DOMAIN}"
+
+  if [[ "${CFCTL_BACKEND_STATUS}" -ne 0 || -z "${CFCTL_BACKEND_ARTIFACT_JSON}" || "${CFCTL_BACKEND_ARTIFACT_JSON}" == "null" ]]; then
+    cfctl_emit_failure \
+      "audit" \
+      "access" \
+      "audit_script" \
+      '{"state":"unknown","basis":"execution_failed","errors":[],"request":null,"status_code":null,"permission_family":"Access: Apps and Policies"}' \
+      "execution_failed" \
+      "Access posture audit backend failed; check lane permissions with cfctl can access.app --all-lanes" \
+      "access"
+    exit 1
+  fi
+
+  result_json="${CFCTL_BACKEND_ARTIFACT_JSON}"
+  fail_count="$(jq -r '.summary.fail_count // 0' <<< "${result_json}")"
+  warning_count="$(jq -r '.summary.warning_count // 0' <<< "${result_json}")"
+
+  if [[ "${fail_count}" -gt 0 ]]; then
+    ok="false"
+  fi
+  if [[ "${CFCTL_STRICT}" == "1" && "${warning_count}" -gt 0 ]]; then
+    ok="false"
+  fi
+
+  summary_json="$(
+    jq \
+      --argjson strict "$([[ "${CFCTL_STRICT}" == "1" ]] && echo true || echo false)" \
+      '{
+        status: (if (.summary.fail_count // 0) > 0 then "fail" elif (.summary.warning_count // 0) > 0 then "warn" else "pass" end),
+        strict_mode: $strict,
+        scoped_app_count: (.scoped_app_count // 0),
+        check_count: (.summary.check_count // 0),
+        pass_count: (.summary.pass_count // 0),
+        fail_count: (.summary.fail_count // 0),
+        warning_count: (.summary.warning_count // 0),
+        offender_total: (.summary.offender_total // 0),
+        otp_login_enabled: (.otp.provider_present // false),
+        failing_checks: (.summary.failing_checks // [])
+      }' <<< "${result_json}"
+  )"
+
+  cfctl_emit_result \
+    "${ok}" \
+    "audit" \
+    "access" \
+    "audit_script" \
+    "true" \
+    '{"state":"not_applicable","basis":"live_posture_audit","errors":[],"request":null,"status_code":null,"permission_family":"Access: Apps and Policies"}' \
+    '{"state":"not_applicable"}' \
+    "${summary_json}" \
+    "${result_json}" \
+    "${CFCTL_BACKEND_ARTIFACT_PATH}" \
+    "$([[ "${ok}" == "true" ]] && printf '' || printf 'posture_check_failed')" \
+    "$([[ "${ok}" == "true" ]] && printf '' || printf 'One or more live Access posture checks failed')" \
+    "access"
+}
+
+cfctl_state_audit_surfaces_json() {
+  # Desired-state surfaces that support a diff, catalog-driven so the sweep
+  # auto-extends when a new sync-backed surface lands.
+  jq -c '
+    [ .desired_state // {} | to_entries[]
+      | select(.value.supported == true and .value.sync_supported == true)
+      | .key ]
+  ' "${CFCTL_RUNTIME_CATALOG_PATH:-${CF_REPO_ROOT}/catalog/runtime.json}"
+}
+
+cfctl_state_audit_zones_for_surface() {
+  # Distinct zones a surface's specs target; empty for account-scoped surfaces.
+  local surface="$1"
+  cfctl_load_state_specs "${surface}" \
+    | jq -r '[.[] | .match.zone // empty] | unique | .[]'
+}
+
+cfctl_handle_audit_state() {
+  local cfctl_bin="${CF_REPO_ROOT}/cfctl"
+  local targets_json='[]'
+  local surface
+  local zone
+  local scope
+  local diff_json
+  local diff_status
+  local target_entry
+  local posture_json='null'
+  local ok="true"
+  local converged
+
+  while IFS= read -r surface; do
+    [[ -n "${surface}" ]] || continue
+
+    local zones_json
+    zones_json="$(cfctl_state_audit_zones_for_surface "${surface}" | jq -R . | jq -sc .)"
+
+    if [[ "$(jq 'length' <<< "${zones_json}")" -gt 0 ]]; then
+      scope="zone"
+      while IFS= read -r zone; do
+        [[ -n "${zone}" ]] || continue
+        diff_status=0
+        diff_json="$("${cfctl_bin}" diff "${surface}" --zone "${zone}" 2>/dev/null)" || diff_status=$?
+        target_entry="$(
+          jq -n \
+            --arg surface "${surface}" \
+            --arg scope "${scope}" \
+            --arg zone "${zone}" \
+            --argjson ok "$([[ "${diff_status}" -eq 0 ]] && echo true || echo false)" \
+            --argjson result "$(jq -c '.result // null' <<< "${diff_json:-null}" 2>/dev/null || echo null)" \
+            '{surface: $surface, scope: $scope, zone: $zone, ok: $ok, result: $result, error: (if $ok then null else "diff_failed" end)}'
+        )"
+        targets_json="$(jq -c --argjson entry "${target_entry}" '. + [$entry]' <<< "${targets_json}")"
+      done < <(jq -r '.[]' <<< "${zones_json}")
+    else
+      scope="account"
+      diff_status=0
+      diff_json="$("${cfctl_bin}" diff "${surface}" 2>/dev/null)" || diff_status=$?
+      target_entry="$(
+        jq -n \
+          --arg surface "${surface}" \
+          --arg scope "${scope}" \
+          --argjson ok "$([[ "${diff_status}" -eq 0 ]] && echo true || echo false)" \
+          --argjson result "$(jq -c '.result // null' <<< "${diff_json:-null}" 2>/dev/null || echo null)" \
+          '{surface: $surface, scope: $scope, zone: null, ok: $ok, result: $result, error: (if $ok then null else "diff_failed" end)}'
+      )"
+      targets_json="$(jq -c --argjson entry "${target_entry}" '. + [$entry]' <<< "${targets_json}")"
+    fi
+  done < <(cfctl_state_audit_surfaces_json | jq -r '.[]')
+
+  # Fold in live Access posture (best-effort; absence is reported, not fatal).
+  local posture_status=0
+  local posture_raw
+  posture_raw="$("${cfctl_bin}" audit access 2>/dev/null)" || posture_status=$?
+  posture_json="$(jq -c '.result // null' <<< "${posture_raw:-null}" 2>/dev/null || echo null)"
+
+  local rollup_json
+  rollup_json="$(cfctl_state_audit_rollup_json "${targets_json}" "${posture_json}")"
+
+  converged="$(jq -r '.converged' <<< "${rollup_json}")"
+  if [[ "${converged}" != "true" ]]; then
+    ok="false"
+  fi
+
+  cfctl_emit_result \
+    "${ok}" \
+    "audit" \
+    "state" \
+    "desired_state" \
+    "true" \
+    '{"state":"not_applicable","basis":"live_state_convergence","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
+    '{"state":"not_applicable"}' \
+    "$(jq -c '.summary + {converged: .converged}' <<< "${rollup_json}")" \
+    "${rollup_json}" \
+    "" \
+    "$([[ "${ok}" == "true" ]] && printf '' || printf 'state_not_converged')" \
+    "$([[ "${ok}" == "true" ]] && printf '' || printf 'Live configuration has drifted from recorded desired state or Access posture')" \
+    "state"
+}
+
 cfctl_handle_audit() {
   local subcommand="${1:-trust}"
 
@@ -5260,13 +5524,30 @@ cfctl_handle_audit() {
     trust)
       cfctl_handle_doctor
       ;;
+    access)
+      cfctl_handle_audit_access
+      ;;
+    state)
+      cfctl_handle_audit_state
+      ;;
     ""|-h|--help|help)
       cat <<'EOF'
 Usage:
   cfctl audit trust
+  cfctl audit access [--id <app-id>|--domain <app-domain>] [--strict]
+  cfctl audit state
 
 Notes:
   cfctl audit trust is an alias for cfctl doctor.
+  cfctl audit access evaluates live Access posture (allowed_idps shape,
+  onetimepin intent, launcher visibility, auto-redirect, allow policies)
+  as pass/fail checks tied to catalog standards. It reads the live
+  account — the counterpart to source-config `cfctl standards audit`.
+  --strict also fails on recommended-level warnings.
+  cfctl audit state sweeps every desired-state surface (deriving zones from
+  the specs), folds in Access posture, and reports one convergence verdict
+  with a ready-to-run remediation queue. It reads live account truth and is
+  read-only; ok/exit reflect whether live matches recorded intent.
 EOF
       ;;
     *)

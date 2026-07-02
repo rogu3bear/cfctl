@@ -1,0 +1,29 @@
+{
+  "match": {
+    "domain": "investors.mlnavigator.com"
+  },
+  "intent": {
+    "classification": "authenticated_counterparty_portal",
+    "source_repo": "/Users/star/dev/mln-web",
+    "rationale": "External investors authenticate to this portal. They cannot be onboarded to a private identity provider, so the onetimepin (email OTP) login method is the deliberate, correct auth mechanism here — not a gap. This spec records that decision so cfctl audit access stops flagging OTP on this app while still flagging operator surfaces that should move to a real IdP.",
+    "otp_provider_id": "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+  },
+  "body": {
+    "name": "MLNavigator Investor Portal",
+    "type": "self_hosted",
+    "domain": "investors.mlnavigator.com",
+    "self_hosted_domains": [
+      "investors.mlnavigator.com"
+    ],
+    "destinations": [
+      {
+        "type": "public",
+        "uri": "investors.mlnavigator.com"
+      }
+    ],
+    "allowed_idps": [
+      "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+    ],
+    "session_duration": "24h"
+  }
+}

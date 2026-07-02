@@ -63,25 +63,72 @@ access_login_method_resolve_provider_json() {
     '
 }
 
+access_login_method_resolve_providers_json() {
+  local providers_json="$1"
+  local provider_ids_json="$2"
+
+  jq -n \
+    --argjson providers "${providers_json}" \
+    --argjson requested_ids "${provider_ids_json}" \
+    '
+      ($requested_ids | unique) as $wanted
+      | (
+          $wanted
+          | map(. as $wanted_id | ($providers | map(select(.id == $wanted_id)) | first) // {id: $wanted_id, missing: true})
+        ) as $lookups
+      | ($lookups | map(select(.missing == true)) | map(.id)) as $missing
+      | ($lookups | map(select(.missing != true)) | map({id, name: (.name // null), type: (.type // null)})) as $matches
+      | {
+          ok: (($wanted | length) > 0 and ($missing | length) == 0),
+          selector: {provider_ids: $wanted},
+          selector_count: ($wanted | length),
+          match_count: ($matches | length),
+          provider: null,
+          matches: $matches,
+          missing: $missing,
+          error_code: (
+            if ($wanted | length) == 0 then "missing_provider_selector"
+            elif ($missing | length) > 0 then "provider_not_found"
+            else null
+            end
+          ),
+          error_message: (
+            if ($wanted | length) == 0 then "set-list requires one or more repeated --provider-id flags."
+            elif ($missing | length) > 0 then ("No existing Access identity provider matched: " + ($missing | join(", ")))
+            else null
+            end
+          )
+        }
+    '
+}
+
 access_login_method_plan_json() {
   local apps_json="$1"
-  local provider_json="$2"
-  local account_id="$3"
-  local app_id="$4"
-  local app_name="$5"
-  local app_domain="$6"
+  local operation="$2"
+  local desired_providers_json="$3"
+  local account_id="$4"
+  local app_id="$5"
+  local app_name="$6"
+  local app_domain="$7"
 
   jq -n \
     --argjson apps "${apps_json}" \
-    --argjson provider "${provider_json}" \
+    --argjson desired_providers "${desired_providers_json}" \
+    --arg operation "${operation}" \
     --arg account_id "${account_id}" \
     --arg app_id "${app_id}" \
     --arg app_name "${app_name}" \
     --arg app_domain "${app_domain}" \
     '
-      def mutable_body($provider_id):
+      ($desired_providers | map(.id)) as $selected_ids
+      | def desired_for($current):
+          if $operation == "set" or $operation == "set-list" then $selected_ids
+          elif $operation == "add" then ($current + ($selected_ids - $current))
+          else ($current - $selected_ids)
+          end;
+      def mutable_body($desired):
         del(.id, .uid, .aud, .created_at, .updated_at, .tags)
-        | .allowed_idps = [$provider_id]
+        | .allowed_idps = $desired
         | .policies = ((.policies // []) | map({id: (.id // null), precedence: (.precedence // null)}));
 
       (
@@ -98,7 +145,9 @@ access_login_method_plan_json() {
           $targets
           | map(
               . as $app
-              | (($app.allowed_idps // []) == [$provider.id]) as $already_pinned
+              | ($app.allowed_idps // []) as $current
+              | (desired_for($current)) as $desired
+              | (($current | sort) == ($desired | sort)) as $already_reconciled
               | {
                   app: {
                     id: $app.id,
@@ -106,22 +155,34 @@ access_login_method_plan_json() {
                     domain: ($app.domain // null),
                     type: ($app.type // null)
                   },
-                  allowed_idps_before: ($app.allowed_idps // []),
-                  desired_allowed_idps: [$provider.id],
-                  desired_provider: $provider,
+                  allowed_idps_before: $current,
+                  desired_allowed_idps: $desired,
+                  desired_providers: $desired_providers,
                   auto_redirect_to_identity: ($app.auto_redirect_to_identity // null),
                   policy_decisions: (($app.policies // []) | map(.decision // empty) | unique),
-                  status: (if $already_pinned then "noop" else "update" end),
-                  request: {
-                    method: "PUT",
-                    path: ("/accounts/" + $account_id + "/access/apps/" + $app.id),
-                    body: ($app | mutable_body($provider.id))
-                  }
+                  status: (
+                    if ($desired | length) == 0 then "blocked_empty_result"
+                    elif $already_reconciled then "noop"
+                    else "update"
+                    end
+                  ),
+                  request: (
+                    if ($desired | length) == 0 or $already_reconciled then null
+                    else {
+                      method: "PUT",
+                      path: ("/accounts/" + $account_id + "/access/apps/" + $app.id),
+                      body: ($app | mutable_body($desired))
+                    }
+                    end
+                  )
                 }
             )
         ) as $changes
+      | ($changes | map(select(.status == "blocked_empty_result")) | length) as $blocked_count
       | {
-          provider: $provider,
+          operation: $operation,
+          provider: ($desired_providers | first // null),
+          desired_providers: $desired_providers,
           target_selector: ({
             id: (if $app_id == "" then null else $app_id end),
             name: (if $app_name == "" then null else $app_name end),
@@ -129,18 +190,31 @@ access_login_method_plan_json() {
           } | with_entries(select(.value != null))),
           changes: $changes,
           summary: {
+            operation: $operation,
             target_count: ($targets | length),
             update_count: ($changes | map(select(.status == "update")) | length),
             noop_count: ($changes | map(select(.status == "noop")) | length),
-            failure_count: 0,
-            provider_id: $provider.id,
-            provider_name: ($provider.name // null),
-            provider_type: ($provider.type // null),
+            blocked_count: $blocked_count,
+            failure_count: (if ($targets | length) == 0 or $blocked_count > 0 then 1 else 0 end),
+            provider_id: (($desired_providers | first // {}).id // null),
+            provider_name: (($desired_providers | first // {}).name // null),
+            provider_type: (($desired_providers | first // {}).type // null),
+            provider_ids: $selected_ids,
             app_ids: ($targets | map(.id))
           },
-          ok: (($targets | length) > 0),
-          error_code: (if ($targets | length) == 0 then "target_not_found" else null end),
-          error_message: (if ($targets | length) == 0 then "No Access applications matched the app selector." else null end)
+          ok: (($targets | length) > 0 and $blocked_count == 0),
+          error_code: (
+            if ($targets | length) == 0 then "target_not_found"
+            elif $blocked_count > 0 then "empty_allowed_idps_result"
+            else null
+            end
+          ),
+          error_message: (
+            if ($targets | length) == 0 then "No Access applications matched the app selector."
+            elif $blocked_count > 0 then "Refusing a change that would leave allowed_idps empty (empty means every login method is allowed). Use set or set-list to pin an explicit provider set instead."
+            else null
+            end
+          )
         }
     '
 }
@@ -153,32 +227,38 @@ access_login_method_verify_json() {
     --argjson apps "${apps_json}" \
     --argjson plan "${plan_json}" \
     '
-      ($plan.provider.id) as $provider_id
-      | ($plan.summary.app_ids // []) as $target_ids
+      ($plan.changes // []) as $changes
       | (
-          $target_ids
-          | map(. as $app_id | ($apps[]? | select(.id == $app_id)) as $app | {
-              id: $app_id,
-              name: ($app.name // null),
-              domain: ($app.domain // null),
-              allowed_idps: ($app.allowed_idps // []),
-              verified: (($app.allowed_idps // []) == [$provider_id])
-            })
+          $changes
+          | map(
+              . as $change
+              | ($apps[]? | select(.id == $change.app.id)) as $app
+              | {
+                  id: $change.app.id,
+                  name: ($app.name // null),
+                  domain: ($app.domain // null),
+                  allowed_idps: ($app.allowed_idps // []),
+                  desired_allowed_idps: $change.desired_allowed_idps,
+                  verified: ((($app.allowed_idps // []) | sort) == ($change.desired_allowed_idps | sort))
+                }
+            )
         ) as $rows
       | {
-          success: (($rows | map(select(.verified != true)) | length) == 0 and ($rows | length) == ($target_ids | length)),
+          success: (($rows | map(select(.verified != true)) | length) == 0 and ($rows | length) == ($changes | length)),
           errors: (
-            if (($rows | map(select(.verified != true)) | length) == 0 and ($rows | length) == ($target_ids | length)) then []
+            if (($rows | map(select(.verified != true)) | length) == 0 and ($rows | length) == ($changes | length)) then []
             else [{
               code: "readback_mismatch",
-              message: "One or more targeted Access applications did not read back with exactly the desired identity provider."
+              message: "One or more targeted Access applications did not read back with exactly the desired identity-provider set."
             }]
             end
           ),
           messages: [],
           result: {
-            provider_id: $provider_id,
-            target_count: ($target_ids | length),
+            operation: ($plan.operation // null),
+            provider_id: ($plan.summary.provider_id // null),
+            provider_ids: ($plan.summary.provider_ids // []),
+            target_count: ($changes | length),
             verified_count: ($rows | map(select(.verified == true)) | length),
             apps: $rows,
             failures: ($rows | map(select(.verified != true)))
@@ -291,15 +371,16 @@ main() {
   local app_name="${APP_NAME:-}"
   local app_domain="${APP_DOMAIN:-}"
   local provider_id="${PROVIDER_ID:-}"
+  local provider_ids_json="${PROVIDER_IDS_JSON:-[]}"
   local provider_type="${PROVIDER_TYPE:-}"
   local provider_name="${PROVIDER_NAME:-}"
+  local desired_providers_json="[]"
   local report_file
   local apps_response
   local providers_response
   local apps_json
   local providers_json
   local provider_resolution_json
-  local provider_json
   local plan_json
   local mutation_results_json="[]"
   local verification_response_json="null"
@@ -311,16 +392,19 @@ main() {
 
   report_file="$(cf_inventory_file "operations" "access-login-method-mutation")"
 
-  if [[ "${operation}" != "set" ]]; then
-    provider_resolution_json="$(jq -n '{ok:false, selector:{}, selector_count:0, match_count:0, provider:null, matches:[], error_code:"unsupported_operation", error_message:"Unsupported access.login_method operation."}')"
-    plan_json="$(jq -n '{ok:false, summary:{target_count:null, update_count:null, noop_count:null, failure_count:1}, changes:[] }')"
-    report_json="$(access_login_method_report_json "${apply}" "${operation}" "${provider_resolution_json}" "${plan_json}" "[]" "null" "unsupported_operation" "Unsupported access.login_method operation.")"
-    access_login_method_write_report "${report_file}" "${report_json}"
-    echo "${report_json}" | jq '{summary, mutation_response}'
-    cf_print_log_footer
-    echo "${report_file}"
-    exit 1
-  fi
+  case "${operation}" in
+    set|set-list|add|remove) ;;
+    *)
+      provider_resolution_json="$(jq -n '{ok:false, selector:{}, selector_count:0, match_count:0, provider:null, matches:[], error_code:"unsupported_operation", error_message:"Unsupported access.login_method operation."}')"
+      plan_json="$(jq -n '{ok:false, summary:{target_count:null, update_count:null, noop_count:null, failure_count:1}, changes:[] }')"
+      report_json="$(access_login_method_report_json "${apply}" "${operation}" "${provider_resolution_json}" "${plan_json}" "[]" "null" "unsupported_operation" "Unsupported access.login_method operation.")"
+      access_login_method_write_report "${report_file}" "${report_json}"
+      echo "${report_json}" | jq '{summary, mutation_response}'
+      cf_print_log_footer
+      echo "${report_file}"
+      exit 1
+      ;;
+  esac
 
   apps_response="$(cf_api_capture GET "/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/apps")"
   providers_response="$(cf_api_capture GET "/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/identity_providers")"
@@ -349,7 +433,11 @@ main() {
 
   apps_json="$(jq -c '.result // []' <<< "${apps_response}")"
   providers_json="$(jq -c '.result // []' <<< "${providers_response}")"
-  provider_resolution_json="$(access_login_method_resolve_provider_json "${providers_json}" "${provider_id}" "${provider_type}" "${provider_name}")"
+  if [[ "${operation}" == "set-list" ]]; then
+    provider_resolution_json="$(access_login_method_resolve_providers_json "${providers_json}" "${provider_ids_json}")"
+  else
+    provider_resolution_json="$(access_login_method_resolve_provider_json "${providers_json}" "${provider_id}" "${provider_type}" "${provider_name}")"
+  fi
 
   if [[ "$(jq -r '.ok == true' <<< "${provider_resolution_json}")" != "true" ]]; then
     plan_json="$(jq -n '{ok:false, summary:{target_count:null, update_count:null, noop_count:null, failure_count:1}, changes:[] }')"
@@ -361,8 +449,12 @@ main() {
     exit 1
   fi
 
-  provider_json="$(jq -c '.provider' <<< "${provider_resolution_json}")"
-  plan_json="$(access_login_method_plan_json "${apps_json}" "${provider_json}" "${CLOUDFLARE_ACCOUNT_ID}" "${app_id}" "${app_name}" "${app_domain}")"
+  if [[ "${operation}" == "set-list" ]]; then
+    desired_providers_json="$(jq -c '.matches' <<< "${provider_resolution_json}")"
+  else
+    desired_providers_json="$(jq -c '[.provider]' <<< "${provider_resolution_json}")"
+  fi
+  plan_json="$(access_login_method_plan_json "${apps_json}" "${operation}" "${desired_providers_json}" "${CLOUDFLARE_ACCOUNT_ID}" "${app_id}" "${app_name}" "${app_domain}")"
 
   if [[ "$(jq -r '.ok == true' <<< "${plan_json}")" != "true" ]]; then
     report_json="$(access_login_method_report_json "${apply}" "${operation}" "${provider_resolution_json}" "${plan_json}" "[]" "null" "$(jq -r '.error_code' <<< "${plan_json}")" "$(jq -r '.error_message' <<< "${plan_json}")")"

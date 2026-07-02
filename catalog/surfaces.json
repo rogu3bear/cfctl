@@ -1018,6 +1018,18 @@
             "set": {
               "risk": "write",
               "selectors_any_of": [["provider_id"], ["provider_type"], ["provider_name"]]
+            },
+            "set-list": {
+              "risk": "write",
+              "selectors_any_of": [["provider_id"]]
+            },
+            "add": {
+              "risk": "write",
+              "selectors_any_of": [["provider_id"], ["provider_type"], ["provider_name"]]
+            },
+            "remove": {
+              "risk": "write",
+              "selectors_any_of": [["provider_id"], ["provider_type"], ["provider_name"]]
             }
           }
         }
@@ -1027,7 +1039,169 @@
         "./cfctl list access.login_method --domain docs.example.org",
         "./cfctl apply access.login_method set --provider-type onetimepin --plan",
         "./cfctl apply access.login_method set --provider-id <provider-id> --ack-plan <operation-id>",
-        "./cfctl apply access.login_method set --provider-name 'One-time PIN' --plan"
+        "./cfctl apply access.login_method set-list --provider-id <id-a> --provider-id <id-b> --domain docs.example.org --plan",
+        "./cfctl apply access.login_method add --provider-type onetimepin --domain docs.example.org --plan",
+        "./cfctl apply access.login_method remove --provider-type onetimepin --domain docs.example.org --plan"
+      ]
+    },
+    "access.idp": {
+      "description": "Cloudflare Access identity providers (login methods) in the pinned account. The onetimepin provider is the account-wide OTP login method: create enables it, delete disables it.",
+      "standards_ref": "access.idp",
+      "docs_topics": ["zero-trust-api", "api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_access_identity_providers.sh",
+      "apply_script": "scripts/cf_mutate_access_identity_provider.sh",
+      "permission_family": "Access: Organizations, Identity Providers, and Groups",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/access/identity_providers"
+      },
+      "selectors": ["id", "name", "type"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"], ["type"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"], ["type"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "create": {
+              "risk": "write"
+            },
+            "update": {
+              "risk": "write",
+              "selectors_any_of": [["id"], ["type"], ["name"]]
+            },
+            "delete": {
+              "risk": "destructive",
+              "selectors_any_of": [["id"], ["type"], ["name"]],
+              "confirm": "delete"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list access.idp",
+        "./cfctl get access.idp --type onetimepin",
+        "./cfctl apply access.idp create --type onetimepin --plan",
+        "./cfctl apply access.idp create --type onetimepin --ack-plan <operation-id>",
+        "./cfctl apply access.idp delete --type onetimepin --confirm delete --plan"
+      ]
+    },
+    "access.group": {
+      "description": "Cloudflare Access groups (reusable include/exclude/require rule groups) in the pinned account.",
+      "standards_ref": "access.group",
+      "docs_topics": ["zero-trust-api", "api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_access_groups.sh",
+      "apply_script": "scripts/cf_mutate_access_group.sh",
+      "permission_family": "Access: Organizations, Identity Providers, and Groups",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/access/groups"
+      },
+      "selectors": ["id", "name"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "create": {
+              "risk": "write"
+            },
+            "update": {
+              "risk": "write",
+              "required_selectors": ["id"]
+            },
+            "delete": {
+              "risk": "destructive",
+              "required_selectors": ["id"],
+              "confirm": "delete"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list access.group",
+        "./cfctl get access.group --name operators",
+        "./cfctl apply access.group create --body '{\"name\":\"operators\",\"include\":[{\"email\":{\"email\":\"ops@example.com\"}}]}' --plan",
+        "./cfctl apply access.group update --id <group-id> --body-file group.json --plan",
+        "./cfctl apply access.group delete --id <group-id> --confirm delete --plan"
+      ]
+    },
+    "access.organization": {
+      "description": "Cloudflare Access organization settings (the Zero Trust org singleton): session duration, UI read-only, auto-redirect, login design. Writes are field-scoped read-modify-write, never blind PUTs.",
+      "standards_ref": "access.organization",
+      "docs_topics": ["zero-trust-api", "api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_access_organization.sh",
+      "apply_script": "scripts/cf_mutate_access_organization.sh",
+      "permission_family": "Access: Organizations, Identity Providers, and Groups",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/access/organizations"
+      },
+      "selectors": [],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true
+        },
+        "verify": {
+          "supported": true
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "set-session-duration": {
+              "risk": "write"
+            },
+            "set-ui-read-only": {
+              "risk": "write"
+            },
+            "set-auto-redirect-to-identity": {
+              "risk": "write"
+            },
+            "update": {
+              "risk": "write"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list access.organization",
+        "./cfctl get access.organization",
+        "./cfctl apply access.organization set-session-duration --content 24h --plan",
+        "./cfctl apply access.organization set-ui-read-only --content true --plan",
+        "./cfctl apply access.organization update --body '{\"login_design\":{\"header_text\":\"Ops\"}}' --plan"
       ]
     },
     "access.policy": {
