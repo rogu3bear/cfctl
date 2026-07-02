@@ -1,0 +1,34 @@
+{
+  "match": {
+    "domain": "founder.mlnavigator.com"
+  },
+  "intent": {
+    "classification": "authenticated_counterparty_portal",
+    "source_repo": "/Users/star/dev/mln-web",
+    "rationale": "The founder portal (and its demo host) authenticates external founders who cannot join a private identity provider, so onetimepin (email OTP) is the deliberate login method. The unauthenticated /api/public-surveys carve-out under this host is tracked separately in founder-public-surveys.json.",
+    "otp_provider_id": "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+  },
+  "body": {
+    "name": "Founder Portal",
+    "type": "self_hosted",
+    "domain": "founder.mlnavigator.com",
+    "self_hosted_domains": [
+      "founder.mlnavigator.com",
+      "demo.mlnavigator.com"
+    ],
+    "destinations": [
+      {
+        "type": "public",
+        "uri": "founder.mlnavigator.com"
+      },
+      {
+        "type": "public",
+        "uri": "demo.mlnavigator.com"
+      }
+    ],
+    "allowed_idps": [
+      "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+    ],
+    "session_duration": "24h"
+  }
+}
