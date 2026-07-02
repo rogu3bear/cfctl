@@ -56,6 +56,25 @@ CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-id <provider
 
 Add `--id`, `--name`, or `--domain` to narrow the app target. Without an app selector, the target is all Access applications.
 
+Identity-provider lifecycle itself lives on `access.idp`. Creating or deleting
+the `onetimepin` provider is the account-wide OTP login-method toggle;
+creating it when it already exists is a noop, and delete is destructive:
+
+```bash
+cfctl list access.idp
+cfctl get access.idp --type onetimepin
+cfctl apply access.idp create --type onetimepin --plan
+cfctl apply access.idp create --type onetimepin --ack-plan <operation-id>
+cfctl apply access.idp delete --type onetimepin --confirm delete --plan
+cfctl apply access.idp delete --type onetimepin --confirm delete --ack-plan <operation-id>
+```
+
+Only `onetimepin` gets a synthesized create body. Every other provider type
+requires an explicit `--body`/`--body-file` (including `update`): the live GET
+omits provider config secrets, so cfctl refuses to build read-modify-write
+bodies that would blank them. Secret-like config values are redacted before
+any body reaches a plan artifact.
+
 Example authorization flow:
 
 ```bash

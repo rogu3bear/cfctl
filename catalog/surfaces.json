@@ -1030,6 +1030,60 @@
         "./cfctl apply access.login_method set --provider-name 'One-time PIN' --plan"
       ]
     },
+    "access.idp": {
+      "description": "Cloudflare Access identity providers (login methods) in the pinned account. The onetimepin provider is the account-wide OTP login method: create enables it, delete disables it.",
+      "standards_ref": "access.idp",
+      "docs_topics": ["zero-trust-api", "api-auth"],
+      "backend": "inventory_script",
+      "inventory_script": "scripts/cf_inventory_access_identity_providers.sh",
+      "apply_script": "scripts/cf_mutate_access_identity_provider.sh",
+      "permission_family": "Access: Organizations, Identity Providers, and Groups",
+      "probe": {
+        "method": "GET",
+        "path_template": "/accounts/{account_id}/access/identity_providers"
+      },
+      "selectors": ["id", "name", "type"],
+      "actions": {
+        "list": {
+          "supported": true
+        },
+        "get": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"], ["type"]]
+        },
+        "verify": {
+          "supported": true,
+          "selectors_any_of": [["id"], ["name"], ["type"]]
+        },
+        "can": {
+          "supported": true
+        },
+        "apply": {
+          "supported": true,
+          "operations": {
+            "create": {
+              "risk": "write"
+            },
+            "update": {
+              "risk": "write",
+              "selectors_any_of": [["id"], ["type"], ["name"]]
+            },
+            "delete": {
+              "risk": "destructive",
+              "selectors_any_of": [["id"], ["type"], ["name"]],
+              "confirm": "delete"
+            }
+          }
+        }
+      },
+      "examples": [
+        "./cfctl list access.idp",
+        "./cfctl get access.idp --type onetimepin",
+        "./cfctl apply access.idp create --type onetimepin --plan",
+        "./cfctl apply access.idp create --type onetimepin --ack-plan <operation-id>",
+        "./cfctl apply access.idp delete --type onetimepin --confirm delete --plan"
+      ]
+    },
     "access.policy": {
       "description": "Application-scoped Access policies attached to Access apps.",
       "module": "access_policy",

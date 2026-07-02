@@ -4005,6 +4005,16 @@ cfctl_handle_apply() {
         "BODY_JSON=${CFCTL_BODY_JSON}" \
         "BODY_FILE=${CFCTL_BODY_FILE}"
       ;;
+    access.idp)
+      cfctl_run_backend_script "${script_path}" \
+        "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \
+        "OPERATION=${operation}" \
+        "IDP_ID=${id_value}" \
+        "IDP_TYPE=${CFCTL_TYPE}" \
+        "IDP_NAME=${CFCTL_NAME}" \
+        "BODY_JSON=${CFCTL_BODY_JSON}" \
+        "BODY_FILE=${CFCTL_BODY_FILE}"
+      ;;
     dns.record)
       cfctl_run_backend_script "${script_path}" \
         "APPLY=$([[ "${CFCTL_PLAN}" == "1" ]] && echo 0 || echo 1)" \

@@ -9,6 +9,7 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | Surface | Read | Can | Apply | Verify | Desired State | Standards | Docs Topics | Module |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `access.app` | yes | yes | yes | yes | yes | `access.app` | `zero-trust-api, api-auth` | `access_app` |
+| `access.idp` | yes | yes | yes | yes | no | `access.idp` | `zero-trust-api, api-auth` | `-` |
 | `access.login_method` | yes | yes | yes | yes | no | `access.login_method` | `zero-trust-api, api-auth` | `access_login_method` |
 | `access.policy` | yes | yes | yes | yes | yes | `access.policy` | `zero-trust-api, api-auth` | `access_policy` |
 | `access.service_token` | yes | yes | yes | yes | no | `-` | `-` | `-` |
@@ -52,6 +53,9 @@ This matrix is derived from the same catalogs used by `cfctl explain`, `cfctl cl
 | `access.app` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: id |
 | `access.app` | `update` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: id |
 | `access.app` | `sync` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | state match: id, name, domain |
+| `access.idp` | `create` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | - |
+| `access.idp` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | one of: id / type / name |
+| `access.idp` | `update` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | one of: id / type / name |
 | `access.login_method` | `set` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | one of: provider_id / provider_type / provider_name |
 | `access.policy` | `create` | `write` | yes | `apply` | yes | `-` | `dev`, `global` | required: app_id |
 | `access.policy` | `delete` | `destructive` | yes | `lease` | yes | `delete` | `dev`, `global` | required: app_id, policy_id |

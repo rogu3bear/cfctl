@@ -172,6 +172,34 @@
         "cfctl apply access.login_method set --provider-id <provider-id> --ack-plan <operation-id>"
       ]
     },
+    "access.idp": {
+      "stance": "preview-gated provider lifecycle; access.idp is the only sanctioned surface for creating, updating, or deleting Access identity providers",
+      "standards": [
+        {
+          "id": "access.idp.otp-deliberate",
+          "level": "required",
+          "title": "Treat onetimepin lifecycle as account-wide auth policy",
+          "summary": "Creating or deleting the onetimepin provider enables or disables the OTP login method for the whole account; it must go through plan/ack, and delete requires --confirm delete."
+        },
+        {
+          "id": "access.idp.existing-target-resolution",
+          "level": "required",
+          "title": "Resolve update/delete targets fail-closed",
+          "summary": "update and delete must resolve exactly one existing provider by id, type, or name; zero or multiple matches stop the write."
+        },
+        {
+          "id": "access.idp.no-secret-in-artifact",
+          "level": "required",
+          "title": "Keep provider config secrets out of artifacts",
+          "summary": "Secret-bearing config values (client_secret and similar) must be redacted before any request body lands in a plan, report, or stdout; non-onetimepin bodies are operator-supplied because live GET omits config secrets."
+        }
+      ],
+      "evidence": [
+        "cfctl list access.idp",
+        "cfctl apply access.idp create --type onetimepin --plan",
+        "cfctl apply access.idp delete --type onetimepin --confirm delete --plan"
+      ]
+    },
     "access.policy": {
       "stance": "desired-state preferred for shared and high-value policies",
       "standards": [

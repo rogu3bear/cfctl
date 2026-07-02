@@ -87,6 +87,7 @@ cfctl list r2.bucket
 cfctl list queue
 cfctl list workflow
 cfctl list access.app
+cfctl list access.idp
 cfctl list tunnel
 ```
 

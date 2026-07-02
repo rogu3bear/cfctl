@@ -97,6 +97,9 @@ bash -n \
   "${ROOT_DIR}/scripts/verify_maildesk_cf_contract.sh" \
   "${ROOT_DIR}/scripts/verify_env_loader_contract.sh" \
   "${ROOT_DIR}/lib/runtime/env.sh" \
+  "${ROOT_DIR}/scripts/verify_access_identity_provider_contract.sh" \
+  "${ROOT_DIR}/scripts/cf_inventory_access_identity_providers.sh" \
+  "${ROOT_DIR}/scripts/cf_mutate_access_identity_provider.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_access_login_methods.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_audit_logs.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_api_gateway.sh" \
@@ -247,6 +250,7 @@ python3 -m py_compile "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
 "${ROOT_DIR}/scripts/verify_access_login_method_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_maildesk_cf_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_env_loader_contract.sh" >/dev/null
+"${ROOT_DIR}/scripts/verify_access_identity_provider_contract.sh" >/dev/null
 
 set +e
 doctor_bootstrap_json="$(
@@ -927,6 +931,16 @@ assert_jq_file "surface module bindings" '
   and .surfaces["access.login_method"].inventory_script == "scripts/cf_inventory_access_login_methods.sh"
   and .surfaces["access.login_method"].apply_script == "scripts/cf_mutate_access_login_method.sh"
   and (.surfaces["access.login_method"].actions.apply.operations.set.selectors_any_of | any(. == ["provider_type"]))
+  and .surfaces["access.idp"].standards_ref == "access.idp"
+  and .surfaces["access.idp"].inventory_script == "scripts/cf_inventory_access_identity_providers.sh"
+  and .surfaces["access.idp"].apply_script == "scripts/cf_mutate_access_identity_provider.sh"
+  and .surfaces["access.idp"].permission_family == "Access: Organizations, Identity Providers, and Groups"
+  and (.surfaces["access.idp"].docs_topics | index("zero-trust-api")) != null
+  and .surfaces["access.idp"].probe.path_template == "/accounts/{account_id}/access/identity_providers"
+  and (.surfaces["access.idp"].actions.apply.operations | keys | sort) == ["create", "delete", "update"]
+  and .surfaces["access.idp"].actions.apply.operations.delete.confirm == "delete"
+  and .surfaces["access.idp"].actions.apply.operations.delete.risk == "destructive"
+  and (.surfaces["access.idp"].actions.apply.operations.delete.selectors_any_of | any(. == ["type"]))
   and .surfaces["access.policy"].module == "access_policy"
   and .surfaces["access.policy"].standards_ref == "access.policy"
   and (.surfaces["access.policy"].docs_topics | index("zero-trust-api")) != null

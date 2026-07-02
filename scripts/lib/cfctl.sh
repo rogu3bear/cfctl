@@ -1596,6 +1596,11 @@ cfctl_collect_surface_items() {
       cfctl_run_backend_script "${script_path}"
       CFCTL_COLLECT_BACKEND="inventory_script"
       ;;
+    access.idp)
+      script_path="${CF_REPO_ROOT}/scripts/cf_inventory_access_identity_providers.sh"
+      cfctl_run_backend_script "${script_path}"
+      CFCTL_COLLECT_BACKEND="inventory_script"
+      ;;
     pages.secret)
       script_path="${CF_REPO_ROOT}/scripts/cf_inventory_pages_secrets.sh"
       cfctl_run_backend_script "${script_path}" "PAGES_PROJECT=${CFCTL_PROJECT}"
@@ -1675,6 +1680,9 @@ cfctl_collect_surface_items() {
       ;;
     access.service_token)
       CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.service_tokens // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
+      ;;
+    access.idp)
+      CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.identity_providers // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
       ;;
     pages.secret)
       CFCTL_COLLECT_ITEMS_JSON="$(jq -c '.secrets // []' <<< "${CFCTL_BACKEND_ARTIFACT_JSON}")"
@@ -2176,6 +2184,20 @@ cfctl_filter_surface_items() {
               (if $name != "" then .name == $name else true end)
               and
               (if $domain != "" then .domain == $domain else true end)
+            )
+        ]
+      ' <<< "${items_json}"
+      ;;
+    access.idp)
+      jq -c --arg id "${CFCTL_ID}" --arg name "${CFCTL_NAME}" --arg type "${CFCTL_TYPE}" '
+        [
+          .[]
+          | select(
+              (if $id != "" then .id == $id else true end)
+              and
+              (if $name != "" then .name == $name else true end)
+              and
+              (if $type != "" then .type == $type else true end)
             )
         ]
       ' <<< "${items_json}"
