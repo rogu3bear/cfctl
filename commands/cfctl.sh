@@ -4851,6 +4851,10 @@ cfctl_handle_token() {
       shift || true
       exec env CF_RUNTIME_CALLER=cfctl "${CF_REPO_ROOT}/scripts/cf_token_verify_state.sh" "$@"
       ;;
+    revoke-pending)
+      shift || true
+      exec env CF_RUNTIME_CALLER=cfctl "${CF_REPO_ROOT}/scripts/cf_token_revoke_pending.sh" "$@"
+      ;;
     permission-groups)
       shift || true
       exec env CF_RUNTIME_CALLER=cfctl "${CF_REPO_ROOT}/scripts/cf_token_permission_groups.sh" "$@"
@@ -4868,6 +4872,7 @@ cfctl_handle_token() {
 Usage:
   cfctl token get --id <token-id>
   cfctl token verify-state (--consumer <name> | --state-file <path>) [--quiet]
+  cfctl token revoke-pending --consumer <name> [--commit]
   cfctl token permission-groups [--name <filter>] [--scope <scope>]
   cfctl token mint --name <token-name> [token options]
   cfctl token revoke --id <token-id> [--plan|--ack-plan <operation-id> --confirm delete]
@@ -4875,6 +4880,7 @@ Usage:
 Examples:
   cfctl token get --id <token-id>
   CF_TOKEN_LANE=global cfctl token verify-state --consumer mln-web
+  CF_TOKEN_LANE=global cfctl token revoke-pending --consumer mln-web --commit
   cfctl token permission-groups --name "DNS"
   cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --plan
   cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --ack-plan <operation-id> --value-out /tmp/dns-editor.token
