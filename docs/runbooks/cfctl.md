@@ -16,7 +16,7 @@ It is built for agent and operator use:
 - `standards` for canonical configuration guidance
 - `lanes` for auth-lane health and availability
 - `bootstrap` for the initial credential and operator-token permission plan
-- `token` for token permission-group discovery and token minting
+- `token` for token status reads (`get`), permission-group discovery, and token minting
 - `list` for collections
 - `get` for exact resources
 - `snapshot` for evidence-first read capture
@@ -69,6 +69,7 @@ cfctl wrangler --version
 cfctl wrangler deploy --plan
 cfctl cloudflared version
 cfctl cloudflared tunnel create preview-tunnel --plan
+cfctl token get --id <token-id>
 cfctl token permission-groups --name "DNS"
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --plan
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --ack-plan <operation-id> --value-out /tmp/dns-editor.token

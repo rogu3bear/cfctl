@@ -4843,6 +4843,10 @@ cfctl_handle_token() {
   local subcommand="${1:-}"
 
   case "${subcommand}" in
+    get)
+      shift || true
+      exec env CF_RUNTIME_CALLER=cfctl "${CF_REPO_ROOT}/scripts/cf_token_get.sh" "$@"
+      ;;
     permission-groups)
       shift || true
       exec env CF_RUNTIME_CALLER=cfctl "${CF_REPO_ROOT}/scripts/cf_token_permission_groups.sh" "$@"
@@ -4858,11 +4862,13 @@ cfctl_handle_token() {
     ""|-h|--help|help)
       cat <<'EOF'
 Usage:
+  cfctl token get --id <token-id>
   cfctl token permission-groups [--name <filter>] [--scope <scope>]
   cfctl token mint --name <token-name> [token options]
   cfctl token revoke --id <token-id> [--plan|--ack-plan <operation-id> --confirm delete]
 
 Examples:
+  cfctl token get --id <token-id>
   cfctl token permission-groups --name "DNS"
   cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --plan
   cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --ack-plan <operation-id> --value-out /tmp/dns-editor.token

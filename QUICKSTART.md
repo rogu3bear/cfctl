@@ -121,6 +121,7 @@ CF_TOKEN_LANE=global cfctl apply dns.record upsert ... --plan
 
 ```bash
 cfctl token permission-groups --name "DNS"
+cfctl token get --id <token-id>            # read a token's live status + expiry (never its secret)
 
 cfctl token mint \
   --name dns-editor-$(date +%Y%m%d) \

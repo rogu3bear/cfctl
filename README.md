@@ -186,6 +186,7 @@ cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
 Token minting:
 
 ```bash
+cfctl token get --id <token-id>
 cfctl token permission-groups --name "DNS"
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --plan
 cfctl token mint --name dns-editor-<unique-suffix> --permission "DNS Write" --zone example.com --ttl-hours 24 --ack-plan <operation-id> --value-out /tmp/dns-editor.token
