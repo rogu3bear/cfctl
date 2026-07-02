@@ -95,6 +95,8 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_token_revoke.sh" \
   "${ROOT_DIR}/scripts/verify_access_login_method_contract.sh" \
   "${ROOT_DIR}/scripts/verify_maildesk_cf_contract.sh" \
+  "${ROOT_DIR}/scripts/verify_env_loader_contract.sh" \
+  "${ROOT_DIR}/lib/runtime/env.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_access_login_methods.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_audit_logs.sh" \
   "${ROOT_DIR}/scripts/cf_inventory_api_gateway.sh" \
@@ -244,6 +246,7 @@ python3 "${ROOT_DIR}/scripts/verify_permission_catalog.py" >/dev/null
 python3 -m py_compile "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
 "${ROOT_DIR}/scripts/verify_access_login_method_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_maildesk_cf_contract.sh" >/dev/null
+"${ROOT_DIR}/scripts/verify_env_loader_contract.sh" >/dev/null
 
 set +e
 doctor_bootstrap_json="$(
@@ -254,6 +257,7 @@ doctor_bootstrap_json="$(
     -u CLOUDFLARE_ACCOUNT_ID \
     CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
     CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_WORKSPACE_ENV_FILE="/nonexistent/cfctl-empty-env" \
     "${ROOT_DIR}/cfctl" doctor
 )"
 doctor_bootstrap_status=$?
@@ -301,6 +305,7 @@ can_bootstrap_json="$(
     -u CLOUDFLARE_ACCOUNT_ID \
     CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
     CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_WORKSPACE_ENV_FILE="/nonexistent/cfctl-empty-env" \
     "${ROOT_DIR}/cfctl" can email.routing_rule --zone example.com
 )"
 jq -e '
@@ -321,6 +326,7 @@ can_upsert_bootstrap_json="$(
     -u CLOUDFLARE_ACCOUNT_ID \
     CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
     CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_WORKSPACE_ENV_FILE="/nonexistent/cfctl-empty-env" \
     "${ROOT_DIR}/cfctl" can email.routing_rule upsert --zone example.com --name role@example.com --service maildesk-cf-router
 )"
 jq -e '
@@ -409,6 +415,7 @@ sender_domain_guide_json="$(
     -u CLOUDFLARE_ACCOUNT_ID \
     CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
     CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_WORKSPACE_ENV_FILE="/nonexistent/cfctl-empty-env" \
     "${ROOT_DIR}/cfctl" guide sender_domain enable --zone example.com --name example.com
 )"
 jq -e '
@@ -571,6 +578,7 @@ ownership_check_json="$(
     -u CLOUDFLARE_ACCOUNT_ID \
     CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
     CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_WORKSPACE_ENV_FILE="/nonexistent/cfctl-empty-env" \
     "${ROOT_DIR}/cfctl" ownership check
 )"
 jq -e '
@@ -590,6 +598,7 @@ ownership_get_json="$(
     -u CLOUDFLARE_ACCOUNT_ID \
     CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
     CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_WORKSPACE_ENV_FILE="/nonexistent/cfctl-empty-env" \
     "${ROOT_DIR}/cfctl" ownership get --resource-key "cloudflare:dns.record:*"
 )"
 jq -e '
@@ -632,6 +641,7 @@ lane_precedence_json="$(
     CF_TOKEN_LANE=global \
     CF_SHARED_ENV_FILE="${lane_precedence_shared_env}" \
     CF_REPO_ENV_FILE="${lane_precedence_repo_env}" \
+    CF_WORKSPACE_ENV_FILE="/nonexistent/cfctl-empty-env" \
     bash -c 'source "$1"; cf_load_cloudflare_env; cf_current_auth_state_json' bash "${ROOT_DIR}/scripts/lib/cloudflare.sh"
 )"
 jq -e '
@@ -639,6 +649,96 @@ jq -e '
   and .CF_ACTIVE_TOKEN_ENV == "CF_GLOBAL_TOKEN"
   and .CF_ACTIVE_AUTH_SCHEME == "global_api_key"
 ' <<< "${lane_precedence_json}" >/dev/null || die "explicit CF_TOKEN_LANE was not preserved over env files"
+
+assert_jq_file "runtime env_import contract" '
+  .env_import.workspace_file_env == "CF_WORKSPACE_ENV_FILE"
+  and .env_import.fill_gaps_only == true
+  and .env_import.no_shell_eval == true
+  and (.env_import.allowlist | index("CLOUDFLARE_ACCOUNT_ID")) != null
+' "${ROOT_DIR}/catalog/runtime.json"
+
+lane_parity_ok="$(
+  bash -c '
+    set -euo pipefail
+    source "$1"
+    dev_env="$(cf_token_env_name_for_lane dev)"
+    global_env="$(cf_token_env_name_for_lane global)"
+    dev_scheme="$(cf_lane_auth_scheme_for_lane dev)"
+    global_scheme="$(cf_lane_auth_scheme_for_lane global)"
+    jq -e \
+      --arg dev_env "${dev_env}" \
+      --arg global_env "${global_env}" \
+      --arg dev_scheme "${dev_scheme}" \
+      --arg global_scheme "${global_scheme}" \
+      ".lanes.dev.credential_env == \$dev_env
+        and .lanes.global.credential_env == \$global_env
+        and .lanes.dev.auth_scheme == \$dev_scheme
+        and .lanes.global.auth_scheme == \$global_scheme" \
+      "$2" >/dev/null && echo true || echo false
+  ' bash "${ROOT_DIR}/scripts/lib/cloudflare.sh" "${ROOT_DIR}/catalog/runtime.json"
+)"
+[[ "${lane_parity_ok}" == "true" ]] || die "lane resolution must match catalog/runtime.json lanes metadata"
+if bash -c 'source "$1"; cf_token_env_name_for_lane bogus' bash "${ROOT_DIR}/scripts/lib/cloudflare.sh" >/dev/null 2>&1; then
+  die "unknown lane must fail closed in cf_token_env_name_for_lane"
+fi
+
+lanes_requirements_json="$(
+  env \
+    -u CF_DEV_TOKEN \
+    -u CLOUDFLARE_EMAIL \
+    -u CLOUDFLARE_API_TOKEN \
+    -u CLOUDFLARE_ACCOUNT_ID \
+    CF_GLOBAL_TOKEN="static-contract-global-token" \
+    CF_SHARED_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_WORKSPACE_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    "${ROOT_DIR}/cfctl" lanes
+)"
+jq -e '
+  .ok == true
+  and .action == "lanes"
+  and ((.result.lanes[] | select(.lane == "dev") | .error) == "credential_missing")
+  and ((.result.lanes[] | select(.lane == "global") | .error) == "requirements_unmet")
+  and ((.result.lanes[] | select(.lane == "global") | .missing_requirements) == ["CLOUDFLARE_EMAIL"])
+  and (.result.summary.configured_lane_count == 0)
+' <<< "${lanes_requirements_json}" >/dev/null || die "partial global lane must degrade to requirements_unmet instead of exiting"
+if grep -Fq 'static-contract-global-token' <<< "${lanes_requirements_json}"; then
+  die "lanes output leaked a token value"
+fi
+
+credential_gate_json="$(
+  ROOT_DIR="${ROOT_DIR}" bash <<'BASH'
+set -euo pipefail
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/lib/runtime/cfctl.sh"
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/commands/cfctl.sh"
+
+cfctl_probe_permission() {
+  jq -n '{state: "unknown", basis: "credential_missing", errors: [], request: null, status_code: null, permission_family: "Cloudflare API"}'
+}
+
+cfctl_reset_flags
+
+apply_status=0
+apply_output="$(cfctl_action_permission_gate dns.record apply upsert 2>/dev/null)" || apply_status=$?
+
+list_status=0
+cfctl_action_permission_gate dns.record list >/dev/null 2>&1 || list_status=$?
+
+jq -n \
+  --argjson apply_status "${apply_status}" \
+  --argjson list_status "${list_status}" \
+  --argjson apply_result "$(printf '%s' "${apply_output}" | jq -c '.' 2>/dev/null || echo null)" \
+  '{apply_status: $apply_status, list_status: $list_status, apply_result: $apply_result}'
+BASH
+)"
+jq -e '
+  .apply_status != 0
+  and .list_status == 0
+  and .apply_result.ok == false
+  and .apply_result.error.code == "credential_missing"
+' <<< "${credential_gate_json}" >/dev/null || die "apply gate must fail closed on credential_missing while reads stay open"
 
 env_run_shared_env="${lane_precedence_dir}/env-run.env"
 printf '%s\n' \
@@ -651,6 +751,7 @@ env_run_output="$(
     -u CLOUDFLARE_API_TOKEN \
     CF_SHARED_ENV_FILE="${env_run_shared_env}" \
     CF_REPO_ENV_FILE="/nonexistent/cfctl-empty-env" \
+    CF_WORKSPACE_ENV_FILE="/nonexistent/cfctl-empty-env" \
       "${ROOT_DIR}/cfctl" env run --lane dev -- env
 )"
 env_run_help_output="$("${ROOT_DIR}/cfctl" env run --help)"
@@ -929,6 +1030,10 @@ assert_contains "runbook wrapper examples" "cfctl cloudflared version" "${ROOT_D
 assert_contains "runbook env run" "cfctl env run --lane dev -- env" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook env run argv secrecy" "\`env run\` records command argv as evidence; do not pass secrets as command args" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "auth runbook env run" "CF_SHARED_ENV_FILE=/Users/star/dev/.env cfctl env run --lane dev --" "${ROOT_DIR}/docs/runbooks/auth-and-env.md"
+assert_contains "auth runbook workspace fallback knob" "CF_WORKSPACE_ENV_FILE" "${ROOT_DIR}/docs/runbooks/auth-and-env.md"
+assert_contains "auth runbook workspace fill gaps" "fills gaps only" "${ROOT_DIR}/docs/runbooks/auth-and-env.md"
+assert_contains "auth runbook env sources" "cfctl env sources" "${ROOT_DIR}/docs/runbooks/auth-and-env.md"
+assert_contains "auth runbook stray repo env note" ".env.local" "${ROOT_DIR}/docs/runbooks/auth-and-env.md"
 assert_contains "auth runbook env run argv secrecy" "Because argv is evidence, do not pass secrets as command" "${ROOT_DIR}/docs/runbooks/auth-and-env.md"
 assert_contains "runtime policy env run" "\`cfctl env run\` strips parent lane secrets" "${ROOT_DIR}/docs/runtime-policy.md"
 assert_contains "runbook inactive legacy preview cleanup" "previews purge-inactive-legacy" "${ROOT_DIR}/docs/runbooks/cfctl.md"

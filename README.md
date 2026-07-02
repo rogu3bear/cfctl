@@ -49,11 +49,18 @@ Wrangler is excellent for Workers and Pages. `cloudflared` is excellent for tunn
 | Lane selector | `CF_TOKEN_LANE=dev|global` |
 | Account pin | `CLOUDFLARE_ACCOUNT_ID` |
 | Env source | `~/.config/cfctl/.env` by default, or `CF_SHARED_ENV_FILE` (loader: [scripts/lib/cloudflare.sh](scripts/lib/cloudflare.sh)) |
+| Workspace fallback | `CF_WORKSPACE_ENV_FILE` (default `~/dev/.env`) — strict allowlisted `KEY=VALUE` import, fills gaps only, never shell-sourced; `""` disables |
 
 Lane behavior:
 
 - `dev` derives `CLOUDFLARE_API_TOKEN` for wrangler.
 - `global` derives `CLOUDFLARE_API_KEY` and requires `CLOUDFLARE_EMAIL`.
+
+Credential provenance: `cfctl env sources` (and `cfctl doctor` under
+`result.env_health`) reports which file supplied each credential and flags
+drift when the same variable differs across sources — fingerprints only,
+never values. The canonical shared file always wins; the workspace fallback
+only fills gaps.
 
 ## First commands
 

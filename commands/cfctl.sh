@@ -231,9 +231,30 @@ cfctl_action_permission_gate() {
   local operation="${3:-}"
   local permission_json
   local state
+  local basis
 
   permission_json="$(cfctl_probe_permission "${surface}" "${action}" "${operation}")"
   state="$(jq -r '.state' <<< "${permission_json}")"
+  basis="$(jq -r '.basis // empty' <<< "${permission_json}")"
+
+  if [[ "${action}" == "apply" && "${state}" == "unknown" ]] \
+    && [[ "${basis}" == "credential_missing" || "${basis}" == "requirements_unmet" ]]; then
+    cfctl_emit_result \
+      "false" \
+      "${action}" \
+      "${surface}" \
+      "permission_probe" \
+      "false" \
+      "${permission_json}" \
+      '{"state":"not_applicable"}' \
+      "$(jq -n --arg message "No usable Cloudflare credential for the selected lane; refusing to apply blind" '{message: $message}')" \
+      "null" \
+      "" \
+      "credential_missing" \
+      "No usable Cloudflare credential for the selected lane. Run cfctl doctor, configure the lane, then retry." \
+      "${operation}"
+    exit 1
+  fi
 
   if [[ "${state}" == "denied" ]]; then
     cfctl_emit_result \
@@ -739,7 +760,7 @@ cfctl_select_requested_lane_if_available() {
     return
   fi
 
-  if [[ "${requested_lane}" == "global" && -z "${CLOUDFLARE_EMAIL:-}" ]]; then
+  if ! cf_lane_requirements_met "${requested_lane}"; then
     return
   fi
 
@@ -1083,6 +1104,7 @@ cfctl_doctor_repair_hints_json() {
   local secret_scan_json="$4"
   local registry_integrity_json="$5"
   local lanes_json="${6:-null}"
+  local env_health_json="${7:-null}"
   local hints='[]'
 
   if [[ "${lanes_json}" != "null" && "$(jq '(.summary.configured_lane_count // 0) == 0' <<< "${lanes_json}")" == "true" ]]; then
@@ -1117,6 +1139,14 @@ cfctl_doctor_repair_hints_json() {
 
   if [[ "$(jq '(.missing_count // 0) > 0' <<< "${registry_integrity_json}")" == "true" ]]; then
     hints="$(jq '. + ["Fix missing mutable-operation policy fields in catalog/runtime.json or catalog/surfaces.json"]' <<< "${hints}")"
+  fi
+
+  if [[ "${env_health_json}" != "null" && "$(jq '(.provenance.summary.drift_count // 0) > 0' <<< "${env_health_json}")" == "true" ]]; then
+    hints="$(jq '. + ["cfctl env sources","Credential drift: the same variable differs across env sources; update the canonical shared env file so rotations do not go stale"]' <<< "${hints}")"
+  fi
+
+  if [[ "${env_health_json}" != "null" && "$(jq '.hygiene.stray_repo_env.present == true' <<< "${env_health_json}")" == "true" ]]; then
+    hints="$(jq '. + ["Repo-root .env is never read by cfctl (the repo override is .env.local); relocate or remove its secrets deliberately"]' <<< "${hints}")"
   fi
 
   printf '%s\n' "${hints}"
@@ -1450,6 +1480,8 @@ cfctl_handle_doctor() {
   local overall_status="healthy"
   local configured_lane_count
   local healthy_lane_count
+  local env_health_json
+  local credential_drift_count
 
   lanes_json="$(cfctl_collect_lane_health_json)"
   guard_report_json="$(cfctl_backend_guard_report_json)"
@@ -1459,8 +1491,10 @@ cfctl_handle_doctor() {
   preview_health_json="$(cfctl_preview_receipt_health_json)"
   lock_health_json="$(cf_runtime_lock_health_json)"
   bypass_health_json="$(cfctl_bypass_health_json)"
+  env_health_json="$(cfctl_env_health_json)"
   configured_lane_count="$(jq -r '.summary.configured_lane_count // 0' <<< "${lanes_json}")"
   healthy_lane_count="$(jq -r '.summary.healthy_lane_count // 0' <<< "${lanes_json}")"
+  credential_drift_count="$(jq -r '.provenance.summary.drift_count // 0' <<< "${env_health_json}")"
 
   if [[ "${healthy_lane_count}" -eq 0 ]]; then
     if [[ "${configured_lane_count}" -eq 0 ]]; then
@@ -1508,7 +1542,11 @@ cfctl_handle_doctor() {
     overall_status="degraded"
   fi
 
-  repair_hints_json="$(cfctl_doctor_repair_hints_json "${preview_health_json}" "${lock_health_json}" "${bypass_health_json}" "${secret_scan_json}" "${registry_integrity_json}" "${lanes_json}")"
+  if [[ "${overall_status}" != "unsafe" && "${overall_status}" != "bootstrap_required" && "${credential_drift_count}" -gt 0 ]]; then
+    overall_status="degraded"
+  fi
+
+  repair_hints_json="$(cfctl_doctor_repair_hints_json "${preview_health_json}" "${lock_health_json}" "${bypass_health_json}" "${secret_scan_json}" "${registry_integrity_json}" "${lanes_json}" "${env_health_json}")"
   safe_next_steps_json="$(cfctl_safe_next_steps_json "${overall_status}")"
 
   if [[ "${CFCTL_STRICT}" == "1" && "${overall_status}" != "healthy" ]]; then
@@ -1525,6 +1563,7 @@ cfctl_handle_doctor() {
       --argjson preview_receipts "${preview_health_json}" \
       --argjson lock_health "${lock_health_json}" \
       --argjson bypass_health "${bypass_health_json}" \
+      --argjson env_health "${env_health_json}" \
       --argjson repair_hints "${repair_hints_json}" \
       --argjson safe_next_steps "${safe_next_steps_json}" \
       --argjson strict_mode "$([[ "${CFCTL_STRICT}" == "1" ]] && echo true || echo false)" \
@@ -1549,6 +1588,7 @@ cfctl_handle_doctor() {
           preview_receipts: $preview_receipts,
           lock_health: $lock_health,
           bypass_health: $bypass_health,
+          env_health: $env_health,
           secret_scan: $secret_scan,
           safe_next_steps: $safe_next_steps,
           repair_hints: (if $include_repair_hints == true then $repair_hints else [] end),
@@ -1565,7 +1605,7 @@ cfctl_handle_doctor() {
     "true" \
     '{"state":"not_applicable","basis":"runtime_health","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
     '{"state":"not_applicable"}' \
-    "$(jq '{status: .status, strict_mode: .strict_mode, configured_lane_count: (.lanes.summary.configured_lane_count // 0), healthy_lanes: .lanes.summary.healthy_lanes, missing_backend_guards: (.backend_guards.missing | length), registry_policy_gaps: (.registry_integrity.missing_count // 0), secret_leak_count: (.secret_scan.leak_count // 0), unsafe_secret_sink_count: (.secret_scan.unsafe_secret_sink_count // 0), stale_lock_count: (.lock_health.stale_lock_count // 0), orphaned_lock_count: (.lock_health.orphaned_lock_count // 0), expired_preview_count: (.preview_receipts.expired_preview_count // 0), legacy_preview_count: (.preview_receipts.legacy_preview_count // 0), authorization_count: (.bypass_health.authorization_health.authorization_count // 0), expired_authorization_count: (.bypass_health.authorization_health.expired_count // 0), legacy_bypass_active: (.bypass_health.legacy_env_active // false), repair_hint_count: (.repair_hint_count // 0), safe_next_steps: (.safe_next_steps // [])}' <<< "${result_json}")" \
+    "$(jq '{status: .status, strict_mode: .strict_mode, configured_lane_count: (.lanes.summary.configured_lane_count // 0), healthy_lanes: .lanes.summary.healthy_lanes, missing_backend_guards: (.backend_guards.missing | length), registry_policy_gaps: (.registry_integrity.missing_count // 0), secret_leak_count: (.secret_scan.leak_count // 0), unsafe_secret_sink_count: (.secret_scan.unsafe_secret_sink_count // 0), stale_lock_count: (.lock_health.stale_lock_count // 0), orphaned_lock_count: (.lock_health.orphaned_lock_count // 0), expired_preview_count: (.preview_receipts.expired_preview_count // 0), legacy_preview_count: (.preview_receipts.legacy_preview_count // 0), authorization_count: (.bypass_health.authorization_health.authorization_count // 0), expired_authorization_count: (.bypass_health.authorization_health.expired_count // 0), legacy_bypass_active: (.bypass_health.legacy_env_active // false), credential_drift_count: (.env_health.provenance.summary.drift_count // 0), repair_hint_count: (.repair_hint_count // 0), safe_next_steps: (.safe_next_steps // [])}' <<< "${result_json}")" \
     "${result_json}" \
     "" \
     "$([[ "${ok}" == "true" ]] && printf '' || printf 'runtime_health_failed')" \
@@ -4267,13 +4307,39 @@ cfctl_env_run_usage() {
   cat <<'EOF'
 Usage:
   cfctl env run [--lane dev|global] -- <command> [args...]
+  cfctl env sources
 
 Run an external argv command with cfctl-selected Cloudflare auth. The child
 receives only the lane-derived tool auth env, such as CLOUDFLARE_API_TOKEN for
 the dev lane. Parent lane secrets are stripped, child output is redacted, and a
 runtime artifact records the lane/env mapping without cfctl token values.
 Command argv is recorded for evidence; do not pass secrets as command args.
+
+`env sources` reports, read-only, which env file supplied each allowlisted
+credential (fingerprints only, never values) and flags drift when the same
+variable differs across sources.
 EOF
+}
+
+cfctl_handle_env_sources() {
+  local env_health_json
+
+  env_health_json="$(cfctl_env_health_json)"
+
+  cfctl_emit_result \
+    "true" \
+    "env" \
+    "runtime" \
+    "env_sources" \
+    "true" \
+    '{"state":"not_applicable","basis":"env_sources","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
+    '{"state":"not_applicable"}' \
+    "$(jq '{tracked_var_count: (.provenance.summary.tracked_var_count // 0), set_var_count: (.provenance.summary.set_var_count // 0), drift_count: (.provenance.summary.drift_count // 0), drift_vars: (.provenance.summary.drift_vars // []), stray_repo_env_present: (.hygiene.stray_repo_env.present // false)}' <<< "${env_health_json}")" \
+    "${env_health_json}" \
+    "" \
+    "" \
+    "" \
+    "sources"
 }
 
 cfctl_handle_env() {
@@ -4285,6 +4351,10 @@ cfctl_handle_env() {
   case "${subcommand}" in
     ""|-h|--help|help)
       cfctl_env_run_usage
+      return 0
+      ;;
+    sources)
+      cfctl_handle_env_sources
       return 0
       ;;
   esac

@@ -181,6 +181,16 @@
     ],
     "summary": "Runs an external argv command under a cfctl-selected auth lane, exporting only the lane-derived tool env and recording a redacted runtime artifact."
   },
+  "env_import": {
+    "workspace_file_env": "CF_WORKSPACE_ENV_FILE",
+    "workspace_file_default": "~/dev/.env",
+    "fill_gaps_only": true,
+    "no_shell_eval": true,
+    "allowlist": [
+      "CLOUDFLARE_ACCOUNT_ID"
+    ],
+    "summary": "Workspace env fallback: strict KEY=VALUE import of lane credentials, lane requirements, and this allowlist; never sourced as shell, never overwrites canonical shared or repo env values."
+  },
   "tool_wrappers": {
     "wrangler": {
       "script": "scripts/cf_wrangler.sh",

@@ -31,6 +31,24 @@ cfctl_lane_auth_probe_json() {
     return
   fi
 
+  if ! cf_lane_requirements_met "${lane}"; then
+    jq -n \
+      --arg lane "${lane}" \
+      --argjson lane_meta "${lane_meta}" \
+      --argjson missing "$(cf_lane_missing_requirements_json "${lane}")" \
+      '
+        {
+          lane: $lane,
+          available: false,
+          credential_env: ($lane_meta.credential_env // null),
+          auth_scheme: ($lane_meta.auth_scheme // null),
+          error: "requirements_unmet",
+          missing_requirements: $missing
+        }
+      '
+    return
+  fi
+
   previous_state="$(cf_current_auth_state_json)"
   cf_use_token_lane "${lane}"
 
@@ -131,6 +149,17 @@ cfctl_compare_permission_all_lanes() {
         jq \
           --arg lane "${lane}" \
           '. + [{lane: $lane, available: false, permission: {state: "unknown", basis: "credential_missing", errors: [], request: null, status_code: null, permission_family: "Cloudflare API"}}]' \
+          <<< "${reports}"
+      )"
+      continue
+    fi
+
+    if ! cf_lane_requirements_met "${lane}"; then
+      reports="$(
+        jq \
+          --arg lane "${lane}" \
+          --argjson missing "$(cf_lane_missing_requirements_json "${lane}")" \
+          '. + [{lane: $lane, available: false, permission: {state: "unknown", basis: "requirements_unmet", missing_requirements: $missing, errors: [], request: null, status_code: null, permission_family: "Cloudflare API"}}]' \
           <<< "${reports}"
       )"
       continue

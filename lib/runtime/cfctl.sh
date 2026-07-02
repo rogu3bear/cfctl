@@ -19,4 +19,6 @@ source "${CFCTL_RUNTIME_DIR}/result.sh"
 # shellcheck disable=SC1091
 source "${CFCTL_RUNTIME_DIR}/lanes.sh"
 # shellcheck disable=SC1091
+source "${CFCTL_RUNTIME_DIR}/env.sh"
+# shellcheck disable=SC1091
 source "${CFCTL_RUNTIME_DIR}/desired_state.sh"

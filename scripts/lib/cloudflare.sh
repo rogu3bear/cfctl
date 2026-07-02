@@ -8,6 +8,7 @@ CF_OPERATOR_HOME="${CF_OPERATOR_HOME:-${HOME}}"
 CF_CONFIG_HOME_DEFAULT="${CF_CONFIG_HOME_DEFAULT:-${XDG_CONFIG_HOME:-${CF_OPERATOR_HOME}/.config}/cfctl}"
 CF_SHARED_ENV_FILE_DEFAULT="${CF_SHARED_ENV_FILE_DEFAULT:-${CF_CONFIG_HOME_DEFAULT}/.env}"
 CF_REPO_ENV_FILE_DEFAULT="${CF_REPO_ENV_FILE_DEFAULT:-${CF_REPO_ROOT}/.env.local}"
+CF_WORKSPACE_ENV_FILE_DEFAULT="${CF_WORKSPACE_ENV_FILE_DEFAULT:-${CF_WORKSPACE_ROOT:-${CF_OPERATOR_HOME}/dev}/.env}"
 CF_API_BASE="${CF_API_BASE:-https://api.cloudflare.com/client/v4}"
 CF_TOKEN_LANE_DEFAULT="${CF_TOKEN_LANE_DEFAULT:-dev}"
 CF_RUNTIME_CATALOG_PATH_DEFAULT="${CF_RUNTIME_CATALOG_PATH_DEFAULT:-${CF_REPO_ROOT}/catalog/runtime.json}"
@@ -132,20 +133,72 @@ cf_require_tools() {
   done
 }
 
+cf_lane_meta_from_catalog_json() {
+  local lane="${1:-}"
+  local catalog_path
+
+  catalog_path="$(cf_runtime_catalog_path)"
+  if [[ -z "${lane}" || ! -f "${catalog_path}" ]]; then
+    printf 'null\n'
+    return
+  fi
+
+  jq -c --arg lane "${lane}" '.lanes[$lane] // null' "${catalog_path}"
+}
+
+cf_supported_lanes_text() {
+  jq -r '(.lanes // {}) | keys | sort | join(", ")' "$(cf_runtime_catalog_path)" 2>/dev/null || printf 'dev, global'
+}
+
 cf_token_env_name_for_lane() {
   local lane="${1:-}"
+  local env_name
 
-  case "${lane}" in
-    dev)
-      printf 'CF_DEV_TOKEN\n'
-      ;;
-    global)
-      printf 'CF_GLOBAL_TOKEN\n'
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+  env_name="$(cf_lane_meta_from_catalog_json "${lane}" | jq -r '.credential_env // empty')"
+  if [[ -z "${env_name}" ]]; then
+    return 1
+  fi
+
+  printf '%s\n' "${env_name}"
+}
+
+cf_lane_auth_scheme_for_lane() {
+  local lane="${1:-}"
+  local auth_scheme
+
+  auth_scheme="$(cf_lane_meta_from_catalog_json "${lane}" | jq -r '.auth_scheme // empty')"
+  if [[ -z "${auth_scheme}" ]]; then
+    return 1
+  fi
+
+  printf '%s\n' "${auth_scheme}"
+}
+
+cf_lane_requirements_json() {
+  local lane="${1:-}"
+
+  cf_lane_meta_from_catalog_json "${lane}" | jq -c '.requires // []'
+}
+
+cf_lane_missing_requirements_json() {
+  local lane="${1:-}"
+  local missing='[]'
+  local requirement
+
+  while IFS= read -r requirement; do
+    [[ -n "${requirement}" ]] || continue
+    if [[ -z "${!requirement:-}" ]]; then
+      missing="$(jq -c --arg requirement "${requirement}" '. + [$requirement]' <<< "${missing}")"
+    fi
+  done < <(cf_lane_requirements_json "${lane}" | jq -r '.[]?')
+
+  printf '%s\n' "${missing}"
+}
+
+cf_lane_requirements_met() {
+  local lane="${1:-}"
+
+  [[ "$(cf_lane_missing_requirements_json "${lane}" | jq 'length')" == "0" ]]
 }
 
 cf_token_available_for_lane() {
@@ -170,7 +223,7 @@ cf_select_active_token() {
   else
     local env_name=""
     if ! env_name="$(cf_token_env_name_for_lane "${requested_lane}")"; then
-      echo "Unsupported CF_TOKEN_LANE: ${requested_lane}. Expected one of: dev, global." >&2
+      echo "Unsupported CF_TOKEN_LANE: ${requested_lane}. Expected one of: $(cf_supported_lanes_text)." >&2
       exit 1
     fi
 
@@ -179,19 +232,22 @@ cf_select_active_token() {
       exit 1
     fi
 
+    local auth_scheme=""
+    if ! auth_scheme="$(cf_lane_auth_scheme_for_lane "${requested_lane}")"; then
+      echo "Lane ${requested_lane} declares no auth_scheme in $(cf_runtime_catalog_path)" >&2
+      exit 1
+    fi
+
     export CF_ACTIVE_TOKEN_LANE="${requested_lane}"
     export CF_ACTIVE_TOKEN_ENV="${env_name}"
     export CF_ACTIVE_AUTH_SECRET="${!env_name}"
+    export CF_ACTIVE_AUTH_SCHEME="${auth_scheme}"
 
-    case "${requested_lane}" in
-      dev)
-        export CF_ACTIVE_AUTH_SCHEME="api_token"
-        ;;
-      global)
-        export CF_ACTIVE_AUTH_SCHEME="global_api_key"
-        cf_require_var CLOUDFLARE_EMAIL
-        ;;
-    esac
+    local requirement
+    while IFS= read -r requirement; do
+      [[ -n "${requirement}" ]] || continue
+      cf_require_var "${requirement}"
+    done < <(cf_lane_requirements_json "${requested_lane}" | jq -r '.[]?')
   fi
 
   if [[ "${CF_ACTIVE_AUTH_SCHEME}" == "api_token" ]]; then
@@ -848,6 +904,125 @@ cf_build_curl_auth_args() {
   esac
 }
 
+cf_workspace_env_file() {
+  if [[ "${CF_WORKSPACE_ENV_FILE+x}" == "x" ]]; then
+    printf '%s\n' "${CF_WORKSPACE_ENV_FILE}"
+    return
+  fi
+
+  printf '%s\n' "${CF_WORKSPACE_ENV_FILE_DEFAULT}"
+}
+
+cf_env_import_allowlist_json() {
+  local catalog_path
+
+  catalog_path="$(cf_runtime_catalog_path)"
+  if [[ ! -f "${catalog_path}" ]]; then
+    printf '[]\n'
+    return
+  fi
+
+  jq -c '
+    (
+      [(.lanes // {}) | to_entries[] | .value.credential_env // empty]
+      + [(.lanes // {}) | to_entries[] | .value.requires[]?]
+      + ((.env_import.allowlist // []))
+    )
+    | map(select(type == "string" and length > 0))
+    | unique
+  ' "${catalog_path}"
+}
+
+cf_env_file_var_raw_value() {
+  local file="${1:-}"
+  local name="${2:-}"
+  local line
+  local value
+  local result=""
+  local found=1
+
+  if [[ -z "${file}" || ! -f "${file}" || -z "${name}" ]]; then
+    return 1
+  fi
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -n "${line}" ]] || continue
+    [[ "${line}" == \#* ]] && continue
+    if [[ "${line}" == export\ * ]]; then
+      line="${line#export }"
+      line="${line#"${line%%[![:space:]]*}"}"
+    fi
+    [[ "${line}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+    [[ "${line%%=*}" == "${name}" ]] || continue
+    value="${line#*=}"
+    case "${value}" in
+      \"*\")
+        value="${value:1:${#value}-2}"
+        ;;
+      \'*\')
+        value="${value:1:${#value}-2}"
+        ;;
+    esac
+    result="${value}"
+    found=0
+  done < "${file}"
+
+  if [[ "${found}" -ne 0 ]]; then
+    return 1
+  fi
+
+  printf '%s' "${result}"
+}
+
+cf_import_env_file_strict() {
+  local file="${1:-}"
+  local name
+  local value
+
+  if [[ -z "${file}" || ! -f "${file}" ]]; then
+    return 0
+  fi
+
+  while IFS= read -r name; do
+    [[ -n "${name}" ]] || continue
+    [[ -z "${!name:-}" ]] || continue
+    if value="$(cf_env_file_var_raw_value "${file}" "${name}")"; then
+      [[ -n "${value}" ]] || continue
+      printf -v "${name}" '%s' "${value}"
+      # shellcheck disable=SC2163
+      export "${name?}"
+    fi
+  done < <(cf_env_import_allowlist_json | jq -r '.[]?')
+}
+
+cf_env_value_fingerprint_from_file() {
+  local file="${1:-}"
+  local name="${2:-}"
+  local value
+
+  if ! value="$(cf_env_file_var_raw_value "${file}" "${name}")"; then
+    return 1
+  fi
+
+  if [[ -z "${value}" ]]; then
+    return 1
+  fi
+
+  cf_hash_text "${value}" | cut -c1-12
+}
+
+cf_env_value_fingerprint() {
+  local value="${1:-}"
+
+  if [[ -z "${value}" ]]; then
+    return 1
+  fi
+
+  cf_hash_text "${value}" | cut -c1-12
+}
+
 cf_load_cloudflare_env() {
   cf_load_cloudflare_env_files
   cf_select_active_token
@@ -856,6 +1031,7 @@ cf_load_cloudflare_env() {
 cf_load_cloudflare_env_files() {
   local shared_env_file="${CF_SHARED_ENV_FILE:-${CF_SHARED_ENV_FILE_DEFAULT}}"
   local repo_env_file="${CF_REPO_ENV_FILE:-${CF_REPO_ENV_FILE_DEFAULT}}"
+  local workspace_env_file
   local explicit_token_lane_is_set=0
   local explicit_token_lane="${CF_TOKEN_LANE:-}"
 
@@ -875,6 +1051,13 @@ cf_load_cloudflare_env_files() {
     # shellcheck disable=SC1090
     source "${repo_env_file}"
     set +a
+  fi
+
+  # Workspace fallback: strict allowlisted KEY=VALUE import only, never shell
+  # sourcing, and it fills gaps only (canonical shared/repo values always win).
+  workspace_env_file="$(cf_workspace_env_file)"
+  if [[ -n "${workspace_env_file}" && -f "${workspace_env_file}" ]]; then
+    cf_import_env_file_strict "${workspace_env_file}"
   fi
 
   if [[ "${explicit_token_lane_is_set}" == "1" ]]; then

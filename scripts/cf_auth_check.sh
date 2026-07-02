@@ -55,9 +55,14 @@ esac
 
 OUTPUT_FILE="$(cf_inventory_file "auth" "auth-check")"
 
+PRIMARY_TOKEN_ENV="$(cf_token_env_name_for_lane dev)"
+EMERGENCY_TOKEN_ENV="$(cf_token_env_name_for_lane global)"
+
 REPORT_JSON="$(
   jq -n \
     --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    --arg primary_token_env "${PRIMARY_TOKEN_ENV}" \
+    --arg emergency_token_env "${EMERGENCY_TOKEN_ENV}" \
     --arg shared_env_file "${CF_SHARED_ENV_FILE:-${CF_SHARED_ENV_FILE_DEFAULT}}" \
     --arg repo_env_file "${CF_REPO_ENV_FILE:-${CF_REPO_ENV_FILE_DEFAULT}}" \
     --arg cloudflare_account_id "${CLOUDFLARE_ACCOUNT_ID:-}" \
@@ -68,8 +73,8 @@ REPORT_JSON="$(
     --arg wrangler_auth_env "$(if [[ "${CF_ACTIVE_AUTH_SCHEME:-unknown}" == "global_api_key" ]]; then echo CLOUDFLARE_API_KEY; else echo CLOUDFLARE_API_TOKEN; fi)" \
     --argjson shared_env_present "${SHARED_ENV_PRESENT}" \
     --argjson repo_env_present "${REPO_ENV_PRESENT}" \
-    --argjson dev_token_present "$(if [[ -n "${CF_DEV_TOKEN:-}" ]]; then echo true; else echo false; fi)" \
-    --argjson global_token_present "$(if [[ -n "${CF_GLOBAL_TOKEN:-}" ]]; then echo true; else echo false; fi)" \
+    --argjson dev_token_present "$(if [[ -n "${!PRIMARY_TOKEN_ENV:-}" ]]; then echo true; else echo false; fi)" \
+    --argjson global_token_present "$(if [[ -n "${!EMERGENCY_TOKEN_ENV:-}" ]]; then echo true; else echo false; fi)" \
     --argjson auth_check "${AUTH_CHECK_JSON}" \
     --argjson token_verify "${TOKEN_VERIFY_JSON}" \
     --argjson account "${ACCOUNT_JSON}" \
@@ -77,8 +82,8 @@ REPORT_JSON="$(
       {
         generated_at: $generated_at,
         auth: {
-          primary_token_env: "CF_DEV_TOKEN",
-          emergency_token_env: "CF_GLOBAL_TOKEN",
+          primary_token_env: $primary_token_env,
+          emergency_token_env: $emergency_token_env,
           active_auth_scheme: $active_auth_scheme,
           active_token_lane: $active_token_lane,
           active_token_env: $active_token_env,
