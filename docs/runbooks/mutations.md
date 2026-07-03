@@ -71,6 +71,23 @@ app's `allowed_idps` empty is refused — empty means every login method is
 allowed — so removing the last provider requires an explicit `set`/`set-list`
 decision instead.
 
+When `cfctl audit access` flags `otp_only_where_intended`, first separate true
+external-counterparty OTP portals from operator/staff/service-token/deny-only
+surfaces. Only record a `state/access.app` OTP intent for a real external
+counterparty portal whose users cannot join the private IdP. For the remaining
+operator surfaces, prepare a targeted GitHub IdP preview instead of adding an
+OTP exception:
+
+```bash
+cfctl list access.idp
+cfctl apply access.login_method set --provider-id <github-provider-id> --domain <app-domain> --plan
+```
+
+Use one app selector per preview. The preview preserves the app body and policy
+shape while changing `allowed_idps`; after review, apply with the emitted
+`operation_id` and verify with `cfctl audit access` plus a targeted
+`cfctl list access.login_method --domain <app-domain>` readback.
+
 Identity-provider lifecycle itself lives on `access.idp`. Creating or deleting
 the `onetimepin` provider is the account-wide OTP login-method toggle;
 creating it when it already exists is a noop, and delete is destructive:
