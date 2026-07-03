@@ -171,6 +171,8 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - `maildesk-cf init|verify|snapshot|diff|plan|provision --plan` checks one JSON maildesk spec across Email Routing aliases, Workers, D1, R2, Queues, sender mode, and enabled provider readback
 - `maildesk-cf provision --ack-plan <operation-id>` is blocked until composite mutation is backed by preview-gated component surfaces
 - `maildesk-cf` does not perform broad live sends; targeted delivery proof must be requested explicitly
+- `form-intake init|verify|snapshot|diff|plan` checks one JSON public intake spec across source fields, Turnstile, Access posture, secret bindings, Resend evidence, page render, and logging sinks
+- `form-intake plan` emits component operations only; composite apply is absent and production synthetic submit remains opt-in
 - destructive operations require explicit confirmation such as `--confirm delete`
 - blocked surfaces fail with structured permission results instead of raw Cloudflare API blobs
 - ambiguous target resolution is a hard failure
@@ -222,6 +224,27 @@ blocked until each component mutation is present as a public preview-gated
 surface. The public template defaults to receive-only outbound mode; enabled
 sender providers use DNS/authentication and provider readback evidence. Broad
 live sends are never attempted by default.
+
+## form-intake Lifecycle
+
+Use `form-intake` when the question is whether a public form path is usable and
+observable end to end, not whether one isolated Cloudflare resource exists.
+
+```bash
+cfctl form-intake init --url https://example.com/contact
+cfctl form-intake verify --file state/form-intake/example.json
+cfctl form-intake snapshot --file state/form-intake/example.json
+cfctl form-intake diff --file state/form-intake/example.json
+cfctl form-intake plan --file state/form-intake/example.json
+```
+
+The current implementation is read-only. It checks source field alignment,
+Cloudflare Turnstile/widget domains, Pages or Worker secret bindings, Access
+policy posture, Resend sender evidence, page form render, and configured
+storage/log sinks. `plan` proposes component operations, but real changes must
+go through the named preview-gated component surfaces. Production synthetic
+submits are disabled unless a spec opts in and bounded response/readback proof
+is supplied.
 
 ## Result Envelope
 

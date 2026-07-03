@@ -28,6 +28,7 @@ Important:
 - `sync` follows the same preview/ack flow as other writes.
 - `hostname` is a composite lifecycle command, not a generic resource surface.
 - `maildesk-cf` is a composite lifecycle command, not a generic resource surface.
+- `form.intake` is a composite lifecycle command, not a generic resource surface.
 
 Supported surfaces:
 - `access.app`
@@ -37,6 +38,7 @@ Supported surfaces:
 - `security.txt`
 - `hostname` (verify/diff/plan only)
 - `maildesk-cf` (init/verify/snapshot/diff/plan/provision-plan only)
+- `form.intake` (init/verify/snapshot/diff/plan only)
 - `tunnel`
 
 State specs live under [state](state/README.md).
@@ -48,3 +50,4 @@ Rules:
 - delete syncs require explicit destructive confirmation
 - hostname lifecycle specs are YAML under `state/hostname/` and composite apply is blocked until component mutations are preview-gated
 - maildesk-cf lifecycle specs are JSON under `state/maildesk-cf/` and composite provision apply is blocked until component mutations are preview-gated
+- form.intake lifecycle specs are JSON under `state/form-intake/` and composite apply is absent; plans propose preview-gated component operations only

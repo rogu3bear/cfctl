@@ -22,6 +22,8 @@ Start by naming the job class:
   run `cfctl list`, `cfctl get`, `cfctl snapshot`, `cfctl can`, or `cfctl verify` and cite the runtime artifact.
 - External command auth bridge:
   run `cfctl env run --lane dev -- <command> [args...]` when another repo owns deploy semantics but `cfctl` owns Cloudflare credential hydration. Never pass secrets as command args because argv is recorded as evidence.
+- Public intake readiness:
+  run `cfctl form-intake verify --file state/form-intake/<name>.json` when the question is whether users can see a form, pass Turnstile, submit fields, receive a response, and leave storage/log evidence.
 - Mutation:
   read state, scan the generated matrix in [docs/capabilities.md](capabilities.md), load standards, classify, guide, preview with `--plan`, apply with `--ack-plan <operation-id>`, then verify.
 - Runtime development:
@@ -61,6 +63,7 @@ cfctl list edge.certificate --zone example.com
 cfctl get access.app --domain docs.example.org
 cfctl hostname verify --file state/hostname/example.yaml
 cfctl maildesk-cf verify --file state/maildesk-cf/example.json
+cfctl form-intake verify --file state/form-intake/example.json
 CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
 ./scripts/cf_compare_token_coverage.sh
 ./scripts/cf_auth_check.sh
@@ -106,6 +109,15 @@ component writes:
 cfctl maildesk-cf verify --file state/maildesk-cf/example.json
 cfctl maildesk-cf diff --file state/maildesk-cf/example.json
 cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
+```
+
+For public intake readiness, use the composite read path before planning
+component writes:
+
+```bash
+cfctl form-intake verify --file state/form-intake/example.json
+cfctl form-intake diff --file state/form-intake/example.json
+cfctl form-intake plan --file state/form-intake/example.json
 ```
 
 To actually execute a reviewed write:

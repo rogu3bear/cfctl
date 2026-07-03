@@ -132,6 +132,7 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_mutate_zone_setting.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_security_txt.sh" \
   "${ROOT_DIR}/scripts/cf_mutate_zone_ruleset.sh" \
+  "${ROOT_DIR}/scripts/verify_form_intake_contract.sh" \
   "${ROOT_DIR}/scripts/verify_public_contract.sh" \
   "${ROOT_DIR}/scripts/verify_static_contract.sh"
 for surface_module in \
@@ -261,8 +262,10 @@ jq -e '
 python3 "${ROOT_DIR}/scripts/render_capabilities_doc.py" --check "${ROOT_DIR}/docs/capabilities.md" >/dev/null
 python3 "${ROOT_DIR}/scripts/verify_permission_catalog.py" >/dev/null
 python3 -m py_compile "${ROOT_DIR}/scripts/cf_maildesk_cf_lifecycle.py"
+python3 -m py_compile "${ROOT_DIR}/scripts/cf_form_intake_lifecycle.py"
 "${ROOT_DIR}/scripts/verify_access_login_method_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_maildesk_cf_contract.sh" >/dev/null
+bash "${ROOT_DIR}/scripts/verify_form_intake_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_env_loader_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_access_identity_provider_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_access_organization_contract.sh" >/dev/null
@@ -464,6 +467,10 @@ assert_jq_file "permission profile minimality policy" '
   and (.profiles.read.forbidden_permissions | index("* Write")) != null
   and (.profiles["security-audit"].forbidden_permissions | index("* Write")) != null
   and (.profiles["security-audit"].allowed_surfaces | index("audit.log")) != null
+  and (.profiles.read.allowed_surfaces | index("form.intake")) != null
+  and (.profiles.hostname.allowed_surfaces | index("form.intake")) != null
+  and (.profiles.deploy.allowed_surfaces | index("form.intake")) != null
+  and (.profiles["security-audit"].allowed_surfaces | index("form.intake")) != null
   and .profiles.dns.allowed_surfaces == ["dns.record", "zone"]
   and (.profiles.hostname.allowed_surfaces | index("edge.certificate")) != null
   and (.profiles.hostname.allowed_surfaces | index("zone.setting")) != null
@@ -478,7 +485,13 @@ assert_jq_file "permission profile minimality policy" '
   and .profiles["full-operator"].allowed_surfaces == ["*"]
   and (.profiles["full-operator"].forbidden_permissions | index("Account API Tokens *")) != null
 ' "${ROOT_DIR}/catalog/permissions.json"
-assert_jq_file "runtime public verbs" '(.public_verbs | index("docs")) != null and (.public_verbs | index("env")) != null and (.public_verbs | index("wrangler")) != null and (.public_verbs | index("cloudflared")) != null and (.public_verbs | index("hostname")) != null and (.public_verbs | index("maildesk-cf")) != null and (.public_verbs | index("ownership")) != null and (.landing_flow | index("ownership check")) != null and (.landing_flow | index("docs")) != null' "${ROOT_DIR}/catalog/runtime.json"
+assert_jq_file "runtime public verbs" '(.public_verbs | index("docs")) != null and (.public_verbs | index("env")) != null and (.public_verbs | index("wrangler")) != null and (.public_verbs | index("cloudflared")) != null and (.public_verbs | index("hostname")) != null and (.public_verbs | index("maildesk-cf")) != null and (.public_verbs | index("form-intake")) != null and (.public_verbs | index("ownership")) != null and (.landing_flow | index("ownership check")) != null and (.landing_flow | index("docs")) != null' "${ROOT_DIR}/catalog/runtime.json"
+assert_jq_file "runtime form intake desired state" '
+  .desired_state["form.intake"].supported == true
+  and .desired_state["form.intake"].sync_supported == false
+  and .desired_state["form.intake"].state_dir == "state/form-intake"
+  and .desired_state["form.intake"].match_selectors == ["file", "url"]
+' "${ROOT_DIR}/catalog/runtime.json"
 assert_jq_file "runtime env run policy" '
   .env_run.default_lane == "dev"
   and .env_run.requires_argv_separator == true
@@ -515,6 +528,12 @@ assert_jq_file "tool wrapper metadata" '
 assert_jq_file "docs bank shape" '.checked_on != null and .refresh_policy.refresh_interval_days > 0 and (.foundation | length) > 0 and (.watch | length) > 0' "${ROOT_DIR}/catalog/cloudflare-doc-bank.json"
 assert_jq_file "docs bank api gateway topic" '(.foundation | any(.id == "api-gateway")) and (.foundation | any(.id == "audit-logs")) and (.watch | any(.id == "api-shield-vulnerability-scanner"))' "${ROOT_DIR}/catalog/cloudflare-doc-bank.json"
 assert_jq_file "standards shape" '(.universal | length) > 0 and (.surfaces | keys | length) > 0' "${ROOT_DIR}/catalog/standards.json"
+assert_jq_file "form intake standards" '
+  .surfaces["form.intake"].stance == "composite public intake readiness before component mutation"
+  and (.surfaces["form.intake"].standards | map(.id) | index("form.intake.component-writes-preview-gated")) != null
+  and (.surfaces["form.intake"].standards | map(.id) | index("form.intake.synthetic-submit-opt-in")) != null
+  and (.surfaces["form.intake"].evidence | index("cfctl form-intake plan --file state/form-intake/<name>.json")) != null
+' "${ROOT_DIR}/catalog/standards.json"
 assert_jq_file "compatibility freshness thresholds" '.audit.compatibility_date_freshness.note_after_days == 30 and .audit.compatibility_date_freshness.warning_after_days == 90' "${ROOT_DIR}/catalog/standards.json"
 assert_jq_file "standards audit source-context tokens" '
   (.audit.noncanonical_path_tokens | map(.token) | index("/worktrees/")) != null
@@ -1010,6 +1029,12 @@ assert_jq_file "surface module bindings" '
   and .surfaces["maildesk-cf"].actions.provision.required_selectors == ["file"]
   and .surfaces["maildesk-cf"].actions.apply.supported == false
   and (.surfaces["maildesk-cf"].docs_topics | index("email-routing")) != null
+  and .surfaces["form.intake"].backend == "form_intake_lifecycle"
+  and .surfaces["form.intake"].standards_ref == "form.intake"
+  and .surfaces["form.intake"].actions.plan.supported == true
+  and .surfaces["form.intake"].actions.plan.required_selectors == ["file"]
+  and .surfaces["form.intake"].actions.apply.supported == false
+  and (.surfaces["form.intake"].docs_topics | index("turnstile")) != null
   and .surfaces["sender_domain"].inventory_script == "scripts/cf_inventory_sender_domains.sh"
   and .surfaces["sender_domain"].permission_family == "Email Sending"
   and .surfaces["sender_domain"].apply_script == "scripts/cf_mutate_sender_domain.sh"
@@ -1052,14 +1077,17 @@ assert_contains "hostname state example" "cfctl hostname verify --file state/hos
 assert_contains "hostname checked-in spec" "service: example-edge-router" "${ROOT_DIR}/state/hostname/example.yaml"
 assert_contains "maildesk state example" "cfctl maildesk-cf verify --file state/maildesk-cf/example.json" "${ROOT_DIR}/state/maildesk-cf/README.md"
 assert_contains "maildesk checked-in spec" "\"script_name\": \"maildesk-cf-router\"" "${ROOT_DIR}/state/maildesk-cf/example.json"
+assert_contains "form intake state example" "cfctl form-intake verify --file state/form-intake/example.json" "${ROOT_DIR}/state/form-intake/README.md"
+assert_contains "form intake checked-in spec" "\"synthetic_submit\"" "${ROOT_DIR}/state/form-intake/example.json"
 assert_contains "cfctl prompt contract" "You are now operating as \`cfctl\`, a strict, catalog-driven Cloudflare control plane." "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt preview ack" "always require \`--plan\` first, then \`--ack-plan <operation-id>\`" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt token revoke" "For token revocation, require \`--plan\` first" "${ROOT_DIR}/CFCTL_PROMPT.md"
-assert_contains "cfctl prompt error verb" "\`doctor\`, \`audit\`, \`admin\`, \`bootstrap\`, \`lanes\`, \`surfaces\`, \`docs\`, \`previews\`, \`locks\`, \`env\`, \`ownership\`, \`wrangler\`, \`cloudflared\`, \`hostname\`, \`maildesk-cf\`, \`standards\`, \`token\`, \`list\`, \`get\`, \`can\`, \`classify\`, \`guide\`, \`apply\`, \`verify\`, \`explain\`, \`snapshot\`, \`diff\`, or \`error\`." "${ROOT_DIR}/CFCTL_PROMPT.md"
+assert_contains "cfctl prompt error verb" "\`doctor\`, \`audit\`, \`admin\`, \`bootstrap\`, \`lanes\`, \`surfaces\`, \`docs\`, \`previews\`, \`locks\`, \`env\`, \`ownership\`, \`wrangler\`, \`cloudflared\`, \`hostname\`, \`maildesk-cf\`, \`form-intake\`, \`standards\`, \`token\`, \`list\`, \`get\`, \`can\`, \`classify\`, \`guide\`, \`apply\`, \`verify\`, \`explain\`, \`snapshot\`, \`diff\`, or \`error\`." "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt env run" "For \`env run\`, require \`--\` followed by argv command tokens." "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt env run argv secrecy" "refuse requests that pass secrets as command args" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt hostname" "For \`hostname\`, treat \`verify\`, \`diff\`, and \`plan\` as read-only composite evidence flows" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt maildesk" "For \`maildesk-cf\`, treat \`init\`, \`verify\`, \`snapshot\`, \`diff\`, \`plan\`, and \`provision --plan\` as read-only composite evidence flows" "${ROOT_DIR}/CFCTL_PROMPT.md"
+assert_contains "cfctl prompt form intake" "For \`form-intake\`, treat \`init\`, \`verify\`, \`snapshot\`, \`diff\`, and \`plan\` as composite evidence flows" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl prompt wrapper gating" "For \`wrangler\` and \`cloudflared\`, treat clearly read-only subcommands as direct wrapped executions" "${ROOT_DIR}/CFCTL_PROMPT.md"
 assert_contains "cfctl preview inactive legacy cleanup command" "purge-inactive-legacy" "${ROOT_DIR}/commands/cfctl.sh"
 assert_contains "cfctl preview duplicate active cleanup command" "purge-duplicate-active" "${ROOT_DIR}/commands/cfctl.sh"
@@ -1071,6 +1099,7 @@ assert_contains "readme duplicate active preview cleanup" "cfctl previews purge-
 assert_contains "readme source-live boundary" "Source Config Vs Live State" "${ROOT_DIR}/README.md"
 assert_contains "readme hostname lifecycle" "Hostname lifecycle" "${ROOT_DIR}/README.md"
 assert_contains "readme maildesk lifecycle" "maildesk-cf lifecycle" "${ROOT_DIR}/README.md"
+assert_contains "readme form intake lifecycle" "form-intake lifecycle" "${ROOT_DIR}/README.md"
 assert_contains "readme token revoke" "cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete" "${ROOT_DIR}/README.md"
 assert_contains "readme standards audit freshness" "checked-in Wrangler config alignment, including \`compatibility_date\` freshness" "${ROOT_DIR}/README.md"
 assert_contains "readme standards audit source authority" "classify source authority" "${ROOT_DIR}/README.md"
@@ -1078,9 +1107,11 @@ assert_contains "public agent landing wrapper hierarchy" "cfctl wrangler ..." "$
 assert_contains "public agent landing source-live boundary" "Do not turn a source-config audit into a live Cloudflare claim." "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "public readme hostname lifecycle" "Hostname lifecycle" "${ROOT_DIR}/README.md"
 assert_contains "public readme maildesk lifecycle" "cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan" "${ROOT_DIR}/README.md"
+assert_contains "public readme form intake lifecycle" "cfctl form-intake plan --file state/form-intake/example.json" "${ROOT_DIR}/README.md"
 assert_contains "public readme token revoke" "cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete" "${ROOT_DIR}/README.md"
 assert_contains "agent landing decision path" "## Decision Path" "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "agent landing source-live boundary" "Do not turn a source-config audit into a live Cloudflare claim." "${ROOT_DIR}/docs/agent-landing.md"
+assert_contains "agent landing form intake" "Public intake readiness" "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "agent landing env run" "External command auth bridge" "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "agent landing env run argv secrecy" "Never pass secrets as command args because argv is recorded as evidence." "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "runbook wrapper examples" "cfctl cloudflared version" "${ROOT_DIR}/docs/runbooks/cfctl.md"
@@ -1098,6 +1129,7 @@ assert_contains "runbook duplicate active preview cleanup" "previews purge-dupli
 assert_contains "runbook audit log read" "cfctl list audit.log" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook hostname lifecycle" "cfctl hostname verify --file state/hostname/example.yaml" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook maildesk lifecycle" "cfctl maildesk-cf verify --file state/maildesk-cf/example.json" "${ROOT_DIR}/docs/runbooks/cfctl.md"
+assert_contains "runbook form intake lifecycle" "cfctl form-intake verify --file state/form-intake/example.json" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook token revoke" "token revoke --plan\` reads token id/name/status/expiry metadata" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook compatibility freshness" "standards audit\` reports \`compatibility_date\` aging and stale counts" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook source context summary" "\`source_context_summary\`" "${ROOT_DIR}/docs/runbooks/cfctl.md"
@@ -1120,6 +1152,8 @@ assert_contains "state docs zone setting" "- \`zone.setting\`" "${ROOT_DIR}/docs
 assert_contains "state readme zone setting" "- \`zone.setting\`" "${ROOT_DIR}/state/README.md"
 assert_contains "state docs security txt" "- \`security.txt\`" "${ROOT_DIR}/docs/state.md"
 assert_contains "state readme security txt" "- \`security.txt\`" "${ROOT_DIR}/state/README.md"
+assert_contains "state docs form intake" "- \`form.intake\`" "${ROOT_DIR}/docs/state.md"
+assert_contains "state readme form intake" "- \`form.intake\`" "${ROOT_DIR}/state/README.md"
 assert_jq_file "mlnavigator reply spf desired state" '
   .match.zone == "mlnavigator.com"
   and .match.name == "reply.mlnavigator.com"
@@ -1167,6 +1201,7 @@ assert_contains "capabilities read-only surfaces" "## Read-Only Surfaces" "${ROO
 assert_contains "capabilities read-only warning" "Mutation should not be inferred from an inventory script alone." "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities hostname composite" "Composite lifecycle commands:" "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities maildesk composite" "cfctl maildesk-cf provision --file state/maildesk-cf/<name>.json --plan" "${ROOT_DIR}/docs/capabilities.md"
+assert_contains "capabilities form intake composite" "cfctl form-intake plan --file state/form-intake/<name>.json" "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "docs bank tracked vs operable note" "Tracked here does not automatically mean operable through \`cfctl\` today" "${ROOT_DIR}/docs/cloudflare-doc-bank.md"
 assert_contains "docs bank audit logs" "Audit Logs v2" "${ROOT_DIR}/docs/cloudflare-doc-bank.md"
 assert_contains "public contract live verifier note" "This is a live account smoke test." "${ROOT_DIR}/scripts/verify_public_contract.sh"
@@ -1189,6 +1224,7 @@ assert_contains "permission doctrine profile deploy" "- \`deploy\`: Worker, Page
 assert_contains "permission doctrine profile security audit" "- \`security-audit\`: read-only API-security" "${ROOT_DIR}/docs/permission-doctrine.md"
 assert_contains "permission doctrine profile full operator" "- \`full-operator\`: broad local operator profile" "${ROOT_DIR}/docs/permission-doctrine.md"
 assert_contains "permission doctrine token exclusion" "Operator profiles must not include \`Account API Tokens *\` permissions." "${ROOT_DIR}/docs/permission-doctrine.md"
+assert_contains "permission doctrine token admin separation" "Token-admin authority stays separate from the day-to-day lane" "${ROOT_DIR}/docs/permission-doctrine.md"
 assert_contains "permission doctrine read forbidden" "Read-risk profiles must not include \`* Write\`, \`* Revoke\`, or \`* Run\`" "${ROOT_DIR}/docs/permission-doctrine.md"
 assert_contains "permission doctrine account settings blast radius" "\`Account Settings Read\` is the coarse Cloudflare permission behind" "${ROOT_DIR}/docs/permission-doctrine.md"
 assert_contains "readme permission doctrine" "docs/permission-doctrine.md" "${ROOT_DIR}/README.md"

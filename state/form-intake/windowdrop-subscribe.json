@@ -1,0 +1,50 @@
+{
+  "name": "windowdrop-subscribe-intake",
+  "route": {
+    "url": "https://windowdrop.pro",
+    "submit_url": "https://windowdrop.pro/api/subscribe",
+    "method": "POST",
+    "public": true
+  },
+  "owner": {
+    "repo": "/Users/star/dev/windowdrop",
+    "service": "pages",
+    "project": "windowdrop"
+  },
+  "source": {
+    "frontend_files": [
+      "drop-web/site/src/components/email_capture.rs"
+    ],
+    "backend_files": [
+      "functions/api/subscribe.ts"
+    ]
+  },
+  "fields": [
+    {
+      "name": "email",
+      "required": true,
+      "type": "email"
+    }
+  ],
+  "turnstile": {
+    "required": true,
+    "sitekey": "0x4AAAAAACh770I-GvLb9erh",
+    "widget_name": "WindowDrop Subscribe",
+    "secret_binding": "TURNSTILE_SECRET"
+  },
+  "access": {
+    "expected": "public"
+  },
+  "resend": {
+    "mode": "enabled",
+    "api_key_binding": "RESEND_API_KEY",
+    "domain": "windowdrop.pro",
+    "provider_readback_required": false
+  },
+  "logging": {
+    "sinks": []
+  },
+  "synthetic_submit": {
+    "enabled": false
+  }
+}

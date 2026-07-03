@@ -183,6 +183,20 @@ cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
 
 `maildesk-cf provision --plan` emits a local operation id and proposed component operations. `maildesk-cf provision --ack-plan <operation-id>` is blocked until those component writes are each available through preview-gated public `cfctl` surfaces. The verifier does not perform broad live sends; enabled sender providers use DNS/authentication and provider readback evidence unless a human explicitly asks for targeted delivery proof.
 
+## form-intake lifecycle
+
+Use `cfctl form-intake verify|snapshot|diff|plan` with JSON specs under [state/form-intake](state/form-intake) when a public lead, contact, survey, waitlist, or signup path needs source fields, Turnstile, Access posture, Pages/Worker secrets, Resend sender readiness, page render, and storage/log readback checked together.
+
+```bash
+cfctl form-intake init --url https://example.com/contact
+cfctl form-intake verify --file state/form-intake/example.json
+cfctl form-intake snapshot --file state/form-intake/example.json
+cfctl form-intake diff --file state/form-intake/example.json
+cfctl form-intake plan --file state/form-intake/example.json
+```
+
+`form-intake plan` emits proposed component operations only. Real changes stay on preview-gated component surfaces such as `turnstile.widget`, `pages.secret`, `worker.secret`, `access.app`, `access.policy`, `sender_domain`, and storage wrapper commands. Production synthetic submissions are disabled by default and require explicit spec opt-in plus bounded response/readback evidence.
+
 Token minting:
 
 ```bash
@@ -203,7 +217,8 @@ Defined in [catalog/runtime.json](catalog/runtime.json):
 
 ```
 doctor    audit     admin     bootstrap lanes     surfaces  docs      previews  locks
-env       ownership wrangler  cloudflared hostname  maildesk-cf standards token list
+env       ownership wrangler  cloudflared hostname  maildesk-cf form-intake standards
+token     list
 get       can       classify  guide      apply     verify    explain snapshot diff
 ```
 
@@ -263,7 +278,7 @@ lib/runtime/       - auth, result envelopes, lanes, desired-state helpers
 lib/backends/      - backend wrappers
 lib/surfaces/      - runtime catalog access and surface metadata
 catalog/           - surface registry, runtime policy, standards, doc bank
-state/             - selective desired-state specs plus ownership, hostname, and maildesk-cf lifecycle registries
+state/             - selective desired-state specs plus ownership, hostname, maildesk-cf, and form-intake lifecycle registries
 compat/            - legacy script -> cfctl mapping
 legacy/            - older workflows kept for reference
 scripts/           - inventory, mutation, wrangler/cloudflared wrappers, email-routing helpers
@@ -276,7 +291,7 @@ var/logs/          - command logs (gitignored)
 
 Desired state is selective, not universal — it exists where repeated drift justifies `diff` and `sync`, not as a blanket declarative layer.
 
-Currently supported: `access.app`, `access.policy`, `dns.record`, `zone.setting`, `security.txt`, `hostname` verify/diff/plan, `maildesk-cf` verify/snapshot/diff/plan/provision-plan, `tunnel`.
+Currently supported: `access.app`, `access.policy`, `dns.record`, `zone.setting`, `security.txt`, `hostname` verify/diff/plan, `maildesk-cf` verify/snapshot/diff/plan/provision-plan, `form.intake` init/verify/snapshot/diff/plan, `tunnel`.
 
 Use:
 
