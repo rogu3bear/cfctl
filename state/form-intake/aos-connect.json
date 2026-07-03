@@ -1,0 +1,106 @@
+{
+  "name": "aos-connect-intake",
+  "route": {
+    "url": "https://connect.adapteros.com",
+    "submit_url": "https://connect.adapteros.com/connect-request",
+    "method": "POST",
+    "public": true
+  },
+  "owner": {
+    "repo": "/Users/star/dev/aos-web",
+    "service": "pages",
+    "project": "aos-web"
+  },
+  "source": {
+    "frontend_files": [
+      "crates/site/src/pages/connect.rs"
+    ],
+    "backend_files": [
+      "deploy/pages/_worker.js"
+    ]
+  },
+  "fields": [
+    {
+      "name": "intent",
+      "required": true
+    },
+    {
+      "name": "name",
+      "required": false
+    },
+    {
+      "name": "email",
+      "required": true,
+      "type": "email"
+    },
+    {
+      "name": "organization",
+      "required": false
+    },
+    {
+      "name": "workflow",
+      "required": false
+    },
+    {
+      "name": "source_category",
+      "required": false
+    },
+    {
+      "name": "spend_pressure",
+      "required": false
+    },
+    {
+      "name": "firm",
+      "required": false
+    },
+    {
+      "name": "investor_context",
+      "required": false
+    },
+    {
+      "name": "validation_workflow",
+      "required": false
+    },
+    {
+      "name": "feedback_intent",
+      "required": false
+    },
+    {
+      "name": "github",
+      "required": false
+    },
+    {
+      "name": "src",
+      "required": false,
+      "hidden": true
+    },
+    {
+      "name": "company_website",
+      "required": false,
+      "hidden": true,
+      "honeypot": true
+    }
+  ],
+  "turnstile": {
+    "required": true,
+    "sitekey": "0x4AAAAAAC85Hn0h_LXek0R5",
+    "widget_name": "adapteros-briefing",
+    "sitekey_binding": "TURNSTILE_SITE_KEY",
+    "secret_binding": "TURNSTILE_SECRET"
+  },
+  "access": {
+    "expected": "public"
+  },
+  "resend": {
+    "mode": "enabled",
+    "api_key_binding": "RESEND_API_KEY",
+    "domain": "adapteros.com",
+    "provider_readback_required": false
+  },
+  "logging": {
+    "sinks": []
+  },
+  "synthetic_submit": {
+    "enabled": false
+  }
+}
