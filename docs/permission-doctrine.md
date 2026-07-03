@@ -56,6 +56,12 @@ Allowed bootstrap creator permissions:
 The bootstrap creator must not be installed as `CF_DEV_TOKEN`, stored in hosted
 CI, or reused for day-to-day operations.
 
+Token-admin authority stays separate from the day-to-day lane. `CF_DEV_TOKEN`
+should be able to run normal inventory, policy, Access, deploy, and intake
+verification work without `Account API Tokens Write`. Token minting and
+rotation use the bootstrap creator or an explicit token-admin procedure, then
+return to the narrower operator token.
+
 ## Operator Profiles
 
 Profile names are fixed by `catalog/permissions.json`:
@@ -65,6 +71,8 @@ Profile names are fixed by `catalog/permissions.json`:
 - `hostname`: composite hostname lifecycle profile for DNS, Access, routes,
   Worker, certificates, and zone-level TLS/HTTPS settings.
 - `deploy`: Worker, Pages, D1, R2, Queues, route, and wrangler deploy profile.
+- `form.intake` is covered by the read/deploy/security-audit allowlists as a
+  composite verifier; its real changes still use component surfaces.
 - `security-audit`: read-only API-security, Access, logging, and edge posture
   inventory profile.
 - `full-operator`: broad local operator profile; use only when narrower

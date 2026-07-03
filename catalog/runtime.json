@@ -18,6 +18,7 @@
     "cloudflared",
     "hostname",
     "maildesk-cf",
+    "form-intake",
     "standards",
     "token",
     "list",
@@ -290,6 +291,15 @@
       "match_selectors": [
         "file",
         "domain"
+      ]
+    },
+    "form.intake": {
+      "supported": true,
+      "sync_supported": false,
+      "state_dir": "state/form-intake",
+      "match_selectors": [
+        "file",
+        "url"
       ]
     },
     "tunnel": {

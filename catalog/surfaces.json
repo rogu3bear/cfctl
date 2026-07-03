@@ -539,6 +539,35 @@
         "./cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan"
       ]
     },
+    "form.intake": {
+      "description": "Composite public form intake readiness across source fields, Cloudflare Turnstile, Access posture, Pages/Worker secrets, Resend sender evidence, page render, and logging sinks.",
+      "standards_ref": "form.intake",
+      "docs_topics": ["turnstile", "zero-trust-api", "pages-functions", "d1", "api-auth"],
+      "backend": "form_intake_lifecycle",
+      "permission_family": "Form intake lifecycle",
+      "selectors": ["file", "url"],
+      "actions": {
+        "plan": {
+          "supported": true,
+          "risk": "read",
+          "preview_required": false,
+          "verification_required": true,
+          "required_selectors": ["file"],
+          "public_example": "cfctl form-intake plan --file state/form-intake/<name>.json",
+          "troubleshooting_hint": "Run verify first; form.intake emits component operations and does not mutate Cloudflare directly."
+        },
+        "apply": {
+          "supported": false
+        }
+      },
+      "examples": [
+        "./cfctl form-intake init --url https://example.com/contact",
+        "./cfctl form-intake verify --file state/form-intake/example.json",
+        "./cfctl form-intake snapshot --file state/form-intake/example.json",
+        "./cfctl form-intake diff --file state/form-intake/example.json",
+        "./cfctl form-intake plan --file state/form-intake/example.json"
+      ]
+    },
     "sender_domain": {
       "description": "Cloudflare Email Sending sender subdomains in a specific zone.",
       "backend": "inventory_script",

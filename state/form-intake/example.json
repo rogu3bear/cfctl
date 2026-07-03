@@ -1,0 +1,72 @@
+{
+  "name": "example-contact-intake",
+  "route": {
+    "url": "https://example.com/contact",
+    "submit_url": "https://example.com/api/contact",
+    "method": "POST",
+    "public": true
+  },
+  "owner": {
+    "repo": "/Users/star/dev/example-web",
+    "service": "pages",
+    "project": "example-pages"
+  },
+  "source": {
+    "frontend_files": [
+      "src/contact.tsx"
+    ],
+    "backend_files": [
+      "functions/api/contact.ts"
+    ]
+  },
+  "fields": [
+    {
+      "name": "name",
+      "required": true
+    },
+    {
+      "name": "email",
+      "required": true,
+      "type": "email"
+    },
+    {
+      "name": "message",
+      "required": true,
+      "type": "textarea"
+    },
+    {
+      "name": "website",
+      "required": false,
+      "hidden": true,
+      "honeypot": true
+    }
+  ],
+  "turnstile": {
+    "required": true,
+    "sitekey": "0x0000000000000000000000",
+    "widget_name": "example-contact",
+    "sitekey_binding": "TURNSTILE_SITE_KEY",
+    "secret_binding": "TURNSTILE_SECRET"
+  },
+  "access": {
+    "expected": "public"
+  },
+  "resend": {
+    "mode": "enabled",
+    "api_key_binding": "RESEND_API_KEY",
+    "domain": "example.com",
+    "provider_readback_required": false
+  },
+  "logging": {
+    "sinks": [
+      {
+        "type": "d1.database",
+        "name": "example-intake-db",
+        "binding": "INTAKE_DB"
+      }
+    ]
+  },
+  "synthetic_submit": {
+    "enabled": false
+  }
+}

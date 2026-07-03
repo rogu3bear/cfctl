@@ -23,6 +23,7 @@ This table is the operable runtime surface. The standards layer and docs bank in
 | `dns.record` | yes | yes | yes | yes | yes | `dns.record` | `api-auth` | `dns_record` |
 | `edge.certificate` | yes | yes | yes | yes | no | `edge.certificate` | `advanced-certificates, api-auth` | `edge_certificate` |
 | `email.routing_rule` | yes | yes | yes | yes | no | `-` | `email-routing, api-auth` | `-` |
+| `form.intake` | no | no | no | no | yes | `form.intake` | `turnstile, zero-trust-api, pages-functions, d1, api-auth` | `-` |
 | `logpush.job` | yes | yes | yes | yes | no | `-` | `-` | `-` |
 | `maildesk-cf` | no | no | no | no | yes | `maildesk-cf` | `email-routing, email-workers, d1, r2, queues, api-auth` | `-` |
 | `pages.project` | yes | yes | no | yes | no | `-` | `-` | `-` |
@@ -150,6 +151,11 @@ Composite lifecycle commands:
 - `cfctl maildesk-cf diff --file state/maildesk-cf/<name>.json`
 - `cfctl maildesk-cf provision --file state/maildesk-cf/<name>.json --plan` emits a preview operation id and proposed component operations.
 - `cfctl maildesk-cf provision --file state/maildesk-cf/<name>.json --ack-plan <operation-id>` is intentionally blocked until component mutations are preview-gated.
+- `cfctl form-intake init --url https://example.com/contact` emits a starter public-intake desired-state template without mutating Cloudflare.
+- `cfctl form-intake verify --file state/form-intake/<name>.json`
+- `cfctl form-intake snapshot --file state/form-intake/<name>.json`
+- `cfctl form-intake diff --file state/form-intake/<name>.json`
+- `cfctl form-intake plan --file state/form-intake/<name>.json` emits proposed component operations; composite apply is absent.
 
 Ownership authority commands:
 - `cfctl ownership list`

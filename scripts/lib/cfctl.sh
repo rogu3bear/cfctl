@@ -10,6 +10,7 @@ cfctl_reset_flags() {
   CFCTL_ID=""
   CFCTL_NAME=""
   CFCTL_DOMAIN=""
+  CFCTL_URL=""
   CFCTL_FILE=""
   CFCTL_PATTERN=""
   CFCTL_PHASE=""
@@ -84,6 +85,8 @@ cfctl_parse_flags() {
       --name=*) CFCTL_NAME="${1#*=}"; shift ;;
       --domain) CFCTL_DOMAIN="$2"; shift 2 ;;
       --domain=*) CFCTL_DOMAIN="${1#*=}"; shift ;;
+      --url) CFCTL_URL="$2"; shift 2 ;;
+      --url=*) CFCTL_URL="${1#*=}"; shift ;;
       --file) CFCTL_FILE="$2"; shift 2 ;;
       --file=*) CFCTL_FILE="${1#*=}"; shift ;;
       --pattern) CFCTL_PATTERN="$2"; shift 2 ;;
@@ -845,6 +848,7 @@ cfctl_current_args_shell() {
   [[ -n "${CFCTL_ID}" ]] && args+=(--id "${CFCTL_ID}")
   [[ -n "${CFCTL_NAME}" ]] && args+=(--name "${CFCTL_NAME}")
   [[ -n "${CFCTL_DOMAIN}" ]] && args+=(--domain "${CFCTL_DOMAIN}")
+  [[ -n "${CFCTL_URL}" ]] && args+=(--url "${CFCTL_URL}")
   [[ -n "${CFCTL_FILE}" ]] && args+=(--file "${CFCTL_FILE}")
   [[ -n "${CFCTL_PROJECT}" ]] && args+=(--project "${CFCTL_PROJECT}")
   [[ -n "${CFCTL_PATTERN}" ]] && args+=(--pattern "${CFCTL_PATTERN}")
@@ -905,6 +909,7 @@ cfctl_current_selector_args_shell() {
   [[ -n "${CFCTL_ID}" ]] && args+=(--id "${CFCTL_ID}")
   [[ -n "${CFCTL_NAME}" ]] && args+=(--name "${CFCTL_NAME}")
   [[ -n "${CFCTL_DOMAIN}" ]] && args+=(--domain "${CFCTL_DOMAIN}")
+  [[ -n "${CFCTL_URL}" ]] && args+=(--url "${CFCTL_URL}")
   [[ -n "${CFCTL_FILE}" ]] && args+=(--file "${CFCTL_FILE}")
   [[ -n "${CFCTL_PROJECT}" ]] && args+=(--project "${CFCTL_PROJECT}")
   [[ -n "${CFCTL_PATTERN}" ]] && args+=(--pattern "${CFCTL_PATTERN}")
@@ -1123,6 +1128,7 @@ cfctl_target_json() {
     --arg id "${CFCTL_ID}" \
     --arg name "${CFCTL_NAME}" \
     --arg domain "${CFCTL_DOMAIN}" \
+    --arg url "${CFCTL_URL}" \
     --arg file "${CFCTL_FILE}" \
     --arg pattern "${CFCTL_PATTERN}" \
     --arg service "${CFCTL_SERVICE}" \
@@ -1155,6 +1161,7 @@ cfctl_target_json() {
         id: (if $id == "" then null else $id end),
         name: (if $name == "" then null else $name end),
         domain: (if $domain == "" then null else $domain end),
+        url: (if $url == "" then null else $url end),
         file: (if $file == "" then null else $file end),
         pattern: (if $pattern == "" then null else $pattern end),
         service: (if $service == "" then null else $service end),

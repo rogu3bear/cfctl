@@ -57,6 +57,7 @@ Usage:
   cfctl cloudflared [cloudflared args]
   cfctl hostname verify|diff|plan|apply [--file state/hostname/<name>.yaml]
   cfctl maildesk-cf init|verify|snapshot|diff|plan|provision [--file state/maildesk-cf/<name>.json] [--domain example.com]
+  cfctl form-intake init|verify|snapshot|diff|plan [--file state/form-intake/<name>.json] [--url https://example.com/contact]
   cfctl token permission-groups [--name <filter>] [--scope <scope>]
   cfctl token mint --name <token-name> [token options]
   cfctl token revoke --id <token-id> [--plan|--ack-plan <operation-id> --confirm delete]
@@ -89,6 +90,7 @@ Verb intent:
   cloudflared Run cloudflared through the cfctl envelope, logs, and preview gate for mutating commands.
   hostname Composite hostname lifecycle evidence from checked-in state/hostname specs.
   maildesk-cf Composite maildesk-cf provisioning readiness from checked-in state/maildesk-cf specs.
+  form-intake Composite public intake readiness from checked-in state/form-intake specs.
   token     List token permission groups, mint, or revoke account-owned API tokens.
   list      List surfaces or resources.
   explain   Show the contract for one surface.
@@ -139,6 +141,10 @@ Examples:
   cfctl hostname plan --file state/hostname/example.yaml
   cfctl maildesk-cf verify --file state/maildesk-cf/example.json
   cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
+  cfctl form-intake init --url https://example.com/contact
+  cfctl form-intake verify --file state/form-intake/example.json
+  cfctl form-intake snapshot --file state/form-intake/example.json
+  cfctl form-intake plan --file state/form-intake/example.json
   cfctl admin authorizations
   cfctl admin authorize-backend --backend scripts/cf_api_apply.sh --reason "maintainer debug"
   cfctl admin revoke-backend --path var/runtime/admin/backend-bypass-<id>.json
@@ -182,6 +188,7 @@ Desired-state surfaces:
 Composite lifecycle state:
   hostname
   maildesk-cf
+  form.intake
 
 Need more context?
   ${CF_REPO_ROOT}/AGENTS.md
@@ -2199,6 +2206,69 @@ cfctl_handle_classify() {
     return
   fi
 
+  if [[ "${surface}" == "form.intake" && "${requested_operation}" == "plan" ]]; then
+    cfctl_require_surface "${surface}"
+    policy_json="$(cfctl_operation_policy_json "${surface}" "plan" "")"
+    selector_requirements_json="$(cfctl_requirement_check_json "${surface}" "plan" "")"
+    public_example="$(jq -r '.public_example // "cfctl form-intake plan --file state/form-intake/<name>.json"' <<< "${policy_json}")"
+    troubleshooting_hint="$(jq -r '.troubleshooting_hint // "Run verify first; form.intake only emits component operations and does not mutate Cloudflare."' <<< "${policy_json}")"
+    lane_hint_json="$(
+      jq -n \
+        --arg current_lane "${CF_ACTIVE_TOKEN_LANE:-}" \
+        '{
+          current_lane: (if $current_lane == "" then null else $current_lane end),
+          recommended_lane: null,
+          retry_on_recommended_lane: false
+        }'
+    )"
+    result_json="$(
+      jq -n \
+        --argjson target "$(cfctl_target_json)" \
+        --argjson policy "${policy_json}" \
+        --argjson selector_readiness "${selector_requirements_json}" \
+        --argjson lane_hint "${lane_hint_json}" \
+        --arg public_example "${public_example}" \
+        --arg troubleshooting_hint "${troubleshooting_hint}" \
+        '
+          {
+            surface: "form.intake",
+            action: "form-intake",
+            requested_operation: "plan",
+            target: $target,
+            policy: $policy,
+            lane_comparison: null,
+            current_permission_probe: null,
+            selector_readiness: $selector_readiness,
+            lane_hint: $lane_hint,
+            public_example: $public_example,
+            troubleshooting_hint: $troubleshooting_hint,
+            likely_failure_class: (
+              if $selector_readiness.ready != true then
+                "invalid_arguments"
+              else
+                null
+              end
+            )
+          }
+        '
+    )"
+    cfctl_emit_result \
+      "true" \
+      "classify" \
+      "form.intake" \
+      "registry" \
+      "true" \
+      '{"state":"not_applicable","basis":"form_intake_lifecycle","errors":[],"request":null,"status_code":null,"permission_family":"Form intake lifecycle"}' \
+      '{"state":"not_applicable"}' \
+      "$(jq '{risk: .policy.risk, preview_required: .policy.preview_required, selector_ready: .selector_readiness.ready, likely_failure_class: .likely_failure_class}' <<< "${result_json}")" \
+      "${result_json}" \
+      "" \
+      "" \
+      "" \
+      "${requested_operation}"
+    return
+  fi
+
   cfctl_require_surface "${surface}"
 
   if cfctl_action_supported "${surface}" "${requested_operation}"; then
@@ -2428,6 +2498,76 @@ cfctl_handle_guide() {
       "" \
       "" \
       "revoke"
+    return
+  fi
+
+  if [[ "${surface}" == "form.intake" && "${requested_operation}" == "plan" ]]; then
+    local form_policy_json
+    local form_args_shell
+    local form_verify_args_shell
+
+    form_policy_json="$(cfctl_operation_policy_json "form.intake" "plan" "")"
+    form_args_shell="$(cfctl_current_args_shell)"
+    form_verify_args_shell="${form_args_shell}"
+    if [[ -z "${CFCTL_FILE}" ]]; then
+      form_args_shell="${form_args_shell} --file state/form-intake/<name>.json"
+      form_verify_args_shell="${form_verify_args_shell} --file state/form-intake/<name>.json"
+    fi
+    preview_command="cfctl form-intake plan${form_args_shell}"
+    discovery_command="cfctl form-intake verify${form_verify_args_shell}"
+    verify_command="cfctl form-intake verify${form_verify_args_shell}"
+    troubleshooting_hint="$(jq -r '.troubleshooting_hint // "Run verify first; form.intake only emits component operations and does not mutate Cloudflare."' <<< "${form_policy_json}")"
+    public_example="$(jq -r '.public_example // "cfctl form-intake plan --file state/form-intake/<name>.json"' <<< "${form_policy_json}")"
+    guide_json="$(
+      jq -n \
+        --arg discovery_command "${discovery_command}" \
+        --arg preview_command "${preview_command}" \
+        --arg verify_command "${verify_command}" \
+        --arg public_example "${public_example}" \
+        --arg troubleshooting_hint "${troubleshooting_hint}" \
+        --argjson policy "${form_policy_json}" \
+        --argjson selector_readiness "$(cfctl_requirement_check_json "form.intake" "plan" "")" \
+        '
+          {
+            surface: "form.intake",
+            operation: "plan",
+            module: null,
+            standards_ref: "form.intake",
+            docs_topics: ["turnstile", "zero-trust-api", "pages-functions", "d1", "api-auth"],
+            policy: $policy,
+            selector_readiness: $selector_readiness,
+            lane_hint: {current_lane: null, recommended_lane: null},
+            steps: [
+              "Run the verification command first to read source, Cloudflare, page, Resend, and synthetic-submit readiness.",
+              "Run the plan command and inspect component operation proposals.",
+              "Apply any needed changes through the named preview-gated component surfaces.",
+              "Run the verification command again after component changes."
+            ],
+            public_example: $public_example,
+            troubleshooting_hint: $troubleshooting_hint,
+            commands: {
+              discovery: $discovery_command,
+              preview: $preview_command,
+              apply_blocked: null,
+              verify: $verify_command
+            }
+          }
+        '
+    )"
+    cfctl_emit_result \
+      "true" \
+      "guide" \
+      "form.intake" \
+      "registry" \
+      "true" \
+      '{"state":"not_applicable","basis":"form_intake_lifecycle","errors":[],"request":null,"status_code":null,"permission_family":"Form intake lifecycle"}' \
+      '{"state":"not_applicable"}' \
+      "$(jq '.commands' <<< "${guide_json}")" \
+      "${guide_json}" \
+      "" \
+      "" \
+      "" \
+      "plan"
     return
   fi
 
@@ -3630,6 +3770,68 @@ cfctl_handle_maildesk_cf() {
     "${error_code}" \
     "${error_message}" \
     "${maildesk_action}"
+}
+
+cfctl_handle_form_intake() {
+  local form_action="${1:-verify}"
+  local output
+  local status
+  local artifact_path
+  local result_json
+  local performed="true"
+  local ok="true"
+  local error_code=""
+  local error_message=""
+
+  case "${form_action}" in
+    init|verify|snapshot|diff|plan) ;;
+    *)
+      cfctl_emit_failure "form-intake" "form.intake" "form_intake_lifecycle" '{"state":"not_applicable","basis":"form_intake_lifecycle","errors":[],"request":null,"status_code":null,"permission_family":"Form intake lifecycle"}' "unsupported_operation" "Unsupported form-intake action: ${form_action}" "${form_action}"
+      exit 1
+      ;;
+  esac
+
+  if [[ "${form_action}" == "plan" ]]; then
+    CFCTL_OPERATION_ID="${CFCTL_OPERATION_ID:-$(cf_runtime_operation_id)}"
+  fi
+
+  set +e
+  output="$(
+    env \
+      FORM_INTAKE_ACTION="${form_action}" \
+      FORM_INTAKE_URL="${CFCTL_URL}" \
+      SPEC_FILE="${CFCTL_FILE}" \
+      CFCTL_OPERATION_ID="${CFCTL_OPERATION_ID}" \
+      python3 "${CF_REPO_ROOT}/scripts/cf_form_intake_lifecycle.py" 2>&1
+  )"
+  status="$?"
+  set -e
+
+  artifact_path="$(printf '%s\n' "${output}" | tail -n 1)"
+  if [[ "${status}" -ne 0 || ! -f "${artifact_path}" ]]; then
+    ok="false"
+    performed="false"
+    error_code="execution_failed"
+    error_message="${output}"
+    result_json="null"
+  else
+    result_json="$(cat "${artifact_path}")"
+  fi
+
+  cfctl_emit_result \
+    "${ok}" \
+    "form-intake" \
+    "form.intake" \
+    "form_intake_lifecycle" \
+    "${performed}" \
+    '{"state":"not_applicable","basis":"form_intake_lifecycle","errors":[],"request":null,"status_code":null,"permission_family":"Form intake lifecycle"}' \
+    "$([[ "${ok}" == "true" ]] && jq '{state: (if .ready then "verified" else "drift" end)}' <<< "${result_json}" || echo '{"state":"blocked"}')" \
+    "$([[ "${result_json}" != "null" ]] && jq '{spec_path, ready, source_ready: .readiness.source_ready, cloudflare_ready: .readiness.cloudflare_ready, page_ready: .readiness.page_ready, resend_ready: .readiness.resend_ready, synthetic_ready: .readiness.synthetic_ready, drift_count: (.drifts | length), drift_classes, operation_count: .plan.operation_count, mutation_enabled: .plan.mutation_enabled, plan_mode: .plan.plan_mode, operation_id: .plan.operation_id, synthetic_enabled: (.spec.synthetic_submit.enabled // .generated_spec.synthetic_submit.enabled // false)}' <<< "${result_json}" || jq -n --arg message "${error_message}" '{message: $message}')" \
+    "${result_json}" \
+    "$([[ "${result_json}" != "null" ]] && printf '%s' "${artifact_path}" || printf '')" \
+    "${error_code}" \
+    "${error_message}" \
+    "${form_action}"
 }
 
 cfctl_required_confirmation() {
@@ -5829,6 +6031,14 @@ cfctl_main() {
       fi
       cfctl_parse_flags "$@"
       cfctl_handle_maildesk_cf "${maildesk_action}"
+      ;;
+    form-intake)
+      local form_action="${1:-verify}"
+      if [[ "$#" -gt 0 ]]; then
+        shift
+      fi
+      cfctl_parse_flags "$@"
+      cfctl_handle_form_intake "${form_action}"
       ;;
     token)
       cfctl_handle_token "$@"

@@ -341,6 +341,46 @@
         "cfctl maildesk-cf provision --file state/maildesk-cf/<name>.json --plan"
       ]
     },
+    "form.intake": {
+      "stance": "composite public intake readiness before component mutation",
+      "standards": [
+        {
+          "id": "form.intake.state-owns-complete-path",
+          "level": "required",
+          "title": "One spec owns the user submission path",
+          "summary": "A form intake spec should declare the public route, owning repo/service, submitted fields, honeypot fields, Turnstile widget and secret bindings, Access posture, Resend mode, logging sinks, and synthetic-submit policy together."
+        },
+        {
+          "id": "form.intake.verify-before-plan",
+          "level": "required",
+          "title": "Verify source, live config, page render, and logging together",
+          "summary": "Readiness must prove source field alignment, Cloudflare Turnstile and secret binding posture, public Access posture, page form render, Resend sender readiness, and storage/log sinks with an evidence artifact."
+        },
+        {
+          "id": "form.intake.component-writes-preview-gated",
+          "level": "required",
+          "title": "Do not composite-apply intake fixes",
+          "summary": "The composite plan may propose component operations, but real changes must use preview-gated public surfaces such as turnstile.widget, pages.secret, worker.secret, access.app, access.policy, sender_domain, and storage wrappers."
+        },
+        {
+          "id": "form.intake.synthetic-submit-opt-in",
+          "level": "required",
+          "title": "Keep production synthetic submits explicitly bounded",
+          "summary": "Synthetic production submissions are disabled by default. When enabled, the spec must carry a test marker and the verifier must prove both response and readback evidence instead of silently widening live writes."
+        },
+        {
+          "id": "form.intake.resend-explicit-evidence",
+          "level": "recommended",
+          "title": "Use explicit Resend evidence",
+          "summary": "Resend readiness should use explicit provider evidence or binding metadata, not broad workspace secret import or accidental shell-sourced API keys."
+        }
+      ],
+      "evidence": [
+        "cfctl form-intake verify --file state/form-intake/<name>.json",
+        "cfctl form-intake diff --file state/form-intake/<name>.json",
+        "cfctl form-intake plan --file state/form-intake/<name>.json"
+      ]
+    },
     "dns.record": {
       "stance": "desired-state preferred for repeated, platform, and routing-critical records",
       "standards": [
