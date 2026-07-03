@@ -345,6 +345,17 @@ def resource_binding_present(spec: dict[str, Any], evidence: dict[str, Any], sin
     return any(binding in item for item in binding_maps if isinstance(item, dict))
 
 
+def widget_covers_host(widget: dict[str, Any], host: str) -> bool:
+    # Turnstile widget domains cover the listed domain and all of its subdomains.
+    if not host:
+        return False
+    for domain in widget.get("domains") or []:
+        domain_text = str(domain)
+        if host == domain_text or host.endswith("." + domain_text):
+            return True
+    return False
+
+
 def find_turnstile_widget(spec: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any] | None:
     turnstile = spec.get("turnstile") or {}
     sitekey = str(turnstile.get("sitekey") or "")
@@ -404,8 +415,8 @@ def cloudflare_checks(spec: dict[str, Any], evidence: dict[str, Any]) -> tuple[d
     if turnstile_required:
         if not widget:
             drifts.append({"class": "turnstile_widget_drift", "message": "Turnstile widget/sitekey was not found"})
-        elif host and host not in [str(domain) for domain in widget.get("domains") or []]:
-            drifts.append({"class": "turnstile_widget_drift", "message": "Turnstile widget domains do not include route host", "host": host})
+        elif host and not widget_covers_host(widget, host):
+            drifts.append({"class": "turnstile_widget_drift", "message": "Turnstile widget domains do not cover route host", "host": host})
         for binding in (turnstile.get("sitekey_binding"), turnstile.get("secret_binding")):
             if binding and not binding_present(spec, evidence, str(binding)):
                 drifts.append({"class": "secret_binding_missing", "binding": binding, "surface": "pages.secret" if owner_service(spec) == "pages" else "worker.secret"})
@@ -448,7 +459,7 @@ def cloudflare_checks(spec: dict[str, Any], evidence: dict[str, Any]) -> tuple[d
             "required": turnstile_required,
             "sitekey": turnstile.get("sitekey"),
             "widget_found": widget is not None,
-            "domain_ready": (not turnstile_required) or bool(widget and host in [str(domain) for domain in widget.get("domains") or []]),
+            "domain_ready": (not turnstile_required) or bool(widget and widget_covers_host(widget, host)),
         },
         "access": {
             "expected": expected,

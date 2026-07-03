@@ -12,10 +12,11 @@ die() {
 fixture_file="$(mktemp "${TMPDIR:-/tmp}/form-intake-fixture.XXXXXX")"
 missing_fixture_file="$(mktemp "${TMPDIR:-/tmp}/form-intake-missing-fixture.XXXXXX")"
 ready_spec_file="$(mktemp "${TMPDIR:-/tmp}/form-intake-ready-spec.XXXXXX")"
+subdomain_spec_file="$(mktemp "${TMPDIR:-/tmp}/form-intake-subdomain-spec.XXXXXX")"
 missing_spec_file="$(mktemp "${TMPDIR:-/tmp}/form-intake-missing-spec.XXXXXX")"
 source_dir="$(mktemp -d "${TMPDIR:-/tmp}/form-intake-source.XXXXXX")"
 caller_spec_dir="$(mktemp -d "${TMPDIR:-/tmp}/form-intake-caller-spec.XXXXXX")"
-trap 'rm -f "${fixture_file}" "${missing_fixture_file}" "${ready_spec_file}" "${missing_spec_file}"; rm -rf "${source_dir}" "${caller_spec_dir}"' EXIT
+trap 'rm -f "${fixture_file}" "${missing_fixture_file}" "${ready_spec_file}" "${subdomain_spec_file}" "${missing_spec_file}"; rm -rf "${source_dir}" "${caller_spec_dir}"' EXIT
 
 cat >"${source_dir}/page.html" <<'HTML'
 <!doctype html>
@@ -267,6 +268,24 @@ jq -e '
   and .checks.synthetic_submit.performed == false
   and (.plan.operations | length) == 0
 ' "${artifact_path}" >/dev/null || die "ready fixture did not verify"
+
+jq '.route.url = "https://deep.example.com/contact" | .route.submit_url = "https://deep.example.com/api/contact"' \
+  "${ready_spec_file}" >"${subdomain_spec_file}"
+
+subdomain_output="$(
+  FORM_INTAKE_EVIDENCE_FILE="${fixture_file}" \
+  FORM_INTAKE_ACTION=verify \
+  SPEC_FILE="${subdomain_spec_file}" \
+  python3 "${ROOT_DIR}/scripts/cf_form_intake_lifecycle.py"
+)"
+subdomain_artifact_path="$(printf '%s\n' "${subdomain_output}" | tail -n 1)"
+[[ -f "${subdomain_artifact_path}" ]] || die "subdomain verify artifact was not written"
+
+jq -e '
+  .ready == true
+  and (.drifts | length) == 0
+  and .checks.cloudflare.turnstile.domain_ready == true
+' "${subdomain_artifact_path}" >/dev/null || die "widget domain must cover subdomain route hosts (Turnstile covers subdomains)"
 
 missing_output="$(
   FORM_INTAKE_EVIDENCE_FILE="${missing_fixture_file}" \
