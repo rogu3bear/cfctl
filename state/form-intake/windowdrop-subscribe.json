@@ -16,7 +16,7 @@
       "drop-web/site/src/components/email_capture.rs"
     ],
     "backend_files": [
-      "drop-web/site/functions/api/subscribe.ts"
+      "functions/api/subscribe.ts"
     ]
   },
   "fields": [
