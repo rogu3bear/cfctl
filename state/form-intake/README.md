@@ -23,3 +23,9 @@ wrapper commands.
 Production synthetic submissions are disabled by default. If a spec enables
 them, it must include a test marker and the verifier must produce bounded
 response plus readback evidence.
+
+Known limitation: page checks read the raw fetched HTML without executing
+JavaScript. Client-side-rendered forms (for example Leptos/WASM sites) report
+`page_form_missing`/`page_field_missing` even when the form renders correctly
+in a browser. Read those drift classes alongside `source_*` and Cloudflare
+checks before treating a client-rendered intake as broken.

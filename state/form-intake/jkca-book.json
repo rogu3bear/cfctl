@@ -1,0 +1,61 @@
+{
+  "name": "jkca-book-intake",
+  "route": {
+    "url": "https://book.jkca.me",
+    "submit_url": "https://book.jkca.me/api",
+    "method": "POST",
+    "public": true
+  },
+  "owner": {
+    "repo": "/Users/star/dev/jkca-web",
+    "service": "worker",
+    "script": "jkca-web-book"
+  },
+  "source": {
+    "frontend_files": [
+      "crates/web-book/src/pages/home.rs"
+    ],
+    "backend_files": [
+      "crates/web-book/src/booking_journey.rs"
+    ]
+  },
+  "fields": [
+    {
+      "name": "name",
+      "required": true
+    },
+    {
+      "name": "email",
+      "required": true,
+      "type": "email"
+    },
+    {
+      "name": "timezone",
+      "required": true
+    }
+  ],
+  "turnstile": {
+    "required": false
+  },
+  "access": {
+    "expected": "public"
+  },
+  "resend": {
+    "mode": "enabled",
+    "api_key_binding": "RESEND_API_KEY",
+    "domain": "jkca.me",
+    "provider_readback_required": false
+  },
+  "logging": {
+    "sinks": [
+      {
+        "type": "d1.database",
+        "name": "jkca-book",
+        "binding": "BOOK_DB"
+      }
+    ]
+  },
+  "synthetic_submit": {
+    "enabled": false
+  }
+}

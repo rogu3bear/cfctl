@@ -1,0 +1,53 @@
+{
+  "name": "leakbar-license-recover",
+  "route": {
+    "url": "https://leakbar.com",
+    "submit_url": "https://leakbar.com/api/license/recover",
+    "method": "POST",
+    "public": true
+  },
+  "owner": {
+    "repo": "/Users/star/dev/leakbar",
+    "service": "worker",
+    "script": "leakbar-web"
+  },
+  "source": {
+    "frontend_files": [
+      "web/src/components/landing.rs"
+    ],
+    "backend_files": [
+      "web/src/lib.rs"
+    ]
+  },
+  "fields": [
+    {
+      "name": "email",
+      "required": true,
+      "type": "email"
+    }
+  ],
+  "turnstile": {
+    "required": false
+  },
+  "access": {
+    "expected": "public"
+  },
+  "resend": {
+    "mode": "enabled",
+    "api_key_binding": "RESEND_API_KEY",
+    "domain": "leakbar.com",
+    "provider_readback_required": false
+  },
+  "logging": {
+    "sinks": [
+      {
+        "type": "r2.bucket",
+        "name": "leakbar-licenses",
+        "binding": "LICENSE_BUCKET"
+      }
+    ]
+  },
+  "synthetic_submit": {
+    "enabled": false
+  }
+}

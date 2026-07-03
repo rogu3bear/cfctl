@@ -1,0 +1,86 @@
+{
+  "name": "mln-contact-intake",
+  "route": {
+    "url": "https://mlnavigator.com/contact",
+    "submit_url": "https://mlnavigator.com/contact",
+    "method": "POST",
+    "public": true
+  },
+  "owner": {
+    "repo": "/Users/star/dev/mln-web",
+    "service": "pages",
+    "project": "mln-web"
+  },
+  "source": {
+    "frontend_files": [
+      "crates/web-server/src/views/pages/contact.rs",
+      "assets/js/contact-form.js"
+    ],
+    "backend_files": [
+      "pages/marketing/functions/contact.ts"
+    ]
+  },
+  "fields": [
+    {
+      "name": "category",
+      "required": true
+    },
+    {
+      "name": "domain",
+      "required": false
+    },
+    {
+      "name": "name",
+      "required": true
+    },
+    {
+      "name": "email",
+      "required": true,
+      "type": "email"
+    },
+    {
+      "name": "organization",
+      "required": false
+    },
+    {
+      "name": "intent",
+      "required": true
+    },
+    {
+      "name": "constraints",
+      "required": false
+    },
+    {
+      "name": "message",
+      "required": true,
+      "type": "textarea"
+    },
+    {
+      "name": "confirmation",
+      "required": false,
+      "hidden": true,
+      "honeypot": true
+    }
+  ],
+  "turnstile": {
+    "required": true,
+    "sitekey": "0x4AAAAAAC82DSLCBy2Gkd21",
+    "widget_name": "mlnavigator",
+    "secret_binding": "TURNSTILE_SECRET_KEY"
+  },
+  "access": {
+    "expected": "public"
+  },
+  "resend": {
+    "mode": "enabled",
+    "api_key_binding": "MLN_RESEND_API_KEY",
+    "domain": "mlnavigator.com",
+    "provider_readback_required": false
+  },
+  "logging": {
+    "sinks": []
+  },
+  "synthetic_submit": {
+    "enabled": false
+  }
+}
