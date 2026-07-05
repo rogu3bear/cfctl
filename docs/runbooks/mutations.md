@@ -71,6 +71,43 @@ app's `allowed_idps` empty is refused — empty means every login method is
 allowed — so removing the last provider requires an explicit `set`/`set-list`
 decision instead.
 
+When `cfctl audit access` flags `otp_only_where_intended`, first separate true
+external-counterparty OTP portals from operator, staff, service-token-only,
+deny-only, launcher, and WARP surfaces. Only record a `state/access.app` OTP
+intent for a real external counterparty portal whose users cannot join the
+private IdP. An OTP intent is a spec whose `match.domain` targets the app and
+whose `body.allowed_idps` lists the onetimepin provider id; the `intent` block
+records the justifying classification and rationale, and
+`state/access.app/README.md` owns the spec-side policy for which surfaces may
+carry one. For the remaining operator surfaces, prepare a targeted GitHub IdP
+preview instead of adding an OTP exception:
+
+```bash
+cfctl list access.idp
+CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-id <github-provider-id> --domain <app-domain> --plan
+```
+
+Use one app selector per preview. The preview preserves the app body and policy
+shape while changing `allowed_idps`; after review, apply with the emitted
+`operation_id` and verify with `cfctl audit access` plus a targeted
+`cfctl list access.login_method --domain <app-domain>` readback.
+
+If the target app is managed by a `state/access.app` spec, an
+`access.login_method` change to `allowed_idps` is silently reverted by the next
+`cfctl apply access.app sync` — sync rebuilds the live app from the spec's
+`body` alone. For a spec-managed app, update the spec's `body.allowed_idps`
+(and sync) instead of, or alongside, `login_method set`.
+
+`cfctl audit access` also runs `otp_intent_specs_justified`: any
+`state/access.app` spec that grants the onetimepin provider id without a
+justified `intent.classification` (`authenticated_counterparty_portal` or
+`intentional_public_carveout`) is reported as a spec-level offender
+`{domain, classification}` — for example `operator_pending_idp_migration`
+stays flagged until the surface migrates off OTP. The
+`otp_only_where_intended` offender rows also carry `app_launcher_visible`,
+`auto_redirect_to_identity`, and `has_allow_policy`, so triage reads
+operator-vs-portal posture straight off the row.
+
 Identity-provider lifecycle itself lives on `access.idp`. Creating or deleting
 the `onetimepin` provider is the account-wide OTP login-method toggle;
 creating it when it already exists is a noop, and delete is destructive:
@@ -228,6 +265,6 @@ BODY_JSON='{"name":"example-tunnel","config_src":"cloudflare"}' \
 
 - With the default `CF_DEV_TOKEN`, DNS dry runs may still be unable to pre-resolve an existing record id.
 - If a write is blocked on the primary lane, retry the same command with `CF_TOKEN_LANE=global`.
-- `apply <surface> sync` is only supported for `access.app`, `access.policy`, `dns.record`, `zone.setting`, and `tunnel`.
+- `apply <surface> sync` is only supported for `access.app`, `access.policy`, `dns.record`, `zone.setting`, `security.txt`, and `tunnel`.
 - `cf_api_apply.sh` expects a fully expanded Cloudflare API path in `REQUEST_PATH` and `VERIFY_PATH`.
 - `cf_api_apply.sh` is the backend escape hatch for API Shield, rate limits, Access policies, and other surfaces that do not yet have a dedicated wrapper.
