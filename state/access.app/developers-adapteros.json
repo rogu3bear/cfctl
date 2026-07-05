@@ -1,5 +1,11 @@
 {
   "match": { "domain": "developers.adapteros.com" },
+  "intent": {
+    "classification": "authenticated_counterparty_portal",
+    "source_repo": "/Users/star/dev/aos-web",
+    "rationale": "External adapterOS developers authenticate to this app and cannot be onboarded to a private identity provider, so the onetimepin (email OTP) login method is the deliberate, correct auth mechanism.",
+    "otp_provider_id": "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+  },
   "body": {
     "name": "adapterOS Developers",
     "type": "self_hosted",

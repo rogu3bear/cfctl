@@ -1,5 +1,10 @@
 {
   "match": { "domain": "ops.adapteros.com" },
+  "intent": {
+    "classification": "operator_pending_idp_migration",
+    "rationale": "ops.adapteros.com is an operator surface still pinned to onetimepin (email OTP) pending migration to the GitHub identity provider. Per the OTP offender closeout doctrine this stays an honest, visibly flagged exception until the migration lands, rather than being reclassified as an endorsed counterparty portal.",
+    "otp_provider_id": "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+  },
   "body": {
     "name": "adapterOS Ops",
     "type": "self_hosted",
