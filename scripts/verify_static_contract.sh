@@ -279,6 +279,7 @@ grep -Fq 'counterpart to source-config' <<< "${audit_access_help_output}" || die
 grep -Fq 'cfctl audit state' <<< "${audit_access_help_output}" || die "audit help missing state convergence usage"
 grep -Fq 'remediation queue' <<< "${audit_access_help_output}" || die "audit help must describe the state remediation queue"
 assert_contains "posture audit ties checks to standards ids" 'standard_ref: "access.app.allowed-idps-explicit"' "${ROOT_DIR}/scripts/cf_audit_access_posture.sh"
+assert_contains "posture audit enforces justified otp intent specs" 'id: "otp_intent_specs_justified"' "${ROOT_DIR}/scripts/cf_audit_access_posture.sh"
 assert_contains "posture audit reads desired-state otp intent" 'state/access.app' "${ROOT_DIR}/scripts/cf_audit_access_posture.sh"
 
 set +e
@@ -1174,6 +1175,22 @@ assert_jq_file "mlnavigator survey retire access app state" '
   and .intent.classification == "retire_legacy_public_surface"
   and .delete == true
 ' "${ROOT_DIR}/state/access.app/mlnavigator-survey-retire.json"
+assert_jq_file "adapteros beta access app otp intent" '
+  .match.domain == "beta.adapteros.com"
+  and .intent.classification == "authenticated_counterparty_portal"
+  and .intent.otp_provider_id == "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+  and (.body.allowed_idps | index("7b0bc477-5d42-4dab-b0ea-c97d0aef7810")) != null
+' "${ROOT_DIR}/state/access.app/beta-adapteros.json"
+assert_jq_file "adapteros developers access app otp intent" '
+  .match.domain == "developers.adapteros.com"
+  and .intent.classification == "authenticated_counterparty_portal"
+  and .intent.otp_provider_id == "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+' "${ROOT_DIR}/state/access.app/developers-adapteros.json"
+assert_jq_file "adapteros ops access app pending intent" '
+  .match.domain == "ops.adapteros.com"
+  and .intent.classification == "operator_pending_idp_migration"
+  and .intent.otp_provider_id == "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+' "${ROOT_DIR}/state/access.app/ops-adapteros.json"
 assert_jq_file "founder public surveys bypass policy state" '
   .match.app_id == "ef0898ec-1d46-4515-8326-6a244ea8c54e"
   and .match.name == "Bypass Everyone"

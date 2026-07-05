@@ -72,7 +72,14 @@ access_posture_checks_json() {
                 $scoped
                 | map(select(((.allowed_idps // []) | index($otp_id)) != null))
                 | map(select(.domain as $domain | ($otp_intended_domains | index($domain)) == null))
-                | map(offender_row)
+                | map(
+                    offender_row
+                    + {
+                        app_launcher_visible: (.app_launcher_visible == true),
+                        auto_redirect_to_identity: (.auto_redirect_to_identity == true),
+                        has_allow_policy: (((.policies // []) | map(select((.decision // "") == "allow")) | length) > 0)
+                      }
+                  )
               end
             ) as $offenders
             | {
@@ -122,6 +129,30 @@ access_posture_checks_json() {
                 standard_ref: "access.policy.match-logic-explicit",
                 level: "required",
                 title: "Every self_hosted app carries at least one allow policy",
+                status: (if ($offenders | length) == 0 then "pass" else "fail" end),
+                offender_count: ($offenders | length),
+                offenders: $offenders
+              }
+          ),
+          (
+            (
+              if $otp_id == null then []
+              else
+                $intended
+                | map(select(((.allowed_idps // []) | index($otp_id)) != null))
+                | (if $app_domain != "" then map(select(.domain == $app_domain)) else . end)
+                | map(
+                    (.classification // "") as $c
+                    | select((["authenticated_counterparty_portal", "intentional_public_carveout"] | index($c)) == null)
+                  )
+                | map({domain: (.domain // null), classification: (.classification // null)})
+              end
+            ) as $offenders
+            | {
+                id: "otp_intent_specs_justified",
+                standard_ref: "access.idp.otp-deliberate",
+                level: "required",
+                title: "Every desired-state spec that grants onetimepin records a justified OTP intent",
                 status: (if ($offenders | length) == 0 then "pass" else "fail" end),
                 offender_count: ($offenders | length),
                 offenders: $offenders
@@ -176,7 +207,7 @@ main() {
   intended_files=("${ROOT_DIR}/state/access.app"/*.json)
   if [[ -e "${intended_files[0]}" ]]; then
     intended_json="$(
-      jq -sc 'map({domain: (.match.domain // null), allowed_idps: (.body.allowed_idps // [])})' \
+      jq -sc 'map({domain: (.match.domain // null), allowed_idps: (.body.allowed_idps // []), classification: (.intent.classification // null)})' \
         "${intended_files[@]}"
     )"
   fi

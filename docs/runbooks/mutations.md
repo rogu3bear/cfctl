@@ -98,6 +98,16 @@ If the target app is managed by a `state/access.app` spec, an
 `body` alone. For a spec-managed app, update the spec's `body.allowed_idps`
 (and sync) instead of, or alongside, `login_method set`.
 
+`cfctl audit access` also runs `otp_intent_specs_justified`: any
+`state/access.app` spec that grants the onetimepin provider id without a
+justified `intent.classification` (`authenticated_counterparty_portal` or
+`intentional_public_carveout`) is reported as a spec-level offender
+`{domain, classification}` — for example `operator_pending_idp_migration`
+stays flagged until the surface migrates off OTP. The
+`otp_only_where_intended` offender rows also carry `app_launcher_visible`,
+`auto_redirect_to_identity`, and `has_allow_policy`, so triage reads
+operator-vs-portal posture straight off the row.
+
 Identity-provider lifecycle itself lives on `access.idp`. Creating or deleting
 the `onetimepin` provider is the account-wide OTP login-method toggle;
 creating it when it already exists is a noop, and delete is destructive:
