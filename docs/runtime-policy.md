@@ -83,7 +83,7 @@ cfctl audit trust
 
 to verify:
 
-- lane health
+- default-lane health, including active API-token status and pinned-account access
 - backend-guard coverage
 - artifact secret scan
 - runtime policy shape
@@ -92,3 +92,20 @@ to verify:
 - backend authorization health
 
 `cfctl audit trust` is an alias for `cfctl doctor`.
+
+Doctor keeps three health dimensions separate:
+
+- `safety`: the default day-to-day lane, backend guards, secret scans and sinks,
+  registry policy, and legacy bypass state. Any blocker makes the runtime
+  `unsafe`. A healthy emergency lane never masks an unhealthy default lane.
+- `readiness`: active operational blockers. Stale or orphaned locks make the
+  runtime `degraded`; `doctor --strict` fails until they are resolved.
+- `hygiene`: expired previews, legacy preview receipts, expired backend
+  authorizations, credential-source drift, and stray repo env files. These are
+  maintenance findings, remain visible in normal and strict output, and do not
+  independently make a safe, ready runtime fail.
+
+For API-token lanes, an HTTP-success response is insufficient: the token
+response must report `result.status: active`. When an account is pinned, the
+account read must also succeed. `result.lanes.summary` records the default lane,
+its exact health status, and any healthy emergency lanes separately.
