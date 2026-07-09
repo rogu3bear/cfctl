@@ -99,6 +99,7 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_token_rotate.sh" \
   "${ROOT_DIR}/scripts/lib/token_state.sh" \
   "${ROOT_DIR}/scripts/verify_token_lifecycle_contract.sh" \
+  "${ROOT_DIR}/scripts/verify_lane_health_contract.sh" \
   "${ROOT_DIR}/scripts/verify_access_login_method_contract.sh" \
   "${ROOT_DIR}/scripts/verify_maildesk_cf_contract.sh" \
   "${ROOT_DIR}/scripts/verify_env_loader_contract.sh" \
@@ -272,6 +273,7 @@ bash "${ROOT_DIR}/scripts/verify_form_intake_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_access_posture_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_state_audit_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_token_lifecycle_contract.sh" >/dev/null
+"${ROOT_DIR}/scripts/verify_lane_health_contract.sh" >/dev/null
 
 audit_access_help_output="$("${ROOT_DIR}/cfctl" audit --help)"
 grep -Fq 'cfctl audit access [--id <app-id>|--domain <app-domain>] [--strict]' <<< "${audit_access_help_output}" || die "audit help missing access posture usage"
@@ -1098,6 +1100,8 @@ assert_contains "readme env run argv secrecy" "do not pass secrets as command-li
 assert_contains "readme inactive legacy preview cleanup" "cfctl previews purge-inactive-legacy" "${ROOT_DIR}/README.md"
 assert_contains "readme duplicate active preview cleanup" "cfctl previews purge-duplicate-active" "${ROOT_DIR}/README.md"
 assert_contains "readme source-live boundary" "Source Config Vs Live State" "${ROOT_DIR}/README.md"
+assert_contains "readme default lane trust" "A healthy emergency \`global\` lane remains visible for" "${ROOT_DIR}/README.md"
+assert_contains "readme doctor health dimensions" "Doctor reports three independent health dimensions" "${ROOT_DIR}/README.md"
 assert_contains "readme hostname lifecycle" "Hostname lifecycle" "${ROOT_DIR}/README.md"
 assert_contains "readme maildesk lifecycle" "maildesk-cf lifecycle" "${ROOT_DIR}/README.md"
 assert_contains "readme form intake lifecycle" "form-intake lifecycle" "${ROOT_DIR}/README.md"
@@ -1106,6 +1110,7 @@ assert_contains "readme standards audit freshness" "checked-in Wrangler config a
 assert_contains "readme standards audit source authority" "classify source authority" "${ROOT_DIR}/README.md"
 assert_contains "public agent landing wrapper hierarchy" "cfctl wrangler ..." "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "public agent landing source-live boundary" "Do not turn a source-config audit into a live Cloudflare claim." "${ROOT_DIR}/docs/agent-landing.md"
+assert_contains "public agent landing default lane safety" "A healthy \`global\`" "${ROOT_DIR}/docs/agent-landing.md"
 assert_contains "public readme hostname lifecycle" "Hostname lifecycle" "${ROOT_DIR}/README.md"
 assert_contains "public readme maildesk lifecycle" "cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan" "${ROOT_DIR}/README.md"
 assert_contains "public readme form intake lifecycle" "cfctl form-intake plan --file state/form-intake/example.json" "${ROOT_DIR}/README.md"
@@ -1134,11 +1139,15 @@ assert_contains "runbook form intake lifecycle" "cfctl form-intake verify --file
 assert_contains "runbook token revoke" "token revoke --plan\` reads token id/name/status/expiry metadata" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook compatibility freshness" "standards audit\` reports \`compatibility_date\` aging and stale counts" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook source context summary" "\`source_context_summary\`" "${ROOT_DIR}/docs/runbooks/cfctl.md"
+assert_contains "runbook default lane recovery boundary" "a healthy emergency lane is recovery capacity" "${ROOT_DIR}/docs/runbooks/cfctl.md"
+assert_contains "runbook doctor interpretation" "Interpret doctor in this order" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "runbook standards audit source evidence" "standards audit\` is source-config evidence" "${ROOT_DIR}/docs/runbooks/cfctl.md"
 assert_contains "config standards compatibility freshness" "Compatibility-date freshness is intentionally advisory" "${ROOT_DIR}/docs/config-standards.md"
 assert_contains "config standards canonical notes" "\`canonical_warning_count\`" "${ROOT_DIR}/docs/config-standards.md"
 assert_contains "runtime policy inactive legacy preview cleanup" "cfctl previews purge-inactive-legacy" "${ROOT_DIR}/docs/runtime-policy.md"
 assert_contains "runtime policy duplicate active preview cleanup" "cfctl previews purge-duplicate-active" "${ROOT_DIR}/docs/runtime-policy.md"
+assert_contains "runtime policy doctor health dimensions" "Doctor keeps three health dimensions separate" "${ROOT_DIR}/docs/runtime-policy.md"
+assert_contains "runtime policy active token status" "result.status: active" "${ROOT_DIR}/docs/runtime-policy.md"
 assert_contains "capabilities operable note" "This table is the operable runtime surface." "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities generated note" "_Generated from \`catalog/surfaces.json\` and \`catalog/runtime.json\`." "${ROOT_DIR}/docs/capabilities.md"
 assert_contains "capabilities module column" "| Surface | Read | Can | Apply | Verify | Desired State | Standards | Docs Topics | Module |" "${ROOT_DIR}/docs/capabilities.md"

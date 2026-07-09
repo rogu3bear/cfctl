@@ -130,8 +130,11 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
   `can <surface> <operation>` checks the operation policy and permission probe
 - `cfctl audit trust` is an alias for `cfctl doctor`
 - `doctor` reports `bootstrap_required` when no token lanes are configured and points at `cfctl bootstrap permissions`
-- `doctor --strict` exits non-zero for degraded trust state, not only unsafe state
-- `doctor --repair-hints` emits exact cleanup and repair commands when trust is degraded
+- `doctor` requires the default day-to-day lane to be healthy; a healthy emergency lane is recovery capacity, not a substitute for the default lane
+- API-token health requires both `result.status: active` and successful access to the pinned account
+- `doctor` reports `safety`, `readiness`, and `hygiene` independently under `result.health`
+- `doctor --strict` exits non-zero for unsafe safety or degraded readiness; hygiene-only findings remain visible without failing the gate
+- `doctor --repair-hints` prioritizes restoring the default lane, then readiness blockers, then hygiene cleanup
 - `previews` lists actionable, legacy, and expired preview receipts
 - `previews purge-expired` removes expired preview receipts only
 - `previews purge-inactive-legacy` removes only legacy preview receipts that lack complete trust metadata
@@ -176,6 +179,16 @@ CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --hos
 - destructive operations require explicit confirmation such as `--confirm delete`
 - blocked surfaces fail with structured permission results instead of raw Cloudflare API blobs
 - ambiguous target resolution is a hard failure
+
+Interpret doctor in this order:
+
+1. If `safety.status` is `unsafe`, stop new writes and restore the default lane
+   or repair the named trust blocker. Do not silently continue on `global`.
+2. If `readiness.status` is `blocked`, inspect locks and clear only proven
+   stale/orphaned entries before planning another mutation.
+3. If `hygiene.status` is `attention`, review the findings and use the scoped
+   cleanup commands. Expired evidence is maintenance, not proof that auth or
+   mutation safety is broken.
 
 ## Advanced Certificate Manager
 

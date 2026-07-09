@@ -23,6 +23,8 @@ cfctl_lane_auth_probe_json() {
         {
           lane: $lane,
           available: false,
+          auth_ok: false,
+          health_status: "credential_missing",
           credential_env: ($lane_meta.credential_env // null),
           auth_scheme: ($lane_meta.auth_scheme // null),
           error: "credential_missing"
@@ -40,6 +42,8 @@ cfctl_lane_auth_probe_json() {
         {
           lane: $lane,
           available: false,
+          auth_ok: false,
+          health_status: "requirements_unmet",
           credential_env: ($lane_meta.credential_env // null),
           auth_scheme: ($lane_meta.auth_scheme // null),
           error: "requirements_unmet",
@@ -93,7 +97,54 @@ cfctl_lane_auth_probe_json() {
         configured_auth_scheme: ($lane_meta.auth_scheme // null),
         resolved_auth_scheme: $resolved_scheme,
         wrangler_env: ($lane_meta.wrangler_env // null),
-        auth_ok: ($auth_check.success // false),
+        auth_response_ok: (($auth_check.success // false) == true),
+        token_status: (
+          if ($resolved_scheme == "account_api_token" or $resolved_scheme == "user_api_token") then
+            ($auth_check.result.status // null)
+          else
+            null
+          end
+        ),
+        account_ok: (
+          if $account_check == null then
+            null
+          else
+            (($account_check.success // false) == true)
+          end
+        ),
+        auth_ok: (
+          (($auth_check.success // false) == true)
+          and (
+            if ($resolved_scheme == "account_api_token" or $resolved_scheme == "user_api_token") then
+              (($auth_check.result.status // null) == "active")
+            else
+              true
+            end
+          )
+          and (
+            if $account_check == null then
+              true
+            else
+              (($account_check.success // false) == true)
+            end
+          )
+        ),
+        health_status: (
+          if (($auth_check.success // false) != true) then
+            "authentication_failed"
+          elif ($resolved_scheme == "account_api_token" or $resolved_scheme == "user_api_token")
+            and (($auth_check.result.status // null) != "active") then
+            if (($auth_check.result.status // null) == "expired" or ($auth_check.result.status // null) == "disabled") then
+              $auth_check.result.status
+            else
+              "invalid_token_status"
+            end
+          elif $account_check != null and (($account_check.success // false) != true) then
+            "account_access_denied"
+          else
+            "healthy"
+          end
+        ),
         auth_check: $auth_check,
         account_check: $account_check
       }
@@ -104,8 +155,10 @@ cfctl_collect_lane_health_json() {
   local lanes_json
   local reports='[]'
   local lane
+  local default_lane
 
   lanes_json="$(cfctl_supported_lanes_json)"
+  default_lane="$(jq -r '.env_run.default_lane // "dev"' "$(cf_runtime_catalog_path)")"
   while IFS= read -r lane; do
     reports="$(
       jq \
@@ -117,6 +170,7 @@ cfctl_collect_lane_health_json() {
 
   jq -n \
     --arg active_lane "${CF_ACTIVE_TOKEN_LANE:-}" \
+    --arg default_lane "${default_lane}" \
     --argjson lanes "${reports}" \
     '
       {
@@ -125,7 +179,13 @@ cfctl_collect_lane_health_json() {
         summary: {
           configured_lane_count: ($lanes | map(select(.available == true)) | length),
           healthy_lane_count: ($lanes | map(select(.auth_ok == true)) | length),
-          healthy_lanes: ($lanes | map(select(.auth_ok == true)) | map(.lane))
+          healthy_lanes: ($lanes | map(select(.auth_ok == true)) | map(.lane)),
+          unhealthy_lanes: ($lanes | map(select(.auth_ok != true)) | map(.lane)),
+          default_lane: $default_lane,
+          default_lane_configured: (($lanes | map(select(.lane == $default_lane and .available == true)) | length) == 1),
+          default_lane_healthy: (($lanes | map(select(.lane == $default_lane and .auth_ok == true)) | length) == 1),
+          default_lane_status: (($lanes | map(select(.lane == $default_lane)) | .[0].health_status) // "credential_missing"),
+          emergency_healthy_lanes: ($lanes | map(select(.lane != $default_lane and .auth_ok == true)) | map(.lane))
         }
       }
     '

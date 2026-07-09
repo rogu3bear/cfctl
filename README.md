@@ -95,6 +95,23 @@ Before credentials exist, `cfctl doctor` reports `bootstrap_required` and points
 at `cfctl bootstrap permissions`; `cfctl doctor --strict` still fails until a
 healthy token lane exists.
 
+The default `dev` lane is the day-to-day trust boundary. An API-token lane is
+healthy only when Cloudflare returns `result.status: active` and the pinned
+account read succeeds. A healthy emergency `global` lane remains visible for
+recovery, but it does not mask an expired, disabled, malformed, or
+account-denied `dev` lane.
+
+Doctor reports three independent health dimensions under `result.health`:
+
+- `safety`: default-lane auth, backend guards, secret handling, and registry policy
+- `readiness`: active write blockers such as stale or orphaned locks
+- `hygiene`: retained expired previews, legacy receipts, expired authorizations,
+  credential-source drift, and stray repo env files
+
+Safety failures make doctor `unsafe`. Readiness blockers make it `degraded` and
+cause `--strict` to fail. Hygiene remains explicit maintenance evidence but
+does not, by itself, change a healthy exit into a failure.
+
 Useful reads:
 
 ```bash
@@ -327,6 +344,10 @@ cfctl admin revoke-backend --path <authorization-path>
 
 - `cfctl doctor` is bootstrap-aware: zero configured token lanes is
   `bootstrap_required`, while configured-but-unhealthy lanes remain unsafe.
+- `cfctl doctor` requires the default day-to-day lane to be healthy; an
+  emergency lane cannot turn a failed default lane green.
+- `cfctl doctor --strict` fails safety and readiness states, while hygiene-only
+  findings remain visible and non-blocking.
 - `cfctl previews purge-inactive-legacy` removes only legacy preview receipts
   without complete trust metadata; active trusted previews are not targeted.
 - `cfctl previews purge-duplicate-active` removes older active preview receipts

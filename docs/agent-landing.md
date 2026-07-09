@@ -28,8 +28,16 @@ Start by naming the job class:
   read state, scan the generated matrix in [docs/capabilities.md](capabilities.md), load standards, classify, guide, preview with `--plan`, apply with `--ack-plan <operation-id>`, then verify.
 - Runtime development:
   change `cfctl`, catalogs, docs, and contract checks together; do not document a public capability before it exists in the catalog and command surface.
-- Degraded trust:
-  run `cfctl doctor --repair-hints`, inspect previews and locks, and clear only expired/stale artifacts.
+- Unsafe safety:
+  run `cfctl doctor --repair-hints` and `cfctl lanes`; restore the default
+  `dev` lane or the named trust blocker before new writes. A healthy `global`
+  lane is recovery capacity, not a green default-lane result.
+- Blocked readiness:
+  inspect locks and clear only entries proven stale or orphaned.
+- Hygiene attention:
+  inspect previews, authorizations, and env-source findings, then use only the
+  scoped cleanup command. Hygiene findings stay visible but do not by themselves
+  make safe, ready trust fail.
 
 Do not turn a source-config audit into a live Cloudflare claim. If the question is about what users see at the edge, take a live read.
 
