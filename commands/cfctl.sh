@@ -1116,8 +1116,8 @@ cfctl_doctor_repair_hints_json() {
 
   if [[ "${lanes_json}" != "null" && "$(jq '(.summary.configured_lane_count // 0) == 0' <<< "${lanes_json}")" == "true" ]]; then
     hints="$(jq '. + ["cfctl bootstrap permissions","Create a least-privilege CF_DEV_TOKEN, then write it to the configured cfctl env file"]' <<< "${hints}")"
-  elif [[ "${lanes_json}" != "null" && "$(jq '(.summary.healthy_lane_count // 0) == 0' <<< "${lanes_json}")" == "true" ]]; then
-    hints="$(jq '. + ["cfctl lanes","Check the configured Cloudflare token lane credentials"]' <<< "${hints}")"
+  elif [[ "${lanes_json}" != "null" && "$(jq '(.summary.default_lane_healthy // false) != true' <<< "${lanes_json}")" == "true" ]]; then
+    hints="$(jq '. + ["cfctl lanes","Restore the default dev lane; a healthy emergency lane does not make the runtime day-to-day ready"]' <<< "${hints}")"
   fi
 
   if [[ "$(jq '(.expired_preview_count // 0) > 0' <<< "${preview_health_json}")" == "true" ]]; then
@@ -1165,8 +1165,10 @@ cfctl_safe_next_steps_json() {
 
   if [[ "${overall_status}" == "bootstrap_required" ]]; then
     steps='["cfctl bootstrap permissions","cfctl bootstrap verify --profile read","cfctl surfaces","cfctl ownership check"]'
-  elif [[ "${overall_status}" != "healthy" ]]; then
-    steps='["cfctl doctor --repair-hints","cfctl previews","cfctl locks"]'
+  elif [[ "${overall_status}" == "unsafe" ]]; then
+    steps='["cfctl doctor --repair-hints","cfctl lanes","cfctl previews","cfctl locks"]'
+  elif [[ "${overall_status}" == "degraded" ]]; then
+    steps='["cfctl doctor --repair-hints","cfctl locks","cfctl previews"]'
   fi
 
   printf '%s\n' "${steps}"
@@ -1471,6 +1473,105 @@ cfctl_bypass_health_json() {
     '
 }
 
+cfctl_doctor_health_dimensions_json() {
+  local lanes_json="$1"
+  local guard_report_json="$2"
+  local secret_scan_json="$3"
+  local registry_integrity_json="$4"
+  local preview_health_json="$5"
+  local lock_health_json="$6"
+  local bypass_health_json="$7"
+  local env_health_json="$8"
+
+  jq -n \
+    --argjson lanes "${lanes_json}" \
+    --argjson backend_guards "${guard_report_json}" \
+    --argjson secret_scan "${secret_scan_json}" \
+    --argjson registry_integrity "${registry_integrity_json}" \
+    --argjson preview_receipts "${preview_health_json}" \
+    --argjson lock_health "${lock_health_json}" \
+    --argjson bypass_health "${bypass_health_json}" \
+    --argjson env_health "${env_health_json}" \
+    '
+      [
+        if (($lanes.summary.configured_lane_count // 0) > 0)
+          and (($lanes.summary.default_lane_healthy // false) != true) then
+          {
+            code: "default_lane_unhealthy",
+            count: 1,
+            lane: ($lanes.summary.default_lane // "dev"),
+            status: ($lanes.summary.default_lane_status // "unknown")
+          }
+        else empty end,
+        if ($backend_guards | map(select(.guarded != true)) | length) > 0 then
+          {code: "unguarded_backends", count: ($backend_guards | map(select(.guarded != true)) | length)}
+        else empty end,
+        if (($secret_scan.leak_count // 0) > 0) then
+          {code: "secret_leaks", count: ($secret_scan.leak_count // 0)}
+        else empty end,
+        if (($secret_scan.unsafe_secret_sink_count // 0) > 0) then
+          {code: "unsafe_secret_sinks", count: ($secret_scan.unsafe_secret_sink_count // 0)}
+        else empty end,
+        if (($registry_integrity.missing_count // 0) > 0) then
+          {code: "registry_policy_gaps", count: ($registry_integrity.missing_count // 0)}
+        else empty end,
+        if (($bypass_health.legacy_env_active // false) == true)
+          and (($bypass_health.legacy_env_allowed // false) != true) then
+          {code: "legacy_bypass_active", count: 1}
+        else empty end
+      ] as $safety_blockers
+      | [
+          if (($lock_health.stale_lock_count // 0) > 0) then
+            {code: "stale_locks", count: ($lock_health.stale_lock_count // 0)}
+          else empty end,
+          if (($lock_health.orphaned_lock_count // 0) > 0) then
+            {code: "orphaned_locks", count: ($lock_health.orphaned_lock_count // 0)}
+          else empty end
+        ] as $readiness_blockers
+      | [
+          if (($preview_receipts.expired_preview_count // 0) > 0) then
+            {code: "expired_previews", count: ($preview_receipts.expired_preview_count // 0)}
+          else empty end,
+          if (($preview_receipts.legacy_preview_count // 0) > 0) then
+            {code: "legacy_previews", count: ($preview_receipts.legacy_preview_count // 0)}
+          else empty end,
+          if (($bypass_health.authorization_health.expired_count // 0) > 0) then
+            {code: "expired_authorizations", count: ($bypass_health.authorization_health.expired_count // 0)}
+          else empty end,
+          if (($env_health.provenance.summary.drift_count // 0) > 0) then
+            {code: "credential_source_drift", count: ($env_health.provenance.summary.drift_count // 0)}
+          else empty end,
+          if (($env_health.hygiene.stray_repo_env.present // false) == true) then
+            {code: "stray_repo_env", count: 1}
+          else empty end
+        ] as $hygiene_findings
+      | (($lanes.summary.configured_lane_count // 0) == 0) as $bootstrap_required
+      | {
+          overall_status: (
+            if $bootstrap_required then "bootstrap_required"
+            elif ($safety_blockers | length) > 0 then "unsafe"
+            elif ($readiness_blockers | length) > 0 then "degraded"
+            else "healthy"
+            end
+          ),
+          safety: {
+            status: (if $bootstrap_required then "bootstrap_required" elif ($safety_blockers | length) > 0 then "unsafe" else "safe" end),
+            blockers: $safety_blockers
+          },
+          readiness: {
+            status: (if ($readiness_blockers | length) > 0 then "blocked" else "ready" end),
+            blockers: $readiness_blockers
+          },
+          hygiene: {
+            status: (if ($hygiene_findings | length) > 0 then "attention" else "clean" end),
+            strict_blocking: false,
+            findings: $hygiene_findings,
+            finding_count: ($hygiene_findings | map(.count) | add // 0)
+          }
+        }
+    '
+}
+
 cfctl_handle_doctor() {
   local lanes_json
   local guard_report_json
@@ -1483,12 +1584,10 @@ cfctl_handle_doctor() {
   local repair_hints_json
   local safe_next_steps_json
   local result_json
+  local health_json
   local ok="true"
   local overall_status="healthy"
-  local configured_lane_count
-  local healthy_lane_count
   local env_health_json
-  local credential_drift_count
 
   lanes_json="$(cfctl_collect_lane_health_json)"
   guard_report_json="$(cfctl_backend_guard_report_json)"
@@ -1499,58 +1598,11 @@ cfctl_handle_doctor() {
   lock_health_json="$(cf_runtime_lock_health_json)"
   bypass_health_json="$(cfctl_bypass_health_json)"
   env_health_json="$(cfctl_env_health_json)"
-  configured_lane_count="$(jq -r '.summary.configured_lane_count // 0' <<< "${lanes_json}")"
-  healthy_lane_count="$(jq -r '.summary.healthy_lane_count // 0' <<< "${lanes_json}")"
-  credential_drift_count="$(jq -r '.provenance.summary.drift_count // 0' <<< "${env_health_json}")"
+  health_json="$(cfctl_doctor_health_dimensions_json "${lanes_json}" "${guard_report_json}" "${secret_scan_json}" "${registry_integrity_json}" "${preview_health_json}" "${lock_health_json}" "${bypass_health_json}" "${env_health_json}")"
+  overall_status="$(jq -r '.overall_status' <<< "${health_json}")"
 
-  if [[ "${healthy_lane_count}" -eq 0 ]]; then
-    if [[ "${configured_lane_count}" -eq 0 ]]; then
-      overall_status="bootstrap_required"
-    else
-      ok="false"
-      overall_status="unsafe"
-    fi
-  fi
-
-  if [[ "$(jq 'map(select(.guarded != true)) | length == 0' <<< "${guard_report_json}")" != "true" ]]; then
+  if [[ "${overall_status}" == "unsafe" ]]; then
     ok="false"
-    overall_status="unsafe"
-  fi
-
-  if [[ "$(jq '(.leak_count // 0) == 0' <<< "${secret_scan_json}")" != "true" ]]; then
-    ok="false"
-    overall_status="unsafe"
-  fi
-
-  if [[ "$(jq '(.unsafe_secret_sink_count // 0) == 0' <<< "${secret_scan_json}")" != "true" ]]; then
-    ok="false"
-    overall_status="unsafe"
-  fi
-
-  if [[ "$(jq '(.missing_count // 0) == 0' <<< "${registry_integrity_json}")" != "true" ]]; then
-    ok="false"
-    overall_status="unsafe"
-  fi
-
-  if [[ "$(jq '(.legacy_env_active == true) and (.legacy_env_allowed != true)' <<< "${bypass_health_json}")" == "true" ]]; then
-    ok="false"
-    overall_status="unsafe"
-  fi
-
-  if [[ "${overall_status}" != "unsafe" && "${overall_status}" != "bootstrap_required" && "$(jq '(.expired_preview_count // 0) > 0' <<< "${preview_health_json}")" == "true" ]]; then
-    overall_status="degraded"
-  fi
-
-  if [[ "${overall_status}" != "unsafe" && "${overall_status}" != "bootstrap_required" && "$(jq '(.stale_lock_count // 0) > 0' <<< "${lock_health_json}")" == "true" ]]; then
-    overall_status="degraded"
-  fi
-
-  if [[ "${overall_status}" != "unsafe" && "${overall_status}" != "bootstrap_required" && "$(jq '(.authorization_health.expired_count // 0) > 0' <<< "${bypass_health_json}")" == "true" ]]; then
-    overall_status="degraded"
-  fi
-
-  if [[ "${overall_status}" != "unsafe" && "${overall_status}" != "bootstrap_required" && "${credential_drift_count}" -gt 0 ]]; then
-    overall_status="degraded"
   fi
 
   repair_hints_json="$(cfctl_doctor_repair_hints_json "${preview_health_json}" "${lock_health_json}" "${bypass_health_json}" "${secret_scan_json}" "${registry_integrity_json}" "${lanes_json}" "${env_health_json}")"
@@ -1571,6 +1623,7 @@ cfctl_handle_doctor() {
       --argjson lock_health "${lock_health_json}" \
       --argjson bypass_health "${bypass_health_json}" \
       --argjson env_health "${env_health_json}" \
+      --argjson health "${health_json}" \
       --argjson repair_hints "${repair_hints_json}" \
       --argjson safe_next_steps "${safe_next_steps_json}" \
       --argjson strict_mode "$([[ "${CFCTL_STRICT}" == "1" ]] && echo true || echo false)" \
@@ -1580,6 +1633,7 @@ cfctl_handle_doctor() {
         {
           status: $overall_status,
           strict_mode: $strict_mode,
+          health: $health,
           runtime: {
             preferred_entrypoint: ($runtime.preferred_entrypoint // null),
             public_verbs: ($runtime.public_verbs // []),
@@ -1612,11 +1666,11 @@ cfctl_handle_doctor() {
     "true" \
     '{"state":"not_applicable","basis":"runtime_health","errors":[],"request":null,"status_code":null,"permission_family":"Cloudflare API"}' \
     '{"state":"not_applicable"}' \
-    "$(jq '{status: .status, strict_mode: .strict_mode, configured_lane_count: (.lanes.summary.configured_lane_count // 0), healthy_lanes: .lanes.summary.healthy_lanes, missing_backend_guards: (.backend_guards.missing | length), registry_policy_gaps: (.registry_integrity.missing_count // 0), secret_leak_count: (.secret_scan.leak_count // 0), unsafe_secret_sink_count: (.secret_scan.unsafe_secret_sink_count // 0), stale_lock_count: (.lock_health.stale_lock_count // 0), orphaned_lock_count: (.lock_health.orphaned_lock_count // 0), expired_preview_count: (.preview_receipts.expired_preview_count // 0), legacy_preview_count: (.preview_receipts.legacy_preview_count // 0), authorization_count: (.bypass_health.authorization_health.authorization_count // 0), expired_authorization_count: (.bypass_health.authorization_health.expired_count // 0), legacy_bypass_active: (.bypass_health.legacy_env_active // false), credential_drift_count: (.env_health.provenance.summary.drift_count // 0), repair_hint_count: (.repair_hint_count // 0), safe_next_steps: (.safe_next_steps // [])}' <<< "${result_json}")" \
+    "$(jq '{status: .status, strict_mode: .strict_mode, safety_status: .health.safety.status, readiness_status: .health.readiness.status, hygiene_status: .health.hygiene.status, hygiene_finding_count: .health.hygiene.finding_count, configured_lane_count: (.lanes.summary.configured_lane_count // 0), healthy_lanes: .lanes.summary.healthy_lanes, default_lane: .lanes.summary.default_lane, default_lane_healthy: .lanes.summary.default_lane_healthy, default_lane_status: .lanes.summary.default_lane_status, emergency_healthy_lanes: .lanes.summary.emergency_healthy_lanes, missing_backend_guards: (.backend_guards.missing | length), registry_policy_gaps: (.registry_integrity.missing_count // 0), secret_leak_count: (.secret_scan.leak_count // 0), unsafe_secret_sink_count: (.secret_scan.unsafe_secret_sink_count // 0), stale_lock_count: (.lock_health.stale_lock_count // 0), orphaned_lock_count: (.lock_health.orphaned_lock_count // 0), expired_preview_count: (.preview_receipts.expired_preview_count // 0), legacy_preview_count: (.preview_receipts.legacy_preview_count // 0), authorization_count: (.bypass_health.authorization_health.authorization_count // 0), expired_authorization_count: (.bypass_health.authorization_health.expired_count // 0), legacy_bypass_active: (.bypass_health.legacy_env_active // false), credential_drift_count: (.env_health.provenance.summary.drift_count // 0), repair_hint_count: (.repair_hint_count // 0), safe_next_steps: (.safe_next_steps // [])}' <<< "${result_json}")" \
     "${result_json}" \
     "" \
     "$([[ "${ok}" == "true" ]] && printf '' || printf 'runtime_health_failed')" \
-    "$([[ "${ok}" == "true" ]] && printf '' || printf 'Doctor found one or more trust blockers or degraded strict-mode conditions')"
+    "$([[ "${ok}" == "true" ]] && printf '' || printf 'Doctor found one or more safety blockers or strict-mode readiness blockers')"
 }
 
 cfctl_handle_previews() {

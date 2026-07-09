@@ -99,6 +99,7 @@ bash -n \
   "${ROOT_DIR}/scripts/cf_token_rotate.sh" \
   "${ROOT_DIR}/scripts/lib/token_state.sh" \
   "${ROOT_DIR}/scripts/verify_token_lifecycle_contract.sh" \
+  "${ROOT_DIR}/scripts/verify_lane_health_contract.sh" \
   "${ROOT_DIR}/scripts/verify_access_login_method_contract.sh" \
   "${ROOT_DIR}/scripts/verify_maildesk_cf_contract.sh" \
   "${ROOT_DIR}/scripts/verify_env_loader_contract.sh" \
@@ -272,6 +273,7 @@ bash "${ROOT_DIR}/scripts/verify_form_intake_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_access_posture_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_state_audit_contract.sh" >/dev/null
 "${ROOT_DIR}/scripts/verify_token_lifecycle_contract.sh" >/dev/null
+"${ROOT_DIR}/scripts/verify_lane_health_contract.sh" >/dev/null
 
 audit_access_help_output="$("${ROOT_DIR}/cfctl" audit --help)"
 grep -Fq 'cfctl audit access [--id <app-id>|--domain <app-domain>] [--strict]' <<< "${audit_access_help_output}" || die "audit help missing access posture usage"
