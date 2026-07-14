@@ -1,0 +1,29 @@
+{
+  "match": {
+    "domain": "research.mlnavigator.com"
+  },
+  "intent": {
+    "classification": "private_single_operator_plane",
+    "source_repo": "/Users/star/dev/osint-research-center",
+    "rationale": "Private single-operator OSINT Research Center (research.mlnavigator.com). EXACT-email gate to james@mlnavigator.com only — deliberately NO @mlnavigator.com domain wildcard and NO bypass rule (spec section 22, ANCHOR.md). onetimepin (email OTP) is the login method; the owner-only allow policy restricts admission to the single exact email. The Worker independently re-validates the Access JWT (signature, issuer, audience, expiry, exact email).",
+    "otp_provider_id": "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+  },
+  "body": {
+    "name": "OSINT Research Center",
+    "type": "self_hosted",
+    "domain": "research.mlnavigator.com",
+    "self_hosted_domains": [
+      "research.mlnavigator.com"
+    ],
+    "destinations": [
+      {
+        "type": "public",
+        "uri": "research.mlnavigator.com"
+      }
+    ],
+    "allowed_idps": [
+      "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+    ],
+    "session_duration": "24h"
+  }
+}

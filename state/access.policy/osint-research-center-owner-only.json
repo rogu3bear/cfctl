@@ -1,0 +1,25 @@
+{
+  "match": {
+    "app_id": "0a92e538-1600-4288-b14e-481954676398",
+    "name": "owner-only"
+  },
+  "intent": {
+    "classification": "private_single_operator_exact_email_gate",
+    "source_repo": "/Users/star/dev/osint-research-center",
+    "rationale": "The OSINT Research Center is a private single-operator plane. This is the ONLY policy on the Access app: an allow decision that includes the single exact email james@mlnavigator.com. Deliberately NO @mlnavigator.com email_domain wildcard and NO bypass policy (spec section 22, ANCHOR.md). Any change to the include set, the audience, or the absence of a wildcard/bypass is an intentional doctrine change requiring the A4 mutation protocol with cfctl verification."
+  },
+  "body": {
+    "name": "owner-only",
+    "decision": "allow",
+    "include": [
+      {
+        "email": {
+          "email": "james@mlnavigator.com"
+        }
+      }
+    ],
+    "exclude": [],
+    "require": [],
+    "precedence": 1
+  }
+}
