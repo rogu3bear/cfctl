@@ -1064,6 +1064,92 @@ fn paid_plan_rejects_a_ceiling_below_the_declared_maximum() {
 }
 
 #[test]
+fn approval_checkpoint_binds_the_exact_cost_ceiling_across_crash_reload() {
+    let mut capability = CapabilityV1::new(
+        "paid",
+        "Paid operation",
+        "POST",
+        "/accounts/{account_id}/paid",
+    );
+    capability.cost.incremental = true;
+    capability.cost.known = true;
+    capability.cost.currency = Some("USD".to_owned());
+    capability.cost.maximum = Some(10.0);
+    let mut plan = PlanV1::draft("p", "a", "sha256:c", capability, json!({})).expect("plan");
+    plan.policy.requires_cost_ceiling = true;
+    plan.refresh_hash().expect("hash");
+    plan.approve(
+        true,
+        Some(cfctl_core::MoneyV1 {
+            currency: "USD".to_owned(),
+            amount: 20.0,
+        }),
+    )
+    .expect("approve");
+
+    let receipt = plan
+        .transaction_artifact(TransactionStageV1::ApprovalPersisted)
+        .expect("hash-bound approval receipt");
+    assert_eq!(receipt["max_cost"]["currency"], "USD");
+    assert_eq!(receipt["max_cost"]["amount"], 20.0);
+
+    let encoded = serde_json::to_vec(&plan).expect("crash snapshot");
+    let mut reloaded: PlanV1 = serde_json::from_slice(&encoded).expect("crash reload");
+    reloaded
+        .validate_transaction_journal()
+        .expect("approval remains bound after reload");
+    reloaded
+        .approval
+        .as_mut()
+        .and_then(|approval| approval.max_cost.as_mut())
+        .expect("approved ceiling")
+        .amount = 200.0;
+    assert!(reloaded.validate_transaction_journal().is_err());
+    assert!(reloaded.mark_consumed().is_err());
+}
+
+#[test]
+fn core_approval_rejects_invalid_money_without_relying_on_the_cli_parser() {
+    let mut capability = CapabilityV1::new(
+        "paid",
+        "Paid operation",
+        "POST",
+        "/accounts/{account_id}/paid",
+    );
+    capability.cost.incremental = true;
+    capability.cost.known = true;
+    capability.cost.currency = Some("USD".to_owned());
+    capability.cost.maximum = Some(10.0);
+    let mut plan = PlanV1::draft("p", "a", "sha256:c", capability, json!({})).expect("plan");
+    plan.policy.requires_cost_ceiling = true;
+    plan.refresh_hash().expect("hash");
+
+    for max_cost in [
+        cfctl_core::MoneyV1 {
+            currency: "USD".to_owned(),
+            amount: f64::NAN,
+        },
+        cfctl_core::MoneyV1 {
+            currency: "USD".to_owned(),
+            amount: f64::INFINITY,
+        },
+        cfctl_core::MoneyV1 {
+            currency: "USD".to_owned(),
+            amount: -1.0,
+        },
+        cfctl_core::MoneyV1 {
+            currency: "US".to_owned(),
+            amount: 20.0,
+        },
+    ] {
+        let mut candidate = plan.clone();
+        assert!(candidate.approve(true, Some(max_cost)).is_err());
+        assert_eq!(candidate.status, PlanStatus::Draft);
+        assert!(candidate.approval.is_none());
+    }
+}
+
+#[test]
 fn redaction_recurses_through_objects_and_arrays() {
     let value = json!({
         "access_token": "secret-a",

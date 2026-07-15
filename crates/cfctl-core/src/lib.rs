@@ -29,6 +29,11 @@ pub enum CoreError {
     ExplicitApprovalRequired,
     #[error("operation {0} requires an explicit maximum cost ceiling")]
     CostCeilingRequired(String),
+    #[error("operation {operation_id} has an invalid cost ceiling: {reason}")]
+    InvalidCostCeiling {
+        operation_id: String,
+        reason: String,
+    },
     #[error(
         "operation {operation_id} has declared maximum cost {required_currency}:{required_amount}, above the approved ceiling"
     )]
@@ -1312,7 +1317,7 @@ impl PlanV1 {
         Ok(())
     }
 
-    pub fn approve(&mut self, explicit_yes: bool, max_cost: Option<MoneyV1>) -> Result<()> {
+    pub fn approve(&mut self, explicit_yes: bool, mut max_cost: Option<MoneyV1>) -> Result<()> {
         if !explicit_yes {
             return Err(CoreError::ExplicitApprovalRequired);
         }
@@ -1333,17 +1338,43 @@ impl PlanV1 {
         if self.policy.requires_cost_ceiling && max_cost.is_none() {
             return Err(CoreError::CostCeilingRequired(self.operation_id.clone()));
         }
-        if let (Some(required), Some(currency), Some(approved)) = (
-            self.capability.cost.maximum,
-            self.capability.cost.currency.as_deref(),
-            max_cost.as_ref(),
-        ) && (!approved.currency.eq_ignore_ascii_case(currency) || approved.amount < required)
-        {
-            return Err(CoreError::CostCeilingTooLow {
+        if let Some(approved) = max_cost.as_mut() {
+            validate_money(approved).map_err(|reason| CoreError::InvalidCostCeiling {
                 operation_id: self.operation_id.clone(),
-                required_currency: currency.to_owned(),
-                required_amount: required,
-            });
+                reason,
+            })?;
+            approved.currency.make_ascii_uppercase();
+        }
+        if self.capability.cost.incremental && self.capability.cost.known {
+            let required =
+                self.capability
+                    .cost
+                    .maximum
+                    .ok_or_else(|| CoreError::InvalidCostCeiling {
+                        operation_id: self.operation_id.clone(),
+                        reason: "known incremental cost has no declared maximum".to_owned(),
+                    })?;
+            let currency = self.capability.cost.currency.as_deref().ok_or_else(|| {
+                CoreError::InvalidCostCeiling {
+                    operation_id: self.operation_id.clone(),
+                    reason: "known incremental cost has no declared currency".to_owned(),
+                }
+            })?;
+            validate_money_fields(currency, required).map_err(|reason| {
+                CoreError::InvalidCostCeiling {
+                    operation_id: self.operation_id.clone(),
+                    reason: format!("declared catalog maximum is invalid: {reason}"),
+                }
+            })?;
+            if let Some(approved) = max_cost.as_ref()
+                && (!approved.currency.eq_ignore_ascii_case(currency) || approved.amount < required)
+            {
+                return Err(CoreError::CostCeilingTooLow {
+                    operation_id: self.operation_id.clone(),
+                    required_currency: currency.to_owned(),
+                    required_amount: required,
+                });
+            }
         }
         let current_hash = hash_value(&self.hashable_content())?;
         if current_hash != self.content_hash {
@@ -1353,13 +1384,21 @@ impl PlanV1 {
                 expected: "unchanged hash-bound draft",
             });
         }
-        self.approval = Some(ApprovalV1 {
+        let approval = ApprovalV1 {
             approved_at: Utc::now(),
             approved_content_hash: self.content_hash.clone(),
             max_cost,
-        });
+        };
+        let receipt = self.approval_receipt(&approval);
+        self.approval = Some(approval);
         self.status = PlanStatus::Approved;
-        self.record_transaction_stage(TransactionStageV1::ApprovalPersisted)?;
+        if let Err(error) = self
+            .record_transaction_stage_with_artifact(TransactionStageV1::ApprovalPersisted, receipt)
+        {
+            self.approval = None;
+            self.status = PlanStatus::Draft;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1566,6 +1605,7 @@ impl PlanV1 {
                 "current transaction stage does not match the journal tail".to_owned(),
             ));
         }
+        self.validate_approval_checkpoint(bind_current_status)?;
         if bind_current_status
             && self
                 .transaction_journal
@@ -1577,6 +1617,55 @@ impl PlanV1 {
             ));
         }
         Ok(())
+    }
+
+    fn validate_approval_checkpoint(&self, bind_current_status: bool) -> Result<()> {
+        let has_approval_checkpoint = self
+            .transaction_journal
+            .iter()
+            .any(|checkpoint| checkpoint.stage == TransactionStageV1::ApprovalPersisted);
+        if has_approval_checkpoint {
+            let approval = self.approval.as_ref().ok_or_else(|| {
+                self.invalid_transaction_journal(
+                    "approval checkpoint has no current approval".to_owned(),
+                )
+            })?;
+            if approval.approved_content_hash != self.content_hash {
+                return Err(self.invalid_transaction_journal(
+                    "approval content hash does not match the current plan".to_owned(),
+                ));
+            }
+            if let Some(max_cost) = approval.max_cost.as_ref()
+                && let Err(reason) = validate_money(max_cost)
+            {
+                return Err(self.invalid_transaction_journal(format!(
+                    "approval cost ceiling is invalid: {reason}"
+                )));
+            }
+            let expected_receipt = self.approval_receipt(approval);
+            if self.transaction_artifact(TransactionStageV1::ApprovalPersisted)
+                != Some(&expected_receipt)
+            {
+                return Err(self.invalid_transaction_journal(
+                    "approval checkpoint does not bind the current approval".to_owned(),
+                ));
+            }
+        } else if bind_current_status && self.approval.is_some() {
+            return Err(self.invalid_transaction_journal(
+                "current approval has no approval checkpoint".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn approval_receipt(&self, approval: &ApprovalV1) -> Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "operation_id": self.operation_id,
+            "approved_at": approval.approved_at,
+            "approved_content_hash": approval.approved_content_hash,
+            "max_cost": approval.max_cost,
+        })
     }
 
     fn transaction_checkpoint_hash(
@@ -1638,6 +1727,23 @@ impl PlanV1 {
             "policy": self.policy,
         })
     }
+}
+
+fn validate_money(money: &MoneyV1) -> std::result::Result<(), String> {
+    validate_money_fields(&money.currency, money.amount)
+}
+
+fn validate_money_fields(currency: &str, amount: f64) -> std::result::Result<(), String> {
+    if currency.len() != 3 || !currency.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return Err("currency must be a three-letter ASCII code".to_owned());
+    }
+    if !amount.is_finite() {
+        return Err("amount must be finite".to_owned());
+    }
+    if amount < 0.0 {
+        return Err("amount must not be negative".to_owned());
+    }
+    Ok(())
 }
 
 pub fn hash_value(value: &Value) -> Result<String> {
