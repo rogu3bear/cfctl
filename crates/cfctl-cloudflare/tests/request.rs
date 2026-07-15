@@ -2086,9 +2086,9 @@ async fn created_resource_is_verified_through_a_complete_parent_collection() {
             let read = stream.read(&mut buffer).await.expect("read verification");
             requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
             let body = if page == 1 {
-                r#"{"success":true,"result":[{"id":"widget-other","name":"other","enabled":false}],"result_info":{"page":1,"total_pages":2}}"#
+                r#"{"success":true,"result":[{"slug":"widget-other","name":"other","enabled":false}],"result_info":{"page":1,"total_pages":2}}"#
             } else {
-                r#"{"success":true,"result":[{"id":"secret-created-id","name":"planned-secret-like-name","enabled":true}],"result_info":{"page":2,"total_pages":2}}"#
+                r#"{"success":true,"result":[{"slug":"secret-created-slug","name":"planned-secret-like-name","enabled":true}],"result_info":{"page":2,"total_pages":2}}"#
             };
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2111,9 +2111,9 @@ async fn created_resource_is_verified_through_a_complete_parent_collection() {
     );
     plan.capability.created_collection_resource = Some(CreatedCollectionResourceContractV1 {
         collection_path: "/accounts/{account_id}/widgets".to_owned(),
-        identity_selector: "widget_id".to_owned(),
-        response_result_identity_pointer: "/id".to_owned(),
-        response_item_identity_pointer: "/id".to_owned(),
+        identity_selector: "slug".to_owned(),
+        response_result_identity_pointer: "/slug".to_owned(),
+        response_item_identity_pointer: "/slug".to_owned(),
         read_capability_id: "widgets-list".to_owned(),
         delete_capability_id: "widgets-delete".to_owned(),
         verified_response_fields: vec!["enabled".to_owned(), "name".to_owned()],
@@ -2130,7 +2130,7 @@ async fn created_resource_is_verified_through_a_complete_parent_collection() {
     let apply = CloudflareResponseV1 {
         status: 201,
         success: true,
-        result: json!({"id":"secret-created-id"}),
+        result: json!({"slug":"secret-created-slug"}),
         errors: Vec::new(),
         result_info: None,
         etag: None,
@@ -2158,7 +2158,7 @@ async fn created_resource_is_verified_through_a_complete_parent_collection() {
     assert!(requests[0].starts_with("GET /client/v4/accounts/account-1/widgets "));
     assert!(requests[1].starts_with("GET /client/v4/accounts/account-1/widgets?page=2 "));
     assert!(requests.iter().all(|request| {
-        !request.contains("secret-created-id")
+        !request.contains("secret-created-slug")
             && !request.contains("planned-secret-like-name")
             && !request.contains("mutation_mode")
             && !request.contains("mutation-etag")
@@ -2507,7 +2507,7 @@ async fn exact_resource_update_projects_branch_local_write_only_inputs() {
 }
 
 #[tokio::test]
-async fn created_resource_is_read_back_by_schema_proven_id_and_planned_fields() {
+async fn created_resource_is_read_back_by_hash_bound_identity_and_planned_fields() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind fake server");
@@ -2517,7 +2517,7 @@ async fn created_resource_is_read_back_by_schema_proven_id_and_planned_fields() 
         let mut buffer = vec![0_u8; 8192];
         let read = stream.read(&mut buffer).await.expect("read verification");
         let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-        let body = r#"{"success":true,"result":{"id":"widget-1","name":"created","settings":{"enabled":true},"server_default":"kept"},"errors":[]}"#;
+        let body = r#"{"success":true,"result":{"slug":"widget-one","name":"created","settings":{"enabled":true},"server_default":"kept"},"errors":[]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -2537,9 +2537,9 @@ async fn created_resource_is_read_back_by_schema_proven_id_and_planned_fields() 
         Some(json!({"name":"created", "settings":{"enabled":true}})),
     );
     plan.capability.created_resource = Some(CreatedResourceContractV1 {
-        detail_path: "/accounts/{account_id}/widgets/{widget_id}".to_owned(),
-        identity_selector: "widget_id".to_owned(),
-        response_result_identity_pointer: "/id".to_owned(),
+        detail_path: "/accounts/{account_id}/widgets/{slug}".to_owned(),
+        identity_selector: "slug".to_owned(),
+        response_result_identity_pointer: "/slug".to_owned(),
         read_capability_id: "widgets-get".to_owned(),
         delete_capability_id: "widgets-delete".to_owned(),
         verified_response_fields: vec!["name".to_owned(), "settings".to_owned()],
@@ -2555,7 +2555,7 @@ async fn created_resource_is_read_back_by_schema_proven_id_and_planned_fields() 
     let apply = CloudflareResponseV1 {
         status: 201,
         success: true,
-        result: json!({"id":"widget-1"}),
+        result: json!({"slug":"widget-one"}),
         errors: Vec::new(),
         result_info: None,
         etag: None,
@@ -2580,7 +2580,7 @@ async fn created_resource_is_read_back_by_schema_proven_id_and_planned_fields() 
 
     assert!(verification.passed, "{}", verification.basis);
     let request = server.await.expect("server joins");
-    assert!(request.starts_with("GET /client/v4/accounts/account-1/widgets/widget-1 "));
+    assert!(request.starts_with("GET /client/v4/accounts/account-1/widgets/widget-one "));
     assert!(!request.contains("mutation_mode"));
     assert!(!request.contains("mutation-etag"));
     assert!(!request.contains("\"name\":\"created\""));

@@ -2138,6 +2138,69 @@ fn create_contract_binds_a_schema_proven_id_and_exact_read_delete_pair() {
 }
 
 #[test]
+fn create_contracts_bind_a_schema_proven_selector_named_identity() {
+    let mut exact_document = create_lifecycle_fixture();
+    exact_document["components"]["schemas"]["Widget"]["properties"]
+        .as_object_mut()
+        .expect("widget properties")
+        .remove("id");
+    exact_document["components"]["schemas"]["Widget"]["properties"]["slug"] =
+        json!({"type":"string"});
+    let mut exact_child = exact_document["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets/{widget_id}")
+        .expect("widget child");
+    exact_child["parameters"][1]["name"] = json!("slug");
+    exact_document["paths"]["/accounts/{account_id}/widgets/{slug}"] = exact_child;
+
+    let exact = normalize_openapi(&exact_document).expect("selector-backed exact create");
+    let exact_target = exact
+        .get("widgets-create")
+        .and_then(|capability| capability.created_resource.as_ref())
+        .expect("selector-backed exact create contract");
+    assert_eq!(exact_target.identity_selector, "slug");
+    assert_eq!(exact_target.response_result_identity_pointer, "/slug");
+
+    let mut collection_document = create_collection_lifecycle_fixture();
+    collection_document["components"]["schemas"]["Widget"]["properties"]
+        .as_object_mut()
+        .expect("widget properties")
+        .remove("id");
+    collection_document["components"]["schemas"]["Widget"]["properties"]["slug"] =
+        json!({"type":"string"});
+    let mut collection_child = collection_document["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets/{widget_id}")
+        .expect("widget child");
+    collection_child["parameters"][1]["name"] = json!("slug");
+    collection_document["paths"]["/accounts/{account_id}/widgets/{slug}"] = collection_child;
+
+    let collection =
+        normalize_openapi(&collection_document).expect("selector-backed collection create");
+    let collection_target = collection
+        .get("widgets-create")
+        .and_then(|capability| capability.created_collection_resource.as_ref())
+        .expect("selector-backed collection create contract");
+    assert_eq!(collection_target.identity_selector, "slug");
+    assert_eq!(collection_target.response_result_identity_pointer, "/slug");
+    assert_eq!(collection_target.response_item_identity_pointer, "/slug");
+
+    collection_document["components"]["schemas"]["Widget"]["properties"]["slug"]["type"] =
+        json!("integer");
+    let incompatible =
+        normalize_openapi(&collection_document).expect("incompatible selector create");
+    assert!(
+        incompatible
+            .get("widgets-create")
+            .expect("create widget")
+            .created_collection_resource
+            .is_none()
+    );
+}
+
+#[test]
 fn create_contract_rejects_an_undocumented_response_identity() {
     let mut document = create_lifecycle_fixture();
     document["paths"]["/accounts/{account_id}/widgets"]["post"]["responses"]["201"]["content"]["application/json"]

@@ -818,7 +818,6 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
         .and_then(Value::as_object)
         .ok_or(CatalogError::MissingPaths)?;
     let mut capabilities = BTreeMap::new();
-    let mut creates_with_schema_proven_string_ids = BTreeSet::new();
 
     for (path, path_item) in paths {
         let Some(operations) = path_item.as_object() else {
@@ -880,9 +879,6 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
                 })
                 .unwrap_or_default();
             capability.maturity = maturity(operation_object);
-            if method == "post" && success_response_declares_result_string_id(document, operation) {
-                creates_with_schema_proven_string_ids.insert(id.clone());
-            }
             classify(&mut capability);
             block_incomplete_dynamic_mutation(&mut capability);
             capabilities.insert(id, capability);
@@ -893,16 +889,8 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     classify_parent_collection_delete_contracts(document, &mut capabilities);
     classify_parent_collection_update_contracts(document, &mut capabilities);
     classify_same_path_object_update_contracts(document, &mut capabilities);
-    classify_created_resource_contracts(
-        document,
-        &mut capabilities,
-        &creates_with_schema_proven_string_ids,
-    );
-    classify_created_collection_resource_contracts(
-        document,
-        &mut capabilities,
-        &creates_with_schema_proven_string_ids,
-    );
+    classify_created_resource_contracts(document, &mut capabilities);
+    classify_created_collection_resource_contracts(document, &mut capabilities);
 
     let source_hash = hash_value(document)?;
     let mut snapshot = CatalogSnapshot {
@@ -991,7 +979,6 @@ fn classify_same_path_object_update_contracts(
 fn classify_created_resource_contracts(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
-    creates_with_schema_proven_string_ids: &BTreeSet<String>,
 ) {
     let read_targets = capabilities
         .values()
@@ -1006,7 +993,7 @@ fn classify_created_resource_contracts(
         .map(|capability| {
             (
                 (capability.path.clone(), capability.product.clone()),
-                capability.id.clone(),
+                (capability.id.clone(), capability.selectors.clone()),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -1024,7 +1011,7 @@ fn classify_created_resource_contracts(
         .map(|capability| {
             (
                 (capability.path.clone(), capability.product.clone()),
-                capability.id.clone(),
+                (capability.id.clone(), capability.selectors.clone()),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -1032,7 +1019,6 @@ fn classify_created_resource_contracts(
     for capability in capabilities.values_mut() {
         if capability.method != "POST"
             || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
-            || !creates_with_schema_proven_string_ids.contains(&capability.id)
             || capability
                 .selectors
                 .iter()
@@ -1065,6 +1051,7 @@ fn created_resource_contract(
     read_targets: &ExactReadTargets,
     delete_targets: &ExactDeleteTargets,
 ) -> Option<CreatedResourceContractV1> {
+    let create_operation = document.get("paths")?.get(&capability.path)?.get("post")?;
     let verified_response_fields = canonical_verifiable_request_object_fields(capability)?;
     let field_names = verified_response_fields
         .iter()
@@ -1073,31 +1060,54 @@ fn created_resource_contract(
 
     let candidates = read_targets
         .iter()
-        .filter_map(|((detail_path, product), read_capability_id)| {
-            if product != &capability.product {
-                return None;
-            }
-            let identity_selector = direct_child_selector(&capability.path, detail_path)?;
-            if !selector_can_be_response_id(&identity_selector) {
-                return None;
-            }
-            let delete_capability_id =
-                delete_targets.get(&(detail_path.clone(), product.clone()))?;
-            let read_operation = document.get("paths")?.get(detail_path)?.get("get")?;
-            if !success_response_declares_result_string_id(document, read_operation)
-                || !success_response_declares_result_fields(document, read_operation, &field_names)
-            {
-                return None;
-            }
-            Some(CreatedResourceContractV1 {
-                detail_path: detail_path.clone(),
-                identity_selector,
-                response_result_identity_pointer: "/id".to_owned(),
-                read_capability_id: read_capability_id.clone(),
-                delete_capability_id: delete_capability_id.clone(),
-                verified_response_fields: verified_response_fields.clone(),
-            })
-        })
+        .filter_map(
+            |((detail_path, product), (read_capability_id, read_selectors))| {
+                if product != &capability.product {
+                    return None;
+                }
+                let identity_selector = direct_child_selector(&capability.path, detail_path)?;
+                let (delete_capability_id, delete_selectors) =
+                    delete_targets.get(&(detail_path.clone(), product.clone()))?;
+                if !selector_can_be_response_id(&identity_selector)
+                    && (!selectors_have_required_string_path_selector(
+                        read_selectors,
+                        &identity_selector,
+                    ) || !selectors_have_required_string_path_selector(
+                        delete_selectors,
+                        &identity_selector,
+                    ))
+                {
+                    return None;
+                }
+                let read_operation = document.get("paths")?.get(detail_path)?.get("get")?;
+                let response_result_identity_pointer = response_identity_fields(&identity_selector)
+                    .into_iter()
+                    .find(|identity_field| {
+                        success_response_declares_result_string_field(
+                            document,
+                            create_operation,
+                            identity_field,
+                        ) && success_response_declares_result_string_field(
+                            document,
+                            read_operation,
+                            identity_field,
+                        )
+                    })
+                    .map(|identity_field| format!("/{identity_field}"))?;
+                if !success_response_declares_result_fields(document, read_operation, &field_names)
+                {
+                    return None;
+                }
+                Some(CreatedResourceContractV1 {
+                    detail_path: detail_path.clone(),
+                    identity_selector,
+                    response_result_identity_pointer,
+                    read_capability_id: read_capability_id.clone(),
+                    delete_capability_id: delete_capability_id.clone(),
+                    verified_response_fields: verified_response_fields.clone(),
+                })
+            },
+        )
         .collect::<Vec<_>>();
     let [target] = candidates.as_slice() else {
         return None;
@@ -1119,13 +1129,12 @@ fn direct_child_selector(collection_path: &str, detail_path: &str) -> Option<Str
 }
 
 type CollectionReadTargets = BTreeMap<(String, String), (String, Vec<SelectorV1>)>;
-type ExactReadTargets = BTreeMap<(String, String), String>;
-type ExactDeleteTargets = BTreeMap<(String, String), String>;
+type ExactReadTargets = BTreeMap<(String, String), (String, Vec<SelectorV1>)>;
+type ExactDeleteTargets = BTreeMap<(String, String), (String, Vec<SelectorV1>)>;
 
 fn classify_created_collection_resource_contracts(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
-    creates_with_schema_proven_string_ids: &BTreeSet<String>,
 ) {
     let list_targets: CollectionReadTargets = capabilities
         .values()
@@ -1151,7 +1160,7 @@ fn classify_created_collection_resource_contracts(
         .map(|capability| {
             (
                 (capability.path.clone(), capability.product.clone()),
-                capability.id.clone(),
+                (capability.id.clone(), capability.selectors.clone()),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -1159,7 +1168,6 @@ fn classify_created_collection_resource_contracts(
     for capability in capabilities.values_mut() {
         if capability.method != "POST"
             || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
-            || !creates_with_schema_proven_string_ids.contains(&capability.id)
             || capability
                 .selectors
                 .iter()
@@ -1195,6 +1203,7 @@ fn created_collection_resource_contract(
     list_targets: &CollectionReadTargets,
     delete_targets: &ExactDeleteTargets,
 ) -> Option<CreatedCollectionResourceContractV1> {
+    let create_operation = document.get("paths")?.get(&capability.path)?.get("post")?;
     let verified_response_fields = canonical_verifiable_request_object_fields(capability)?;
 
     let (read_capability_id, read_selectors) =
@@ -1204,37 +1213,73 @@ fn created_collection_resource_contract(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let requires_page_number_completion = complete_collection_readback_contract(
-        document,
-        read_operation,
-        read_selectors,
-        "id",
-        &field_names,
-    )?;
     let delete_candidates = delete_targets
         .iter()
-        .filter_map(|((delete_path, product), delete_capability_id)| {
-            if product != &capability.product {
-                return None;
-            }
-            let identity_selector = direct_child_selector(&capability.path, delete_path)?;
-            selector_can_be_response_id(&identity_selector)
-                .then(|| (identity_selector, delete_capability_id.clone()))
-        })
+        .filter_map(
+            |((delete_path, product), (delete_capability_id, delete_selectors))| {
+                if product != &capability.product {
+                    return None;
+                }
+                let identity_selector = direct_child_selector(&capability.path, delete_path)?;
+                if !selector_can_be_response_id(&identity_selector)
+                    && !selectors_have_required_string_path_selector(
+                        delete_selectors,
+                        &identity_selector,
+                    )
+                {
+                    return None;
+                }
+                let (identity_field, requires_page_number_completion) =
+                    response_identity_fields(&identity_selector)
+                        .into_iter()
+                        .find_map(|identity_field| {
+                            if !success_response_declares_result_string_field(
+                                document,
+                                create_operation,
+                                identity_field,
+                            ) {
+                                return None;
+                            }
+                            complete_collection_readback_contract(
+                                document,
+                                read_operation,
+                                read_selectors,
+                                identity_field,
+                                &field_names,
+                            )
+                            .map(|pagination| (identity_field, pagination))
+                        })?;
+                let response_identity_pointer = format!("/{identity_field}");
+                Some((
+                    identity_selector,
+                    response_identity_pointer,
+                    delete_capability_id.clone(),
+                    requires_page_number_completion,
+                ))
+            },
+        )
         .collect::<Vec<_>>();
-    let [(identity_selector, delete_capability_id)] = delete_candidates.as_slice() else {
+    let [
+        (
+            identity_selector,
+            response_identity_pointer,
+            delete_capability_id,
+            requires_page_number_completion,
+        ),
+    ] = delete_candidates.as_slice()
+    else {
         return None;
     };
 
     Some(CreatedCollectionResourceContractV1 {
         collection_path: capability.path.clone(),
         identity_selector: identity_selector.clone(),
-        response_result_identity_pointer: "/id".to_owned(),
-        response_item_identity_pointer: "/id".to_owned(),
+        response_result_identity_pointer: response_identity_pointer.clone(),
+        response_item_identity_pointer: response_identity_pointer.clone(),
         read_capability_id: read_capability_id.clone(),
         delete_capability_id: delete_capability_id.clone(),
         verified_response_fields,
-        requires_page_number_completion,
+        requires_page_number_completion: *requires_page_number_completion,
     })
 }
 
@@ -1599,7 +1644,14 @@ fn capability_has_required_string_path_selector(
     capability: &CapabilityV1,
     selector_name: &str,
 ) -> bool {
-    capability.selectors.iter().any(|selector| {
+    selectors_have_required_string_path_selector(&capability.selectors, selector_name)
+}
+
+fn selectors_have_required_string_path_selector(
+    selectors: &[SelectorV1],
+    selector_name: &str,
+) -> bool {
+    selectors.iter().any(|selector| {
         selector.name == selector_name
             && selector.location == "path"
             && selector.required
@@ -1613,13 +1665,7 @@ fn selector_can_be_response_id(selector: &str) -> bool {
         || selector.ends_with("_identifier")
 }
 
-fn collection_readback_identity_contract(
-    document: &Value,
-    operation: &Value,
-    selectors: &[SelectorV1],
-    identity_selector: &str,
-    verified_item_fields: &[&str],
-) -> Option<(String, bool)> {
+fn response_identity_fields(identity_selector: &str) -> Vec<&str> {
     let mut identity_fields = Vec::new();
     if selector_can_be_response_id(identity_selector) {
         identity_fields.push("id");
@@ -1627,21 +1673,33 @@ fn collection_readback_identity_contract(
     if !identity_selector.contains(['/', '~']) && !identity_fields.contains(&identity_selector) {
         identity_fields.push(identity_selector);
     }
-    identity_fields.into_iter().find_map(|identity_field| {
-        complete_collection_readback_contract(
-            document,
-            operation,
-            selectors,
-            identity_field,
-            verified_item_fields,
-        )
-        .map(|requires_page_number_completion| {
-            (
-                format!("/{identity_field}"),
-                requires_page_number_completion,
+    identity_fields
+}
+
+fn collection_readback_identity_contract(
+    document: &Value,
+    operation: &Value,
+    selectors: &[SelectorV1],
+    identity_selector: &str,
+    verified_item_fields: &[&str],
+) -> Option<(String, bool)> {
+    response_identity_fields(identity_selector)
+        .into_iter()
+        .find_map(|identity_field| {
+            complete_collection_readback_contract(
+                document,
+                operation,
+                selectors,
+                identity_field,
+                verified_item_fields,
             )
+            .map(|requires_page_number_completion| {
+                (
+                    format!("/{identity_field}"),
+                    requires_page_number_completion,
+                )
+            })
         })
-    })
 }
 
 fn complete_collection_readback_contract(
@@ -1879,7 +1937,11 @@ fn request_property_is_read_only(document: &Value, property: &Value) -> bool {
         == Some(true)
 }
 
-fn success_response_declares_result_string_id(document: &Value, operation: &Value) -> bool {
+fn success_response_declares_result_string_field(
+    document: &Value,
+    operation: &Value,
+    field: &str,
+) -> bool {
     operation
         .get("responses")
         .and_then(Value::as_object)
@@ -1887,7 +1949,7 @@ fn success_response_declares_result_string_id(document: &Value, operation: &Valu
         .flatten()
         .filter(|(status, _)| status.starts_with('2'))
         .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
-        .any(|schema| schema_declares_string_path(document, schema, &["result", "id"], 0))
+        .any(|schema| schema_declares_string_path(document, schema, &["result", field], 0))
 }
 
 fn success_response_declares_complete_collection(

@@ -1782,9 +1782,12 @@ fn validate_created_resource_target(capability: &CapabilityV1, input: &CallInput
         )
     })?;
     let expected_suffix = format!("/{{{}}}", target.identity_selector);
-    if !selector_can_be_response_id(&target.identity_selector)
+    if target.identity_selector.is_empty()
         || !target.detail_path.ends_with(&expected_suffix)
-        || target.response_result_identity_pointer != "/id"
+        || !response_identity_pointer_supported(
+            &target.identity_selector,
+            &target.response_result_identity_pointer,
+        )
         || target.read_capability_id.is_empty()
         || target.delete_capability_id.is_empty()
         || target.verified_response_fields.is_empty()
@@ -1829,7 +1832,7 @@ fn selector_can_be_response_id(selector: &str) -> bool {
         || selector.ends_with("_identifier")
 }
 
-fn response_item_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
+fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
     (selector_can_be_response_id(selector) && pointer == "/id")
         || (!selector
             .chars()
@@ -1851,8 +1854,11 @@ fn validate_created_collection_resource_target(
         })?;
     if target.collection_path != capability.path
         || target.identity_selector.is_empty()
-        || target.response_result_identity_pointer != "/id"
-        || target.response_item_identity_pointer != "/id"
+        || target.response_result_identity_pointer != target.response_item_identity_pointer
+        || !response_identity_pointer_supported(
+            &target.identity_selector,
+            &target.response_result_identity_pointer,
+        )
         || target.read_capability_id.is_empty()
         || target.delete_capability_id.is_empty()
         || target.verified_response_fields.is_empty()
@@ -1904,7 +1910,7 @@ fn validate_deleted_resource_target(capability: &CapabilityV1, input: &CallInput
     );
     if target.identity_selector.is_empty()
         || capability.path != expected_path
-        || !response_item_identity_pointer_supported(
+        || !response_identity_pointer_supported(
             &target.identity_selector,
             &target.response_item_identity_pointer,
         )
@@ -1947,7 +1953,7 @@ fn validate_updated_resource_target(capability: &CapabilityV1, input: &CallInput
     );
     if target.identity_selector.is_empty()
         || capability.path != expected_path
-        || !response_item_identity_pointer_supported(
+        || !response_identity_pointer_supported(
             &target.identity_selector,
             &target.response_item_identity_pointer,
         )

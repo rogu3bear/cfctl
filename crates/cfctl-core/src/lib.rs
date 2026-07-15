@@ -658,9 +658,12 @@ impl CapabilityV1 {
                 self.path.trim_end_matches('/'),
                 target.identity_selector
             );
-            selector_can_be_response_id(&target.identity_selector)
+            !target.identity_selector.is_empty()
                 && target.detail_path == expected_path
-                && target.response_result_identity_pointer == "/id"
+                && response_identity_pointer_supported(
+                    &target.identity_selector,
+                    &target.response_result_identity_pointer,
+                )
                 && !target.read_capability_id.is_empty()
                 && !target.delete_capability_id.is_empty()
                 && !target.verified_response_fields.is_empty()
@@ -719,10 +722,14 @@ impl CapabilityV1 {
         self.created_collection_resource
             .as_ref()
             .is_some_and(|target| {
-                selector_can_be_response_id(&target.identity_selector)
+                !target.identity_selector.is_empty()
                     && self.path == target.collection_path
-                    && target.response_result_identity_pointer == "/id"
-                    && target.response_item_identity_pointer == "/id"
+                    && target.response_result_identity_pointer
+                        == target.response_item_identity_pointer
+                    && response_identity_pointer_supported(
+                        &target.identity_selector,
+                        &target.response_result_identity_pointer,
+                    )
                     && !target.read_capability_id.is_empty()
                     && !target.delete_capability_id.is_empty()
                     && !target.verified_response_fields.is_empty()
@@ -749,7 +756,7 @@ impl CapabilityV1 {
             );
             !target.identity_selector.is_empty()
                 && self.path == expected_path
-                && response_item_identity_pointer_supported(
+                && response_identity_pointer_supported(
                     &target.identity_selector,
                     &target.response_item_identity_pointer,
                 )
@@ -769,7 +776,7 @@ impl CapabilityV1 {
             };
             !target.identity_selector.is_empty()
                 && self.path == expected_path
-                && response_item_identity_pointer_supported(
+                && response_identity_pointer_supported(
                     &target.identity_selector,
                     &target.response_item_identity_pointer,
                 )
@@ -788,7 +795,7 @@ impl CapabilityV1 {
     }
 }
 
-fn response_item_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
+fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
     (selector_can_be_response_id(selector) && pointer == "/id")
         || (!selector
             .chars()

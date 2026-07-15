@@ -4510,21 +4510,22 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 mod tests {
     use super::{
         CallInput, apply_zone_account_response, apply_zone_entitlement_response,
-        compensation_request, find_secret_value, guide_document, persist_secret_lifecycle,
-        preflight_call_input, preserve_previous_catalog, redact_secret_result,
-        required_entitlement_precondition, required_zone_account_precondition,
-        should_bind_zone_account, should_resolve_zone_entitlement, sink_secret_result,
-        validate_api_token_creation_contract, validate_current_permission_groups,
-        validate_entitlement_receipt_precondition, validate_selected_permission_groups,
-        validate_zone_account_receipt_precondition, zone_target,
+        boundary_response_artifact, compensation_request, find_secret_value, guide_document,
+        persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
+        redact_secret_result, required_entitlement_precondition,
+        required_zone_account_precondition, should_bind_zone_account,
+        should_resolve_zone_entitlement, sink_secret_result, validate_api_token_creation_contract,
+        validate_current_permission_groups, validate_entitlement_receipt_precondition,
+        validate_selected_permission_groups, validate_zone_account_receipt_precondition,
+        zone_target,
     };
     use cfctl_auth::{AuthError, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
     use cfctl_cloudflare::CloudflareResponseV1;
     use cfctl_core::{
         AdapterStatus, CapabilityV1, CreatedCollectionResourceContractV1,
-        CreatedResourceContractV1, EffectClass, PlanStatus, PlanV1, RiskClass,
-        SamePathReadContractV1, SelectorV1, TransactionStageV1, hash_value,
+        CreatedResourceContractV1, EffectClass, EvidenceClass, EvidenceV1, PlanStatus, PlanV1,
+        RiskClass, SamePathReadContractV1, SelectorV1, TransactionStageV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::Utc;
@@ -5349,9 +5350,9 @@ mod tests {
         capability.rollback.supported = true;
         capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
         capability.created_resource = Some(CreatedResourceContractV1 {
-            detail_path: "/accounts/{account_id}/widgets/{widget_id}".to_owned(),
-            identity_selector: "widget_id".to_owned(),
-            response_result_identity_pointer: "/id".to_owned(),
+            detail_path: "/accounts/{account_id}/widgets/{slug}".to_owned(),
+            identity_selector: "slug".to_owned(),
+            response_result_identity_pointer: "/slug".to_owned(),
             read_capability_id: "widgets-get".to_owned(),
             delete_capability_id: "widgets-delete".to_owned(),
             verified_response_fields: vec!["name".to_owned()],
@@ -5377,9 +5378,23 @@ mod tests {
         plan.mark_consumed().expect("consume");
         plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
             .expect("attempt");
+        let response = CloudflareResponseV1 {
+            status: 201,
+            success: true,
+            result: json!({"slug":"widget-one","name":"secret-like-widget"}),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let apply_evidence = EvidenceV1::new(
+            EvidenceClass::Apply,
+            "sha256:apply-receipt",
+            "/tmp/apply-receipt.json",
+        );
         plan.record_transaction_stage_with_artifact(
             TransactionStageV1::BoundaryResponsePersisted,
-            json!({"resource_id":"widget-id","success":true}),
+            boundary_response_artifact(&plan, &response, &apply_evidence),
         )
         .expect("response receipt");
         plan.status = PlanStatus::RectificationRequired;
@@ -5391,10 +5406,10 @@ mod tests {
         assert_eq!(request.capability_id, "widgets-delete");
         assert_eq!(
             request.expected_path,
-            "/accounts/{account_id}/widgets/{widget_id}"
+            "/accounts/{account_id}/widgets/{slug}"
         );
         assert_eq!(request.input.selectors["account_id"], "account-a");
-        assert_eq!(request.input.selectors["widget_id"], "widget-id");
+        assert_eq!(request.input.selectors["slug"], "widget-one");
         assert_eq!(request.input.query, json!({}));
         assert!(request.input.body.is_none());
         assert!(request.input.if_match.is_none());

@@ -636,6 +636,66 @@ fn created_resource_contract_rejects_noncanonical_field_allowlists() {
 }
 
 #[test]
+fn created_resource_contracts_require_exact_identity_pointers() {
+    let mut exact = CapabilityV1::new(
+        "widgets-create",
+        "Create widget",
+        "POST",
+        "/accounts/{account_id}/widgets",
+    );
+    exact.verification.strategy =
+        "created_resource_contains_planned_fields_by_returned_id".to_owned();
+    exact.request_schema = Some(json!({
+        "type":"object",
+        "properties":{"name":{"type":"string"}}
+    }));
+    exact.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/widgets/{slug}".to_owned(),
+        identity_selector: "slug".to_owned(),
+        response_result_identity_pointer: "/slug".to_owned(),
+        read_capability_id: "widgets-get".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+    });
+    assert!(exact.verification_contract_supported());
+
+    exact
+        .created_resource
+        .as_mut()
+        .expect("created-resource contract")
+        .response_result_identity_pointer = "/id".to_owned();
+    assert!(!exact.verification_contract_supported());
+
+    let mut collection = CapabilityV1::new(
+        "widgets-create",
+        "Create widget",
+        "POST",
+        "/accounts/{account_id}/widgets",
+    );
+    collection.verification.strategy =
+        "parent_collection_contains_created_resource_id_and_planned_fields".to_owned();
+    collection.request_schema = exact.request_schema.clone();
+    collection.created_collection_resource = Some(CreatedCollectionResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "slug".to_owned(),
+        response_result_identity_pointer: "/slug".to_owned(),
+        response_item_identity_pointer: "/slug".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+        requires_page_number_completion: false,
+    });
+    assert!(collection.verification_contract_supported());
+
+    collection
+        .created_collection_resource
+        .as_mut()
+        .expect("created-collection contract")
+        .response_item_identity_pointer = "/id".to_owned();
+    assert!(!collection.verification_contract_supported());
+}
+
+#[test]
 fn created_collection_contract_excludes_write_only_fields_from_its_allowlist() {
     let mut capability = CapabilityV1::new(
         "widgets-create",
