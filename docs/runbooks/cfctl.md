@@ -137,6 +137,22 @@ metadata and account-only resource policy. Running the approved plan repeats
 that inventory read before consumption; drift requires a new plan. Do not use
 generic `call` for account API-token creation.
 
+Mint a user-owned token for one explicit account with the parallel governed
+workflow:
+
+```bash
+cfctl keys permissions --user --account <account-id> --json
+cfctl keys mint --user --name <name> --permission <reviewed-group-id> \
+  --account <account-id> --ttl-hours <hours> \
+  --value-out /new/secure/path --json
+```
+
+The `--user` flag changes token ownership and the permission-inventory
+endpoint, not the policy scope: every selected group must declare account scope
+and the policy remains pinned to the one `--account` value. Use the same flag
+for `keys rotate` and `keys revoke`; those plans select the user token endpoint
+while preserving the explicit account authority context.
+
 Create an Access service token through its separate exact account or zone
 lifecycle. The input is intentionally limited to `name` and optional
 `duration`; version and grace-period fields belong to rotation, not initial

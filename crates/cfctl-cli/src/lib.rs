@@ -118,12 +118,22 @@ pub enum KeysCommand {
 
 #[derive(Debug, Args)]
 pub struct KeyPermissionArgs {
+    #[arg(
+        long,
+        help = "Read the user-owned token permission inventory; --account remains the explicit resource and authority context"
+    )]
+    pub user: bool,
     #[arg(long)]
     pub account: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct KeyMutationArgs {
+    #[arg(
+        long,
+        help = "Create a user-owned token scoped to the explicit --account resource"
+    )]
+    pub user: bool,
     #[arg(long)]
     pub name: String,
     #[arg(long = "permission")]
@@ -138,6 +148,11 @@ pub struct KeyMutationArgs {
 
 #[derive(Debug, Args)]
 pub struct KeyRevokeArgs {
+    #[arg(
+        long,
+        help = "Revoke a user-owned token instead of an account-owned token"
+    )]
+    pub user: bool,
     #[arg(long)]
     pub id: String,
     #[arg(long)]
@@ -146,6 +161,11 @@ pub struct KeyRevokeArgs {
 
 #[derive(Debug, Args)]
 pub struct KeyRotateArgs {
+    #[arg(
+        long,
+        help = "Rotate a user-owned token instead of an account-owned token"
+    )]
+    pub user: bool,
     #[arg(long)]
     pub id: String,
     #[arg(long)]

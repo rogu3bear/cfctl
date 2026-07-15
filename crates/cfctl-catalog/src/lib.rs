@@ -6496,13 +6496,6 @@ fn classify_api_token_lifecycle(capability: &mut CapabilityV1) {
             "credential values are emitted once and must be delivered to an explicit sink"
                 .to_owned(),
         );
-        if capability.id == "user-api-tokens-create-token" {
-            capability.adapter_status = AdapterStatus::Blocked;
-            capability.blocked_reason = Some(
-                "user-token minting is blocked until a dedicated live permission inventory and least-privilege policy workflow is implemented"
-                    .to_owned(),
-            );
-        }
     } else if capability.id.ends_with("roll-token") {
         capability.risk = RiskClass::SecretSensitive;
         capability.effect = EffectClass::IdentityOrOwnership;

@@ -118,9 +118,11 @@ cfctl call dns-records-for-a-zone-create-dns-record \
 evidence classes, blockers, safe next actions, and argv arrays. A blocked
 capability never receives a runnable `call_argv`; its post-resolution argv is
 clearly separated as a template. Token creation is exposed through the
-inventory-bound `keys mint` workflow rather than a direct create call;
-user-token creation remains blocked without an equivalent workflow and has no
-execution template.
+inventory-bound `keys mint` workflow rather than a direct create call.
+Account-owned tokens use the account permission inventory. User-owned tokens
+require `--user`, use the user permission inventory, and are constrained to one
+explicit `--account` resource; wildcard and arbitrary-resource policies are
+not accepted.
 
 A mutating `call` creates a hash-bound transaction plan. It does not write
 immediately. Review the plan and exact operation ID:
@@ -170,13 +172,15 @@ ownership receipt is hash-bound to the plan; missing access, cross-account
 targets, substituted responses, and ownership drift fail before mutation.
 
 `cfctl keys mint` validates every selected permission-group ID against a fresh,
-account-bound live inventory before it creates a plan. The plan binds only the
+owner-specific live inventory before it creates a plan. The plan binds only the
 normalized ID, name, category, and scopes for the selected groups plus the
-live-read evidence hash; it never copies arbitrary inventory fields. Execution
-repeats that read before durable consumption and rejects renamed, rescoped,
-missing, duplicate, cross-account, or widened policy input. Direct token-create
-calls and user-token minting remain blocked until they can carry the same
-least-privilege contract.
+live-read evidence hash; it never copies arbitrary inventory fields. Each
+selected group must explicitly support `com.cloudflare.api.account`, and the
+policy must target exactly the requested account. Execution repeats the same
+owner-specific inventory read before durable consumption and rejects renamed,
+rescoped, missing, duplicate, cross-account, wrong-owner, or widened policy
+input. Direct token-create calls cannot bypass this workflow. Use `--user` for
+a user-owned token; omission selects the account-owned endpoint.
 
 Access service tokens use separate, exactly allowlisted account- and zone-scoped
 creation lifecycles. Each accepts only `name` and optional `duration`, requires

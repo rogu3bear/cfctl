@@ -2797,12 +2797,7 @@ async fn create_plan(
 ) -> Result<ResultEnvelopeV2> {
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
-    if profile.kind == ProfileKind::GlobalKey && requested_profile.is_none() {
-        return Err(CliError::Input(
-            "the emergency global-key profile is never selected implicitly; pass `--profile` explicitly"
-                .to_owned(),
-        ));
-    }
+    reject_implicit_global_key_selection(profile, requested_profile)?;
     let resolved_account = resolve_account_id(store, profile, requested_account, &input)?;
     let account_id = resolved_account
         .as_deref()
@@ -3367,18 +3362,9 @@ fn validate_api_token_creation_contract(
     adapter_targets: &Value,
     account_id: &str,
 ) -> Result<()> {
-    if !matches!(
-        capability.id.as_str(),
-        "account-api-tokens-create-token" | "user-api-tokens-create-token"
-    ) {
+    let Some(inventory_contract) = token_permission_inventory_contract(&capability.id) else {
         return Ok(());
-    }
-    if capability.id != "account-api-tokens-create-token" {
-        return Err(CliError::Input(
-            "user-token minting is blocked until a dedicated least-privilege inventory workflow is implemented; use account-scoped `cfctl keys mint`"
-                .to_owned(),
-        ));
-    }
+    };
     let inventory = adapter_targets
         .get("permission_inventory")
         .ok_or_else(|| {
@@ -3390,12 +3376,12 @@ fn validate_api_token_creation_contract(
     if inventory
         .get("source_capability_id")
         .and_then(Value::as_str)
-        != Some("account-api-tokens-list-permission-groups")
+        != Some(inventory_contract.capability_id)
     {
-        return Err(CliError::Input(
-            "token mint permission metadata is not bound to the account permission-group inventory capability"
-                .to_owned(),
-        ));
+        return Err(CliError::Input(format!(
+            "token mint permission metadata is not bound to the required `{}` inventory capability",
+            inventory_contract.capability_id
+        )));
     }
     let selected_groups = inventory
         .get("selected_groups")
@@ -3422,6 +3408,7 @@ fn validate_api_token_creation_contract(
         .collect::<Result<Vec<_>>>()?;
     let normalized_groups =
         validate_selected_permission_groups(&selected_ids, &Value::Array(selected_groups.clone()))?;
+    validate_permission_group_resource_scope(&normalized_groups, "com.cloudflare.api.account")?;
     let expected_hash = inventory
         .get("selected_groups_hash")
         .and_then(Value::as_str)
@@ -3455,6 +3442,54 @@ fn validate_api_token_creation_contract(
         ));
     }
     validate_token_policy_body(input.body.as_ref(), &selected_ids, account_id)
+}
+
+#[derive(Clone, Copy)]
+struct TokenPermissionInventoryContract {
+    capability_id: &'static str,
+    path: &'static str,
+    account_selector: bool,
+}
+
+fn token_permission_inventory_contract(
+    token_create_capability_id: &str,
+) -> Option<TokenPermissionInventoryContract> {
+    match token_create_capability_id {
+        "account-api-tokens-create-token" => Some(TokenPermissionInventoryContract {
+            capability_id: "account-api-tokens-list-permission-groups",
+            path: "/accounts/{account_id}/tokens/permission_groups",
+            account_selector: true,
+        }),
+        "user-api-tokens-create-token" => Some(TokenPermissionInventoryContract {
+            capability_id: "permission-groups-list-permission-groups",
+            path: "/user/tokens/permission_groups",
+            account_selector: false,
+        }),
+        _ => None,
+    }
+}
+
+fn validate_permission_group_resource_scope(groups: &[Value], required_scope: &str) -> Result<()> {
+    for group in groups {
+        let id = group
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        let supports_scope = group
+            .get("scopes")
+            .and_then(Value::as_array)
+            .is_some_and(|scopes| {
+                scopes
+                    .iter()
+                    .any(|scope| scope.as_str() == Some(required_scope))
+            });
+        if !supports_scope {
+            return Err(CliError::Input(format!(
+                "permission group `{id}` does not support the required account resource scope `{required_scope}`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_token_policy_body(
@@ -4992,9 +5027,9 @@ async fn validate_live_permission_inventory_precondition(
     plan: &PlanV1,
     credential: &AuthCredential,
 ) -> Result<Option<EvidenceV1>> {
-    if plan.capability.id != "account-api-tokens-create-token" {
+    let Some(expected_inventory) = token_permission_inventory_contract(&plan.capability.id) else {
         return Ok(None);
-    }
+    };
     let inventory_contract = plan
         .targets
         .pointer("/adapter/permission_inventory")
@@ -5015,12 +5050,12 @@ async fn validate_live_permission_inventory_precondition(
             "token mint permission-inventory capability `{source_capability_id}` no longer exists"
         ))
     })?;
-    if source_capability.id != "account-api-tokens-list-permission-groups"
+    if source_capability.id != expected_inventory.capability_id
         || source_capability.method != "GET"
-        || source_capability.path != "/accounts/{account_id}/tokens/permission_groups"
+        || source_capability.path != expected_inventory.path
     {
         return Err(CliError::Input(
-            "token mint permission-inventory capability drifted from the governed account read"
+            "token mint permission-inventory capability drifted from its governed owner-specific read"
                 .to_owned(),
         ));
     }
@@ -5029,7 +5064,11 @@ async fn validate_live_permission_inventory_precondition(
         .execute_read(
             source_capability,
             &CallInput {
-                selectors: json!({"account_id": plan.account_id}),
+                selectors: if expected_inventory.account_selector {
+                    json!({"account_id": plan.account_id})
+                } else {
+                    json!({})
+                },
                 query: json!({}),
                 body: None,
                 ..CallInput::default()
@@ -5923,13 +5962,15 @@ async fn key_permissions(
     store: &StateStore,
     arguments: &KeyPermissionArgs,
 ) -> Result<ResultEnvelopeV2> {
-    let capability_id = if arguments.account.is_some() {
-        "account-api-tokens-list-permission-groups"
-    } else {
+    let capability_id = if arguments.user || arguments.account.is_none() {
         "permission-groups-list-permission-groups"
+    } else {
+        "account-api-tokens-list-permission-groups"
     };
     let mut selectors = Vec::new();
-    if let Some(account) = &arguments.account {
+    if !arguments.user
+        && let Some(account) = &arguments.account
+    {
         selectors.push(("account_id".to_owned(), account.clone()));
     }
     call_command(
@@ -5958,21 +5999,25 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
         CliError::Input("token minting requires the sink-only `--value-out <path>`".to_owned())
     })?;
     if arguments.permissions.is_empty() {
-        return Err(CliError::Input(
+        return Err(CliError::Input(if arguments.user {
+            "at least one permission group ID is required; use `cfctl keys permissions --user --account <id>`"
+                    .to_owned()
+        } else {
             "at least one permission group ID is required; use `cfctl keys permissions --account <id>`"
-                .to_owned(),
-        ));
+                    .to_owned()
+        }));
     }
     let inventory = key_permissions(
         store,
         &KeyPermissionArgs {
             account: Some(account.to_owned()),
+            user: arguments.user,
         },
     )
     .await?;
     if !inventory.ok || !inventory.performed || inventory.account_id.as_deref() != Some(account) {
         return Err(CliError::Input(
-            "fresh account permission inventory did not produce an account-bound live-read receipt"
+            "fresh owner-specific permission inventory did not produce an account-bound live-read receipt"
                 .to_owned(),
         ));
     }
@@ -5980,6 +6025,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
         &arguments.permissions,
         inventory.result.get("result").unwrap_or(&Value::Null),
     )?;
+    validate_permission_group_resource_scope(&selected_groups, "com.cloudflare.api.account")?;
     let selected_group_ids = selected_groups
         .iter()
         .filter_map(|group| group.get("id").and_then(Value::as_str))
@@ -6004,16 +6050,27 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
             json!((Utc::now() + ChronoDuration::hours(i64::from(hours))).to_rfc3339());
     }
     let catalog = ensure_catalog(store).await?;
+    let capability_id = if arguments.user {
+        "user-api-tokens-create-token"
+    } else {
+        "account-api-tokens-create-token"
+    };
+    let inventory_contract = token_permission_inventory_contract(capability_id)
+        .ok_or_else(|| capability_missing(capability_id))?;
     let capability = catalog
-        .get("account-api-tokens-create-token")
+        .get(capability_id)
         .cloned()
-        .ok_or_else(|| capability_missing("account-api-tokens-create-token"))?;
+        .ok_or_else(|| capability_missing(capability_id))?;
     let mut plan = create_plan(
         store,
         &catalog,
         capability,
         CallInput {
-            selectors: json!({"account_id": account}),
+            selectors: if arguments.user {
+                json!({})
+            } else {
+                json!({"account_id": account})
+            },
             query: json!({}),
             body: Some(body),
             ..CallInput::default()
@@ -6023,7 +6080,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
         json!({
             "value_out": value_out,
             "permission_inventory": {
-                "source_capability_id": "account-api-tokens-list-permission-groups",
+                "source_capability_id": inventory_contract.capability_id,
                 "selected_groups": selected_groups,
                 "selected_groups_hash": selected_groups_hash,
                 "evidence_hashes": inventory_evidence_hashes,
@@ -6111,16 +6168,25 @@ fn validate_selected_permission_groups(
 
 async fn key_rotate(store: &StateStore, arguments: &KeyRotateArgs) -> Result<ResultEnvelopeV2> {
     let catalog = ensure_catalog(store).await?;
+    let capability_id = if arguments.user {
+        "user-api-tokens-roll-token"
+    } else {
+        "account-api-tokens-roll-token"
+    };
     let capability = catalog
-        .get("account-api-tokens-roll-token")
+        .get(capability_id)
         .cloned()
-        .ok_or_else(|| capability_missing("account-api-tokens-roll-token"))?;
+        .ok_or_else(|| capability_missing(capability_id))?;
     create_plan(
         store,
         &catalog,
         capability,
         CallInput {
-            selectors: json!({"account_id": arguments.account, "token_id": arguments.id}),
+            selectors: if arguments.user {
+                json!({"token_id": arguments.id})
+            } else {
+                json!({"account_id": arguments.account, "token_id": arguments.id})
+            },
             query: json!({}),
             body: Some(json!({})),
             ..CallInput::default()
@@ -6137,16 +6203,25 @@ async fn key_revoke(store: &StateStore, arguments: &KeyRevokeArgs) -> Result<Res
         CliError::Input("token revocation requires `--account` for explicit ownership".to_owned())
     })?;
     let catalog = ensure_catalog(store).await?;
+    let capability_id = if arguments.user {
+        "user-api-tokens-delete-token"
+    } else {
+        "account-api-tokens-delete-token"
+    };
     let capability = catalog
-        .get("account-api-tokens-delete-token")
+        .get(capability_id)
         .cloned()
-        .ok_or_else(|| capability_missing("account-api-tokens-delete-token"))?;
+        .ok_or_else(|| capability_missing(capability_id))?;
     create_plan(
         store,
         &catalog,
         capability,
         CallInput {
-            selectors: json!({"account_id": account, "token_id": arguments.id}),
+            selectors: if arguments.user {
+                json!({"token_id": arguments.id})
+            } else {
+                json!({"account_id": account, "token_id": arguments.id})
+            },
             query: json!({}),
             body: None,
             ..CallInput::default()
@@ -7011,12 +7086,9 @@ fn stage_required(stage: cfctl_core::GuideStage, capability: &cfctl_core::Capabi
 fn guide_document(capability: &CapabilityV1) -> Value {
     let blocking_gaps = capability.mutation_contract_gaps();
     let post_resolution_call_argv = capability_call_argv(capability);
-    let contract_ready = capability.adapter_status != AdapterStatus::Blocked
-        && blocking_gaps.is_empty()
-        && post_resolution_call_argv.is_some();
-    let call_argv = contract_ready
-        .then(|| post_resolution_call_argv.clone())
-        .flatten();
+    let contract_ready =
+        capability.adapter_status != AdapterStatus::Blocked && blocking_gaps.is_empty();
+    let call_argv = contract_ready.then(|| post_resolution_call_argv.clone());
     let stages = guide_stages()
         .iter()
         .enumerate()
@@ -7027,7 +7099,7 @@ fn guide_document(capability: &CapabilityV1) -> Value {
                 capability,
                 contract_ready,
                 &blocking_gaps,
-                post_resolution_call_argv.as_deref(),
+                Some(&post_resolution_call_argv),
             )
         })
         .collect::<Vec<_>>();
@@ -7042,35 +7114,33 @@ fn guide_document(capability: &CapabilityV1) -> Value {
         "next_action": guide_next_action(
             capability,
             contract_ready,
-            post_resolution_call_argv.as_deref(),
+            Some(&post_resolution_call_argv),
         ),
         "stages": stages,
     })
 }
 
-fn capability_call_argv(capability: &CapabilityV1) -> Option<Vec<String>> {
-    if capability.id == "user-api-tokens-create-token" {
-        return None;
-    }
-    if capability.id == "account-api-tokens-create-token" {
-        return Some(
-            [
-                "cfctl",
-                "keys",
-                "mint",
-                "--name",
-                "<token-name>",
-                "--permission",
-                "<permission-group-id>",
-                "--account",
-                "<account_id>",
-                "--value-out",
-                "<new-mode-0600-path>",
-                "--json",
-            ]
-            .map(str::to_owned)
-            .to_vec(),
-        );
+fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
+    if matches!(
+        capability.id.as_str(),
+        "account-api-tokens-create-token" | "user-api-tokens-create-token"
+    ) {
+        let mut argv = vec!["cfctl", "keys", "mint"];
+        if capability.id == "user-api-tokens-create-token" {
+            argv.push("--user");
+        }
+        argv.extend([
+            "--name",
+            "<token-name>",
+            "--permission",
+            "<permission-group-id>",
+            "--account",
+            "<account_id>",
+            "--value-out",
+            "<new-mode-0600-path>",
+            "--json",
+        ]);
+        return argv.into_iter().map(str::to_owned).collect();
     }
 
     let mut argv = vec!["cfctl".to_owned(), "call".to_owned(), capability.id.clone()];
@@ -7101,7 +7171,7 @@ fn capability_call_argv(capability: &CapabilityV1) -> Option<Vec<String>> {
         argv.extend(["--value-out".to_owned(), sink.to_owned()]);
     }
     argv.push("--json".to_owned());
-    Some(argv)
+    argv
 }
 
 fn capability_has_meaningful_request_body(capability: &CapabilityV1) -> bool {
@@ -7739,6 +7809,19 @@ fn catalog_show_argv(capability_id: &str) -> Vec<String> {
     ]
 }
 
+fn reject_implicit_global_key_selection(
+    profile: &ProfileMetadata,
+    requested_profile: Option<&str>,
+) -> Result<()> {
+    if profile.kind == ProfileKind::GlobalKey && requested_profile.is_none() {
+        return Err(CliError::Input(
+            "the emergency global-key profile is never selected implicitly; pass `--profile` explicitly"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn preflight_secret_sink(plan: &PlanV1) -> Result<()> {
     if !is_secret_output_plan(plan) {
         return Ok(());
@@ -8085,7 +8168,7 @@ mod tests {
         compensation_request, find_secret_value, guide_document, is_live_plan_precondition_hash,
         is_secret_output_capability, non_readback_verification_basis, persist_prepared_plan,
         persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
-        query_object_from_pairs, redact_secret_result,
+        query_object_from_pairs, redact_secret_result, reject_implicit_global_key_selection,
         required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -11279,6 +11362,83 @@ mod tests {
     }
 
     #[test]
+    fn user_token_creation_requires_its_own_inventory_and_account_compatible_groups() {
+        let user_capability = CapabilityV1::new(
+            "user-api-tokens-create-token",
+            "Create user-owned token",
+            "POST",
+            "/user/tokens",
+        );
+        let groups = json!([{
+            "id": "group-a",
+            "name": "Workers Scripts Write",
+            "scopes": ["com.cloudflare.api.account"]
+        }]);
+        let groups_hash = hash_value(&groups).expect("group hash");
+        let user_adapter = json!({
+            "permission_inventory": {
+                "source_capability_id": "permission-groups-list-permission-groups",
+                "selected_groups": groups,
+                "selected_groups_hash": groups_hash,
+                "evidence_hashes": [format!("sha256:{}", "b".repeat(64))]
+            }
+        });
+        let input = CallInput {
+            selectors: json!({}),
+            query: json!({}),
+            body: Some(json!({
+                "name":"least-privilege user token",
+                "policies":[{
+                    "effect":"allow",
+                    "permission_groups":[{"id":"group-a"}],
+                    "resources":{"com.cloudflare.api.account.account-a":"*"}
+                }]
+            })),
+            ..CallInput::default()
+        };
+        validate_api_token_creation_contract(&user_capability, &input, &user_adapter, "account-a")
+            .expect("user-owned account-scoped token uses the user inventory");
+
+        let mut wrong_owner_inventory = user_adapter.clone();
+        wrong_owner_inventory["permission_inventory"]["source_capability_id"] =
+            json!("account-api-tokens-list-permission-groups");
+        let wrong_owner = validate_api_token_creation_contract(
+            &user_capability,
+            &input,
+            &wrong_owner_inventory,
+            "account-a",
+        )
+        .expect_err("user-owned token cannot borrow an account-owned permission inventory");
+        assert!(
+            wrong_owner
+                .to_string()
+                .contains("permission-groups-list-permission-groups")
+        );
+
+        let zone_only_groups = json!([{
+            "id": "group-a",
+            "name": "DNS Write",
+            "scopes": ["com.cloudflare.api.account.zone"]
+        }]);
+        let zone_only_adapter = json!({
+            "permission_inventory": {
+                "source_capability_id": "permission-groups-list-permission-groups",
+                "selected_groups": zone_only_groups,
+                "selected_groups_hash": hash_value(&zone_only_groups).expect("zone group hash"),
+                "evidence_hashes": [format!("sha256:{}", "c".repeat(64))]
+            }
+        });
+        let incompatible = validate_api_token_creation_contract(
+            &user_capability,
+            &input,
+            &zone_only_adapter,
+            "account-a",
+        )
+        .expect_err("zone-only permission cannot be attached to an account resource");
+        assert!(incompatible.to_string().contains("account resource scope"));
+    }
+
+    #[test]
     fn token_permission_precondition_rejects_renamed_or_rescoped_groups() {
         let selected = json!([{
             "id":"group-a",
@@ -11408,7 +11568,7 @@ mod tests {
             }
         }));
 
-        let queue_argv = capability_call_argv(&queue_update).expect("Queue call argv");
+        let queue_argv = capability_call_argv(&queue_update);
         assert!(queue_argv.iter().any(|argument| argument == "--body-stdin"));
 
         let mut empty_object = CapabilityV1::new(
@@ -11422,7 +11582,7 @@ mod tests {
             "x-cfctl-body-required":false,
             "properties":{}
         }));
-        let empty_argv = capability_call_argv(&empty_object).expect("empty object call argv");
+        let empty_argv = capability_call_argv(&empty_object);
         assert!(!empty_argv.iter().any(|argument| argument == "--body-stdin"));
 
         for request_schema in [
@@ -11436,7 +11596,7 @@ mod tests {
                 "/accounts/{account_id}/widgets/import",
             );
             capability.request_schema = Some(request_schema);
-            let argv = capability_call_argv(&capability).expect("non-object call argv");
+            let argv = capability_call_argv(&capability);
             assert!(argv.iter().any(|argument| argument == "--body-stdin"));
         }
     }
@@ -11520,16 +11680,45 @@ mod tests {
         assert_ne!(account_guide["call_argv"][1], "call");
 
         account_token.id = "user-api-tokens-create-token".to_owned();
-        account_token.adapter_status = AdapterStatus::Blocked;
-        account_token.blocked_reason = Some(
-            "user-token minting is blocked until a dedicated live permission inventory workflow is implemented"
-                .to_owned(),
-        );
         let user_guide = guide_document(&account_token);
-        assert_eq!(user_guide["contract_state"], "blocked");
-        assert!(user_guide["call_argv"].is_null());
-        assert_eq!(user_guide["next_action"]["argv"][1], "keys");
-        assert_eq!(user_guide["next_action"]["argv"][2], "permissions");
+        assert_eq!(user_guide["contract_state"], "available");
+        assert_eq!(
+            user_guide["call_argv"],
+            json!([
+                "cfctl",
+                "keys",
+                "mint",
+                "--user",
+                "--name",
+                "<token-name>",
+                "--permission",
+                "<permission-group-id>",
+                "--account",
+                "<account_id>",
+                "--value-out",
+                "<new-mode-0600-path>",
+                "--json"
+            ])
+        );
+    }
+
+    #[test]
+    fn emergency_global_key_is_never_selected_without_an_explicit_profile_flag() {
+        let emergency = ProfileMetadata::new("emergency", ProfileKind::GlobalKey, None);
+        let oauth = ProfileMetadata::new("work", ProfileKind::OAuth, Some("account-a"));
+
+        let blocked = reject_implicit_global_key_selection(&emergency, None)
+            .expect_err("implicit global-key selection must fail closed");
+        assert!(
+            blocked
+                .to_string()
+                .contains("never selected implicitly"),
+            "{blocked}"
+        );
+        reject_implicit_global_key_selection(&emergency, Some("emergency"))
+            .expect("explicit --profile may use the emergency lane");
+        reject_implicit_global_key_selection(&oauth, None)
+            .expect("non-emergency profiles remain selectable as current");
     }
 
     #[test]
@@ -11669,7 +11858,6 @@ mod tests {
         assert!(!payload.to_string().contains("deployment automation"));
         assert_eq!(
             capability_call_argv(&plan.capability)
-                .expect("service-token call")
                 .iter()
                 .find(|argument| argument.contains("0600"))
                 .map(String::as_str),
@@ -11684,7 +11872,6 @@ mod tests {
         );
         assert_eq!(
             capability_call_argv(&risk_metadata_drift)
-                .expect("service-token call despite risk metadata drift")
                 .iter()
                 .find(|argument| argument.contains("0600"))
                 .map(String::as_str),
@@ -11755,7 +11942,6 @@ mod tests {
         );
         assert_eq!(
             capability_call_argv(&plan.capability)
-                .expect("zone service-token call")
                 .iter()
                 .find(|argument| argument.contains("0600"))
                 .map(String::as_str),

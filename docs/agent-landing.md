@@ -44,10 +44,11 @@ Each stage names its contract state, evidence class, and machine-safe argv
 arrays. `call_argv` is present only when the catalog contract is executable;
 blocked capabilities instead expose exact `blocking_gaps`, a safe next action,
 and, when a safe execution surface exists, a non-runnable
-`post_resolution_call_argv` template. Account API-token creation is routed
-through `keys mint`, which refreshes and binds the live permission-group
-inventory. User-token creation remains blocked and exposes no execution
-template until it has an equivalent inventory-bound workflow.
+`post_resolution_call_argv` template. Account and user API-token creation are
+routed through `keys mint`, which refreshes and binds the matching live
+permission-group inventory. User-owned creation is explicit
+(`--user --account <id>`) and remains limited to one exact account resource;
+generated guidance never offers arbitrary or wildcard token policies.
 
 Turnstile widget creation writes the returned secret only to an explicit new
 mode-0600 sink, proves the returned sitekey through an exact detail read, and

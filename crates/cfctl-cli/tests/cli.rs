@@ -81,6 +81,72 @@ fn approval_requires_the_exact_plan_id_and_explicit_yes_flag() {
     assert_eq!(approval.operation_id, "op-123");
     assert!(approval.yes);
     assert_eq!(approval.max_cost.as_deref(), Some("USD:10.00"));
+
+    let without_yes = Cli::try_parse_from(["cfctl", "plans", "approve", "op-123"])
+        .expect("approve without --yes still parses as a draft gate request");
+    let Some(Command::Plans(arguments)) = without_yes.command else {
+        panic!("plans command");
+    };
+    let cfctl_cli::PlansCommand::Approve(approval) = arguments.command else {
+        panic!("approve command");
+    };
+    assert_eq!(approval.operation_id, "op-123");
+    assert!(
+        !approval.yes,
+        "chat/intent alone must not set the approval flag; only --yes grants authority"
+    );
+}
+
+#[test]
+fn user_owned_key_lifecycle_requires_an_explicit_owner_flag_and_account_context() {
+    let parsed = Cli::try_parse_from([
+        "cfctl",
+        "keys",
+        "mint",
+        "--user",
+        "--name",
+        "deployment",
+        "--permission",
+        "group-id",
+        "--account",
+        "account-id",
+        "--value-out",
+        "/tmp/new-token",
+    ])
+    .expect("user-owned mint parses");
+    let Some(Command::Keys(arguments)) = parsed.command else {
+        panic!("keys command");
+    };
+    let cfctl_cli::KeysCommand::Mint(mint) = arguments.command else {
+        panic!("mint command");
+    };
+    assert!(mint.user);
+    assert_eq!(mint.account.as_deref(), Some("account-id"));
+
+    for action in ["rotate", "revoke"] {
+        let mut arguments = vec![
+            "cfctl",
+            "keys",
+            action,
+            "--user",
+            "--id",
+            "token-id",
+            "--account",
+            "account-id",
+        ];
+        if action == "rotate" {
+            arguments.extend(["--value-out", "/tmp/rotated-token"]);
+        }
+        let parsed = Cli::try_parse_from(arguments).expect("user-owned lifecycle parses");
+        let Some(Command::Keys(arguments)) = parsed.command else {
+            panic!("keys command");
+        };
+        match arguments.command {
+            cfctl_cli::KeysCommand::Rotate(rotate) => assert!(rotate.user),
+            cfctl_cli::KeysCommand::Revoke(revoke) => assert!(revoke.user),
+            _ => panic!("unexpected key command"),
+        }
+    }
 }
 
 #[test]
