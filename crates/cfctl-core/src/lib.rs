@@ -603,13 +603,20 @@ impl CapabilityV1 {
 
     /// Returns the canonical top-level request fields that a response
     /// readback can observe. Fully write-only inputs remain valid request
-    /// fields but are deliberately absent from this list.
+    /// fields but are deliberately absent from this list. A schema with
+    /// `properties` and no explicit type is object-shaped for this purpose;
+    /// any explicit non-object type remains ineligible.
     #[must_use]
     pub fn verifiable_request_object_fields(&self) -> Option<Vec<String>> {
-        let mut fields = self
-            .request_schema
-            .as_ref()
-            .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))?
+        let schema = self.request_schema.as_ref()?;
+        if schema
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|value_type| value_type != "object")
+        {
+            return None;
+        }
+        let mut fields = schema
             .get("properties")?
             .as_object()?
             .iter()

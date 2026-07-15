@@ -1401,10 +1401,17 @@ fn safe_omitted_readback_projection(capability: &CapabilityV1, selector: &Select
 }
 
 fn canonical_request_object_fields(capability: &CapabilityV1) -> Option<Vec<String>> {
-    let mut fields = capability
-        .request_schema
-        .as_ref()
-        .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))?
+    let schema = capability.request_schema.as_ref()?;
+    // OpenAPI permits `properties` without a redundant `type: object`. The
+    // verifier still requires an object body and rejects explicit non-objects.
+    if schema
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value_type| value_type != "object")
+    {
+        return None;
+    }
+    let mut fields = schema
         .get("properties")?
         .as_object()?
         .keys()

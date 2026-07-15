@@ -2244,6 +2244,12 @@ async fn exact_resource_update_is_verified_by_same_path_planned_fields() {
             "settings":{"enabled":true,"mode":"strict"}
         })),
     );
+    plan.capability
+        .request_schema
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .expect("request schema")
+        .remove("type");
     plan.capability.product = "R2 Object".to_owned();
     plan.capability.selectors.push(SelectorV1 {
         name: "cf-r2-jurisdiction".to_owned(),

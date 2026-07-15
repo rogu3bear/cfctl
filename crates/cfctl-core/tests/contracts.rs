@@ -244,6 +244,17 @@ fn same_path_read_contracts_require_hash_bound_canonical_fields() {
     assert!(update.verification_contract_supported());
 
     update
+        .request_schema
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("request schema")
+        .remove("type");
+    assert!(update.verification_contract_supported());
+    update.request_schema.as_mut().expect("request schema")["type"] = json!("string");
+    assert!(!update.verification_contract_supported());
+    update.request_schema.as_mut().expect("request schema")["type"] = json!("object");
+
+    update
         .same_path_read
         .as_mut()
         .expect("same-path contract")

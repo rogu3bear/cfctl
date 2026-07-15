@@ -1701,6 +1701,39 @@ fn exact_resource_updates_pair_with_same_path_field_readback_contracts() {
 }
 
 #[test]
+fn update_contract_accepts_properties_without_an_explicit_object_type() {
+    let mut implicit_object = exact_resource_update_fixture();
+    implicit_object["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["patch"]["requestBody"]
+        ["content"]["application/json"]["schema"]
+        .as_object_mut()
+        .expect("patch request schema")
+        .remove("type");
+    let implicit_snapshot =
+        normalize_openapi(&implicit_object).expect("implicit-object update catalog");
+    assert_eq!(
+        implicit_snapshot
+            .get("widgets-patch")
+            .expect("implicit-object patch")
+            .verification
+            .strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+
+    implicit_object["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["patch"]["requestBody"]
+        ["content"]["application/json"]["schema"]["type"] = json!("string");
+    let non_object_snapshot =
+        normalize_openapi(&implicit_object).expect("explicit non-object update catalog");
+    assert_ne!(
+        non_object_snapshot
+            .get("widgets-patch")
+            .expect("non-object patch")
+            .verification
+            .strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+}
+
+#[test]
 fn same_path_object_updates_require_schema_proven_readback_fields() {
     let document = json!({
         "openapi":"3.0.3",
@@ -1907,6 +1940,23 @@ fn create_contract_binds_a_schema_proven_id_and_exact_read_delete_pair() {
     assert_eq!(target.read_capability_id, "widgets-get");
     assert_eq!(target.delete_capability_id, "widgets-delete");
     assert_eq!(target.verified_response_fields, vec!["name"]);
+
+    let mut implicit_object = document;
+    implicit_object["paths"]["/accounts/{account_id}/widgets"]["post"]["requestBody"]
+        ["content"]["application/json"]["schema"]
+        .as_object_mut()
+        .expect("create request schema")
+        .remove("type");
+    let implicit_snapshot =
+        normalize_openapi(&implicit_object).expect("implicit-object create catalog");
+    assert_eq!(
+        implicit_snapshot
+            .get("widgets-create")
+            .expect("implicit-object create")
+            .verification
+            .strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
 }
 
 #[test]
