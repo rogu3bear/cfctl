@@ -192,6 +192,76 @@ fn unchecked_request_validates_required_body_shape_from_pinned_schema() {
     assert!(builder.build_unchecked(&capability, &valid).is_ok());
 }
 
+#[test]
+fn unchecked_request_validates_nested_required_fields_and_enums() {
+    let mut capability =
+        CapabilityV1::new("d1-update", "Update D1 database", "PATCH", "/database/id");
+    capability.request_schema = Some(json!({
+        "type": "object",
+        "properties": {
+            "read_replication": {
+                "type": "object",
+                "required": ["mode"],
+                "properties": {
+                    "mode": {"type": "string", "enum": ["auto", "disabled"]}
+                }
+            }
+        }
+    }));
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+
+    for body in [
+        json!({"read_replication": {}}),
+        json!({"read_replication": {"mode": "experimental"}}),
+        json!({"read_replication": {"mode": "auto", "surprise": true}}),
+    ] {
+        let error = builder
+            .build_unchecked(
+                &capability,
+                &CallInput {
+                    body: Some(body),
+                    ..CallInput::default()
+                },
+            )
+            .expect_err("invalid nested body must fail before network execution");
+        assert!(matches!(error, CloudflareError::InvalidRequestBody(_)));
+    }
+
+    for mode in ["auto", "disabled"] {
+        let input = CallInput {
+            body: Some(json!({"read_replication": {"mode": mode}})),
+            ..CallInput::default()
+        };
+        assert!(builder.build_unchecked(&capability, &input).is_ok());
+    }
+}
+
+#[test]
+fn unchecked_request_validates_nested_array_item_enums() {
+    let mut capability = CapabilityV1::new("route-update", "Update routes", "PATCH", "/routes");
+    capability.request_schema = Some(json!({
+        "type": "object",
+        "properties": {
+            "modes": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["active", "passive"]}
+            }
+        }
+    }));
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    let invalid = CallInput {
+        body: Some(json!({"modes": ["active", "experimental"]})),
+        ..CallInput::default()
+    };
+    assert!(builder.build_unchecked(&capability, &invalid).is_err());
+
+    let valid = CallInput {
+        body: Some(json!({"modes": ["active", "passive"]})),
+        ..CallInput::default()
+    };
+    assert!(builder.build_unchecked(&capability, &valid).is_ok());
+}
+
 #[tokio::test]
 async fn executor_retries_rate_limits_and_applies_only_the_selected_credential() {
     let listener = TcpListener::bind("127.0.0.1:0")

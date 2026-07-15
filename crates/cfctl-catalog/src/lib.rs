@@ -1681,32 +1681,12 @@ pub async fn fetch_official(client: &reqwest::Client) -> Result<CatalogSnapshot>
 
 fn request_schema_contract(document: &Value, operation: &Value) -> Option<Value> {
     let schema = operation.pointer("/requestBody/content/application~1json/schema")?;
-    let resolved = resolve_local_schema(document, schema);
-    let mut contract = Map::new();
-    for key in ["type", "required", "enum", "additionalProperties"] {
-        if let Some(value) = resolved.get(key) {
-            contract.insert(key.to_owned(), value.clone());
-        }
-    }
-    if let Some(properties) = resolved.get("properties").and_then(Value::as_object) {
-        let properties = properties
-            .iter()
-            .map(|(name, property)| {
-                let property = resolve_local_schema(document, property);
-                let shape = ["type", "enum", "format", "nullable"]
-                    .into_iter()
-                    .filter_map(|key| {
-                        property
-                            .get(key)
-                            .cloned()
-                            .map(|value| (key.to_owned(), value))
-                    })
-                    .collect();
-                (name.clone(), Value::Object(shape))
-            })
-            .collect();
-        contract.insert("properties".to_owned(), Value::Object(properties));
-    }
+    let mut active_references = BTreeSet::new();
+    let mut contract =
+        normalize_request_schema_contract(document, schema, 0, &mut active_references)
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
     contract.insert(
         "x-cfctl-body-required".to_owned(),
         operation
@@ -1715,6 +1695,78 @@ fn request_schema_contract(document: &Value, operation: &Value) -> Option<Value>
             .unwrap_or(Value::Bool(false)),
     );
     Some(Value::Object(contract))
+}
+
+const MAX_REQUEST_SCHEMA_CONTRACT_DEPTH: usize = 16;
+
+fn normalize_request_schema_contract(
+    document: &Value,
+    schema: &Value,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> Value {
+    let reference = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .filter(|reference| reference.starts_with("#/"));
+    let inserted_reference =
+        reference.is_some_and(|reference| active_references.insert(reference.to_owned()));
+    if reference.is_some() && !inserted_reference {
+        return Value::Object(Map::new());
+    }
+    let resolved = resolve_local_schema(document, schema);
+    let mut contract = Map::new();
+    for key in ["type", "required", "enum", "format", "nullable"] {
+        if let Some(value) = resolved.get(key) {
+            contract.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(additional) = resolved.get("additionalProperties") {
+        let additional = if additional.is_object() {
+            if depth < MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
+                normalize_request_schema_contract(
+                    document,
+                    additional,
+                    depth + 1,
+                    active_references,
+                )
+            } else {
+                Value::Object(Map::new())
+            }
+        } else {
+            additional.clone()
+        };
+        contract.insert("additionalProperties".to_owned(), additional);
+    }
+    if depth < MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
+        if let Some(properties) = resolved.get("properties").and_then(Value::as_object) {
+            let properties = properties
+                .iter()
+                .map(|(name, property)| {
+                    (
+                        name.clone(),
+                        normalize_request_schema_contract(
+                            document,
+                            property,
+                            depth + 1,
+                            active_references,
+                        ),
+                    )
+                })
+                .collect();
+            contract.insert("properties".to_owned(), Value::Object(properties));
+        }
+        if let Some(items) = resolved.get("items") {
+            contract.insert(
+                "items".to_owned(),
+                normalize_request_schema_contract(document, items, depth + 1, active_references),
+            );
+        }
+    }
+    if inserted_reference && let Some(reference) = reference {
+        active_references.remove(reference);
+    }
+    Value::Object(contract)
 }
 
 fn success_response_declares_result_string_id(document: &Value, operation: &Value) -> bool {
@@ -2397,6 +2449,29 @@ fn is_d1_read_replication_update(capability: &CapabilityV1) -> bool {
         && capability.permissions[0] == "D1 Write"
         && canonical_request_object_fields(capability)
             .is_some_and(|fields| fields.len() == 1 && fields[0] == "read_replication")
+        && d1_read_replication_request_contract_supported(capability)
+}
+
+fn d1_read_replication_request_contract_supported(capability: &CapabilityV1) -> bool {
+    let Some(replication) = capability
+        .request_schema
+        .as_ref()
+        .and_then(|schema| schema.get("properties"))
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get("read_replication"))
+    else {
+        return false;
+    };
+    let properties = replication.get("properties").and_then(Value::as_object);
+    replication.get("type").and_then(Value::as_str) == Some("object")
+        && replication.get("required") == Some(&serde_json::json!(["mode"]))
+        && properties.is_some_and(|properties| {
+            properties.len() == 1
+                && properties.get("mode").is_some_and(|mode| {
+                    mode.get("type").and_then(Value::as_str) == Some("string")
+                        && mode.get("enum") == Some(&serde_json::json!(["auto", "disabled"]))
+                })
+        })
 }
 
 fn classify_d1_read_replication_update(capability: &mut CapabilityV1) {

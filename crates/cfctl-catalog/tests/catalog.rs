@@ -6,8 +6,8 @@ use cfctl_catalog::{
     normalize_openapi,
 };
 use cfctl_core::{
-    AdapterStatus, BillingModelV1, CostExposureV1, DeletedResourceContractV1, EffectClass,
-    KnowledgeReferenceV1, RiskClass, hash_value,
+    AdapterStatus, BillingModelV1, CapabilityV1, CostExposureV1, DeletedResourceContractV1,
+    EffectClass, KnowledgeReferenceV1, RiskClass, hash_value,
 };
 use chrono::Utc;
 use serde_json::json;
@@ -56,6 +56,28 @@ fn official_docs_indexes_expose_product_and_page_links_deterministically() {
     );
 }
 
+fn assert_nested_replication_schema(schema: &serde_json::Value) {
+    assert_eq!(schema["properties"]["replication"]["type"], "object");
+    assert_eq!(
+        schema["properties"]["replication"]["required"],
+        json!(["mode"])
+    );
+    assert_eq!(
+        schema["properties"]["replication"]["properties"]["mode"]["enum"],
+        json!(["auto", "disabled"])
+    );
+    assert!(
+        schema["properties"]["replication"]
+            .get("description")
+            .is_none()
+    );
+    assert!(
+        schema["properties"]["replication"]["properties"]["mode"]
+            .get("description")
+            .is_none()
+    );
+}
+
 #[test]
 fn request_contract_resolves_local_schema_without_copying_secret_values() {
     let mut document = fixture();
@@ -64,12 +86,25 @@ fn request_contract_resolves_local_schema_without_copying_secret_values() {
         "description": "jurisdiction selector"
     });
     document["components"]["schemas"]["DeployFlag"] = json!({"type": "boolean"});
+    document["components"]["schemas"]["Replication"] = json!({
+        "type": "object",
+        "required": ["mode"],
+        "description": "replication configuration",
+        "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["auto", "disabled"],
+                "description": "replication mode"
+            }
+        }
+    });
     document["components"]["schemas"]["CreateRecord"] = json!({
         "type": "object",
         "required": ["name"],
         "properties": {
             "name": {"type": "string", "description": "record name"},
-            "ttl": {"type": "integer"}
+            "ttl": {"type": "integer"},
+            "replication": {"$ref": "#/components/schemas/Replication"}
         }
     });
     document["paths"]["/zones/{zone_id}/dns_records"]["post"] = json!({
@@ -111,6 +146,7 @@ fn request_contract_resolves_local_schema_without_copying_secret_values() {
     assert_eq!(schema["type"], "object");
     assert_eq!(schema["x-cfctl-body-required"], true);
     assert_eq!(schema["properties"]["ttl"]["type"], "integer");
+    assert_nested_replication_schema(schema);
     assert!(schema["properties"]["name"].get("description").is_none());
 
     let capability = snapshot
@@ -142,6 +178,33 @@ fn request_contract_resolves_local_schema_without_copying_secret_values() {
         .expect("ambiguous selector");
     assert_eq!(ambiguous.value_type, "unknown");
     assert!(ambiguous.description.is_none());
+}
+
+#[test]
+fn recursive_request_schema_contract_stops_at_the_active_reference() {
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "components": {"schemas": {"Node": {
+            "type": "object",
+            "properties": {"next": {"$ref": "#/components/schemas/Node"}}
+        }}},
+        "paths": {"/accounts/{account_id}/nodes": {"post": {
+            "operationId": "nodes-create",
+            "summary": "Create node",
+            "tags": ["Nodes"],
+            "requestBody": {"content": {"application/json": {"schema": {
+                "$ref": "#/components/schemas/Node"
+            }}}}
+        }}}
+    });
+    let snapshot = normalize_openapi(&document).expect("recursive catalog");
+    let schema = snapshot
+        .get("nodes-create")
+        .and_then(|capability| capability.request_schema.as_ref())
+        .expect("bounded recursive contract");
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["properties"]["next"], json!({}));
 }
 
 #[test]
@@ -909,11 +972,41 @@ fn exact_resource_deletes_reject_broadening_inputs_and_required_read_controls() 
     );
 }
 
+fn assert_d1_update_contract(update: &CapabilityV1) {
+    assert_eq!(
+        update.verification.strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+    assert_eq!(update.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(update.risk, RiskClass::ScopedWrite);
+    assert_eq!(update.effect, EffectClass::ReversibleWrite);
+    assert_eq!(update.cost.maximum, Some(0.0));
+    assert_eq!(update.cost.references.len(), 2);
+    assert!(
+        update
+            .cost
+            .basis
+            .as_deref()
+            .is_some_and(|basis| basis.contains("no incremental operation or replica charge"))
+    );
+    assert!(!update.rollback.supported);
+    assert_eq!(
+        update.request_schema.as_ref().expect("request schema")["properties"]["read_replication"]["properties"]
+            ["mode"]["enum"],
+        json!(["auto", "disabled"])
+    );
+}
+
 #[test]
 fn d1_database_readback_omits_only_the_documented_fields_projection() {
     let document = json!({
         "openapi": "3.0.3",
         "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "components": {"schemas": {"D1ReadReplication": {
+            "type": "object",
+            "required": ["mode"],
+            "properties": {"mode": {"type": "string", "enum": ["auto", "disabled"]}}
+        }}},
         "paths": {
             "/accounts/{account_id}/d1/database/{database_id}": {
                 "parameters": [
@@ -943,7 +1036,9 @@ fn d1_database_readback_omits_only_the_documented_fields_projection() {
                     "tags":["D1"],
                     "x-api-token-group":["D1 Write"],
                     "requestBody":{"content":{"application/json":{"schema":{
-                        "type":"object","properties":{"read_replication":{"type":"object"}}
+                        "type":"object","properties":{"read_replication":{
+                            "$ref":"#/components/schemas/D1ReadReplication"
+                        }}
                     }}}}
                 },
                 "delete": {
@@ -968,23 +1063,19 @@ fn d1_database_readback_omits_only_the_documented_fields_projection() {
     let update = snapshot
         .get("d1-update-partial-database")
         .expect("update D1 database");
+    assert_d1_update_contract(update);
+
+    let mut drifted_mode = document.clone();
+    drifted_mode["components"]["schemas"]["D1ReadReplication"]["properties"]["mode"]["enum"] =
+        json!(["auto", "disabled", "experimental"]);
+    let drifted_snapshot = normalize_openapi(&drifted_mode).expect("drifted D1 catalog");
     assert_eq!(
-        update.verification.strategy,
-        "same_resource_contains_planned_fields_after_update"
+        drifted_snapshot
+            .get("d1-update-partial-database")
+            .expect("drifted update")
+            .adapter_status,
+        AdapterStatus::Blocked
     );
-    assert_eq!(update.adapter_status, AdapterStatus::DynamicApi);
-    assert_eq!(update.risk, RiskClass::ScopedWrite);
-    assert_eq!(update.effect, EffectClass::ReversibleWrite);
-    assert_eq!(update.cost.maximum, Some(0.0));
-    assert_eq!(update.cost.references.len(), 2);
-    assert!(
-        update
-            .cost
-            .basis
-            .as_deref()
-            .is_some_and(|basis| basis.contains("no incremental operation or replica charge"))
-    );
-    assert!(!update.rollback.supported);
 
     let mut unrelated = document;
     unrelated["paths"]["/accounts/{account_id}/d1/database/{database_id}"]["get"]["tags"] =

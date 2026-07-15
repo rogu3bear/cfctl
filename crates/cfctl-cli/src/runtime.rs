@@ -25,6 +25,7 @@ use cfctl_catalog::{
 };
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, Executor, OperationVerificationV1,
+    validate_request_contract,
 };
 use cfctl_core::{
     AdapterStatus, CapabilityV1, ErrorV1, EvidenceClass, EvidenceV1, MoneyV1, PlanStatus, PlanV1,
@@ -538,6 +539,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         ));
     }
     let mut prepared = call_input(&arguments)?;
+    preflight_call_input(&capability, &prepared.input, prepared.secret_body.as_ref())?;
     if !capability.mutating {
         if prepared.secret_body.is_some() {
             return Err(CliError::Input(
@@ -591,6 +593,19 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         secrets.delete(&reference)?;
     }
     result
+}
+
+fn preflight_call_input(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    secret_body: Option<&Value>,
+) -> Result<()> {
+    let mut resolved = input.clone();
+    if let Some(secret_body) = secret_body {
+        resolved.body = Some(secret_body.clone());
+    }
+    validate_request_contract(capability, &resolved)?;
+    Ok(())
 }
 
 async fn execute_read(
@@ -4496,12 +4511,12 @@ mod tests {
     use super::{
         CallInput, apply_zone_account_response, apply_zone_entitlement_response,
         compensation_request, find_secret_value, guide_document, persist_secret_lifecycle,
-        preserve_previous_catalog, redact_secret_result, required_entitlement_precondition,
-        required_zone_account_precondition, should_bind_zone_account,
-        should_resolve_zone_entitlement, sink_secret_result, validate_api_token_creation_contract,
-        validate_current_permission_groups, validate_entitlement_receipt_precondition,
-        validate_selected_permission_groups, validate_zone_account_receipt_precondition,
-        zone_target,
+        preflight_call_input, preserve_previous_catalog, redact_secret_result,
+        required_entitlement_precondition, required_zone_account_precondition,
+        should_bind_zone_account, should_resolve_zone_entitlement, sink_secret_result,
+        validate_api_token_creation_contract, validate_current_permission_groups,
+        validate_entitlement_receipt_precondition, validate_selected_permission_groups,
+        validate_zone_account_receipt_precondition, zone_target,
     };
     use cfctl_auth::{AuthError, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
@@ -4568,6 +4583,33 @@ mod tests {
                 .expect("last valid previous catalog remains"),
             catalog
         );
+    }
+
+    #[test]
+    fn call_preflight_rejects_nested_contract_drift_before_planning() {
+        let mut capability =
+            CapabilityV1::new("d1-update", "Update database", "PATCH", "/databases/id");
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "x-cfctl-body-required":true,
+            "properties":{"read_replication":{
+                "type":"object",
+                "required":["mode"],
+                "properties":{"mode":{"type":"string","enum":["auto","disabled"]}}
+            }}
+        }));
+        let input = CallInput {
+            body: Some(json!({"read_replication":{"mode":"experimental"}})),
+            ..CallInput::default()
+        };
+
+        let error = preflight_call_input(&capability, &input, None)
+            .expect_err("invalid nested body must fail before planning");
+        assert!(error.to_string().contains("pinned enum"));
+
+        let secret_body = json!({"read_replication":{"mode":"auto"}});
+        preflight_call_input(&capability, &CallInput::default(), Some(&secret_body))
+            .expect("secret body must be validated before it is replaced by an opaque reference");
     }
 
     #[test]

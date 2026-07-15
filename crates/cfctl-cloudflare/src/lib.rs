@@ -98,7 +98,7 @@ impl RequestBuilder {
         capability: &CapabilityV1,
         input: &CallInput,
     ) -> Result<PreparedRequest> {
-        validate_request_body(capability, input.body.as_ref())?;
+        validate_request_contract(capability, input)?;
         let mut url = self.base_url.clone();
         let selectors = input.selectors.as_object();
         {
@@ -1815,6 +1815,10 @@ fn is_delete_verifier(strategy: &str) -> bool {
     )
 }
 
+pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    validate_request_body(capability, input.body.as_ref())
+}
+
 fn validate_request_body(capability: &CapabilityV1, body: Option<&Value>) -> Result<()> {
     let Some(schema) = capability.request_schema.as_ref() else {
         return Ok(());
@@ -1830,16 +1834,74 @@ fn validate_request_body(capability: &CapabilityV1, body: Option<&Value>) -> Res
     let Some(body) = body else {
         return Ok(());
     };
-    if let Some(expected) = schema.get("type").and_then(Value::as_str)
-        && !json_type_matches(body, expected)
+    validate_request_schema_value(schema, body, "", 0)
+}
+
+const MAX_REQUEST_VALIDATION_DEPTH: usize = 64;
+
+fn validate_request_schema_value(
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    depth: usize,
+) -> Result<()> {
+    if depth > MAX_REQUEST_VALIDATION_DEPTH {
+        return Err(CloudflareError::InvalidRequestBody(
+            "pinned schema exceeds the validation depth limit".to_owned(),
+        ));
+    }
+    if value.is_null()
+        && (schema.get("nullable").and_then(Value::as_bool) == Some(true)
+            || schema
+                .get("enum")
+                .and_then(Value::as_array)
+                .is_some_and(|values| values.contains(value)))
     {
+        return Ok(());
+    }
+    if let Some(expected) = schema.get("type").and_then(Value::as_str)
+        && !json_type_matches(value, expected)
+    {
+        let reason = if path.is_empty() {
+            format!("expected top-level {expected}")
+        } else {
+            format!("property `{path}` must be {expected}")
+        };
+        return Err(CloudflareError::InvalidRequestBody(reason));
+    }
+    if schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.contains(value))
+    {
+        let location = if path.is_empty() {
+            "top-level value".to_owned()
+        } else {
+            format!("property `{path}`")
+        };
         return Err(CloudflareError::InvalidRequestBody(format!(
-            "expected top-level {expected}"
+            "{location} is not one of the pinned enum values"
         )));
     }
-    let Some(object) = body.as_object() else {
-        return Ok(());
-    };
+    if let Some(object) = value.as_object() {
+        validate_request_object(schema, object, path, depth)?;
+    }
+    if let Some(array) = value.as_array()
+        && let Some(items) = schema.get("items")
+    {
+        for item in array {
+            validate_request_schema_value(items, item, path, depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_request_object(
+    schema: &Value,
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+    depth: usize,
+) -> Result<()> {
     for required in schema
         .get("required")
         .and_then(Value::as_array)
@@ -1849,28 +1911,59 @@ fn validate_request_body(capability: &CapabilityV1, body: Option<&Value>) -> Res
     {
         if !object.contains_key(required) {
             return Err(CloudflareError::InvalidRequestBody(format!(
-                "missing required property `{required}`"
+                "missing required property `{}`",
+                request_property_path(path, required)
             )));
         }
     }
-    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
-        return Ok(());
-    };
+    let properties = schema.get("properties").and_then(Value::as_object);
+    let additional = schema.get("additionalProperties");
     for (name, value) in object {
-        let Some(expected) = properties
-            .get(name)
-            .and_then(|property| property.get("type"))
-            .and_then(Value::as_str)
-        else {
+        if let Some(property) = properties.and_then(|properties| properties.get(name)) {
+            validate_request_schema_value(
+                property,
+                value,
+                &request_property_path(path, name),
+                depth + 1,
+            )?;
             continue;
-        };
-        if !json_type_matches(value, expected) {
-            return Err(CloudflareError::InvalidRequestBody(format!(
-                "property `{name}` must be {expected}"
-            )));
+        }
+        match additional {
+            Some(Value::Bool(false)) => {
+                let location = if path.is_empty() {
+                    "request body"
+                } else {
+                    path
+                };
+                return Err(CloudflareError::InvalidRequestBody(format!(
+                    "object at `{location}` contains a property disallowed by the pinned schema"
+                )));
+            }
+            Some(additional_schema) if additional_schema.is_object() => {
+                validate_request_schema_value(additional_schema, value, path, depth + 1)?;
+            }
+            None if properties.is_some_and(|properties| !properties.is_empty()) => {
+                let location = if path.is_empty() {
+                    "request body"
+                } else {
+                    path
+                };
+                return Err(CloudflareError::InvalidRequestBody(format!(
+                    "object at `{location}` contains a property outside the pinned contract"
+                )));
+            }
+            _ => {}
         }
     }
     Ok(())
+}
+
+fn request_property_path(parent: &str, property: &str) -> String {
+    if parent.is_empty() {
+        property.to_owned()
+    } else {
+        format!("{parent}.{property}")
+    }
 }
 
 fn json_type_matches(value: &Value, expected: &str) -> bool {
