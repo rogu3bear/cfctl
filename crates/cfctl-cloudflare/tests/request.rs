@@ -336,6 +336,59 @@ fn unchecked_request_enforces_scalar_and_collection_bounds() {
 }
 
 #[test]
+fn unchecked_request_enforces_executable_string_formats() {
+    let mut capability = CapabilityV1::new("formatted-create", "Create", "POST", "/formatted");
+    capability.request_schema = Some(json!({
+        "type": "object",
+        "required": ["timestamp", "hostname", "ipv4", "ipv6"],
+        "properties": {
+            "timestamp": {"type": "string", "format": "date-time"},
+            "hostname": {"type": "string", "format": "hostname"},
+            "ipv4": {"type": "string", "format": "ipv4"},
+            "ipv6": {"type": "string", "format": "ipv6"}
+        }
+    }));
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    let valid = CallInput {
+        body: Some(json!({
+            "timestamp": "2026-07-15T03:45:00-05:00",
+            "hostname": "service.example.com.",
+            "ipv4": "192.0.2.1",
+            "ipv6": "2001:db8::1"
+        })),
+        ..CallInput::default()
+    };
+    assert!(builder.build_unchecked(&capability, &valid).is_ok());
+    let mut root_hostname = valid.clone();
+    root_hostname.body.as_mut().expect("valid body")["hostname"] = json!(".");
+    assert!(builder.build_unchecked(&capability, &root_hostname).is_ok());
+
+    for (field, value) in [
+        ("timestamp", "2026-07-15 03:45:00"),
+        ("hostname", "_invalid.example.com"),
+        ("ipv4", "999.0.2.1"),
+        ("ipv6", "2001:db8::1::1"),
+    ] {
+        let mut body = valid.body.clone().expect("valid body");
+        body[field] = json!(value);
+        let error = builder
+            .build_unchecked(
+                &capability,
+                &CallInput {
+                    body: Some(body),
+                    ..CallInput::default()
+                },
+            )
+            .expect_err("invalid executable formats must fail before request construction");
+        assert!(matches!(
+            error,
+            CloudflareError::InvalidRequestBody(reason)
+                if reason.contains("pinned") && !reason.contains(value)
+        ));
+    }
+}
+
+#[test]
 fn unchecked_request_treats_equivalent_json_numbers_as_duplicate_items() {
     let mut capability = CapabilityV1::new("unique-create", "Create", "POST", "/unique");
     capability.request_schema = Some(json!({

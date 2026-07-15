@@ -10,6 +10,7 @@ repository.workspace = true
 cfctl-auth = { version = "2.0.0-alpha.1", path = "../cfctl-auth" }
 cfctl-core = { version = "2.0.0-alpha.1", path = "../cfctl-core" }
 async-trait.workspace = true
+chrono.workspace = true
 http.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -18,9 +19,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
-
-[dev-dependencies]
-chrono.workspace = true
 
 [lints]
 workspace = true

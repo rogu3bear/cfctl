@@ -1,9 +1,14 @@
 //! Typed Cloudflare request construction and governed execution.
 
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::BTreeSet,
+    net::{Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 
 use cfctl_auth::AuthCredential;
 use cfctl_core::{CapabilityV1, PlanStatus, PlanV1, SelectorV1};
+use chrono::DateTime;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1996,6 +2001,7 @@ fn validate_request_schema_bounds(
     if let Some(text) = value.as_str() {
         let length = usize_as_u64(text.chars().count());
         validate_length_bounds(schema, path, length, "characters", "minLength", "maxLength")?;
+        validate_string_format(schema, text, path)?;
     }
     if let Some(array) = value.as_array() {
         validate_length_bounds(
@@ -2030,6 +2036,47 @@ fn validate_request_schema_bounds(
         )?;
     }
     Ok(())
+}
+
+fn validate_string_format(schema: &Value, value: &str, path: &str) -> Result<()> {
+    let Some(format) = schema.get("format").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let valid = match format {
+        "date-time" => DateTime::parse_from_rfc3339(value).is_ok(),
+        "hostname" => is_valid_hostname(value),
+        "ipv4" => value.parse::<Ipv4Addr>().is_ok(),
+        "ipv6" => value.parse::<Ipv6Addr>().is_ok(),
+        _ => true,
+    };
+    if valid {
+        return Ok(());
+    }
+    invalid_request_bound(path, &format!("does not match the pinned {format} format"))
+}
+
+fn is_valid_hostname(value: &str) -> bool {
+    if value == "." {
+        return true;
+    }
+    let hostname = value.strip_suffix('.').unwrap_or(value);
+    !hostname.is_empty()
+        && hostname.len() <= 253
+        && hostname.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
 }
 
 fn validate_length_bounds(
