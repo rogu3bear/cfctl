@@ -19,6 +19,7 @@ Cloudflare.
    cfctl doctor
    cfctl catalog sync
    cfctl catalog coverage
+   cfctl agents doctor
    ```
 
 3. Discover and inspect the capability before acting:

@@ -350,12 +350,26 @@ fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
         .ok_or_else(|| {
             TaskError::InvalidSourceContract("xtask has no repository parent".to_owned())
         })?;
-    let active_guidance = [
+    // First-load agent doctrine must not re-teach archived v1 verbs or layout.
+    // Historical/migration docs (docs/v1-parity.md, NUANCE.md, state/*) are out of scope.
+    // Tracked public guidance is always required. Local strategy files are gitignored for
+    // public releases but, when present in a private checkout, must stay v2-aligned.
+    let required_guidance = [
+        "CFCTL_PROMPT.md",
+        "docs/agent-landing.md",
+        "skills/cfctl-operator/SKILL.md",
         "CONTRIBUTING.md",
         "SECURITY.md",
-        "skills/cfctl-operator/SKILL.md",
+    ];
+    let optional_local_guidance = [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "ANCHOR.md",
+        "NORTH_STAR.md",
+        "LAYERS.md",
     ];
     let stale_v1_guidance = [
+        // Archived public verbs / auth lanes
         "./scripts/",
         "--ack-plan",
         "CF_DEV_TOKEN",
@@ -363,21 +377,45 @@ fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
         "cfctl ownership",
         "cfctl skills",
         "cloudflare-api-mcp",
+        // Archived shell-runtime layout taught as live repo shape
         "lib/runtime/",
         "lib/backends/",
         "`commands/` owns",
         "`commands/` contains",
+        "`commands/`: ",
+        "`lib/runtime/`",
+        "`lib/backends/`",
+        "`scripts/`: ",
+        "verify_static_contract.sh",
+        "verify_public_contract.sh",
+        "cfctl standards audit",
+        "cfctl admin authorize-backend",
     ];
-    for path in active_guidance {
+    for path in required_guidance {
+        verify_guidance_file_has_no_stale_v1(repository_root, path, &stale_v1_guidance)?;
+    }
+    for path in optional_local_guidance {
         let absolute_path = repository_root.join(path);
-        let content = fs::read_to_string(&absolute_path)
-            .map_err(|source| io_error(&absolute_path, source))?;
-        for phrase in stale_v1_guidance {
-            if content.contains(phrase) {
-                return Err(TaskError::InvalidSourceContract(format!(
-                    "{path} still teaches archived v1 guidance `{phrase}`"
-                )));
-            }
+        if absolute_path.is_file() {
+            verify_guidance_file_has_no_stale_v1(repository_root, path, &stale_v1_guidance)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_guidance_file_has_no_stale_v1(
+    repository_root: &Path,
+    path: &str,
+    stale_v1_guidance: &[&str],
+) -> Result<(), TaskError> {
+    let absolute_path = repository_root.join(path);
+    let content =
+        fs::read_to_string(&absolute_path).map_err(|source| io_error(&absolute_path, source))?;
+    for phrase in stale_v1_guidance {
+        if content.contains(phrase) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "{path} still teaches archived v1 guidance `{phrase}`"
+            )));
         }
     }
     Ok(())
