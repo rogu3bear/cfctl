@@ -1107,7 +1107,7 @@ fn classify_global_warp_override_contract(
     capability.rollback.supported = false;
     capability.rollback.strategy = None;
     capability.rollback.warning = Some(
-        "automatic restoration is unsupported because the plan does not bind the prior state of the disconnect control; recovery requires a separately reviewed operation built from trusted evidence. Cloudflare documents that this account-wide control requires the Super Administrator role and may take up to 10 minutes to propagate to devices"
+        "automatic restoration is unsupported; cfctl binds the prior disconnect state for drift detection but does not yet derive a compensation plan from it. Recovery requires a separately reviewed operation that restores the bound state. Cloudflare documents that this account-wide control requires the Super Administrator role and may take up to 10 minutes to propagate to devices"
             .to_owned(),
     );
     refresh_dynamic_mutation_contract(capability);

@@ -2841,7 +2841,8 @@ fn global_warp_override_has_an_exact_audit_aware_state_contract() {
         false
     );
     assert!(mutation.rollback.warning.as_deref().is_some_and(|warning| {
-        warning.contains("prior state")
+        warning.contains("binds the prior disconnect state for drift detection")
+            && warning.contains("does not yet derive a compensation plan")
             && warning.contains("Super Administrator")
             && warning.contains("10 minutes")
     }));

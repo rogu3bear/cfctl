@@ -993,8 +993,152 @@ fn delete_plan_secret(plan: &PlanV1, secrets: &dyn SecretStore) -> Result<bool> 
 
 const ENTITLEMENT_UNRESOLVED_GAP: &str =
     "account entitlement has not been resolved for this plan-gated operation";
+const GLOBAL_WARP_OVERRIDE_MUTATION_CAPABILITY_ID: &str =
+    "devices-resilience-set-global-warp-override";
+const GLOBAL_WARP_OVERRIDE_READ_CAPABILITY_ID: &str =
+    "devices-resilience-retrieve-global-warp-override";
+const GLOBAL_WARP_OVERRIDE_PATH: &str = "/accounts/{account_id}/devices/resilience/disconnect";
 const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str = "zone-subscription-zone-subscription-details";
+
+fn is_global_warp_override_mutation(capability: &CapabilityV1) -> bool {
+    capability.id == GLOBAL_WARP_OVERRIDE_MUTATION_CAPABILITY_ID
+}
+
+fn should_bind_global_warp_override_state(capability: &CapabilityV1) -> bool {
+    is_global_warp_override_mutation(capability)
+        && capability.mutating
+        && capability.method == "POST"
+        && capability.path == GLOBAL_WARP_OVERRIDE_PATH
+        && capability.account_scope == "account"
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.verification.strategy
+            == "same_path_result_contains_planned_fields_after_mutation"
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path == GLOBAL_WARP_OVERRIDE_PATH
+                && read.read_capability_id == GLOBAL_WARP_OVERRIDE_READ_CAPABILITY_ID
+                && read.verified_response_fields == ["disconnect"]
+        })
+}
+
+fn global_warp_override_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == GLOBAL_WARP_OVERRIDE_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == GLOBAL_WARP_OVERRIDE_PATH
+        && capability.product == "Devices Resilience"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.selectors.len() == 1
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "account_id" && selector.location == "path" && selector.required
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|contract| {
+                matches!(
+                    contract.body_mode,
+                    cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                ) && contract.success_statuses == ["200"]
+                    && contract.success_media_types == ["application/json"]
+            })
+}
+
+fn apply_global_warp_override_state_response(
+    account_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the Global WARP override state read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    let disconnect = response
+        .result
+        .get("disconnect")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Global WARP override state read omitted boolean `disconnect`; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+    Ok(json!({
+        "schema_version": 1,
+        "source_capability_id": GLOBAL_WARP_OVERRIDE_READ_CAPABILITY_ID,
+        "source_path": GLOBAL_WARP_OVERRIDE_PATH,
+        "target_capability_id": GLOBAL_WARP_OVERRIDE_MUTATION_CAPABILITY_ID,
+        "target_scope": "account",
+        "target_id": account_id,
+        "disconnect": disconnect,
+    }))
+}
+
+async fn read_live_global_warp_override_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !should_bind_global_warp_override_state(capability) {
+        return Err(CliError::Input(
+            "Global WARP override mutation drifted from its governed prior-state contract"
+                .to_owned(),
+        ));
+    }
+    let selected_account = input
+        .selectors
+        .get("account_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Global WARP override state precondition requires string selector `account_id`"
+                    .to_owned(),
+            )
+        })?;
+    if selected_account != account_id {
+        return Err(CliError::Input(format!(
+            "Global WARP override target account `{selected_account}` differs from selected account `{account_id}`; the mutation boundary was not crossed"
+        )));
+    }
+    let source_capability = catalog
+        .get(GLOBAL_WARP_OVERRIDE_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(GLOBAL_WARP_OVERRIDE_READ_CAPABILITY_ID))?;
+    if !global_warp_override_read_contract_supported(source_capability) {
+        return Err(CliError::Input(
+            "Global WARP override state source capability drifted from the governed account read"
+                .to_owned(),
+        ));
+    }
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source_capability,
+            &CallInput {
+                selectors: json!({"account_id": account_id}),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt = apply_global_warp_override_state_response(account_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
 
 fn should_resolve_zone_entitlement(capability: &CapabilityV1) -> bool {
     let dynamic_contract = capability.adapter_status == AdapterStatus::DynamicApi
@@ -1301,7 +1445,11 @@ async fn create_plan(
             )
         })?;
     let resolve_entitlement = should_resolve_zone_entitlement(&capability);
-    let credential = if resolve_entitlement || should_bind_zone_account(&capability) {
+    let bind_global_warp_override_state = should_bind_global_warp_override_state(&capability);
+    let credential = if resolve_entitlement
+        || should_bind_zone_account(&capability)
+        || bind_global_warp_override_state
+    {
         Some(fresh_credential(profile, &PlatformSecretStore).await?)
     } else {
         None
@@ -1332,6 +1480,26 @@ async fn create_plan(
     } else {
         None
     };
+    let global_warp_override_state_precondition = if bind_global_warp_override_state {
+        let credential = credential.as_ref().ok_or_else(|| {
+            CliError::Input(
+                "Global WARP override state precondition credential was not resolved".to_owned(),
+            )
+        })?;
+        Some(
+            read_live_global_warp_override_state(
+                store,
+                catalog,
+                &capability,
+                &input,
+                account_id,
+                credential,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     persist_prepared_plan(
         store,
         catalog,
@@ -1345,6 +1513,7 @@ async fn create_plan(
         LivePlanPreconditions {
             entitlement: entitlement_precondition,
             zone_account: zone_account_precondition,
+            global_warp_override_state: global_warp_override_state_precondition,
         },
     )
 }
@@ -1357,6 +1526,70 @@ struct PlanAuthority<'a> {
 struct LivePlanPreconditions {
     entitlement: Option<(Value, EvidenceV1)>,
     zone_account: Option<(Value, EvidenceV1)>,
+    global_warp_override_state: Option<(Value, EvidenceV1)>,
+}
+
+fn plan_targets(
+    input: &CallInput,
+    account_id: &str,
+    adapter_targets: &Value,
+    live_preconditions: &LivePlanPreconditions,
+) -> Value {
+    let mut targets = json!({
+        "selectors": input.selectors,
+        "account_id": account_id,
+        "adapter": adapter_targets,
+    });
+    if let Some((receipt, _)) = &live_preconditions.global_warp_override_state {
+        targets["live_preconditions"]["global_warp_override_state"] = receipt.clone();
+    }
+    targets
+}
+
+fn bind_live_plan_preconditions(
+    plan: &mut PlanV1,
+    live_preconditions: &LivePlanPreconditions,
+) -> Result<()> {
+    for (name, precondition) in [
+        ("entitlement", &live_preconditions.entitlement),
+        ("zone_account", &live_preconditions.zone_account),
+        (
+            "global_warp_override_state",
+            &live_preconditions.global_warp_override_state,
+        ),
+    ] {
+        if let Some((receipt, _)) = precondition {
+            plan.precondition_hashes
+                .insert(name.to_owned(), hash_value(receipt)?);
+        }
+    }
+    Ok(())
+}
+
+fn planned_cloudflare_diff(
+    plan: &PlanV1,
+    input: &CallInput,
+    live_preconditions: &LivePlanPreconditions,
+) -> Value {
+    let mut diff = json!({
+        "request_method": plan.capability.method,
+        "request_path": plan.capability.path,
+        "request_body": input.body,
+    });
+    if let Some((receipt, _)) = &live_preconditions.global_warp_override_state {
+        diff["observed_before"] = json!({
+            "disconnect": receipt.get("disconnect").cloned().unwrap_or(Value::Null),
+        });
+        diff["planned_after"] = json!({
+            "disconnect": input
+                .body
+                .as_ref()
+                .and_then(|body| body.get("disconnect"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        });
+    }
+    diff
 }
 
 fn persist_prepared_plan(
@@ -1381,11 +1614,7 @@ fn persist_prepared_plan(
             policy.reasons.join("; ")
         )));
     }
-    let targets = json!({
-        "selectors": input.selectors,
-        "account_id": account_id,
-        "adapter": adapter_targets,
-    });
+    let targets = plan_targets(&input, account_id, &adapter_targets, &live_preconditions);
     let mut plan = PlanV1::draft(
         &profile.id,
         account_id,
@@ -1404,24 +1633,14 @@ fn persist_prepared_plan(
         .insert("catalog".to_owned(), catalog.schema_hash.clone());
     plan.precondition_hashes
         .insert("request_input".to_owned(), hash_value(&plan.input)?);
-    if let Some((receipt, _)) = &live_preconditions.entitlement {
-        plan.precondition_hashes
-            .insert("entitlement".to_owned(), hash_value(receipt)?);
-    }
-    if let Some((receipt, _)) = &live_preconditions.zone_account {
-        plan.precondition_hashes
-            .insert("zone_account".to_owned(), hash_value(receipt)?);
-    }
+    bind_live_plan_preconditions(&mut plan, &live_preconditions)?;
     plan.precondition_hashes
         .extend(workspace_precondition_hashes(store)?);
     plan.affected_repositories = impact.affected_repositories;
     plan.affected_resources = impact.affected_resources;
     plan.local_diffs = impact.local_diffs;
-    plan.cloudflare_diffs.push(json!({
-        "request_method": plan.capability.method,
-        "request_path": plan.capability.path,
-        "request_body": input.body,
-    }));
+    let cloudflare_diff = planned_cloudflare_diff(&plan, &input, &live_preconditions);
+    plan.cloudflare_diffs.push(cloudflare_diff);
     plan.verification_steps
         .push(plan.capability.verification.strategy.clone());
     if let Some(strategy) = &plan.capability.rollback.strategy {
@@ -1458,6 +1677,9 @@ fn persist_prepared_plan(
         envelope.evidence.insert(0, evidence);
     }
     if let Some((_, evidence)) = live_preconditions.zone_account {
+        envelope.evidence.insert(0, evidence);
+    }
+    if let Some((_, evidence)) = live_preconditions.global_warp_override_state {
         envelope.evidence.insert(0, evidence);
     }
     Ok(envelope)
@@ -1889,6 +2111,15 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     let permission_inventory_evidence =
         validate_live_permission_inventory_precondition(store, &catalog, &plan, &credential)
             .await?;
+    let global_warp_override_state_evidence =
+        validate_live_global_warp_override_state_precondition(
+            store,
+            &catalog,
+            &plan,
+            &execution_input,
+            &credential,
+        )
+        .await?;
     plan.mark_consumed()?;
     store.save_plan(&plan)?;
     persist_transaction_stage(
@@ -1907,6 +2138,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
             zone_account: zone_account_evidence,
             entitlement: entitlement_evidence,
             permission_inventory: permission_inventory_evidence,
+            global_warp_override_state: global_warp_override_state_evidence,
         },
     )
     .await
@@ -1916,6 +2148,7 @@ struct LivePreconditionEvidence {
     zone_account: Option<EvidenceV1>,
     entitlement: Option<EvidenceV1>,
     permission_inventory: Option<EvidenceV1>,
+    global_warp_override_state: Option<EvidenceV1>,
 }
 
 async fn execute_consumed_plan(
@@ -1982,6 +2215,7 @@ fn prepend_live_precondition_evidence(
     evidence: LivePreconditionEvidence,
 ) {
     for item in [
+        evidence.global_warp_override_state,
         evidence.permission_inventory,
         evidence.entitlement,
         evidence.zone_account,
@@ -1991,6 +2225,80 @@ fn prepend_live_precondition_evidence(
     {
         envelope.evidence.insert(0, item);
     }
+}
+
+async fn validate_live_global_warp_override_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_global_warp_override_state_precondition(plan)? else {
+        return Ok(None);
+    };
+    let (receipt, evidence) = read_live_global_warp_override_state(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    validate_global_warp_override_state_receipt_precondition(expected_hash, &receipt)?;
+    Ok(Some(evidence))
+}
+
+fn validate_global_warp_override_state_receipt_precondition(
+    expected_hash: &str,
+    receipt: &Value,
+) -> Result<()> {
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live Global WARP override state drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn required_global_warp_override_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    if !is_global_warp_override_mutation(&plan.capability) {
+        return Ok(None);
+    }
+    if !should_bind_global_warp_override_state(&plan.capability) {
+        return Err(CliError::Input(
+            "Global WARP override plan is inconsistent with its hash-bound prior-state contract; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get("global_warp_override_state")
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the live Global WARP override prior-state contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/global_warp_override_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the hash-bound Global WARP override prior-state receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "plan Global WARP override prior-state receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
 }
 
 async fn validate_live_zone_account_precondition(
@@ -3647,7 +3955,11 @@ fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> 
     for (name, expected) in &plan.precondition_hashes {
         if matches!(
             name.as_str(),
-            "catalog" | "request_input" | "entitlement" | "zone_account"
+            "catalog"
+                | "request_input"
+                | "entitlement"
+                | "zone_account"
+                | "global_warp_override_state"
         ) {
             continue;
         }
@@ -4041,6 +4353,7 @@ fn guide_stage_document(
 
     let zone_account_live_read = should_bind_zone_account(capability);
     let zone_entitlement_live_read = should_resolve_zone_entitlement(capability);
+    let global_warp_override_state_live_read = should_bind_global_warp_override_state(capability);
     let entitlement_blocked = capability.entitlement.available == Some(false)
         || blocking_gaps.iter().any(|gap| gap.contains("entitlement"));
     let entitlement_unresolved = capability.mutating
@@ -4049,6 +4362,9 @@ fn guide_stage_document(
     let contract_state = match stage {
         GuideStage::SelectAccount if zone_account_live_read => "live_read_required",
         GuideStage::CheckEntitlement if zone_entitlement_live_read => "live_read_required",
+        GuideStage::InspectCurrentState if global_warp_override_state_live_read => {
+            "live_read_required"
+        }
         GuideStage::CheckEntitlement if entitlement_blocked => "blocked",
         GuideStage::CheckEntitlement if entitlement_unresolved => "manual_review",
         GuideStage::CalculateCost if capability.mutating && !capability.cost.known => "blocked",
@@ -4089,11 +4405,14 @@ fn guide_stage_document(
         "Read the exact live zone details and require its account ID to match the selected account."
     } else if stage == GuideStage::CheckEntitlement && zone_entitlement_live_read {
         "Read the exact live zone subscription and evaluate its active plan against the official availability matrix."
+    } else if stage == GuideStage::InspectCurrentState && global_warp_override_state_live_read {
+        "Read and bind the exact live account-wide disconnect state; execution repeats this read and rejects drift before crossing the mutation boundary."
     } else {
         guide_stage_summary(stage, capability.mutating)
     };
     let evidence_class = if (stage == GuideStage::SelectAccount && zone_account_live_read)
         || (stage == GuideStage::CheckEntitlement && zone_entitlement_live_read)
+        || (stage == GuideStage::InspectCurrentState && global_warp_override_state_live_read)
     {
         "live_read"
     } else {
@@ -4217,6 +4536,16 @@ fn guide_stage_commands(
         ],
         GuideStage::InspectCurrentState if !capability.mutating => {
             conditional(call_argv.map(<[String]>::to_vec))
+        }
+        GuideStage::InspectCurrentState if should_bind_global_warp_override_state(capability) => {
+            vec![vec![
+                "cfctl".to_owned(),
+                "call".to_owned(),
+                GLOBAL_WARP_OVERRIDE_READ_CAPABILITY_ID.to_owned(),
+                "--selector".to_owned(),
+                "account_id=<account_id>".to_owned(),
+                "--json".to_owned(),
+            ]]
         }
         GuideStage::InspectCurrentState => {
             vec![argv(&["cfctl", "workspace", "audit", "--json"])]
@@ -4555,17 +4884,20 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        CallInput, apply_zone_account_response, apply_zone_entitlement_response,
-        boundary_response_artifact, compensation_request, find_secret_value, guide_document,
+        CallInput, LivePlanPreconditions, PlanAuthority, apply_global_warp_override_state_response,
+        apply_zone_account_response, apply_zone_entitlement_response, boundary_response_artifact,
+        compensation_request, find_secret_value, guide_document, persist_prepared_plan,
         persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
         query_object_from_pairs, redact_secret_result, required_entitlement_precondition,
-        required_zone_account_precondition, should_bind_zone_account,
+        required_global_warp_override_state_precondition, required_zone_account_precondition,
+        should_bind_global_warp_override_state, should_bind_zone_account,
         should_resolve_zone_entitlement, sink_secret_result, validate_api_token_creation_contract,
         validate_current_permission_groups, validate_entitlement_receipt_precondition,
+        validate_global_warp_override_state_receipt_precondition,
         validate_selected_permission_groups, validate_zone_account_receipt_precondition,
         workspace_resource_keys, zone_target,
     };
-    use cfctl_auth::{AuthError, SecretStore};
+    use cfctl_auth::{AuthError, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
     use cfctl_cloudflare::CloudflareResponseV1;
     use cfctl_core::{
@@ -4592,6 +4924,271 @@ mod tests {
         };
         catalog.refresh_hash().expect("catalog hash");
         catalog
+    }
+
+    fn global_warp_override_capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            "devices-resilience-set-global-warp-override",
+            "Set Global WARP override state",
+            "POST",
+            "/accounts/{account_id}/devices/resilience/disconnect",
+        );
+        capability.mutating = true;
+        capability.account_scope = "account".to_owned();
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.product = "Devices Resilience".to_owned();
+        capability.risk = RiskClass::CrossConfig;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.permissions = vec!["Zero Trust Resilience Write".to_owned()];
+        capability.cost.known = true;
+        capability.cost.maximum = Some(0.0);
+        capability.cost.basis = Some("no direct incremental operation charge".to_owned());
+        capability.entitlement.available = Some(true);
+        capability.request_schema = Some(json!({
+            "type": "object",
+            "required": ["disconnect"],
+            "x-cfctl-body-required": true,
+            "additionalProperties": false,
+            "properties": {
+                "disconnect": {"type": "boolean"},
+                "justification": {
+                    "type": "string",
+                    "x-cfctl-verification-observable": false,
+                },
+            },
+        }));
+        capability.selectors = vec![SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        }];
+        capability.verification.strategy =
+            "same_path_result_contains_planned_fields_after_mutation".to_owned();
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: "/accounts/{account_id}/devices/resilience/disconnect".to_owned(),
+            read_capability_id: "devices-resilience-retrieve-global-warp-override".to_owned(),
+            verified_response_fields: vec!["disconnect".to_owned()],
+        });
+        capability.rollback.warning =
+            Some("automatic restoration requires a separately reviewed operation".to_owned());
+        capability
+    }
+
+    #[test]
+    fn global_warp_override_state_receipt_binds_only_the_exact_account_state() {
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "disconnect": false,
+                "timestamp": "2026-07-15T12:00:00Z",
+                "ignored_future_field": "does-not-enter-the-receipt",
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+
+        let receipt = apply_global_warp_override_state_response("account-a", &response)
+            .expect("global WARP state receipt");
+        assert_eq!(
+            receipt,
+            json!({
+                "schema_version": 1,
+                "source_capability_id": "devices-resilience-retrieve-global-warp-override",
+                "source_path": "/accounts/{account_id}/devices/resilience/disconnect",
+                "target_capability_id": "devices-resilience-set-global-warp-override",
+                "target_scope": "account",
+                "target_id": "account-a",
+                "disconnect": false,
+            })
+        );
+
+        let expected_hash = hash_value(&receipt).expect("receipt hash");
+        validate_global_warp_override_state_receipt_precondition(&expected_hash, &receipt)
+            .expect("unchanged state");
+        let mut drifted = receipt;
+        drifted["disconnect"] = json!(true);
+        let error =
+            validate_global_warp_override_state_receipt_precondition(&expected_hash, &drifted)
+                .expect_err("changed state must fail before the write boundary");
+        assert!(error.to_string().contains("drifted after planning"));
+        assert!(
+            error
+                .to_string()
+                .contains("mutation boundary was not crossed")
+        );
+    }
+
+    #[test]
+    fn global_warp_override_state_receipt_rejects_failed_or_ambiguous_reads() {
+        let response = |status, success, result| CloudflareResponseV1 {
+            status,
+            success,
+            result,
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let failed = apply_global_warp_override_state_response(
+            "account-a",
+            &response(403, false, json!({"disconnect": false})),
+        )
+        .expect_err("failed read");
+        assert!(failed.to_string().contains("HTTP 403"));
+        let omitted = apply_global_warp_override_state_response(
+            "account-a",
+            &response(200, true, json!({"timestamp": "now"})),
+        )
+        .expect_err("missing state");
+        assert!(omitted.to_string().contains("omitted boolean `disconnect`"));
+    }
+
+    #[test]
+    fn executable_global_warp_override_plan_requires_its_bound_prior_state() {
+        let capability = global_warp_override_capability();
+        assert!(should_bind_global_warp_override_state(&capability));
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({
+                "selectors": {"account_id": "account-a"},
+                "account_id": "account-a",
+                "adapter": {},
+            }),
+        )
+        .expect("plan");
+
+        let missing = required_global_warp_override_state_precondition(&plan)
+            .expect_err("old plan without a prior-state receipt must fail");
+        assert!(missing.to_string().contains("predates"));
+
+        let receipt = json!({
+            "schema_version": 1,
+            "source_capability_id": "devices-resilience-retrieve-global-warp-override",
+            "source_path": "/accounts/{account_id}/devices/resilience/disconnect",
+            "target_capability_id": "devices-resilience-set-global-warp-override",
+            "target_scope": "account",
+            "target_id": "account-a",
+            "disconnect": false,
+        });
+        let receipt_hash = hash_value(&receipt).expect("receipt hash");
+        plan.targets["live_preconditions"]["global_warp_override_state"] = receipt;
+        plan.precondition_hashes.insert(
+            "global_warp_override_state".to_owned(),
+            receipt_hash.clone(),
+        );
+        assert_eq!(
+            required_global_warp_override_state_precondition(&plan).expect("bound precondition"),
+            Some(receipt_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn prepared_global_warp_override_plan_carries_exact_before_and_after_state() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = global_warp_override_capability();
+        assert!(capability.mutation_contract_gaps().is_empty());
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "https://example.invalid/openapi.json".to_owned(),
+            source_hash: "source-sha".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability.id.clone(), capability.clone())]),
+        };
+        catalog.refresh_hash().expect("catalog hash");
+        let profile = ProfileMetadata::new("profile-a", ProfileKind::ApiToken, Some("account-a"));
+        let input = CallInput {
+            selectors: json!({"account_id": "account-a"}),
+            body: Some(json!({
+                "disconnect": true,
+                "justification": "controlled test plan",
+            })),
+            ..CallInput::default()
+        };
+        let receipt = json!({
+            "schema_version": 1,
+            "source_capability_id": "devices-resilience-retrieve-global-warp-override",
+            "source_path": "/accounts/{account_id}/devices/resilience/disconnect",
+            "target_capability_id": "devices-resilience-set-global-warp-override",
+            "target_scope": "account",
+            "target_id": "account-a",
+            "disconnect": false,
+        });
+        let receipt_hash = hash_value(&receipt).expect("receipt hash");
+        let receipt_evidence = store
+            .write_evidence(EvidenceClass::LiveRead, &receipt)
+            .expect("live read evidence");
+
+        let envelope = persist_prepared_plan(
+            &store,
+            &catalog,
+            capability,
+            input,
+            PlanAuthority {
+                profile: &profile,
+                account_id: "account-a",
+            },
+            json!({}),
+            LivePlanPreconditions {
+                entitlement: None,
+                zone_account: None,
+                global_warp_override_state: Some((receipt.clone(), receipt_evidence)),
+            },
+        )
+        .expect("prepared plan");
+        let plan = &envelope.result["plan"];
+
+        assert_eq!(
+            plan["precondition_hashes"]["global_warp_override_state"],
+            receipt_hash
+        );
+        assert_eq!(
+            plan["targets"]["live_preconditions"]["global_warp_override_state"],
+            receipt
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["observed_before"],
+            json!({"disconnect": false})
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["planned_after"],
+            json!({"disconnect": true})
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["request_body"]["justification"],
+            "controlled test plan"
+        );
+    }
+
+    #[test]
+    fn global_warp_override_guide_requires_the_exact_live_state_read() {
+        let capability = global_warp_override_capability();
+        let guide = guide_document(&capability);
+        let current_state = &guide["stages"][4];
+        assert_eq!(current_state["name"], "inspect_current_state");
+        assert_eq!(current_state["contract_state"], "live_read_required");
+        assert_eq!(current_state["evidence_class"], "live_read");
+        assert_eq!(
+            current_state["commands"][0],
+            json!([
+                "cfctl",
+                "call",
+                "devices-resilience-retrieve-global-warp-override",
+                "--selector",
+                "account_id=<account_id>",
+                "--json"
+            ])
+        );
     }
 
     #[test]
