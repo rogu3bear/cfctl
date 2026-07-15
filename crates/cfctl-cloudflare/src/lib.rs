@@ -277,6 +277,7 @@ impl Executor {
         let strategy = plan.capability.verification.strategy.as_str();
         let input: CallInput = serde_json::from_value(plan.input.clone())
             .map_err(cfctl_core::CoreError::Serialization)?;
+        validate_verification_preconditions(&plan.capability, &input)?;
         if strategy.starts_with("api_token_details_") {
             let (token_id, expectation) =
                 token_verification_target(strategy, &input, apply_response)?;
@@ -358,9 +359,9 @@ impl Executor {
                 .verify_resource_delete(plan, apply_response, &input, credential)
                 .await;
         }
-        if is_same_path_field_verifier(strategy) {
+        if is_update_verifier(strategy) {
             return self
-                .verify_exact_resource_update(plan, apply_response, &input, credential)
+                .verify_resource_update(plan, apply_response, &input, credential)
                 .await;
         }
         if strategy == "created_resource_contains_planned_fields_by_returned_id" {
@@ -480,12 +481,8 @@ impl Executor {
             },
         )?;
         let readback = self.send_paginated(&request, credential).await?;
-        let pagination_complete = !target.requires_page_number_completion
-            || readback.result_info.as_ref().is_some_and(|result_info| {
-                let page = result_info.get("page").and_then(Value::as_u64);
-                let total_pages = result_info.get("total_pages").and_then(Value::as_u64);
-                page.is_some_and(|page| page > 0 && Some(page) == total_pages)
-            });
+        let pagination_complete =
+            collection_pagination_complete(target.requires_page_number_completion, &readback);
         let identities = readback.result.as_array().map(|items| {
             items
                 .iter()
@@ -576,6 +573,135 @@ impl Executor {
                 readback.status,
                 readback.success,
                 render_field_names(&mismatches)
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback,
+        })
+    }
+
+    async fn verify_resource_update(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        match plan.capability.verification.strategy.as_str() {
+            "same_resource_contains_planned_fields_after_update"
+            | "same_path_result_contains_planned_fields_after_update" => {
+                self.verify_exact_resource_update(plan, apply_response, input, credential)
+                    .await
+            }
+            "parent_collection_item_contains_planned_fields_after_update" => {
+                self.verify_parent_collection_update(plan, apply_response, input, credential)
+                    .await
+            }
+            strategy => Err(CloudflareError::UnsupportedVerificationStrategy(
+                strategy.to_owned(),
+            )),
+        }
+    }
+
+    async fn verify_parent_collection_update(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let target = plan.capability.updated_resource.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the hash-bound updated-resource contract is absent".to_owned(),
+            )
+        })?;
+        let updated_identity = input
+            .selectors
+            .get(&target.identity_selector)
+            .and_then(Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the planned update selector has no non-empty resource identity".to_owned(),
+                )
+            })?;
+        let planned = input
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .filter(|body| !body.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "planned update body is absent, empty, or not an object".to_owned(),
+                )
+            })?;
+        let mut selectors = input.selectors.as_object().cloned().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "planned update selectors are not an object".to_owned(),
+            )
+        })?;
+        selectors.remove(&target.identity_selector);
+        let collection = CapabilityV1::new(
+            &target.read_capability_id,
+            "Updated resource collection verification readback",
+            "GET",
+            &target.collection_path,
+        );
+        let request = self.builder.build(
+            &collection,
+            &CallInput {
+                selectors: Value::Object(selectors),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send_paginated(&request, credential).await?;
+        let pagination_complete =
+            collection_pagination_complete(target.requires_page_number_completion, &readback);
+        let items = readback.result.as_array();
+        let identity_shape_valid = items.is_some_and(|items| {
+            items.iter().all(|item| {
+                item.pointer(&target.response_item_identity_pointer)
+                    .and_then(Value::as_str)
+                    .is_some_and(|identity| !identity.is_empty())
+            })
+        });
+        let matching_items = items
+            .into_iter()
+            .flatten()
+            .filter(|item| {
+                item.pointer(&target.response_item_identity_pointer)
+                    .and_then(Value::as_str)
+                    == Some(updated_identity)
+            })
+            .collect::<Vec<_>>();
+        let planned_fields_match = matching_items
+            .first()
+            .is_some_and(|item| contains_planned_value(item, &Value::Object(planned.clone())));
+        let passed = apply_response.success
+            && readback.success
+            && pagination_complete
+            && identity_shape_valid
+            && matching_items.len() == 1
+            && planned_fields_match;
+        let basis = if passed {
+            "the complete schema-proven parent collection contained exactly one matching identity with every planned update field"
+                .to_owned()
+        } else {
+            format!(
+                "parent collection did not prove update (apply success={}, readback HTTP {}, readback success={}, pagination complete={}, result array={}, item identities valid={}, identity matches={}, planned fields match={})",
+                apply_response.success,
+                readback.status,
+                readback.success,
+                pagination_complete,
+                items.is_some(),
+                identity_shape_valid,
+                matching_items.len(),
+                planned_fields_match
             )
         };
         Ok(OperationVerificationV1 {
@@ -776,6 +902,15 @@ fn pagination_bounds(result_info: Option<&Value>) -> Option<(u64, u64)> {
     let current = result_info.get("page").and_then(Value::as_u64).unwrap_or(1);
     let total = result_info.get("total_pages").and_then(Value::as_u64)?;
     (total > current).then_some((current, total))
+}
+
+fn collection_pagination_complete(required: bool, readback: &CloudflareResponseV1) -> bool {
+    !required
+        || readback.result_info.as_ref().is_some_and(|result_info| {
+            let page = result_info.get("page").and_then(Value::as_u64);
+            let total_pages = result_info.get("total_pages").and_then(Value::as_u64);
+            page.is_some_and(|page| page > 0 && Some(page) == total_pages)
+        })
 }
 
 fn set_query_parameter(url: &mut Url, name: &str, value: &str) {
@@ -1105,6 +1240,7 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
         | "dns_record_details_match_created_id_and_planned_fields" => Some("create"),
         "same_resource_contains_planned_fields_after_update"
         | "same_path_result_contains_planned_fields_after_update"
+        | "parent_collection_item_contains_planned_fields_after_update"
         | "dns_record_details_match_planned_id_and_fields" => Some("update"),
         _ => None,
     };
@@ -1120,58 +1256,118 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
                 ))
             })?;
     }
-    if strategy == "created_resource_contains_planned_fields_by_returned_id" {
-        let target = capability.created_resource.as_ref().ok_or_else(|| {
-            CloudflareError::MissingVerificationTarget(
-                "the hash-bound created-resource contract is absent".to_owned(),
-            )
-        })?;
-        let expected_suffix = format!("/{{{}}}", target.identity_selector);
-        if target.identity_selector.is_empty()
-            || !target.detail_path.ends_with(&expected_suffix)
-            || !target.response_result_identity_pointer.starts_with('/')
-            || target.read_capability_id.is_empty()
-            || target.delete_capability_id.is_empty()
-        {
-            return Err(CloudflareError::MissingVerificationTarget(
-                "the hash-bound created-resource contract is malformed".to_owned(),
-            ));
+    match strategy {
+        "created_resource_contains_planned_fields_by_returned_id" => {
+            validate_created_resource_target(capability)
         }
+        "parent_collection_omits_deleted_resource_id" => {
+            validate_deleted_resource_target(capability, input)
+        }
+        "parent_collection_item_contains_planned_fields_after_update" => {
+            validate_updated_resource_target(capability, input)
+        }
+        _ => Ok(()),
     }
-    if strategy == "parent_collection_omits_deleted_resource_id" {
-        let target = capability.deleted_resource.as_ref().ok_or_else(|| {
-            CloudflareError::MissingVerificationTarget(
-                "the hash-bound deleted-resource contract is absent".to_owned(),
-            )
-        })?;
-        let expected_path = format!(
-            "{}/{{{}}}",
-            target.collection_path.trim_end_matches('/'),
-            target.identity_selector
-        );
-        if target.identity_selector.is_empty()
-            || capability.path != expected_path
-            || target.response_item_identity_pointer != "/id"
-            || target.read_capability_id.is_empty()
-            || input
-                .selectors
-                .get(&target.identity_selector)
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-        {
-            return Err(CloudflareError::MissingVerificationTarget(
-                "the hash-bound deleted-resource contract is malformed".to_owned(),
-            ));
-        }
+}
+
+fn validate_created_resource_target(capability: &CapabilityV1) -> Result<()> {
+    let target = capability.created_resource.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the hash-bound created-resource contract is absent".to_owned(),
+        )
+    })?;
+    let expected_suffix = format!("/{{{}}}", target.identity_selector);
+    if target.identity_selector.is_empty()
+        || !target.detail_path.ends_with(&expected_suffix)
+        || !target.response_result_identity_pointer.starts_with('/')
+        || target.read_capability_id.is_empty()
+        || target.delete_capability_id.is_empty()
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the hash-bound created-resource contract is malformed".to_owned(),
+        ));
     }
     Ok(())
 }
 
-fn is_same_path_field_verifier(strategy: &str) -> bool {
+fn validate_deleted_resource_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    let target = capability.deleted_resource.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the hash-bound deleted-resource contract is absent".to_owned(),
+        )
+    })?;
+    let expected_path = format!(
+        "{}/{{{}}}",
+        target.collection_path.trim_end_matches('/'),
+        target.identity_selector
+    );
+    if target.identity_selector.is_empty()
+        || capability.path != expected_path
+        || target.response_item_identity_pointer != "/id"
+        || target.read_capability_id.is_empty()
+        || input
+            .selectors
+            .get(&target.identity_selector)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the hash-bound deleted-resource contract is malformed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_updated_resource_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    let target = capability.updated_resource.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the hash-bound updated-resource contract is absent".to_owned(),
+        )
+    })?;
+    let expected_path = format!(
+        "{}/{{{}}}",
+        target.collection_path.trim_end_matches('/'),
+        target.identity_selector
+    );
+    if target.identity_selector.is_empty()
+        || capability.path != expected_path
+        || target.response_item_identity_pointer != "/id"
+        || target.read_capability_id.is_empty()
+        || input
+            .selectors
+            .get(&target.identity_selector)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the hash-bound updated-resource contract is malformed".to_owned(),
+        ));
+    }
+    let Some(planned) = input.body.as_ref().and_then(Value::as_object) else {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "planned update body is absent, empty, or not an object".to_owned(),
+        ));
+    };
+    if planned.keys().any(|field| {
+        target
+            .verified_response_fields
+            .binary_search(field)
+            .is_err()
+    }) {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned update contains a field outside the hash-bound collection readback fields"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_update_verifier(strategy: &str) -> bool {
     matches!(
         strategy,
         "same_resource_contains_planned_fields_after_update"
             | "same_path_result_contains_planned_fields_after_update"
+            | "parent_collection_item_contains_planned_fields_after_update"
     )
 }
 

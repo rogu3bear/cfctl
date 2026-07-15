@@ -6,6 +6,7 @@ use cfctl_cloudflare::{
 };
 use cfctl_core::{
     CapabilityV1, CreatedResourceContractV1, DeletedResourceContractV1, PlanStatus, PlanV1,
+    UpdatedResourceContractV1,
 };
 use serde_json::json;
 use tokio::{
@@ -976,6 +977,195 @@ async fn parent_collection_verifier_rejects_a_present_deleted_identity_without_e
 }
 
 #[tokio::test]
+async fn exact_resource_update_is_verified_by_complete_parent_collection_fields() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for page in 1..=2 {
+            let (mut stream, _) = listener.accept().await.expect("accept verification");
+            let mut buffer = vec![0_u8; 8192];
+            let read = stream.read(&mut buffer).await.expect("read verification");
+            requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+            let body = if page == 1 {
+                r#"{"success":true,"result":[{"id":"widget-2","name":"other","enabled":false}],"result_info":{"page":1,"total_pages":2}}"#
+            } else {
+                r#"{"success":true,"result":[{"id":"widget-1","name":"after","enabled":true}],"result_info":{"page":2,"total_pages":2}}"#
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write verification");
+        }
+        requests
+    });
+    let mut plan = dns_record_plan(
+        "widgets-update",
+        "PATCH",
+        "/accounts/{account_id}/widgets/{widget_id}",
+        "parent_collection_item_contains_planned_fields_after_update",
+        json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        Some(json!({"name":"after", "enabled":true})),
+    );
+    plan.capability.updated_resource = Some(UpdatedResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        verified_response_fields: vec!["enabled".to_owned(), "name".to_owned()],
+        requires_page_number_completion: true,
+    });
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let requests = server.await.expect("server joins");
+    assert!(requests[0].starts_with("GET /client/v4/accounts/account-1/widgets "));
+    assert!(requests[1].starts_with("GET /client/v4/accounts/account-1/widgets?page=2 "));
+    assert!(requests.iter().all(|request| !request.contains("widget-1")));
+}
+
+#[tokio::test]
+async fn parent_collection_update_rejects_field_drift_without_echoing_values() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let _ = stream.read(&mut buffer).await.expect("read verification");
+        let body =
+            r#"{"success":true,"result":[{"id":"widget-1","name":"unexpected-live-value"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+    });
+    let mut plan = dns_record_plan(
+        "widgets-update",
+        "PATCH",
+        "/accounts/{account_id}/widgets/{widget_id}",
+        "parent_collection_item_contains_planned_fields_after_update",
+        json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        Some(json!({"name":"planned-secret-like-value"})),
+    );
+    plan.capability.updated_resource = Some(UpdatedResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+        requires_page_number_completion: false,
+    });
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("planned fields match=false"));
+    assert!(!verification.basis.contains("planned-secret-like-value"));
+    assert!(!verification.basis.contains("unexpected-live-value"));
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn parent_collection_update_rejects_unbound_fields_before_the_mutation_boundary() {
+    let mut plan = dns_record_plan(
+        "widgets-update",
+        "PATCH",
+        "/accounts/{account_id}/widgets/{widget_id}",
+        "parent_collection_item_contains_planned_fields_after_update",
+        json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        Some(json!({"hidden":true})),
+    );
+    plan.capability.updated_resource = Some(UpdatedResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+        requires_page_number_completion: false,
+    });
+    plan.status = PlanStatus::Consumed;
+    let input: CallInput = serde_json::from_value(plan.input.clone()).expect("input");
+    let catalog_hash = plan.catalog_hash.clone();
+    let executor =
+        Executor::new(reqwest::Client::new(), "http://127.0.0.1:9/client/v4").expect("executor");
+
+    let error = executor
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            &catalog_hash,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect_err("unbound field must fail before network execution")
+        .to_string();
+
+    assert!(error.contains("outside the hash-bound collection readback fields"));
+    assert_eq!(plan.status, PlanStatus::Consumed);
+}
+
+#[tokio::test]
 async fn exact_resource_update_is_verified_by_same_path_planned_fields() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1308,6 +1498,10 @@ async fn same_path_object_update_verifies_schema_proven_fields_with_a_clean_get(
         json!({"zone_id":"zone-1"}),
         Some(json!({"mode":"strict", "nested":{"enabled":true}})),
     );
+    plan.capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{"mode":{"type":"string"},"nested":{"type":"object"}}
+    }));
     plan.input = serde_json::to_value(CallInput {
         selectors: json!({"zone_id":"zone-1"}),
         query: json!({"mutation_mode":"replace"}),

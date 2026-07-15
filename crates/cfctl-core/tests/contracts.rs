@@ -3,7 +3,7 @@
 use cfctl_core::{
     AdapterStatus, CapabilityV1, CostV1, CreatedResourceContractV1, EffectClass, EvidenceClass,
     EvidenceV1, GuideStage, PlanStatus, PlanV1, ResultEnvelopeV2, RiskClass, TransactionStageV1,
-    guide_stages, redact_json,
+    UpdatedResourceContractV1, guide_stages, redact_json,
 };
 use serde_json::json;
 
@@ -105,6 +105,35 @@ fn mutation_contracts_reject_declared_but_unimplemented_strategies() {
             .iter()
             .any(|gap| { gap == "declared verification strategy is unsupported: not_applicable" })
     );
+}
+
+#[test]
+fn updated_resource_contract_rejects_noncanonical_field_allowlists() {
+    let mut capability = CapabilityV1::new(
+        "widgets-update",
+        "Update widget",
+        "PATCH",
+        "/accounts/{account_id}/widgets/{widget_id}",
+    );
+    capability.verification.strategy =
+        "parent_collection_item_contains_planned_fields_after_update".to_owned();
+    capability.updated_resource = Some(UpdatedResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        verified_response_fields: vec!["name".to_owned(), "enabled".to_owned()],
+        requires_page_number_completion: false,
+    });
+
+    assert!(!capability.verification_contract_supported());
+
+    capability
+        .updated_resource
+        .as_mut()
+        .expect("updated-resource contract")
+        .verified_response_fields = vec!["enabled".to_owned(), "name".to_owned()];
+    assert!(capability.verification_contract_supported());
 }
 
 #[test]
@@ -216,10 +245,22 @@ fn plan_hash_binds_all_reviewed_content_and_is_not_replayable_after_consumption(
         .expect("created-resource contract must rehash");
     assert_ne!(with_precondition, plan.content_hash);
     let with_created_resource_contract = plan.content_hash.clone();
+    plan.capability.updated_resource = Some(UpdatedResourceContractV1 {
+        collection_path: "/zones/{zone_id}/dns_records".to_owned(),
+        identity_selector: "record_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "dns.records.list".to_owned(),
+        verified_response_fields: vec!["content".to_owned(), "type".to_owned()],
+        requires_page_number_completion: true,
+    });
+    plan.refresh_hash()
+        .expect("updated-resource contract must rehash");
+    assert_ne!(with_created_resource_contract, plan.content_hash);
+    let with_updated_resource_contract = plan.content_hash.clone();
     plan.targets = json!({"zone_id":"zone-a","record_id":"record-b"});
     plan.refresh_hash().expect("test fixture must rehash");
 
-    assert_ne!(with_created_resource_contract, plan.content_hash);
+    assert_ne!(with_updated_resource_contract, plan.content_hash);
     assert_eq!(plan.status, PlanStatus::Draft);
     plan.approve(true, None)
         .expect("test fixture must approve with explicit yes");

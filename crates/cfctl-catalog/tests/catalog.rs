@@ -160,7 +160,7 @@ fn stored_catalog_rejects_capability_drift_from_its_content_hash() {
 }
 
 #[test]
-fn legacy_catalog_hash_survives_an_absent_deleted_resource_contract() {
+fn legacy_catalog_hash_survives_absent_optional_resource_contracts() {
     let snapshot = normalize_openapi(&fixture()).expect("catalog");
     let mut stored = serde_json::to_value(&snapshot).expect("serialize catalog");
     let capabilities = stored["capabilities"]
@@ -171,6 +171,10 @@ fn legacy_catalog_hash_survives_an_absent_deleted_resource_contract() {
             .as_object_mut()
             .expect("capability object")
             .remove("deleted_resource");
+        capability
+            .as_object_mut()
+            .expect("capability object")
+            .remove("updated_resource");
     }
     stored["schema_hash"] = json!(hash_value(&stored["capabilities"]).expect("legacy hash"));
 
@@ -854,6 +858,149 @@ fn parent_collection_delete_contracts_reject_unverifiable_pagination_and_broaden
     assert_ne!(
         delete.verification.strategy,
         "parent_collection_omits_deleted_resource_id"
+    );
+}
+
+#[test]
+fn exact_resource_updates_use_schema_proven_parent_collection_fields() {
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/accounts/{account_id}/widgets": {
+                "get": {
+                    "operationId":"widgets-list",
+                    "summary":"List Widgets",
+                    "tags":["Widgets"],
+                    "parameters":[
+                        {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}}
+                    ],
+                    "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
+                        "type":"object",
+                        "properties":{"result":{"type":"array","items":{"type":"object","properties":{
+                            "id":{"type":"string"},"enabled":{"type":"boolean"},"name":{"type":"string"}
+                        }}}}
+                    }}}}}
+                }
+            },
+            "/accounts/{account_id}/widgets/{widget_id}": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+                    {"in":"path","name":"widget_id","required":true,"schema":{"type":"string"}}
+                ],
+                "patch": {
+                    "operationId":"widgets-update",
+                    "summary":"Update Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "type":"object","properties":{"name":{"type":"string"},"enabled":{"type":"boolean"}}
+                    }}}}
+                }
+            }
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("widget catalog");
+    let capability = snapshot.get("widgets-update").expect("update widget");
+    assert_eq!(
+        capability.verification.strategy,
+        "parent_collection_item_contains_planned_fields_after_update"
+    );
+    let target = capability
+        .updated_resource
+        .as_ref()
+        .expect("updated-resource contract");
+    assert_eq!(target.collection_path, "/accounts/{account_id}/widgets");
+    assert_eq!(target.identity_selector, "widget_id");
+    assert_eq!(target.response_item_identity_pointer, "/id");
+    assert_eq!(target.read_capability_id, "widgets-list");
+    assert_eq!(target.verified_response_fields, ["enabled", "name"]);
+    assert!(!target.requires_page_number_completion);
+    assert!(
+        capability
+            .mutation_contract_gaps()
+            .iter()
+            .all(|gap| !gap.contains("verification") && !gap.contains("rollback"))
+    );
+}
+
+#[test]
+fn parent_collection_update_contracts_reject_unobservable_fields_and_update_modes() {
+    let mut document = json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/accounts/{account_id}/widgets": {
+                "get": {
+                    "operationId":"widgets-list",
+                    "summary":"List Widgets",
+                    "tags":["Widgets"],
+                    "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
+                        "type":"object","properties":{"result":{"type":"array","items":{"type":"object","properties":{
+                            "id":{"type":"string"},"name":{"type":"string"}
+                        }}}}
+                    }}}}}
+                }
+            },
+            "/accounts/{account_id}/widgets/{widget_id}": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+                    {"in":"path","name":"widget_id","required":true,"schema":{"type":"string"}}
+                ],
+                "patch": {
+                    "operationId":"widgets-update",
+                    "summary":"Update Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "type":"object","properties":{"name":{"type":"string"},"hidden":{"type":"boolean"}}
+                    }}}}
+                }
+            }
+        }
+    });
+
+    let unobservable = normalize_openapi(&document).expect("unobservable catalog");
+    assert!(
+        unobservable
+            .get("widgets-update")
+            .expect("update widget")
+            .updated_resource
+            .is_none()
+    );
+
+    document["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["patch"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"] = json!({"name":{"type":"string"}});
+    document["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["patch"]["parameters"] =
+        json!([{"in":"query","name":"mode","schema":{"type":"string"}}]);
+    let modal = normalize_openapi(&document).expect("modal catalog");
+    assert!(
+        modal
+            .get("widgets-update")
+            .expect("update widget")
+            .updated_resource
+            .is_none()
+    );
+
+    document["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["patch"]["parameters"] =
+        json!([]);
+    let paths = document["paths"].as_object_mut().expect("paths object");
+    let mut detail = paths
+        .remove("/accounts/{account_id}/widgets/{widget_id}")
+        .expect("detail path");
+    detail["parameters"][1]["name"] = json!("widget_slug");
+    paths.insert(
+        "/accounts/{account_id}/widgets/{widget_slug}".to_owned(),
+        detail,
+    );
+    let slug_target = normalize_openapi(&document).expect("slug-target catalog");
+    assert!(
+        slug_target
+            .get("widgets-update")
+            .expect("update widget")
+            .updated_resource
+            .is_none()
     );
 }
 

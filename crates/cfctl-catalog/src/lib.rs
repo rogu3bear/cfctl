@@ -9,7 +9,7 @@ use std::{
 use cfctl_core::{
     AdapterStatus, BillingModelV1, CapabilityV1, CostExposureV1, CreatedResourceContractV1,
     DeletedResourceContractV1, EffectClass, KnowledgeReferenceV1, Maturity, RiskClass, SelectorV1,
-    hash_value,
+    UpdatedResourceContractV1, hash_value,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -890,6 +890,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
 
     classify_exact_resource_contracts(&mut capabilities);
     classify_parent_collection_delete_contracts(document, &mut capabilities);
+    classify_parent_collection_update_contracts(document, &mut capabilities);
     classify_same_path_object_update_contracts(document, &mut capabilities);
     classify_created_resource_contracts(&mut capabilities, &creates_with_schema_proven_string_ids);
 
@@ -1104,14 +1105,13 @@ fn classify_parent_collection_delete_contracts(
         .filter(|capability| capability.method == "GET")
         .filter_map(|capability| {
             let operation = document.get("paths")?.get(&capability.path)?.get("get")?;
-            complete_collection_readback_contract(document, operation, capability).map(
-                |requires_page_number_completion| {
+            complete_collection_readback_contract(document, operation, &capability.selectors, &[])
+                .map(|requires_page_number_completion| {
                     (
                         (capability.path.clone(), capability.product.clone()),
                         (capability.id.clone(), requires_page_number_completion),
                     )
-                },
-            )
+                })
         })
         .collect::<BTreeMap<_, _>>();
 
@@ -1168,21 +1168,119 @@ fn classify_parent_collection_delete_contracts(
     }
 }
 
+fn classify_parent_collection_update_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let list_targets = capabilities
+        .values()
+        .filter(|capability| capability.method == "GET")
+        .map(|capability| {
+            (
+                (capability.path.clone(), capability.product.clone()),
+                (capability.id.clone(), capability.selectors.clone()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for capability in capabilities.values_mut() {
+        if !matches!(capability.method.as_str(), "PATCH" | "PUT")
+            || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
+            || !path_targets_exact_resource(&capability.path)
+            || capability
+                .selectors
+                .iter()
+                .any(|selector| selector.location != "path")
+        {
+            continue;
+        }
+        let Some((collection_path, identity_segment)) = capability.path.rsplit_once('/') else {
+            continue;
+        };
+        let Some(identity_selector) = identity_segment
+            .strip_prefix('{')
+            .and_then(|segment| segment.strip_suffix('}'))
+            .filter(|selector| selector_can_be_response_id(selector))
+        else {
+            continue;
+        };
+        let Some((read_capability_id, read_selectors)) =
+            list_targets.get(&(collection_path.to_owned(), capability.product.clone()))
+        else {
+            continue;
+        };
+        let Some(read_operation) = document
+            .get("paths")
+            .and_then(Value::as_object)
+            .and_then(|paths| paths.get(collection_path))
+            .and_then(|path| path.get("get"))
+        else {
+            continue;
+        };
+        let Some(mut verified_response_fields) = capability
+            .request_schema
+            .as_ref()
+            .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))
+            .and_then(|schema| schema.get("properties"))
+            .and_then(Value::as_object)
+            .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+            .filter(|fields| !fields.is_empty())
+        else {
+            continue;
+        };
+        verified_response_fields.sort();
+        verified_response_fields.dedup();
+        let field_names = verified_response_fields
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let Some(requires_page_number_completion) = complete_collection_readback_contract(
+            document,
+            read_operation,
+            read_selectors,
+            &field_names,
+        ) else {
+            continue;
+        };
+
+        capability.updated_resource = Some(UpdatedResourceContractV1 {
+            collection_path: collection_path.to_owned(),
+            identity_selector: identity_selector.to_owned(),
+            response_item_identity_pointer: "/id".to_owned(),
+            read_capability_id: read_capability_id.clone(),
+            verified_response_fields,
+            requires_page_number_completion,
+        });
+        "parent_collection_item_contains_planned_fields_after_update"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "automatic restoration is unsupported because the plan does not bind a pre-change snapshot; restoration requires a separately reviewed update plan built from trusted evidence"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
+
+fn selector_can_be_response_id(selector: &str) -> bool {
+    selector == "id" || selector.ends_with("_id") || selector.ends_with("_identifier")
+}
+
 fn complete_collection_readback_contract(
     document: &Value,
     operation: &Value,
-    capability: &CapabilityV1,
+    selectors: &[SelectorV1],
+    verified_item_fields: &[&str],
 ) -> Option<bool> {
-    if capability
-        .selectors
+    if selectors
         .iter()
         .any(|selector| selector.required && selector.location != "path")
     {
         return None;
     }
 
-    let query_names = capability
-        .selectors
+    let query_names = selectors
         .iter()
         .filter(|selector| selector.location == "query")
         .map(|selector| selector.name.to_ascii_lowercase())
@@ -1205,7 +1303,12 @@ fn complete_collection_readback_contract(
     if unsupported_pagination {
         return None;
     }
-    if !success_response_declares_complete_collection(document, operation, page_number_pagination) {
+    if !success_response_declares_complete_collection(
+        document,
+        operation,
+        page_number_pagination,
+        verified_item_fields,
+    ) {
         return None;
     }
     Some(page_number_pagination)
@@ -1281,6 +1384,7 @@ fn success_response_declares_complete_collection(
     document: &Value,
     operation: &Value,
     requires_page_number_completion: bool,
+    verified_item_fields: &[&str],
 ) -> bool {
     operation
         .get("responses")
@@ -1291,11 +1395,113 @@ fn success_response_declares_complete_collection(
         .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
         .any(|schema| {
             schema_declares_result_array_string_id(document, schema, 0)
+                && (verified_item_fields.is_empty()
+                    || schema_declares_result_array_item_fields(
+                        document,
+                        schema,
+                        verified_item_fields,
+                        0,
+                    ))
                 && (!requires_page_number_completion
                     || [["result_info", "page"], ["result_info", "total_pages"]]
                         .iter()
                         .all(|path| schema_declares_numeric_path(document, schema, path, 0)))
         })
+}
+
+fn schema_declares_result_array_item_fields(
+    document: &Value,
+    schema: &Value,
+    fields: &[&str],
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                schema_declares_result_array_item_fields(document, resolved, fields, depth + 1)
+            });
+    }
+    if let Some(result) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get("result"))
+        && schema_declares_array_item_fields(document, result, fields, depth + 1)
+    {
+        return true;
+    }
+    if schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members.iter().any(|member| {
+                schema_declares_result_array_item_fields(document, member, fields, depth + 1)
+            })
+        })
+    {
+        return true;
+    }
+    for alternative in ["oneOf", "anyOf"] {
+        if let Some(members) = schema.get(alternative).and_then(Value::as_array) {
+            return !members.is_empty()
+                && members.iter().all(|member| {
+                    schema_declares_result_array_item_fields(document, member, fields, depth + 1)
+                });
+        }
+    }
+    false
+}
+
+fn schema_declares_array_item_fields(
+    document: &Value,
+    schema: &Value,
+    fields: &[&str],
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                schema_declares_array_item_fields(document, resolved, fields, depth + 1)
+            });
+    }
+    if schema.get("type").and_then(Value::as_str) == Some("array")
+        && schema.get("items").is_some_and(|items| {
+            fields
+                .iter()
+                .all(|field| schema_declares_path(document, items, &[*field], depth + 1))
+        })
+    {
+        return true;
+    }
+    if schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members.iter().any(|member| {
+                schema_declares_array_item_fields(document, member, fields, depth + 1)
+            })
+        })
+    {
+        return true;
+    }
+    for alternative in ["oneOf", "anyOf"] {
+        if let Some(members) = schema.get(alternative).and_then(Value::as_array) {
+            return !members.is_empty()
+                && members.iter().all(|member| {
+                    schema_declares_array_item_fields(document, member, fields, depth + 1)
+                });
+        }
+    }
+    false
 }
 
 fn schema_declares_result_array_string_id(document: &Value, schema: &Value, depth: usize) -> bool {
