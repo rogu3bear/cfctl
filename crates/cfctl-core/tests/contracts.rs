@@ -1691,6 +1691,81 @@ fn core_approval_rejects_invalid_money_without_relying_on_the_cli_parser() {
 }
 
 #[test]
+fn approval_requires_explicit_yes_and_rejects_chat_intent_alone() {
+    let capability = CapabilityV1::new(
+        "dns.records.update",
+        "Update DNS record",
+        "PUT",
+        "/zones/{zone_id}/dns_records/{record_id}",
+    );
+    let mut plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "schema-sha",
+        capability,
+        json!({"zone_id":"zone-a","record_id":"record-a"}),
+    )
+    .expect("plan");
+
+    let error = plan
+        .approve(false, None)
+        .expect_err("chat/intent yes without --yes is not authority");
+    assert!(
+        error
+            .to_string()
+            .contains("approval must be an explicit yes bound to the operation id"),
+        "{error}"
+    );
+    assert_eq!(plan.status, PlanStatus::Draft);
+    assert!(plan.approval.is_none());
+}
+
+#[test]
+fn approval_rejects_a_hash_drifted_draft_before_granting_authority() {
+    let capability = CapabilityV1::new(
+        "dns.records.update",
+        "Update DNS record",
+        "PUT",
+        "/zones/{zone_id}/dns_records/{record_id}",
+    );
+    let mut plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "schema-sha",
+        capability,
+        json!({"zone_id":"zone-a","record_id":"record-a"}),
+    )
+    .expect("plan");
+    let bound_hash = plan.content_hash.clone();
+
+    // Operator-visible targets change without rebinding the reviewed content hash.
+    plan.targets = json!({"zone_id":"zone-b","record_id":"record-a"});
+    assert_eq!(plan.content_hash, bound_hash);
+
+    let error = plan
+        .approve(true, None)
+        .expect_err("hash-drifted draft must not approve");
+    assert!(
+        error.to_string().contains("unchanged hash-bound draft"),
+        "{error}"
+    );
+    assert_eq!(plan.status, PlanStatus::Draft);
+    assert!(plan.approval.is_none());
+
+    plan.refresh_hash()
+        .expect("rebind after intentional review");
+    plan.approve(true, None)
+        .expect("rehashed draft may approve with explicit yes");
+    assert_eq!(plan.status, PlanStatus::Approved);
+    assert_eq!(
+        plan.approval
+            .as_ref()
+            .map(|approval| approval.approved_content_hash.as_str()),
+        Some(plan.content_hash.as_str())
+    );
+}
+
+#[test]
 fn redaction_recurses_through_objects_and_arrays() {
     let value = json!({
         "access_token": "secret-a",

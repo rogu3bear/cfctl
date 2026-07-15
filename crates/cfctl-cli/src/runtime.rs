@@ -11710,9 +11710,7 @@ mod tests {
         let blocked = reject_implicit_global_key_selection(&emergency, None)
             .expect_err("implicit global-key selection must fail closed");
         assert!(
-            blocked
-                .to_string()
-                .contains("never selected implicitly"),
+            blocked.to_string().contains("never selected implicitly"),
             "{blocked}"
         );
         reject_implicit_global_key_selection(&emergency, Some("emergency"))
