@@ -3259,6 +3259,313 @@ fn access_authorization_configuration_classifier_rejects_retargeting_and_permiss
     assert_eq!(drifted_create.adapter_status, AdapterStatus::Blocked);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadBalancingFixtureKind {
+    MonitorOrPool,
+    LoadBalancer,
+}
+
+struct LoadBalancingConfigurationFixture {
+    collection_path: &'static str,
+    detail_path: &'static str,
+    create_id: &'static str,
+    patch_id: &'static str,
+    update_id: &'static str,
+    read_id: &'static str,
+    delete_id: &'static str,
+    product: &'static str,
+    permission: &'static str,
+    kind: LoadBalancingFixtureKind,
+}
+
+fn load_balancing_configuration_fixture(
+    case: &LoadBalancingConfigurationFixture,
+) -> serde_json::Value {
+    let mut document = create_lifecycle_fixture();
+    let mut collection = document["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets")
+        .expect("widget collection");
+    collection["post"]["operationId"] = json!(case.create_id);
+    collection["post"]["tags"] = json!([case.product]);
+    collection["post"]["x-api-token-group"] = json!([case.permission]);
+
+    let mut detail = document["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets/{widget_id}")
+        .expect("widget detail");
+    let identity_selector = case
+        .detail_path
+        .rsplit_once('{')
+        .and_then(|(_, suffix)| suffix.strip_suffix('}'))
+        .expect("identity selector");
+    let scope_selector = if case.collection_path.starts_with("/accounts/") {
+        Some("account_id")
+    } else if case.collection_path.starts_with("/zones/") {
+        Some("zone_id")
+    } else {
+        None
+    };
+    collection["parameters"] = scope_selector.map_or_else(
+        || json!([]),
+        |selector| {
+            json!([{
+                "in":"path","name":selector,"required":true,"schema":{"type":"string"}
+            }])
+        },
+    );
+    detail["parameters"] = json!([]);
+    if let Some(selector) = scope_selector {
+        detail["parameters"]
+            .as_array_mut()
+            .expect("detail parameters")
+            .push(json!({
+                "in":"path","name":selector,"required":true,"schema":{"type":"string"}
+            }));
+    }
+    detail["parameters"]
+        .as_array_mut()
+        .expect("detail parameters")
+        .push(json!({
+            "in":"path","name":identity_selector,"required":true,"schema":{"type":"string"}
+        }));
+    detail["get"]["operationId"] = json!(case.read_id);
+    detail["get"]["tags"] = json!([case.product]);
+    detail["delete"]["operationId"] = json!(case.delete_id);
+    detail["delete"]["tags"] = json!([case.product]);
+    detail["delete"]["x-api-token-group"] = json!([case.permission]);
+    let update = json!({
+        "summary": "Update Load Balancing configuration",
+        "tags": [case.product],
+        "x-api-token-group": [case.permission],
+        "requestBody": {
+            "required": true,
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {"name": {"type": "string"}}
+            }}}
+        },
+        "responses": {
+            "200": {
+                "description": "Load Balancing configuration updated",
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/WidgetResponse"}
+                    }
+                }
+            }
+        }
+    });
+    detail["patch"] = update.clone();
+    detail["patch"]["operationId"] = json!(case.patch_id);
+    detail["put"] = update;
+    detail["put"]["operationId"] = json!(case.update_id);
+    document["paths"][case.collection_path] = collection;
+    document["paths"][case.detail_path] = detail;
+    document
+}
+
+fn load_balancing_configuration_fixtures() -> [LoadBalancingConfigurationFixture; 6] {
+    [
+        LoadBalancingConfigurationFixture {
+            collection_path: "/accounts/{account_id}/load_balancers/monitors",
+            detail_path: "/accounts/{account_id}/load_balancers/monitors/{monitor_id}",
+            create_id: "account-load-balancer-monitors-create-monitor",
+            patch_id: "account-load-balancer-monitors-patch-monitor",
+            update_id: "account-load-balancer-monitors-update-monitor",
+            read_id: "account-load-balancer-monitors-monitor-details",
+            delete_id: "account-load-balancer-monitors-delete-monitor",
+            product: "Account Load Balancer Monitors",
+            permission: "Load Balancing: Monitors and Pools Write",
+            kind: LoadBalancingFixtureKind::MonitorOrPool,
+        },
+        LoadBalancingConfigurationFixture {
+            collection_path: "/accounts/{account_id}/load_balancers/pools",
+            detail_path: "/accounts/{account_id}/load_balancers/pools/{pool_id}",
+            create_id: "account-load-balancer-pools-create-pool",
+            patch_id: "account-load-balancer-pools-patch-pool",
+            update_id: "account-load-balancer-pools-update-pool",
+            read_id: "account-load-balancer-pools-pool-details",
+            delete_id: "account-load-balancer-pools-delete-pool",
+            product: "Account Load Balancer Pools",
+            permission: "Load Balancing: Monitors and Pools Write",
+            kind: LoadBalancingFixtureKind::MonitorOrPool,
+        },
+        LoadBalancingConfigurationFixture {
+            collection_path: "/user/load_balancers/monitors",
+            detail_path: "/user/load_balancers/monitors/{monitor_id}",
+            create_id: "load-balancer-monitors-create-monitor",
+            patch_id: "load-balancer-monitors-patch-monitor",
+            update_id: "load-balancer-monitors-update-monitor",
+            read_id: "load-balancer-monitors-monitor-details",
+            delete_id: "load-balancer-monitors-delete-monitor",
+            product: "Load Balancer Monitors",
+            permission: "Load Balancing: Monitors and Pools Write",
+            kind: LoadBalancingFixtureKind::MonitorOrPool,
+        },
+        LoadBalancingConfigurationFixture {
+            collection_path: "/user/load_balancers/pools",
+            detail_path: "/user/load_balancers/pools/{pool_id}",
+            create_id: "load-balancer-pools-create-pool",
+            patch_id: "load-balancer-pools-patch-pool",
+            update_id: "load-balancer-pools-update-pool",
+            read_id: "load-balancer-pools-pool-details",
+            delete_id: "load-balancer-pools-delete-pool",
+            product: "Load Balancer Pools",
+            permission: "Load Balancing: Monitors and Pools Write",
+            kind: LoadBalancingFixtureKind::MonitorOrPool,
+        },
+        LoadBalancingConfigurationFixture {
+            collection_path: "/accounts/{account_id}/load_balancers",
+            detail_path: "/accounts/{account_id}/load_balancers/{load_balancer_id}",
+            create_id: "account-load-balancers-create-account-load-balancer",
+            patch_id: "account-load-balancers-patch-account-load-balancer",
+            update_id: "account-load-balancers-update-account-load-balancer",
+            read_id: "account-load-balancers-get-account-load-balancer",
+            delete_id: "account-load-balancers-delete-account-load-balancer",
+            product: "Account Load Balancers",
+            permission: "Load Balancers Account Write",
+            kind: LoadBalancingFixtureKind::LoadBalancer,
+        },
+        LoadBalancingConfigurationFixture {
+            collection_path: "/zones/{zone_id}/load_balancers",
+            detail_path: "/zones/{zone_id}/load_balancers/{load_balancer_id}",
+            create_id: "load-balancers-create-load-balancer",
+            patch_id: "load-balancers-patch-load-balancer",
+            update_id: "load-balancers-update-load-balancer",
+            read_id: "load-balancers-load-balancer-details",
+            delete_id: "load-balancers-delete-load-balancer",
+            product: "Load Balancers",
+            permission: "Load Balancers Write",
+            kind: LoadBalancingFixtureKind::LoadBalancer,
+        },
+    ]
+}
+
+#[test]
+fn load_balancing_configuration_has_exact_cost_entitlement_and_risk_contracts() {
+    for case in load_balancing_configuration_fixtures() {
+        let document = load_balancing_configuration_fixture(&case);
+        let snapshot = normalize_openapi(&document).expect("Load Balancing catalog");
+        for id in [case.create_id, case.patch_id, case.update_id] {
+            let capability = snapshot.get(id).expect("Load Balancing mutation");
+            assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+            assert_eq!(capability.cost.billing_model, BillingModelV1::UsageBased);
+            assert_eq!(capability.cost.exposure, CostExposureV1::DownstreamUsage);
+            assert!(capability.cost.references.iter().any(|reference| {
+                reference.url
+                    == "https://developers.cloudflare.com/load-balancing/get-started/enable-load-balancing/"
+            }));
+            assert!(capability.cost.references.iter().any(|reference| {
+                reference.url
+                    == "https://developers.cloudflare.com/load-balancing/get-started/quickstart/"
+            }));
+            assert_eq!(capability.entitlement.available, None);
+            assert!(capability.entitlement.plans.is_empty());
+            assert!(!capability.entitlement.requires_live_resolution);
+            assert!(
+                capability
+                    .entitlement
+                    .blocker
+                    .as_deref()
+                    .is_some_and(|blocker| {
+                        blocker.contains("paid account add-on")
+                            && blocker.contains("product-scoped subscription join key")
+                            && blocker.contains("Load Balancing")
+                    })
+            );
+            assert_eq!(
+                capability.entitlement.source.as_deref(),
+                Some(
+                    "https://developers.cloudflare.com/load-balancing/get-started/enable-load-balancing/"
+                )
+            );
+
+            match case.kind {
+                LoadBalancingFixtureKind::MonitorOrPool => {
+                    assert_eq!(capability.risk, RiskClass::CrossConfig);
+                    assert_eq!(capability.effect, EffectClass::ReversibleWrite);
+                    assert!(capability.cost.known);
+                    assert!(!capability.cost.incremental);
+                    assert_eq!(capability.cost.maximum, Some(0.0));
+                    assert_eq!(capability.mutation_contract_gaps().len(), 1);
+                    assert!(capability.mutation_contract_gaps()[0].contains("entitlement"));
+                }
+                LoadBalancingFixtureKind::LoadBalancer => {
+                    assert_eq!(capability.risk, RiskClass::Spend);
+                    assert_eq!(capability.effect, EffectClass::Spend);
+                    assert!(!capability.cost.known);
+                    assert!(capability.cost.incremental);
+                    assert_eq!(capability.cost.maximum, None);
+                    let gaps = capability.mutation_contract_gaps();
+                    assert_eq!(gaps.len(), 2);
+                    assert!(gaps.iter().any(|gap| gap.contains("cost is not bounded")));
+                    assert!(gaps.iter().any(|gap| gap.contains("entitlement")));
+                }
+            }
+        }
+    }
+
+    let case = load_balancing_configuration_fixtures()
+        .into_iter()
+        .find(|case| case.kind == LoadBalancingFixtureKind::LoadBalancer)
+        .expect("load balancer fixture");
+    let mut enriched = normalize_openapi(&load_balancing_configuration_fixture(&case))
+        .expect("Load Balancing catalog");
+    let expected_basis = enriched
+        .get(case.create_id)
+        .expect("load balancer create")
+        .cost
+        .basis
+        .clone();
+    attach_official_product_knowledge(&mut enriched, &pricing_feeds_fixture())
+        .expect("official pricing enrichment");
+    assert_eq!(
+        enriched
+            .get(case.create_id)
+            .expect("enriched load balancer create")
+            .cost
+            .basis,
+        expected_basis
+    );
+}
+
+#[test]
+fn load_balancing_configuration_classifier_rejects_retargeting_and_permission_drift() {
+    let case = load_balancing_configuration_fixtures()
+        .into_iter()
+        .next()
+        .expect("monitor fixture");
+    let mut retargeted = load_balancing_configuration_fixture(&case);
+    let collection = retargeted["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove(case.collection_path)
+        .expect("monitor collection");
+    retargeted["paths"]["/accounts/{account_id}/load_balancers/monitor_templates"] = collection;
+    let retargeted_snapshot = normalize_openapi(&retargeted).expect("retargeted catalog");
+    let retargeted_create = retargeted_snapshot
+        .get(case.create_id)
+        .expect("retargeted create");
+    assert_eq!(retargeted_create.risk, RiskClass::Unknown);
+    assert!(!retargeted_create.cost.known);
+    assert!(retargeted_create.entitlement.blocker.is_none());
+
+    let mut permission_drift = load_balancing_configuration_fixture(&case);
+    permission_drift["paths"][case.collection_path]["post"]["x-api-token-group"] =
+        json!(["Account Settings Write"]);
+    let permission_snapshot = normalize_openapi(&permission_drift).expect("permission drift");
+    let drifted_create = permission_snapshot
+        .get(case.create_id)
+        .expect("permission-drifted create");
+    assert_eq!(drifted_create.risk, RiskClass::Unknown);
+    assert!(!drifted_create.cost.known);
+    assert!(drifted_create.entitlement.blocker.is_none());
+}
+
 #[test]
 fn create_contract_binds_a_schema_proven_id_and_exact_read_delete_pair() {
     let document = create_lifecycle_fixture();

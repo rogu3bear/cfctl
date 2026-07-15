@@ -528,11 +528,15 @@ impl CapabilityV1 {
         if dynamic_api_contract && self.permissions.is_empty() {
             gaps.push("required Cloudflare permission lane is not declared".to_owned());
         }
-        let plan_gated = self.entitlement.plans.values().any(|available| !available);
-        if plan_gated && self.entitlement.available != Some(true) {
-            gaps.push(self.entitlement.blocker.clone().unwrap_or_else(|| {
-                "account entitlement has not been resolved for this plan-gated operation".to_owned()
-            }));
+        if self.entitlement.available != Some(true) {
+            if let Some(blocker) = self.entitlement.blocker.as_ref() {
+                gaps.push(blocker.clone());
+            } else if self.entitlement.plans.values().any(|available| !available) {
+                gaps.push(
+                    "account entitlement has not been resolved for this plan-gated operation"
+                        .to_owned(),
+                );
+            }
         }
         gaps
     }

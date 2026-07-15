@@ -432,7 +432,10 @@ pub fn attach_official_product_knowledge(
             } else {
                 CostExposureV1::DownstreamUsage
             };
-            if capability.mutating && !capability.cost.known {
+            if capability.mutating
+                && !capability.cost.known
+                && cost_basis_is_schema_placeholder(capability.cost.basis.as_deref())
+            {
                 capability.cost.basis = Some(
                     "official product pricing is linked, but the mutation does not declare a hard ceiling for downstream resource or usage charges"
                         .to_owned(),
@@ -442,6 +445,16 @@ pub fn attach_official_product_knowledge(
         refresh_dynamic_mutation_contract(capability);
     }
     snapshot.refresh_hash()
+}
+
+fn cost_basis_is_schema_placeholder(basis: Option<&str>) -> bool {
+    matches!(
+        basis,
+        None | Some(
+            "official API schema does not declare operation pricing"
+                | "official schema does not declare a hard price ceiling"
+        )
+    )
 }
 
 fn supports_live_zone_entitlement_resolution(capability: &CapabilityV1) -> bool {
@@ -3444,6 +3457,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         classify_dns_record_lifecycle(capability);
     } else if let Some(kind) = access_authorization_configuration_kind(capability) {
         classify_access_authorization_configuration(capability, kind);
+    } else if let Some(kind) = load_balancing_configuration_kind(capability) {
+        classify_load_balancing_configuration(capability, kind);
     } else {
         return false;
     }
@@ -3814,6 +3829,178 @@ fn classify_access_authorization_configuration(
     ]);
     capability.entitlement.source =
         Some("https://www.cloudflare.com/plans/zero-trust-services/".to_owned());
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadBalancingConfigurationKind {
+    MonitorOrPool,
+    LoadBalancer,
+}
+
+struct LoadBalancingConfigurationContract {
+    create_id: &'static str,
+    patch_id: &'static str,
+    update_id: &'static str,
+    collection_path: &'static str,
+    detail_path: &'static str,
+    product: &'static str,
+    permission: &'static str,
+    kind: LoadBalancingConfigurationKind,
+}
+
+const LOAD_BALANCING_CONFIGURATION_CONTRACTS: &[LoadBalancingConfigurationContract] = &[
+    LoadBalancingConfigurationContract {
+        create_id: "account-load-balancer-monitors-create-monitor",
+        patch_id: "account-load-balancer-monitors-patch-monitor",
+        update_id: "account-load-balancer-monitors-update-monitor",
+        collection_path: "/accounts/{account_id}/load_balancers/monitors",
+        detail_path: "/accounts/{account_id}/load_balancers/monitors/{monitor_id}",
+        product: "Account Load Balancer Monitors",
+        permission: "Load Balancing: Monitors and Pools Write",
+        kind: LoadBalancingConfigurationKind::MonitorOrPool,
+    },
+    LoadBalancingConfigurationContract {
+        create_id: "account-load-balancer-pools-create-pool",
+        patch_id: "account-load-balancer-pools-patch-pool",
+        update_id: "account-load-balancer-pools-update-pool",
+        collection_path: "/accounts/{account_id}/load_balancers/pools",
+        detail_path: "/accounts/{account_id}/load_balancers/pools/{pool_id}",
+        product: "Account Load Balancer Pools",
+        permission: "Load Balancing: Monitors and Pools Write",
+        kind: LoadBalancingConfigurationKind::MonitorOrPool,
+    },
+    LoadBalancingConfigurationContract {
+        create_id: "load-balancer-monitors-create-monitor",
+        patch_id: "load-balancer-monitors-patch-monitor",
+        update_id: "load-balancer-monitors-update-monitor",
+        collection_path: "/user/load_balancers/monitors",
+        detail_path: "/user/load_balancers/monitors/{monitor_id}",
+        product: "Load Balancer Monitors",
+        permission: "Load Balancing: Monitors and Pools Write",
+        kind: LoadBalancingConfigurationKind::MonitorOrPool,
+    },
+    LoadBalancingConfigurationContract {
+        create_id: "load-balancer-pools-create-pool",
+        patch_id: "load-balancer-pools-patch-pool",
+        update_id: "load-balancer-pools-update-pool",
+        collection_path: "/user/load_balancers/pools",
+        detail_path: "/user/load_balancers/pools/{pool_id}",
+        product: "Load Balancer Pools",
+        permission: "Load Balancing: Monitors and Pools Write",
+        kind: LoadBalancingConfigurationKind::MonitorOrPool,
+    },
+    LoadBalancingConfigurationContract {
+        create_id: "account-load-balancers-create-account-load-balancer",
+        patch_id: "account-load-balancers-patch-account-load-balancer",
+        update_id: "account-load-balancers-update-account-load-balancer",
+        collection_path: "/accounts/{account_id}/load_balancers",
+        detail_path: "/accounts/{account_id}/load_balancers/{load_balancer_id}",
+        product: "Account Load Balancers",
+        permission: "Load Balancers Account Write",
+        kind: LoadBalancingConfigurationKind::LoadBalancer,
+    },
+    LoadBalancingConfigurationContract {
+        create_id: "load-balancers-create-load-balancer",
+        patch_id: "load-balancers-patch-load-balancer",
+        update_id: "load-balancers-update-load-balancer",
+        collection_path: "/zones/{zone_id}/load_balancers",
+        detail_path: "/zones/{zone_id}/load_balancers/{load_balancer_id}",
+        product: "Load Balancers",
+        permission: "Load Balancers Write",
+        kind: LoadBalancingConfigurationKind::LoadBalancer,
+    },
+];
+
+fn load_balancing_configuration_kind(
+    capability: &CapabilityV1,
+) -> Option<LoadBalancingConfigurationKind> {
+    LOAD_BALANCING_CONFIGURATION_CONTRACTS
+        .iter()
+        .find(|contract| {
+            let route_matches = if capability.id == contract.create_id {
+                capability.method == "POST" && capability.path == contract.collection_path
+            } else if capability.id == contract.patch_id {
+                capability.method == "PATCH" && capability.path == contract.detail_path
+            } else if capability.id == contract.update_id {
+                capability.method == "PUT" && capability.path == contract.detail_path
+            } else {
+                false
+            };
+            route_matches
+                && capability.product == contract.product
+                && capability.permissions.len() == 1
+                && capability.permissions[0] == contract.permission
+        })
+        .map(|contract| contract.kind)
+}
+
+fn classify_load_balancing_configuration(
+    capability: &mut CapabilityV1,
+    kind: LoadBalancingConfigurationKind,
+) {
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Enable Load Balancing".to_owned(),
+            url: "https://developers.cloudflare.com/load-balancing/get-started/enable-load-balancing/"
+                .to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Load Balancing quickstart".to_owned(),
+            url: "https://developers.cloudflare.com/load-balancing/get-started/quickstart/"
+                .to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Load Balancing quota errors".to_owned(),
+            url: "https://developers.cloudflare.com/load-balancing/troubleshooting/common-error-codes/"
+                .to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+    ];
+    capability.entitlement.available = None;
+    capability.entitlement.plans.clear();
+    capability.entitlement.blocker = Some(
+        "paid account add-on entitlement is unresolved because the official API contract does not publish an exact product-scoped subscription join key for Load Balancing on the selected account"
+            .to_owned(),
+    );
+    capability.entitlement.source = Some(
+        "https://developers.cloudflare.com/load-balancing/get-started/enable-load-balancing/"
+            .to_owned(),
+    );
+    capability.entitlement.requires_live_resolution = false;
+
+    match kind {
+        LoadBalancingConfigurationKind::MonitorOrPool => {
+            capability.risk = RiskClass::CrossConfig;
+            capability.effect = EffectClass::ReversibleWrite;
+            capability.cost.incremental = false;
+            capability.cost.currency = None;
+            capability.cost.maximum = Some(0.0);
+            capability.cost.known = true;
+            capability.cost.basis = Some(
+                "creating or updating a monitor or pool does not purchase or upgrade the paid add-on and Cloudflare rejects objects beyond the account quota; referenced pools can reroute traffic and attached monitors can generate health-probe traffic under the existing usage-based subscription"
+                    .to_owned(),
+            );
+        }
+        LoadBalancingConfigurationKind::LoadBalancer => {
+            capability.risk = RiskClass::Spend;
+            capability.effect = EffectClass::Spend;
+            capability.cost.incremental = true;
+            capability.cost.currency = None;
+            capability.cost.maximum = None;
+            capability.cost.known = false;
+            capability.cost.basis = Some(
+                "creating or updating a traffic-serving load balancer can add usage under the paid Load Balancing add-on; the request and account contract do not provide a hard monetary ceiling"
+                    .to_owned(),
+            );
+        }
+    }
     capability.verification.required = true;
     "post_change_read_or_operation_specific_verifier"
         .clone_into(&mut capability.verification.strategy);

@@ -124,6 +124,24 @@ fn known_incremental_cost_requires_a_valid_executable_ceiling() {
 }
 
 #[test]
+fn explicit_entitlement_blocker_is_enforced_without_a_plan_matrix() {
+    let mut capability = CapabilityV1::new(
+        "paid.widgets.create",
+        "Create a paid widget",
+        "POST",
+        "/accounts/{account_id}/widgets",
+    );
+    let blocker = "live paid add-on entitlement is unresolved for the selected account".to_owned();
+    capability.entitlement.blocker = Some(blocker.clone());
+
+    assert!(capability.entitlement.plans.is_empty());
+    assert!(capability.mutation_contract_gaps().contains(&blocker));
+
+    capability.entitlement.available = Some(true);
+    assert!(!capability.mutation_contract_gaps().contains(&blocker));
+}
+
+#[test]
 fn mutation_contracts_reject_declared_but_unimplemented_strategies() {
     let mut capability = CapabilityV1::new(
         "widgets.create",
