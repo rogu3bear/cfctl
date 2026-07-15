@@ -3370,27 +3370,10 @@ fn classify(capability: &mut CapabilityV1) {
         "not_applicable".clone_into(&mut capability.verification.strategy);
         return;
     }
-    if [
-        "account-api-tokens-create-token",
-        "account-api-tokens-roll-token",
-        "account-api-tokens-delete-token",
-        "user-api-tokens-create-token",
-        "user-api-tokens-roll-token",
-        "user-api-tokens-delete-token",
-    ]
-    .contains(&capability.id.as_str())
-    {
-        classify_api_token_lifecycle(capability);
+    if classify_operation_specific_contract(capability) {
         return;
-    } else if is_workers_ai_model_run(capability) {
-        return classify_workers_ai_model_run(capability);
-    } else if is_d1_read_replication_update(capability) {
-        classify_d1_read_replication_update(capability);
-        return;
-    } else if is_dns_record_lifecycle(&capability.id) {
-        classify_dns_record_lifecycle(capability);
-        return;
-    } else if capability.method == "DELETE"
+    }
+    if capability.method == "DELETE"
         || ["delete", "purge", "revoke", "remove"]
             .iter()
             .any(|term| text.contains(term))
@@ -3439,6 +3422,32 @@ fn classify(capability: &mut CapabilityV1) {
     capability.verification.required = true;
     "post_change_read_or_operation_specific_verifier"
         .clone_into(&mut capability.verification.strategy);
+}
+
+fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
+    if [
+        "account-api-tokens-create-token",
+        "account-api-tokens-roll-token",
+        "account-api-tokens-delete-token",
+        "user-api-tokens-create-token",
+        "user-api-tokens-roll-token",
+        "user-api-tokens-delete-token",
+    ]
+    .contains(&capability.id.as_str())
+    {
+        classify_api_token_lifecycle(capability);
+    } else if is_workers_ai_model_run(capability) {
+        classify_workers_ai_model_run(capability);
+    } else if is_d1_read_replication_update(capability) {
+        classify_d1_read_replication_update(capability);
+    } else if is_dns_record_lifecycle(&capability.id) {
+        classify_dns_record_lifecycle(capability);
+    } else if let Some(kind) = access_authorization_configuration_kind(capability) {
+        classify_access_authorization_configuration(capability, kind);
+    } else {
+        return false;
+    }
+    true
 }
 
 fn is_workers_ai_model_run(capability: &CapabilityV1) -> bool {
@@ -3588,6 +3597,223 @@ fn classify_d1_read_replication_update(capability: &mut CapabilityV1) {
             source: "official Cloudflare docs".to_owned(),
         },
     ];
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessAuthorizationConfigurationKind {
+    Group,
+    IdentityProvider,
+    Policy,
+}
+
+struct AccessAuthorizationConfigurationContract {
+    id: &'static str,
+    method: &'static str,
+    path: &'static str,
+    product: &'static str,
+    permission: &'static str,
+    kind: AccessAuthorizationConfigurationKind,
+}
+
+const ACCESS_AUTHORIZATION_CONFIGURATION_CONTRACTS: &[AccessAuthorizationConfigurationContract] = &[
+    AccessAuthorizationConfigurationContract {
+        id: "access-groups-create-an-access-group",
+        method: "POST",
+        path: "/accounts/{account_id}/access/groups",
+        product: "Access groups",
+        permission: "Access: Organizations, Identity Providers, and Groups Write",
+        kind: AccessAuthorizationConfigurationKind::Group,
+    },
+    AccessAuthorizationConfigurationContract {
+        id: "access-groups-update-an-access-group",
+        method: "PUT",
+        path: "/accounts/{account_id}/access/groups/{group_id}",
+        product: "Access groups",
+        permission: "Access: Organizations, Identity Providers, and Groups Write",
+        kind: AccessAuthorizationConfigurationKind::Group,
+    },
+    AccessAuthorizationConfigurationContract {
+        id: "zone-level-access-groups-create-an-access-group",
+        method: "POST",
+        path: "/zones/{zone_id}/access/groups",
+        product: "Zone-Level Access groups",
+        permission: "Access: Organizations, Identity Providers, and Groups Write",
+        kind: AccessAuthorizationConfigurationKind::Group,
+    },
+    AccessAuthorizationConfigurationContract {
+        id: "zone-level-access-groups-update-an-access-group",
+        method: "PUT",
+        path: "/zones/{zone_id}/access/groups/{group_id}",
+        product: "Zone-Level Access groups",
+        permission: "Access: Organizations, Identity Providers, and Groups Write",
+        kind: AccessAuthorizationConfigurationKind::Group,
+    },
+    AccessAuthorizationConfigurationContract {
+        id: "access-identity-providers-add-an-access-identity-provider",
+        method: "POST",
+        path: "/accounts/{account_id}/access/identity_providers",
+        product: "Access identity providers",
+        permission: "Access: Organizations, Identity Providers, and Groups Write",
+        kind: AccessAuthorizationConfigurationKind::IdentityProvider,
+    },
+    AccessAuthorizationConfigurationContract {
+        id: "access-identity-providers-update-an-access-identity-provider",
+        method: "PUT",
+        path: "/accounts/{account_id}/access/identity_providers/{identity_provider_id}",
+        product: "Access identity providers",
+        permission: "Access: Organizations, Identity Providers, and Groups Write",
+        kind: AccessAuthorizationConfigurationKind::IdentityProvider,
+    },
+    AccessAuthorizationConfigurationContract {
+        id: "zone-level-access-identity-providers-add-an-access-identity-provider",
+        method: "POST",
+        path: "/zones/{zone_id}/access/identity_providers",
+        product: "Zone-Level Access identity providers",
+        permission: "Access: Organizations, Identity Providers, and Groups Write",
+        kind: AccessAuthorizationConfigurationKind::IdentityProvider,
+    },
+    AccessAuthorizationConfigurationContract {
+        id: "zone-level-access-identity-providers-update-an-access-identity-provider",
+        method: "PUT",
+        path: "/zones/{zone_id}/access/identity_providers/{identity_provider_id}",
+        product: "Zone-Level Access identity providers",
+        permission: "Access: Organizations, Identity Providers, and Groups Write",
+        kind: AccessAuthorizationConfigurationKind::IdentityProvider,
+    },
+    AccessAuthorizationConfigurationContract {
+        id: "access-policies-create-an-access-policy",
+        method: "POST",
+        path: "/accounts/{account_id}/access/apps/{app_id}/policies",
+        product: "Access application-scoped policies",
+        permission: "Access: Apps and Policies Write",
+        kind: AccessAuthorizationConfigurationKind::Policy,
+    },
+    AccessAuthorizationConfigurationContract {
+        id: "access-policies-update-an-access-policy",
+        method: "PUT",
+        path: "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}",
+        product: "Access application-scoped policies",
+        permission: "Access: Apps and Policies Write",
+        kind: AccessAuthorizationConfigurationKind::Policy,
+    },
+    AccessAuthorizationConfigurationContract {
+        id: "access-policies-create-an-access-reusable-policy",
+        method: "POST",
+        path: "/accounts/{account_id}/access/policies",
+        product: "Access reusable policies",
+        permission: "Access: Apps and Policies Write",
+        kind: AccessAuthorizationConfigurationKind::Policy,
+    },
+    AccessAuthorizationConfigurationContract {
+        id: "access-policies-update-an-access-reusable-policy",
+        method: "PUT",
+        path: "/accounts/{account_id}/access/policies/{policy_id}",
+        product: "Access reusable policies",
+        permission: "Access: Apps and Policies Write",
+        kind: AccessAuthorizationConfigurationKind::Policy,
+    },
+    AccessAuthorizationConfigurationContract {
+        id: "zone-level-access-policies-create-an-access-policy",
+        method: "POST",
+        path: "/zones/{zone_id}/access/apps/{app_id}/policies",
+        product: "Zone-Level Access policies",
+        permission: "Access: Apps and Policies Write",
+        kind: AccessAuthorizationConfigurationKind::Policy,
+    },
+    AccessAuthorizationConfigurationContract {
+        id: "zone-level-access-policies-update-an-access-policy",
+        method: "PUT",
+        path: "/zones/{zone_id}/access/apps/{app_id}/policies/{policy_id}",
+        product: "Zone-Level Access policies",
+        permission: "Access: Apps and Policies Write",
+        kind: AccessAuthorizationConfigurationKind::Policy,
+    },
+];
+
+fn access_authorization_configuration_kind(
+    capability: &CapabilityV1,
+) -> Option<AccessAuthorizationConfigurationKind> {
+    ACCESS_AUTHORIZATION_CONFIGURATION_CONTRACTS
+        .iter()
+        .find(|contract| {
+            capability.id == contract.id
+                && capability.method == contract.method
+                && capability.path == contract.path
+                && capability.product == contract.product
+                && !capability.permissions.is_empty()
+                && capability
+                    .permissions
+                    .iter()
+                    .all(|actual| actual == contract.permission)
+        })
+        .map(|contract| contract.kind)
+}
+
+fn classify_access_authorization_configuration(
+    capability: &mut CapabilityV1,
+    kind: AccessAuthorizationConfigurationKind,
+) {
+    capability.risk = match kind {
+        AccessAuthorizationConfigurationKind::IdentityProvider => RiskClass::IdentityOrOwnership,
+        AccessAuthorizationConfigurationKind::Group
+        | AccessAuthorizationConfigurationKind::Policy => RiskClass::CrossConfig,
+    };
+    capability.effect = match kind {
+        AccessAuthorizationConfigurationKind::IdentityProvider => EffectClass::IdentityOrOwnership,
+        AccessAuthorizationConfigurationKind::Group
+        | AccessAuthorizationConfigurationKind::Policy => EffectClass::ReversibleWrite,
+    };
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.billing_model = BillingModelV1::Subscription;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "creating or updating Access authorization configuration has no direct operation charge and does not itself consume a user seat; users who subsequently authenticate or generate Gateway activity can consume seats under the account's Free, pay-as-you-go, or contract plan"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Cloudflare Zero Trust and SASE plans".to_owned(),
+            url: "https://www.cloudflare.com/plans/zero-trust-services/".to_owned(),
+            source: "official Cloudflare pricing".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare One seat management".to_owned(),
+            url: "https://developers.cloudflare.com/cloudflare-one/team-and-resources/users/seat-management/"
+                .to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+    ];
+    capability.cost.references.push(match kind {
+        AccessAuthorizationConfigurationKind::Group => KnowledgeReferenceV1 {
+            title: "Cloudflare Access rule groups".to_owned(),
+            url: "https://developers.cloudflare.com/cloudflare-one/access-controls/policies/groups/"
+                .to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        AccessAuthorizationConfigurationKind::IdentityProvider => KnowledgeReferenceV1 {
+            title: "Cloudflare Access identity providers".to_owned(),
+            url: "https://developers.cloudflare.com/cloudflare-one/integrations/identity-providers/"
+                .to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        AccessAuthorizationConfigurationKind::Policy => KnowledgeReferenceV1 {
+            title: "Manage Cloudflare Access policies".to_owned(),
+            url: "https://developers.cloudflare.com/cloudflare-one/access-controls/policies/policy-management/"
+                .to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+    });
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans = BTreeMap::from([
+        ("free".to_owned(), true),
+        ("pay_as_you_go".to_owned(), true),
+        ("contract".to_owned(), true),
+    ]);
+    capability.entitlement.source =
+        Some("https://www.cloudflare.com/plans/zero-trust-services/".to_owned());
     capability.verification.required = true;
     "post_change_read_or_operation_specific_verifier"
         .clone_into(&mut capability.verification.strategy);

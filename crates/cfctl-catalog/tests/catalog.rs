@@ -3063,6 +3063,202 @@ fn create_lifecycle_fixture() -> serde_json::Value {
     })
 }
 
+struct AccessConfigurationFixture {
+    collection_path: &'static str,
+    detail_path: &'static str,
+    create_id: &'static str,
+    update_id: &'static str,
+    read_id: &'static str,
+    delete_id: &'static str,
+    product: &'static str,
+    permission: &'static str,
+    expected_risk: RiskClass,
+    expected_effect: EffectClass,
+}
+
+fn access_configuration_fixture(case: &AccessConfigurationFixture) -> serde_json::Value {
+    let mut document = create_lifecycle_fixture();
+    let mut collection = document["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets")
+        .expect("widget collection");
+    collection["post"]["operationId"] = json!(case.create_id);
+    collection["post"]["tags"] = json!([case.product]);
+    collection["post"]["x-api-token-group"] = json!([case.permission]);
+
+    let mut detail = document["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets/{widget_id}")
+        .expect("widget detail");
+    let identity_selector = case
+        .detail_path
+        .rsplit_once('{')
+        .and_then(|(_, suffix)| suffix.strip_suffix('}'))
+        .expect("identity selector");
+    detail["parameters"][1]["name"] = json!(identity_selector);
+    detail["get"]["operationId"] = json!(case.read_id);
+    detail["get"]["tags"] = json!([case.product]);
+    detail["delete"]["operationId"] = json!(case.delete_id);
+    detail["delete"]["tags"] = json!([case.product]);
+    detail["delete"]["x-api-token-group"] = json!([case.permission]);
+    detail["put"] = json!({
+        "operationId": case.update_id,
+        "summary": "Update Access configuration",
+        "tags": [case.product],
+        "x-api-token-group": [case.permission],
+        "requestBody": {
+            "required": true,
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {"name": {"type": "string"}}
+            }}}
+        },
+        "responses": {
+            "200": {
+                "description": "Access configuration updated",
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/WidgetResponse"}
+                    }
+                }
+            }
+        }
+    });
+    document["paths"][case.collection_path] = collection;
+    document["paths"][case.detail_path] = detail;
+    document
+}
+
+#[test]
+fn access_authorization_configuration_has_exact_cost_entitlement_and_risk_contracts() {
+    let fixtures = [
+        AccessConfigurationFixture {
+            collection_path: "/accounts/{account_id}/access/groups",
+            detail_path: "/accounts/{account_id}/access/groups/{group_id}",
+            create_id: "access-groups-create-an-access-group",
+            update_id: "access-groups-update-an-access-group",
+            read_id: "access-groups-get-an-access-group",
+            delete_id: "access-groups-delete-an-access-group",
+            product: "Access groups",
+            permission: "Access: Organizations, Identity Providers, and Groups Write",
+            expected_risk: RiskClass::CrossConfig,
+            expected_effect: EffectClass::ReversibleWrite,
+        },
+        AccessConfigurationFixture {
+            collection_path: "/accounts/{account_id}/access/identity_providers",
+            detail_path: "/accounts/{account_id}/access/identity_providers/{identity_provider_id}",
+            create_id: "access-identity-providers-add-an-access-identity-provider",
+            update_id: "access-identity-providers-update-an-access-identity-provider",
+            read_id: "access-identity-providers-get-an-access-identity-provider",
+            delete_id: "access-identity-providers-delete-an-access-identity-provider",
+            product: "Access identity providers",
+            permission: "Access: Organizations, Identity Providers, and Groups Write",
+            expected_risk: RiskClass::IdentityOrOwnership,
+            expected_effect: EffectClass::IdentityOrOwnership,
+        },
+        AccessConfigurationFixture {
+            collection_path: "/accounts/{account_id}/access/policies",
+            detail_path: "/accounts/{account_id}/access/policies/{policy_id}",
+            create_id: "access-policies-create-an-access-reusable-policy",
+            update_id: "access-policies-update-an-access-reusable-policy",
+            read_id: "access-policies-get-an-access-reusable-policy",
+            delete_id: "access-policies-delete-an-access-reusable-policy",
+            product: "Access reusable policies",
+            permission: "Access: Apps and Policies Write",
+            expected_risk: RiskClass::CrossConfig,
+            expected_effect: EffectClass::ReversibleWrite,
+        },
+    ];
+
+    for case in fixtures {
+        let document = access_configuration_fixture(&case);
+        let snapshot = normalize_openapi(&document).expect("Access configuration catalog");
+        for id in [case.create_id, case.update_id] {
+            let capability = snapshot.get(id).expect("Access configuration mutation");
+            assert_eq!(capability.adapter_status, AdapterStatus::DynamicApi);
+            assert_eq!(capability.risk, case.expected_risk);
+            assert_eq!(capability.effect, case.expected_effect);
+            assert!(capability.cost.known);
+            assert!(!capability.cost.incremental);
+            assert_eq!(capability.cost.maximum, Some(0.0));
+            assert_eq!(capability.cost.billing_model, BillingModelV1::Subscription);
+            assert_eq!(capability.cost.exposure, CostExposureV1::DownstreamUsage);
+            assert!(capability.cost.references.iter().any(|reference| {
+                reference.url == "https://www.cloudflare.com/plans/zero-trust-services/"
+            }));
+            assert!(capability.cost.references.iter().any(|reference| {
+                reference.url
+                    == "https://developers.cloudflare.com/cloudflare-one/team-and-resources/users/seat-management/"
+            }));
+            assert_eq!(capability.entitlement.available, Some(true));
+            assert_eq!(capability.entitlement.plans.get("free"), Some(&true));
+            assert_eq!(
+                capability.entitlement.plans.get("pay_as_you_go"),
+                Some(&true)
+            );
+            assert_eq!(capability.entitlement.plans.get("contract"), Some(&true));
+            assert!(capability.mutation_contract_gaps().is_empty());
+        }
+    }
+}
+
+#[test]
+fn access_authorization_configuration_classifier_rejects_retargeting_and_permission_drift() {
+    let groups = AccessConfigurationFixture {
+        collection_path: "/accounts/{account_id}/access/groups",
+        detail_path: "/accounts/{account_id}/access/groups/{group_id}",
+        create_id: "access-groups-create-an-access-group",
+        update_id: "access-groups-update-an-access-group",
+        read_id: "access-groups-get-an-access-group",
+        delete_id: "access-groups-delete-an-access-group",
+        product: "Access groups",
+        permission: "Access: Organizations, Identity Providers, and Groups Write",
+        expected_risk: RiskClass::CrossConfig,
+        expected_effect: EffectClass::ReversibleWrite,
+    };
+    let mut retargeted = access_configuration_fixture(&groups);
+    let collection = retargeted["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/access/groups")
+        .expect("Access groups collection");
+    retargeted["paths"]["/accounts/{account_id}/access/group_templates"] = collection;
+    let retargeted_snapshot = normalize_openapi(&retargeted).expect("retargeted Access catalog");
+    let retargeted_create = retargeted_snapshot
+        .get("access-groups-create-an-access-group")
+        .expect("retargeted create");
+    assert_eq!(retargeted_create.risk, RiskClass::Unknown);
+    assert!(!retargeted_create.cost.known);
+    assert_eq!(retargeted_create.adapter_status, AdapterStatus::Blocked);
+
+    let policies = AccessConfigurationFixture {
+        collection_path: "/accounts/{account_id}/access/policies",
+        detail_path: "/accounts/{account_id}/access/policies/{policy_id}",
+        create_id: "access-policies-create-an-access-reusable-policy",
+        update_id: "access-policies-update-an-access-reusable-policy",
+        read_id: "access-policies-get-an-access-reusable-policy",
+        delete_id: "access-policies-delete-an-access-reusable-policy",
+        product: "Access reusable policies",
+        permission: "Access: Apps and Policies Write",
+        expected_risk: RiskClass::CrossConfig,
+        expected_effect: EffectClass::ReversibleWrite,
+    };
+    let mut permission_drift = access_configuration_fixture(&policies);
+    permission_drift["paths"]["/accounts/{account_id}/access/policies"]["post"]["x-api-token-group"] =
+        json!(["Account Settings Write"]);
+    let permission_snapshot =
+        normalize_openapi(&permission_drift).expect("permission-drifted Access catalog");
+    let drifted_create = permission_snapshot
+        .get("access-policies-create-an-access-reusable-policy")
+        .expect("permission-drifted create");
+    assert_eq!(drifted_create.risk, RiskClass::Unknown);
+    assert!(!drifted_create.cost.known);
+    assert_eq!(drifted_create.adapter_status, AdapterStatus::Blocked);
+}
+
 #[test]
 fn create_contract_binds_a_schema_proven_id_and_exact_read_delete_pair() {
     let document = create_lifecycle_fixture();
