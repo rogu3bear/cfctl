@@ -166,6 +166,12 @@ separately; approvals use the derived `schema_hash`, so local adapter or safety
 contract changes invalidate an older approval even when the upstream schema is
 unchanged.
 
+PUT/PATCH settings that do not end in a resource selector gain field-level
+readback only when an identical-path GET from the same product officially
+declares every writable request field under `result`. Bulk arrays and partial
+response schemas stay blocked, and restoration still requires a separately
+reviewed plan because no pre-change snapshot is captured.
+
 ## Secrets
 
 Secret inputs enter through stdin and become opaque platform-key-store

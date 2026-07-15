@@ -358,7 +358,7 @@ impl Executor {
                 .verify_exact_resource_delete(plan, apply_response, &input, credential)
                 .await;
         }
-        if strategy == "same_resource_contains_planned_fields_after_update" {
+        if is_same_path_field_verifier(strategy) {
             return self
                 .verify_exact_resource_update(plan, apply_response, &input, credential)
                 .await;
@@ -981,6 +981,7 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
         "created_resource_contains_planned_fields_by_returned_id"
         | "dns_record_details_match_created_id_and_planned_fields" => Some("create"),
         "same_resource_contains_planned_fields_after_update"
+        | "same_path_result_contains_planned_fields_after_update"
         | "dns_record_details_match_planned_id_and_fields" => Some("update"),
         _ => None,
     };
@@ -1015,6 +1016,14 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
         }
     }
     Ok(())
+}
+
+fn is_same_path_field_verifier(strategy: &str) -> bool {
+    matches!(
+        strategy,
+        "same_resource_contains_planned_fields_after_update"
+            | "same_path_result_contains_planned_fields_after_update"
+    )
 }
 
 fn validate_request_body(capability: &CapabilityV1, body: Option<&Value>) -> Result<()> {

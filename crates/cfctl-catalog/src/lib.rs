@@ -848,6 +848,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     }
 
     classify_exact_resource_contracts(&mut capabilities);
+    classify_same_path_object_update_contracts(document, &mut capabilities);
     classify_created_resource_contracts(&mut capabilities, &creates_with_schema_proven_string_ids);
 
     let source_hash = hash_value(document)?;
@@ -861,6 +862,58 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     };
     snapshot.refresh_hash()?;
     Ok(snapshot)
+}
+
+fn classify_same_path_object_update_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let readback_products = capabilities
+        .values()
+        .filter(|capability| capability.method == "GET")
+        .map(|capability| (capability.path.clone(), capability.product.clone()))
+        .collect::<BTreeSet<_>>();
+
+    for capability in capabilities.values_mut() {
+        if !matches!(capability.method.as_str(), "PATCH" | "PUT")
+            || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
+            || !readback_products.contains(&(capability.path.clone(), capability.product.clone()))
+        {
+            continue;
+        }
+        let Some(fields) = capability
+            .request_schema
+            .as_ref()
+            .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))
+            .and_then(|schema| schema.get("properties"))
+            .and_then(Value::as_object)
+            .map(|properties| properties.keys().map(String::as_str).collect::<Vec<_>>())
+            .filter(|fields| !fields.is_empty())
+        else {
+            continue;
+        };
+        let Some(read_operation) = document
+            .get("paths")
+            .and_then(Value::as_object)
+            .and_then(|paths| paths.get(&capability.path))
+            .and_then(|path| path.get("get"))
+        else {
+            continue;
+        };
+        if !success_response_declares_result_fields(document, read_operation, &fields) {
+            continue;
+        }
+
+        "same_path_result_contains_planned_fields_after_update"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "automatic restoration is unsupported because the plan does not bind a pre-change snapshot; restoration requires a separately reviewed update plan built from trusted evidence"
+                .to_owned(),
+        );
+        refresh_incomplete_contract_reason(capability);
+    }
 }
 
 fn classify_created_resource_contracts(
@@ -1064,6 +1117,67 @@ fn success_response_declares_result_string_id(document: &Value, operation: &Valu
         .filter(|(status, _)| status.starts_with('2'))
         .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
         .any(|schema| schema_declares_string_path(document, schema, &["result", "id"], 0))
+}
+
+fn success_response_declares_result_fields(
+    document: &Value,
+    operation: &Value,
+    fields: &[&str],
+) -> bool {
+    operation
+        .get("responses")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(status, _)| status.starts_with('2'))
+        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
+        .any(|schema| {
+            fields
+                .iter()
+                .all(|field| schema_declares_path(document, schema, &["result", *field], 0))
+        })
+}
+
+fn schema_declares_path(document: &Value, schema: &Value, path: &[&str], depth: usize) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| schema_declares_path(document, resolved, path, depth + 1));
+    }
+    if path.is_empty() {
+        return true;
+    }
+    if let Some(property) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(path[0]))
+    {
+        return schema_declares_path(document, property, &path[1..], depth + 1);
+    }
+    if schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| schema_declares_path(document, member, path, depth + 1))
+        })
+    {
+        return true;
+    }
+    for alternative in ["oneOf", "anyOf"] {
+        if let Some(members) = schema.get(alternative).and_then(Value::as_array) {
+            return !members.is_empty()
+                && members
+                    .iter()
+                    .all(|member| schema_declares_path(document, member, path, depth + 1));
+        }
+    }
+    false
 }
 
 fn schema_declares_string_path(

@@ -1008,6 +1008,77 @@ async fn exact_resource_update_rejects_field_drift_without_echoing_values() {
 }
 
 #[tokio::test]
+async fn same_path_object_update_verifies_schema_proven_fields_with_a_clean_get() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let read = stream.read(&mut buffer).await.expect("read verification");
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let body = r#"{"success":true,"result":{"mode":"strict","nested":{"enabled":true},"server_default":"kept"},"errors":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+        request
+    });
+    let mut plan = dns_record_plan(
+        "settings-update",
+        "PUT",
+        "/zones/{zone_id}/settings/example",
+        "same_path_result_contains_planned_fields_after_update",
+        json!({"zone_id":"zone-1"}),
+        Some(json!({"mode":"strict", "nested":{"enabled":true}})),
+    );
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({"zone_id":"zone-1"}),
+        query: json!({"mutation_mode":"replace"}),
+        body: Some(json!({"mode":"strict", "nested":{"enabled":true}})),
+        if_match: Some("mutation-etag".to_owned()),
+        ..CallInput::default()
+    })
+    .expect("input");
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let request = server.await.expect("server joins");
+    assert!(request.starts_with("GET /client/v4/zones/zone-1/settings/example "));
+    assert!(!request.contains("mutation_mode"));
+    assert!(!request.contains("mutation-etag"));
+}
+
+#[tokio::test]
 async fn dns_record_verification_rejects_live_field_drift_without_echoing_values() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

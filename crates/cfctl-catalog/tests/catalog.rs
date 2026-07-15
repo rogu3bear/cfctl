@@ -516,6 +516,78 @@ fn exact_resource_updates_pair_with_same_path_field_readback_contracts() {
     assert_eq!(coverage.rollback_contracts, 2);
 }
 
+#[test]
+fn same_path_object_updates_require_schema_proven_readback_fields() {
+    let document = json!({
+        "openapi":"3.0.3",
+        "info":{"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/zones/{zone_id}/settings/example": {
+                "get": {
+                    "operationId":"settings-get",
+                    "tags":["Example Settings"],
+                    "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
+                        "type":"object",
+                        "properties":{"result":{"type":"object","properties":{
+                            "mode":{"type":"string"},"enabled":{"type":"boolean"}
+                        }}}
+                    }}}}}
+                },
+                "put": {
+                    "operationId":"settings-update",
+                    "tags":["Example Settings"],
+                    "x-api-token-group":["Settings Write"],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "type":"object",
+                        "properties":{"mode":{"type":"string"},"enabled":{"type":"boolean"}}
+                    }}}}
+                }
+            },
+            "/zones/{zone_id}/settings/partial": {
+                "get": {
+                    "operationId":"partial-settings-get",
+                    "tags":["Partial Settings"],
+                    "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
+                        "type":"object",
+                        "properties":{"result":{"type":"object","properties":{"mode":{"type":"string"}}}}
+                    }}}}}
+                },
+                "patch": {
+                    "operationId":"partial-settings-update",
+                    "tags":["Partial Settings"],
+                    "x-api-token-group":["Settings Write"],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "type":"object",
+                        "properties":{"mode":{"type":"string"},"hidden":{"type":"boolean"}}
+                    }}}}
+                }
+            }
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("settings catalog");
+    let update = snapshot.get("settings-update").expect("settings update");
+    assert_eq!(
+        update.verification.strategy,
+        "same_path_result_contains_planned_fields_after_update"
+    );
+    assert!(!update.rollback.supported);
+    assert!(
+        update
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("pre-change snapshot"))
+    );
+    let partial = snapshot
+        .get("partial-settings-update")
+        .expect("partial update");
+    assert_ne!(
+        partial.verification.strategy,
+        "same_path_result_contains_planned_fields_after_update"
+    );
+}
+
 fn create_lifecycle_fixture() -> serde_json::Value {
     json!({
         "openapi": "3.0.3",
