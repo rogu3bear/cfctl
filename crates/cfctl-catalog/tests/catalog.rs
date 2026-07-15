@@ -3566,6 +3566,226 @@ fn load_balancing_configuration_classifier_rejects_retargeting_and_permission_dr
     assert!(drifted_create.entitlement.blocker.is_none());
 }
 
+struct EmailSecuritySettingsFixture {
+    collection_path: &'static str,
+    detail_path: &'static str,
+    create_id: &'static str,
+    update_id: &'static str,
+    read_id: &'static str,
+    delete_id: &'static str,
+}
+
+fn email_security_settings_fixture(case: &EmailSecuritySettingsFixture) -> serde_json::Value {
+    let mut document = create_lifecycle_fixture();
+    let mut collection = document["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets")
+        .expect("widget collection");
+    collection["post"]["operationId"] = json!(case.create_id);
+    collection["post"]["tags"] = json!(["Email Security Settings"]);
+    collection["post"]["x-api-token-group"] = json!(["Cloud Email Security: Write"]);
+
+    let mut detail = document["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets/{widget_id}")
+        .expect("widget detail");
+    let identity_selector = case
+        .detail_path
+        .rsplit_once('{')
+        .and_then(|(_, suffix)| suffix.strip_suffix('}'))
+        .expect("identity selector");
+    detail["parameters"] = json!([
+        {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+        {"in":"path","name":identity_selector,"required":true,"schema":{"type":"string"}}
+    ]);
+    detail["get"]["operationId"] = json!(case.read_id);
+    detail["get"]["tags"] = json!(["Email Security Settings"]);
+    detail["delete"]["operationId"] = json!(case.delete_id);
+    detail["delete"]["tags"] = json!(["Email Security Settings"]);
+    detail["delete"]["x-api-token-group"] = json!(["Cloud Email Security: Write"]);
+    detail["patch"] = json!({
+        "operationId": case.update_id,
+        "summary": "Update Email Security setting",
+        "tags": ["Email Security Settings"],
+        "x-api-token-group": ["Cloud Email Security: Write"],
+        "requestBody": {
+            "required": true,
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "minProperties": 1,
+                "properties": {"name": {"type": "string"}}
+            }}}
+        },
+        "responses": {
+            "200": {
+                "description": "Email Security setting updated",
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/WidgetResponse"}
+                    }
+                }
+            }
+        }
+    });
+    document["paths"][case.collection_path] = collection;
+    document["paths"][case.detail_path] = detail;
+    document
+}
+
+fn email_security_settings_fixtures() -> [EmailSecuritySettingsFixture; 7] {
+    [
+        EmailSecuritySettingsFixture {
+            collection_path: "/accounts/{account_id}/email-security/settings/allow_policies",
+            detail_path: "/accounts/{account_id}/email-security/settings/allow_policies/{policy_id}",
+            create_id: "email_security_create_allow_policy",
+            update_id: "email_security_update_allow_policy",
+            read_id: "email_security_get_allow_policy",
+            delete_id: "email_security_delete_allow_policy",
+        },
+        EmailSecuritySettingsFixture {
+            collection_path: "/accounts/{account_id}/email-security/settings/block_senders",
+            detail_path: "/accounts/{account_id}/email-security/settings/block_senders/{pattern_id}",
+            create_id: "email_security_create_blocked_sender",
+            update_id: "email_security_update_blocked_sender",
+            read_id: "email_security_get_blocked_sender",
+            delete_id: "email_security_delete_blocked_sender",
+        },
+        EmailSecuritySettingsFixture {
+            collection_path: "/accounts/{account_id}/email-security/settings/domains",
+            detail_path: "/accounts/{account_id}/email-security/settings/domains/{domain_id}",
+            create_id: "email_security_create_domains",
+            update_id: "email_security_update_domain",
+            read_id: "email_security_get_domain",
+            delete_id: "email_security_delete_domain",
+        },
+        EmailSecuritySettingsFixture {
+            collection_path: "/accounts/{account_id}/email-security/settings/impersonation_registry",
+            detail_path: "/accounts/{account_id}/email-security/settings/impersonation_registry/{impersonation_registry_id}",
+            create_id: "email_security_create_impersonation_registry",
+            update_id: "email_security_update_impersonation_registry",
+            read_id: "email_security_get_impersonation_registry",
+            delete_id: "email_security_delete_impersonation_registry",
+        },
+        EmailSecuritySettingsFixture {
+            collection_path: "/accounts/{account_id}/email-security/settings/sending_domain_restrictions",
+            detail_path: "/accounts/{account_id}/email-security/settings/sending_domain_restrictions/{sending_domain_restriction_id}",
+            create_id: "email_security_create_sending_domain_restriction",
+            update_id: "email_security_update_sending_domain_restriction",
+            read_id: "email_security_get_sending_domain_restriction",
+            delete_id: "email_security_delete_sending_domain_restriction",
+        },
+        EmailSecuritySettingsFixture {
+            collection_path: "/accounts/{account_id}/email-security/settings/trusted_domains",
+            detail_path: "/accounts/{account_id}/email-security/settings/trusted_domains/{trusted_domain_id}",
+            create_id: "email_security_create_trusted_domain",
+            update_id: "email_security_update_trusted_domain",
+            read_id: "email_security_get_trusted_domain",
+            delete_id: "email_security_delete_trusted_domain",
+        },
+        EmailSecuritySettingsFixture {
+            collection_path: "/accounts/{account_id}/email-security/settings/url_ignore_patterns",
+            detail_path: "/accounts/{account_id}/email-security/settings/url_ignore_patterns/{pattern_id}",
+            create_id: "email_security_create_url_ignore_pattern",
+            update_id: "email_security_update_url_ignore_pattern",
+            read_id: "email_security_get_url_ignore_pattern",
+            delete_id: "email_security_delete_url_ignore_pattern",
+        },
+    ]
+}
+
+#[test]
+fn email_security_settings_have_exact_cost_entitlement_and_risk_contracts() {
+    for case in email_security_settings_fixtures() {
+        let snapshot = normalize_openapi(&email_security_settings_fixture(&case))
+            .expect("Email Security settings catalog");
+        for id in [case.create_id, case.update_id] {
+            let capability = snapshot.get(id).expect("Email Security setting mutation");
+            assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+            assert_eq!(capability.risk, RiskClass::CrossConfig);
+            assert_eq!(capability.effect, EffectClass::ReversibleWrite);
+            assert!(capability.cost.known);
+            assert!(!capability.cost.incremental);
+            assert_eq!(capability.cost.maximum, Some(0.0));
+            assert_eq!(capability.cost.billing_model, BillingModelV1::Contract);
+            assert_eq!(capability.cost.exposure, CostExposureV1::AccountQuote);
+            assert!(capability.cost.references.iter().any(|reference| {
+                reference.url == "https://www.cloudflare.com/plans/zero-trust-services/"
+            }));
+            assert!(capability.cost.references.iter().any(|reference| {
+                reference.url
+                    == "https://developers.cloudflare.com/cloudflare-one/email-security/settings/detection-settings/"
+            }));
+            assert_eq!(capability.entitlement.available, None);
+            assert!(capability.entitlement.plans.is_empty());
+            assert!(!capability.entitlement.requires_live_resolution);
+            assert!(
+                capability
+                    .entitlement
+                    .blocker
+                    .as_deref()
+                    .is_some_and(|blocker| {
+                        blocker.contains("paid Email Security add-on")
+                            && blocker.contains("product-scoped subscription join key")
+                    })
+            );
+            assert_eq!(
+                capability.entitlement.source.as_deref(),
+                Some("https://www.cloudflare.com/plans/zero-trust-services/")
+            );
+            let gaps = capability.mutation_contract_gaps();
+            assert_eq!(gaps.len(), 1, "{id}: {gaps:?}");
+            assert!(gaps[0].contains("entitlement"));
+        }
+
+        let create = snapshot
+            .get(case.create_id)
+            .expect("Email Security setting create");
+        assert!(create.created_resource.is_some());
+        assert!(create.rollback.supported);
+        let update = snapshot
+            .get(case.update_id)
+            .expect("Email Security setting update");
+        assert!(update.same_path_read.is_some());
+        assert!(!update.rollback.supported);
+    }
+}
+
+#[test]
+fn email_security_settings_classifier_rejects_retargeting_and_permission_drift() {
+    let case = email_security_settings_fixtures()
+        .into_iter()
+        .next()
+        .expect("Email Security fixture");
+    let mut retargeted = email_security_settings_fixture(&case);
+    let collection = retargeted["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove(case.collection_path)
+        .expect("Email Security collection");
+    retargeted["paths"]["/accounts/{account_id}/email-security/settings/allow_policy_templates"] =
+        collection;
+    let retargeted_snapshot = normalize_openapi(&retargeted).expect("retargeted catalog");
+    let retargeted_create = retargeted_snapshot
+        .get(case.create_id)
+        .expect("retargeted create");
+    assert_eq!(retargeted_create.risk, RiskClass::Unknown);
+    assert!(!retargeted_create.cost.known);
+    assert!(retargeted_create.entitlement.blocker.is_none());
+
+    let mut permission_drift = email_security_settings_fixture(&case);
+    permission_drift["paths"][case.collection_path]["post"]["x-api-token-group"] =
+        json!(["Account Settings Write"]);
+    let permission_snapshot = normalize_openapi(&permission_drift).expect("permission drift");
+    let drifted_create = permission_snapshot
+        .get(case.create_id)
+        .expect("permission-drifted create");
+    assert_eq!(drifted_create.risk, RiskClass::Unknown);
+    assert!(!drifted_create.cost.known);
+    assert!(drifted_create.entitlement.blocker.is_none());
+}
+
 #[test]
 fn create_contract_binds_a_schema_proven_id_and_exact_read_delete_pair() {
     let document = create_lifecycle_fixture();

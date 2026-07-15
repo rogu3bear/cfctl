@@ -3459,6 +3459,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         classify_access_authorization_configuration(capability, kind);
     } else if let Some(kind) = load_balancing_configuration_kind(capability) {
         classify_load_balancing_configuration(capability, kind);
+    } else if is_email_security_settings_configuration(capability) {
+        classify_email_security_settings_configuration(capability);
     } else {
         return false;
     }
@@ -4004,6 +4006,114 @@ fn classify_load_balancing_configuration(
     capability.verification.required = true;
     "post_change_read_or_operation_specific_verifier"
         .clone_into(&mut capability.verification.strategy);
+}
+
+struct EmailSecuritySettingsConfigurationContract {
+    create_id: &'static str,
+    update_id: &'static str,
+    collection_path: &'static str,
+    detail_path: &'static str,
+}
+
+const EMAIL_SECURITY_SETTINGS_CONFIGURATION_CONTRACTS:
+    &[EmailSecuritySettingsConfigurationContract] = &[
+    EmailSecuritySettingsConfigurationContract {
+        create_id: "email_security_create_allow_policy",
+        update_id: "email_security_update_allow_policy",
+        collection_path: "/accounts/{account_id}/email-security/settings/allow_policies",
+        detail_path: "/accounts/{account_id}/email-security/settings/allow_policies/{policy_id}",
+    },
+    EmailSecuritySettingsConfigurationContract {
+        create_id: "email_security_create_blocked_sender",
+        update_id: "email_security_update_blocked_sender",
+        collection_path: "/accounts/{account_id}/email-security/settings/block_senders",
+        detail_path: "/accounts/{account_id}/email-security/settings/block_senders/{pattern_id}",
+    },
+    EmailSecuritySettingsConfigurationContract {
+        create_id: "email_security_create_domains",
+        update_id: "email_security_update_domain",
+        collection_path: "/accounts/{account_id}/email-security/settings/domains",
+        detail_path: "/accounts/{account_id}/email-security/settings/domains/{domain_id}",
+    },
+    EmailSecuritySettingsConfigurationContract {
+        create_id: "email_security_create_impersonation_registry",
+        update_id: "email_security_update_impersonation_registry",
+        collection_path: "/accounts/{account_id}/email-security/settings/impersonation_registry",
+        detail_path: "/accounts/{account_id}/email-security/settings/impersonation_registry/{impersonation_registry_id}",
+    },
+    EmailSecuritySettingsConfigurationContract {
+        create_id: "email_security_create_sending_domain_restriction",
+        update_id: "email_security_update_sending_domain_restriction",
+        collection_path: "/accounts/{account_id}/email-security/settings/sending_domain_restrictions",
+        detail_path: "/accounts/{account_id}/email-security/settings/sending_domain_restrictions/{sending_domain_restriction_id}",
+    },
+    EmailSecuritySettingsConfigurationContract {
+        create_id: "email_security_create_trusted_domain",
+        update_id: "email_security_update_trusted_domain",
+        collection_path: "/accounts/{account_id}/email-security/settings/trusted_domains",
+        detail_path: "/accounts/{account_id}/email-security/settings/trusted_domains/{trusted_domain_id}",
+    },
+    EmailSecuritySettingsConfigurationContract {
+        create_id: "email_security_create_url_ignore_pattern",
+        update_id: "email_security_update_url_ignore_pattern",
+        collection_path: "/accounts/{account_id}/email-security/settings/url_ignore_patterns",
+        detail_path: "/accounts/{account_id}/email-security/settings/url_ignore_patterns/{pattern_id}",
+    },
+];
+
+fn is_email_security_settings_configuration(capability: &CapabilityV1) -> bool {
+    EMAIL_SECURITY_SETTINGS_CONFIGURATION_CONTRACTS
+        .iter()
+        .any(|contract| {
+            let route_matches = if capability.id == contract.create_id {
+                capability.method == "POST" && capability.path == contract.collection_path
+            } else if capability.id == contract.update_id {
+                capability.method == "PATCH" && capability.path == contract.detail_path
+            } else {
+                false
+            };
+            route_matches
+                && capability.product == "Email Security Settings"
+                && capability.permissions.len() == 1
+                && capability.permissions[0] == "Cloud Email Security: Write"
+        })
+}
+
+fn classify_email_security_settings_configuration(capability: &mut CapabilityV1) {
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.billing_model = BillingModelV1::Contract;
+    capability.cost.exposure = CostExposureV1::AccountQuote;
+    capability.cost.basis = Some(
+        "this settings request does not purchase Email Security, add licensed inboxes, or change the account package, so its direct incremental ceiling is zero; protection continues under the account's separately negotiated Email Security contract"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Zero Trust and SASE pricing".to_owned(),
+            url: "https://www.cloudflare.com/plans/zero-trust-services/".to_owned(),
+            source: "official Cloudflare pricing".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Email Security detection settings".to_owned(),
+            url: "https://developers.cloudflare.com/cloudflare-one/email-security/settings/detection-settings/"
+                .to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+    ];
+    capability.entitlement.available = None;
+    capability.entitlement.plans.clear();
+    capability.entitlement.blocker = Some(
+        "paid Email Security add-on entitlement is unresolved because the official API contract does not publish an exact product-scoped subscription join key for the selected account"
+            .to_owned(),
+    );
+    capability.entitlement.source =
+        Some("https://www.cloudflare.com/plans/zero-trust-services/".to_owned());
+    capability.entitlement.requires_live_resolution = false;
 }
 
 fn is_dns_record_lifecycle(capability_id: &str) -> bool {
