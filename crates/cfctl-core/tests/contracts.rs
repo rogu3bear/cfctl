@@ -6,7 +6,7 @@ use cfctl_core::{
     PlanV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1, SelectorV1, TransactionStageV1,
     UpdatedResourceContractV1, guide_stages, redact_json,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn uncontracted_selector(name: &str, location: &str, value_type: &str) -> SelectorV1 {
     SelectorV1 {
@@ -174,6 +174,57 @@ fn mutation_contracts_reject_declared_but_unimplemented_strategies() {
             .iter()
             .any(|gap| { gap == "declared verification strategy is unsupported: not_applicable" })
     );
+}
+
+#[test]
+fn global_warp_restore_strategy_is_bound_to_the_exact_account_state_contract() {
+    let mut capability = CapabilityV1::new(
+        "devices-resilience-set-global-warp-override",
+        "Set Global WARP override state",
+        "POST",
+        "/accounts/{account_id}/devices/resilience/disconnect",
+    );
+    capability.mutating = true;
+    capability.account_scope = "account".to_owned();
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("restore_global_warp_override_prior_disconnect_state".to_owned());
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "required":["disconnect"],
+        "additionalProperties":false,
+        "properties":{
+            "disconnect":{"type":"boolean"},
+            "justification":{
+                "type":"string",
+                "x-cfctl-verification-observable":false
+            }
+        }
+    }));
+    capability.verification.strategy =
+        "same_path_result_contains_planned_fields_after_mutation".to_owned();
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/accounts/{account_id}/devices/resilience/disconnect".to_owned(),
+        read_capability_id: "devices-resilience-retrieve-global-warp-override".to_owned(),
+        verified_response_fields: vec!["disconnect".to_owned()],
+    });
+
+    assert!(capability.rollback_contract_supported());
+
+    let mut grafted = capability.clone();
+    grafted.id = "widgets-set-global-state".to_owned();
+    assert!(!grafted.rollback_contract_supported());
+
+    let mut broadened = capability;
+    broadened
+        .request_schema
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .and_then(|schema| schema.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+        .expect("request properties")
+        .insert("unverified".to_owned(), json!({"type":"string"}));
+    assert!(!broadened.rollback_contract_supported());
 }
 
 #[test]

@@ -682,6 +682,20 @@ impl CapabilityV1 {
                     && (self.created_resource_contract_supported()
                         || self.created_collection_resource_contract_supported())
             }
+            Some("restore_global_warp_override_prior_disconnect_state") => {
+                self.id == "devices-resilience-set-global-warp-override"
+                    && self.method == "POST"
+                    && self.path == "/accounts/{account_id}/devices/resilience/disconnect"
+                    && self.account_scope == "account"
+                    && self.verification.strategy
+                        == "same_path_result_contains_planned_fields_after_mutation"
+                    && self.verification_contract_supported()
+                    && self.same_path_read.as_ref().is_some_and(|read| {
+                        read.read_capability_id
+                            == "devices-resilience-retrieve-global-warp-override"
+                            && read.verified_response_fields == ["disconnect"]
+                    })
+            }
             _ => false,
         }
     }

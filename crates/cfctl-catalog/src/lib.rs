@@ -941,6 +941,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     classify_created_collection_resource_contracts(document, &mut capabilities);
     classify_global_warp_override_contract(document, &mut capabilities);
     classify_same_path_object_mutation_contracts(document, &mut capabilities);
+    finalize_global_warp_override_rollback_contract(&mut capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
@@ -1107,7 +1108,29 @@ fn classify_global_warp_override_contract(
     capability.rollback.supported = false;
     capability.rollback.strategy = None;
     capability.rollback.warning = Some(
-        "automatic restoration is unsupported; cfctl binds the prior disconnect state for drift detection but does not yet derive a compensation plan from it. Recovery requires a separately reviewed operation that restores the bound state. Cloudflare documents that this account-wide control requires the Super Administrator role and may take up to 10 minutes to propagate to devices"
+        "automatic restoration remains unavailable until cfctl proves an exact same-path state readback contract. Cloudflare documents that this account-wide control requires the Super Administrator role and may take up to 10 minutes to propagate to devices"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
+
+fn finalize_global_warp_override_rollback_contract(
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let Some(capability) = capabilities.get_mut("devices-resilience-set-global-warp-override")
+    else {
+        return;
+    };
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("restore_global_warp_override_prior_disconnect_state".to_owned());
+    if !capability.rollback_contract_supported() {
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        return;
+    }
+    capability.rollback.warning = Some(
+        "rectification derives a separate hash-bound restoration plan from the prior disconnect state; it never runs automatically and requires explicit approval. Cloudflare documents that this account-wide control requires the Super Administrator role and may take up to 10 minutes to propagate to devices"
             .to_owned(),
     );
     refresh_dynamic_mutation_contract(capability);

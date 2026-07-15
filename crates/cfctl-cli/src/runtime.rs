@@ -2263,6 +2263,34 @@ fn validate_global_warp_override_state_receipt_precondition(
     Ok(())
 }
 
+fn validate_global_warp_override_prior_state_receipt(
+    plan: &PlanV1,
+    receipt: &Value,
+) -> Result<bool> {
+    let exact_identity = receipt.as_object().is_some_and(|object| object.len() == 7)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("source_capability_id").and_then(Value::as_str)
+            == Some(GLOBAL_WARP_OVERRIDE_READ_CAPABILITY_ID)
+        && receipt.get("source_path").and_then(Value::as_str) == Some(GLOBAL_WARP_OVERRIDE_PATH)
+        && receipt.get("target_capability_id").and_then(Value::as_str)
+            == Some(GLOBAL_WARP_OVERRIDE_MUTATION_CAPABILITY_ID)
+        && receipt.get("target_scope").and_then(Value::as_str) == Some("account")
+        && receipt.get("target_id").and_then(Value::as_str) == Some(plan.account_id.as_str());
+    let disconnect = receipt.get("disconnect").and_then(Value::as_bool);
+    if !exact_identity || disconnect.is_none() {
+        return Err(CliError::Input(
+            "plan Global WARP override prior-state receipt has an invalid account, source, or state shape; create a new plan"
+                .to_owned(),
+        ));
+    }
+    disconnect.ok_or_else(|| {
+        CliError::Input(
+            "plan Global WARP override prior-state receipt omitted boolean `disconnect`; create a new plan"
+                .to_owned(),
+        )
+    })
+}
+
 fn required_global_warp_override_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
     if !is_global_warp_override_mutation(&plan.capability) {
         return Ok(None);
@@ -2292,6 +2320,7 @@ fn required_global_warp_override_state_precondition(plan: &PlanV1) -> Result<Opt
                     .to_owned(),
             )
         })?;
+    validate_global_warp_override_prior_state_receipt(plan, receipt)?;
     if hash_value(receipt)? != expected_hash {
         return Err(CliError::Input(
             "plan Global WARP override prior-state receipt does not match its precondition hash; create a new plan"
@@ -2299,6 +2328,25 @@ fn required_global_warp_override_state_precondition(plan: &PlanV1) -> Result<Opt
         ));
     }
     Ok(Some(expected_hash))
+}
+
+fn global_warp_override_prior_disconnect_state(plan: &PlanV1) -> Result<bool> {
+    required_global_warp_override_state_precondition(plan)?.ok_or_else(|| {
+        CliError::Input(
+            "Global WARP override compensation requires a hash-bound prior-state precondition"
+                .to_owned(),
+        )
+    })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/global_warp_override_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "Global WARP override compensation requires a hash-bound prior-state receipt"
+                    .to_owned(),
+            )
+        })?;
+    validate_global_warp_override_prior_state_receipt(plan, receipt)
 }
 
 async fn validate_live_zone_account_precondition(
@@ -2876,6 +2924,7 @@ async fn resume_plan(store: &StateStore, selector: &PlanSelector) -> Result<Resu
 
 struct CompensationRequest {
     capability_id: String,
+    expected_method: String,
     expected_path: String,
     input: CallInput,
     requested_account: Option<String>,
@@ -2896,6 +2945,23 @@ fn validate_compensation_contract(capability: &CapabilityV1) -> Result<()> {
     )))
 }
 
+fn global_warp_override_compensation_request(plan: &PlanV1) -> Result<CompensationRequest> {
+    Ok(CompensationRequest {
+        capability_id: GLOBAL_WARP_OVERRIDE_MUTATION_CAPABILITY_ID.to_owned(),
+        expected_method: "POST".to_owned(),
+        expected_path: GLOBAL_WARP_OVERRIDE_PATH.to_owned(),
+        input: CallInput {
+            selectors: json!({"account_id": plan.account_id}),
+            query: json!({}),
+            body: Some(json!({
+                "disconnect": global_warp_override_prior_disconnect_state(plan)?,
+            })),
+            ..CallInput::default()
+        },
+        requested_account: Some(plan.account_id.clone()),
+    })
+}
+
 fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
     if !matches!(
         plan.status,
@@ -2912,25 +2978,38 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
     if artifact.get("success").and_then(Value::as_bool) != Some(true) {
         return Ok(None);
     }
-    let resource_id = artifact
-        .get("resource_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
+    if plan.capability.id == GLOBAL_WARP_OVERRIDE_MUTATION_CAPABILITY_ID {
+        return global_warp_override_compensation_request(plan).map(Some);
+    }
+    let resource_id = || {
+        artifact
+            .get("resource_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
             CliError::Input(
                 "the creation response is recorded, but its hash-bound receipt has no resource id; inspect live resource state before compensating"
                     .to_owned(),
             )
-        })?;
-    let (capability_id, expected_path, selectors) = match plan.capability.id.as_str() {
+        })
+    };
+    let (capability_id, expected_method, expected_path, selectors, body) = match plan
+        .capability
+        .id
+        .as_str()
+    {
         "account-api-tokens-create-token" => (
             "account-api-tokens-delete-token".to_owned(),
+            "DELETE".to_owned(),
             "/accounts/{account_id}/tokens/{token_id}".to_owned(),
-            json!({"account_id": plan.account_id, "token_id": resource_id}),
+            json!({"account_id": plan.account_id, "token_id": resource_id()?}),
+            None,
         ),
         "user-api-tokens-create-token" => (
             "user-api-tokens-delete-token".to_owned(),
+            "DELETE".to_owned(),
             "/user/tokens/{token_id}".to_owned(),
-            json!({"token_id": resource_id}),
+            json!({"token_id": resource_id()?}),
+            None,
         ),
         "dns-records-for-a-zone-create-dns-record" => {
             let input: CallInput = serde_json::from_value(plan.input.clone())?;
@@ -2947,8 +3026,10 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
                 })?;
             (
                 "dns-records-for-a-zone-delete-dns-record".to_owned(),
+                "DELETE".to_owned(),
                 "/zones/{zone_id}/dns_records/{dns_record_id}".to_owned(),
-                json!({"zone_id": zone_id, "dns_record_id": resource_id}),
+                json!({"zone_id": zone_id, "dns_record_id": resource_id()?}),
+                None,
             )
         }
         _ => {
@@ -2957,16 +3038,25 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
             {
                 return Ok(None);
             }
-            generic_created_resource_compensation(plan, resource_id)?
+            let (capability_id, expected_path, selectors) =
+                generic_created_resource_compensation(plan, resource_id()?)?;
+            (
+                capability_id,
+                "DELETE".to_owned(),
+                expected_path,
+                selectors,
+                None,
+            )
         }
     };
     Ok(Some(CompensationRequest {
         capability_id,
+        expected_method,
         expected_path,
         input: CallInput {
             selectors,
             query: json!({}),
-            body: None,
+            body,
             ..CallInput::default()
         },
         requested_account: Some(plan.account_id.clone()),
@@ -3027,10 +3117,11 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
             .get(&request.capability_id)
             .cloned()
             .ok_or_else(|| capability_missing(&request.capability_id))?;
-        if capability.method != "DELETE" || capability.path != request.expected_path {
+        if capability.method != request.expected_method || capability.path != request.expected_path
+        {
             return Err(CliError::Input(format!(
-                "compensation target `{}` no longer resolves to the hash-bound DELETE path; inspect live resource state before creating a replacement plan",
-                request.capability_id
+                "compensation target `{}` no longer resolves to the hash-bound {} path; inspect live resource state before creating a replacement plan",
+                request.capability_id, request.expected_method
             )));
         }
         let source_receipt_hash = plan
@@ -3049,6 +3140,7 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
                 "compensates_operation_id": plan.operation_id,
                 "compensates_capability_id": plan.capability.id,
                 "source_receipt_hash": source_receipt_hash,
+                "source_precondition_hash": plan.precondition_hashes.get("global_warp_override_state"),
             }),
         )
         .await?;
@@ -3061,7 +3153,7 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
             result.insert(
                 "message".to_owned(),
                 Value::String(
-                    "A separate hash-bound compensation plan was created from the verified response receipt. It has not run; review and explicitly approve its operation ID."
+                    "A separate hash-bound compensation plan was created from the source plan receipts. It has not run; review and explicitly approve its operation ID."
                         .to_owned(),
                 ),
             );
@@ -4972,8 +5064,10 @@ mod tests {
             read_capability_id: "devices-resilience-retrieve-global-warp-override".to_owned(),
             verified_response_fields: vec!["disconnect".to_owned()],
         });
-        capability.rollback.warning =
-            Some("automatic restoration requires a separately reviewed operation".to_owned());
+        capability.rollback.supported = true;
+        capability.rollback.strategy =
+            Some("restore_global_warp_override_prior_disconnect_state".to_owned());
+        capability.rollback.warning = Some("restoration requires explicit approval".to_owned());
         capability
     }
 
@@ -5089,6 +5183,18 @@ mod tests {
             required_global_warp_override_state_precondition(&plan).expect("bound precondition"),
             Some(receipt_hash.as_str())
         );
+
+        let mut retargeted =
+            plan.targets["live_preconditions"]["global_warp_override_state"].clone();
+        retargeted["target_id"] = json!("account-b");
+        plan.precondition_hashes.insert(
+            "global_warp_override_state".to_owned(),
+            hash_value(&retargeted).expect("retargeted receipt hash"),
+        );
+        plan.targets["live_preconditions"]["global_warp_override_state"] = retargeted;
+        let error = required_global_warp_override_state_precondition(&plan)
+            .expect_err("a rehashed cross-account receipt must still fail");
+        assert!(error.to_string().contains("invalid account"));
     }
 
     #[test]
@@ -5171,6 +5277,72 @@ mod tests {
     }
 
     #[test]
+    fn global_warp_rectification_derives_a_separate_exact_restore_request() {
+        let capability = global_warp_override_capability();
+        let receipt = json!({
+            "schema_version": 1,
+            "source_capability_id": "devices-resilience-retrieve-global-warp-override",
+            "source_path": "/accounts/{account_id}/devices/resilience/disconnect",
+            "target_capability_id": "devices-resilience-set-global-warp-override",
+            "target_scope": "account",
+            "target_id": "account-a",
+            "disconnect": false,
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability.clone(),
+            json!({
+                "selectors":{"account_id":"account-a"},
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{"global_warp_override_state":receipt},
+            }),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            query: json!({}),
+            body: Some(json!({
+                "disconnect": true,
+                "justification": "controlled source plan",
+            })),
+            ..CallInput::default()
+        })
+        .expect("call input");
+        plan.precondition_hashes.insert(
+            "global_warp_override_state".to_owned(),
+            hash_value(&receipt).expect("receipt hash"),
+        );
+        plan.refresh_hash().expect("bind source plan");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"success":true,"http_status":200}),
+        )
+        .expect("response receipt");
+        plan.status = PlanStatus::RectificationRequired;
+
+        let request = compensation_request(&plan)
+            .expect("request resolves")
+            .expect("compensation is supported");
+
+        assert_eq!(request.capability_id, capability.id);
+        assert_eq!(request.expected_method, "POST");
+        assert_eq!(request.expected_path, capability.path);
+        assert_eq!(request.input.selectors, json!({"account_id":"account-a"}));
+        assert_eq!(request.input.query, json!({}));
+        assert_eq!(request.input.body, Some(json!({"disconnect":false})));
+        assert!(request.input.if_match.is_none());
+        assert!(request.input.if_none_match.is_none());
+        assert_eq!(request.requested_account.as_deref(), Some("account-a"));
+    }
+
+    #[test]
     fn global_warp_override_guide_requires_the_exact_live_state_read() {
         let capability = global_warp_override_capability();
         let guide = guide_document(&capability);
@@ -5188,6 +5360,13 @@ mod tests {
                 "account_id=<account_id>",
                 "--json"
             ])
+        );
+        let rectify = &guide["stages"][13];
+        assert_eq!(rectify["name"], "rectify");
+        assert_eq!(rectify["contract_state"], "available");
+        assert_eq!(
+            rectify["commands"][0],
+            json!(["cfctl", "plans", "rectify", "<operation-id>", "--json"])
         );
     }
 
@@ -6053,6 +6232,7 @@ mod tests {
             .expect("compensation is supported");
 
         assert_eq!(request.capability_id, "account-api-tokens-delete-token");
+        assert_eq!(request.expected_method, "DELETE");
         assert_eq!(request.input.selectors["account_id"], "account-a");
         assert_eq!(request.input.selectors["token_id"], "token-id");
         assert_eq!(request.requested_account.as_deref(), Some("account-a"));
@@ -6173,6 +6353,7 @@ mod tests {
             .expect("compensation is supported");
 
         assert_eq!(request.capability_id, "widgets-delete");
+        assert_eq!(request.expected_method, "DELETE");
         assert_eq!(
             request.expected_path,
             "/accounts/{account_id}/widgets/{slug}"

@@ -2841,11 +2841,16 @@ fn global_warp_override_has_an_exact_audit_aware_state_contract() {
         false
     );
     assert!(mutation.rollback.warning.as_deref().is_some_and(|warning| {
-        warning.contains("binds the prior disconnect state for drift detection")
-            && warning.contains("does not yet derive a compensation plan")
+        warning.contains("separate hash-bound restoration plan")
+            && warning.contains("explicit approval")
             && warning.contains("Super Administrator")
             && warning.contains("10 minutes")
     }));
+    assert!(mutation.rollback.supported);
+    assert_eq!(
+        mutation.rollback.strategy.as_deref(),
+        Some("restore_global_warp_override_prior_disconnect_state")
+    );
 
     let mut drifted = document;
     drifted["components"]["schemas"]["Justification"]["description"] =
