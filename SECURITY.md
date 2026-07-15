@@ -1,6 +1,9 @@
 # Security Policy
 
-`cfctl` mints, holds, and routes Cloudflare API tokens. Treat anything that touches that flow as security-sensitive.
+`cfctl` mints, holds, rotates, and revokes Cloudflare API tokens and can plan
+changes across an account. Treat authentication, catalog policy, planning,
+execution, verification, evidence, installers, and release provenance as
+security-sensitive boundaries.
 
 ## Reporting a vulnerability
 
@@ -22,20 +25,50 @@ You will get an acknowledgement on receipt. A fix or mitigation is coordinated b
 ## Scope
 
 In scope:
-- The `cfctl` runtime (`cfctl`, `commands/`, `lib/`)
-- Catalog files in `catalog/` that drive policy
-- Backend scripts under `scripts/` when invoked through `cfctl`
-- Wrapped `wrangler` and `cloudflared` invocations through `cfctl`
-- Token mint, secret-sink, preview, and lock flows
+
+- The Rust runtime and public contracts under `crates/`.
+- Catalog ingestion, generated capability metadata, and local safety
+  contracts that control execution authority.
+- OAuth, API-token, Keychain, Secret Service, secret-input, and secret-output
+  paths.
+- Plan approval, account and target binding, transaction journals, crash
+  recovery, operation-specific verification, and compensation planning.
+- Governed Wrangler, cloudflared, and UI handoffs.
+- Workspace discovery, IaC parsing, exact diffs, installers, signing,
+  provenance, and publication tooling.
 
 Out of scope:
-- Vulnerabilities in upstream `wrangler`, `cloudflared`, `jq`, or `curl` themselves — report those upstream.
+
+- Vulnerabilities in upstream Cloudflare products or third-party tools
+  themselves; report those upstream.
 - Issues that require an attacker who already has full shell access on the operator's machine.
-- Issues that require a Cloudflare API token the operator has not minted via `cfctl token mint`.
+- Unsupported local modifications that deliberately bypass the reviewed
+  binary and its policy.
 
 ## Operator hygiene (not vulnerabilities, but worth saying)
 
-- Never commit `.env` or any file containing a real token.
-- Prefer `cfctl token mint --value-out <absolute path>` over `--reveal-token-once`.
-- Treat `var/inventory/` and `var/logs/` as potentially sensitive — they record real account state.
-- Rotate the master token used to mint scoped tokens on a schedule, and after any suspected exposure.
+- Never commit a real credential, account identifier, or private evidence.
+- Use `--value-out` for secret-producing calls; cfctl refuses stdout delivery
+  and creates only a new mode-0600 file.
+- Keep profiles pinned to one account and use the global-key profile only as
+  an explicit emergency lane.
+- Treat local state and redacted receipts as sensitive operational metadata.
+- Rotate credentials on a schedule and immediately after suspected exposure.
+
+## Source and dependency proof
+
+`cargo xtask verify` is the canonical local proof. It includes formatting,
+Clippy with warnings denied, the complete test suite, catalog/source-contract
+checks, `cargo deny check`, and a full-history Gitleaks scan.
+
+`deny.toml` denies yanked crates, unreviewed licenses, unknown registries and
+Git sources, and wildcard dependency requirements. Internal path dependencies
+carry the exact workspace version. Duplicate transitive versions remain
+warnings with their dependency trees; they are not hidden by blanket skips.
+
+`.gitleaksignore` may contain only exact reviewed fingerprints. Never suppress
+a whole rule, path, commit, or entropy class to make the gate green.
+
+These checks are local proof. They do not prove that an account mutation,
+signature, notarization, upload, deployment, domain verification, or OAuth
+promotion occurred.

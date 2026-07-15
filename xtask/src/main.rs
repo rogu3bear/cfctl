@@ -198,7 +198,25 @@ fn verify() -> Result<(), TaskError> {
             "--locked",
         ],
     )?;
+    verify_security_contract()?;
     verify_source_contract()?;
+    Ok(())
+}
+
+fn security_proof_commands() -> [(&'static str, &'static [&'static str]); 2] {
+    [
+        ("cargo", &["deny", "check"]),
+        (
+            "gitleaks",
+            &["detect", "--source", ".", "--no-banner", "--redact"],
+        ),
+    ]
+}
+
+fn verify_security_contract() -> Result<(), TaskError> {
+    for (program, arguments) in security_proof_commands() {
+        run(program, arguments)?;
+    }
     Ok(())
 }
 
@@ -329,6 +347,8 @@ fn verify_v1_cutover_contract() -> Result<(), TaskError> {
 fn verify_documented_contracts() -> Result<(), TaskError> {
     for (path, phrase) in [
         ("README.md", "hash-chained transaction journal"),
+        ("SECURITY.md", "full-history Gitleaks scan"),
+        ("CONTRIBUTING.md", "Do not reintroduce the archived v1"),
         ("docs/v2-security.md", "operation-specific verification"),
         ("docs/v2-architecture.md", "Wrangler TOML/JSONC, Terraform"),
     ] {
@@ -1624,9 +1644,23 @@ mod tests {
     use super::{
         expected_signed_release_file_names, parse_remote_tag_commit, release_build_driver,
         release_build_subcommand, release_tag_is_exact_version, render_linux_installer_text,
-        validate_codesign_details, validate_notary_receipt_value, validate_signed_release_file_set,
-        validated_release_targets,
+        security_proof_commands, validate_codesign_details, validate_notary_receipt_value,
+        validate_signed_release_file_set, validated_release_targets,
     };
+
+    #[test]
+    fn local_proof_includes_dependency_policy_and_full_history_secret_scan() {
+        assert_eq!(
+            security_proof_commands(),
+            [
+                ("cargo", &["deny", "check"][..]),
+                (
+                    "gitleaks",
+                    &["detect", "--source", ".", "--no-banner", "--redact"][..],
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn linux_musl_release_builds_use_the_zig_cross_linker() {

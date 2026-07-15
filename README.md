@@ -291,15 +291,20 @@ Rust 1.93 is pinned. The local proof lane is:
 cargo xtask verify
 ```
 
+The proof host also needs `cargo-deny` and Gitleaks. The lane rejects yanked
+dependencies, unreviewed licenses or sources, unversioned dependency edges,
+and secret findings across the complete Git history. Duplicate transitive
+versions remain visible as warnings with their inverse dependency trees.
+
 The assembly lane builds Apple arm64/x86_64 and Linux musl arm64/x86_64 twice,
 compares hashes, creates SPDX SBOMs and provenance, and renders the Homebrew
 formula and checksum-verifying Linux installer. The release lane repeats that
 proof and signs the manifests before they can be uploaded to an existing
 GitHub release:
 
-The local release host needs the four Rust standard-library targets, Zig and
-`cargo-zigbuild`, `cargo-auditable` 0.7.5, Syft, Cosign, Xcode command-line
-tools, an explicit Developer ID Application identity, and a named
+The local release host additionally needs the four Rust standard-library
+targets, Zig and `cargo-zigbuild`, `cargo-auditable` 0.7.5, Syft, Cosign,
+Xcode command-line tools, an explicit Developer ID Application identity, and a named
 `notarytool` Keychain profile. The auditable build metadata is what lets each
 platform SBOM enumerate the actual Rust dependency graph instead of treating
 `cfctl` as one opaque file.

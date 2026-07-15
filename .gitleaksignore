@@ -1,0 +1,4 @@
+# Non-secret Keychain reference used by the transaction-recovery fixture. This
+# fingerprint suppresses only the reviewed historical finding, not the rule,
+# file, or commit.
+5a3bed583e757d4350fbb4887ed472f26a2301ac:crates/cfctl-cli/src/runtime.rs:generic-api-key:3134
