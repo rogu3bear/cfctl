@@ -3896,6 +3896,35 @@ fn turnstile_widget_detail_fixture() -> serde_json::Value {
     })
 }
 
+fn turnstile_widget_rotate_fixture() -> serde_json::Value {
+    json!({
+        "parameters": [
+            {"in":"path","name":"account_id","required":true,"schema":{"type":"string","maxLength":32}},
+            {"in":"path","name":"sitekey","required":true,"schema":{"type":"string","maxLength":32}}
+        ],
+        "post": {
+            "operationId":"accounts-turnstile-widget-rotate-secret",
+            "summary":"Rotate Secret for a Turnstile Widget",
+            "description":"Generate a new secret key for this widget. If `invalidate_immediately` is set to `false`, the previous secret remains valid for 2 hours. Secrets cannot be rotated again during the grace period.",
+            "tags":["Turnstile"],
+            "x-api-token-group":["Turnstile Sites Write","Account Settings Write"],
+            "requestBody": {
+                "required": true,
+                "content":{"application/json":{"schema":{
+                    "type":"object",
+                    "properties":{"invalidate_immediately":{"type":"boolean"}}
+                }}}
+            },
+            "responses": {
+                "200": {
+                    "description":"Secret rotated",
+                    "content":{"application/json":{"schema":{"$ref":"#/components/schemas/WidgetResponse"}}}
+                }
+            }
+        }
+    })
+}
+
 fn turnstile_widget_update_fixture() -> serde_json::Value {
     json!({
         "openapi": "3.0.3",
@@ -3912,7 +3941,8 @@ fn turnstile_widget_update_fixture() -> serde_json::Value {
         }},
         "paths": {
             "/accounts/{account_id}/challenges/widgets": turnstile_widget_collection_fixture(),
-            "/accounts/{account_id}/challenges/widgets/{sitekey}": turnstile_widget_detail_fixture()
+            "/accounts/{account_id}/challenges/widgets/{sitekey}": turnstile_widget_detail_fixture(),
+            "/accounts/{account_id}/challenges/widgets/{sitekey}/rotate_secret": turnstile_widget_rotate_fixture()
         }
     })
 }
@@ -4002,6 +4032,83 @@ fn turnstile_widget_create_sinks_secret_and_binds_sitekey_lifecycle() {
             .all(|selector| selector.location == "path")
     );
     assert!(create.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn turnstile_widget_rotation_requires_an_explicit_secret_cutover() {
+    let snapshot =
+        normalize_openapi(&turnstile_widget_update_fixture()).expect("Turnstile catalog");
+    let rotate = snapshot
+        .get("accounts-turnstile-widget-rotate-secret")
+        .expect("Turnstile rotation");
+
+    assert_eq!(rotate.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(rotate.risk, RiskClass::SecretSensitive);
+    assert_eq!(rotate.effect, EffectClass::IdentityOrOwnership);
+    assert!(rotate.cost.known);
+    assert!(!rotate.cost.incremental);
+    assert_eq!(rotate.cost.maximum, Some(0.0));
+    assert_eq!(rotate.cost.billing_model, BillingModelV1::Subscription);
+    assert_eq!(rotate.cost.exposure, CostExposureV1::AccountQuote);
+    assert_eq!(rotate.entitlement.available, Some(true));
+    assert!(!rotate.verification.required);
+    assert_eq!(
+        rotate.verification.strategy,
+        "sink_write_and_source_response_status"
+    );
+    assert!(!rotate.rollback.supported);
+    assert!(rotate.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("irreversible")
+            && warning.contains("2 hours")
+            && warning.contains("invalidate_immediately")
+    }));
+    assert_eq!(
+        rotate
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("required")),
+        Some(&json!(["invalidate_immediately"]))
+    );
+    assert!(rotate.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn turnstile_widget_rotation_classifier_rejects_route_permission_and_schema_drift() {
+    let mut retargeted = turnstile_widget_update_fixture();
+    let operation = retargeted["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/challenges/widgets/{sitekey}/rotate_secret")
+        .expect("rotation");
+    retargeted["paths"]["/accounts/{account_id}/challenges/widgets/{sitekey}/rotate_credentials"] =
+        operation;
+    let retargeted_snapshot = normalize_openapi(&retargeted).expect("retargeted rotation");
+    let retargeted_rotate = retargeted_snapshot
+        .get("accounts-turnstile-widget-rotate-secret")
+        .expect("retargeted rotate");
+    assert_eq!(retargeted_rotate.risk, RiskClass::Unknown);
+    assert!(!retargeted_rotate.cost.known);
+
+    let mut permission_drift = turnstile_widget_update_fixture();
+    permission_drift["paths"]["/accounts/{account_id}/challenges/widgets/{sitekey}/rotate_secret"]
+        ["post"]["x-api-token-group"] = json!(["Account Settings Write"]);
+    let permission_snapshot = normalize_openapi(&permission_drift).expect("permission drift");
+    let drifted_permission = permission_snapshot
+        .get("accounts-turnstile-widget-rotate-secret")
+        .expect("permission-drifted rotate");
+    assert_eq!(drifted_permission.risk, RiskClass::Unknown);
+    assert!(!drifted_permission.cost.known);
+
+    let mut schema_drift = turnstile_widget_update_fixture();
+    schema_drift["paths"]["/accounts/{account_id}/challenges/widgets/{sitekey}/rotate_secret"]["post"]
+        ["requestBody"]["content"]["application/json"]["schema"]["properties"]["grace_period_seconds"] =
+        json!({"type":"integer"});
+    let schema_snapshot = normalize_openapi(&schema_drift).expect("schema drift");
+    let drifted_schema = schema_snapshot
+        .get("accounts-turnstile-widget-rotate-secret")
+        .expect("schema-drifted rotate");
+    assert_eq!(drifted_schema.risk, RiskClass::Unknown);
+    assert!(!drifted_schema.cost.known);
 }
 
 #[test]

@@ -71,7 +71,9 @@ Credential material lives only in Keychain on macOS or Secret Service on
 Linux. Secret request fields enter through stdin and become opaque references.
 Secret results require `--value-out`, which must not exist and is created mode
 0600. Arguments, stdout, plans, logs, evidence, and delegated subprocess
-receipts are redacted.
+receipts are redacted. When an API cannot read a newly issued credential back,
+the truthful terminal proof is the successful Cloudflare response plus the
+durable sink receipt; cfctl does not claim that a later read verified the value.
 
 ## Adapter boundary
 

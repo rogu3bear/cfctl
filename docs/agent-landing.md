@@ -53,7 +53,10 @@ Turnstile widget creation writes the returned secret only to an explicit new
 mode-0600 sink, proves the returned sitekey through an exact detail read, and
 offers deletion only as a separate reviewed compensation plan. Widget updates
 use an exact same-resource readback and a zero-direct-incremental-cost contract.
-Secret rotation remains blocked pending a rotation-specific cutover contract.
+Secret rotation requires an explicit `invalidate_immediately` choice and a new
+mode-0600 sink. The plan explains that immediate invalidation is irreversible,
+while the non-immediate path keeps the old secret for only two hours and blocks
+another rotation during that grace period.
 
 ## Deterministic execution
 

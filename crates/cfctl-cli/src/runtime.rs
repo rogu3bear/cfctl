@@ -4979,7 +4979,7 @@ async fn verify_api_plan(
         plan.status = PlanStatus::Verified;
         let outcome = ApiVerificationOutcome {
             state: VerificationState::Passed,
-            basis: "operation declares no post-change verifier".to_owned(),
+            basis: non_readback_verification_basis(&plan.capability),
             evidence: None,
             error: None,
         };
@@ -5002,6 +5002,15 @@ async fn verify_api_plan(
         verification_response_artifact(&outcome)?,
     )?;
     Ok(outcome)
+}
+
+fn non_readback_verification_basis(capability: &CapabilityV1) -> String {
+    if capability.verification.strategy == "sink_write_and_source_response_status" {
+        "Cloudflare returned success and the required sink-only secret output was durably persisted"
+            .to_owned()
+    } else {
+        "operation declares no post-change verifier".to_owned()
+    }
 }
 
 fn verification_outcome(
@@ -7054,7 +7063,7 @@ fn guide_stage_document(
         &live_reads,
     );
     let summary = guide_live_read_summary(stage, &live_reads)
-        .unwrap_or_else(|| guide_stage_summary(stage, capability.mutating));
+        .unwrap_or_else(|| guide_stage_summary(stage, capability));
     let evidence_class = if guide_stage_uses_live_read(stage, &live_reads) {
         "live_read"
     } else {
@@ -7072,8 +7081,10 @@ fn guide_stage_document(
     })
 }
 
-fn guide_stage_summary(stage: cfctl_core::GuideStage, mutating: bool) -> &'static str {
+fn guide_stage_summary(stage: cfctl_core::GuideStage, capability: &CapabilityV1) -> &'static str {
     use cfctl_core::GuideStage;
+
+    let mutating = capability.mutating;
 
     match stage {
         GuideStage::Discover => {
@@ -7117,6 +7128,11 @@ fn guide_stage_summary(stage: cfctl_core::GuideStage, mutating: bool) -> &'stati
         }
         GuideStage::Execute => {
             "Perform the redacted live read through the catalog-selected adapter."
+        }
+        GuideStage::Verify
+            if capability.verification.strategy == "sink_write_and_source_response_status" =>
+        {
+            "Treat Cloudflare success plus the durable sink-only secret receipt as the terminal verification; no readback can prove the new credential value."
         }
         GuideStage::Verify => {
             "Require operation-specific post-change verification before declaring success."
@@ -7597,9 +7613,9 @@ mod tests {
         apply_zone_account_response, apply_zone_entitlement_response,
         bind_required_empty_compensation_body, boundary_response_artifact, capability_call_argv,
         compensation_request, find_secret_value, guide_document, is_live_plan_precondition_hash,
-        persist_prepared_plan, persist_secret_lifecycle, preflight_call_input,
-        preserve_previous_catalog, query_object_from_pairs, redact_secret_result,
-        required_cloudflare_tunnel_configuration_state_precondition,
+        non_readback_verification_basis, persist_prepared_plan, persist_secret_lifecycle,
+        preflight_call_input, preserve_previous_catalog, query_object_from_pairs,
+        redact_secret_result, required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
         required_warp_connector_configuration_state_precondition,
@@ -10802,6 +10818,38 @@ mod tests {
         assert_eq!(redacted["result"]["status"], "active");
         assert_eq!(redacted["result"]["value"], "[SUNK]");
         assert!(!redacted.to_string().contains("must-not-survive"));
+    }
+
+    #[test]
+    fn sink_only_verification_basis_names_the_durable_secret_receipt() {
+        let mut capability = CapabilityV1::new(
+            "accounts-turnstile-widget-rotate-secret",
+            "Rotate Turnstile secret",
+            "POST",
+            "/accounts/{account_id}/challenges/widgets/{sitekey}/rotate_secret",
+        );
+        capability.risk = RiskClass::SecretSensitive;
+        capability.verification.required = false;
+        capability.verification.strategy = "sink_write_and_source_response_status".to_owned();
+
+        assert_eq!(
+            non_readback_verification_basis(&capability),
+            "Cloudflare returned success and the required sink-only secret output was durably persisted"
+        );
+        let guide = guide_document(&capability);
+        let verify = guide["stages"]
+            .as_array()
+            .expect("guide stages")
+            .iter()
+            .find(|stage| stage["name"] == "verify")
+            .expect("verify stage");
+        assert_eq!(verify["required"], false);
+        assert_eq!(verify["contract_state"], "not_applicable");
+        assert!(
+            verify["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("durable sink-only secret receipt"))
+        );
     }
 
     #[test]

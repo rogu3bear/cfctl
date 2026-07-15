@@ -3467,6 +3467,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         classify_dns_record_lifecycle(capability);
     } else if let Some(kind) = access_authorization_configuration_kind(capability) {
         classify_access_authorization_configuration(capability, kind);
+    } else if turnstile_widget_rotation_contract_supported(capability) {
+        classify_turnstile_widget_rotation(capability);
     } else if turnstile_widget_create_contract_supported(capability) {
         classify_turnstile_widget_create(capability);
     } else if turnstile_widget_update_contract_supported(capability) {
@@ -3489,6 +3491,29 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         return false;
     }
     true
+}
+
+fn turnstile_widget_rotation_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "accounts-turnstile-widget-rotate-secret"
+        && capability.method == "POST"
+        && capability.path == "/accounts/{account_id}/challenges/widgets/{sitekey}/rotate_secret"
+        && capability.product == "Turnstile"
+        && capability
+            .description
+            .as_deref()
+            .is_some_and(|description| {
+                let description = description.to_ascii_lowercase();
+                description.contains("previous secret remains valid for 2 hours")
+                    && description
+                        .contains("secrets cannot be rotated again during the grace period")
+            })
+        && turnstile_widget_write_permissions_supported(capability)
+        && turnstile_widget_detail_selectors_supported(capability)
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(turnstile_widget_response_contract_supported)
+        && turnstile_widget_rotation_request_contract_supported(capability)
 }
 
 fn turnstile_widget_create_contract_supported(capability: &CapabilityV1) -> bool {
@@ -3600,6 +3625,45 @@ fn turnstile_widget_collection_selectors_supported(capability: &CapabilityV1) ->
         })
 }
 
+fn turnstile_widget_detail_selectors_supported(capability: &CapabilityV1) -> bool {
+    let expected = [
+        (
+            "account_id",
+            serde_json::json!({"maxLength":32,"type":"string"}),
+        ),
+        (
+            "sitekey",
+            serde_json::json!({"maxLength":32,"type":"string"}),
+        ),
+    ];
+    capability.selectors.len() == expected.len()
+        && expected.iter().all(|(name, schema)| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+                    && selector.contract.as_ref().is_some_and(|contract| {
+                        contract.schema == *schema && contract.query.is_none()
+                    })
+            })
+        })
+}
+
+fn turnstile_widget_rotation_request_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.request_schema.as_ref().is_some_and(|schema| {
+        schema.get("type").and_then(Value::as_str) == Some("object")
+            && schema.get("x-cfctl-body-required").and_then(Value::as_bool) == Some(true)
+            && schema.get("required").is_none()
+            && canonical_request_object_fields(capability)
+                == Some(vec!["invalidate_immediately".to_owned()])
+            && schema
+                .pointer("/properties/invalidate_immediately/type")
+                .and_then(Value::as_str)
+                == Some("boolean")
+    })
+}
+
 fn turnstile_widget_configuration_request_contract_supported(capability: &CapabilityV1) -> bool {
     let Some(schema) = capability.request_schema.as_ref() else {
         return false;
@@ -3675,6 +3739,33 @@ fn classify_turnstile_widget_create(capability: &mut CapabilityV1) {
     classify_turnstile_widget_cost_and_entitlement(
         capability,
         "creating a Turnstile widget consumes widget capacity but does not purchase a plan or add a usage charge, so its direct incremental ceiling is zero; Free accounts remain limited to 20 widgets and Enterprise capacity is separately negotiated",
+    );
+}
+
+fn classify_turnstile_widget_rotation(capability: &mut CapabilityV1) {
+    capability.risk = RiskClass::SecretSensitive;
+    capability.effect = EffectClass::IdentityOrOwnership;
+    if let Some(schema) = capability
+        .request_schema
+        .as_mut()
+        .and_then(Value::as_object_mut)
+    {
+        schema.insert(
+            "required".to_owned(),
+            serde_json::json!(["invalidate_immediately"]),
+        );
+    }
+    capability.verification.required = false;
+    "sink_write_and_source_response_status".clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "secret rotation is irreversible: `invalidate_immediately=true` invalidates the previous secret at once, while `false` preserves it for only 2 hours and blocks another rotation during that grace period; install and verify the new sink before dependent cutover"
+            .to_owned(),
+    );
+    classify_turnstile_widget_cost_and_entitlement(
+        capability,
+        "rotating an existing Turnstile widget secret does not purchase a plan, add a widget, or add usage charges, so its direct incremental ceiling is zero; widget capacity and Enterprise terms remain part of the account's existing subscription",
     );
 }
 

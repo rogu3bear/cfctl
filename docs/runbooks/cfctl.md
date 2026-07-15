@@ -137,6 +137,18 @@ metadata and account-only resource policy. Running the approved plan repeats
 that inventory read before consumption; drift requires a new plan. Do not use
 generic `call` for token creation.
 
+Turnstile secret rotation requires an explicit cutover choice. `false` keeps
+the prior secret valid for two hours and prevents another rotation during that
+window; `true` invalidates it immediately. In both cases the new secret is
+written only to a new sink:
+
+```bash
+printf '%s' '{"invalidate_immediately":false}' | \
+  cfctl call accounts-turnstile-widget-rotate-secret \
+    --selector account_id=<account-id> --selector sitekey=<sitekey> \
+    --body-stdin --value-out /new/secure/path --json
+```
+
 ## Agent entry
 
 ```bash
