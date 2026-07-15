@@ -391,6 +391,22 @@ fn same_path_read_contracts_union_all_of_object_fields_without_exposing_secrets(
     update.request_schema.as_mut().expect("request schema")["allOf"][1]["type"] = json!("string");
     assert_eq!(update.verifiable_request_object_fields(), None);
     assert!(!update.verification_contract_supported());
+}
+
+#[test]
+fn same_path_read_contracts_union_object_alternative_fields() {
+    let mut update = CapabilityV1::new(
+        "widgets-update",
+        "Update widget",
+        "PATCH",
+        "/accounts/{account_id}/widgets/{widget_id}",
+    );
+    update.verification.strategy = "same_resource_contains_planned_fields_after_update".to_owned();
+    update.same_path_read = Some(SamePathReadContractV1 {
+        path: update.path.clone(),
+        read_capability_id: "widgets-get".to_owned(),
+        verified_response_fields: Vec::new(),
+    });
 
     update.request_schema = Some(json!({
         "oneOf": [
@@ -398,8 +414,16 @@ fn same_path_read_contracts_union_all_of_object_fields_without_exposing_secrets(
             {"type":"object", "properties":{"enabled":{"type":"boolean"}}}
         ]
     }));
-    assert_eq!(update.verifiable_request_object_fields(), None);
-    assert!(!update.verification_contract_supported());
+    update
+        .same_path_read
+        .as_mut()
+        .expect("same-path contract")
+        .verified_response_fields = vec!["enabled".to_owned(), "name".to_owned()];
+    assert_eq!(
+        update.verifiable_request_object_fields(),
+        Some(vec!["enabled".to_owned(), "name".to_owned()])
+    );
+    assert!(update.verification_contract_supported());
 
     update.request_schema = Some(json!({
         "properties": {"kind":{"type":"string"}},
@@ -410,8 +434,86 @@ fn same_path_read_contracts_union_all_of_object_fields_without_exposing_secrets(
     }));
     assert_eq!(
         update.verifiable_request_object_fields(),
+        Some(vec![
+            "email".to_owned(),
+            "kind".to_owned(),
+            "name".to_owned()
+        ])
+    );
+
+    update.request_schema = Some(json!({
+        "anyOf": [
+            {
+                "type":"object",
+                "properties": {
+                    "name":{"type":"string"},
+                    "secret":{"type":"string", "writeOnly":true}
+                }
+            },
+            {
+                "type":"object",
+                "properties": {
+                    "enabled":{"type":"boolean"},
+                    "token":{"type":"string", "writeOnly":true}
+                }
+            }
+        ]
+    }));
+    assert_eq!(
+        update.verifiable_request_object_fields(),
+        Some(vec!["enabled".to_owned(), "name".to_owned()])
+    );
+    assert!(update.request_object_field_is_write_only("secret"));
+    assert!(update.request_object_field_is_write_only("token"));
+
+    update.request_schema = Some(json!({
+        "properties": {"kind":{"type":"string"}},
+        "oneOf": [
+            {"type":"object", "properties":{"kind":{"enum":["object"]}}},
+            {"type":"string"}
+        ]
+    }));
+    assert_eq!(
+        update.verifiable_request_object_fields(),
         Some(vec!["kind".to_owned()])
     );
+
+    update.request_schema = Some(json!({
+        "oneOf": [
+            {"type":"object", "properties":{"kind":{"enum":["object"]}}},
+            {"type":"string"}
+        ]
+    }));
+    assert_eq!(update.verifiable_request_object_fields(), None);
+}
+
+#[test]
+fn request_object_field_extraction_is_width_bounded() {
+    let branches = (0..5_000)
+        .map(|value| {
+            json!({
+                "type":"object",
+                "properties":{"value":{"const":value}}
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut capability = CapabilityV1::new(
+        "widgets-update",
+        "Update widget",
+        "PATCH",
+        "/accounts/{account_id}/widgets/{widget_id}",
+    );
+    capability.request_schema = Some(json!({
+        "properties":{
+            "direct":{"type":"string"},
+            "secret":{"type":"string", "writeOnly":true}
+        },
+        "oneOf":branches
+    }));
+
+    assert_eq!(capability.request_object_fields(), None);
+    assert_eq!(capability.verifiable_request_object_fields(), None);
+    assert!(!capability.request_object_field_is_write_only("secret"));
 }
 
 #[test]

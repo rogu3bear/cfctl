@@ -602,10 +602,10 @@ impl CapabilityV1 {
     }
 
     /// Returns the canonical top-level fields of an object request schema.
-    /// Direct properties and `allOf` members are combined because every
-    /// `allOf` member constrains the same request. Fields declared only inside
-    /// alternative `oneOf` and `anyOf` branches remain ineligible until a
-    /// verification contract can bind the selected branch explicitly.
+    /// Direct properties and fields from fully object-shaped compositions are
+    /// combined into a deterministic allowlist. Catalog classifiers require a
+    /// readback schema to declare that full union, while the runtime compares
+    /// only fields present in the validated, hash-bound plan body.
     #[must_use]
     pub fn request_object_fields(&self) -> Option<Vec<String>> {
         let fields = request_object_property_schemas(self.request_schema.as_ref()?)?;
@@ -622,11 +622,7 @@ impl CapabilityV1 {
         let fields = request_object_property_schemas(self.request_schema.as_ref()?)?;
         let fields = fields
             .into_iter()
-            .filter(|(_, schemas)| {
-                !schemas
-                    .iter()
-                    .all(|schema| schema_declares_write_only(schema, 0))
-            })
+            .filter(|(_, schemas)| !property_schemas_are_write_only(schemas))
             .map(|(name, _)| name)
             .collect::<Vec<_>>();
         if fields.is_empty() {
@@ -643,12 +639,7 @@ impl CapabilityV1 {
             .as_ref()
             .and_then(request_object_property_schemas)
             .and_then(|fields| fields.get(field).cloned())
-            .is_some_and(|schemas| {
-                !schemas.is_empty()
-                    && schemas
-                        .iter()
-                        .all(|schema| schema_declares_write_only(schema, 0))
-            })
+            .is_some_and(|schemas| property_schemas_are_write_only(&schemas))
     }
 
     fn verified_response_fields_match_request_schema(&self, fields: &[String]) -> bool {
@@ -792,66 +783,133 @@ impl CapabilityV1 {
 }
 
 const MAX_REQUEST_OBJECT_SCHEMA_DEPTH: usize = 64;
+const MAX_REQUEST_OBJECT_SCHEMA_STEPS: usize = 4_096;
 
 fn request_object_property_schemas(schema: &Value) -> Option<BTreeMap<String, Vec<&Value>>> {
     let mut fields = BTreeMap::new();
-    if !collect_all_of_object_property_schemas(schema, 0, &mut fields) || fields.is_empty() {
+    let mut remaining_steps = MAX_REQUEST_OBJECT_SCHEMA_STEPS;
+    if collect_composed_object_property_schemas(schema, 0, &mut remaining_steps, &mut fields)
+        != RequestObjectSchemaCollection::Object
+        || fields.is_empty()
+    {
         return None;
     }
     Some(fields)
 }
 
-fn collect_all_of_object_property_schemas<'a>(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestObjectSchemaCollection {
+    Object,
+    Ineligible,
+    LimitExceeded,
+}
+
+fn collect_composed_object_property_schemas<'a>(
     schema: &'a Value,
     depth: usize,
+    remaining_steps: &mut usize,
     fields: &mut BTreeMap<String, Vec<&'a Value>>,
-) -> bool {
-    if depth > MAX_REQUEST_OBJECT_SCHEMA_DEPTH {
-        return false;
+) -> RequestObjectSchemaCollection {
+    if depth > MAX_REQUEST_OBJECT_SCHEMA_DEPTH || *remaining_steps == 0 {
+        return RequestObjectSchemaCollection::LimitExceeded;
     }
+    *remaining_steps -= 1;
     match schema.get("type") {
         None => {}
         Some(Value::String(value_type)) if value_type == "object" => {}
-        _ => return false,
+        _ => return RequestObjectSchemaCollection::Ineligible,
     }
-    let mut direct_property_count = 0;
+    let mut local_fields = BTreeMap::<String, Vec<&Value>>::new();
     if let Some(properties) = schema.get("properties") {
         let Some(properties) = properties.as_object() else {
-            return false;
+            return RequestObjectSchemaCollection::Ineligible;
         };
-        direct_property_count = properties.len();
         for (name, property_schema) in properties {
-            fields
+            local_fields
                 .entry(name.clone())
                 .or_default()
                 .push(property_schema);
         }
     }
-    // Preserve the established contract for explicitly declared root fields,
-    // but never infer a fixed allowlist from alternative branches. Branch-only
-    // fields remain rejected at the mutation boundary until a selected variant
-    // can be hash-bound by the plan.
-    if schema.get("oneOf").is_some() || schema.get("anyOf").is_some() {
-        return direct_property_count > 0;
-    }
     if let Some(all_of) = schema.get("allOf") {
         let Some(members) = all_of.as_array().filter(|members| !members.is_empty()) else {
-            return false;
+            return RequestObjectSchemaCollection::Ineligible;
         };
-        if members
-            .iter()
-            .any(|member| !collect_all_of_object_property_schemas(member, depth + 1, fields))
-        {
-            return false;
+        for member in members {
+            let outcome = collect_composed_object_property_schemas(
+                member,
+                depth + 1,
+                remaining_steps,
+                &mut local_fields,
+            );
+            if outcome != RequestObjectSchemaCollection::Object {
+                return outcome;
+            }
         }
     }
-    true
+    for composition in ["oneOf", "anyOf"] {
+        let Some(members) = schema.get(composition) else {
+            continue;
+        };
+        let Some(members) = members.as_array().filter(|members| !members.is_empty()) else {
+            return RequestObjectSchemaCollection::Ineligible;
+        };
+        let mut alternative_fields = BTreeMap::new();
+        let mut object_shaped = true;
+        for member in members {
+            match collect_composed_object_property_schemas(
+                member,
+                depth + 1,
+                remaining_steps,
+                &mut alternative_fields,
+            ) {
+                RequestObjectSchemaCollection::Object => {}
+                RequestObjectSchemaCollection::Ineligible => {
+                    object_shaped = false;
+                    break;
+                }
+                RequestObjectSchemaCollection::LimitExceeded => {
+                    return RequestObjectSchemaCollection::LimitExceeded;
+                }
+            }
+        }
+        if object_shaped {
+            merge_request_object_property_schemas(&mut local_fields, alternative_fields);
+        } else if local_fields.is_empty() {
+            // A non-object alternative cannot use an object readback contract.
+            // Keep explicit universal fields when present to preserve the
+            // existing object-body lane, but never infer branch-only fields.
+            return RequestObjectSchemaCollection::Ineligible;
+        }
+    }
+    merge_request_object_property_schemas(fields, local_fields);
+    RequestObjectSchemaCollection::Object
 }
 
-fn schema_declares_write_only(schema: &Value, depth: usize) -> bool {
-    if depth > MAX_REQUEST_OBJECT_SCHEMA_DEPTH {
+fn merge_request_object_property_schemas<'a>(
+    fields: &mut BTreeMap<String, Vec<&'a Value>>,
+    additional: BTreeMap<String, Vec<&'a Value>>,
+) {
+    for (name, schemas) in additional {
+        fields.entry(name).or_default().extend(schemas);
+    }
+}
+
+fn property_schemas_are_write_only(schemas: &[&Value]) -> bool {
+    if schemas.is_empty() {
         return false;
     }
+    let mut remaining_steps = MAX_REQUEST_OBJECT_SCHEMA_STEPS;
+    schemas
+        .iter()
+        .all(|schema| schema_declares_write_only(schema, 0, &mut remaining_steps))
+}
+
+fn schema_declares_write_only(schema: &Value, depth: usize, remaining_steps: &mut usize) -> bool {
+    if depth > MAX_REQUEST_OBJECT_SCHEMA_DEPTH || *remaining_steps == 0 {
+        return false;
+    }
+    *remaining_steps -= 1;
     if schema.get("writeOnly").and_then(Value::as_bool) == Some(true) {
         return true;
     }
@@ -861,7 +919,7 @@ fn schema_declares_write_only(schema: &Value, depth: usize) -> bool {
         .is_some_and(|members| {
             members
                 .iter()
-                .any(|member| schema_declares_write_only(member, depth + 1))
+                .any(|member| schema_declares_write_only(member, depth + 1, remaining_steps))
         })
     {
         return true;
@@ -872,9 +930,9 @@ fn schema_declares_write_only(schema: &Value, depth: usize) -> bool {
             .and_then(Value::as_array)
             .is_some_and(|members| {
                 !members.is_empty()
-                    && members
-                        .iter()
-                        .all(|member| schema_declares_write_only(member, depth + 1))
+                    && members.iter().all(|member| {
+                        schema_declares_write_only(member, depth + 1, remaining_steps)
+                    })
             })
     })
 }

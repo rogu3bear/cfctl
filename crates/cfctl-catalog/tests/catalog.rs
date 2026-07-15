@@ -1785,19 +1785,28 @@ fn update_contract_unions_all_of_fields_and_excludes_write_only_inputs() {
     document["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["patch"]["requestBody"]["content"]
         ["application/json"]["schema"] = json!({
         "oneOf": [
-            {"type":"object", "properties":{"name":{"type":"string"}}},
+            {"type":"object", "properties":{
+                "name":{"type":"string"},
+                "secret":{"type":"string", "writeOnly":true}
+            }},
             {"type":"object", "properties":{"enabled":{"type":"boolean"}}}
         ]
     });
     let alternatives = normalize_openapi(&document).expect("oneOf update catalog");
-    assert_ne!(
-        alternatives
-            .get("widgets-patch")
-            .expect("oneOf patch")
-            .verification
-            .strategy,
+    let patch = alternatives.get("widgets-patch").expect("oneOf patch");
+    assert_eq!(
+        patch.verification.strategy,
         "same_resource_contains_planned_fields_after_update"
     );
+    assert_eq!(
+        patch
+            .same_path_read
+            .as_ref()
+            .expect("alternative readback")
+            .verified_response_fields,
+        ["enabled", "name"]
+    );
+    assert!(patch.request_object_field_is_write_only("secret"));
 
     document["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["patch"]["requestBody"]["content"]
         ["application/json"]["schema"]["properties"] = json!({"name":{"type":"string"}});
@@ -1816,7 +1825,7 @@ fn update_contract_unions_all_of_fields_and_excludes_write_only_inputs() {
             .as_ref()
             .expect("direct-field readback")
             .verified_response_fields,
-        ["name"]
+        ["enabled", "name"]
     );
 }
 

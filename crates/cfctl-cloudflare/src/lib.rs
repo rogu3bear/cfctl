@@ -1490,23 +1490,31 @@ fn contains_verifiable_planned_value(
 }
 
 fn request_schema_path_is_write_only(schema: &Value, path: &[RequestSchemaPathStep]) -> bool {
-    let candidates = request_schema_path_candidates(schema, path, 0);
+    let mut remaining_steps = MAX_REQUEST_SCHEMA_PROJECTION_STEPS;
+    let Some(candidates) = request_schema_path_candidates(schema, path, 0, &mut remaining_steps)
+    else {
+        return false;
+    };
     !candidates.is_empty()
         && candidates
             .iter()
-            .all(|candidate| schema_declares_write_only(candidate, 0))
+            .all(|candidate| schema_declares_write_only(candidate, 0, &mut remaining_steps))
 }
+
+const MAX_REQUEST_SCHEMA_PROJECTION_STEPS: usize = 4_096;
 
 fn request_schema_path_candidates<'a>(
     schema: &'a Value,
     path: &[RequestSchemaPathStep],
     depth: usize,
-) -> Vec<&'a Value> {
-    if depth > MAX_REQUEST_VALIDATION_DEPTH {
-        return Vec::new();
+    remaining_steps: &mut usize,
+) -> Option<Vec<&'a Value>> {
+    if depth > MAX_REQUEST_VALIDATION_DEPTH || *remaining_steps == 0 {
+        return None;
     }
+    *remaining_steps -= 1;
     let Some((step, remaining)) = path.split_first() else {
-        return vec![schema];
+        return Some(vec![schema]);
     };
     let mut candidates = Vec::new();
     let child = match step {
@@ -1517,7 +1525,12 @@ fn request_schema_path_candidates<'a>(
         RequestSchemaPathStep::Item => schema.get("items"),
     };
     if let Some(child) = child {
-        candidates.extend(request_schema_path_candidates(child, remaining, depth + 1));
+        candidates.extend(request_schema_path_candidates(
+            child,
+            remaining,
+            depth + 1,
+            remaining_steps,
+        )?);
     }
     for composition in ["allOf", "oneOf", "anyOf"] {
         for member in schema
@@ -1526,16 +1539,22 @@ fn request_schema_path_candidates<'a>(
             .into_iter()
             .flatten()
         {
-            candidates.extend(request_schema_path_candidates(member, path, depth + 1));
+            candidates.extend(request_schema_path_candidates(
+                member,
+                path,
+                depth + 1,
+                remaining_steps,
+            )?);
         }
     }
-    candidates
+    Some(candidates)
 }
 
-fn schema_declares_write_only(schema: &Value, depth: usize) -> bool {
-    if depth > MAX_REQUEST_VALIDATION_DEPTH {
+fn schema_declares_write_only(schema: &Value, depth: usize, remaining_steps: &mut usize) -> bool {
+    if depth > MAX_REQUEST_VALIDATION_DEPTH || *remaining_steps == 0 {
         return false;
     }
+    *remaining_steps -= 1;
     if schema.get("writeOnly").and_then(Value::as_bool) == Some(true) {
         return true;
     }
@@ -1545,7 +1564,7 @@ fn schema_declares_write_only(schema: &Value, depth: usize) -> bool {
         .is_some_and(|members| {
             members
                 .iter()
-                .any(|member| schema_declares_write_only(member, depth + 1))
+                .any(|member| schema_declares_write_only(member, depth + 1, remaining_steps))
         })
     {
         return true;
@@ -1556,11 +1575,34 @@ fn schema_declares_write_only(schema: &Value, depth: usize) -> bool {
             .and_then(Value::as_array)
             .is_some_and(|members| {
                 !members.is_empty()
-                    && members
-                        .iter()
-                        .all(|member| schema_declares_write_only(member, depth + 1))
+                    && members.iter().all(|member| {
+                        schema_declares_write_only(member, depth + 1, remaining_steps)
+                    })
             })
     })
+}
+
+#[cfg(test)]
+mod request_schema_projection_tests {
+    use super::{RequestSchemaPathStep, request_schema_path_is_write_only};
+
+    #[test]
+    fn write_only_projection_fails_closed_when_schema_work_is_exhausted() {
+        let branches = (0..5_000)
+            .map(|_| {
+                serde_json::json!({
+                    "type":"object",
+                    "properties":{
+                        "secret":{"type":"string", "writeOnly":true}
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let schema = serde_json::json!({"oneOf":branches});
+        let path = [RequestSchemaPathStep::Property("secret".to_owned())];
+
+        assert!(!request_schema_path_is_write_only(&schema, &path));
+    }
 }
 
 fn contains_planned_value(actual: &Value, planned: &Value) -> bool {

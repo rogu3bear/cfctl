@@ -2336,6 +2336,108 @@ fn all_of_update_request_schema() -> Value {
 }
 
 #[tokio::test]
+async fn exact_resource_update_projects_branch_local_write_only_inputs() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"id":"widget-1","name":"after","config":{"client_id":"public-id"}},"errors":[]}"#,
+    ])
+    .await;
+    let mut plan = dns_record_plan(
+        "widgets-update",
+        "PATCH",
+        "/accounts/{account_id}/widgets/{widget_id}",
+        "same_resource_contains_planned_fields_after_update",
+        json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        Some(json!({
+            "name":"after",
+            "secret":"must-not-be-returned",
+            "config":{
+                "client_id":"public-id",
+                "client_secret":"nested-must-not-be-returned"
+            }
+        })),
+    );
+    plan.capability.request_schema = Some(json!({
+        "oneOf": [
+            {
+                "type":"object",
+                "required":["name", "secret", "config"],
+                "properties": {
+                    "name":{"type":"string"},
+                    "secret":{"type":"string", "writeOnly":true},
+                    "config":{
+                        "type":"object",
+                        "required":["client_id", "client_secret"],
+                        "properties":{
+                            "client_id":{"type":"string"},
+                            "client_secret":{"type":"string", "writeOnly":true}
+                        }
+                    }
+                }
+            },
+            {
+                "type":"object",
+                "required":["enabled"],
+                "properties":{"enabled":{"type":"boolean"}}
+            }
+        ]
+    }));
+    plan.capability
+        .same_path_read
+        .as_mut()
+        .expect("same-path readback")
+        .verified_response_fields =
+        vec!["config".to_owned(), "enabled".to_owned(), "name".to_owned()];
+    let input = CallInput {
+        selectors: json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        body: Some(json!({
+            "name":"after",
+            "secret":"must-not-be-returned",
+            "config":{
+                "client_id":"public-id",
+                "client_secret":"nested-must-not-be-returned"
+            }
+        })),
+        ..CallInput::default()
+    };
+    RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build_unchecked(&plan.capability, &input)
+        .expect("hash-bound body should match exactly one request branch");
+    plan.input = serde_json::to_value(input).expect("input");
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"widget-1"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("branch-local write-only input should remain outside readback");
+
+    assert!(verification.passed, "{}", verification.basis);
+    assert!(!verification.basis.contains("must-not-be-returned"));
+    assert!(!verification.basis.contains("nested-must-not-be-returned"));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
 async fn created_resource_is_read_back_by_schema_proven_id_and_planned_fields() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
