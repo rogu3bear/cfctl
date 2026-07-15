@@ -717,6 +717,9 @@ impl CapabilityV1 {
                             && read.verified_response_fields == ["read_replication"]
                     })
             }
+            Some("restore_cloudflare_tunnel_configuration_prior_snapshot") => {
+                cloudflare_tunnel_configuration_rollback_contract_supported(self)
+            }
             Some("restore_dns_record_prior_snapshot_with_put") => {
                 matches!(
                     (self.id.as_str(), self.method.as_str()),
@@ -1080,6 +1083,35 @@ fn d1_read_replication_request_contract_supported(capability: &CapabilityV1) -> 
                             ]))
                 })
         })
+}
+
+const CLOUDFLARE_TUNNEL_CONFIGURATION_REQUEST_SCHEMA_HASH: &str =
+    "sha256:0d3afbf113085d7fe33fb84c2e0194f9b2adffb96917e78d1f9c6e3cef57c2ed";
+
+fn cloudflare_tunnel_configuration_rollback_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "cloudflare-tunnel-configuration-put-configuration"
+        && capability.method == "PUT"
+        && capability.product == "Cloudflare Tunnel Configuration"
+        && capability.path == "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations"
+        && capability.account_scope == "account"
+        && capability.verification.strategy
+            == "same_path_result_contains_planned_fields_after_update"
+        && capability.verification_contract_supported()
+        && cloudflare_tunnel_configuration_request_contract_supported(capability)
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path == "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations"
+                && read.read_capability_id == "cloudflare-tunnel-configuration-get-configuration"
+                && read.verified_response_fields == ["config"]
+        })
+}
+
+fn cloudflare_tunnel_configuration_request_contract_supported(capability: &CapabilityV1) -> bool {
+    capability
+        .request_schema
+        .as_ref()
+        .and_then(|schema| canonical_hash_value(schema).ok())
+        .as_deref()
+        == Some(CLOUDFLARE_TUNNEL_CONFIGURATION_REQUEST_SCHEMA_HASH)
 }
 
 const DNS_RECORD_UPDATE_REQUEST_SCHEMA_HASH: &str =

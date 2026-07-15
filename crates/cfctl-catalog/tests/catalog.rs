@@ -4201,6 +4201,221 @@ fn cloudflare_tunnel_lifecycle_rejects_permission_and_source_schema_drift() {
     assert!(!drifted_update.cost.known);
 }
 
+fn cloudflare_tunnel_origin_request_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "access": {
+                "type": "object",
+                "required": ["audTag", "teamName"],
+                "properties": {
+                    "audTag": {"type": "array", "items": {"type": "string"}},
+                    "required": {"type": "boolean"},
+                    "teamName": {"type": "string"}
+                }
+            },
+            "caPool": {"type": "string"},
+            "connectTimeout": {"type": "integer"},
+            "disableChunkedEncoding": {"type": "boolean"},
+            "http2Origin": {"type": "boolean"},
+            "httpHostHeader": {"type": "string"},
+            "keepAliveConnections": {"type": "integer"},
+            "keepAliveTimeout": {"type": "integer"},
+            "matchSNItoHost": {"type": "boolean"},
+            "noHappyEyeballs": {"type": "boolean"},
+            "noTLSVerify": {"type": "boolean"},
+            "originServerName": {"type": "string"},
+            "proxyType": {"type": "string"},
+            "tcpKeepAlive": {"type": "integer"},
+            "tlsTimeout": {"type": "integer"}
+        }
+    })
+}
+
+fn cloudflare_tunnel_configuration_fixture() -> serde_json::Value {
+    let mut document = cloudflare_tunnel_lifecycle_fixture();
+    let origin_request = cloudflare_tunnel_origin_request_schema();
+    document["components"]["schemas"]["Widget"]["properties"]["config"] = json!({
+        "type": "object",
+        "properties": {
+            "ingress": {"type": "array"},
+            "originRequest": {"type": "object"}
+        }
+    });
+    let response = json!({
+        "description": "Tunnel configuration",
+        "content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/WidgetResponse"}
+        }}
+    });
+    document["paths"]["/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations"] = json!({
+        "parameters": [
+            {
+                "in": "path",
+                "name": "account_id",
+                "required": true,
+                "schema": {"type": "string", "maxLength": 32}
+            },
+            {
+                "in": "path",
+                "name": "tunnel_id",
+                "required": true,
+                "schema": {"type": "string", "format": "uuid", "maxLength": 36}
+            }
+        ],
+        "get": {
+            "operationId": "cloudflare-tunnel-configuration-get-configuration",
+            "summary": "Get configuration",
+            "tags": ["Cloudflare Tunnel Configuration"],
+            "x-api-token-group": [
+                "Cloudflare One Connectors Write",
+                "Cloudflare One Connectors Read",
+                "Cloudflare One Connector: cloudflared Write",
+                "Cloudflare One Connector: cloudflared Read",
+                "Cloudflare Tunnel Write",
+                "Cloudflare Tunnel Read"
+            ],
+            "responses": {"200": response.clone()}
+        },
+        "put": {
+            "operationId": "cloudflare-tunnel-configuration-put-configuration",
+            "summary": "Put configuration",
+            "tags": ["Cloudflare Tunnel Configuration"],
+            "x-api-token-group": [
+                "Cloudflare One Connectors Write",
+                "Cloudflare One Connector: cloudflared Write",
+                "Cloudflare Tunnel Write"
+            ],
+            "requestBody": {
+                "required": true,
+                "content": {"application/json": {"schema": {
+                    "type": "object",
+                    "properties": {
+                        "config": {
+                            "type": "object",
+                            "properties": {
+                                "ingress": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["hostname", "service"],
+                                        "properties": {
+                                            "hostname": {"type": "string"},
+                                            "originRequest": origin_request.clone(),
+                                            "path": {"type": "string"},
+                                            "service": {"type": "string"}
+                                        }
+                                    }
+                                },
+                                "originRequest": origin_request
+                            }
+                        }
+                    }
+                }}}
+            },
+            "responses": {"200": response}
+        }
+    });
+    document
+}
+
+#[test]
+fn cloudflare_tunnel_configuration_binds_a_reversible_full_routing_replacement() {
+    let snapshot = normalize_openapi(&cloudflare_tunnel_configuration_fixture())
+        .expect("Tunnel configuration catalog");
+    let capability = snapshot
+        .get("cloudflare-tunnel-configuration-put-configuration")
+        .expect("Tunnel configuration PUT");
+
+    assert_eq!(
+        capability.adapter_status,
+        AdapterStatus::DynamicApi,
+        "{capability:#?}"
+    );
+    assert_eq!(capability.risk, RiskClass::CrossConfig);
+    assert_eq!(capability.effect, EffectClass::ReversibleWrite);
+    let request = capability.request_schema.as_ref().expect("request schema");
+    assert_eq!(request.get("required"), Some(&json!(["config"])));
+    assert_eq!(request.get("additionalProperties"), Some(&json!(false)));
+    assert_eq!(
+        request.pointer("/properties/config/required"),
+        Some(&json!(["ingress"]))
+    );
+    for pointer in [
+        "/properties/config/additionalProperties",
+        "/properties/config/properties/ingress/items/additionalProperties",
+        "/properties/config/properties/ingress/items/properties/originRequest/additionalProperties",
+        "/properties/config/properties/ingress/items/properties/originRequest/properties/access/additionalProperties",
+        "/properties/config/properties/originRequest/additionalProperties",
+        "/properties/config/properties/originRequest/properties/access/additionalProperties",
+    ] {
+        assert_eq!(request.pointer(pointer), Some(&json!(false)), "{pointer}");
+    }
+    assert!(capability.cost.known);
+    assert_eq!(capability.cost.maximum, Some(0.0));
+    assert_eq!(capability.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(capability.entitlement.available, Some(true));
+    assert_eq!(
+        capability.entitlement.plans.get("zero_trust_free"),
+        Some(&true)
+    );
+    assert_eq!(
+        capability.verification.strategy,
+        "same_path_result_contains_planned_fields_after_update"
+    );
+    assert_eq!(
+        capability
+            .same_path_read
+            .as_ref()
+            .expect("same-path read")
+            .read_capability_id,
+        "cloudflare-tunnel-configuration-get-configuration"
+    );
+    assert!(capability.rollback.supported);
+    assert_eq!(
+        capability.rollback.strategy.as_deref(),
+        Some("restore_cloudflare_tunnel_configuration_prior_snapshot")
+    );
+    assert!(capability.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn cloudflare_tunnel_configuration_rejects_permission_and_nested_schema_drift() {
+    let mut permission_drift = cloudflare_tunnel_configuration_fixture();
+    permission_drift["paths"]["/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations"]["put"]
+        ["x-api-token-group"] = json!(["Cloudflare Tunnel Write"]);
+    let permission_snapshot = normalize_openapi(&permission_drift).expect("permission drift");
+    let drifted_permission = permission_snapshot
+        .get("cloudflare-tunnel-configuration-put-configuration")
+        .expect("permission-drifted Tunnel configuration");
+    assert_eq!(drifted_permission.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(drifted_permission.risk, RiskClass::Unknown);
+
+    let mut schema_drift = cloudflare_tunnel_configuration_fixture();
+    schema_drift["paths"]["/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations"]["put"]
+        ["requestBody"]["content"]["application/json"]["schema"]["properties"]["config"]["properties"]
+        ["originRequest"]["properties"]["proxyProtocol"] = json!({"type": "string"});
+    let schema_snapshot = normalize_openapi(&schema_drift).expect("nested schema drift");
+    let drifted_schema = schema_snapshot
+        .get("cloudflare-tunnel-configuration-put-configuration")
+        .expect("schema-drifted Tunnel configuration");
+    assert_eq!(drifted_schema.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(drifted_schema.risk, RiskClass::Unknown);
+    assert!(!drifted_schema.cost.known);
+
+    let mut read_drift = cloudflare_tunnel_configuration_fixture();
+    read_drift["paths"]["/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations"]["get"]["x-api-token-group"] =
+        json!(["Cloudflare Tunnel Read"]);
+    let read_snapshot = normalize_openapi(&read_drift).expect("read contract drift");
+    let drifted_read = read_snapshot
+        .get("cloudflare-tunnel-configuration-put-configuration")
+        .expect("read-drifted Tunnel configuration");
+    assert_eq!(drifted_read.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(drifted_read.risk, RiskClass::Unknown);
+    assert!(!drifted_read.cost.known);
+}
+
 #[test]
 fn create_contract_binds_a_schema_proven_id_and_exact_read_delete_pair() {
     let document = create_lifecycle_fixture();

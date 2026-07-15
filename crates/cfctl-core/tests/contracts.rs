@@ -297,6 +297,53 @@ fn d1_read_replication_restore_strategy_is_bound_to_the_exact_database_contract(
 }
 
 #[test]
+fn cloudflare_tunnel_configuration_restore_strategy_is_bound_to_exact_routing_contract() {
+    let request_schema = serde_json::from_str(include_str!(
+        "fixtures/cloudflare-tunnel-configuration-put-request-schema.json"
+    ))
+    .expect("pinned Cloudflare Tunnel configuration PUT schema");
+    let mut capability = CapabilityV1::new(
+        "cloudflare-tunnel-configuration-put-configuration",
+        "Put configuration",
+        "PUT",
+        "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
+    );
+    capability.mutating = true;
+    capability.account_scope = "account".to_owned();
+    capability.product = "Cloudflare Tunnel Configuration".to_owned();
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("restore_cloudflare_tunnel_configuration_prior_snapshot".to_owned());
+    capability.request_schema = Some(request_schema);
+    capability.verification.strategy =
+        "same_path_result_contains_planned_fields_after_update".to_owned();
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations".to_owned(),
+        read_capability_id: "cloudflare-tunnel-configuration-get-configuration".to_owned(),
+        verified_response_fields: vec!["config".to_owned()],
+    });
+
+    assert!(capability.rollback_contract_supported());
+
+    let mut grafted = capability.clone();
+    grafted.path = "/accounts/{account_id}/cfd_tunnel/{other_id}/configurations".to_owned();
+    assert!(!grafted.rollback_contract_supported());
+
+    let mut broadened = capability.clone();
+    broadened.request_schema.as_mut().expect("request schema")["properties"]["config"]["properties"]
+        ["ingress"]["items"]["properties"]["unreviewed"] = json!({"type":"string"});
+    assert!(!broadened.rollback_contract_supported());
+
+    let mut wrong_read = capability;
+    wrong_read
+        .same_path_read
+        .as_mut()
+        .expect("same-path read")
+        .read_capability_id = "widgets-get-configuration".to_owned();
+    assert!(!wrong_read.rollback_contract_supported());
+}
+
+#[test]
 fn dns_record_restore_strategy_is_bound_to_the_exact_official_update_contract() {
     let request_schema = serde_json::from_str(include_str!(
         "fixtures/dns-record-update-request-schema.json"

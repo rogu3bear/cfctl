@@ -956,6 +956,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     classify_same_path_object_mutation_contracts(document, &mut capabilities);
     finalize_global_warp_override_rollback_contract(&mut capabilities);
     finalize_d1_read_replication_rollback_contract(&mut capabilities);
+    finalize_cloudflare_tunnel_configuration_rollback_contract(&mut capabilities);
     finalize_dns_record_rollback_contract(document, &mut capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
@@ -3469,6 +3470,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         classify_email_security_settings_configuration(capability);
     } else if let Some(kind) = cloudflare_tunnel_lifecycle_kind(capability) {
         classify_cloudflare_tunnel_lifecycle(capability, kind);
+    } else if cloudflare_tunnel_configuration_contract_supported(capability) {
+        classify_cloudflare_tunnel_configuration(capability);
     } else if let Some(kind) = queue_configuration_kind(capability) {
         classify_queue_configuration(capability, kind);
     } else {
@@ -4295,6 +4298,408 @@ fn classify_cloudflare_tunnel_lifecycle(
             "x-cfctl-body-required": true
         }),
     });
+}
+
+const CLOUDFLARE_TUNNEL_CONFIGURATION_MUTATION_CAPABILITY_ID: &str =
+    "cloudflare-tunnel-configuration-put-configuration";
+const CLOUDFLARE_TUNNEL_CONFIGURATION_READ_CAPABILITY_ID: &str =
+    "cloudflare-tunnel-configuration-get-configuration";
+const CLOUDFLARE_TUNNEL_CONFIGURATION_PATH: &str =
+    "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations";
+
+fn cloudflare_tunnel_configuration_identity_supported(capability: &CapabilityV1) -> bool {
+    capability.id == CLOUDFLARE_TUNNEL_CONFIGURATION_MUTATION_CAPABILITY_ID
+        && capability.method == "PUT"
+        && capability.path == CLOUDFLARE_TUNNEL_CONFIGURATION_PATH
+        && capability.product == "Cloudflare Tunnel Configuration"
+        && capability.account_scope == "account"
+        && capability.permissions
+            == [
+                "Cloudflare One Connectors Write",
+                "Cloudflare One Connector: cloudflared Write",
+                "Cloudflare Tunnel Write",
+            ]
+        && capability.selectors.len() == 2
+        && ["account_id", "tunnel_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name && selector.location == "path" && selector.required
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+                    && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            })
+}
+
+fn exact_schema_keys(schema: &Value, expected: &[&str]) -> bool {
+    schema.as_object().is_some_and(|object| {
+        object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+    })
+}
+
+fn exact_primitive_schema(schema: Option<&Value>, expected_type: &str) -> bool {
+    schema.is_some_and(|schema| {
+        exact_schema_keys(schema, &["type"])
+            && schema.get("type").and_then(Value::as_str) == Some(expected_type)
+    })
+}
+
+fn cloudflare_tunnel_origin_request_source_schema_supported(schema: &Value) -> bool {
+    if !exact_schema_keys(schema, &["properties", "type"])
+        || schema.get("type").and_then(Value::as_str) != Some("object")
+    {
+        return false;
+    }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    let expected_fields = [
+        "access",
+        "caPool",
+        "connectTimeout",
+        "disableChunkedEncoding",
+        "http2Origin",
+        "httpHostHeader",
+        "keepAliveConnections",
+        "keepAliveTimeout",
+        "matchSNItoHost",
+        "noHappyEyeballs",
+        "noTLSVerify",
+        "originServerName",
+        "proxyType",
+        "tcpKeepAlive",
+        "tlsTimeout",
+    ];
+    if properties.len() != expected_fields.len()
+        || !expected_fields
+            .iter()
+            .all(|field| properties.contains_key(*field))
+    {
+        return false;
+    }
+    let Some(access) = properties.get("access") else {
+        return false;
+    };
+    if !exact_schema_keys(access, &["properties", "required", "type"])
+        || access.get("type").and_then(Value::as_str) != Some("object")
+        || access.get("required") != Some(&serde_json::json!(["audTag", "teamName"]))
+    {
+        return false;
+    }
+    let Some(access_properties) = access.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    if access_properties.len() != 3
+        || !["audTag", "required", "teamName"]
+            .iter()
+            .all(|field| access_properties.contains_key(*field))
+        || !exact_primitive_schema(access_properties.get("required"), "boolean")
+        || !exact_primitive_schema(access_properties.get("teamName"), "string")
+    {
+        return false;
+    }
+    let Some(audience_tags) = access_properties.get("audTag") else {
+        return false;
+    };
+    if !exact_schema_keys(audience_tags, &["items", "type"])
+        || audience_tags.get("type").and_then(Value::as_str) != Some("array")
+        || !exact_primitive_schema(audience_tags.get("items"), "string")
+    {
+        return false;
+    }
+    [
+        ("caPool", "string"),
+        ("connectTimeout", "integer"),
+        ("disableChunkedEncoding", "boolean"),
+        ("http2Origin", "boolean"),
+        ("httpHostHeader", "string"),
+        ("keepAliveConnections", "integer"),
+        ("keepAliveTimeout", "integer"),
+        ("matchSNItoHost", "boolean"),
+        ("noHappyEyeballs", "boolean"),
+        ("noTLSVerify", "boolean"),
+        ("originServerName", "string"),
+        ("proxyType", "string"),
+        ("tcpKeepAlive", "integer"),
+        ("tlsTimeout", "integer"),
+    ]
+    .iter()
+    .all(|(field, expected_type)| exact_primitive_schema(properties.get(*field), expected_type))
+}
+
+fn cloudflare_tunnel_configuration_source_schema_supported(schema: &Value) -> bool {
+    if !exact_schema_keys(schema, &["properties", "type", "x-cfctl-body-required"])
+        || schema.get("type").and_then(Value::as_str) != Some("object")
+        || schema.get("x-cfctl-body-required").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    let Some(root_properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(config) = root_properties
+        .get("config")
+        .filter(|_| root_properties.len() == 1)
+    else {
+        return false;
+    };
+    if !exact_schema_keys(config, &["properties", "type"])
+        || config.get("type").and_then(Value::as_str) != Some("object")
+    {
+        return false;
+    }
+    let Some(config_properties) = config.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    if config_properties.len() != 2
+        || !["ingress", "originRequest"]
+            .iter()
+            .all(|field| config_properties.contains_key(*field))
+    {
+        return false;
+    }
+    let Some(ingress) = config_properties.get("ingress") else {
+        return false;
+    };
+    if !exact_schema_keys(ingress, &["items", "minItems", "type"])
+        || ingress.get("type").and_then(Value::as_str) != Some("array")
+        || ingress.get("minItems").and_then(Value::as_u64) != Some(1)
+    {
+        return false;
+    }
+    let Some(item) = ingress.get("items") else {
+        return false;
+    };
+    if !exact_schema_keys(item, &["properties", "required", "type"])
+        || item.get("type").and_then(Value::as_str) != Some("object")
+        || item.get("required") != Some(&serde_json::json!(["hostname", "service"]))
+    {
+        return false;
+    }
+    let Some(item_properties) = item.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    item_properties.len() == 4
+        && ["hostname", "originRequest", "path", "service"]
+            .iter()
+            .all(|field| item_properties.contains_key(*field))
+        && exact_primitive_schema(item_properties.get("hostname"), "string")
+        && exact_primitive_schema(item_properties.get("path"), "string")
+        && exact_primitive_schema(item_properties.get("service"), "string")
+        && item_properties.get("originRequest") == config_properties.get("originRequest")
+        && config_properties
+            .get("originRequest")
+            .is_some_and(cloudflare_tunnel_origin_request_source_schema_supported)
+}
+
+fn cloudflare_tunnel_configuration_contract_supported(capability: &CapabilityV1) -> bool {
+    cloudflare_tunnel_configuration_identity_supported(capability)
+        && capability
+            .request_schema
+            .as_ref()
+            .is_some_and(cloudflare_tunnel_configuration_source_schema_supported)
+}
+
+fn harden_cloudflare_tunnel_configuration_request_schema(schema: &mut Value) -> bool {
+    let Some(root) = schema.as_object_mut() else {
+        return false;
+    };
+    root.insert("required".to_owned(), serde_json::json!(["config"]));
+    root.insert("additionalProperties".to_owned(), Value::Bool(false));
+    let Some(config) = schema
+        .pointer_mut("/properties/config")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    config.insert("required".to_owned(), serde_json::json!(["ingress"]));
+    config.insert("additionalProperties".to_owned(), Value::Bool(false));
+    for pointer in [
+        "/properties/config/properties/ingress/items",
+        "/properties/config/properties/ingress/items/properties/originRequest",
+        "/properties/config/properties/ingress/items/properties/originRequest/properties/access",
+        "/properties/config/properties/originRequest",
+        "/properties/config/properties/originRequest/properties/access",
+    ] {
+        let Some(object) = schema.pointer_mut(pointer).and_then(Value::as_object_mut) else {
+            return false;
+        };
+        object.insert("additionalProperties".to_owned(), Value::Bool(false));
+    }
+    true
+}
+
+fn classify_cloudflare_tunnel_configuration(capability: &mut CapabilityV1) {
+    let Some(request_schema) = capability.request_schema.as_mut() else {
+        return;
+    };
+    if !harden_cloudflare_tunnel_configuration_request_schema(request_schema) {
+        return;
+    }
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "replacing a remotely managed Tunnel configuration has no direct per-operation charge; exposed traffic, users, logs, Access applications, and separately enabled Cloudflare One services can retain plan-specific downstream cost and limits"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Put Cloudflare Tunnel configuration".to_owned(),
+            url: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/tunnels/subresources/cloudflared/subresources/configurations/methods/update/"
+                .to_owned(),
+            source: "official Cloudflare API".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare Tunnel configuration".to_owned(),
+            url: "https://developers.cloudflare.com/tunnel/configuration/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare One plans and pricing".to_owned(),
+            url: "https://www.cloudflare.com/plans/zero-trust-services/".to_owned(),
+            source: "official Cloudflare pricing".to_owned(),
+        },
+    ];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans = BTreeMap::from([
+        ("zero_trust_free".to_owned(), true),
+        ("zero_trust_pay_as_you_go".to_owned(), true),
+        ("zero_trust_contract".to_owned(), true),
+    ]);
+    capability.entitlement.blocker = None;
+    capability.entitlement.source = Some("https://developers.cloudflare.com/tunnel/".to_owned());
+    capability.entitlement.requires_live_resolution = false;
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "automatic restoration is unavailable unless cfctl binds the exact live pre-change Tunnel configuration; creating an initial configuration without prior state remains blocked from this reversible lane"
+            .to_owned(),
+    );
+}
+
+fn cloudflare_tunnel_configuration_hardened_request_supported(capability: &CapabilityV1) -> bool {
+    let Some(schema) = capability.request_schema.as_ref() else {
+        return false;
+    };
+    let mut source_shape = schema.clone();
+    let Some(root) = source_shape.as_object_mut() else {
+        return false;
+    };
+    if root.remove("required") != Some(serde_json::json!(["config"]))
+        || root.remove("additionalProperties") != Some(Value::Bool(false))
+    {
+        return false;
+    }
+    let Some(config) = source_shape
+        .pointer_mut("/properties/config")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    if config.remove("required") != Some(serde_json::json!(["ingress"]))
+        || config.remove("additionalProperties") != Some(Value::Bool(false))
+    {
+        return false;
+    }
+    for pointer in [
+        "/properties/config/properties/ingress/items",
+        "/properties/config/properties/ingress/items/properties/originRequest",
+        "/properties/config/properties/ingress/items/properties/originRequest/properties/access",
+        "/properties/config/properties/originRequest",
+        "/properties/config/properties/originRequest/properties/access",
+    ] {
+        let Some(object) = source_shape
+            .pointer_mut(pointer)
+            .and_then(Value::as_object_mut)
+        else {
+            return false;
+        };
+        if object.remove("additionalProperties") != Some(Value::Bool(false)) {
+            return false;
+        }
+    }
+    cloudflare_tunnel_configuration_source_schema_supported(&source_shape)
+}
+
+fn cloudflare_tunnel_configuration_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == CLOUDFLARE_TUNNEL_CONFIGURATION_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == CLOUDFLARE_TUNNEL_CONFIGURATION_PATH
+        && capability.product == "Cloudflare Tunnel Configuration"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && capability.permissions
+            == [
+                "Cloudflare One Connectors Write",
+                "Cloudflare One Connectors Read",
+                "Cloudflare One Connector: cloudflared Write",
+                "Cloudflare One Connector: cloudflared Read",
+                "Cloudflare Tunnel Write",
+                "Cloudflare Tunnel Read",
+            ]
+        && capability.selectors.len() == 2
+        && ["account_id", "tunnel_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name && selector.location == "path" && selector.required
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+                    && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            })
+}
+
+fn finalize_cloudflare_tunnel_configuration_rollback_contract(
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let source_supported = capabilities
+        .get(CLOUDFLARE_TUNNEL_CONFIGURATION_READ_CAPABILITY_ID)
+        .is_some_and(cloudflare_tunnel_configuration_read_contract_supported);
+    let Some(capability) =
+        capabilities.get_mut(CLOUDFLARE_TUNNEL_CONFIGURATION_MUTATION_CAPABILITY_ID)
+    else {
+        return;
+    };
+    if !cloudflare_tunnel_configuration_identity_supported(capability)
+        || !cloudflare_tunnel_configuration_hardened_request_supported(capability)
+    {
+        return;
+    }
+    if !source_supported {
+        capability.risk = RiskClass::Unknown;
+        capability.effect = EffectClass::Unknown;
+        capability.cost.known = false;
+        capability.cost.maximum = None;
+        refresh_dynamic_mutation_contract(capability);
+        return;
+    }
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("restore_cloudflare_tunnel_configuration_prior_snapshot".to_owned());
+    if !capability.rollback_contract_supported() {
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        return;
+    }
+    capability.rollback.warning = Some(
+        "rectification derives a separate hash-bound Tunnel configuration PUT plan from the exact prior routing snapshot; it never runs automatically and requires explicit approval"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

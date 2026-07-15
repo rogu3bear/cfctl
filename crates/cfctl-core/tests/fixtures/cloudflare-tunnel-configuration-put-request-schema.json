@@ -1,0 +1,182 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "config": {
+      "additionalProperties": false,
+      "properties": {
+        "ingress": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "hostname": {
+                "type": "string"
+              },
+              "originRequest": {
+                "additionalProperties": false,
+                "properties": {
+                  "access": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "audTag": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "required": {
+                        "type": "boolean"
+                      },
+                      "teamName": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "audTag",
+                      "teamName"
+                    ],
+                    "type": "object"
+                  },
+                  "caPool": {
+                    "type": "string"
+                  },
+                  "connectTimeout": {
+                    "type": "integer"
+                  },
+                  "disableChunkedEncoding": {
+                    "type": "boolean"
+                  },
+                  "http2Origin": {
+                    "type": "boolean"
+                  },
+                  "httpHostHeader": {
+                    "type": "string"
+                  },
+                  "keepAliveConnections": {
+                    "type": "integer"
+                  },
+                  "keepAliveTimeout": {
+                    "type": "integer"
+                  },
+                  "matchSNItoHost": {
+                    "type": "boolean"
+                  },
+                  "noHappyEyeballs": {
+                    "type": "boolean"
+                  },
+                  "noTLSVerify": {
+                    "type": "boolean"
+                  },
+                  "originServerName": {
+                    "type": "string"
+                  },
+                  "proxyType": {
+                    "type": "string"
+                  },
+                  "tcpKeepAlive": {
+                    "type": "integer"
+                  },
+                  "tlsTimeout": {
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              },
+              "path": {
+                "type": "string"
+              },
+              "service": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "hostname",
+              "service"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "originRequest": {
+          "additionalProperties": false,
+          "properties": {
+            "access": {
+              "additionalProperties": false,
+              "properties": {
+                "audTag": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "required": {
+                  "type": "boolean"
+                },
+                "teamName": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "audTag",
+                "teamName"
+              ],
+              "type": "object"
+            },
+            "caPool": {
+              "type": "string"
+            },
+            "connectTimeout": {
+              "type": "integer"
+            },
+            "disableChunkedEncoding": {
+              "type": "boolean"
+            },
+            "http2Origin": {
+              "type": "boolean"
+            },
+            "httpHostHeader": {
+              "type": "string"
+            },
+            "keepAliveConnections": {
+              "type": "integer"
+            },
+            "keepAliveTimeout": {
+              "type": "integer"
+            },
+            "matchSNItoHost": {
+              "type": "boolean"
+            },
+            "noHappyEyeballs": {
+              "type": "boolean"
+            },
+            "noTLSVerify": {
+              "type": "boolean"
+            },
+            "originServerName": {
+              "type": "string"
+            },
+            "proxyType": {
+              "type": "string"
+            },
+            "tcpKeepAlive": {
+              "type": "integer"
+            },
+            "tlsTimeout": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "ingress"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "config"
+  ],
+  "type": "object",
+  "x-cfctl-body-required": true
+}

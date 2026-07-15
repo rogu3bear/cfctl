@@ -605,6 +605,56 @@ fn preflight_call_input(
         resolved.body = Some(secret_body.clone());
     }
     validate_request_contract(capability, &resolved)?;
+    validate_cloudflare_tunnel_configuration_ingress(capability, &resolved)?;
+    Ok(())
+}
+
+fn validate_cloudflare_tunnel_configuration_ingress(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    if !is_cloudflare_tunnel_configuration_mutation(capability) {
+        return Ok(());
+    }
+    let ingress = input
+        .body
+        .as_ref()
+        .and_then(|body| body.pointer("/config/ingress"))
+        .and_then(Value::as_array)
+        .filter(|rules| !rules.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Tunnel configuration requires at least one ingress rule and a final catch-all rule"
+                    .to_owned(),
+            )
+        })?;
+    for (index, rule) in ingress.iter().enumerate() {
+        let service = rule
+            .get("service")
+            .and_then(Value::as_str)
+            .filter(|service| !service.trim().is_empty())
+            .ok_or_else(|| {
+                CliError::Input(format!(
+                    "Tunnel ingress rule {} requires a non-empty service",
+                    index + 1
+                ))
+            })?;
+        let _ = service;
+        let matches_all_traffic =
+            rule.get("hostname").and_then(Value::as_str) == Some("") && rule.get("path").is_none();
+        if matches_all_traffic && index + 1 != ingress.len() {
+            return Err(CliError::Input(format!(
+                "Tunnel ingress rule {} is a catch-all, so every later rule is unreachable; move the catch-all to the end",
+                index + 1
+            )));
+        }
+        if index + 1 == ingress.len() && !matches_all_traffic {
+            return Err(CliError::Input(
+                "Tunnel configuration requires a final catch-all ingress rule with an empty hostname and no path"
+                    .to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1001,6 +1051,14 @@ const GLOBAL_WARP_OVERRIDE_PATH: &str = "/accounts/{account_id}/devices/resilien
 const D1_READ_REPLICATION_READ_CAPABILITY_ID: &str = "d1-get-database";
 const D1_READ_REPLICATION_PATH: &str = "/accounts/{account_id}/d1/database/{database_id}";
 const D1_READ_REPLICATION_PRECONDITION: &str = "d1_read_replication_state";
+const CLOUDFLARE_TUNNEL_CONFIGURATION_MUTATION_CAPABILITY_ID: &str =
+    "cloudflare-tunnel-configuration-put-configuration";
+const CLOUDFLARE_TUNNEL_CONFIGURATION_READ_CAPABILITY_ID: &str =
+    "cloudflare-tunnel-configuration-get-configuration";
+const CLOUDFLARE_TUNNEL_CONFIGURATION_PATH: &str =
+    "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations";
+const CLOUDFLARE_TUNNEL_CONFIGURATION_STATE_PRECONDITION: &str =
+    "cloudflare_tunnel_configuration_state";
 const DNS_RECORD_DETAIL_READ_CAPABILITY_ID: &str = "dns-records-for-a-zone-dns-record-details";
 const DNS_RECORD_DETAIL_PATH: &str = "/zones/{zone_id}/dns_records/{dns_record_id}";
 const DNS_RECORD_STATE_PRECONDITION: &str = "dns_record_state";
@@ -1109,6 +1167,65 @@ fn d1_read_replication_read_contract_supported(capability: &CapabilityV1) -> boo
                                 && !query.allow_empty_value
                         })
                 })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|contract| {
+                matches!(
+                    contract.body_mode,
+                    cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                ) && contract.success_statuses == ["200"]
+                    && contract.success_media_types == ["application/json"]
+            })
+}
+
+fn is_cloudflare_tunnel_configuration_mutation(capability: &CapabilityV1) -> bool {
+    capability.id == CLOUDFLARE_TUNNEL_CONFIGURATION_MUTATION_CAPABILITY_ID
+}
+
+fn should_bind_cloudflare_tunnel_configuration_state(capability: &CapabilityV1) -> bool {
+    is_cloudflare_tunnel_configuration_mutation(capability)
+        && capability.mutating
+        && capability.method == "PUT"
+        && capability.path == CLOUDFLARE_TUNNEL_CONFIGURATION_PATH
+        && capability.product == "Cloudflare Tunnel Configuration"
+        && capability.account_scope == "account"
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.rollback.strategy.as_deref()
+            == Some("restore_cloudflare_tunnel_configuration_prior_snapshot")
+        && capability.rollback_contract_supported()
+}
+
+fn cloudflare_tunnel_configuration_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == CLOUDFLARE_TUNNEL_CONFIGURATION_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == CLOUDFLARE_TUNNEL_CONFIGURATION_PATH
+        && capability.product == "Cloudflare Tunnel Configuration"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.permissions
+            == [
+                "Cloudflare One Connectors Write",
+                "Cloudflare One Connectors Read",
+                "Cloudflare One Connector: cloudflared Write",
+                "Cloudflare One Connector: cloudflared Read",
+                "Cloudflare Tunnel Write",
+                "Cloudflare Tunnel Read",
+            ]
+        && capability.selectors.len() == 2
+        && ["account_id", "tunnel_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name && selector.location == "path" && selector.required
+            })
         })
         && capability
             .response_contract
@@ -1487,6 +1604,132 @@ async fn read_live_d1_read_replication_state(
     Ok((receipt, evidence))
 }
 
+fn apply_cloudflare_tunnel_configuration_state_response(
+    capability: &CapabilityV1,
+    account_id: &str,
+    tunnel_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the Tunnel configuration state read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    let prior_config = response
+        .result
+        .get("config")
+        .filter(|config| config.is_object())
+        .cloned()
+        .ok_or_else(|| {
+            CliError::Input(
+                "Tunnel configuration state read omitted an object `config`; initial configuration creation has no restorable prior snapshot and the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+    let restore_input = CallInput {
+        selectors: json!({"account_id": account_id, "tunnel_id": tunnel_id}),
+        body: Some(json!({"config": prior_config})),
+        ..CallInput::default()
+    };
+    preflight_call_input(capability, &restore_input, None).map_err(|error| {
+        CliError::Input(format!(
+            "live Tunnel configuration is outside cfctl's exact restorable request contract; the mutation boundary was not crossed: {error}"
+        ))
+    })?;
+    let prior_config = restore_input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("config"))
+        .cloned()
+        .ok_or_else(|| {
+            CliError::Input(
+                "validated Tunnel configuration restore body omitted `config`; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+    Ok(json!({
+        "schema_version": 1,
+        "source_capability_id": CLOUDFLARE_TUNNEL_CONFIGURATION_READ_CAPABILITY_ID,
+        "source_path": CLOUDFLARE_TUNNEL_CONFIGURATION_PATH,
+        "target_capability_id": capability.id,
+        "target_method": capability.method,
+        "target_path": capability.path,
+        "target_scope": "account",
+        "account_id": account_id,
+        "tunnel_id": tunnel_id,
+        "prior_config": prior_config,
+    }))
+}
+
+async fn read_live_cloudflare_tunnel_configuration_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !should_bind_cloudflare_tunnel_configuration_state(capability) {
+        return Err(CliError::Input(
+            "Tunnel configuration mutation drifted from its governed prior-state contract"
+                .to_owned(),
+        ));
+    }
+    let selected_account = input
+        .selectors
+        .get("account_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Tunnel configuration state precondition requires string selector `account_id`"
+                    .to_owned(),
+            )
+        })?;
+    if selected_account != account_id {
+        return Err(CliError::Input(format!(
+            "Tunnel configuration target account `{selected_account}` differs from selected account `{account_id}`; the mutation boundary was not crossed"
+        )));
+    }
+    let tunnel_id = input
+        .selectors
+        .get("tunnel_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Tunnel configuration state precondition requires string selector `tunnel_id`"
+                    .to_owned(),
+            )
+        })?;
+    let source_capability = catalog
+        .get(CLOUDFLARE_TUNNEL_CONFIGURATION_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(CLOUDFLARE_TUNNEL_CONFIGURATION_READ_CAPABILITY_ID))?;
+    if !cloudflare_tunnel_configuration_read_contract_supported(source_capability) {
+        return Err(CliError::Input(
+            "Tunnel configuration state source capability drifted from the governed same-path read"
+                .to_owned(),
+        ));
+    }
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source_capability,
+            &CallInput {
+                selectors: json!({"account_id": account_id, "tunnel_id": tunnel_id}),
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt = apply_cloudflare_tunnel_configuration_state_response(
+        capability, account_id, tunnel_id, &response,
+    )?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
+
 fn apply_global_warp_override_state_response(
     account_id: &str,
     response: &CloudflareResponseV1,
@@ -1857,6 +2100,7 @@ fn plan_requires_live_credential(capability: &CapabilityV1) -> bool {
         || should_bind_zone_account(capability)
         || should_bind_global_warp_override_state(capability)
         || should_bind_d1_read_replication_state(capability)
+        || should_bind_cloudflare_tunnel_configuration_state(capability)
         || should_bind_dns_record_state(capability)
 }
 
@@ -1919,7 +2163,7 @@ async fn create_plan(
     } else {
         None
     };
-    let global_warp_override_state_precondition = prepare_global_warp_override_state_precondition(
+    let mut live_preconditions = prepare_live_plan_preconditions(
         store,
         catalog,
         &capability,
@@ -1928,24 +2172,8 @@ async fn create_plan(
         credential.as_ref(),
     )
     .await?;
-    let d1_read_replication_state_precondition = prepare_d1_read_replication_state_precondition(
-        store,
-        catalog,
-        &capability,
-        &input,
-        account_id,
-        credential.as_ref(),
-    )
-    .await?;
-    let dns_record_state_precondition = prepare_dns_record_state_precondition(
-        store,
-        catalog,
-        &capability,
-        &input,
-        account_id,
-        credential.as_ref(),
-    )
-    .await?;
+    live_preconditions.entitlement = entitlement_precondition;
+    live_preconditions.zone_account = zone_account_precondition;
     persist_prepared_plan(
         store,
         catalog,
@@ -1956,13 +2184,7 @@ async fn create_plan(
             account_id,
         },
         adapter_targets,
-        LivePlanPreconditions {
-            entitlement: entitlement_precondition,
-            zone_account: zone_account_precondition,
-            global_warp_override_state: global_warp_override_state_precondition,
-            d1_read_replication_state: d1_read_replication_state_precondition,
-            dns_record_state: dns_record_state_precondition,
-        },
+        live_preconditions,
     )
 }
 
@@ -2008,6 +2230,29 @@ async fn prepare_d1_read_replication_state_precondition(
         .map(Some)
 }
 
+async fn prepare_cloudflare_tunnel_configuration_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !should_bind_cloudflare_tunnel_configuration_state(capability) {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input(
+            "Tunnel configuration state precondition credential was not resolved".to_owned(),
+        )
+    })?;
+    read_live_cloudflare_tunnel_configuration_state(
+        store, catalog, capability, input, account_id, credential,
+    )
+    .await
+    .map(Some)
+}
+
 async fn prepare_dns_record_state_precondition(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -2027,6 +2272,37 @@ async fn prepare_dns_record_state_precondition(
         .map(Some)
 }
 
+async fn prepare_live_plan_preconditions(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<LivePlanPreconditions> {
+    Ok(LivePlanPreconditions {
+        entitlement: None,
+        zone_account: None,
+        global_warp_override_state: prepare_global_warp_override_state_precondition(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await?,
+        d1_read_replication_state: prepare_d1_read_replication_state_precondition(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await?,
+        cloudflare_tunnel_configuration_state:
+            prepare_cloudflare_tunnel_configuration_state_precondition(
+                store, catalog, capability, input, account_id, credential,
+            )
+            .await?,
+        dns_record_state: prepare_dns_record_state_precondition(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await?,
+    })
+}
+
 struct PlanAuthority<'a> {
     profile: &'a ProfileMetadata,
     account_id: &'a str,
@@ -2037,6 +2313,7 @@ struct LivePlanPreconditions {
     zone_account: Option<(Value, EvidenceV1)>,
     global_warp_override_state: Option<(Value, EvidenceV1)>,
     d1_read_replication_state: Option<(Value, EvidenceV1)>,
+    cloudflare_tunnel_configuration_state: Option<(Value, EvidenceV1)>,
     dns_record_state: Option<(Value, EvidenceV1)>,
 }
 
@@ -2056,6 +2333,10 @@ fn plan_targets(
     }
     if let Some((receipt, _)) = &live_preconditions.d1_read_replication_state {
         targets["live_preconditions"][D1_READ_REPLICATION_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.cloudflare_tunnel_configuration_state {
+        targets["live_preconditions"][CLOUDFLARE_TUNNEL_CONFIGURATION_STATE_PRECONDITION] =
+            receipt.clone();
     }
     if let Some((receipt, _)) = &live_preconditions.dns_record_state {
         targets["live_preconditions"][DNS_RECORD_STATE_PRECONDITION] = receipt.clone();
@@ -2077,6 +2358,10 @@ fn bind_live_plan_preconditions(
         (
             D1_READ_REPLICATION_PRECONDITION,
             &live_preconditions.d1_read_replication_state,
+        ),
+        (
+            CLOUDFLARE_TUNNEL_CONFIGURATION_STATE_PRECONDITION,
+            &live_preconditions.cloudflare_tunnel_configuration_state,
         ),
         (
             DNS_RECORD_STATE_PRECONDITION,
@@ -2126,6 +2411,19 @@ fn planned_cloudflare_diff(
                 .body
                 .as_ref()
                 .and_then(|body| body.get("read_replication"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        });
+    }
+    if let Some((receipt, _)) = &live_preconditions.cloudflare_tunnel_configuration_state {
+        diff["observed_before"] = json!({
+            "config": receipt.get("prior_config").cloned().unwrap_or(Value::Null),
+        });
+        diff["planned_after"] = json!({
+            "config": input
+                .body
+                .as_ref()
+                .and_then(|body| body.get("config"))
                 .cloned()
                 .unwrap_or(Value::Null),
         });
@@ -2228,6 +2526,9 @@ fn persist_prepared_plan(
         envelope.evidence.insert(0, evidence);
     }
     if let Some((_, evidence)) = live_preconditions.d1_read_replication_state {
+        envelope.evidence.insert(0, evidence);
+    }
+    if let Some((_, evidence)) = live_preconditions.cloudflare_tunnel_configuration_state {
         envelope.evidence.insert(0, evidence);
     }
     if let Some((_, evidence)) = live_preconditions.dns_record_state {
@@ -2643,43 +2944,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         adapter_targets,
         &plan.account_id,
     )?;
-    let zone_account_evidence = validate_live_zone_account_precondition(
-        store,
-        &catalog,
-        &plan,
-        &execution_input,
-        &credential,
-    )
-    .await?;
-    let entitlement_evidence = validate_live_entitlement_precondition(
-        store,
-        &catalog,
-        &plan,
-        &execution_input,
-        &credential,
-    )
-    .await?;
-    let permission_inventory_evidence =
-        validate_live_permission_inventory_precondition(store, &catalog, &plan, &credential)
-            .await?;
-    let global_warp_override_state_evidence =
-        validate_live_global_warp_override_state_precondition(
-            store,
-            &catalog,
-            &plan,
-            &execution_input,
-            &credential,
-        )
-        .await?;
-    let d1_read_replication_state_evidence = validate_live_d1_read_replication_state_precondition(
-        store,
-        &catalog,
-        &plan,
-        &execution_input,
-        &credential,
-    )
-    .await?;
-    let dns_record_state_evidence = validate_live_dns_record_state_precondition(
+    let live_precondition_evidence = validate_live_plan_precondition_evidence(
         store,
         &catalog,
         &plan,
@@ -2701,14 +2966,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         &execution_input,
         &credential,
         &secrets,
-        LivePreconditionEvidence {
-            zone_account: zone_account_evidence,
-            entitlement: entitlement_evidence,
-            permission_inventory: permission_inventory_evidence,
-            global_warp_override_state: global_warp_override_state_evidence,
-            d1_read_replication_state: d1_read_replication_state_evidence,
-            dns_record_state: dns_record_state_evidence,
-        },
+        live_precondition_evidence,
     )
     .await
 }
@@ -2719,7 +2977,48 @@ struct LivePreconditionEvidence {
     permission_inventory: Option<EvidenceV1>,
     global_warp_override_state: Option<EvidenceV1>,
     d1_read_replication_state: Option<EvidenceV1>,
+    cloudflare_tunnel_configuration_state: Option<EvidenceV1>,
     dns_record_state: Option<EvidenceV1>,
+}
+
+async fn validate_live_plan_precondition_evidence(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<LivePreconditionEvidence> {
+    Ok(LivePreconditionEvidence {
+        zone_account: validate_live_zone_account_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        entitlement: validate_live_entitlement_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        permission_inventory: validate_live_permission_inventory_precondition(
+            store, catalog, plan, credential,
+        )
+        .await?,
+        global_warp_override_state: validate_live_global_warp_override_state_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        d1_read_replication_state: validate_live_d1_read_replication_state_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        cloudflare_tunnel_configuration_state:
+            validate_live_cloudflare_tunnel_configuration_state_precondition(
+                store, catalog, plan, input, credential,
+            )
+            .await?,
+        dns_record_state: validate_live_dns_record_state_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+    })
 }
 
 async fn execute_consumed_plan(
@@ -2787,6 +3086,7 @@ fn prepend_live_precondition_evidence(
 ) {
     for item in [
         evidence.dns_record_state,
+        evidence.cloudflare_tunnel_configuration_state,
         evidence.d1_read_replication_state,
         evidence.global_warp_override_state,
         evidence.permission_inventory,
@@ -3042,6 +3342,162 @@ fn d1_read_replication_prior_mode(plan: &PlanV1) -> Result<String> {
             CliError::Input("D1 compensation requires a hash-bound prior-state receipt".to_owned())
         })?;
     validate_d1_read_replication_prior_state_receipt(plan, receipt)
+}
+
+async fn validate_live_cloudflare_tunnel_configuration_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_cloudflare_tunnel_configuration_state_precondition(plan)?
+    else {
+        return Ok(None);
+    };
+    let (receipt, evidence) = read_live_cloudflare_tunnel_configuration_state(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live Tunnel configuration drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
+}
+
+fn validate_cloudflare_tunnel_configuration_prior_state_receipt(
+    plan: &PlanV1,
+    receipt: &Value,
+) -> Result<Value> {
+    let tunnel_id = plan
+        .targets
+        .pointer("/selectors/tunnel_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Tunnel configuration plan omitted its hash-bound Tunnel selector; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let exact_identity = receipt.as_object().is_some_and(|object| object.len() == 10)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("source_capability_id").and_then(Value::as_str)
+            == Some(CLOUDFLARE_TUNNEL_CONFIGURATION_READ_CAPABILITY_ID)
+        && receipt.get("source_path").and_then(Value::as_str)
+            == Some(CLOUDFLARE_TUNNEL_CONFIGURATION_PATH)
+        && receipt.get("target_capability_id").and_then(Value::as_str)
+            == Some(plan.capability.id.as_str())
+        && receipt.get("target_method").and_then(Value::as_str)
+            == Some(plan.capability.method.as_str())
+        && receipt.get("target_path").and_then(Value::as_str)
+            == Some(plan.capability.path.as_str())
+        && receipt.get("target_scope").and_then(Value::as_str) == Some("account")
+        && receipt.get("account_id").and_then(Value::as_str) == Some(plan.account_id.as_str())
+        && receipt.get("tunnel_id").and_then(Value::as_str) == Some(tunnel_id);
+    let prior_config = receipt
+        .get("prior_config")
+        .filter(|config| config.is_object())
+        .cloned();
+    if !exact_identity || prior_config.is_none() {
+        return Err(CliError::Input(
+            "plan Tunnel configuration prior-state receipt has an invalid account, Tunnel, source, method, path, or state shape; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let prior_config = prior_config.ok_or_else(|| {
+        CliError::Input(
+            "plan Tunnel configuration prior-state receipt omitted an object configuration; create a new plan"
+                .to_owned(),
+        )
+    })?;
+    let restore_input = CallInput {
+        selectors: json!({"account_id": plan.account_id, "tunnel_id": tunnel_id}),
+        body: Some(json!({"config": prior_config})),
+        ..CallInput::default()
+    };
+    preflight_call_input(&plan.capability, &restore_input, None).map_err(|error| {
+        CliError::Input(format!(
+            "plan Tunnel configuration prior-state receipt is outside the exact restorable request contract; create a new plan: {error}"
+        ))
+    })?;
+    restore_input
+        .body
+        .and_then(|body| body.get("config").cloned())
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan Tunnel configuration prior-state receipt omitted its validated configuration; create a new plan"
+                    .to_owned(),
+            )
+        })
+}
+
+fn required_cloudflare_tunnel_configuration_state_precondition(
+    plan: &PlanV1,
+) -> Result<Option<&str>> {
+    if !is_cloudflare_tunnel_configuration_mutation(&plan.capability) {
+        return Ok(None);
+    }
+    if !should_bind_cloudflare_tunnel_configuration_state(&plan.capability) {
+        return Err(CliError::Input(
+            "Tunnel configuration plan is inconsistent with its hash-bound prior-state contract; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(CLOUDFLARE_TUNNEL_CONFIGURATION_STATE_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the live Tunnel configuration prior-state contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/cloudflare_tunnel_configuration_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the hash-bound Tunnel configuration prior-state receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    validate_cloudflare_tunnel_configuration_prior_state_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "plan Tunnel configuration prior-state receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+fn cloudflare_tunnel_configuration_prior_snapshot(plan: &PlanV1) -> Result<Value> {
+    required_cloudflare_tunnel_configuration_state_precondition(plan)?.ok_or_else(|| {
+        CliError::Input(
+            "Tunnel configuration compensation requires a hash-bound prior-state precondition"
+                .to_owned(),
+        )
+    })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/cloudflare_tunnel_configuration_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "Tunnel configuration compensation requires a hash-bound prior-state receipt"
+                    .to_owned(),
+            )
+        })?;
+    validate_cloudflare_tunnel_configuration_prior_state_receipt(plan, receipt)
 }
 
 async fn validate_live_dns_record_state_precondition(
@@ -3830,6 +4286,39 @@ fn d1_read_replication_compensation_request(plan: &PlanV1) -> Result<Compensatio
     })
 }
 
+fn cloudflare_tunnel_configuration_compensation_request(
+    plan: &PlanV1,
+) -> Result<CompensationRequest> {
+    let tunnel_id = plan
+        .targets
+        .pointer("/selectors/tunnel_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Tunnel configuration compensation requires a hash-bound Tunnel selector"
+                    .to_owned(),
+            )
+        })?;
+    Ok(CompensationRequest {
+        capability_id: CLOUDFLARE_TUNNEL_CONFIGURATION_MUTATION_CAPABILITY_ID.to_owned(),
+        expected_method: "PUT".to_owned(),
+        expected_path: CLOUDFLARE_TUNNEL_CONFIGURATION_PATH.to_owned(),
+        input: CallInput {
+            selectors: json!({
+                "account_id": plan.account_id,
+                "tunnel_id": tunnel_id,
+            }),
+            query: json!({}),
+            body: Some(json!({
+                "config": cloudflare_tunnel_configuration_prior_snapshot(plan)?,
+            })),
+            ..CallInput::default()
+        },
+        requested_account: Some(plan.account_id.clone()),
+    })
+}
+
 fn dns_record_compensation_request(plan: &PlanV1) -> Result<CompensationRequest> {
     let zone_id = plan
         .targets
@@ -3901,6 +4390,9 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
     }
     if is_d1_read_replication_mutation(&plan.capability) {
         return d1_read_replication_compensation_request(plan).map(Some);
+    }
+    if is_cloudflare_tunnel_configuration_mutation(&plan.capability) {
+        return cloudflare_tunnel_configuration_compensation_request(plan).map(Some);
     }
     if is_dns_record_update_mutation(&plan.capability) {
         return dns_record_compensation_request(plan).map(Some);
@@ -4999,6 +5491,7 @@ fn is_live_plan_precondition_hash(name: &str) -> bool {
             | "zone_account"
             | "global_warp_override_state"
             | D1_READ_REPLICATION_PRECONDITION
+            | CLOUDFLARE_TUNNEL_CONFIGURATION_STATE_PRECONDITION
             | DNS_RECORD_STATE_PRECONDITION
     )
 }
@@ -5385,36 +5878,82 @@ fn guide_next_action(
     json!({"summary": summary, "argv": argv})
 }
 
-fn guide_stage_document(
-    number: usize,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuideLiveRead {
+    ZoneAccount,
+    ZoneEntitlement,
+    GlobalWarpOverrideState,
+    D1ReadReplicationState,
+    CloudflareTunnelConfigurationState,
+    DnsRecordState,
+}
+
+fn guide_live_reads(capability: &CapabilityV1) -> Vec<GuideLiveRead> {
+    [
+        (
+            should_bind_zone_account(capability),
+            GuideLiveRead::ZoneAccount,
+        ),
+        (
+            should_resolve_zone_entitlement(capability),
+            GuideLiveRead::ZoneEntitlement,
+        ),
+        (
+            should_bind_global_warp_override_state(capability),
+            GuideLiveRead::GlobalWarpOverrideState,
+        ),
+        (
+            should_bind_d1_read_replication_state(capability),
+            GuideLiveRead::D1ReadReplicationState,
+        ),
+        (
+            should_bind_cloudflare_tunnel_configuration_state(capability),
+            GuideLiveRead::CloudflareTunnelConfigurationState,
+        ),
+        (
+            should_bind_dns_record_state(capability),
+            GuideLiveRead::DnsRecordState,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(required, read)| required.then_some(read))
+    .collect()
+}
+
+fn guide_stage_contract_state(
     stage: cfctl_core::GuideStage,
     capability: &CapabilityV1,
     contract_ready: bool,
     blocking_gaps: &[String],
-    call_argv: Option<&[String]>,
-) -> Value {
+    live_reads: &[GuideLiveRead],
+) -> &'static str {
     use cfctl_core::GuideStage;
 
-    let zone_account_live_read = should_bind_zone_account(capability);
-    let zone_entitlement_live_read = should_resolve_zone_entitlement(capability);
-    let global_warp_override_state_live_read = should_bind_global_warp_override_state(capability);
-    let d1_read_replication_state_live_read = should_bind_d1_read_replication_state(capability);
-    let dns_record_state_live_read = should_bind_dns_record_state(capability);
     let entitlement_blocked = capability.entitlement.available == Some(false)
         || blocking_gaps.iter().any(|gap| gap.contains("entitlement"));
     let entitlement_unresolved = capability.mutating
         && capability.entitlement.available != Some(true)
         && capability.entitlement.plans.is_empty();
-    let contract_state = match stage {
-        GuideStage::SelectAccount if zone_account_live_read => "live_read_required",
-        GuideStage::CheckEntitlement if zone_entitlement_live_read => "live_read_required",
-        GuideStage::InspectCurrentState if global_warp_override_state_live_read => {
+    match stage {
+        GuideStage::SelectAccount if live_reads.contains(&GuideLiveRead::ZoneAccount) => {
             "live_read_required"
         }
-        GuideStage::InspectCurrentState if d1_read_replication_state_live_read => {
+        GuideStage::CheckEntitlement if live_reads.contains(&GuideLiveRead::ZoneEntitlement) => {
             "live_read_required"
         }
-        GuideStage::InspectCurrentState if dns_record_state_live_read => "live_read_required",
+        GuideStage::InspectCurrentState
+            if live_reads.iter().any(|read| {
+                matches!(
+                    read,
+                    GuideLiveRead::GlobalWarpOverrideState
+                        | GuideLiveRead::D1ReadReplicationState
+                        | GuideLiveRead::CloudflareTunnelConfigurationState
+                        | GuideLiveRead::DnsRecordState
+                )
+            }) =>
+        {
+            "live_read_required"
+        }
         GuideStage::CheckEntitlement if entitlement_blocked => "blocked",
         GuideStage::CheckEntitlement if entitlement_unresolved => "manual_review",
         GuideStage::CalculateCost if capability.mutating && !capability.cost.known => "blocked",
@@ -5450,26 +5989,92 @@ fn guide_stage_document(
         }
         GuideStage::CloseWithEvidence if capability.mutating && !contract_ready => "blocked",
         _ => "available",
-    };
-    let summary = if stage == GuideStage::SelectAccount && zone_account_live_read {
-        "Read the exact live zone details and require its account ID to match the selected account."
-    } else if stage == GuideStage::CheckEntitlement && zone_entitlement_live_read {
-        "Read the exact live zone subscription and evaluate its active plan against the official availability matrix."
-    } else if stage == GuideStage::InspectCurrentState && global_warp_override_state_live_read {
-        "Read and bind the exact live account-wide disconnect state; execution repeats this read and rejects drift before crossing the mutation boundary."
-    } else if stage == GuideStage::InspectCurrentState && d1_read_replication_state_live_read {
-        "Read and bind the exact live database read-replication mode; execution repeats this read and rejects drift before crossing the mutation boundary."
-    } else if stage == GuideStage::InspectCurrentState && dns_record_state_live_read {
-        "Read and bind the exact live writable DNS record state; execution repeats this read and rejects drift before crossing the mutation boundary."
-    } else {
-        guide_stage_summary(stage, capability.mutating)
-    };
-    let evidence_class = if (stage == GuideStage::SelectAccount && zone_account_live_read)
-        || (stage == GuideStage::CheckEntitlement && zone_entitlement_live_read)
-        || (stage == GuideStage::InspectCurrentState && global_warp_override_state_live_read)
-        || (stage == GuideStage::InspectCurrentState && d1_read_replication_state_live_read)
-        || (stage == GuideStage::InspectCurrentState && dns_record_state_live_read)
-    {
+    }
+}
+
+fn guide_live_read_summary(
+    stage: cfctl_core::GuideStage,
+    live_reads: &[GuideLiveRead],
+) -> Option<&'static str> {
+    use cfctl_core::GuideStage;
+
+    match stage {
+        GuideStage::SelectAccount if live_reads.contains(&GuideLiveRead::ZoneAccount) => Some(
+            "Read the exact live zone details and require its account ID to match the selected account.",
+        ),
+        GuideStage::CheckEntitlement if live_reads.contains(&GuideLiveRead::ZoneEntitlement) => {
+            Some(
+                "Read the exact live zone subscription and evaluate its active plan against the official availability matrix.",
+            )
+        }
+        GuideStage::InspectCurrentState
+            if live_reads.contains(&GuideLiveRead::GlobalWarpOverrideState) =>
+        {
+            Some(
+                "Read and bind the exact live account-wide disconnect state; execution repeats this read and rejects drift before crossing the mutation boundary.",
+            )
+        }
+        GuideStage::InspectCurrentState
+            if live_reads.contains(&GuideLiveRead::D1ReadReplicationState) =>
+        {
+            Some(
+                "Read and bind the exact live database read-replication mode; execution repeats this read and rejects drift before crossing the mutation boundary.",
+            )
+        }
+        GuideStage::InspectCurrentState
+            if live_reads.contains(&GuideLiveRead::CloudflareTunnelConfigurationState) =>
+        {
+            Some(
+                "Read and bind the exact live remotely managed Tunnel routing configuration; execution repeats this read and rejects drift before replacing any ingress rule.",
+            )
+        }
+        GuideStage::InspectCurrentState if live_reads.contains(&GuideLiveRead::DnsRecordState) => {
+            Some(
+                "Read and bind the exact live writable DNS record state; execution repeats this read and rejects drift before crossing the mutation boundary.",
+            )
+        }
+        _ => None,
+    }
+}
+
+fn guide_stage_uses_live_read(stage: cfctl_core::GuideStage, live_reads: &[GuideLiveRead]) -> bool {
+    use cfctl_core::GuideStage;
+
+    match stage {
+        GuideStage::SelectAccount => live_reads.contains(&GuideLiveRead::ZoneAccount),
+        GuideStage::CheckEntitlement => live_reads.contains(&GuideLiveRead::ZoneEntitlement),
+        GuideStage::InspectCurrentState => live_reads.iter().any(|read| {
+            matches!(
+                read,
+                GuideLiveRead::GlobalWarpOverrideState
+                    | GuideLiveRead::D1ReadReplicationState
+                    | GuideLiveRead::CloudflareTunnelConfigurationState
+                    | GuideLiveRead::DnsRecordState
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn guide_stage_document(
+    number: usize,
+    stage: cfctl_core::GuideStage,
+    capability: &CapabilityV1,
+    contract_ready: bool,
+    blocking_gaps: &[String],
+    call_argv: Option<&[String]>,
+) -> Value {
+    let live_reads = guide_live_reads(capability);
+    let contract_state = guide_stage_contract_state(
+        stage,
+        capability,
+        contract_ready,
+        blocking_gaps,
+        &live_reads,
+    );
+    let summary = guide_live_read_summary(stage, &live_reads)
+        .unwrap_or_else(|| guide_stage_summary(stage, capability.mutating));
+    let evidence_class = if guide_stage_uses_live_read(stage, &live_reads) {
         "live_read"
     } else {
         guide_stage_evidence_class(stage, capability.mutating)
@@ -5585,6 +6190,18 @@ fn operation_specific_current_state_command(capability: &CapabilityV1) -> Option
             "account_id=<account_id>".to_owned(),
             "--selector".to_owned(),
             "database_id=<database_id>".to_owned(),
+            "--json".to_owned(),
+        ]);
+    }
+    if should_bind_cloudflare_tunnel_configuration_state(capability) {
+        return Some(vec![
+            "cfctl".to_owned(),
+            "call".to_owned(),
+            CLOUDFLARE_TUNNEL_CONFIGURATION_READ_CAPABILITY_ID.to_owned(),
+            "--selector".to_owned(),
+            "account_id=<account_id>".to_owned(),
+            "--selector".to_owned(),
+            "tunnel_id=<tunnel_id>".to_owned(),
             "--json".to_owned(),
         ]);
     }
@@ -5970,6 +6587,7 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 mod tests {
     use super::{
         CallInput, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions, PlanAuthority,
+        apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_read_replication_state_response, apply_dns_record_state_response,
         apply_global_warp_override_state_response, apply_zone_account_response,
         apply_zone_entitlement_response, bind_required_empty_compensation_body,
@@ -5977,13 +6595,14 @@ mod tests {
         guide_document, is_live_plan_precondition_hash, persist_prepared_plan,
         persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
         query_object_from_pairs, redact_secret_result,
+        required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
-        required_zone_account_precondition, should_bind_d1_read_replication_state,
-        should_bind_dns_record_state, should_bind_global_warp_override_state,
-        should_bind_zone_account, should_resolve_zone_entitlement, sink_secret_result,
-        validate_api_token_creation_contract, validate_current_permission_groups,
-        validate_entitlement_receipt_precondition,
+        required_zone_account_precondition, should_bind_cloudflare_tunnel_configuration_state,
+        should_bind_d1_read_replication_state, should_bind_dns_record_state,
+        should_bind_global_warp_override_state, should_bind_zone_account,
+        should_resolve_zone_entitlement, sink_secret_result, validate_api_token_creation_contract,
+        validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
         validate_selected_permission_groups, validate_zone_account_receipt_precondition,
         workspace_resource_keys, zone_target,
@@ -6007,6 +6626,9 @@ mod tests {
     #[test]
     fn d1_state_hash_is_validated_by_the_live_precondition_lane() {
         assert!(is_live_plan_precondition_hash("d1_read_replication_state"));
+        assert!(is_live_plan_precondition_hash(
+            "cloudflare_tunnel_configuration_state"
+        ));
         assert!(!is_live_plan_precondition_hash("workspace_graph"));
     }
 
@@ -6134,6 +6756,60 @@ mod tests {
         });
         capability.rollback.supported = true;
         capability.rollback.strategy = Some("restore_d1_read_replication_prior_mode".to_owned());
+        capability.rollback.warning = Some("restoration requires explicit approval".to_owned());
+        capability
+    }
+
+    fn cloudflare_tunnel_configuration_capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            "cloudflare-tunnel-configuration-put-configuration",
+            "Put configuration",
+            "PUT",
+            "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
+        );
+        capability.mutating = true;
+        capability.account_scope = "account".to_owned();
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.product = "Cloudflare Tunnel Configuration".to_owned();
+        capability.risk = RiskClass::CrossConfig;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.permissions = vec![
+            "Cloudflare One Connectors Write".to_owned(),
+            "Cloudflare One Connector: cloudflared Write".to_owned(),
+            "Cloudflare Tunnel Write".to_owned(),
+        ];
+        capability.cost.known = true;
+        capability.cost.maximum = Some(0.0);
+        capability.cost.basis = Some("no direct incremental operation charge".to_owned());
+        capability.entitlement.available = Some(true);
+        capability.request_schema = Some(
+            serde_json::from_str(include_str!(
+                "../../cfctl-core/tests/fixtures/cloudflare-tunnel-configuration-put-request-schema.json"
+            ))
+            .expect("pinned Cloudflare Tunnel configuration schema"),
+        );
+        capability.selectors = ["account_id", "tunnel_id"]
+            .into_iter()
+            .map(|name| SelectorV1 {
+                name: name.to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            })
+            .collect();
+        capability.verification.required = true;
+        capability.verification.strategy =
+            "same_path_result_contains_planned_fields_after_update".to_owned();
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations".to_owned(),
+            read_capability_id: "cloudflare-tunnel-configuration-get-configuration".to_owned(),
+            verified_response_fields: vec!["config".to_owned()],
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy =
+            Some("restore_cloudflare_tunnel_configuration_prior_snapshot".to_owned());
         capability.rollback.warning = Some("restoration requires explicit approval".to_owned());
         capability
     }
@@ -6475,6 +7151,154 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_tunnel_configuration_receipt_binds_only_restorable_routing_state() {
+        let capability = cloudflare_tunnel_configuration_capability();
+        assert!(should_bind_cloudflare_tunnel_configuration_state(
+            &capability
+        ));
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "config": {
+                    "ingress": [
+                        {"hostname":"app.example.com","service":"http://localhost:8080"},
+                        {"hostname":"","service":"http_status:404"}
+                    ]
+                },
+                "version": 17,
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+
+        let receipt = apply_cloudflare_tunnel_configuration_state_response(
+            &capability,
+            "account-a",
+            "tunnel-a",
+            &response,
+        )
+        .expect("Tunnel configuration receipt");
+        assert_eq!(
+            receipt,
+            json!({
+                "schema_version": 1,
+                "source_capability_id": "cloudflare-tunnel-configuration-get-configuration",
+                "source_path": "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
+                "target_capability_id": "cloudflare-tunnel-configuration-put-configuration",
+                "target_method": "PUT",
+                "target_path": "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
+                "target_scope": "account",
+                "account_id": "account-a",
+                "tunnel_id": "tunnel-a",
+                "prior_config": {
+                    "ingress": [
+                        {"hostname":"app.example.com","service":"http://localhost:8080"},
+                        {"hostname":"","service":"http_status:404"}
+                    ]
+                },
+            })
+        );
+
+        let mut unsupported = response;
+        unsupported.result["config"]["future_routing_control"] = json!(true);
+        let error = apply_cloudflare_tunnel_configuration_state_response(
+            &capability,
+            "account-a",
+            "tunnel-a",
+            &unsupported,
+        )
+        .expect_err("unrestorable future fields fail closed");
+        assert!(error.to_string().contains("restorable request contract"));
+    }
+
+    #[test]
+    fn cloudflare_tunnel_configuration_preflight_requires_one_final_catch_all_rule() {
+        let capability = cloudflare_tunnel_configuration_capability();
+        let valid = CallInput {
+            selectors: json!({"account_id":"account-a","tunnel_id":"tunnel-a"}),
+            body: Some(json!({"config":{"ingress":[
+                {"hostname":"app.example.com","service":"http://localhost:8080"},
+                {"hostname":"","service":"http_status:404"}
+            ]}})),
+            ..CallInput::default()
+        };
+        preflight_call_input(&capability, &valid, None).expect("final catch-all is valid");
+
+        let mut missing = valid.clone();
+        missing.body.as_mut().expect("body")["config"]["ingress"][1]["hostname"] =
+            json!("other.example.com");
+        let error = preflight_call_input(&capability, &missing, None)
+            .expect_err("a named final rule does not match all traffic");
+        assert!(error.to_string().contains("final catch-all"));
+
+        let mut unreachable = valid;
+        unreachable.body.as_mut().expect("body")["config"]["ingress"] = json!([
+            {"hostname":"","service":"http_status:404"},
+            {"hostname":"app.example.com","service":"http://localhost:8080"},
+            {"hostname":"","service":"http_status:404"}
+        ]);
+        let error = preflight_call_input(&capability, &unreachable, None)
+            .expect_err("an earlier catch-all makes later rules unreachable");
+        assert!(error.to_string().contains("rule 1"));
+        assert!(error.to_string().contains("unreachable"));
+    }
+
+    #[test]
+    fn cloudflare_tunnel_configuration_state_rejects_rehashed_cross_tunnel_targets() {
+        let capability = cloudflare_tunnel_configuration_capability();
+        let receipt = json!({
+            "schema_version": 1,
+            "source_capability_id": "cloudflare-tunnel-configuration-get-configuration",
+            "source_path": "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
+            "target_capability_id": "cloudflare-tunnel-configuration-put-configuration",
+            "target_method": "PUT",
+            "target_path": "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
+            "target_scope": "account",
+            "account_id": "account-a",
+            "tunnel_id": "tunnel-a",
+            "prior_config": {"ingress":[{"hostname":"","service":"http_status:404"}]},
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({
+                "selectors":{"account_id":"account-a","tunnel_id":"tunnel-a"},
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{"cloudflare_tunnel_configuration_state":receipt},
+            }),
+        )
+        .expect("plan");
+        plan.precondition_hashes.insert(
+            "cloudflare_tunnel_configuration_state".to_owned(),
+            hash_value(&receipt).expect("receipt hash"),
+        );
+        assert_eq!(
+            required_cloudflare_tunnel_configuration_state_precondition(&plan)
+                .expect("bound precondition"),
+            plan.precondition_hashes
+                .get("cloudflare_tunnel_configuration_state")
+                .map(String::as_str)
+        );
+
+        let mut retargeted = receipt;
+        retargeted["tunnel_id"] = json!("tunnel-b");
+        plan.precondition_hashes.insert(
+            "cloudflare_tunnel_configuration_state".to_owned(),
+            hash_value(&retargeted).expect("retargeted receipt hash"),
+        );
+        plan.targets["live_preconditions"]["cloudflare_tunnel_configuration_state"] = retargeted;
+        let error = required_cloudflare_tunnel_configuration_state_precondition(&plan)
+            .expect_err("a rehashed cross-Tunnel receipt must still fail");
+        assert!(error.to_string().contains("account, Tunnel"));
+    }
+
+    #[test]
     fn global_warp_override_state_receipt_binds_only_the_exact_account_state() {
         let response = CloudflareResponseV1 {
             status: 200,
@@ -6653,6 +7477,7 @@ mod tests {
                 zone_account: None,
                 global_warp_override_state: Some((receipt.clone(), receipt_evidence)),
                 d1_read_replication_state: None,
+                cloudflare_tunnel_configuration_state: None,
                 dns_record_state: None,
             },
         )
@@ -6733,6 +7558,7 @@ mod tests {
                 zone_account: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: Some((receipt.clone(), receipt_evidence)),
+                cloudflare_tunnel_configuration_state: None,
                 dns_record_state: None,
             },
         )
@@ -6754,6 +7580,92 @@ mod tests {
         assert_eq!(
             plan["cloudflare_diffs"][0]["planned_after"],
             json!({"read_replication":{"mode":"auto"}})
+        );
+    }
+
+    #[test]
+    fn prepared_cloudflare_tunnel_configuration_plan_carries_exact_before_and_after_routing() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = cloudflare_tunnel_configuration_capability();
+        assert!(capability.mutation_contract_gaps().is_empty());
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "https://example.invalid/openapi.json".to_owned(),
+            source_hash: "source-sha".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability.id.clone(), capability.clone())]),
+        };
+        catalog.refresh_hash().expect("catalog hash");
+        let profile = ProfileMetadata::new("profile-a", ProfileKind::ApiToken, Some("account-a"));
+        let prior_config = json!({
+            "ingress":[{"hostname":"","service":"http_status:404"}]
+        });
+        let planned_config = json!({
+            "ingress":[
+                {"hostname":"app.example.com","service":"http://localhost:8080"},
+                {"hostname":"","service":"http_status:404"}
+            ]
+        });
+        let receipt = json!({
+            "schema_version": 1,
+            "source_capability_id": "cloudflare-tunnel-configuration-get-configuration",
+            "source_path": "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
+            "target_capability_id": "cloudflare-tunnel-configuration-put-configuration",
+            "target_method": "PUT",
+            "target_path": "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
+            "target_scope": "account",
+            "account_id": "account-a",
+            "tunnel_id": "tunnel-a",
+            "prior_config": prior_config,
+        });
+        let receipt_hash = hash_value(&receipt).expect("receipt hash");
+        let receipt_evidence = store
+            .write_evidence(EvidenceClass::LiveRead, &receipt)
+            .expect("live read evidence");
+
+        let envelope = persist_prepared_plan(
+            &store,
+            &catalog,
+            capability,
+            CallInput {
+                selectors: json!({"account_id":"account-a","tunnel_id":"tunnel-a"}),
+                body: Some(json!({"config":planned_config})),
+                ..CallInput::default()
+            },
+            PlanAuthority {
+                profile: &profile,
+                account_id: "account-a",
+            },
+            json!({}),
+            LivePlanPreconditions {
+                entitlement: None,
+                zone_account: None,
+                global_warp_override_state: None,
+                d1_read_replication_state: None,
+                cloudflare_tunnel_configuration_state: Some((receipt.clone(), receipt_evidence)),
+                dns_record_state: None,
+            },
+        )
+        .expect("prepared plan");
+        let plan = &envelope.result["plan"];
+
+        assert_eq!(
+            plan["precondition_hashes"]["cloudflare_tunnel_configuration_state"],
+            receipt_hash
+        );
+        assert_eq!(
+            plan["targets"]["live_preconditions"]["cloudflare_tunnel_configuration_state"],
+            receipt
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["observed_before"],
+            json!({"config":prior_config})
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["planned_after"],
+            json!({"config":planned_config})
         );
     }
 
@@ -6824,6 +7736,7 @@ mod tests {
                 zone_account: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
+                cloudflare_tunnel_configuration_state: None,
                 dns_record_state: Some((receipt.clone(), receipt_evidence)),
             },
         )
@@ -6984,6 +7897,80 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_tunnel_configuration_rectification_derives_an_exact_restore_put() {
+        let capability = cloudflare_tunnel_configuration_capability();
+        let prior_config = json!({
+            "ingress": [
+                {"hostname":"app.example.com","service":"http://localhost:8080"},
+                {"hostname":"","service":"http_status:404"}
+            ]
+        });
+        let receipt = json!({
+            "schema_version": 1,
+            "source_capability_id": "cloudflare-tunnel-configuration-get-configuration",
+            "source_path": "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
+            "target_capability_id": "cloudflare-tunnel-configuration-put-configuration",
+            "target_method": "PUT",
+            "target_path": "/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
+            "target_scope": "account",
+            "account_id": "account-a",
+            "tunnel_id": "tunnel-a",
+            "prior_config": prior_config,
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability.clone(),
+            json!({
+                "selectors":{"account_id":"account-a","tunnel_id":"tunnel-a"},
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{"cloudflare_tunnel_configuration_state":receipt},
+            }),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors: json!({"account_id":"account-a","tunnel_id":"tunnel-a"}),
+            body: Some(json!({
+                "config":{"ingress":[{"hostname":"","service":"http_status:503"}]}
+            })),
+            ..CallInput::default()
+        })
+        .expect("call input");
+        plan.precondition_hashes.insert(
+            "cloudflare_tunnel_configuration_state".to_owned(),
+            hash_value(&receipt).expect("receipt hash"),
+        );
+        plan.refresh_hash().expect("bind source plan");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"success":true,"http_status":200}),
+        )
+        .expect("response receipt");
+        plan.status = PlanStatus::RectificationRequired;
+
+        let request = compensation_request(&plan)
+            .expect("request resolves")
+            .expect("compensation is supported");
+
+        assert_eq!(request.capability_id, capability.id);
+        assert_eq!(request.expected_method, "PUT");
+        assert_eq!(request.expected_path, capability.path);
+        assert_eq!(
+            request.input.selectors,
+            json!({"account_id":"account-a","tunnel_id":"tunnel-a"})
+        );
+        assert_eq!(request.input.query, json!({}));
+        assert_eq!(request.input.body, Some(json!({"config":prior_config})));
+        assert_eq!(request.requested_account.as_deref(), Some("account-a"));
+    }
+
+    #[test]
     fn dns_rectification_derives_a_separate_exact_put_restore_request() {
         let capability = dns_record_update_capability("PATCH");
         let receipt = json!({
@@ -7108,6 +8095,30 @@ mod tests {
                 "account_id=<account_id>",
                 "--selector",
                 "database_id=<database_id>",
+                "--json"
+            ])
+        );
+        assert_eq!(guide["stages"][13]["contract_state"], "available");
+    }
+
+    #[test]
+    fn cloudflare_tunnel_configuration_guide_requires_the_exact_live_routing_read() {
+        let capability = cloudflare_tunnel_configuration_capability();
+        let guide = guide_document(&capability);
+        let current_state = &guide["stages"][4];
+        assert_eq!(current_state["name"], "inspect_current_state");
+        assert_eq!(current_state["contract_state"], "live_read_required");
+        assert_eq!(current_state["evidence_class"], "live_read");
+        assert_eq!(
+            current_state["commands"][0],
+            json!([
+                "cfctl",
+                "call",
+                "cloudflare-tunnel-configuration-get-configuration",
+                "--selector",
+                "account_id=<account_id>",
+                "--selector",
+                "tunnel_id=<tunnel_id>",
                 "--json"
             ])
         );
