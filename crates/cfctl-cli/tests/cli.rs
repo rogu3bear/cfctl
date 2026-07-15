@@ -233,3 +233,122 @@ fn v1_migration_imports_safe_state_without_copying_secret_content() {
         );
     }
 }
+
+#[test]
+fn legacy_wrangler_profile_can_be_inspected_and_removed_without_revival() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    write_legacy_wrangler_profile(runtime.path());
+
+    let profiles = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args(["auth", "profiles", "--json"])
+        .output()
+        .expect("inspect legacy profiles");
+    assert!(
+        profiles.status.success(),
+        "{}",
+        String::from_utf8_lossy(&profiles.stderr)
+    );
+    let profiles: serde_json::Value =
+        serde_json::from_slice(&profiles.stdout).expect("profiles envelope");
+    assert_eq!(
+        profiles["result"]["profiles"][0]["kind"], "wrangler_session",
+        "{profiles}"
+    );
+
+    let doctor = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args(["doctor", "--json"])
+        .output()
+        .expect("diagnose legacy profile");
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let doctor: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("doctor envelope");
+    assert_eq!(
+        doctor["result"]["unsupported_legacy_profiles"][0]["profile"],
+        "legacy"
+    );
+    assert_eq!(
+        doctor["result"]["unsupported_legacy_profiles"][0]["credential_store_accessed"],
+        false
+    );
+    assert_eq!(
+        doctor["result"]["unsupported_legacy_profiles"][0]["remove_argv"],
+        serde_json::json!(["cfctl", "auth", "logout", "legacy", "--json"])
+    );
+
+    for command in [
+        ["auth", "status", "legacy", "--json"],
+        ["auth", "use", "legacy", "--json"],
+    ] {
+        let rejected = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+            .env("CFCTL_HOME", runtime.path())
+            .args(command)
+            .output()
+            .expect("reject legacy profile");
+        assert!(!rejected.status.success());
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&rejected.stderr).expect("failure envelope");
+        let message = envelope["error"]["message"]
+            .as_str()
+            .expect("failure message");
+        assert!(message.contains("no longer supported"), "{message}");
+        assert!(message.contains("auth logout legacy"), "{message}");
+        assert!(message.contains("auth login"), "{message}");
+        assert!(!message.contains("stored JSON is invalid"), "{message}");
+    }
+
+    let logout = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args(["auth", "logout", "legacy", "--json"])
+        .output()
+        .expect("remove legacy profile metadata");
+    assert!(
+        logout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&logout.stderr)
+    );
+    let logout: serde_json::Value =
+        serde_json::from_slice(&logout.stdout).expect("logout envelope");
+    assert_eq!(logout["result"]["credentials_removed"], false);
+    assert_eq!(logout["result"]["legacy_profile_removed"], true);
+
+    let saved: serde_json::Value = serde_json::from_slice(
+        &fs::read(runtime.path().join("config/profiles.json")).expect("saved profiles"),
+    )
+    .expect("saved profile JSON");
+    assert_eq!(saved["current_profile"], serde_json::Value::Null);
+    assert_eq!(
+        saved["profiles"].as_object().map(serde_json::Map::len),
+        Some(0)
+    );
+}
+
+fn write_legacy_wrangler_profile(runtime: &std::path::Path) {
+    fs::create_dir_all(runtime.join("config")).expect("runtime config directory");
+    fs::write(
+        runtime.join("config/profiles.json"),
+        r#"{
+            "schema_version": 1,
+            "current_profile": "legacy",
+            "profiles": {
+                "legacy": {
+                    "schema_version": 1,
+                    "id": "legacy",
+                    "kind": "wrangler_session",
+                    "account_id": "account-a",
+                    "oauth_client_id": null,
+                    "oauth_scopes": [],
+                    "oauth_scope_inventory_hash": null,
+                    "emergency_only": false
+                }
+            },
+            "pending_logins": {}
+        }"#,
+    )
+    .expect("legacy profile fixture");
+}

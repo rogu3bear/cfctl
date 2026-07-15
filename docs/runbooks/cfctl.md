@@ -72,6 +72,14 @@ Open the returned authorization URL, then pipe the callback's one-time
 `profiles`, `use`, and `logout` for profile lifecycle. Import an emergency
 global key only through stdin; cfctl never selects it silently.
 
+If `doctor` reports an unsupported `wrangler_session` profile, it is inert
+metadata left by a pre-release experiment. `auth profiles` and `doctor` remain
+readable, but `auth status`, `auth use`, planning, and execution reject that
+profile. Remove it with the exact `remove_argv` reported by `doctor`, then
+create a supported OAuth or API-token profile. Legacy-profile removal does not
+read, delete, or reinterpret any credential-store entry; cfctl does not revive
+Wrangler authentication as an API or delegated-CLI credential lane.
+
 ## Workspace boundaries
 
 ```bash

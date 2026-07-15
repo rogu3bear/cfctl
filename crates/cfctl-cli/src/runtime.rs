@@ -46,7 +46,7 @@ use crate::{
     GuideArgs, ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs, KeyRevokeArgs,
     KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector, PlansCommand,
     ProfileSelector, SearchArgs, WorkspaceCommand,
-    profiles::{PendingLogin, ProfilesConfig},
+    profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
 
 const API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
@@ -285,6 +285,7 @@ fn auth_status(
         .profiles
         .get(&selector.profile)
         .ok_or_else(|| CliError::Input(format!("profile `{}` does not exist", selector.profile)))?;
+    ensure_supported_profile(profile)?;
     let credential_available = secrets.load_credential(&profile.id, profile.kind).is_ok();
     Ok(ResultEnvelopeV2::success(
         "auth status",
@@ -297,12 +298,11 @@ fn use_profile(
     profiles: &mut ProfilesConfig,
     selector: &ProfileSelector,
 ) -> Result<ResultEnvelopeV2> {
-    if !profiles.profiles.contains_key(&selector.profile) {
-        return Err(CliError::Input(format!(
-            "profile `{}` does not exist",
-            selector.profile
-        )));
-    }
+    let profile = profiles
+        .profiles
+        .get(&selector.profile)
+        .ok_or_else(|| CliError::Input(format!("profile `{}` does not exist", selector.profile)))?;
+    ensure_supported_profile(profile)?;
     profiles.current_profile = Some(selector.profile.clone());
     profiles.save(store)?;
     Ok(ResultEnvelopeV2::success(
@@ -317,6 +317,10 @@ async fn logout_profile(
     secrets: &dyn SecretStore,
     selector: &ProfileSelector,
 ) -> Result<ResultEnvelopeV2> {
+    let legacy_profile = profiles
+        .profiles
+        .get(&selector.profile)
+        .is_some_and(|profile| profile.kind == ProfileKind::LegacyWranglerSession);
     if let Some(profile) = profiles.profiles.get(&selector.profile)
         && profile.kind == ProfileKind::OAuth
     {
@@ -335,7 +339,9 @@ async fn logout_profile(
         )
         .await?;
     }
-    secrets.delete_profile(&selector.profile)?;
+    if !legacy_profile {
+        secrets.delete_profile(&selector.profile)?;
+    }
     profiles.profiles.remove(&selector.profile);
     profiles.pending_logins.remove(&selector.profile);
     if profiles.current_profile.as_deref() == Some(&selector.profile) {
@@ -344,7 +350,16 @@ async fn logout_profile(
     profiles.save(store)?;
     Ok(ResultEnvelopeV2::success(
         "auth logout",
-        json!({"profile": selector.profile, "message": "Profile credentials and metadata were removed."}),
+        json!({
+            "profile": selector.profile,
+            "credentials_removed": !legacy_profile,
+            "legacy_profile_removed": legacy_profile,
+            "message": if legacy_profile {
+                "Unsupported legacy Wrangler session metadata was removed; no credential store entry was read or changed."
+            } else {
+                "Profile credentials and metadata were removed."
+            }
+        }),
     ))
 }
 
@@ -3026,6 +3041,7 @@ fn persist_prepared_plan(
     match profile.kind {
         ProfileKind::OAuth => "oauth",
         ProfileKind::ApiToken => "api_token",
+        ProfileKind::LegacyWranglerSession => "unsupported_legacy_wrangler_session",
         ProfileKind::GlobalKey => "emergency_global_key",
     }
     .clone_into(&mut plan.permission_lane);
@@ -6037,6 +6053,24 @@ fn docs_excerpt(body: &str, terms: &[String]) -> String {
 fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
     let profiles = ProfilesConfig::load(store)?;
     let inventory_hash = oauth_scope_inventory_hash(store)?;
+    let unsupported_legacy_profiles: Vec<Value> = profiles
+        .profiles
+        .values()
+        .filter(|profile| profile.kind == ProfileKind::LegacyWranglerSession)
+        .map(|profile| {
+            json!({
+                "profile": profile.id,
+                "kind": "wrangler_session",
+                "supported": false,
+                "credential_store_accessed": false,
+                "remove_argv": ["cfctl", "auth", "logout", profile.id, "--json"],
+                "next_step": format!(
+                    "Remove this metadata-only legacy profile with `cfctl auth logout {}` and create a supported OAuth or API-token profile; Wrangler authentication is not a cfctl credential lane.",
+                    profile.id
+                ),
+            })
+        })
+        .collect();
     let oauth_reconsent: Vec<Value> = profiles
         .profiles
         .values()
@@ -6079,6 +6113,7 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "catalog": catalog,
             "profile_count": profiles.profiles.len(),
             "current_profile": profiles.current_profile,
+            "unsupported_legacy_profiles": unsupported_legacy_profiles,
             "oauth_scope_inventory_hash": inventory_hash,
             "oauth_profiles": oauth_reconsent,
             "platform_secret_store": if cfg!(target_os = "macos") { "keychain" } else if cfg!(target_os = "linux") { "secret_service" } else { "unsupported" },

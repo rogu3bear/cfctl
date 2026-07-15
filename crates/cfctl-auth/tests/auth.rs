@@ -82,6 +82,31 @@ fn profile_metadata_contains_no_credentials() {
     assert!(!json.contains("global_key"));
 }
 
+#[test]
+fn legacy_wrangler_session_metadata_is_readable_but_never_a_credential_lane() {
+    let encoded = r#"{
+        "schema_version": 1,
+        "id": "legacy",
+        "kind": "wrangler_session",
+        "account_id": "account-a",
+        "oauth_client_id": null,
+        "oauth_scopes": [],
+        "oauth_scope_inventory_hash": null,
+        "emergency_only": false
+    }"#;
+    let profile: ProfileMetadata =
+        serde_json::from_str(encoded).expect("legacy metadata remains readable for removal");
+    assert_eq!(
+        serde_json::to_value(&profile).expect("legacy metadata serializes")["kind"],
+        "wrangler_session"
+    );
+
+    let error = MemorySecretStore::default()
+        .load_credential(&profile.id, profile.kind)
+        .expect_err("legacy Wrangler metadata is not an auth credential");
+    assert!(error.to_string().contains("no longer supported"));
+}
+
 #[tokio::test]
 async fn oauth_exchange_refresh_and_revoke_use_public_client_flows() {
     let listener = TcpListener::bind("127.0.0.1:0")

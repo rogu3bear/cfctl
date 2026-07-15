@@ -34,6 +34,10 @@ pub enum AuthError {
     SecretStore(String),
     #[error("profile `{0}` has no stored credential")]
     MissingCredential(String),
+    #[error(
+        "legacy Wrangler session profile `{0}` is no longer supported; run `cfctl auth logout {0}` to remove its metadata, then `cfctl auth login --profile {0}`"
+    )]
+    UnsupportedLegacyWranglerSession(String),
 }
 
 pub type Result<T> = std::result::Result<T, AuthError>;
@@ -147,6 +151,8 @@ pub fn resolve_account<'a>(
 pub enum ProfileKind {
     OAuth,
     ApiToken,
+    #[serde(rename = "wrangler_session")]
+    LegacyWranglerSession,
     GlobalKey,
 }
 
@@ -344,6 +350,9 @@ pub trait SecretStore: Send + Sync {
                 .get(&api_token_key(profile_id))?
                 .map(|token| AuthCredential::Bearer { token })
                 .ok_or_else(|| AuthError::MissingCredential(profile_id.to_owned())),
+            ProfileKind::LegacyWranglerSession => Err(AuthError::UnsupportedLegacyWranglerSession(
+                profile_id.to_owned(),
+            )),
             ProfileKind::GlobalKey => {
                 let encoded = self
                     .get(&global_key(profile_id))?

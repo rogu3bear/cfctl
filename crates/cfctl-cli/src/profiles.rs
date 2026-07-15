@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use cfctl_auth::{OAuthClientConfig, ProfileMetadata};
+use cfctl_auth::{OAuthClientConfig, ProfileKind, ProfileMetadata};
 use cfctl_storage::StateStore;
 use serde::{Deserialize, Serialize};
 
@@ -53,8 +53,21 @@ impl ProfilesConfig {
             .ok_or_else(|| {
                 CliError::Input("no active profile; run `cfctl auth login`".to_owned())
             })?;
-        self.profiles
+        let profile = self
+            .profiles
             .get(id)
-            .ok_or_else(|| CliError::Input(format!("profile `{id}` does not exist")))
+            .ok_or_else(|| CliError::Input(format!("profile `{id}` does not exist")))?;
+        ensure_supported_profile(profile)?;
+        Ok(profile)
     }
+}
+
+pub fn ensure_supported_profile(profile: &ProfileMetadata) -> Result<()> {
+    if profile.kind == ProfileKind::LegacyWranglerSession {
+        return Err(CliError::Input(format!(
+            "legacy Wrangler session profile `{}` is no longer supported; run `cfctl auth logout {}` to remove its metadata, then `cfctl auth login --profile {}`",
+            profile.id, profile.id, profile.id
+        )));
+    }
+    Ok(())
 }
