@@ -211,6 +211,47 @@ fn same_path_post_state_contract_requires_the_exact_post_method_and_readback() {
 }
 
 #[test]
+fn same_path_state_contract_can_omit_an_explicitly_unobservable_request_field() {
+    let mut capability = CapabilityV1::new(
+        "settings-apply",
+        "Apply settings",
+        "POST",
+        "/accounts/{account_id}/settings/example",
+    );
+    capability.verification.strategy =
+        "same_path_result_contains_planned_fields_after_mutation".to_owned();
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{
+            "enabled":{"type":"boolean"},
+            "justification":{
+                "type":"string",
+                "x-cfctl-verification-observable":false
+            }
+        }
+    }));
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: capability.path.clone(),
+        read_capability_id: "settings-get".to_owned(),
+        verified_response_fields: vec!["enabled".to_owned()],
+    });
+
+    assert_eq!(
+        capability.verifiable_request_object_fields(),
+        Some(vec!["enabled".to_owned()])
+    );
+    assert!(capability.request_object_field_is_verification_omitted("justification"));
+    assert!(capability.verification_contract_supported());
+
+    capability.request_schema.as_mut().expect("request schema")["properties"]["justification"]
+        .as_object_mut()
+        .expect("justification schema")
+        .remove("x-cfctl-verification-observable");
+    assert!(!capability.request_object_field_is_verification_omitted("justification"));
+    assert!(!capability.verification_contract_supported());
+}
+
+#[test]
 fn updated_resource_contract_rejects_noncanonical_field_allowlists() {
     let mut capability = CapabilityV1::new(
         "widgets-update",

@@ -3902,7 +3902,7 @@ async fn same_path_object_update_verifies_schema_proven_fields_with_a_clean_get(
 }
 
 #[tokio::test]
-async fn same_path_post_mutation_verifies_schema_proven_fields_with_a_clean_get() {
+async fn same_path_post_mutation_omits_an_audit_only_field_from_clean_readback() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind fake server");
@@ -3912,7 +3912,7 @@ async fn same_path_post_mutation_verifies_schema_proven_fields_with_a_clean_get(
         let mut buffer = vec![0_u8; 8192];
         let read = stream.read(&mut buffer).await.expect("read verification");
         let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-        let body = r#"{"success":true,"result":{"enabled":true,"mode":"strict"},"errors":[]}"#;
+        let body = r#"{"success":true,"result":{"disconnect":true},"errors":[]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -3923,14 +3923,32 @@ async fn same_path_post_mutation_verifies_schema_proven_fields_with_a_clean_get(
             .expect("write verification");
         request
     });
-    let plan = dns_record_plan(
+    let mut plan = dns_record_plan(
         "settings-apply",
         "POST",
         "/accounts/{account_id}/settings/example",
         "same_path_result_contains_planned_fields_after_mutation",
         json!({"account_id":"account-1"}),
-        Some(json!({"enabled":true,"mode":"strict"})),
+        Some(json!({
+            "disconnect":true,
+            "justification":"planned-audit-only-value"
+        })),
     );
+    plan.capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{
+            "disconnect":{"type":"boolean"},
+            "justification":{
+                "type":"string",
+                "x-cfctl-verification-observable":false
+            }
+        }
+    }));
+    plan.capability
+        .same_path_read
+        .as_mut()
+        .expect("same-path readback")
+        .verified_response_fields = vec!["disconnect".to_owned()];
     let apply = CloudflareResponseV1 {
         status: 200,
         success: true,
@@ -3960,6 +3978,7 @@ async fn same_path_post_mutation_verifies_schema_proven_fields_with_a_clean_get(
     assert!(verification.passed, "{}", verification.basis);
     assert!(verification.basis.contains("planned mutation field"));
     assert!(!verification.basis.contains("planned update field"));
+    assert!(!verification.basis.contains("planned-audit-only-value"));
     let request = server.await.expect("server joins");
     assert!(request.starts_with("GET /client/v4/accounts/account-1/settings/example "));
 }

@@ -1570,7 +1570,7 @@ fn contains_verifiable_planned_value(
     if depth > MAX_REQUEST_VALIDATION_DEPTH {
         return false;
     }
-    if schema.is_some_and(|schema| request_schema_path_is_write_only(schema, path)) {
+    if schema.is_some_and(|schema| request_schema_path_is_verification_omitted(schema, path)) {
         return true;
     }
     let Some(actual) = actual else {
@@ -1599,16 +1599,19 @@ fn contains_verifiable_planned_value(
     }
 }
 
-fn request_schema_path_is_write_only(schema: &Value, path: &[RequestSchemaPathStep]) -> bool {
+fn request_schema_path_is_verification_omitted(
+    schema: &Value,
+    path: &[RequestSchemaPathStep],
+) -> bool {
     let mut remaining_steps = MAX_REQUEST_SCHEMA_PROJECTION_STEPS;
     let Some(candidates) = request_schema_path_candidates(schema, path, 0, &mut remaining_steps)
     else {
         return false;
     };
     !candidates.is_empty()
-        && candidates
-            .iter()
-            .all(|candidate| schema_declares_write_only(candidate, 0, &mut remaining_steps))
+        && candidates.iter().all(|candidate| {
+            schema_declares_verification_omitted(candidate, 0, &mut remaining_steps)
+        })
 }
 
 const MAX_REQUEST_SCHEMA_PROJECTION_STEPS: usize = 4_096;
@@ -1660,21 +1663,30 @@ fn request_schema_path_candidates<'a>(
     Some(candidates)
 }
 
-fn schema_declares_write_only(schema: &Value, depth: usize, remaining_steps: &mut usize) -> bool {
+fn schema_declares_verification_omitted(
+    schema: &Value,
+    depth: usize,
+    remaining_steps: &mut usize,
+) -> bool {
     if depth > MAX_REQUEST_VALIDATION_DEPTH || *remaining_steps == 0 {
         return false;
     }
     *remaining_steps -= 1;
-    if schema.get("writeOnly").and_then(Value::as_bool) == Some(true) {
+    if schema.get("writeOnly").and_then(Value::as_bool) == Some(true)
+        || schema
+            .get("x-cfctl-verification-observable")
+            .and_then(Value::as_bool)
+            == Some(false)
+    {
         return true;
     }
     if schema
         .get("allOf")
         .and_then(Value::as_array)
         .is_some_and(|members| {
-            members
-                .iter()
-                .any(|member| schema_declares_write_only(member, depth + 1, remaining_steps))
+            members.iter().any(|member| {
+                schema_declares_verification_omitted(member, depth + 1, remaining_steps)
+            })
         })
     {
         return true;
@@ -1686,7 +1698,7 @@ fn schema_declares_write_only(schema: &Value, depth: usize, remaining_steps: &mu
             .is_some_and(|members| {
                 !members.is_empty()
                     && members.iter().all(|member| {
-                        schema_declares_write_only(member, depth + 1, remaining_steps)
+                        schema_declares_verification_omitted(member, depth + 1, remaining_steps)
                     })
             })
     })
@@ -1694,7 +1706,7 @@ fn schema_declares_write_only(schema: &Value, depth: usize, remaining_steps: &mu
 
 #[cfg(test)]
 mod request_schema_projection_tests {
-    use super::{RequestSchemaPathStep, request_schema_path_is_write_only};
+    use super::{RequestSchemaPathStep, request_schema_path_is_verification_omitted};
 
     #[test]
     fn write_only_projection_fails_closed_when_schema_work_is_exhausted() {
@@ -1711,7 +1723,7 @@ mod request_schema_projection_tests {
         let schema = serde_json::json!({"oneOf":branches});
         let path = [RequestSchemaPathStep::Property("secret".to_owned())];
 
-        assert!(!request_schema_path_is_write_only(&schema, &path));
+        assert!(!request_schema_path_is_verification_omitted(&schema, &path));
     }
 }
 
@@ -2133,7 +2145,7 @@ fn planned_field_is_bound_to_readback(
     verified_response_fields
         .binary_search_by(|candidate| candidate.as_str().cmp(field))
         .is_ok()
-        || capability.request_object_field_is_write_only(field)
+        || capability.request_object_field_is_verification_omitted(field)
 }
 
 fn is_update_verifier(strategy: &str) -> bool {

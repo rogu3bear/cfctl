@@ -2501,7 +2501,11 @@ fn same_path_object_updates_require_schema_proven_readback_fields() {
                     "x-api-token-group":["Settings Write"],
                     "requestBody":{"required":true,"content":{"application/json":{"schema":{
                         "type":"object",
-                        "properties":{"mode":{"type":"string"},"enabled":{"type":"boolean"}}
+                        "properties":{
+                            "mode":{"type":"string"},
+                            "enabled":{"type":"boolean"},
+                            "owner_worker_tag":{"type":"string","writeOnly":true}
+                        }
                     }}}}
                 }
             },
@@ -2540,6 +2544,7 @@ fn same_path_object_updates_require_schema_proven_readback_fields() {
     assert_eq!(target.path, update.path);
     assert_eq!(target.read_capability_id, "settings-get");
     assert_eq!(target.verified_response_fields, ["enabled", "mode"]);
+    assert!(update.request_object_field_is_write_only("owner_worker_tag"));
     assert!(!update.rollback.supported);
     assert!(
         update
@@ -2694,6 +2699,181 @@ fn same_path_post_mutations_require_schema_proven_readback_fields() {
     );
     assert!(create.created_resource.is_some());
     assert!(create.same_path_read.is_none());
+}
+
+fn global_warp_override_fixture() -> serde_json::Value {
+    json!({
+        "openapi":"3.0.3",
+        "info":{"title":"Cloudflare API","version":"4.0.0"},
+        "components":{"schemas":{
+            "Disconnect":{
+                "type":"boolean",
+                "description":"Disconnects all devices on the account using Global WARP override.",
+                "x-auditable":true
+            },
+            "Justification":{
+                "type":"string",
+                "description":"Reasoning for setting the Global WARP override state. This will be surfaced in the audit log.",
+                "x-auditable":true
+            },
+            "OverrideRequest":{
+                "type":"object",
+                "required":["disconnect"],
+                "properties":{
+                    "disconnect":{"$ref":"#/components/schemas/Disconnect"},
+                    "justification":{"$ref":"#/components/schemas/Justification"}
+                }
+            },
+            "OverrideResult":{
+                "type":"object",
+                "properties":{
+                    "disconnect":{"$ref":"#/components/schemas/Disconnect"},
+                    "timestamp":{"type":"string","format":"date-time"}
+                }
+            },
+            "OverrideResponse":{
+                "type":"object",
+                "properties":{
+                    "success":{"type":"boolean"},
+                    "result":{"$ref":"#/components/schemas/OverrideResult"}
+                }
+            }
+        }},
+        "paths":{
+            "/accounts/{account_id}/devices/resilience/disconnect":{
+                "get":{
+                    "operationId":"devices-resilience-retrieve-global-warp-override",
+                    "summary":"Retrieve Global WARP override state",
+                    "description":"Fetch the Global WARP override state.",
+                    "tags":["Devices Resilience"],
+                    "parameters":[{
+                        "in":"path","name":"account_id","required":true,
+                        "schema":{"type":"string"}
+                    }],
+                    "x-api-token-group":[
+                        "Zero Trust Resilience Read",
+                        "Zero Trust Resilience Write",
+                        "Zero Trust Read",
+                        "Zero Trust Write"
+                    ],
+                    "x-fern-availability":"generally-available",
+                    "responses":{"200":{
+                        "description":"Fetch Global WARP override state response.",
+                        "content":{"application/json":{"schema":{
+                            "$ref":"#/components/schemas/OverrideResponse"
+                        }}}
+                    }}
+                },
+                "post":{
+                    "operationId":"devices-resilience-set-global-warp-override",
+                    "summary":"Set Global WARP override state",
+                    "description":"Sets the Global WARP override state.",
+                    "tags":["Devices Resilience"],
+                    "parameters":[{
+                        "in":"path","name":"account_id","required":true,
+                        "schema":{"type":"string"}
+                    }],
+                    "x-api-token-group":["Zero Trust Resilience Write"],
+                    "x-fern-availability":"generally-available",
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "$ref":"#/components/schemas/OverrideRequest"
+                    }}}},
+                    "responses":{"200":{
+                        "description":"Set Global WARP override state response.",
+                        "content":{"application/json":{"schema":{
+                            "$ref":"#/components/schemas/OverrideResponse"
+                        }}}
+                    }}
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn global_warp_override_has_an_exact_audit_aware_state_contract() {
+    let document = global_warp_override_fixture();
+    let snapshot = normalize_openapi(&document).expect("Global WARP override catalog");
+    let mutation = snapshot
+        .get("devices-resilience-set-global-warp-override")
+        .expect("set Global WARP override");
+
+    assert_eq!(mutation.risk, RiskClass::CrossConfig);
+    assert_eq!(mutation.effect, EffectClass::ReversibleWrite);
+    assert_eq!(mutation.adapter_status, AdapterStatus::DynamicApi);
+    assert!(mutation.mutation_contract_gaps().is_empty());
+    assert!(mutation.cost.known);
+    assert!(!mutation.cost.incremental);
+    assert_eq!(mutation.cost.maximum, Some(0.0));
+    assert_eq!(mutation.cost.billing_model, BillingModelV1::Subscription);
+    assert_eq!(mutation.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert!(mutation.cost.references.iter().any(|reference| {
+        reference.url
+            == "https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/configure/settings/"
+    }));
+    assert_eq!(mutation.entitlement.available, Some(true));
+    assert_eq!(mutation.entitlement.plans.get("free"), Some(&true));
+    assert_eq!(mutation.entitlement.plans.get("paid"), Some(&true));
+    assert_eq!(
+        mutation.entitlement.source.as_deref(),
+        Some(
+            "https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/configure/settings/"
+        )
+    );
+    assert_eq!(
+        mutation.verification.strategy,
+        "same_path_result_contains_planned_fields_after_mutation"
+    );
+    assert_eq!(
+        mutation
+            .same_path_read
+            .as_ref()
+            .expect("exact state readback")
+            .verified_response_fields,
+        ["disconnect"]
+    );
+    assert_eq!(
+        mutation.request_schema.as_ref().expect("request schema")["properties"]["justification"]["x-cfctl-verification-observable"],
+        false
+    );
+    assert_eq!(
+        mutation.request_schema.as_ref().expect("request schema")["additionalProperties"],
+        false
+    );
+    assert!(mutation.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("prior state")
+            && warning.contains("Super Administrator")
+            && warning.contains("10 minutes")
+    }));
+
+    let mut drifted = document;
+    drifted["components"]["schemas"]["Justification"]["description"] =
+        json!("An unclassified free-form field.");
+    let drifted_snapshot = normalize_openapi(&drifted).expect("drifted catalog");
+    let drifted_mutation = drifted_snapshot
+        .get("devices-resilience-set-global-warp-override")
+        .expect("drifted Global WARP override");
+    assert_eq!(drifted_mutation.risk, RiskClass::Unknown);
+    assert_ne!(
+        drifted_mutation.verification.strategy,
+        "same_path_result_contains_planned_fields_after_mutation"
+    );
+    assert_eq!(drifted_mutation.adapter_status, AdapterStatus::Blocked);
+
+    let mut enriched = snapshot;
+    attach_official_product_knowledge(&mut enriched, &pricing_feeds_fixture())
+        .expect("attach official knowledge");
+    assert_eq!(
+        enriched
+            .get("devices-resilience-set-global-warp-override")
+            .expect("enriched Global WARP override")
+            .entitlement
+            .source
+            .as_deref(),
+        Some(
+            "https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/configure/settings/"
+        )
+    );
 }
 
 fn create_lifecycle_fixture() -> serde_json::Value {

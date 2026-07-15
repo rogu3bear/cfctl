@@ -698,7 +698,8 @@ impl CapabilityV1 {
     }
 
     /// Returns the canonical top-level request fields that a response
-    /// readback can observe. Fully write-only inputs remain valid request
+    /// readback can observe. Fully write-only inputs and fields explicitly
+    /// marked `x-cfctl-verification-observable: false` remain valid request
     /// fields but are deliberately absent from this list. A schema with
     /// `properties` and no explicit type is object-shaped for this purpose;
     /// any explicit non-object type remains ineligible.
@@ -707,7 +708,7 @@ impl CapabilityV1 {
         let fields = request_object_property_schemas(self.request_schema.as_ref()?)?;
         let fields = fields
             .into_iter()
-            .filter(|(_, schemas)| !property_schemas_are_write_only(schemas))
+            .filter(|(_, schemas)| !property_schemas_are_verification_omitted(schemas))
             .map(|(name, _)| name)
             .collect::<Vec<_>>();
         if fields.is_empty() {
@@ -725,6 +726,18 @@ impl CapabilityV1 {
             .and_then(request_object_property_schemas)
             .and_then(|fields| fields.get(field).cloned())
             .is_some_and(|schemas| property_schemas_are_write_only(&schemas))
+    }
+
+    /// Returns whether a top-level request field is deliberately omitted from
+    /// state readback verification. This includes write-only values and a
+    /// catalog-pinned `x-cfctl-verification-observable: false` annotation.
+    #[must_use]
+    pub fn request_object_field_is_verification_omitted(&self, field: &str) -> bool {
+        self.request_schema
+            .as_ref()
+            .and_then(request_object_property_schemas)
+            .and_then(|fields| fields.get(field).cloned())
+            .is_some_and(|schemas| property_schemas_are_verification_omitted(&schemas))
     }
 
     /// Returns whether this capability's pinned request contract requires one
@@ -1038,6 +1051,57 @@ fn property_schemas_are_write_only(schemas: &[&Value]) -> bool {
     schemas
         .iter()
         .all(|schema| schema_declares_write_only(schema, 0, &mut remaining_steps))
+}
+
+fn property_schemas_are_verification_omitted(schemas: &[&Value]) -> bool {
+    if schemas.is_empty() {
+        return false;
+    }
+    let mut remaining_steps = MAX_REQUEST_OBJECT_SCHEMA_STEPS;
+    schemas
+        .iter()
+        .all(|schema| schema_declares_verification_omitted(schema, 0, &mut remaining_steps))
+}
+
+fn schema_declares_verification_omitted(
+    schema: &Value,
+    depth: usize,
+    remaining_steps: &mut usize,
+) -> bool {
+    if depth > MAX_REQUEST_OBJECT_SCHEMA_DEPTH || *remaining_steps == 0 {
+        return false;
+    }
+    *remaining_steps -= 1;
+    if schema.get("writeOnly").and_then(Value::as_bool) == Some(true)
+        || schema
+            .get("x-cfctl-verification-observable")
+            .and_then(Value::as_bool)
+            == Some(false)
+    {
+        return true;
+    }
+    if schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members.iter().any(|member| {
+                schema_declares_verification_omitted(member, depth + 1, remaining_steps)
+            })
+        })
+    {
+        return true;
+    }
+    ["oneOf", "anyOf"].iter().any(|composition| {
+        schema
+            .get(*composition)
+            .and_then(Value::as_array)
+            .is_some_and(|members| {
+                !members.is_empty()
+                    && members.iter().all(|member| {
+                        schema_declares_verification_omitted(member, depth + 1, remaining_steps)
+                    })
+            })
+    })
 }
 
 fn schema_declares_write_only(schema: &Value, depth: usize, remaining_steps: &mut usize) -> bool {

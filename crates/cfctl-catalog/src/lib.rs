@@ -379,8 +379,10 @@ pub fn attach_official_product_knowledge(
     let pricing = official_pricing_references(feeds);
     for capability in snapshot.capabilities.values_mut() {
         if !capability.entitlement.plans.is_empty() {
-            capability.entitlement.source =
-                Some("official OpenAPI x-cfPlanAvailability".to_owned());
+            capability
+                .entitlement
+                .source
+                .get_or_insert_with(|| "official OpenAPI x-cfPlanAvailability".to_owned());
             let plan_gated = capability
                 .entitlement
                 .plans
@@ -937,6 +939,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     classify_parent_collection_update_contracts(document, &mut capabilities);
     classify_created_resource_contracts(document, &mut capabilities);
     classify_created_collection_resource_contracts(document, &mut capabilities);
+    classify_global_warp_override_contract(document, &mut capabilities);
     classify_same_path_object_mutation_contracts(document, &mut capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
@@ -993,7 +996,7 @@ fn classify_same_path_object_mutation_contracts(
         )) else {
             continue;
         };
-        let Some(fields) = canonical_request_object_fields(capability) else {
+        let Some(fields) = canonical_verifiable_request_object_fields(capability) else {
             continue;
         };
         let Some(read_operation) = document
@@ -1023,15 +1026,168 @@ fn classify_same_path_object_mutation_contracts(
         }
         capability.rollback.supported = false;
         capability.rollback.strategy = None;
-        capability.rollback.warning = Some(if capability.method == "POST" {
-            "automatic reversal is unsupported because the plan does not bind prior state; reversal requires a separately reviewed operation built from trusted evidence"
-                .to_owned()
-        } else {
-            "automatic restoration is unsupported because the plan does not bind a pre-change snapshot; restoration requires a separately reviewed update plan built from trusted evidence"
-                .to_owned()
-        });
+        if capability.rollback.warning.as_deref()
+            == Some("rollback semantics have not been declared")
+        {
+            capability.rollback.warning = Some(if capability.method == "POST" {
+                "automatic reversal is unsupported because the plan does not bind prior state; reversal requires a separately reviewed operation built from trusted evidence"
+                    .to_owned()
+            } else {
+                "automatic restoration is unsupported because the plan does not bind a pre-change snapshot; restoration requires a separately reviewed update plan built from trusted evidence"
+                    .to_owned()
+            });
+        }
         refresh_dynamic_mutation_contract(capability);
     }
+}
+
+fn classify_global_warp_override_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let Some(capability) = capabilities.get_mut("devices-resilience-set-global-warp-override")
+    else {
+        return;
+    };
+    if !global_warp_override_source_contract_supported(document, capability) {
+        return;
+    }
+
+    let Some(request_schema) = capability
+        .request_schema
+        .as_mut()
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(justification) = request_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("justification"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    justification.insert(
+        "x-cfctl-verification-observable".to_owned(),
+        Value::Bool(false),
+    );
+    request_schema.insert("additionalProperties".to_owned(), Value::Bool(false));
+
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans =
+        BTreeMap::from([("free".to_owned(), true), ("paid".to_owned(), true)]);
+    capability.entitlement.source = Some(
+        "https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/configure/settings/"
+            .to_owned(),
+    );
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.billing_model = BillingModelV1::Subscription;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "Cloudflare documents the global disconnect setting as available on all Zero Trust plans; setting or clearing it has no direct incremental operation charge, while existing Zero Trust subscription and seat charges remain unchanged"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Set Global WARP override state".to_owned(),
+            url: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/devices/subresources/resilience/subresources/global_warp_override/methods/create/"
+                .to_owned(),
+            source: "official Cloudflare API reference".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare One Client device settings".to_owned(),
+            url: "https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/configure/settings/"
+                .to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+    ];
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "automatic restoration is unsupported because the plan does not bind the prior state of the disconnect control; recovery requires a separately reviewed operation built from trusted evidence. Cloudflare documents that this account-wide control requires the Super Administrator role and may take up to 10 minutes to propagate to devices"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
+
+fn global_warp_override_source_contract_supported(
+    document: &Value,
+    capability: &CapabilityV1,
+) -> bool {
+    if capability.method != "POST"
+        || capability.path != "/accounts/{account_id}/devices/resilience/disconnect"
+        || capability.product != "Devices Resilience"
+        || capability.title != "Set Global WARP override state"
+        || capability.description.as_deref() != Some("Sets the Global WARP override state.")
+        || capability.maturity != Maturity::GenerallyAvailable
+        || capability.permissions != ["Zero Trust Resilience Write"]
+        || capability.selectors.len() != 1
+        || !capability.selectors.iter().any(|selector| {
+            selector.name == "account_id" && selector.location == "path" && selector.required
+        })
+    {
+        return false;
+    }
+    let Some(operation) =
+        document.pointer("/paths/~1accounts~1{account_id}~1devices~1resilience~1disconnect/post")
+    else {
+        return false;
+    };
+    let Some(source_schema) = operation
+        .pointer("/requestBody/content/application~1json/schema")
+        .map(|schema| resolve_local_schema(document, schema))
+    else {
+        return false;
+    };
+    let Some(source_properties) = source_schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    if source_schema.get("type").and_then(Value::as_str) != Some("object")
+        || source_schema.get("required") != Some(&serde_json::json!(["disconnect"]))
+        || source_properties.len() != 2
+    {
+        return false;
+    }
+    let source_property_matches = |name: &str, expected_type: &str, description: &str| {
+        source_properties
+            .get(name)
+            .map(|schema| resolve_local_schema(document, schema))
+            .is_some_and(|schema| {
+                schema.get("type").and_then(Value::as_str) == Some(expected_type)
+                    && schema.get("description").and_then(Value::as_str) == Some(description)
+                    && schema.get("x-auditable").and_then(Value::as_bool) == Some(true)
+            })
+    };
+    if !source_property_matches(
+        "disconnect",
+        "boolean",
+        "Disconnects all devices on the account using Global WARP override.",
+    ) || !source_property_matches(
+        "justification",
+        "string",
+        "Reasoning for setting the Global WARP override state. This will be surfaced in the audit log.",
+    ) {
+        return false;
+    }
+
+    capability.request_schema.as_ref().is_some_and(|schema| {
+        schema.get("type").and_then(Value::as_str) == Some("object")
+            && schema.get("required") == Some(&serde_json::json!(["disconnect"]))
+            && schema.get("x-cfctl-body-required").and_then(Value::as_bool) == Some(true)
+            && schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some_and(|properties| {
+                    properties.len() == 2
+                        && properties.get("disconnect")
+                            == Some(&serde_json::json!({"type":"boolean"}))
+                        && properties.get("justification")
+                            == Some(&serde_json::json!({"type":"string"}))
+                })
+    })
 }
 
 fn classify_created_resource_contracts(
