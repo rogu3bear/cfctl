@@ -17,6 +17,8 @@ pub enum CloudflareError {
     Url(#[from] url::ParseError),
     #[error("selector `{0}` is required to construct the request path")]
     MissingSelector(String),
+    #[error("catalog header selector `{0}` is required")]
+    MissingHeaderSelector(String),
     #[error("selector `{0}` must be a string, number, or boolean")]
     InvalidSelector(String),
     #[error("required request body is missing for capability `{0}`")]
@@ -33,6 +35,10 @@ pub enum CloudflareError {
     InvalidAuthenticationHeader,
     #[error("invalid conditional request header")]
     InvalidConditionalHeader,
+    #[error("catalog header selector `{0}` is reserved and cannot be set through selectors")]
+    ReservedHeaderSelector(String),
+    #[error("catalog header selector `{0}` has an invalid name or value")]
+    InvalidHeaderSelector(String),
     #[error("Cloudflare reported {0} pages, above the governed pagination limit")]
     PaginationLimit(u64),
     #[error("Cloudflare request failed: {0}")]
@@ -133,6 +139,7 @@ impl RequestBuilder {
             }
         }
         let mut headers = HeaderMap::new();
+        add_declared_header_selectors(&mut headers, capability, selectors)?;
         add_conditional_header(
             &mut headers,
             reqwest::header::IF_MATCH,
@@ -150,6 +157,64 @@ impl RequestBuilder {
             body: input.body.clone(),
         })
     }
+}
+
+fn add_declared_header_selectors(
+    headers: &mut HeaderMap,
+    capability: &CapabilityV1,
+    selectors: Option<&serde_json::Map<String, Value>>,
+) -> Result<()> {
+    for selector in capability
+        .selectors
+        .iter()
+        .filter(|selector| selector.location == "header")
+    {
+        let Some(value) = selectors.and_then(|values| values.get(&selector.name)) else {
+            if selector.required {
+                return Err(CloudflareError::MissingHeaderSelector(
+                    selector.name.clone(),
+                ));
+            }
+            continue;
+        };
+        if header_selector_is_reserved(&selector.name) {
+            return Err(CloudflareError::ReservedHeaderSelector(
+                selector.name.clone(),
+            ));
+        }
+        let rendered = scalar(value)
+            .ok_or_else(|| CloudflareError::InvalidHeaderSelector(selector.name.clone()))?;
+        let name = HeaderName::from_bytes(selector.name.as_bytes())
+            .map_err(|_| CloudflareError::InvalidHeaderSelector(selector.name.clone()))?;
+        let value = HeaderValue::from_str(&rendered)
+            .map_err(|_| CloudflareError::InvalidHeaderSelector(selector.name.clone()))?;
+        headers.insert(name, value);
+    }
+    Ok(())
+}
+
+fn header_selector_is_reserved(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "host"
+            | "x-auth-email"
+            | "x-auth-key"
+            | "idempotency-key"
+            | "if-match"
+            | "if-none-match"
+            | "content-length"
+            | "accept-encoding"
+            | "transfer-encoding"
+            | "connection"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "expect"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

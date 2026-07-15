@@ -6,7 +6,7 @@ use cfctl_cloudflare::{
 };
 use cfctl_core::{
     CapabilityV1, CreatedCollectionResourceContractV1, CreatedResourceContractV1,
-    DeletedResourceContractV1, PlanStatus, PlanV1, SamePathReadContractV1,
+    DeletedResourceContractV1, PlanStatus, PlanV1, SamePathReadContractV1, SelectorV1,
     UpdatedResourceContractV1,
 };
 use serde_json::json;
@@ -49,6 +49,80 @@ fn request_builder_resolves_path_and_query_selectors_without_leaking_auth() {
             .get("if-none-match")
             .and_then(|value| value.to_str().ok()),
         Some("etag-1")
+    );
+}
+
+#[test]
+fn request_builder_sends_only_catalog_declared_header_selectors() {
+    let mut capability = CapabilityV1::new(
+        "r2-get-bucket",
+        "Get R2 bucket",
+        "GET",
+        "/accounts/{account_id}/r2/buckets/{bucket_name}",
+    );
+    capability.selectors = vec![SelectorV1 {
+        name: "cf-r2-jurisdiction".to_owned(),
+        location: "header".to_owned(),
+        required: false,
+        value_type: "string".to_owned(),
+        description: None,
+    }];
+    let request = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("valid base URL")
+        .build(
+            &capability,
+            &CallInput {
+                selectors: json!({
+                    "account_id":"account-1",
+                    "bucket_name":"bucket-1",
+                    "cf-r2-jurisdiction":"eu",
+                    "authorization":"must-not-be-forwarded"
+                }),
+                ..CallInput::default()
+            },
+        )
+        .expect("declared header should build");
+
+    assert_eq!(
+        request
+            .headers
+            .get("cf-r2-jurisdiction")
+            .and_then(|value| value.to_str().ok()),
+        Some("eu")
+    );
+    assert!(request.headers.get("authorization").is_none());
+}
+
+#[test]
+fn request_builder_rejects_missing_required_or_reserved_header_selectors() {
+    let mut capability = CapabilityV1::new("header-read", "Header read", "GET", "/header-read");
+    capability.selectors = vec![SelectorV1 {
+        name: "Tus-Resumable".to_owned(),
+        location: "header".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+    }];
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    let missing = builder
+        .build(&capability, &CallInput::default())
+        .expect_err("required header must fail closed");
+    assert!(
+        matches!(missing, CloudflareError::MissingHeaderSelector(name) if name == "Tus-Resumable")
+    );
+
+    capability.selectors[0].name = "Authorization".to_owned();
+    let reserved = builder
+        .build(
+            &capability,
+            &CallInput {
+                selectors: json!({"Authorization":"must-not-be-forwarded"}),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("auth headers must be reserved");
+    assert!(
+        matches!(reserved, CloudflareError::ReservedHeaderSelector(name) if name == "Authorization")
     );
 }
 

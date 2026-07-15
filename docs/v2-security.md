@@ -4,6 +4,7 @@
 - The emergency global-key profile is never selected implicitly.
 - Secret-shaped request bodies are accepted only through stdin, stored temporarily in the platform secret store, and represented in plans by a hash and opaque reference.
 - Secret-producing responses require `--value-out`; the destination must not exist and is created mode `0600` on Unix. Only a bare credential or a recognized secret field is accepted. Receipts retain safe resource metadata while replacing the value with `[SUNK]`.
+- Catalog-declared request header selectors are emitted only from the selected capability's selector object, which mutation plans hash-bind. Undeclared selector keys are ignored, required headers fail closed, invalid values are not echoed, and credential, host, idempotency, conditional, and hop-by-hop headers are reserved for governed runtime lanes rather than caller override.
 - Delegated subprocesses start with a cleared environment. cfctl restores only `PATH`, `HOME`, `NO_COLOR`, and the selected Cloudflare credential variables.
 - Evidence is redacted before it is content-addressed and written atomically. Presence of evidence is not proof that an operation was performed or verified.
 - Plans are one-use transactions. Their content, schema, account, targets, impact, policy, and approval are hash-bound.
