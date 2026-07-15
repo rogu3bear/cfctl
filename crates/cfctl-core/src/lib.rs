@@ -122,6 +122,33 @@ pub struct SelectorV1 {
     pub contract: Option<SelectorContractV1>,
 }
 
+#[must_use]
+pub fn request_header_is_reserved(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "host"
+            | "x-auth-email"
+            | "x-auth-key"
+            | "idempotency-key"
+            | "if-match"
+            | "if-none-match"
+            | "content-length"
+            | "accept-encoding"
+            | "transfer-encoding"
+            | "connection"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "expect"
+            | "r2-access-key-id"
+            | "r2-secret-access-key"
+    )
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BillingModelV1 {

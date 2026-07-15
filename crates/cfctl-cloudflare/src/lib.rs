@@ -7,7 +7,7 @@ use std::{
 };
 
 use cfctl_auth::AuthCredential;
-use cfctl_core::{CapabilityV1, PlanStatus, PlanV1, SelectorV1};
+use cfctl_core::{CapabilityV1, PlanStatus, PlanV1, SelectorV1, request_header_is_reserved};
 use chrono::DateTime;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,14 @@ pub enum CloudflareError {
     MissingHeaderSelector(String),
     #[error("selector `{0}` must be a string, number, or boolean")]
     InvalidSelector(String),
+    #[error(
+        "selector input must be an object of catalog-declared path, header, or target controls"
+    )]
+    InvalidSelectorObject,
+    #[error("selector `{0}` is not declared by the catalog capability or request path")]
+    UndeclaredSelector(String),
+    #[error("catalog selector `{name}` does not satisfy its pinned schema: {reason}")]
+    InvalidSelectorSchema { name: String, reason: String },
     #[error("query input must be an object of catalog-declared controls")]
     InvalidQueryObject,
     #[error("query control `{0}` is not declared by the catalog capability")]
@@ -212,7 +220,7 @@ fn add_declared_header_selectors(
             }
             continue;
         };
-        if header_selector_is_reserved(&selector.name) {
+        if request_header_is_reserved(&selector.name) {
             return Err(CloudflareError::ReservedHeaderSelector(
                 selector.name.clone(),
             ));
@@ -230,30 +238,6 @@ fn add_declared_header_selectors(
         headers.insert(name, value);
     }
     Ok(())
-}
-
-fn header_selector_is_reserved(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "authorization"
-            | "proxy-authorization"
-            | "cookie"
-            | "set-cookie"
-            | "host"
-            | "x-auth-email"
-            | "x-auth-key"
-            | "idempotency-key"
-            | "if-match"
-            | "if-none-match"
-            | "content-length"
-            | "accept-encoding"
-            | "transfer-encoding"
-            | "connection"
-            | "upgrade"
-            | "te"
-            | "trailer"
-            | "expect"
-    )
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2074,8 +2058,93 @@ fn is_delete_verifier(strategy: &str) -> bool {
 }
 
 pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    validate_selector_contract(capability, &input.selectors)?;
     validate_query_contract(capability, &input.query)?;
     validate_request_body(capability, input.body.as_ref())
+}
+
+fn validate_selector_contract(capability: &CapabilityV1, selectors: &Value) -> Result<()> {
+    let values = match selectors {
+        Value::Null => None,
+        Value::Object(values) => Some(values),
+        _ => return Err(CloudflareError::InvalidSelectorObject),
+    };
+    if let Some(values) = values {
+        for (name, value) in values {
+            let selector = capability
+                .selectors
+                .iter()
+                .find(|selector| selector.location != "query" && selector.name == *name);
+            let Some(selector) = selector else {
+                if path_declares_selector(&capability.path, name) {
+                    if scalar(value).is_none() {
+                        return Err(CloudflareError::InvalidSelector(name.clone()));
+                    }
+                    continue;
+                }
+                return Err(CloudflareError::UndeclaredSelector(name.clone()));
+            };
+            if selector.location == "header" && request_header_is_reserved(name) {
+                return Err(CloudflareError::ReservedHeaderSelector(name.clone()));
+            }
+            if scalar(value).is_none() {
+                return Err(CloudflareError::InvalidSelector(name.clone()));
+            }
+            let schema = selector.contract.as_ref().map(|contract| &contract.schema);
+            let Some(canonical) =
+                canonical_selector_value_for_schema(value, &selector.value_type, schema)
+            else {
+                return Err(CloudflareError::InvalidSelector(name.clone()));
+            };
+            if let Some(schema) = schema {
+                validate_request_schema_value(schema, &canonical, "", 0).map_err(|error| {
+                    let reason = match error {
+                        CloudflareError::InvalidRequestBody(reason) => reason,
+                        other => other.to_string(),
+                    };
+                    CloudflareError::InvalidSelectorSchema {
+                        name: name.clone(),
+                        reason,
+                    }
+                })?;
+            }
+        }
+    }
+    for selector in capability
+        .selectors
+        .iter()
+        .filter(|selector| selector.location != "query" && selector.required)
+    {
+        if values.is_none_or(|values| !values.contains_key(&selector.name)) {
+            return if selector.location == "header" {
+                Err(CloudflareError::MissingHeaderSelector(
+                    selector.name.clone(),
+                ))
+            } else {
+                Err(CloudflareError::MissingSelector(selector.name.clone()))
+            };
+        }
+    }
+    for name in path_selector_names(&capability.path) {
+        if values.is_none_or(|values| !values.contains_key(name)) {
+            return Err(CloudflareError::MissingSelector(name.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+fn path_selector_names(path: &str) -> impl Iterator<Item = &str> {
+    path.trim_start_matches('/')
+        .split('/')
+        .filter_map(|segment| {
+            segment
+                .strip_prefix('{')
+                .and_then(|segment| segment.strip_suffix('}'))
+        })
+}
+
+fn path_declares_selector(path: &str, name: &str) -> bool {
+    path_selector_names(path).any(|selector| selector == name)
 }
 
 fn validate_query_contract(capability: &CapabilityV1, query: &Value) -> Result<()> {
@@ -2158,10 +2227,10 @@ fn query_value_is_empty(value: &Value) -> bool {
 
 fn canonical_query_value(value: &Value, expected: &str, selector: &SelectorV1) -> Option<Value> {
     let schema = selector.contract.as_ref().map(|contract| &contract.schema);
-    canonical_query_value_for_schema(value, expected, schema)
+    canonical_selector_value_for_schema(value, expected, schema)
 }
 
-fn canonical_query_value_for_schema(
+fn canonical_selector_value_for_schema(
     value: &Value,
     expected: &str,
     schema: Option<&Value>,
@@ -2207,7 +2276,7 @@ fn canonical_query_value_for_schema(
             }
             values
                 .iter()
-                .map(|value| canonical_query_value_for_schema(value, item_type, item_schema))
+                .map(|value| canonical_selector_value_for_schema(value, item_type, item_schema))
                 .collect::<Option<Vec<_>>>()
                 .map(Value::Array)
         }

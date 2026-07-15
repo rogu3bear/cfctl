@@ -867,6 +867,31 @@ fn credential_returning_get_is_approval_gated_and_sink_only() {
 }
 
 #[test]
+fn required_credential_headers_block_dynamic_execution() {
+    let mut document = fixture();
+    document["paths"]["/accounts/{account_id}/logs/list"] = json!({
+        "get": {
+            "operationId": "logpull-list",
+            "summary": "List log files",
+            "parameters": [
+                {"in":"path", "name":"account_id", "required":true, "schema":{"type":"string"}},
+                {"in":"header", "name":"R2-Access-Key-Id", "required":true, "schema":{"type":"string"}},
+                {"in":"header", "name":"R2-Secret-Access-Key", "required":true, "schema":{"type":"string"}}
+            ]
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("catalog");
+    let capability = snapshot.get("logpull-list").expect("logpull capability");
+    assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+    let reason = capability
+        .blocked_reason
+        .as_deref()
+        .expect("blocked reason");
+    assert!(reason.contains("R2-Access-Key-Id") && reason.contains("credential"));
+}
+
+#[test]
 fn account_token_mutations_have_complete_native_execution_contracts() {
     let mut document = fixture();
     document["paths"]["/accounts/{account_id}/tokens"]["post"] = json!({

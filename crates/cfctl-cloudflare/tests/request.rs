@@ -413,8 +413,7 @@ fn request_builder_sends_only_catalog_declared_header_selectors() {
                 selectors: json!({
                     "account_id":"account-1",
                     "bucket_name":"bucket-1",
-                    "cf-r2-jurisdiction":"eu",
-                    "authorization":"must-not-be-forwarded"
+                    "cf-r2-jurisdiction":"eu"
                 }),
                 ..CallInput::default()
             },
@@ -428,8 +427,6 @@ fn request_builder_sends_only_catalog_declared_header_selectors() {
             .and_then(|value| value.to_str().ok()),
         Some("eu")
     );
-    assert!(request.headers.get("authorization").is_none());
-
     let error = RequestBuilder::new("https://api.cloudflare.com/client/v4")
         .expect("valid base URL")
         .build(
@@ -480,6 +477,103 @@ fn request_builder_rejects_missing_required_or_reserved_header_selectors() {
     assert!(
         matches!(reserved, CloudflareError::ReservedHeaderSelector(name) if name == "Authorization")
     );
+
+    capability.selectors[0].name = "R2-Secret-Access-Key".to_owned();
+    let reserved = builder
+        .build(
+            &capability,
+            &CallInput {
+                selectors: json!({"R2-Secret-Access-Key":"must-not-be-forwarded"}),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("schema-declared service credentials must remain in governed auth storage");
+    assert!(matches!(
+        reserved,
+        CloudflareError::ReservedHeaderSelector(name) if name == "R2-Secret-Access-Key"
+    ));
+}
+
+#[test]
+fn request_builder_rejects_undeclared_and_schema_invalid_selectors() {
+    let mut capability = CapabilityV1::new(
+        "version-get",
+        "Get version",
+        "GET",
+        "/accounts/{account_id}/versions/{version}",
+    );
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: json!({"type":"string", "minLength":1}),
+                query: None,
+            }),
+        },
+        SelectorV1 {
+            name: "version".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "integer".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: json!({"type":"integer", "minimum":1, "maximum":10}),
+                query: None,
+            }),
+        },
+        SelectorV1 {
+            name: "X-Mode".to_owned(),
+            location: "header".to_owned(),
+            required: false,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: json!({"type":"string", "enum":["safe","strict"]}),
+                query: None,
+            }),
+        },
+    ];
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+
+    let undeclared = builder
+        .build(
+            &capability,
+            &CallInput {
+                selectors: json!({"account_id":"a", "version":"1", "bypass":"true"}),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("undeclared selectors must not be ignored");
+    assert!(matches!(
+        undeclared,
+        CloudflareError::UndeclaredSelector(name) if name == "bypass"
+    ));
+
+    for (name, selectors) in [
+        ("version", json!({"account_id":"a", "version":"11"})),
+        (
+            "X-Mode",
+            json!({"account_id":"a", "version":"1", "X-Mode":"unsafe"}),
+        ),
+    ] {
+        let error = builder
+            .build(
+                &capability,
+                &CallInput {
+                    selectors,
+                    ..CallInput::default()
+                },
+            )
+            .expect_err("selector must satisfy its pinned schema");
+        assert!(matches!(
+            error,
+            CloudflareError::InvalidSelectorSchema { name: actual, .. } if actual == name
+        ));
+    }
 }
 
 #[test]

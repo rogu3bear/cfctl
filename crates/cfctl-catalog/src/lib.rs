@@ -11,6 +11,7 @@ use cfctl_core::{
     CreatedCollectionResourceContractV1, CreatedResourceContractV1, DeletedResourceContractV1,
     EffectClass, KnowledgeReferenceV1, Maturity, QuerySerializationV1, RiskClass,
     SamePathReadContractV1, SelectorContractV1, SelectorV1, UpdatedResourceContractV1, hash_value,
+    request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -892,6 +893,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
                 .unwrap_or_default();
             capability.maturity = maturity(operation_object);
             classify(&mut capability);
+            block_required_reserved_header_selectors(&mut capability);
             block_incomplete_dynamic_mutation(&mut capability);
             capabilities.insert(id, capability);
         }
@@ -2756,6 +2758,27 @@ fn is_workers_ai_model_run(capability: &CapabilityV1) -> bool {
             .permissions
             .iter()
             .any(|permission| permission == "Workers AI Read")
+}
+
+fn block_required_reserved_header_selectors(capability: &mut CapabilityV1) {
+    let reserved = capability
+        .selectors
+        .iter()
+        .filter(|selector| {
+            selector.location == "header"
+                && selector.required
+                && request_header_is_reserved(&selector.name)
+        })
+        .map(|selector| selector.name.clone())
+        .collect::<Vec<_>>();
+    if reserved.is_empty() {
+        return;
+    }
+    capability.adapter_status = AdapterStatus::Blocked;
+    capability.blocked_reason = Some(format!(
+        "required credential or transport header selector(s) are reserved for governed runtime handling: {}",
+        reserved.join(", ")
+    ));
 }
 
 fn classify_workers_ai_model_run(capability: &mut CapabilityV1) {
