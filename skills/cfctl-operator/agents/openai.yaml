@@ -1,0 +1,4 @@
+interface:
+  display_name: "cfctl Operator"
+  short_description: "Governed Cloudflare execution and verification"
+  default_prompt: "Use $cfctl-operator to choose and execute the safest Cloudflare path with evidence."

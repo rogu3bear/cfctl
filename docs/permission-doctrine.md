@@ -24,23 +24,31 @@ explicit local credentials.
 
 Required local environment inputs:
 
-- `CF_DEV_TOKEN`: a scoped day-to-day operator token, not the bootstrap creator.
-- `CLOUDFLARE_ACCOUNT_ID`: the account pinned for live contract verification.
-- `CFCTL_PUBLIC_CONTRACT_ZONE`: a disposable zone or zone name used only for
-  contract smoke tests.
+- `CFCTL_PUBLIC_CONTRACT_ACCOUNT_ID`: the account pinned on the selected
+  profile.
+- `CFCTL_PUBLIC_CONTRACT_PROFILE`: an already selected, credentialed profile
+  with account-token administration permission.
+- `CFCTL_PUBLIC_CONTRACT_PERMISSION_GROUP_ID`: a low-risk read permission from
+  the live account permission-group inventory.
+- `CFCTL_PUBLIC_CONTRACT_CONFIRM=mint-rotate-revoke-disposable-token`: explicit
+  acknowledgement of the reviewed lifecycle smoke.
 
-`CFCTL_PUBLIC_CONTRACT_ZONE` must be visible to the active token lane. Set
-`CF_TOKEN_LANE` explicitly when the default lane does not own the smoke zone,
-for example:
+The smoke creates a one-hour, account-scoped token, writes its value only to a
+mode-0600 temporary sink, rolls the value, revokes the token, and requires a
+live not-found verification before success:
 
 ```bash
-CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_public_contract.sh
+CFCTL_PUBLIC_CONTRACT_ACCOUNT_ID=<account-id> \
+CFCTL_PUBLIC_CONTRACT_PROFILE=<selected-profile> \
+CFCTL_PUBLIC_CONTRACT_PERMISSION_GROUP_ID=<read-permission-group-id> \
+CFCTL_PUBLIC_CONTRACT_CONFIRM=mint-rotate-revoke-disposable-token \
+./scripts/verify_public_contract.sh
 ```
 
 Do not add hosted scheduled jobs or protected-environment live checks without
-an explicit operator decision. Local smoke checks leave evidence in this
-checkout under `var/` and use the same `cfctl` lane and preview/ack rules as
-normal operator work.
+an explicit operator decision. Local smoke checks use normal cfctl profiles,
+hash-bound plans, exact operation approval, secret sinks, and content-addressed
+evidence.
 
 ## Bootstrap Creator
 
@@ -99,7 +107,9 @@ Maximum TTLs are catalog-enforced:
   and document why the broad profile was required.
 - Tokens must be delivered through `--value-out <absolute-path>` and never
   copied from stdout.
-- Token minting must use `--plan`, then `--ack-plan <operation-id>`.
+- Token minting, rotation, and revocation must create a plan, then use
+  `cfctl plans approve <operation-id> --yes` and
+  `cfctl plans run <operation-id>`.
 - Live mutation evidence must include preview, apply, and verification
   artifacts when those paths exist.
 
@@ -107,9 +117,7 @@ Maximum TTLs are catalog-enforced:
 
 Before merging permission or live-contract changes:
 
-- `./scripts/verify_static_contract.sh`
-- `python3 scripts/verify_permission_catalog.py`
-- `python3 scripts/verify_permission_catalog.py --cfctl ./cfctl`
-- `python3 scripts/verify_permission_catalog.py --permission-groups <live-artifact>`
-- Optional local live-contract smoke with explicit local inputs, for example
-  `CF_TOKEN_LANE=global CFCTL_PUBLIC_CONTRACT_ZONE=example.com ./scripts/verify_public_contract.sh`.
+- `cargo xtask verify`
+- `cfctl keys permissions --account <account-id> --json`
+- Optional local live-contract smoke with the four explicit
+  `CFCTL_PUBLIC_CONTRACT_*` inputs documented above.

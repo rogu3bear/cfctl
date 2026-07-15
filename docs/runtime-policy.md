@@ -1,111 +1,68 @@
-# Runtime Policy
+# cfctl v2 runtime policy
 
-This runtime is hardened around one public contract: `cfctl`.
+The policy engine, never an agent, classifies a plan as `auto_execute`,
+`approval_required`, or `blocked`.
 
-## Landing Flow
+## Automatic execution
 
-Arriving agents should use this order:
+Automatic execution is limited to operations with all of these properties:
 
-```bash
-cfctl doctor
-cfctl surfaces
-cfctl docs
-cfctl standards audit
-cfctl standards <surface>
-cfctl explain <surface>
-cfctl classify <surface> <operation>
-cfctl guide <surface> <operation>
-```
+- known semantics and exact selectors
+- one scoped target
+- reversible behavior
+- no dependent configuration or dirty overlap
+- no external communication or identity effect
+- no ownership, security, registrar, or billing effect
+- no incremental or unknown cost
 
-For unfamiliar or non-trivial writes:
+## Approval
 
-```bash
-cfctl guide <surface> <operation> ...
-```
-
-## Write Policy
-
-- Mutation backends are backend-only by default.
-- Public writes go through `cfctl apply ...`.
-- Preview-required operations must run with `--plan` first.
-- The reviewed preview emits an `operation_id`.
-- The real mutation must repeat the command with `--ack-plan <operation-id>`.
-- Use `cfctl previews` to inspect preview receipts, `cfctl previews purge-expired` to remove expired ones, `cfctl previews purge-inactive-legacy` to remove only legacy receipts without complete trust metadata, and `cfctl previews purge-duplicate-active` to remove older trusted active receipts only when a newer receipt exists for the same lane, target, request, and policy.
-- Use `cfctl locks` to inspect write locks and `cfctl locks clear-stale` to remove only stale/orphaned locks.
-- Destructive paths still require explicit confirmation such as `--confirm delete`.
-
-## Secret Policy
-
-- Runtime artifacts and backend artifacts are redacted by default.
-- `cfctl env run` strips parent lane secrets, exports only the selected lane's
-  tool auth env to the child, and records command argv as evidence. Do not pass
-  secrets as command args.
-- `cfctl token mint` does not print the token secret by default.
-- For real token delivery, prefer:
+All other executable writes require a reviewed `PlanV1` and this exact
+mutation:
 
 ```bash
-cfctl token mint ... --value-out <secure-path>
+cfctl plans approve <operation-id> --yes
 ```
 
-Stdout reveal stays disabled unless runtime policy explicitly allows it.
+Paid plans also require `--max-cost CURRENCY:AMOUNT`. Unknown cost is blocked.
+Approval binds the operation ID, account, catalog hash, permission lane,
+selectors, request body hash, workspace graph, source-config hashes, local and
+Cloudflare diffs, cost, verification, compensation, and non-reversible
+warnings. It expires within 24 hours and any relevant drift invalidates it.
 
-`cfctl token revoke` uses the same preview gate before deleting an account-owned
-API token. Plan with the token id first, then ack the reviewed operation and pass
-`--confirm delete`:
+The plan is durably consumed before cfctl crosses the API, subprocess, or UI
+boundary. A crash after consumption cannot automatically replay the action.
+Crash-stale local locks expire after 15 minutes; nonce ownership prevents an
+older process from deleting a newer lock.
 
-```bash
-cfctl token revoke --id <token-id> --plan
-cfctl token revoke --id <token-id> --ack-plan <operation-id> --confirm delete
-```
+## Always approval-required
 
-## Backend Policy
+- deletes and purges
+- security, identity, access, or ownership changes
+- external sends
+- multi-resource or cross-repository changes
+- registrar and billing actions
+- irreversible data mutations
+- paid actions
+- unknown write semantics or risk
 
-- `scripts/cf_mutate_*`, `scripts/cf_api_apply.sh`, and `scripts/cf_token_mint.sh` are backend-only.
-- Direct maintainer/debug use requires:
+## Secrets
 
-```bash
-AUTH_PATH="$(cfctl admin authorize-backend --backend scripts/cf_api_apply.sh --reason 'maintainer debug' | jq -r '.result.authorization_path')"
-CF_BACKEND_BYPASS_FILE="$AUTH_PATH" ./scripts/cf_api_apply.sh
-```
+Credential material lives only in Keychain on macOS or Secret Service on
+Linux. Secret request fields enter through stdin and become opaque references.
+Secret results require `--value-out`, which must not exist and is created mode
+0600. Arguments, stdout, plans, logs, evidence, and delegated subprocess
+receipts are redacted.
 
-- Read-only inventory scripts remain callable, but they are still backend surfaces rather than the public UX.
+## Adapter boundary
 
-## Trust Checks
+Catalog status selects one adapter: `native`, `dynamic_api`, `delegated_cli`,
+`governed_ui`, or `blocked`. Delegated processes receive only the selected
+credential. UI actions are target/account-bound evidence and preserve the same
+approval policy. Model output and adapter selection grant no authority.
 
-Use:
+## Evidence
 
-```bash
-cfctl doctor
-cfctl doctor --strict
-cfctl doctor --repair-hints
-cfctl audit trust
-```
-
-to verify:
-
-- default-lane health, including active API-token status and pinned-account access
-- backend-guard coverage
-- artifact secret scan
-- runtime policy shape
-- preview receipt health
-- lock health
-- backend authorization health
-
-`cfctl audit trust` is an alias for `cfctl doctor`.
-
-Doctor keeps three health dimensions separate:
-
-- `safety`: the default day-to-day lane, backend guards, secret scans and sinks,
-  registry policy, and legacy bypass state. Any blocker makes the runtime
-  `unsafe`. A healthy emergency lane never masks an unhealthy default lane.
-- `readiness`: active operational blockers. Stale or orphaned locks make the
-  runtime `degraded`; `doctor --strict` fails until they are resolved.
-- `hygiene`: expired previews, legacy preview receipts, expired backend
-  authorizations, credential-source drift, and stray repo env files. These are
-  maintenance findings, remain visible in normal and strict output, and do not
-  independently make a safe, ready runtime fail.
-
-For API-token lanes, an HTTP-success response is insufficient: the token
-response must report `result.status: active`. When an account is pinned, the
-account read must also succeed. `result.lanes.summary` records the default lane,
-its exact health status, and any healthy emergency lanes separately.
+Evidence is local, redacted, and content-addressed. Telemetry is off. A receipt
+may be attached elsewhere only through an explicit operator action. Presence
+of an artifact does not mean an action was performed or verified.

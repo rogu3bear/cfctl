@@ -1,0 +1,23 @@
+# ADR 0001: Rust v2 clean break
+
+- Status: accepted
+- Date: 2026-07-14
+
+## Context
+
+The v1 shell runtime accumulated a broad public command surface, backend scripts, and environment-file authentication. That shape cannot provide a stable typed API, crash-safe transactions, platform credential storage, or a complete schema-derived Cloudflare catalog without continuing to multiply parsing and safety paths.
+
+The checkout was already dirty when this work began. Those changes are source intent and must not be reset, stashed, or silently replaced.
+
+## Decision
+
+`cfctl` v2 is a clean public CLI break implemented as a Rust workspace. The versioned public types are `CapabilityV1`, `PlanV1`, `PolicyDecisionV1`, `AgentActionV1`, `EvidenceV1`, and `ResultEnvelopeV2`. Shell scripts are not a public extension surface. Wrangler and cloudflared remain governed subprocess adapters behind catalog capabilities.
+
+Existing desired state and non-secret evidence are imported only by `cfctl migrate v1`. Credentials are never migrated implicitly. The current v1 launcher and its referenced runtime files are retained in a local, non-release archive for one stable v2 release.
+
+## Consequences
+
+- Existing scripts must move to deterministic v2 commands or explicitly invoke the private compatibility archive.
+- The source launcher may build the Rust binary for contributors, but installed releases contain only the native executable.
+- Catalog and evidence SQLite files are rebuildable indexes; JSON artifacts remain authoritative.
+- The cutover is incomplete until the v2 proof lane and public-contract checks pass.

@@ -1,0 +1,14 @@
+:root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; background: #0a0b0f; color: #f4f1ea; }
+body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 80% 10%, #4a2419 0, transparent 32rem), #0a0b0f; }
+main { width: min(70rem, calc(100% - 3rem)); margin: 0 auto; padding: 10vh 0 5rem; }
+h1 { max-width: 16ch; font-size: clamp(3rem, 8vw, 7rem); line-height: .92; letter-spacing: -.06em; margin: .25em 0; }
+h2 { font-size: 1.1rem; }
+p, .lede { color: #c9c5bb; line-height: 1.65; }
+.lede { max-width: 48rem; font-size: 1.3rem; }
+.eyebrow { color: #f6821f; text-transform: uppercase; letter-spacing: .12em; font-size: .78rem; font-weight: 700; }
+pre { overflow: auto; border: 1px solid #393832; border-radius: .8rem; padding: 1.2rem; background: #111216; color: #ffd7b0; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 1rem; margin: 4rem 0; }
+.grid section { border-top: 1px solid #4a4840; padding-top: 1rem; }
+a { color: #ff9a45; }
+button { border: 0; border-radius: 999px; padding: .8rem 1.2rem; font: inherit; font-weight: 700; background: #f6821f; color: #16100a; }
+footer { display: flex; gap: 1.5rem; width: min(70rem, calc(100% - 3rem)); margin: 0 auto; padding: 2rem 0; border-top: 1px solid #242529; }

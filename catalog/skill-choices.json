@@ -1,0 +1,334 @@
+{
+  "schema_version": 1,
+  "kind": "SKILL_CHOICE_POLICY",
+  "score": {
+    "scale": "0-100",
+    "weights": {
+      "exactness": 20,
+      "safety": 25,
+      "verification": 20,
+      "coverage": 15,
+      "latency_efficiency": 5,
+      "cost_efficiency": 5,
+      "maturity": 10
+    },
+    "tie_break": [
+      "eligibility",
+      "executable",
+      "score",
+      "priority",
+      "adapter_id"
+    ],
+    "note": "Policy metrics are declared routing inputs, not observed success claims. Observed outcomes are computed only from SKILL_OUTCOME artifacts."
+  },
+  "risk_classes": [
+    "read",
+    "write",
+    "destructive",
+    "secret_sensitive",
+    "external_communication",
+    "spend"
+  ],
+  "global_controls": {
+    "authority_granted_by_choice": false,
+    "preview_bypass_allowed": false,
+    "external_confirmation_bypass_allowed": false,
+    "mutation_controls": [
+      "live_read_before_write",
+      "preview_ack_for_cloudflare_mutation",
+      "explicit_confirmation_when_required",
+      "post_change_verification",
+      "evidence_artifact"
+    ],
+    "memory_is_evidence": false
+  },
+  "adapters": [
+    {
+      "id": "cfctl-native",
+      "label": "cfctl native runtime",
+      "priority": 100,
+      "execution_mode": "public_command",
+      "invocation": "cfctl <verb> <surface> ...",
+      "availability": {
+        "kind": "built_in",
+        "check": "cfctl help"
+      },
+      "allowed_risks": [
+        "read",
+        "write",
+        "destructive",
+        "secret_sensitive"
+      ],
+      "capabilities": [
+        "catalogued_api",
+        "live_read",
+        "source_config",
+        "desired_state",
+        "preview_apply",
+        "verification",
+        "incident",
+        "token_lifecycle"
+      ],
+      "policy_metrics": {
+        "exactness": 100,
+        "safety": 100,
+        "verification": 100,
+        "coverage": 75,
+        "latency_efficiency": 90,
+        "cost_efficiency": 100,
+        "maturity": 95
+      },
+      "required_controls": [
+        "catalog_policy",
+        "least_privilege_lane"
+      ],
+      "evidence_contract": [
+        "runtime_result",
+        "backend_artifact_when_applicable",
+        "verification_result"
+      ],
+      "fallbacks": [
+        "cloudflare-api-mcp",
+        "cfctl-wrangler",
+        "cfctl-cloudflared",
+        "browser-run",
+        "computer-use"
+      ]
+    },
+    {
+      "id": "cloudflare-api-mcp",
+      "label": "Cloudflare API MCP and Code Mode",
+      "priority": 90,
+      "execution_mode": "dynamic_api_discovery",
+      "invocation": "Use Cloudflare API MCP search and allowed reads; extend cfctl with an operation-specific preview and verification contract before any write.",
+      "availability": {
+        "kind": "declared_by_caller",
+        "check": "Cloudflare API MCP tools are present in the active agent session"
+      },
+      "allowed_risks": [
+        "read"
+      ],
+      "capabilities": [
+        "dynamic_api",
+        "uncatalogued_api",
+        "catalogued_api",
+        "live_read",
+        "verification",
+        "api_discovery"
+      ],
+      "policy_metrics": {
+        "exactness": 94,
+        "safety": 80,
+        "verification": 85,
+        "coverage": 100,
+        "latency_efficiency": 88,
+        "cost_efficiency": 90,
+        "maturity": 78
+      },
+      "required_controls": [
+        "endpoint_schema_discovery",
+        "least_privilege_lane"
+      ],
+      "evidence_contract": [
+        "endpoint_and_schema_reference",
+        "redacted_request_summary",
+        "cloudflare_response_envelope",
+        "verification_result"
+      ],
+      "fallbacks": [
+        "cfctl-native",
+        "browser-run",
+        "computer-use"
+      ]
+    },
+    {
+      "id": "cfctl-wrangler",
+      "label": "Wrangler through cfctl",
+      "priority": 80,
+      "execution_mode": "wrapped_cli",
+      "invocation": "cfctl wrangler <args>",
+      "availability": {
+        "kind": "declared_by_caller",
+        "check": "cfctl wrangler --version"
+      },
+      "allowed_risks": [
+        "read",
+        "write",
+        "destructive",
+        "secret_sensitive"
+      ],
+      "capabilities": [
+        "worker_tooling",
+        "workers_deploy",
+        "developer_platform",
+        "tail_logs",
+        "verification"
+      ],
+      "policy_metrics": {
+        "exactness": 92,
+        "safety": 90,
+        "verification": 85,
+        "coverage": 88,
+        "latency_efficiency": 92,
+        "cost_efficiency": 98,
+        "maturity": 95
+      },
+      "required_controls": [
+        "wrapped_cli_only"
+      ],
+      "evidence_contract": [
+        "redacted_argv",
+        "wrapper_log",
+        "runtime_result"
+      ],
+      "fallbacks": [
+        "cfctl-native",
+        "cloudflare-api-mcp"
+      ]
+    },
+    {
+      "id": "cfctl-cloudflared",
+      "label": "cloudflared through cfctl",
+      "priority": 70,
+      "execution_mode": "wrapped_cli",
+      "invocation": "cfctl cloudflared <args>",
+      "availability": {
+        "kind": "declared_by_caller",
+        "check": "cfctl cloudflared version"
+      },
+      "allowed_risks": [
+        "read",
+        "write",
+        "destructive",
+        "secret_sensitive"
+      ],
+      "capabilities": [
+        "tunnel_connectivity",
+        "local_ingress",
+        "network_runtime",
+        "verification"
+      ],
+      "policy_metrics": {
+        "exactness": 94,
+        "safety": 90,
+        "verification": 88,
+        "coverage": 65,
+        "latency_efficiency": 95,
+        "cost_efficiency": 98,
+        "maturity": 96
+      },
+      "required_controls": [
+        "wrapped_cli_only"
+      ],
+      "evidence_contract": [
+        "redacted_argv",
+        "wrapper_log",
+        "runtime_result"
+      ],
+      "fallbacks": [
+        "cfctl-native",
+        "cloudflare-api-mcp"
+      ]
+    },
+    {
+      "id": "browser-run",
+      "label": "Purpose-built browser automation",
+      "priority": 60,
+      "execution_mode": "browser_automation",
+      "invocation": "Use a purpose-built Browser Run or browser connector through the active agent session.",
+      "availability": {
+        "kind": "declared_by_caller",
+        "check": "A purpose-built browser automation tool is present in the active agent session"
+      },
+      "allowed_risks": [
+        "read",
+        "write",
+        "destructive",
+        "external_communication",
+        "spend"
+      ],
+      "capabilities": [
+        "browser",
+        "web_ui",
+        "rendered_state",
+        "session_state",
+        "verification"
+      ],
+      "policy_metrics": {
+        "exactness": 82,
+        "safety": 78,
+        "verification": 82,
+        "coverage": 85,
+        "latency_efficiency": 62,
+        "cost_efficiency": 70,
+        "maturity": 76
+      },
+      "required_controls": [
+        "bounded_browser_scope",
+        "external_side_effect_confirmation"
+      ],
+      "evidence_contract": [
+        "page_identity",
+        "before_state",
+        "action_receipt",
+        "after_state"
+      ],
+      "fallbacks": [
+        "computer-use",
+        "cloudflare-api-mcp"
+      ]
+    },
+    {
+      "id": "computer-use",
+      "label": "Computer Use UI fallback",
+      "priority": 50,
+      "execution_mode": "native_ui_fallback",
+      "invocation": "Use Computer Use in the active signed-in app or browser session only after purpose-built interfaces are insufficient.",
+      "availability": {
+        "kind": "declared_by_caller",
+        "check": "Computer Use is present in the active agent session"
+      },
+      "allowed_risks": [
+        "read",
+        "write",
+        "destructive",
+        "secret_sensitive",
+        "external_communication",
+        "spend"
+      ],
+      "capabilities": [
+        "native_ui",
+        "browser",
+        "web_ui",
+        "dashboard_only",
+        "signed_in_session",
+        "verification"
+      ],
+      "policy_metrics": {
+        "exactness": 72,
+        "safety": 68,
+        "verification": 75,
+        "coverage": 95,
+        "latency_efficiency": 42,
+        "cost_efficiency": 55,
+        "maturity": 72
+      },
+      "required_controls": [
+        "ui_fallback_only",
+        "bounded_ui_scope",
+        "external_side_effect_confirmation"
+      ],
+      "evidence_contract": [
+        "window_or_page_identity",
+        "before_state",
+        "action_receipt",
+        "after_state"
+      ],
+      "fallbacks": [
+        "browser-run",
+        "cloudflare-api-mcp",
+        "cfctl-native"
+      ]
+    }
+  ]
+}

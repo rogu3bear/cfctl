@@ -41,6 +41,10 @@ Usage:
   cfctl lanes
   cfctl surfaces
   cfctl docs [topic]
+  cfctl skills list
+  cfctl skills choose --intent <text> [--risk <class>] [--need <capability>] [--available <adapter>]
+  cfctl skills record --choice-id <id> --adapter <id> --outcome verified|failed|fallback|abandoned --duration-ms <n> [--evidence <path> --evidence-class <class>]
+  cfctl skills metrics
   cfctl standards [surface]
   cfctl standards audit [root]
   cfctl previews
@@ -81,6 +85,7 @@ Verb intent:
   lanes     Show configured auth lanes and whether they work.
   surfaces  List supported surfaces with read/write support, lane fit, and desired-state support.
   docs      Show the compact official Cloudflare docs bank and tracked incoming capabilities.
+  skills    Select an execution adapter with a SKILL_CHOICE receipt and report observed outcome metrics.
   standards Show the canonical configuration standards for this runtime, one surface, or a workspace audit.
   previews  Inspect actionable, legacy, and duplicate preview receipts, and purge safe local preview artifacts.
   locks     Inspect write locks and clear stale ones.
@@ -118,6 +123,10 @@ Examples:
   cfctl docs
   cfctl docs watch
   cfctl docs ai-search
+  cfctl skills list
+  cfctl skills choose --intent "Read a live Cloudflare resource" --risk read --need live_read --need verification
+  cfctl skills choose --intent "Inspect a dashboard-only setting" --risk read --need native_ui --available computer-use
+  cfctl skills metrics
   cfctl standards dns.record
   cfctl standards worker.runtime
   cfctl standards audit
@@ -5837,6 +5846,117 @@ EOF
   esac
 }
 
+cfctl_handle_skills() {
+  local subcommand="${1:-list}"
+  local engine="${CF_REPO_ROOT}/scripts/cf_skill_choice.py"
+  local catalog="${CF_REPO_ROOT}/catalog/skill-choices.json"
+  local runtime_dir="${CF_REPO_ROOT}/var/inventory/runtime"
+  local engine_json
+  local engine_status=0
+  local result_json
+  local summary_json
+  local performed="false"
+  local verification_json='{"state":"not_applicable"}'
+
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+
+  case "${subcommand}" in
+    list|choose)
+      set +e
+      engine_json="$(python3 "${engine}" --catalog "${catalog}" "${subcommand}" "$@")"
+      engine_status=$?
+      set -e
+      ;;
+    record)
+      set +e
+      engine_json="$(python3 "${engine}" --catalog "${catalog}" record --runtime-dir "${runtime_dir}" "$@")"
+      engine_status=$?
+      set -e
+      performed="true"
+      verification_json='{"state":"passed","basis":"choice_artifact_and_evidence_validation"}'
+      ;;
+    metrics)
+      if [[ "$#" -ne 0 ]]; then
+        engine_json='{"ok":false,"error":"skills metrics does not accept arguments"}'
+        engine_status=2
+      else
+        set +e
+        engine_json="$(python3 "${engine}" --catalog "${catalog}" metrics --runtime-dir "${runtime_dir}")"
+        engine_status=$?
+        set -e
+      fi
+      ;;
+    ""|-h|--help|help)
+      cat <<'EOF'
+Usage:
+  cfctl skills list
+  cfctl skills choose --intent <text> [--risk <class>] [--need <capability>] [--available <adapter>] [--surface <surface>]
+  cfctl skills record --choice-id <id> --adapter <id> --outcome verified|failed|fallback|abandoned --duration-ms <n> [--evidence <path> --evidence-class <class>]
+  cfctl skills metrics
+
+SKILL_CHOICE selects an execution adapter; it never grants authority or bypasses
+preview, explicit confirmation, evidence, or post-change verification controls.
+Raw intent text is hashed and omitted from the persisted runtime receipt.
+EOF
+      return 0
+      ;;
+    *)
+      engine_json="$(jq -n --arg error "Unknown skills subcommand: ${subcommand}" '{ok:false,error:$error}')"
+      engine_status=2
+      ;;
+  esac
+
+  if [[ "${engine_status}" -ne 0 ]] || [[ "$(jq -r '.ok // false' <<< "${engine_json:-null}" 2>/dev/null)" != "true" ]]; then
+    local error_message
+    error_message="$(jq -r '.error // "skill choice engine failed"' <<< "${engine_json:-null}" 2>/dev/null || echo "skill choice engine failed")"
+    cfctl_emit_failure \
+      "skills" \
+      "runtime" \
+      "skill_choice" \
+      '{"state":"not_applicable","basis":"local_policy_engine","errors":[],"request":null,"status_code":null,"permission_family":"local runtime"}' \
+      "invalid_skill_choice_request" \
+      "${error_message}" \
+      "${subcommand}"
+    return 1
+  fi
+
+  result_json="$(jq -c '.result' <<< "${engine_json}")"
+  summary_json="$(
+    jq -c \
+      --arg operation "${subcommand}" \
+      '
+        if .kind == "SKILL_CATALOG" then
+          {operation: $operation, kind, adapter_count: (.adapters | length), metric_class: "declared_policy"}
+        elif .kind == "SKILL_CHOICE" then
+          {operation: $operation, kind, choice_id, status: .decision.status, adapter_id: .decision.adapter_id, executable: .decision.executable, metric_class: .policy.metric_class}
+        elif .kind == "SKILL_OUTCOME" then
+          {operation: $operation, kind, choice_id, adapter_id, outcome, duration_ms}
+        elif .kind == "SKILL_METRICS" then
+          {operation: $operation, kind, adapter_count: (.adapters | length), metric_class}
+        else
+          {operation: $operation, kind: (.kind // "unknown")}
+        end
+      ' <<< "${result_json}"
+  )"
+
+  cfctl_emit_result \
+    "true" \
+    "skills" \
+    "runtime" \
+    "skill_choice" \
+    "${performed}" \
+    '{"state":"not_applicable","basis":"local_policy_engine","errors":[],"request":null,"status_code":null,"permission_family":"local runtime"}' \
+    "${verification_json}" \
+    "${summary_json}" \
+    "${result_json}" \
+    "" \
+    "" \
+    "" \
+    "${subcommand}"
+}
+
 cfctl_handle_admin() {
   local subcommand="${1:-}"
 
@@ -6053,6 +6173,9 @@ cfctl_main() {
       fi
       cfctl_parse_flags "$@"
       cfctl_handle_docs "${docs_topic}"
+      ;;
+    skills)
+      cfctl_handle_skills "$@"
       ;;
     standards)
       local standards_arg="${1:-}"

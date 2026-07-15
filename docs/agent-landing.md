@@ -1,178 +1,109 @@
-# Agent Landing
+# Agent landing: cfctl v2
 
-When an agent lands in this directory, the default posture is:
+`cfctl` is the one public Cloudflare control plane. It catalogs current
+Cloudflare APIs, official docs, Wrangler, cloudflared, and governed UI
+fallbacks without an MCP dependency.
 
-1. Load `CF_DEV_TOKEN` from `~/.config/cfctl/.env` or the `CF_SHARED_ENV_FILE` override.
-2. Run `cfctl doctor`.
-3. Use `cfctl` from `PATH` as the public interface. The local `./cfctl` is equivalent when standing in this directory.
-4. Read current state before writing.
-5. Classify writes before acting.
-6. Switch explicitly to `CF_TOKEN_LANE=global` only when the `dev` lane is blocked or you need the wider emergency surface.
-7. Leave behind runtime evidence in `var/inventory/runtime/` and backend evidence in `var/inventory/`.
-
-If you are embedding this runtime as a dedicated tool-facing sub-agent rather than a general repo assistant, use [CFCTL_PROMPT.md](CFCTL_PROMPT.md) as the strict command-bus prompt.
-
-## Decision Path
-
-Start by naming the job class:
-
-- Source-config audit:
-  run `cfctl standards audit <repo>` and the target repo's own Cloudflare contract checks. Treat the result as checked-in config truth only.
-- Live edge/account inspection:
-  run `cfctl list`, `cfctl get`, `cfctl snapshot`, `cfctl can`, or `cfctl verify` and cite the runtime artifact.
-- External command auth bridge:
-  run `cfctl env run --lane dev -- <command> [args...]` when another repo owns deploy semantics but `cfctl` owns Cloudflare credential hydration. Never pass secrets as command args because argv is recorded as evidence.
-- Public intake readiness:
-  run `cfctl form-intake verify --file state/form-intake/<name>.json` when the question is whether users can see a form, pass Turnstile, submit fields, receive a response, and leave storage/log evidence.
-- Mutation:
-  read state, scan the generated matrix in [docs/capabilities.md](capabilities.md), load standards, classify, guide, preview with `--plan`, apply with `--ack-plan <operation-id>`, then verify.
-- Runtime development:
-  change `cfctl`, catalogs, docs, and contract checks together; do not document a public capability before it exists in the catalog and command surface.
-- Unsafe safety:
-  run `cfctl doctor --repair-hints` and `cfctl lanes`; restore the default
-  `dev` lane or the named trust blocker before new writes. A healthy `global`
-  lane is recovery capacity, not a green default-lane result.
-- Blocked readiness:
-  inspect locks and clear only entries proven stale or orphaned.
-- Hygiene attention:
-  inspect previews, authorizations, and env-source findings, then use only the
-  scoped cleanup command. Hygiene findings stay visible but do not by themselves
-  make safe, ready trust fail.
-
-Do not turn a source-config audit into a live Cloudflare claim. If the question is about what users see at the edge, take a live read.
-
-## First Commands
+## Orient
 
 ```bash
-cfctl doctor
-cfctl surfaces
-cfctl explain surfaces
-cfctl docs
-cfctl docs watch
-cfctl standards audit
-cfctl standards dns.record
-cfctl standards edge.certificate
-cfctl standards worker.errors
-cfctl standards worker.runtime
-cfctl wrangler --version
-cfctl cloudflared version
-cfctl env run --lane dev -- env
-cfctl explain access.app
-cfctl list access.login_method
-cfctl list access.idp
-cfctl audit access
-cfctl audit state
-cfctl classify tunnel create
-cfctl guide access.login_method set --provider-type onetimepin
-CF_TOKEN_LANE=global cfctl can dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --all-lanes
-cfctl snapshot tunnel
-cfctl list pages.project
-cfctl list edge.certificate --zone example.com
-cfctl get access.app --domain docs.example.org
-cfctl hostname verify --file state/hostname/example.yaml
-cfctl maildesk-cf verify --file state/maildesk-cf/example.json
-cfctl form-intake verify --file state/form-intake/example.json
-CF_TOKEN_LANE=global cfctl diff dns.record --zone example.com
-./scripts/cf_compare_token_coverage.sh
-./scripts/cf_auth_check.sh
-CF_TOKEN_LANE=global ./scripts/cf_auth_check.sh
+cfctl doctor --json
+cfctl catalog sync --json
+cfctl catalog coverage --json
+cfctl agents doctor --json
 ```
 
-For a single read-only orientation pass:
+Search before acting:
 
 ```bash
-./scripts/cf_agent_bootstrap.sh
+cfctl catalog search "inspect production Worker routes" --json
+cfctl catalog show <capability-id> --json
+cfctl guide <capability-id> --json
 ```
 
-For writes, start with a dry run:
+The generated guide always covers 15 stages: discover, authenticate, select
+account, check entitlement, inspect current state, load standards, map
+dependencies, calculate cost, build plan, request approval if needed, acquire
+locks, execute, verify, rectify, and close with evidence.
+
+## Deterministic execution
+
+Use `cfctl call` with the selectors declared by the capability:
 
 ```bash
-cfctl guide access.app update --id <app-id> --body-file app.json
-cfctl apply access.app update --id <app-id> --body-file app.json --plan
-cfctl apply access.policy create --app-id <app-id> --body-file policy.json --plan
-CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-type onetimepin --plan
-cfctl apply access.idp create --type onetimepin --plan
-cfctl apply access.idp delete --type onetimepin --confirm delete --plan
-cfctl apply access.group create --body-file group.json --plan
-cfctl apply access.organization set-session-duration --content 24h --plan
-cfctl apply tunnel create --body '{"name":"example","config_src":"cloudflare"}' --plan
-CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --plan
-CF_TOKEN_LANE=global cfctl apply zone.setting set --zone example.com --name ssl --content strict --plan
-CF_TOKEN_LANE=global cfctl apply dns.record sync --zone example.com --plan
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
-cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
+cfctl call zones-list-zones --query name=example.com --json
+cfctl call dns-records-for-a-zone-list-dns-records \
+  --selector zone_id=<zone-id> --json
 ```
 
-For hostname cutovers, use the composite read path before planning component writes:
+Reads emit redacted live-read evidence. Writes emit `PlanV1` first. Review the
+plan, then use the exact ID:
 
 ```bash
-cfctl hostname verify --file state/hostname/example.yaml
-cfctl hostname plan --file state/hostname/example.yaml
+cfctl plans approve <operation-id> --yes --json
+cfctl plans run <operation-id> --json
+cfctl plans status <operation-id> --json
 ```
 
-For maildesk-cf deployments, use the composite read path before planning
-component writes:
+Paid work also requires `--max-cost CURRENCY:AMOUNT`; unknown cost is blocked.
+Plans expire within 24 hours, approvals are invalidated by relevant drift, and
+consumed plans cannot be replayed after a crash.
+
+## Workspace impact
+
+Discovery never escapes registered boundaries:
 
 ```bash
-cfctl maildesk-cf verify --file state/maildesk-cf/example.json
-cfctl maildesk-cf diff --file state/maildesk-cf/example.json
-cfctl maildesk-cf provision --file state/maildesk-cf/example.json --plan
+cfctl workspace add /absolute/repository/root --account <account-id> --json
+cfctl workspace discover --json
+cfctl workspace graph --json
+cfctl workspace audit --json
 ```
 
-For public intake readiness, use the composite read path before planning
-component writes:
+Workspace account pins resolve ambiguity. Source configuration, routes,
+hostnames, bindings, desired state, and cross-repository references become
+preconditions in transaction plans. A source audit is not live Cloudflare
+truth; use a live `call` for edge/account assertions.
+
+## Authentication and secrets
+
+- OAuth Authorization Code with PKCE and refresh tokens is the default.
+- Profiles and workspaces pin accounts; ambiguity fails closed.
+- API tokens are scoped profiles.
+- The global-key profile is emergency-only and never selected silently.
+- Keychain on macOS and Secret Service on Linux hold credentials.
+- Secret inputs come from stdin and become opaque key-store references.
+- Secret outputs require `--value-out` to a new mode-0600 file.
+- stdout, plans, logs, subprocess receipts, and evidence are redacted.
+
+## Adapter rules
+
+Capability status controls the execution boundary:
+
+- `native`: cfctl implements operation-specific handling.
+- `dynamic_api`: the pinned OpenAPI schema validates and executes the call.
+- `delegated_cli`: governed Wrangler/cloudflared subprocess, cleared
+  environment, one selected credential, timeout, and redacted receipt.
+- `governed_ui`: target/account-bound UI action only after API/CLI
+  insufficiency is established.
+- `blocked`: discoverable but not executable, with an exact reason.
+
+Never improvise around a blocker. UI `AgentActionV1` output is a handoff, not
+authority or completion proof.
+
+## Natural-language entry
 
 ```bash
-cfctl form-intake verify --file state/form-intake/example.json
-cfctl form-intake diff --file state/form-intake/example.json
-cfctl form-intake plan --file state/form-intake/example.json
+cfctl "rotate the production Worker secret"
 ```
 
-To actually execute a reviewed write:
+This launches the configured local agent. Agents must use deterministic cfctl
+commands underneath. `CFCTL_AGENT_SESSION` prevents recursive agent launch.
+Model output never approves or directly mutates Cloudflare.
 
-```bash
-cfctl apply access.app update --id <app-id> --body-file app.json --ack-plan <operation-id>
-CF_TOKEN_LANE=global cfctl apply access.login_method set --provider-id <provider-id> --ack-plan <operation-id>
-CF_TOKEN_LANE=global cfctl apply dns.record upsert --zone example.com --name _ops-smoke.example.com --type TXT --content hello-world --ttl 120 --ack-plan <operation-id>
-CF_TOKEN_LANE=global cfctl apply zone.setting set --zone example.com --name ssl --content strict --ack-plan <operation-id>
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --ack-plan <operation-id>
-```
+## Completion evidence
 
-## Advanced Certificate Manager
-
-For an Edge certificate backed by Cloudflare Advanced Certificate Manager, use the `edge.certificate` surface. This is the path for hostnames like `app.example.com` plus `deep.app.example.com`.
-
-```bash
-cfctl standards edge.certificate
-cfctl explain edge.certificate
-cfctl guide edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com
-cfctl list edge.certificate --zone example.com
-CF_TOKEN_LANE=global cfctl can edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --all-lanes
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --validation-method txt --certificate-authority lets_encrypt --validity-days 90 --plan
-CF_TOKEN_LANE=global cfctl apply edge.certificate order --zone example.com --host app.example.com --host deep.app.example.com --ack-plan <operation-id>
-CF_TOKEN_LANE=global cfctl verify edge.certificate --zone example.com --host app.example.com --host deep.app.example.com
-```
-
-Run the capability check before applying. If the dev lane is blocked and the global lane is allowed, say that explicitly in the operator notes and keep the same preview/apply/verify artifact chain.
-
-## Tool Choice
-
-- `cfctl ...`:
-  preferred live interface for reads, standards, capability checks, exact targeting, mutations, verification, lane comparison, previews, and desired-state diffs.
-- `CF_TOKEN_LANE=global cfctl ...`:
-  explicit emergency lane when the primary token cannot reach a surface.
-- Direct API scripts and mutation wrappers:
-  backend implementation for account inventory, Access, DNS-adjacent config, tunnels, email routing, and supported writes. Mutation backends are backend-only by default and should be used directly only when extending/debugging with a scoped authorization from `cfctl admin authorize-backend`.
-- `cfctl wrangler ...`:
-  wrapped Wrangler-native commands with runtime artifacts, logs, and preview gating for non-read-only invocations.
-- `cfctl cloudflared ...`:
-  wrapped cloudflared commands with runtime artifacts, logs, and preview gating for non-read-only invocations.
-
-## Output Contract
-
-- Inventory: `var/inventory/<product>/...`
-- Operations: `var/inventory/operations/...`
-- Runtime: `var/inventory/runtime/...`
-- Auth and token commands: `var/inventory/auth/...`
-- Logs: `var/logs/<workflow>/...`
-- Existing email-routing workflows remain valid and now sit inside the broader runtime.
+Final claims must identify one of: source config, live Cloudflare read,
+preview/plan artifact, apply artifact, post-change verification, local proof,
+or agent action. Evidence presence alone is not verification. If a verifier is
+unsupported, status remains rectification-required rather than “done.”

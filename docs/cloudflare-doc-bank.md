@@ -14,7 +14,7 @@ cfctl docs ai-search
 
 The machine-readable source of truth is:
 
-- [catalog/cloudflare-doc-bank.json](catalog/cloudflare-doc-bank.json)
+- [catalog/cloudflare-doc-bank.json](../catalog/cloudflare-doc-bank.json)
 
 ## What This Bank Is
 
@@ -50,10 +50,15 @@ in the bank tell you how fresh that curation is supposed to be.
 
 ## Current Watch Areas
 
-As of `2026-04-29`, the bank intentionally tracks:
+As of `2026-07-14`, the bank intentionally tracks:
 
 - Audit Logs v2
-- managed Cloudflare MCP servers
+- Cloudflare API MCP, Code Mode, durable approvals, and human-in-the-loop elicitation
+- Agent Memory and its non-evidence boundary
+- temporary accounts for disposable agent previews
+- Workers VPC Gateway egress and private TCP reach
+- Artifacts, Flagship, and R2 SQL as evidence, policy, and analytics building blocks
+- agentic payments, agent email, and Email Service side-effect classes
 - AI Search
 - Browser Run
 - Workflows
@@ -85,4 +90,4 @@ When reading Cloudflare docs programmatically, prefer:
 
 See also:
 
-- [docs/official-cloudflare-reference.md](docs/official-cloudflare-reference.md)
+- [docs/official-cloudflare-reference.md](official-cloudflare-reference.md)

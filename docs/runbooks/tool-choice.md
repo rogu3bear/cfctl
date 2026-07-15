@@ -1,84 +1,29 @@
-# Tool Choice
+# Adapter choice in cfctl v2
 
-## Use cfctl First
-
-Use `cfctl` from `PATH` as the public interface whenever possible. When standing in `.`, `./cfctl` is the equivalent local implementation.
-
-It gives agents and operators:
-
-- lane health and lane comparison
-- capability discovery
-- exact targeting rules
-- live permission probes
-- snapshot and diff verbs
-- structured runtime results
-- consistent verification semantics
-
-Use [../capabilities.md](../capabilities.md) when the first question is which
-surface owns a task, whether that surface is read-only, whether an operation is
-preview-gated or destructive, and which selectors are required. The matrix is
-generated from `catalog/surfaces.json` and `catalog/runtime.json`, not hand-kept
-operator prose.
-
-## Use Direct API Wrappers For
-
-- account-wide inventory
-- zone inventory and DNS reads
-- Access applications and policies
-- tunnel inventory and configuration reads
-- DNS and zone-level config work
-- account-wide email routing audits when a per-zone `cfctl` read is not enough
-- backend implementation for targeted writes through `cf_api_apply.sh` and `cf_mutate_*.sh`
-- any workflow that needs a durable JSON snapshot under `var/inventory/`
-
-These are backend implementation paths. Prefer reaching them through `cfctl` unless you are extending the runtime itself.
-
-Do not call mutation backends directly during normal operations. `cfctl` invokes them for you. Direct invocation is maintainer/debug-only and requires `cfctl admin authorize-backend` plus `CF_BACKEND_BYPASS_FILE=<authorization-path>`.
-
-Mutation backends currently wrapped by `cfctl`:
-
-- `./scripts/cf_mutate_dns_record.sh`
-- `./scripts/cf_mutate_access_app.sh`
-- `./scripts/cf_mutate_access_policy.sh`
-- `./scripts/cf_mutate_turnstile_widget.sh`
-- `./scripts/cf_mutate_waiting_room.sh`
-- `./scripts/cf_mutate_edge_certificate.sh`
-- `./scripts/cf_mutate_email_routing_rule.sh`
-- `./scripts/cf_mutate_logpush_job.sh`
-- `./scripts/cf_mutate_tunnel.sh`
-
-Use `./scripts/cf_api_apply.sh` when:
-
-- you need a Cloudflare API write that does not yet have a dedicated wrapper
-- the mutation is simple and JSON-backed
-- you still want dry-run planning, redacted evidence, and optional readback verification
-
-Use the backend scripts directly when:
-
-- you are implementing a new `cfctl` surface
-- you need a backend-specific debug pass
-- the public `cfctl` contract has not been wired for that surface yet
-- you are repairing or auditing a legacy workflow that intentionally bypasses the public runtime
-- you have explicitly issued a scoped backend authorization with `cfctl admin authorize-backend`
-
-## Use Wrangler For
-
-- Worker-native deploy and management flows
-- Worker versions and tailing
-- D1, KV, R2, Queues, Hyperdrive, and related developer-product operations
-
-Invoke Wrangler through `cfctl` for operator work:
+There is no separate agent-selected tool-choice command. Search the catalog;
+the selected `CapabilityV1` contains the governed adapter status and blocker.
 
 ```bash
-cfctl wrangler <wrangler args>
+cfctl catalog search "<intent>" --json
+cfctl catalog show <capability-id> --json
 ```
 
-Use `./scripts/cf_wrangler.sh` only when extending or debugging the wrapper itself.
+Use statuses in this order only when the catalog declares them:
 
-## Use cloudflared For
+1. `native` for operation-specific cfctl behavior.
+2. `dynamic_api` for schema-validated Cloudflare API execution.
+3. `delegated_cli` for governed Wrangler or cloudflared execution.
+4. `governed_ui` for a target-bound browser/Computer Use handoff after API and
+   CLI insufficiency has been established.
+5. `blocked` when entitlement, permission, cost, verification, or adapter
+   requirements are unmet.
 
-- running a remotely-managed tunnel
-- validating tunnel connectivity
-- local ingress testing
+Adapter selection does not grant authority. Every write still follows the
+hash-bound plan, risk policy, approval, lock, execution, verification, and
+evidence lifecycle. Do not invoke archived backend scripts, direct API calls,
+or Cloudflare API MCP to bypass catalog status.
 
-`cloudflared` is runtime tooling. It is not the source of truth for account inventory or broader configuration.
+For unknown Cloudflare capabilities, run `cfctl catalog sync`; the synchronizer
+ingests the official OpenAPI schema, docs/changelog feeds, and installed CLI
+help. If an official operation remains unsupported, it stays discoverable with
+an exact blocker until cfctl gains a safe adapter.

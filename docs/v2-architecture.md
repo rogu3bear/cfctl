@@ -1,0 +1,63 @@
+# cfctl v2 architecture
+
+`cfctl` v2 is a local-first, catalog-driven Cloudflare control plane. It has no MCP dependency.
+
+## Crates
+
+| Crate | Boundary |
+|---|---|
+| `cfctl-cli` | Public command parser, human/JSON rendering, orchestration |
+| `cfctl-core` | Versioned contracts, hashes, evidence, redaction, plan lifecycle |
+| `cfctl-auth` | OAuth PKCE, profiles, account selection, Keychain/Secret Service |
+| `cfctl-cloudflare` | Schema-validated HTTP execution, retries, pagination, conditionals, and idempotency |
+| `cfctl-catalog` | Official OpenAPI/docs/changelog/CLI ingestion and SQLite search index |
+| `cfctl-planner` | Risk, impact, cost, and approval policy |
+| `cfctl-workspace` | Registered-root Git/IaC discovery, exact local diffs, and repository/resource graph |
+| `cfctl-agent` | Agent discovery, maintained instructions, recursion-safe handoff |
+| `cfctl-storage` | Platform paths, atomic plans, locks, content-addressed evidence |
+| `xtask` | Local verification, reproducible release assembly, publication |
+
+## Adapter boundary
+
+Every capability is classified as `native`, `dynamic_api`, `delegated_cli`, `governed_ui`, or `blocked`. The adapter is selected by catalog data; it is never inferred from model output.
+
+- `native`: operation-specific behavior such as sink-only credential delivery.
+- `dynamic_api`: schema-validated Cloudflare HTTP execution.
+- `delegated_cli`: governed Wrangler/cloudflared process with a cleared environment, one selected credential, timeout, captured output, and redaction.
+- `governed_ui`: target-bound `AgentActionV1` after API/CLI insufficiency is established.
+- `blocked`: discoverable, with an exact missing permission, entitlement, cost, verification, or adapter reason.
+
+Generated API writes are executable only when their operation contract is
+complete. Reads remain dynamically executable; incomplete writes remain
+searchable and explain every missing contract field.
+
+## Workspace and transaction model
+
+Workspace discovery never scans outside explicitly registered roots. It finds
+configless Git repositories and parses Wrangler TOML/JSONC, Terraform, and
+Pulumi files while excluding generated and vendor directories. Resource links
+use canonical absolute repository paths, and every source-config snapshot
+records the current hash, `HEAD` hash, exact worktree-diff hash, and dirty
+status.
+
+`PlanV1` carries a hash-chained transaction journal. Checkpoints distinguish
+the point before a Cloudflare boundary from the persisted response, secret
+sink, and operation-specific verification. A network failure after a boundary
+attempt therefore enters rectification and cannot be mistaken for a safe
+retry.
+
+## Trust sequence
+
+1. Pin profile and account.
+2. Pin the exact catalog schema hash.
+3. Read registered workspace impact.
+4. Bind the request, permission lane, workspace graph, source-config hashes, cost metadata, and exact plan content hash.
+5. Apply policy and, when required, approve that operation ID.
+6. Acquire the local operation lock.
+7. Recheck drift, append the consumption checkpoint, and durably consume the plan.
+8. Append the boundary-attempt checkpoint and cross one adapter boundary.
+9. Persist the response and secret sink, then run the operation-specific verifier.
+10. Close verified/rejected transactions or require rectification without replay.
+11. Write redacted, content-addressed evidence.
+
+See [ADR 0001](architecture/adr/0001-rust-clean-break.md) and [ADR 0002](architecture/adr/0002-risk-based-approval.md).

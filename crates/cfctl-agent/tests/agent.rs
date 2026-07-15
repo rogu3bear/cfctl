@@ -1,0 +1,57 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use cfctl_agent::{
+    AgentKind, AgentLauncher, InstallMode, InvocationContext, build_intent_action,
+    install_agent_skill,
+};
+
+#[test]
+fn bare_intent_launches_the_configured_agent_once() {
+    let launcher = AgentLauncher::new(AgentKind::Codex);
+    let invocation = launcher
+        .prepare(
+            "rotate the production Worker secret",
+            &InvocationContext::default(),
+        )
+        .expect("initial invocation can launch");
+    assert_eq!(invocation.program, "codex");
+    assert!(
+        invocation
+            .env
+            .iter()
+            .any(|(k, v)| k == "CFCTL_AGENT_SESSION" && v == "1")
+    );
+
+    let nested = InvocationContext {
+        agent_session: true,
+    };
+    assert!(launcher.prepare("same intent", &nested).is_err());
+}
+
+#[test]
+fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() {
+    let root = tempfile::tempdir().expect("agent home");
+    let receipt = install_agent_skill(root.path(), AgentKind::Codex, InstallMode::Install)
+        .expect("install skill");
+    let content = std::fs::read_to_string(&receipt.path).expect("installed skill");
+    assert!(content.contains("cfctl catalog search"));
+    assert!(content.contains("cfctl plans approve <operation-id> --yes"));
+    assert!(!content.to_ascii_lowercase().contains("mcp"));
+
+    std::fs::write(&receipt.path, "user-owned drift").expect("drift fixture");
+    let error = install_agent_skill(root.path(), AgentKind::Codex, InstallMode::Install)
+        .expect_err("install cannot overwrite drift");
+    assert!(error.to_string().contains("sync"));
+}
+
+#[test]
+fn agent_actions_are_hash_bound_and_do_not_grant_authority() {
+    let action =
+        build_intent_action(AgentKind::Claude, "inspect DNS", None).expect("action should build");
+    assert!(action.content_hash.starts_with("sha256:"));
+    assert!(
+        action
+            .instructions
+            .contains("does not grant mutation authority")
+    );
+}

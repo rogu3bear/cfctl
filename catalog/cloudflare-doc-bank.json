@@ -1,7 +1,7 @@
 {
   "version": 1,
   "title": "Cloudflare Docs Bank",
-  "checked_on": "2026-04-29",
+  "checked_on": "2026-07-14",
   "intent": "Compact official-doc bank for stable Cloudflare references and incoming capabilities worth tracking in this runtime.",
   "source_policy": {
     "allowed_domains": [
@@ -252,21 +252,170 @@
   ],
   "watch": [
     {
+      "id": "code-mode-durable-runtime",
+      "title": "Code Mode now has a durable approval runtime",
+      "area": "agents",
+      "status": "recent",
+      "source_date": "2026-07-14",
+      "summary": "Cloudflare Code Mode combines progressive tool discovery with executable plans, while its durable runtime adds approval pauses, replay, rollback, and reusable snippets.",
+      "why_it_matters_here": "Its plan and approval model closely matches cfctl preview and acknowledgement receipts and is the natural dynamic-API adapter for uncatalogued operations.",
+      "track_here": [
+        "map durable Code Mode plan identity to cfctl intent and operation receipts",
+        "keep dynamic discovery separate from mutation authority",
+        "evaluate replay and rollback evidence without weakening post-change verification"
+      ],
+      "sources": [
+        {
+          "title": "Code Mode",
+          "url": "https://developers.cloudflare.com/agents/tools/codemode/"
+        },
+        {
+          "title": "Code Mode durable runtime",
+          "url": "https://developers.cloudflare.com/agents/tools/codemode/durable-runtime/"
+        },
+        {
+          "title": "Human in the loop",
+          "url": "https://developers.cloudflare.com/agents/concepts/agentic-patterns/human-in-the-loop/"
+        }
+      ]
+    },
+    {
+      "id": "agent-memory",
+      "title": "Agent Memory creates a new non-evidence state class",
+      "area": "agents",
+      "status": "recent",
+      "source_date": "2026-07-14",
+      "summary": "Agent Memory stores raw conversation messages and separately recalls structured memories into later sessions.",
+      "why_it_matters_here": "It can improve continuity, but remembered text must never be confused with a live read, preview, apply, or verification artifact.",
+      "track_here": [
+        "treat memory as untrusted context rather than Cloudflare truth",
+        "keep credentials and sensitive payloads out of remembered conversations",
+        "require live readback for drift-prone claims"
+      ],
+      "sources": [
+        {
+          "title": "How Agent Memory works",
+          "url": "https://developers.cloudflare.com/agent-memory/concepts/how-agent-memory-works/"
+        }
+      ]
+    },
+    {
+      "id": "temporary-agent-accounts",
+      "title": "Temporary Cloudflare accounts enable disposable previews",
+      "area": "agents",
+      "status": "recent",
+      "source_date": "2026-06-19",
+      "summary": "Agents can create temporary Cloudflare accounts for preview deployments without a pre-existing credential, with intentionally limited lifetime and capability.",
+      "why_it_matters_here": "This adds a disposable preview identity that should stay distinct from day-to-day dev and emergency global account lanes.",
+      "track_here": [
+        "model temporary accounts as expiring preview identities rather than auth lanes",
+        "record expiry and promotion boundaries in evidence",
+        "prevent preview identity from being presented as production proof"
+      ],
+      "sources": [
+        {
+          "title": "Temporary accounts for agents",
+          "url": "https://developers.cloudflare.com/changelog/post/2026-06-19-temporary-accounts-for-agents/"
+        }
+      ]
+    },
+    {
+      "id": "agent-egress-private-networking",
+      "title": "Workers VPC and Gateway now govern agent network reach",
+      "area": "networking",
+      "status": "recent",
+      "source_date": "2026-06-16",
+      "summary": "Workers VPC added Gateway egress filtering and logging plus raw TCP connections to private network targets.",
+      "why_it_matters_here": "Agent execution can now be constrained and audited at the network layer instead of relying only on application prompts and tokens.",
+      "track_here": [
+        "treat Gateway logs as network evidence, not operation verification",
+        "model egress allowlists as an independent safety control",
+        "separate private TCP reach from tunnel ownership and application authorization"
+      ],
+      "sources": [
+        {
+          "title": "Gateway egress for Workers VPC",
+          "url": "https://developers.cloudflare.com/changelog/post/2026-06-05-gateway-egress/"
+        },
+        {
+          "title": "TCP connect for VPC networks",
+          "url": "https://developers.cloudflare.com/changelog/post/2026-06-16-tcp-connect-vpc-networks/"
+        }
+      ]
+    },
+    {
+      "id": "agent-artifacts-policy-analytics",
+      "title": "Artifacts, Flagship, and R2 SQL form an agent control and evidence stack",
+      "area": "agents",
+      "status": "recent",
+      "source_date": "2026-07-14",
+      "summary": "Artifacts provides versioned agent work products, Flagship provides feature and policy decisions, and R2 SQL queries Iceberg-backed data for aggregate analysis.",
+      "why_it_matters_here": "Together they suggest a future remote evidence plane, autonomy kill-switch plane, and metrics plane beyond local var artifacts.",
+      "track_here": [
+        "evaluate Artifacts for versioned cross-agent handoff without replacing immutable operation receipts",
+        "evaluate Flagship for bounded autonomy and kill switches",
+        "evaluate R2 SQL for aggregate outcome analysis while keeping source receipts inspectable"
+      ],
+      "sources": [
+        {
+          "title": "Artifacts",
+          "url": "https://developers.cloudflare.com/artifacts/"
+        },
+        {
+          "title": "Flagship",
+          "url": "https://developers.cloudflare.com/flagship/"
+        },
+        {
+          "title": "R2 SQL",
+          "url": "https://developers.cloudflare.com/r2-sql/"
+        }
+      ]
+    },
+    {
+      "id": "agentic-payments-and-email",
+      "title": "Agents can now spend and communicate through first-class channels",
+      "area": "agents",
+      "status": "recent",
+      "source_date": "2026-07-14",
+      "summary": "Cloudflare documents x402 and MPP agentic payments, agent email communication, and an Email Service for sending from Workers.",
+      "why_it_matters_here": "Spend and external communication are distinct side-effect classes that need explicit confirmation, budget, recipient, and delivery evidence contracts.",
+      "track_here": [
+        "add separate spend and external-communication policy classes before exposing writes",
+        "record recipient, amount, currency, purpose, and delivery or settlement proof without secrets",
+        "do not treat an agent session as standing approval to transmit or pay"
+      ],
+      "sources": [
+        {
+          "title": "Agentic payments",
+          "url": "https://developers.cloudflare.com/agents/tools/payments/"
+        },
+        {
+          "title": "Email communication channel",
+          "url": "https://developers.cloudflare.com/agents/communication-channels/email/"
+        },
+        {
+          "title": "Email Service",
+          "url": "https://developers.cloudflare.com/email-service/"
+        }
+      ]
+    },
+    {
       "id": "mcp-servers",
       "title": "Managed Cloudflare MCP servers",
       "area": "agents",
       "status": "recent",
-      "source_date": "2026-04-22",
-      "summary": "Cloudflare's managed MCP catalog now includes the Cloudflare API MCP server and product-specific docs, bindings, and builds servers. The API server uses Codemode instead of exposing thousands of native tools.",
-      "why_it_matters_here": "This runtime should stay MCP-aware without becoming MCP-dependent. It is a likely future integration lane for docs and account operations.",
+      "source_date": "2026-07-14",
+      "summary": "Cloudflare's API MCP server exposes search and execute across more than 2,500 API endpoints through Code Mode instead of loading thousands of native tool schemas.",
+      "why_it_matters_here": "This is the dynamic discovery adapter for API breadth; cfctl remains the policy, preview, evidence, and verification layer.",
       "track_here": [
         "keep cfctl docs bank aligned with Cloudflare MCP posture",
-        "consider future MCP-aware adapters only where they improve exactness instead of hiding it"
+        "measure API MCP outcomes separately from native cfctl surfaces",
+        "never infer mutation authority from endpoint discoverability"
       ],
       "sources": [
         {
           "title": "Cloudflare MCP servers",
-          "url": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/"
+          "url": "https://developers.cloudflare.com/agents/model-context-protocol/cloudflare/servers-for-cloudflare/"
         }
       ]
     },

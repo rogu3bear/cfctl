@@ -1,5 +1,5 @@
 {
-  "version": 9,
+  "version": 10,
   "preferred_entrypoint": "./cfctl",
   "legacy_policy": "shim_then_hide",
   "public_verbs": [
@@ -10,6 +10,7 @@
     "lanes",
     "surfaces",
     "docs",
+    "skills",
     "previews",
     "locks",
     "env",
@@ -38,6 +39,7 @@
     "surfaces",
     "ownership check",
     "docs",
+    "skills choose",
     "standards <surface>",
     "explain <surface>",
     "classify <surface> <operation>",
@@ -191,6 +193,18 @@
       "CLOUDFLARE_ACCOUNT_ID"
     ],
     "summary": "Workspace env fallback: strict KEY=VALUE import of lane credentials, lane requirements, and this allowlist; never sourced as shell, never overwrites canonical shared or repo env values."
+  },
+  "skill_choice": {
+    "catalog": "catalog/skill-choices.json",
+    "skill": "skills/cfctl-operator/SKILL.md",
+    "result_kind": "SKILL_CHOICE",
+    "outcome_kind": "SKILL_OUTCOME",
+    "metrics_kind": "SKILL_METRICS",
+    "raw_intent_persisted": false,
+    "authority_granted_by_choice": false,
+    "policy_metrics_are_observed": false,
+    "observed_metrics_source": "var/inventory/runtime/* skills record artifacts",
+    "summary": "Selects the safest available execution adapter without changing authority, then aggregates only evidence-backed recorded outcomes as observed metrics."
   },
   "token_lifecycle": {
     "state_dir_default": "~/dev/.secrets-state",

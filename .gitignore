@@ -36,6 +36,12 @@ AGENTS.md
 CLAUDE.md
 NORTH_STAR.md
 ANCHOR.md
+LAYERS.md
+NUANCE.md
+.agent-context-stack
 .agents/
 .claude/
 *.local.md
+target/
+.cfctl-private-archive/
+dist/
