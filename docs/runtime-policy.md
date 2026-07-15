@@ -35,6 +35,13 @@ inventory receipt and the normalized metadata for only the selected groups.
 cfctl re-reads those groups before durable consumption; permission or account
 scope drift invalidates the plan without crossing the token-create boundary.
 
+Zone-scoped writes whose only remaining gap is official plan entitlement use a
+fresh `GET /zones/{zone_id}/subscription` read during planning. cfctl binds the
+exact active plan, normalized plan tier, availability decision, target zone,
+and official matrix hash, then repeats the read before durable consumption.
+An ambiguous account subscription list is not treated as equivalent zone-plan
+proof.
+
 The plan is durably consumed before cfctl crosses the API, subprocess, or UI
 boundary. A crash after consumption cannot automatically replay the action.
 Crash-stale local locks expire after 15 minutes; nonce ownership prevents an

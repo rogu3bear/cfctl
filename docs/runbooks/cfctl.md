@@ -39,6 +39,13 @@ named `blocking_gaps` entry through the supplied safe `next_action`; the
 execution recommendation. It is `null` when no safe future execution surface
 exists. Commands are argv arrays so agents never have to guess shell quoting.
 
+For a zone mutation with `check_entitlement` marked `live_read_required`, the
+generated `next_action.argv` performs a Billing Read of the exact zone
+subscription before it creates a plan. The plan binds that normalized receipt,
+and execution rechecks it. Do not substitute account subscription output or
+manually edit `observed_plan`; ambiguous, inactive, unavailable, and drifted
+entitlements remain blocked.
+
 ## Authentication
 
 Normal OAuth login uses a public client and PKCE:

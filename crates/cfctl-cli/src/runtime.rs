@@ -21,6 +21,7 @@ use cfctl_auth::{
 use cfctl_catalog::{
     CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1, attach_official_product_knowledge,
     fetch_official, fetch_official_text_feeds, ingest_cli_help, ingest_governed_ui_capabilities,
+    refresh_dynamic_mutation_contract,
 };
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, Executor, OperationVerificationV1,
@@ -582,7 +583,8 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         arguments.profile.as_deref(),
         arguments.account.as_deref(),
         Value::Object(adapter_targets),
-    );
+    )
+    .await;
     if result.is_err()
         && let Some(reference) = secret_ref
     {
@@ -974,10 +976,188 @@ fn delete_plan_secret(plan: &PlanV1, secrets: &dyn SecretStore) -> Result<bool> 
     Ok(true)
 }
 
-fn create_plan(
+const ENTITLEMENT_UNRESOLVED_GAP: &str =
+    "account entitlement has not been resolved for this plan-gated operation";
+const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str = "zone-subscription-zone-subscription-details";
+
+fn should_resolve_zone_entitlement(capability: &CapabilityV1) -> bool {
+    let dynamic_contract = capability.adapter_status == AdapterStatus::DynamicApi
+        || (capability.adapter_status == AdapterStatus::Blocked
+            && capability
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("operation contract incomplete:")));
+    dynamic_contract
+        && capability.account_scope == "zone"
+        && capability.entitlement.requires_live_resolution
+        && capability.mutation_contract_gaps() == [ENTITLEMENT_UNRESOLVED_GAP]
+}
+
+fn zone_entitlement_target(capability: &CapabilityV1, input: &CallInput) -> Result<String> {
+    let zone_selectors = capability
+        .path
+        .split('/')
+        .filter_map(|segment| {
+            segment
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+        })
+        .filter(|selector| selector.to_ascii_lowercase().contains("zone"))
+        .collect::<Vec<_>>();
+    let [selector] = zone_selectors.as_slice() else {
+        return Err(CliError::Input(format!(
+            "zone entitlement resolution requires exactly one zone selector in capability `{}`",
+            capability.id
+        )));
+    };
+    input
+        .selectors
+        .get(*selector)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "zone entitlement resolution requires string selector `{selector}`"
+            ))
+        })
+}
+
+fn canonical_zone_plan(plan: &str) -> Option<&'static str> {
+    match plan {
+        "free" | "partners_free" => Some("free"),
+        "pro" | "partners_pro" => Some("pro"),
+        "business" | "partners_business" => Some("business"),
+        "enterprise" | "partners_enterprise" => Some("enterprise"),
+        _ => None,
+    }
+}
+
+fn apply_zone_entitlement_response(
+    capability: &mut CapabilityV1,
+    zone_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the zone subscription entitlement read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    let state = response
+        .result
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "zone subscription entitlement read omitted the subscription state".to_owned(),
+            )
+        })?;
+    if !matches!(state, "Trial" | "Provisioned" | "Paid") {
+        return Err(CliError::Input(format!(
+            "zone subscription state `{state}` is not active; the mutation boundary was not crossed"
+        )));
+    }
+    let observed_plan = response
+        .result
+        .pointer("/rate_plan/id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "zone subscription entitlement read omitted the rate-plan ID".to_owned(),
+            )
+        })?;
+    let canonical_plan = canonical_zone_plan(observed_plan).ok_or_else(|| {
+        CliError::Input(format!(
+            "zone rate plan `{observed_plan}` cannot be mapped to the official free/pro/business/enterprise availability matrix"
+        ))
+    })?;
+    let available = capability
+        .entitlement
+        .plans
+        .get(canonical_plan)
+        .copied()
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "capability `{}` has no `{canonical_plan}` entry in its official plan-availability matrix",
+                capability.id
+            ))
+        })?;
+    let plan_matrix_hash = hash_value(&serde_json::to_value(&capability.entitlement.plans)?)?;
+    capability.entitlement.available = Some(available);
+    capability.entitlement.observed_plan = Some(observed_plan.to_owned());
+    capability.entitlement.source = Some(
+        "live Cloudflare GET /zones/{zone_id}/subscription evaluated against official OpenAPI x-cfPlanAvailability"
+            .to_owned(),
+    );
+    capability.entitlement.blocker = (!available).then(|| {
+        format!(
+            "live zone plan `{observed_plan}` does not permit capability `{}`",
+            capability.id
+        )
+    });
+    refresh_dynamic_mutation_contract(capability);
+    Ok(json!({
+        "schema_version": 1,
+        "source_capability_id": ZONE_SUBSCRIPTION_CAPABILITY_ID,
+        "source_path": "/zones/{zone_id}/subscription",
+        "target_scope": "zone",
+        "target_id": zone_id,
+        "observed_plan": observed_plan,
+        "canonical_plan": canonical_plan,
+        "subscription_state": state,
+        "available": available,
+        "plan_matrix_hash": plan_matrix_hash,
+    }))
+}
+
+async fn read_live_zone_entitlement(
     store: &StateStore,
     catalog: &CatalogSnapshot,
-    capability: cfctl_core::CapabilityV1,
+    capability: &mut CapabilityV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    let source_capability = catalog
+        .get(ZONE_SUBSCRIPTION_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(ZONE_SUBSCRIPTION_CAPABILITY_ID))?;
+    if source_capability.method != "GET"
+        || source_capability.path != "/zones/{zone_id}/subscription"
+        || source_capability.mutating
+        || !matches!(
+            source_capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+    {
+        return Err(CliError::Input(
+            "zone entitlement source capability drifted from the governed subscription read"
+                .to_owned(),
+        ));
+    }
+    let zone_id = zone_entitlement_target(capability, input)?;
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source_capability,
+            &CallInput {
+                selectors: json!({"zone_id": zone_id}),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt = apply_zone_entitlement_response(capability, &zone_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
+
+async fn create_plan(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    mut capability: cfctl_core::CapabilityV1,
     input: CallInput,
     requested_profile: Option<&str>,
     requested_account: Option<&str>,
@@ -1001,6 +1181,54 @@ fn create_plan(
                     .to_owned(),
             )
         })?;
+    let entitlement_precondition = if should_resolve_zone_entitlement(&capability) {
+        let credential = fresh_credential(profile, &PlatformSecretStore).await?;
+        Some(
+            read_live_zone_entitlement(store, catalog, &mut capability, &input, &credential)
+                .await?,
+        )
+    } else {
+        None
+    };
+    if capability.entitlement.available == Some(false) {
+        return Err(CliError::Input(
+            capability.entitlement.blocker.clone().unwrap_or_else(|| {
+                "the selected zone subscription does not permit this capability".to_owned()
+            }),
+        ));
+    }
+    persist_prepared_plan(
+        store,
+        catalog,
+        capability,
+        input,
+        PlanAuthority {
+            profile,
+            account_id,
+        },
+        adapter_targets,
+        entitlement_precondition,
+    )
+}
+
+struct PlanAuthority<'a> {
+    profile: &'a ProfileMetadata,
+    account_id: &'a str,
+}
+
+fn persist_prepared_plan(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: cfctl_core::CapabilityV1,
+    input: CallInput,
+    authority: PlanAuthority<'_>,
+    adapter_targets: Value,
+    entitlement_precondition: Option<(Value, EvidenceV1)>,
+) -> Result<ResultEnvelopeV2> {
+    let PlanAuthority {
+        profile,
+        account_id,
+    } = authority;
     validate_api_token_creation_contract(&capability, &input, &adapter_targets, account_id)?;
     let impact = plan_impact(store, &capability, &input, account_id)?;
     let policy = PolicyEngine.evaluate(&capability, &impact.policy);
@@ -1033,6 +1261,10 @@ fn create_plan(
         .insert("catalog".to_owned(), catalog.schema_hash.clone());
     plan.precondition_hashes
         .insert("request_input".to_owned(), hash_value(&plan.input)?);
+    if let Some((receipt, _)) = &entitlement_precondition {
+        plan.precondition_hashes
+            .insert("entitlement".to_owned(), hash_value(receipt)?);
+    }
     plan.precondition_hashes
         .extend(workspace_precondition_hashes(store)?);
     plan.affected_repositories = impact.affected_repositories;
@@ -1075,6 +1307,9 @@ fn create_plan(
     envelope.account_id = Some(account_id.to_owned());
     envelope.policy_decision = Some(policy);
     envelope.verification.state = VerificationState::Pending;
+    if let Some((_, evidence)) = entitlement_precondition {
+        envelope.evidence.insert(0, evidence);
+    }
     Ok(envelope)
 }
 
@@ -1476,6 +1711,14 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         adapter_targets,
         &plan.account_id,
     )?;
+    let entitlement_evidence = validate_live_entitlement_precondition(
+        store,
+        &catalog,
+        &plan,
+        &execution_input,
+        &credential,
+    )
+    .await?;
     let permission_inventory_evidence =
         validate_live_permission_inventory_precondition(store, &catalog, &plan, &credential)
             .await?;
@@ -1526,10 +1769,68 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         &secrets,
     )
     .await?;
+    if let Some(evidence) = entitlement_evidence {
+        envelope.evidence.insert(0, evidence);
+    }
     if let Some(evidence) = permission_inventory_evidence {
         envelope.evidence.insert(0, evidence);
     }
     Ok(envelope)
+}
+
+async fn validate_live_entitlement_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_entitlement_precondition(plan)? else {
+        return Ok(None);
+    };
+    let mut capability = plan.capability.clone();
+    let (receipt, evidence) =
+        read_live_zone_entitlement(store, catalog, &mut capability, input, credential).await?;
+    validate_entitlement_receipt_precondition(expected_hash, &capability, &receipt)?;
+    Ok(Some(evidence))
+}
+
+fn required_entitlement_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    if !plan.capability.entitlement.requires_live_resolution {
+        return Ok(None);
+    }
+    if plan.capability.account_scope != "zone"
+        || plan.capability.entitlement.available != Some(true)
+    {
+        return Err(CliError::Input(
+            "plan entitlement precondition is inconsistent with its hash-bound zone capability; create a new plan"
+                .to_owned(),
+        ));
+    }
+    plan.precondition_hashes
+        .get("entitlement")
+        .map(String::as_str)
+        .map(Some)
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the live zone-entitlement contract; create a new plan".to_owned(),
+            )
+        })
+}
+
+fn validate_entitlement_receipt_precondition(
+    expected_hash: &str,
+    capability: &CapabilityV1,
+    receipt: &Value,
+) -> Result<()> {
+    let actual_hash = hash_value(receipt)?;
+    if actual_hash != expected_hash || capability.entitlement.available != Some(true) {
+        return Err(CliError::Input(
+            "live zone entitlement drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn validate_live_permission_inventory_precondition(
@@ -2147,7 +2448,8 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
                 "compensates_capability_id": plan.capability.id,
                 "source_receipt_hash": source_receipt_hash,
             }),
-        )?;
+        )
+        .await?;
         "plans rectify".clone_into(&mut envelope.command);
         if let Some(result) = envelope.result.as_object_mut() {
             result.insert(
@@ -2296,7 +2598,8 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
                 "evidence_hashes": inventory_evidence_hashes,
             }
         }),
-    )?;
+    )
+    .await?;
     plan.evidence.splice(0..0, inventory.evidence);
     Ok(plan)
 }
@@ -2395,6 +2698,7 @@ async fn key_rotate(store: &StateStore, arguments: &KeyRotateArgs) -> Result<Res
         Some(&arguments.account),
         json!({"value_out": arguments.value_out}),
     )
+    .await
 }
 
 async fn key_revoke(store: &StateStore, arguments: &KeyRevokeArgs) -> Result<ResultEnvelopeV2> {
@@ -2420,6 +2724,7 @@ async fn key_revoke(store: &StateStore, arguments: &KeyRevokeArgs) -> Result<Res
         Some(account),
         Value::Null,
     )
+    .await
 }
 
 fn workspace_command(store: &StateStore, command: WorkspaceCommand) -> Result<ResultEnvelopeV2> {
@@ -3046,7 +3351,7 @@ fn workspace_precondition_hashes(store: &StateStore) -> Result<BTreeMap<String, 
 fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> {
     let current = workspace_precondition_hashes(store)?;
     for (name, expected) in &plan.precondition_hashes {
-        if name == "catalog" || name == "request_input" {
+        if matches!(name.as_str(), "catalog" | "request_input" | "entitlement") {
             continue;
         }
         if current.get(name) != Some(expected) {
@@ -3332,7 +3637,12 @@ fn guide_next_action(
         gaps.join(" ")
     )
     .to_ascii_lowercase();
-    let (summary, argv) = if blocked_text.contains("cost") {
+    let (summary, argv) = if should_resolve_zone_entitlement(capability) {
+        (
+            "Run the exact call to perform the governed live zone-subscription read. cfctl creates a plan only when the active plan is allowed by the official matrix, then binds and rechecks that entitlement before execution.",
+            call_argv.unwrap_or_default().to_vec(),
+        )
+    } else if blocked_text.contains("cost") {
         (
             "Resolve and bind the operation's official pricing contract before planning it.",
             vec![
@@ -3395,12 +3705,14 @@ fn guide_stage_document(
 ) -> Value {
     use cfctl_core::GuideStage;
 
+    let zone_entitlement_live_read = should_resolve_zone_entitlement(capability);
     let entitlement_blocked = capability.entitlement.available == Some(false)
         || blocking_gaps.iter().any(|gap| gap.contains("entitlement"));
     let entitlement_unresolved = capability.mutating
         && capability.entitlement.available != Some(true)
         && capability.entitlement.plans.is_empty();
     let contract_state = match stage {
+        GuideStage::CheckEntitlement if zone_entitlement_live_read => "live_read_required",
         GuideStage::CheckEntitlement if entitlement_blocked => "blocked",
         GuideStage::CheckEntitlement if entitlement_unresolved => "manual_review",
         GuideStage::CalculateCost if capability.mutating && !capability.cost.known => "blocked",
@@ -3437,14 +3749,24 @@ fn guide_stage_document(
         GuideStage::CloseWithEvidence if capability.mutating && !contract_ready => "blocked",
         _ => "available",
     };
+    let summary = if stage == GuideStage::CheckEntitlement && zone_entitlement_live_read {
+        "Read the exact live zone subscription and evaluate its active plan against the official availability matrix."
+    } else {
+        guide_stage_summary(stage, capability.mutating)
+    };
+    let evidence_class = if stage == GuideStage::CheckEntitlement && zone_entitlement_live_read {
+        "live_read"
+    } else {
+        guide_stage_evidence_class(stage, capability.mutating)
+    };
     json!({
         "stage": number,
         "name": stage.as_str(),
         "capability_id": capability.id,
         "required": stage_required(stage, capability),
         "contract_state": contract_state,
-        "summary": guide_stage_summary(stage, capability.mutating),
-        "evidence_class": guide_stage_evidence_class(stage, capability.mutating),
+        "summary": summary,
+        "evidence_class": evidence_class,
         "commands": guide_stage_commands(stage, capability, contract_state, call_argv),
     })
 }
@@ -3540,6 +3862,9 @@ fn guide_stage_commands(
     let conditional =
         |command: Option<Vec<String>>| available.then_some(command).flatten().into_iter().collect();
     match stage {
+        GuideStage::CheckEntitlement if contract_state == "live_read_required" => {
+            call_argv.map(<[String]>::to_vec).into_iter().collect()
+        }
         GuideStage::Discover | GuideStage::CheckEntitlement | GuideStage::CalculateCost => {
             vec![catalog_show_argv(&capability.id)]
         }
@@ -3888,16 +4213,19 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        CallInput, compensation_request, find_secret_value, guide_document,
-        persist_secret_lifecycle, preserve_previous_catalog, redact_secret_result,
-        sink_secret_result, validate_api_token_creation_contract,
-        validate_current_permission_groups, validate_selected_permission_groups,
+        CallInput, apply_zone_entitlement_response, compensation_request, find_secret_value,
+        guide_document, persist_secret_lifecycle, preserve_previous_catalog, redact_secret_result,
+        required_entitlement_precondition, should_resolve_zone_entitlement, sink_secret_result,
+        validate_api_token_creation_contract, validate_current_permission_groups,
+        validate_entitlement_receipt_precondition, validate_selected_permission_groups,
+        zone_entitlement_target,
     };
     use cfctl_auth::{AuthError, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
+    use cfctl_cloudflare::CloudflareResponseV1;
     use cfctl_core::{
-        AdapterStatus, CapabilityV1, CreatedResourceContractV1, PlanStatus, PlanV1, RiskClass,
-        SelectorV1, TransactionStageV1, hash_value,
+        AdapterStatus, CapabilityV1, CreatedResourceContractV1, EffectClass, PlanStatus, PlanV1,
+        RiskClass, SelectorV1, TransactionStageV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::Utc;
@@ -3955,6 +4283,218 @@ mod tests {
             CatalogSnapshot::load(&store.paths().catalog_previous_file())
                 .expect("last valid previous catalog remains"),
             catalog
+        );
+    }
+
+    #[test]
+    fn zone_entitlement_binds_the_exact_active_subscription_plan() {
+        let mut capability = CapabilityV1::new(
+            "custom-pages-update",
+            "Update custom page",
+            "PUT",
+            "/zones/{zone_identifier}/custom_pages/{identifier}",
+        );
+        capability.account_scope = "zone".to_owned();
+        capability.entitlement.requires_live_resolution = true;
+        capability.entitlement.plans = BTreeMap::from([
+            ("free".to_owned(), false),
+            ("pro".to_owned(), true),
+            ("business".to_owned(), true),
+            ("enterprise".to_owned(), true),
+        ]);
+        let input = CallInput {
+            selectors: json!({
+                "zone_identifier": "zone-a",
+                "identifier": "page-a",
+            }),
+            ..CallInput::default()
+        };
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "state": "Paid",
+                "rate_plan": {"id": "partners_business"},
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+
+        assert_eq!(
+            zone_entitlement_target(&capability, &input).expect("zone target"),
+            "zone-a"
+        );
+        let receipt = apply_zone_entitlement_response(&mut capability, "zone-a", &response)
+            .expect("entitlement receipt");
+
+        assert_eq!(capability.entitlement.available, Some(true));
+        assert_eq!(
+            capability.entitlement.observed_plan.as_deref(),
+            Some("partners_business")
+        );
+        assert_eq!(receipt["canonical_plan"], "business");
+        assert_eq!(receipt["subscription_state"], "Paid");
+        assert_eq!(receipt["available"], true);
+        assert_eq!(receipt["target_id"], "zone-a");
+        assert!(receipt["plan_matrix_hash"].as_str().is_some());
+    }
+
+    #[test]
+    fn zone_entitlement_rejects_inactive_or_unmapped_subscription_plans() {
+        let mut capability = CapabilityV1::new(
+            "custom-pages-update",
+            "Update custom page",
+            "PUT",
+            "/zones/{zone_id}/custom_pages/{identifier}",
+        );
+        capability.account_scope = "zone".to_owned();
+        capability.entitlement.requires_live_resolution = true;
+        capability.entitlement.plans = BTreeMap::from([
+            ("free".to_owned(), false),
+            ("pro".to_owned(), true),
+            ("business".to_owned(), true),
+            ("enterprise".to_owned(), true),
+        ]);
+        let response = |state: &str, plan: &str| CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({"state": state, "rate_plan": {"id": plan}}),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+
+        let inactive = apply_zone_entitlement_response(
+            &mut capability,
+            "zone-a",
+            &response("Cancelled", "business"),
+        )
+        .expect_err("inactive subscription");
+        assert!(inactive.to_string().contains("is not active"));
+
+        let unmapped = apply_zone_entitlement_response(
+            &mut capability,
+            "zone-a",
+            &response("Paid", "pro_plus"),
+        )
+        .expect_err("unmapped plan");
+        assert!(unmapped.to_string().contains("cannot be mapped"));
+    }
+
+    #[test]
+    fn zone_entitlement_unblocks_only_a_complete_contract_and_rechecks_drift() {
+        let mut capability = CapabilityV1::new(
+            "custom-pages-delete",
+            "Delete custom page",
+            "DELETE",
+            "/zones/{zone_id}/custom_pages/{identifier}",
+        );
+        capability.account_scope = "zone".to_owned();
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "operation contract incomplete: account entitlement has not been resolved for this plan-gated operation"
+                .to_owned(),
+        );
+        capability.risk = RiskClass::Destructive;
+        capability.effect = EffectClass::Destructive;
+        capability.cost.known = true;
+        capability.cost.maximum = Some(0.0);
+        capability.cost.basis =
+            Some("deleting an existing resource has no incremental operation charge".to_owned());
+        capability.permissions = vec!["Zone Settings Write".to_owned()];
+        capability.verification.strategy =
+            "same_resource_returns_not_found_after_delete".to_owned();
+        capability.rollback.supported = false;
+        capability.rollback.warning =
+            Some("deletion is irreversible without a prior resource snapshot".to_owned());
+        capability.entitlement.requires_live_resolution = true;
+        capability.entitlement.plans = BTreeMap::from([
+            ("free".to_owned(), false),
+            ("pro".to_owned(), true),
+            ("business".to_owned(), true),
+            ("enterprise".to_owned(), true),
+        ]);
+        assert!(
+            should_resolve_zone_entitlement(&capability),
+            "gaps: {:?}",
+            capability.mutation_contract_gaps()
+        );
+        let guide = guide_document(&capability);
+        assert_eq!(guide["contract_state"], "blocked");
+        assert_eq!(guide["next_action"]["argv"][0], "cfctl");
+        assert_eq!(guide["next_action"]["argv"][1], "call");
+        assert!(
+            guide["next_action"]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("live zone-subscription read"))
+        );
+        assert_eq!(guide["stages"][3]["contract_state"], "live_read_required");
+        assert_eq!(guide["stages"][3]["evidence_class"], "live_read");
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "state": "Paid",
+                "rate_plan": {"id": "pro"},
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+
+        let receipt = apply_zone_entitlement_response(&mut capability, "zone-a", &response)
+            .expect("entitlement receipt");
+        assert_eq!(capability.adapter_status, AdapterStatus::DynamicApi);
+        assert!(capability.blocked_reason.is_none());
+        let expected_hash = hash_value(&receipt).expect("receipt hash");
+        validate_entitlement_receipt_precondition(&expected_hash, &capability, &receipt)
+            .expect("unchanged entitlement");
+
+        let mut drifted = receipt;
+        drifted["observed_plan"] = json!("business");
+        let error =
+            validate_entitlement_receipt_precondition(&expected_hash, &capability, &drifted)
+                .expect_err("drift must fail");
+        assert!(error.to_string().contains("drifted after planning"));
+    }
+
+    #[test]
+    fn zone_entitlement_precondition_cannot_be_omitted_from_an_executable_plan() {
+        let mut capability = CapabilityV1::new(
+            "custom-pages-delete",
+            "Delete custom page",
+            "DELETE",
+            "/zones/{zone_id}/custom_pages/{identifier}",
+        );
+        capability.account_scope = "zone".to_owned();
+        capability.entitlement.requires_live_resolution = true;
+        capability.entitlement.available = Some(true);
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("plan");
+
+        let error = required_entitlement_precondition(&plan)
+            .expect_err("missing entitlement precondition must fail");
+        assert!(error.to_string().contains("predates"));
+
+        plan.precondition_hashes.insert(
+            "entitlement".to_owned(),
+            format!("sha256:{}", "a".repeat(64)),
+        );
+        assert_eq!(
+            required_entitlement_precondition(&plan).expect("entitlement precondition"),
+            plan.precondition_hashes
+                .get("entitlement")
+                .map(String::as_str)
         );
     }
 

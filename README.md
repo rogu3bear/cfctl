@@ -152,6 +152,17 @@ before a crash cannot be replayed. The local
 durability suite reopens the state store after an injected crash between every
 journal transition and proves recovery stops at the last persisted checkpoint.
 
+When a zone-scoped mutation is otherwise complete but its official plan matrix
+requires live resolution, `call` reads the exact zone subscription with the
+selected credential. Only active `Trial`, `Provisioned`, or `Paid` canonical
+Free, Pro, Business, or Enterprise plans (including their explicit partner
+variants) are mapped. The resolved capability metadata and normalized receipt
+hash enter the plan, and `plans run` repeats the read before durable
+consumption. Missing Billing Read access, inactive or unfamiliar plans,
+unavailable tiers, and any drift all fail before the Cloudflare mutation
+boundary. Account-level subscription lists remain blocked until each
+product-scoped subscription can be mapped without ambiguity.
+
 `cfctl keys mint` validates every selected permission-group ID against a fresh,
 account-bound live inventory before it creates a plan. The plan binds only the
 normalized ID, name, category, and scopes for the selected groups plus the

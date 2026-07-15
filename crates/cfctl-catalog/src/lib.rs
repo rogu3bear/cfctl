@@ -410,7 +410,7 @@ pub fn attach_official_product_knowledge(
                 );
             }
         }
-        refresh_incomplete_contract_reason(capability);
+        refresh_dynamic_mutation_contract(capability);
     }
     snapshot.refresh_hash()
 }
@@ -952,7 +952,7 @@ fn classify_same_path_object_update_contracts(
             "automatic restoration is unsupported because the plan does not bind a pre-change snapshot; restoration requires a separately reviewed update plan built from trusted evidence"
                 .to_owned(),
         );
-        refresh_incomplete_contract_reason(capability);
+        refresh_dynamic_mutation_contract(capability);
     }
 }
 
@@ -1024,7 +1024,7 @@ fn classify_created_resource_contracts(
             "compensation creates a separate exact-resource delete plan that must be reviewed and explicitly approved"
                 .to_owned(),
         );
-        refresh_incomplete_contract_reason(capability);
+        refresh_dynamic_mutation_contract(capability);
     }
 }
 
@@ -1089,7 +1089,7 @@ fn classify_exact_resource_contracts(capabilities: &mut BTreeMap<String, Capabil
         }
         capability.rollback.supported = false;
         capability.rollback.strategy = None;
-        refresh_incomplete_contract_reason(capability);
+        refresh_dynamic_mutation_contract(capability);
     }
 }
 
@@ -1577,10 +1577,12 @@ fn block_incomplete_dynamic_mutation(capability: &mut CapabilityV1) {
     if capability.adapter_status != AdapterStatus::DynamicApi || !capability.mutating {
         return;
     }
-    refresh_incomplete_contract_reason(capability);
+    refresh_dynamic_mutation_contract(capability);
 }
 
-fn refresh_incomplete_contract_reason(capability: &mut CapabilityV1) {
+/// Re-evaluates an `OpenAPI` mutation after runtime-bound contract metadata,
+/// such as a live entitlement decision, has been attached.
+pub fn refresh_dynamic_mutation_contract(capability: &mut CapabilityV1) {
     let is_incomplete_dynamic = capability.adapter_status == AdapterStatus::DynamicApi
         || (capability.adapter_status == AdapterStatus::Blocked
             && capability
