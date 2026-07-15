@@ -1577,6 +1577,75 @@ async fn exact_resource_deletion_is_verified_by_complete_parent_collection_absen
 }
 
 #[tokio::test]
+async fn parent_collection_deletion_uses_the_hash_bound_selector_identity_pointer() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let read = stream.read(&mut buffer).await.expect("read verification");
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let body = r#"{"success":true,"result":[{"slug":"other-widget"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+        request
+    });
+    let mut plan = dns_record_plan(
+        "widgets-delete",
+        "DELETE",
+        "/accounts/{account_id}/widgets/{slug}",
+        "parent_collection_omits_deleted_resource_id",
+        json!({"account_id":"account-1", "slug":"target-widget"}),
+        None,
+    );
+    plan.capability.deleted_resource = Some(DeletedResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "slug".to_owned(),
+        response_item_identity_pointer: "/slug".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        requires_page_number_completion: false,
+    });
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let request = server.await.expect("server joins");
+    assert!(request.starts_with("GET /client/v4/accounts/account-1/widgets "));
+    assert!(!request.contains("target-widget"));
+}
+
+#[tokio::test]
 async fn paginated_parent_collection_verification_requires_live_completion_metadata() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

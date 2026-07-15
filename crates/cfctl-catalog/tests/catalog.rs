@@ -1472,6 +1472,88 @@ fn exact_resource_updates_use_schema_proven_parent_collection_fields() {
 }
 
 #[test]
+fn parent_collection_contracts_bind_a_schema_proven_selector_named_identity() {
+    let mut document = json!({
+        "openapi":"3.0.3",
+        "info":{"title":"Cloudflare API","version":"4.0.0"},
+        "paths":{
+            "/accounts/{account_id}/widgets":{
+                "get":{
+                    "operationId":"widgets-list",
+                    "summary":"List Widgets",
+                    "tags":["Widgets"],
+                    "parameters":[
+                        {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}}
+                    ],
+                    "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
+                        "type":"object",
+                        "properties":{"result":{"type":"array","items":{"type":"object","properties":{
+                            "slug":{"type":"string"},"name":{"type":"string"}
+                        }}}}
+                    }}}}}
+                }
+            },
+            "/accounts/{account_id}/widgets/{slug}":{
+                "parameters":[
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+                    {"in":"path","name":"slug","required":true,"schema":{"type":"string"}}
+                ],
+                "delete":{
+                    "operationId":"widgets-delete",
+                    "summary":"Delete Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"]
+                },
+                "patch":{
+                    "operationId":"widgets-update",
+                    "summary":"Update Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "type":"object","properties":{"name":{"type":"string"}}
+                    }}}}
+                }
+            }
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("selector identity catalog");
+    let deleted = snapshot
+        .get("widgets-delete")
+        .and_then(|capability| capability.deleted_resource.as_ref())
+        .expect("selector-backed delete contract");
+    assert_eq!(deleted.identity_selector, "slug");
+    assert_eq!(deleted.response_item_identity_pointer, "/slug");
+    let updated = snapshot
+        .get("widgets-update")
+        .and_then(|capability| capability.updated_resource.as_ref())
+        .expect("selector-backed update contract");
+    assert_eq!(updated.identity_selector, "slug");
+    assert_eq!(updated.response_item_identity_pointer, "/slug");
+    assert_eq!(updated.verified_response_fields, ["name"]);
+
+    document["paths"]["/accounts/{account_id}/widgets"]["get"]["responses"]["200"]["content"]["application/json"]
+        ["schema"]["properties"]["result"]["items"]["properties"]["slug"]["type"] =
+        json!("integer");
+    let incompatible =
+        normalize_openapi(&document).expect("incompatible selector identity catalog");
+    assert!(
+        incompatible
+            .get("widgets-delete")
+            .expect("delete widget")
+            .deleted_resource
+            .is_none()
+    );
+    assert!(
+        incompatible
+            .get("widgets-update")
+            .expect("update widget")
+            .updated_resource
+            .is_none()
+    );
+}
+
+#[test]
 fn parent_collection_update_contracts_reject_unobservable_fields_and_update_modes() {
     let mut document = json!({
         "openapi": "3.0.3",

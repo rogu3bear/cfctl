@@ -1824,7 +1824,17 @@ fn validate_created_resource_target(capability: &CapabilityV1, input: &CallInput
 }
 
 fn selector_can_be_response_id(selector: &str) -> bool {
-    selector == "id" || selector.ends_with("_id") || selector.ends_with("_identifier")
+    matches!(selector, "id" | "identifier")
+        || selector.ends_with("_id")
+        || selector.ends_with("_identifier")
+}
+
+fn response_item_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
+    (selector_can_be_response_id(selector) && pointer == "/id")
+        || (!selector
+            .chars()
+            .any(|character| matches!(character, '/' | '~'))
+            && pointer.strip_prefix('/') == Some(selector))
 }
 
 fn validate_created_collection_resource_target(
@@ -1894,7 +1904,10 @@ fn validate_deleted_resource_target(capability: &CapabilityV1, input: &CallInput
     );
     if target.identity_selector.is_empty()
         || capability.path != expected_path
-        || target.response_item_identity_pointer != "/id"
+        || !response_item_identity_pointer_supported(
+            &target.identity_selector,
+            &target.response_item_identity_pointer,
+        )
         || target.read_capability_id.is_empty()
         || input
             .selectors
@@ -1934,7 +1947,10 @@ fn validate_updated_resource_target(capability: &CapabilityV1, input: &CallInput
     );
     if target.identity_selector.is_empty()
         || capability.path != expected_path
-        || target.response_item_identity_pointer != "/id"
+        || !response_item_identity_pointer_supported(
+            &target.identity_selector,
+            &target.response_item_identity_pointer,
+        )
         || target.read_capability_id.is_empty()
         || input
             .selectors

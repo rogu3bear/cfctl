@@ -212,6 +212,61 @@ fn deleted_resource_contract_rejects_body_and_nonpath_controls() {
 }
 
 #[test]
+fn collection_resource_contracts_require_an_exact_safe_identity_pointer() {
+    let mut deletion = CapabilityV1::new(
+        "widgets-delete",
+        "Delete widget",
+        "DELETE",
+        "/accounts/{account_id}/widgets/{slug}",
+    );
+    deletion.verification.strategy = "parent_collection_omits_deleted_resource_id".to_owned();
+    deletion.deleted_resource = Some(cfctl_core::DeletedResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "slug".to_owned(),
+        response_item_identity_pointer: "/slug".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        requires_page_number_completion: false,
+    });
+    assert!(deletion.verification_contract_supported());
+
+    deletion
+        .deleted_resource
+        .as_mut()
+        .expect("deleted-resource contract")
+        .response_item_identity_pointer = "/id".to_owned();
+    assert!(!deletion.verification_contract_supported());
+
+    let mut update = CapabilityV1::new(
+        "widgets-update",
+        "Update widget",
+        "PATCH",
+        "/accounts/{account_id}/widgets/{slug}",
+    );
+    update.verification.strategy =
+        "parent_collection_item_contains_planned_fields_after_update".to_owned();
+    update.request_schema = Some(json!({
+        "type": "object",
+        "properties": {"name": {"type": "string"}}
+    }));
+    update.updated_resource = Some(UpdatedResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "slug".to_owned(),
+        response_item_identity_pointer: "/slug".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+        requires_page_number_completion: false,
+    });
+    assert!(update.verification_contract_supported());
+
+    update
+        .updated_resource
+        .as_mut()
+        .expect("updated-resource contract")
+        .response_item_identity_pointer = "/slug/nested".to_owned();
+    assert!(!update.verification_contract_supported());
+}
+
+#[test]
 fn same_path_read_contracts_require_hash_bound_canonical_fields() {
     let mut update = CapabilityV1::new(
         "widgets-update",

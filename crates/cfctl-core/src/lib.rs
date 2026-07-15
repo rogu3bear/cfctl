@@ -749,7 +749,10 @@ impl CapabilityV1 {
             );
             !target.identity_selector.is_empty()
                 && self.path == expected_path
-                && target.response_item_identity_pointer == "/id"
+                && response_item_identity_pointer_supported(
+                    &target.identity_selector,
+                    &target.response_item_identity_pointer,
+                )
                 && !target.read_capability_id.is_empty()
         })
     }
@@ -766,7 +769,10 @@ impl CapabilityV1 {
             };
             !target.identity_selector.is_empty()
                 && self.path == expected_path
-                && target.response_item_identity_pointer == "/id"
+                && response_item_identity_pointer_supported(
+                    &target.identity_selector,
+                    &target.response_item_identity_pointer,
+                )
                 && !target.read_capability_id.is_empty()
                 && !request_fields.is_empty()
                 && target.verified_response_fields == request_fields
@@ -780,6 +786,14 @@ impl CapabilityV1 {
                     .all(|fields| fields[0] < fields[1])
         })
     }
+}
+
+fn response_item_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
+    (selector_can_be_response_id(selector) && pointer == "/id")
+        || (!selector
+            .chars()
+            .any(|character| matches!(character, '/' | '~'))
+            && pointer.strip_prefix('/') == Some(selector))
 }
 
 const MAX_REQUEST_OBJECT_SCHEMA_DEPTH: usize = 64;
@@ -944,7 +958,9 @@ fn path_targets_exact_resource(path: &str) -> bool {
 }
 
 fn selector_can_be_response_id(selector: &str) -> bool {
-    selector == "id" || selector.ends_with("_id") || selector.ends_with("_identifier")
+    matches!(selector, "id" | "identifier")
+        || selector.ends_with("_id")
+        || selector.ends_with("_identifier")
 }
 
 fn infer_scope(path: &str) -> &'static str {
