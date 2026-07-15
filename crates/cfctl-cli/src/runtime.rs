@@ -5248,13 +5248,7 @@ fn capability_call_argv(capability: &CapabilityV1) -> Option<Vec<String>> {
         );
         argv.push(format!("{}=<{}>", selector.name, selector.name));
     }
-    if capability
-        .request_schema
-        .as_ref()
-        .and_then(|schema| schema.get("x-cfctl-body-required"))
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
+    if capability_has_meaningful_request_body(capability) {
         argv.push("--body-stdin".to_owned());
     }
     if capability.risk == RiskClass::SecretSensitive {
@@ -5262,6 +5256,25 @@ fn capability_call_argv(capability: &CapabilityV1) -> Option<Vec<String>> {
     }
     argv.push("--json".to_owned());
     Some(argv)
+}
+
+fn capability_has_meaningful_request_body(capability: &CapabilityV1) -> bool {
+    let Some(schema) = capability.request_schema.as_ref() else {
+        return false;
+    };
+    if schema.get("x-cfctl-body-required").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    if capability
+        .request_object_fields()
+        .is_some_and(|fields| !fields.is_empty())
+    {
+        return true;
+    }
+    schema
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value_type| value_type != "object")
 }
 
 fn guide_next_action(
@@ -5944,10 +5957,10 @@ mod tests {
         CallInput, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions, PlanAuthority,
         apply_d1_read_replication_state_response, apply_dns_record_state_response,
         apply_global_warp_override_state_response, apply_zone_account_response,
-        apply_zone_entitlement_response, boundary_response_artifact, compensation_request,
-        find_secret_value, guide_document, is_live_plan_precondition_hash, persist_prepared_plan,
-        persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
-        query_object_from_pairs, redact_secret_result,
+        apply_zone_entitlement_response, boundary_response_artifact, capability_call_argv,
+        compensation_request, find_secret_value, guide_document, is_live_plan_precondition_hash,
+        persist_prepared_plan, persist_secret_lifecycle, preflight_call_input,
+        preserve_previous_catalog, query_object_from_pairs, redact_secret_result,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
         required_zone_account_precondition, should_bind_d1_read_replication_state,
@@ -7783,6 +7796,58 @@ mod tests {
                 "--json"
             ])
         );
+    }
+
+    #[test]
+    fn guide_requests_optional_meaningful_bodies_without_prompting_for_empty_objects() {
+        let mut queue_update = CapabilityV1::new(
+            "queues-update-partial",
+            "Update Queue configuration",
+            "PATCH",
+            "/accounts/{account_id}/queues/{queue_id}",
+        );
+        queue_update.request_schema = Some(json!({
+            "type":"object",
+            "x-cfctl-body-required":false,
+            "properties":{
+                "settings":{
+                    "type":"object",
+                    "properties":{"delivery_paused":{"type":"boolean"}}
+                }
+            }
+        }));
+
+        let queue_argv = capability_call_argv(&queue_update).expect("Queue call argv");
+        assert!(queue_argv.iter().any(|argument| argument == "--body-stdin"));
+
+        let mut empty_object = CapabilityV1::new(
+            "widgets-touch",
+            "Touch widget",
+            "POST",
+            "/accounts/{account_id}/widgets/{widget_id}/touch",
+        );
+        empty_object.request_schema = Some(json!({
+            "type":"object",
+            "x-cfctl-body-required":false,
+            "properties":{}
+        }));
+        let empty_argv = capability_call_argv(&empty_object).expect("empty object call argv");
+        assert!(!empty_argv.iter().any(|argument| argument == "--body-stdin"));
+
+        for request_schema in [
+            json!({"type":"array", "items":{"type":"string"}}),
+            json!({"type":"string"}),
+        ] {
+            let mut capability = CapabilityV1::new(
+                "widgets-import",
+                "Import widgets",
+                "POST",
+                "/accounts/{account_id}/widgets/import",
+            );
+            capability.request_schema = Some(request_schema);
+            let argv = capability_call_argv(&capability).expect("non-object call argv");
+            assert!(argv.iter().any(|argument| argument == "--body-stdin"));
+        }
     }
 
     #[test]
