@@ -243,6 +243,7 @@ impl Executor {
                 },
             ));
         }
+        validate_verification_preconditions(&plan.capability, input)?;
         let mut request = self.builder.build_unchecked(&plan.capability, input)?;
         request.headers.insert(
             HeaderName::from_static("idempotency-key"),
@@ -362,6 +363,11 @@ impl Executor {
                 .verify_exact_resource_update(plan, apply_response, &input, credential)
                 .await;
         }
+        if strategy == "created_resource_contains_planned_fields_by_returned_id" {
+            return self
+                .verify_created_resource(plan, apply_response, &input, credential)
+                .await;
+        }
 
         Err(CloudflareError::UnsupportedVerificationStrategy(
             strategy.to_owned(),
@@ -451,6 +457,94 @@ impl Executor {
                 apply_response.success,
                 readback.status,
                 readback.success,
+                render_field_names(&mismatches)
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback,
+        })
+    }
+
+    async fn verify_created_resource(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let target = plan.capability.created_resource.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the hash-bound created-resource contract is absent".to_owned(),
+            )
+        })?;
+        let planned = input
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .filter(|body| !body.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "planned create body is absent, empty, or not an object".to_owned(),
+                )
+            })?;
+        let resource_id = apply_response
+            .result
+            .pointer(&target.response_result_identity_pointer)
+            .and_then(Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the successful creation response has no non-empty schema-proven identity"
+                        .to_owned(),
+                )
+            })?;
+        let mut selectors = input.selectors.as_object().cloned().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "planned create selectors are not an object".to_owned(),
+            )
+        })?;
+        selectors.insert(
+            target.identity_selector.clone(),
+            Value::String(resource_id.to_owned()),
+        );
+        let details = CapabilityV1::new(
+            &target.read_capability_id,
+            "Created resource verification readback",
+            "GET",
+            &target.detail_path,
+        );
+        let request = self.builder.build(
+            &details,
+            &CallInput {
+                selectors: Value::Object(selectors),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let readback_identity = readback
+            .result
+            .pointer(&target.response_result_identity_pointer)
+            .and_then(Value::as_str);
+        let mismatches = mismatched_planned_fields(planned, &readback.result);
+        let passed = apply_response.success
+            && readback.success
+            && readback_identity == Some(resource_id)
+            && mismatches.is_empty();
+        let basis = if passed {
+            "the exact created-resource readback matched the returned identity and every planned field"
+                .to_owned()
+        } else {
+            format!(
+                "created resource was not proven (apply success={}, readback HTTP {}, readback success={}, identity match={}, fields={})",
+                apply_response.success,
+                readback.status,
+                readback.success,
+                readback_identity == Some(resource_id),
                 render_field_names(&mismatches)
             )
         };
@@ -879,6 +973,48 @@ fn render_field_names(fields: &[String]) -> String {
     } else {
         fields.join(",")
     }
+}
+
+fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    let strategy = capability.verification.strategy.as_str();
+    let body_label = match strategy {
+        "created_resource_contains_planned_fields_by_returned_id"
+        | "dns_record_details_match_created_id_and_planned_fields" => Some("create"),
+        "same_resource_contains_planned_fields_after_update"
+        | "dns_record_details_match_planned_id_and_fields" => Some("update"),
+        _ => None,
+    };
+    if let Some(label) = body_label {
+        input
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .filter(|body| !body.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(format!(
+                    "planned {label} body is absent, empty, or not an object"
+                ))
+            })?;
+    }
+    if strategy == "created_resource_contains_planned_fields_by_returned_id" {
+        let target = capability.created_resource.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the hash-bound created-resource contract is absent".to_owned(),
+            )
+        })?;
+        let expected_suffix = format!("/{{{}}}", target.identity_selector);
+        if target.identity_selector.is_empty()
+            || !target.detail_path.ends_with(&expected_suffix)
+            || !target.response_result_identity_pointer.starts_with('/')
+            || target.read_capability_id.is_empty()
+            || target.delete_capability_id.is_empty()
+        {
+            return Err(CloudflareError::MissingVerificationTarget(
+                "the hash-bound created-resource contract is malformed".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_request_body(capability: &CapabilityV1, body: Option<&Value>) -> Result<()> {

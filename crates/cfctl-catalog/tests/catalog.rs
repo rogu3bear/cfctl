@@ -516,6 +516,142 @@ fn exact_resource_updates_pair_with_same_path_field_readback_contracts() {
     assert_eq!(coverage.rollback_contracts, 2);
 }
 
+fn create_lifecycle_fixture() -> serde_json::Value {
+    json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "components": {
+            "schemas": {
+                "Widget": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type":"string"},
+                        "name": {"type":"string"}
+                    }
+                },
+                "WidgetResponse": {
+                    "type": "object",
+                    "properties": {
+                        "success": {"type":"boolean"},
+                        "result": {"$ref":"#/components/schemas/Widget"}
+                    }
+                }
+            }
+        },
+        "paths": {
+            "/accounts/{account_id}/widgets": {
+                "post": {
+                    "operationId":"widgets-create",
+                    "summary":"Create Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"],
+                    "responses": {
+                        "201": {
+                            "description":"Widget created",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref":"#/components/schemas/WidgetResponse"}
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/accounts/{account_id}/widgets/{widget_id}": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+                    {"in":"path","name":"widget_id","required":true,"schema":{"type":"string"}}
+                ],
+                "get": {
+                    "operationId":"widgets-get",
+                    "summary":"Get Widget",
+                    "tags":["Widgets"]
+                },
+                "delete": {
+                    "operationId":"widgets-delete",
+                    "summary":"Delete Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"]
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn create_contract_binds_a_schema_proven_id_and_exact_read_delete_pair() {
+    let document = create_lifecycle_fixture();
+
+    let snapshot = normalize_openapi(&document).expect("widget catalog");
+    let create = snapshot.get("widgets-create").expect("create widget");
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    assert!(create.rollback.supported);
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    let target = create
+        .created_resource
+        .as_ref()
+        .expect("created-resource target");
+    assert_eq!(
+        target.detail_path,
+        "/accounts/{account_id}/widgets/{widget_id}"
+    );
+    assert_eq!(target.identity_selector, "widget_id");
+    assert_eq!(target.response_result_identity_pointer, "/id");
+    assert_eq!(target.read_capability_id, "widgets-get");
+    assert_eq!(target.delete_capability_id, "widgets-delete");
+}
+
+#[test]
+fn create_contract_rejects_an_undocumented_response_identity() {
+    let mut document = create_lifecycle_fixture();
+    document["paths"]["/accounts/{account_id}/widgets"]["post"]["responses"]["201"]["content"]["application/json"]
+        ["schema"] = json!({
+        "type":"object",
+        "properties":{"result":{"type":"object"}}
+    });
+
+    let snapshot = normalize_openapi(&document).expect("opaque widget catalog");
+    let opaque = snapshot.get("widgets-create").expect("opaque create");
+    assert_ne!(
+        opaque.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    assert!(!opaque.rollback.supported);
+}
+
+#[test]
+fn create_contract_rejects_ambiguous_direct_child_resource_paths() {
+    let mut document = create_lifecycle_fixture();
+    document["paths"]["/accounts/{account_id}/widgets/{widget_key}"] = json!({
+        "get": {
+            "operationId":"widgets-get-by-key",
+            "summary":"Get Widget by Key",
+            "tags":["Widgets"]
+        },
+        "delete": {
+            "operationId":"widgets-delete-by-key",
+            "summary":"Delete Widget by Key",
+            "tags":["Widgets"],
+            "x-api-token-group":["Widgets Write"]
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("ambiguous widget catalog");
+    let ambiguous = snapshot.get("widgets-create").expect("ambiguous create");
+    assert!(ambiguous.created_resource.is_none());
+    assert_ne!(
+        ambiguous.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    assert!(!ambiguous.rollback.supported);
+}
+
 fn pricing_feeds_fixture() -> OfficialTextFeedsV1 {
     OfficialTextFeedsV1 {
         fetched_at: Utc::now(),

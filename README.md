@@ -142,6 +142,14 @@ field without copying record contents into the verification basis. DNS batch,
 import, scan, and review operations remain blocked pending their distinct
 operation contracts.
 
+For other creates, cfctl only derives a lifecycle when the official success
+schema declares a string `result.id` and exactly one same-product child path
+supports both GET and DELETE. The plan binds that path, response pointer, and
+capability IDs. Live verification reads the returned resource and compares
+every planned field; rectification can draft only the exact bound delete.
+Ambiguous paths, undocumented identities, unknown cost, and unresolved risk or
+entitlement stay blocked.
+
 DNS record API mutations have a known zero direct incremental charge, while
 Enterprise DNS query volume and the Workers, storage, traffic, or other
 products reached through the record can have plan-specific downstream pricing.

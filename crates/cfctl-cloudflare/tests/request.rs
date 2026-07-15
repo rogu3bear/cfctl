@@ -2,7 +2,7 @@
 
 use cfctl_auth::AuthCredential;
 use cfctl_cloudflare::{CallInput, CloudflareResponseV1, Executor, RequestBuilder};
-use cfctl_core::{CapabilityV1, PlanV1};
+use cfctl_core::{CapabilityV1, CreatedResourceContractV1, PlanStatus, PlanV1};
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -779,6 +779,171 @@ async fn exact_resource_update_is_verified_by_same_path_planned_fields() {
     assert!(request.starts_with("GET /client/v4/accounts/account-1/widgets/widget-1 "));
     assert!(!request.contains("mutation_mode"));
     assert!(!request.contains("mutation-etag"));
+}
+
+#[tokio::test]
+async fn created_resource_is_read_back_by_schema_proven_id_and_planned_fields() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let read = stream.read(&mut buffer).await.expect("read verification");
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let body = r#"{"success":true,"result":{"id":"widget-1","name":"created","settings":{"enabled":true},"server_default":"kept"},"errors":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+        request
+    });
+    let mut plan = dns_record_plan(
+        "widgets-create",
+        "POST",
+        "/accounts/{account_id}/widgets",
+        "created_resource_contains_planned_fields_by_returned_id",
+        json!({"account_id":"account-1"}),
+        Some(json!({"name":"created", "settings":{"enabled":true}})),
+    );
+    plan.capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/widgets/{widget_id}".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-get".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
+    });
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({"account_id":"account-1"}),
+        query: json!({"mutation_mode":"replace"}),
+        body: Some(json!({"name":"created", "settings":{"enabled":true}})),
+        if_match: Some("mutation-etag".to_owned()),
+        ..CallInput::default()
+    })
+    .expect("input");
+    let apply = CloudflareResponseV1 {
+        status: 201,
+        success: true,
+        result: json!({"id":"widget-1"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let request = server.await.expect("server joins");
+    assert!(request.starts_with("GET /client/v4/accounts/account-1/widgets/widget-1 "));
+    assert!(!request.contains("mutation_mode"));
+    assert!(!request.contains("mutation-etag"));
+    assert!(!request.contains("\"name\":\"created\""));
+}
+
+#[tokio::test]
+async fn created_resource_verification_fails_closed_without_returned_identity() {
+    let mut plan = dns_record_plan(
+        "widgets-create",
+        "POST",
+        "/accounts/{account_id}/widgets",
+        "created_resource_contains_planned_fields_by_returned_id",
+        json!({"account_id":"account-1"}),
+        Some(json!({"name":"secret-like-planned-name"})),
+    );
+    plan.capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/widgets/{widget_id}".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-get".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
+    });
+    let apply = CloudflareResponseV1 {
+        status: 201,
+        success: true,
+        result: json!({"name":"secret-like-live-name"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor =
+        Executor::new(reqwest::Client::new(), "http://127.0.0.1:9/client/v4").expect("executor");
+
+    let error = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect_err("missing identity must fail closed")
+        .to_string();
+
+    assert!(error.contains("identity"));
+    assert!(!error.contains("secret-like-planned-name"));
+    assert!(!error.contains("secret-like-live-name"));
+}
+
+#[tokio::test]
+async fn created_resource_without_planned_fields_is_rejected_before_the_mutation_boundary() {
+    let mut plan = dns_record_plan(
+        "widgets-create",
+        "POST",
+        "/accounts/{account_id}/widgets",
+        "created_resource_contains_planned_fields_by_returned_id",
+        json!({"account_id":"account-1"}),
+        Some(json!({})),
+    );
+    plan.capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/widgets/{widget_id}".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-get".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
+    });
+    plan.status = PlanStatus::Consumed;
+    let input: CallInput = serde_json::from_value(plan.input.clone()).expect("input");
+    let catalog_hash = plan.catalog_hash.clone();
+    let executor =
+        Executor::new(reqwest::Client::new(), "http://127.0.0.1:9/client/v4").expect("executor");
+
+    let error = executor
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            &catalog_hash,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect_err("empty planned fields must fail before network execution")
+        .to_string();
+
+    assert!(error.contains("planned create body"));
+    assert_eq!(plan.status, PlanStatus::Consumed);
 }
 
 #[tokio::test]

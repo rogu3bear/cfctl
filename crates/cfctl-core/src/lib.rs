@@ -190,6 +190,19 @@ pub struct RollbackSpecV1 {
     pub warning: Option<String>,
 }
 
+/// Hash-bound coordinates for proving and compensating a newly created
+/// Cloudflare resource. The identity pointer is relative to the API response's
+/// `result` object; callers must not infer any of these values from mutable
+/// runtime input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedResourceContractV1 {
+    pub detail_path: String,
+    pub identity_selector: String,
+    pub response_result_identity_pointer: String,
+    pub read_capability_id: String,
+    pub delete_capability_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityV1 {
     pub schema_version: u8,
@@ -211,6 +224,8 @@ pub struct CapabilityV1 {
     pub cost: CostV1,
     pub verification: VerificationSpecV1,
     pub rollback: RollbackSpecV1,
+    #[serde(default)]
+    pub created_resource: Option<CreatedResourceContractV1>,
     pub adapter_status: AdapterStatus,
     pub blocked_reason: Option<String>,
     pub request_schema: Option<Value>,
@@ -279,6 +294,7 @@ impl CapabilityV1 {
                     Some("rollback semantics have not been declared".to_owned())
                 },
             },
+            created_resource: None,
             adapter_status: AdapterStatus::DynamicApi,
             blocked_reason: None,
             request_schema: None,

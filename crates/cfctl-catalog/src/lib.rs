@@ -7,8 +7,8 @@ use std::{
 };
 
 use cfctl_core::{
-    AdapterStatus, BillingModelV1, CapabilityV1, CostExposureV1, EffectClass, KnowledgeReferenceV1,
-    Maturity, RiskClass, SelectorV1, hash_value,
+    AdapterStatus, BillingModelV1, CapabilityV1, CostExposureV1, CreatedResourceContractV1,
+    EffectClass, KnowledgeReferenceV1, Maturity, RiskClass, SelectorV1, hash_value,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -776,6 +776,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
         .and_then(Value::as_object)
         .ok_or(CatalogError::MissingPaths)?;
     let mut capabilities = BTreeMap::new();
+    let mut creates_with_schema_proven_string_ids = BTreeSet::new();
 
     for (path, path_item) in paths {
         let Some(operations) = path_item.as_object() else {
@@ -837,6 +838,9 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
                 })
                 .unwrap_or_default();
             capability.maturity = maturity(operation_object);
+            if method == "post" && success_response_declares_result_string_id(document, operation) {
+                creates_with_schema_proven_string_ids.insert(id.clone());
+            }
             classify(&mut capability);
             block_incomplete_dynamic_mutation(&mut capability);
             capabilities.insert(id, capability);
@@ -844,6 +848,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     }
 
     classify_exact_resource_contracts(&mut capabilities);
+    classify_created_resource_contracts(&mut capabilities, &creates_with_schema_proven_string_ids);
 
     let source_hash = hash_value(document)?;
     let mut snapshot = CatalogSnapshot {
@@ -856,6 +861,91 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     };
     snapshot.refresh_hash()?;
     Ok(snapshot)
+}
+
+fn classify_created_resource_contracts(
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+    creates_with_schema_proven_string_ids: &BTreeSet<String>,
+) {
+    let read_targets = capabilities
+        .values()
+        .filter(|capability| {
+            capability.method == "GET" && path_targets_exact_resource(&capability.path)
+        })
+        .map(|capability| {
+            (
+                (capability.path.clone(), capability.product.clone()),
+                capability.id.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let delete_targets = capabilities
+        .values()
+        .filter(|capability| {
+            capability.method == "DELETE" && path_targets_exact_resource(&capability.path)
+        })
+        .map(|capability| {
+            (
+                (capability.path.clone(), capability.product.clone()),
+                capability.id.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for capability in capabilities.values_mut() {
+        if capability.method != "POST"
+            || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
+            || !creates_with_schema_proven_string_ids.contains(&capability.id)
+        {
+            continue;
+        }
+
+        let candidates = read_targets
+            .iter()
+            .filter_map(|((detail_path, product), read_capability_id)| {
+                if product != &capability.product {
+                    return None;
+                }
+                let identity_selector = direct_child_selector(&capability.path, detail_path)?;
+                let delete_capability_id =
+                    delete_targets.get(&(detail_path.clone(), product.clone()))?;
+                Some(CreatedResourceContractV1 {
+                    detail_path: detail_path.clone(),
+                    identity_selector,
+                    response_result_identity_pointer: "/id".to_owned(),
+                    read_capability_id: read_capability_id.clone(),
+                    delete_capability_id: delete_capability_id.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let [target] = candidates.as_slice() else {
+            continue;
+        };
+
+        capability.created_resource = Some(target.clone());
+        "created_resource_contains_planned_fields_by_returned_id"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.rollback.warning = Some(
+            "compensation creates a separate exact-resource delete plan that must be reviewed and explicitly approved"
+                .to_owned(),
+        );
+        refresh_incomplete_contract_reason(capability);
+    }
+}
+
+fn direct_child_selector(collection_path: &str, detail_path: &str) -> Option<String> {
+    let prefix = format!("{}/", collection_path.trim_end_matches('/'));
+    let segment = detail_path.strip_prefix(&prefix)?;
+    if segment.contains('/') {
+        return None;
+    }
+    segment
+        .strip_prefix('{')
+        .and_then(|segment| segment.strip_suffix('}'))
+        .filter(|selector| !selector.is_empty())
+        .map(str::to_owned)
 }
 
 fn classify_exact_resource_contracts(capabilities: &mut BTreeMap<String, CapabilityV1>) {
@@ -963,6 +1053,74 @@ fn request_schema_contract(document: &Value, operation: &Value) -> Option<Value>
             .unwrap_or(Value::Bool(false)),
     );
     Some(Value::Object(contract))
+}
+
+fn success_response_declares_result_string_id(document: &Value, operation: &Value) -> bool {
+    operation
+        .get("responses")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(status, _)| status.starts_with('2'))
+        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
+        .any(|schema| schema_declares_string_path(document, schema, &["result", "id"], 0))
+}
+
+fn schema_declares_string_path(
+    document: &Value,
+    schema: &Value,
+    path: &[&str],
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                schema_declares_string_path(document, resolved, path, depth + 1)
+            });
+    }
+    if path.is_empty() {
+        return schema.get("type").and_then(Value::as_str) == Some("string")
+            || schema
+                .get("allOf")
+                .and_then(Value::as_array)
+                .is_some_and(|members| {
+                    members.iter().any(|member| {
+                        schema_declares_string_path(document, member, path, depth + 1)
+                    })
+                });
+    }
+    if let Some(property) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(path[0]))
+    {
+        return schema_declares_string_path(document, property, &path[1..], depth + 1);
+    }
+    if schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| schema_declares_string_path(document, member, path, depth + 1))
+        })
+    {
+        return true;
+    }
+    for alternative in ["oneOf", "anyOf"] {
+        if let Some(members) = schema.get(alternative).and_then(Value::as_array) {
+            return !members.is_empty()
+                && members
+                    .iter()
+                    .all(|member| schema_declares_string_path(document, member, path, depth + 1));
+        }
+    }
+    false
 }
 
 fn resolve_local_schema<'a>(document: &'a Value, schema: &'a Value) -> &'a Value {

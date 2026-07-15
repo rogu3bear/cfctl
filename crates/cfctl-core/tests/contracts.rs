@@ -1,8 +1,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use cfctl_core::{
-    AdapterStatus, CapabilityV1, CostV1, EffectClass, EvidenceClass, EvidenceV1, GuideStage,
-    PlanStatus, PlanV1, ResultEnvelopeV2, RiskClass, TransactionStageV1, guide_stages, redact_json,
+    AdapterStatus, CapabilityV1, CostV1, CreatedResourceContractV1, EffectClass, EvidenceClass,
+    EvidenceV1, GuideStage, PlanStatus, PlanV1, ResultEnvelopeV2, RiskClass, TransactionStageV1,
+    guide_stages, redact_json,
 };
 use serde_json::json;
 
@@ -145,10 +146,21 @@ fn plan_hash_binds_all_reviewed_content_and_is_not_replayable_after_consumption(
     plan.refresh_hash().expect("precondition must rehash");
     assert_ne!(original, plan.content_hash);
     let with_precondition = plan.content_hash.clone();
+    plan.capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/zones/{zone_id}/dns_records/{record_id}".to_owned(),
+        identity_selector: "record_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "dns.records.get".to_owned(),
+        delete_capability_id: "dns.records.delete".to_owned(),
+    });
+    plan.refresh_hash()
+        .expect("created-resource contract must rehash");
+    assert_ne!(with_precondition, plan.content_hash);
+    let with_created_resource_contract = plan.content_hash.clone();
     plan.targets = json!({"zone_id":"zone-a","record_id":"record-b"});
     plan.refresh_hash().expect("test fixture must rehash");
 
-    assert_ne!(with_precondition, plan.content_hash);
+    assert_ne!(with_created_resource_contract, plan.content_hash);
     assert_eq!(plan.status, PlanStatus::Draft);
     plan.approve(true, None)
         .expect("test fixture must approve with explicit yes");
