@@ -344,6 +344,54 @@ fn cloudflare_tunnel_configuration_restore_strategy_is_bound_to_exact_routing_co
 }
 
 #[test]
+fn warp_connector_configuration_restore_strategy_is_bound_to_exact_mesh_ha_contract() {
+    let request_schema = serde_json::from_str(include_str!(
+        "fixtures/warp-connector-configuration-update-request-schema.json"
+    ))
+    .expect("pinned WARP Connector configuration schema");
+    let mut capability = CapabilityV1::new(
+        "cloudflare-tunnel-configuration-update-warp-connector-configuration",
+        "Update WARP Connector configuration",
+        "PUT",
+        "/accounts/{account_id}/warp_connector/{tunnel_id}/configurations",
+    );
+    capability.mutating = true;
+    capability.account_scope = "account".to_owned();
+    capability.product = "Cloudflare Tunnel Configuration".to_owned();
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("restore_warp_connector_configuration_prior_snapshot".to_owned());
+    capability.request_schema = Some(request_schema);
+    capability.verification.strategy =
+        "same_path_result_contains_planned_fields_after_update".to_owned();
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/accounts/{account_id}/warp_connector/{tunnel_id}/configurations".to_owned(),
+        read_capability_id: "cloudflare-tunnel-configuration-get-warp-connector-configuration"
+            .to_owned(),
+        verified_response_fields: vec!["config".to_owned(), "ha_mode".to_owned()],
+    });
+
+    assert!(capability.rollback_contract_supported());
+
+    let mut grafted = capability.clone();
+    grafted.id = "widgets-update".to_owned();
+    assert!(!grafted.rollback_contract_supported());
+
+    let mut broadened = capability.clone();
+    broadened.request_schema.as_mut().expect("request schema")["properties"]["config"]["oneOf"]
+        [1]["properties"]["routing_table"] = json!({"type":"string"});
+    assert!(!broadened.rollback_contract_supported());
+
+    let mut wrong_read = capability;
+    wrong_read
+        .same_path_read
+        .as_mut()
+        .expect("same-path read")
+        .verified_response_fields = vec!["ha_mode".to_owned()];
+    assert!(!wrong_read.rollback_contract_supported());
+}
+
+#[test]
 fn dns_record_restore_strategy_is_bound_to_the_exact_official_update_contract() {
     let request_schema = serde_json::from_str(include_str!(
         "fixtures/dns-record-update-request-schema.json"

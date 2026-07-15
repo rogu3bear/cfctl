@@ -1,0 +1,58 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "config": {
+      "nullable": true,
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fnr_id": {"type": "string"}
+          },
+          "required": ["fnr_id"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "vips": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {"address": {"type": "string"}},
+                "required": ["address"],
+                "type": "object"
+              },
+              "maxItems": 8,
+              "minItems": 1,
+              "type": "array"
+            },
+            "vips_previous": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {"address": {"type": "string"}},
+                "required": ["address"],
+                "type": "object"
+              },
+              "maxItems": 8,
+              "type": "array"
+            }
+          },
+          "required": ["vips"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "type": "object"
+        }
+      ],
+      "type": "object"
+    },
+    "ha_mode": {
+      "enum": ["none", "disabled", "aws", "local"],
+      "type": "string"
+    }
+  },
+  "required": ["ha_mode"],
+  "type": "object",
+  "x-cfctl-body-required": true
+}

@@ -957,6 +957,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     finalize_global_warp_override_rollback_contract(&mut capabilities);
     finalize_d1_read_replication_rollback_contract(&mut capabilities);
     finalize_cloudflare_tunnel_configuration_rollback_contract(&mut capabilities);
+    finalize_warp_connector_configuration_rollback_contract(&mut capabilities);
     finalize_dns_record_rollback_contract(document, &mut capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
@@ -3472,6 +3473,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         classify_cloudflare_tunnel_lifecycle(capability, kind);
     } else if cloudflare_tunnel_configuration_contract_supported(capability) {
         classify_cloudflare_tunnel_configuration(capability);
+    } else if warp_connector_configuration_contract_supported(capability) {
+        classify_warp_connector_configuration(capability);
     } else if let Some(kind) = queue_configuration_kind(capability) {
         classify_queue_configuration(capability, kind);
     } else {
@@ -4697,6 +4700,315 @@ fn finalize_cloudflare_tunnel_configuration_rollback_contract(
     }
     capability.rollback.warning = Some(
         "rectification derives a separate hash-bound Tunnel configuration PUT plan from the exact prior routing snapshot; it never runs automatically and requires explicit approval"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
+
+const WARP_CONNECTOR_CONFIGURATION_MUTATION_CAPABILITY_ID: &str =
+    "cloudflare-tunnel-configuration-update-warp-connector-configuration";
+const WARP_CONNECTOR_CONFIGURATION_READ_CAPABILITY_ID: &str =
+    "cloudflare-tunnel-configuration-get-warp-connector-configuration";
+const WARP_CONNECTOR_CONFIGURATION_PATH: &str =
+    "/accounts/{account_id}/warp_connector/{tunnel_id}/configurations";
+
+fn warp_connector_configuration_identity_supported(capability: &CapabilityV1) -> bool {
+    capability.id == WARP_CONNECTOR_CONFIGURATION_MUTATION_CAPABILITY_ID
+        && capability.method == "PUT"
+        && capability.path == WARP_CONNECTOR_CONFIGURATION_PATH
+        && capability.product == "Cloudflare Tunnel Configuration"
+        && capability.account_scope == "account"
+        && capability.permissions
+            == [
+                "Cloudflare One Connectors Write",
+                "Cloudflare One Connector: WARP Write",
+            ]
+        && capability.selectors.len() == 2
+        && ["account_id", "tunnel_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name && selector.location == "path" && selector.required
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+                    && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            })
+}
+
+fn warp_connector_vip_array_source_schema_supported(schema: &Value, required: bool) -> bool {
+    let expected_keys = if required {
+        &["items", "maxItems", "minItems", "type"][..]
+    } else {
+        &["items", "maxItems", "type"][..]
+    };
+    if !exact_schema_keys(schema, expected_keys)
+        || schema.get("type").and_then(Value::as_str) != Some("array")
+        || schema.get("maxItems").and_then(Value::as_u64) != Some(8)
+        || (required && schema.get("minItems").and_then(Value::as_u64) != Some(1))
+    {
+        return false;
+    }
+    let Some(item) = schema.get("items") else {
+        return false;
+    };
+    if !exact_schema_keys(item, &["properties", "required", "type"])
+        || item.get("type").and_then(Value::as_str) != Some("object")
+        || item.get("required") != Some(&serde_json::json!(["address"]))
+    {
+        return false;
+    }
+    item.get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| {
+            properties.len() == 1 && exact_primitive_schema(properties.get("address"), "string")
+        })
+}
+
+fn warp_connector_configuration_source_schema_supported(schema: &Value) -> bool {
+    if !exact_schema_keys(
+        schema,
+        &["properties", "required", "type", "x-cfctl-body-required"],
+    ) || schema.get("type").and_then(Value::as_str) != Some("object")
+        || schema.get("required") != Some(&serde_json::json!(["ha_mode"]))
+        || schema.get("x-cfctl-body-required").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    if properties.len() != 2 {
+        return false;
+    }
+    let Some(config) = properties.get("config") else {
+        return false;
+    };
+    let Some(ha_mode) = properties.get("ha_mode") else {
+        return false;
+    };
+    if !exact_schema_keys(ha_mode, &["enum", "type"])
+        || ha_mode.get("type").and_then(Value::as_str) != Some("string")
+        || ha_mode.get("enum") != Some(&serde_json::json!(["none", "disabled", "aws", "local"]))
+        || !exact_schema_keys(config, &["nullable", "oneOf", "type"])
+        || config.get("nullable").and_then(Value::as_bool) != Some(true)
+        || config.get("type").and_then(Value::as_str) != Some("object")
+    {
+        return false;
+    }
+    let Some(branches) = config.get("oneOf").and_then(Value::as_array) else {
+        return false;
+    };
+    if branches.len() != 3 {
+        return false;
+    }
+    let aws = &branches[0];
+    let local = &branches[1];
+    let empty = &branches[2];
+    let aws_supported = exact_schema_keys(aws, &["properties", "required", "type"])
+        && aws.get("type").and_then(Value::as_str) == Some("object")
+        && aws.get("required") == Some(&serde_json::json!(["fnr_id"]))
+        && aws
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| {
+                properties.len() == 1 && exact_primitive_schema(properties.get("fnr_id"), "string")
+            });
+    let local_supported = exact_schema_keys(local, &["properties", "required", "type"])
+        && local.get("type").and_then(Value::as_str) == Some("object")
+        && local.get("required") == Some(&serde_json::json!(["vips"]))
+        && local
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| {
+                properties.len() == 2
+                    && properties.get("vips").is_some_and(|schema| {
+                        warp_connector_vip_array_source_schema_supported(schema, true)
+                    })
+                    && properties.get("vips_previous").is_some_and(|schema| {
+                        warp_connector_vip_array_source_schema_supported(schema, false)
+                    })
+            });
+    let empty_supported = exact_schema_keys(empty, &["additionalProperties", "type"])
+        && empty.get("additionalProperties").and_then(Value::as_bool) == Some(false)
+        && empty.get("type").and_then(Value::as_str) == Some("object");
+    aws_supported && local_supported && empty_supported
+}
+
+fn warp_connector_configuration_contract_supported(capability: &CapabilityV1) -> bool {
+    warp_connector_configuration_identity_supported(capability)
+        && capability
+            .request_schema
+            .as_ref()
+            .is_some_and(warp_connector_configuration_source_schema_supported)
+}
+
+fn harden_warp_connector_configuration_request_schema(schema: &mut Value) -> bool {
+    for pointer in [
+        "",
+        "/properties/config/oneOf/0",
+        "/properties/config/oneOf/1",
+        "/properties/config/oneOf/1/properties/vips/items",
+        "/properties/config/oneOf/1/properties/vips_previous/items",
+    ] {
+        let Some(object) = schema.pointer_mut(pointer).and_then(Value::as_object_mut) else {
+            return false;
+        };
+        object.insert("additionalProperties".to_owned(), Value::Bool(false));
+    }
+    true
+}
+
+fn classify_warp_connector_configuration(capability: &mut CapabilityV1) {
+    let Some(request_schema) = capability.request_schema.as_mut() else {
+        return;
+    };
+    if !harden_warp_connector_configuration_request_schema(request_schema) {
+        return;
+    }
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "updating Cloudflare Mesh high-availability configuration has no direct per-operation charge; routed Cloudflare One traffic and provider-side infrastructure such as AWS network interfaces can retain usage-based cost and plan limits"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Update WARP Connector configuration".to_owned(),
+            url: "https://developers.cloudflare.com/api/go/resources/zero_trust/subresources/tunnels/subresources/warp_connector/subresources/configurations/methods/update/"
+                .to_owned(),
+            source: "official Cloudflare API".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare Mesh high availability".to_owned(),
+            url: "https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-mesh/high-availability/"
+                .to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare One plans and pricing".to_owned(),
+            url: "https://www.cloudflare.com/plans/zero-trust-services/".to_owned(),
+            source: "official Cloudflare pricing".to_owned(),
+        },
+    ];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans = BTreeMap::from([
+        ("zero_trust_free".to_owned(), true),
+        ("zero_trust_pay_as_you_go".to_owned(), true),
+        ("zero_trust_contract".to_owned(), true),
+    ]);
+    capability.entitlement.blocker = None;
+    capability.entitlement.source = Some(
+        "https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-mesh/get-started/"
+            .to_owned(),
+    );
+    capability.entitlement.requires_live_resolution = false;
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "automatic restoration is unavailable unless cfctl binds the exact live pre-change Cloudflare Mesh high-availability configuration"
+            .to_owned(),
+    );
+}
+
+fn warp_connector_configuration_hardened_request_supported(capability: &CapabilityV1) -> bool {
+    let Some(schema) = capability.request_schema.as_ref() else {
+        return false;
+    };
+    let mut source_shape = schema.clone();
+    for pointer in [
+        "",
+        "/properties/config/oneOf/0",
+        "/properties/config/oneOf/1",
+        "/properties/config/oneOf/1/properties/vips/items",
+        "/properties/config/oneOf/1/properties/vips_previous/items",
+    ] {
+        let Some(object) = source_shape
+            .pointer_mut(pointer)
+            .and_then(Value::as_object_mut)
+        else {
+            return false;
+        };
+        if object.remove("additionalProperties") != Some(Value::Bool(false)) {
+            return false;
+        }
+    }
+    warp_connector_configuration_source_schema_supported(&source_shape)
+}
+
+fn warp_connector_configuration_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == WARP_CONNECTOR_CONFIGURATION_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == WARP_CONNECTOR_CONFIGURATION_PATH
+        && capability.product == "Cloudflare Tunnel Configuration"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && capability.permissions
+            == [
+                "Cloudflare One Connectors Write",
+                "Cloudflare One Connectors Read",
+                "Cloudflare One Connector: WARP Write",
+                "Cloudflare One Connector: WARP Read",
+            ]
+        && capability.selectors.len() == 2
+        && ["account_id", "tunnel_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name && selector.location == "path" && selector.required
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+                    && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            })
+}
+
+fn finalize_warp_connector_configuration_rollback_contract(
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let source_supported = capabilities
+        .get(WARP_CONNECTOR_CONFIGURATION_READ_CAPABILITY_ID)
+        .is_some_and(warp_connector_configuration_read_contract_supported);
+    let Some(capability) =
+        capabilities.get_mut(WARP_CONNECTOR_CONFIGURATION_MUTATION_CAPABILITY_ID)
+    else {
+        return;
+    };
+    if !warp_connector_configuration_identity_supported(capability)
+        || !warp_connector_configuration_hardened_request_supported(capability)
+    {
+        return;
+    }
+    if !source_supported {
+        capability.risk = RiskClass::Unknown;
+        capability.effect = EffectClass::Unknown;
+        capability.cost.known = false;
+        capability.cost.maximum = None;
+        refresh_dynamic_mutation_contract(capability);
+        return;
+    }
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("restore_warp_connector_configuration_prior_snapshot".to_owned());
+    if !capability.rollback_contract_supported() {
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        return;
+    }
+    capability.rollback.warning = Some(
+        "rectification derives a separate hash-bound WARP Connector configuration PUT plan from the exact prior high-availability snapshot; it never runs automatically and requires explicit approval"
             .to_owned(),
     );
     refresh_dynamic_mutation_contract(capability);

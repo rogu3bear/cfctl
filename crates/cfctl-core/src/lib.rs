@@ -720,6 +720,9 @@ impl CapabilityV1 {
             Some("restore_cloudflare_tunnel_configuration_prior_snapshot") => {
                 cloudflare_tunnel_configuration_rollback_contract_supported(self)
             }
+            Some("restore_warp_connector_configuration_prior_snapshot") => {
+                warp_connector_configuration_rollback_contract_supported(self)
+            }
             Some("restore_dns_record_prior_snapshot_with_put") => {
                 matches!(
                     (self.id.as_str(), self.method.as_str()),
@@ -1112,6 +1115,36 @@ fn cloudflare_tunnel_configuration_request_contract_supported(capability: &Capab
         .and_then(|schema| canonical_hash_value(schema).ok())
         .as_deref()
         == Some(CLOUDFLARE_TUNNEL_CONFIGURATION_REQUEST_SCHEMA_HASH)
+}
+
+const WARP_CONNECTOR_CONFIGURATION_REQUEST_SCHEMA_HASH: &str =
+    "sha256:4e5032c727efe10cba31c324f8141a1ea723a8f7ddf4779882e0f06665edef5e";
+
+fn warp_connector_configuration_rollback_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "cloudflare-tunnel-configuration-update-warp-connector-configuration"
+        && capability.method == "PUT"
+        && capability.product == "Cloudflare Tunnel Configuration"
+        && capability.path == "/accounts/{account_id}/warp_connector/{tunnel_id}/configurations"
+        && capability.account_scope == "account"
+        && capability.verification.strategy
+            == "same_path_result_contains_planned_fields_after_update"
+        && capability.verification_contract_supported()
+        && warp_connector_configuration_request_contract_supported(capability)
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path == "/accounts/{account_id}/warp_connector/{tunnel_id}/configurations"
+                && read.read_capability_id
+                    == "cloudflare-tunnel-configuration-get-warp-connector-configuration"
+                && read.verified_response_fields == ["config", "ha_mode"]
+        })
+}
+
+fn warp_connector_configuration_request_contract_supported(capability: &CapabilityV1) -> bool {
+    capability
+        .request_schema
+        .as_ref()
+        .and_then(|schema| canonical_hash_value(schema).ok())
+        .as_deref()
+        == Some(WARP_CONNECTOR_CONFIGURATION_REQUEST_SCHEMA_HASH)
 }
 
 const DNS_RECORD_UPDATE_REQUEST_SCHEMA_HASH: &str =

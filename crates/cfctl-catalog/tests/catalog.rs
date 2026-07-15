@@ -4416,6 +4416,205 @@ fn cloudflare_tunnel_configuration_rejects_permission_and_nested_schema_drift() 
     assert!(!drifted_read.cost.known);
 }
 
+fn warp_connector_configuration_schema() -> serde_json::Value {
+    json!({
+        "nullable": true,
+        "oneOf": [
+            {
+                "type": "object",
+                "required": ["fnr_id"],
+                "properties": {"fnr_id": {"type": "string"}}
+            },
+            {
+                "type": "object",
+                "required": ["vips"],
+                "properties": {
+                    "vips": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "required": ["address"],
+                            "properties": {"address": {"type": "string"}}
+                        }
+                    },
+                    "vips_previous": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "required": ["address"],
+                            "properties": {"address": {"type": "string"}}
+                        }
+                    }
+                }
+            },
+            {"type": "object", "additionalProperties": false}
+        ],
+        "type": "object"
+    })
+}
+
+fn warp_connector_configuration_fixture() -> serde_json::Value {
+    let mut document = cloudflare_tunnel_lifecycle_fixture();
+    document["components"]["schemas"]["Widget"]["properties"]["config"] =
+        warp_connector_configuration_schema();
+    document["components"]["schemas"]["Widget"]["properties"]["ha_mode"] = json!({
+        "type": "string",
+        "enum": ["none", "disabled", "aws", "local"]
+    });
+    let response = json!({
+        "description": "WARP Connector configuration",
+        "content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/WidgetResponse"}
+        }}
+    });
+    let config = warp_connector_configuration_schema();
+    document["paths"]["/accounts/{account_id}/warp_connector/{tunnel_id}/configurations"] = json!({
+        "parameters": [
+            {
+                "in": "path",
+                "name": "account_id",
+                "required": true,
+                "schema": {"type": "string", "maxLength": 32}
+            },
+            {
+                "in": "path",
+                "name": "tunnel_id",
+                "required": true,
+                "schema": {"type": "string", "format": "uuid", "maxLength": 36}
+            }
+        ],
+        "get": {
+            "operationId": "cloudflare-tunnel-configuration-get-warp-connector-configuration",
+            "summary": "Get WARP Connector configuration",
+            "tags": ["Cloudflare Tunnel Configuration"],
+            "x-api-token-group": [
+                "Cloudflare One Connectors Write",
+                "Cloudflare One Connectors Read",
+                "Cloudflare One Connector: WARP Write",
+                "Cloudflare One Connector: WARP Read"
+            ],
+            "responses": {"200": response.clone()}
+        },
+        "put": {
+            "operationId": "cloudflare-tunnel-configuration-update-warp-connector-configuration",
+            "summary": "Update WARP Connector configuration",
+            "tags": ["Cloudflare Tunnel Configuration"],
+            "x-api-token-group": [
+                "Cloudflare One Connectors Write",
+                "Cloudflare One Connector: WARP Write"
+            ],
+            "requestBody": {
+                "required": true,
+                "content": {"application/json": {"schema": {
+                    "type": "object",
+                    "required": ["ha_mode"],
+                    "properties": {
+                        "config": config,
+                        "ha_mode": {
+                            "type": "string",
+                            "enum": ["none", "disabled", "aws", "local"]
+                        }
+                    }
+                }}}
+            },
+            "responses": {"200": response}
+        }
+    });
+    document
+}
+
+#[test]
+fn warp_connector_configuration_binds_reversible_mesh_ha_state() {
+    let snapshot = normalize_openapi(&warp_connector_configuration_fixture())
+        .expect("WARP Connector configuration catalog");
+    let capability = snapshot
+        .get("cloudflare-tunnel-configuration-update-warp-connector-configuration")
+        .expect("WARP Connector configuration update");
+
+    assert_eq!(capability.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(capability.risk, RiskClass::CrossConfig);
+    assert_eq!(capability.effect, EffectClass::ReversibleWrite);
+    let request = capability.request_schema.as_ref().expect("request schema");
+    for pointer in [
+        "/additionalProperties",
+        "/properties/config/oneOf/0/additionalProperties",
+        "/properties/config/oneOf/1/additionalProperties",
+        "/properties/config/oneOf/1/properties/vips/items/additionalProperties",
+        "/properties/config/oneOf/1/properties/vips_previous/items/additionalProperties",
+    ] {
+        assert_eq!(request.pointer(pointer), Some(&json!(false)), "{pointer}");
+    }
+    assert!(capability.cost.known);
+    assert_eq!(capability.cost.maximum, Some(0.0));
+    assert_eq!(capability.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(capability.entitlement.available, Some(true));
+    assert_eq!(
+        capability.entitlement.plans.get("zero_trust_free"),
+        Some(&true)
+    );
+    assert_eq!(
+        capability
+            .same_path_read
+            .as_ref()
+            .expect("same-path read")
+            .read_capability_id,
+        "cloudflare-tunnel-configuration-get-warp-connector-configuration"
+    );
+    assert_eq!(
+        capability
+            .same_path_read
+            .as_ref()
+            .expect("same-path read")
+            .verified_response_fields,
+        ["config", "ha_mode"]
+    );
+    assert!(capability.rollback.supported);
+    assert_eq!(
+        capability.rollback.strategy.as_deref(),
+        Some("restore_warp_connector_configuration_prior_snapshot")
+    );
+    assert!(capability.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn warp_connector_configuration_rejects_permission_schema_and_read_drift() {
+    let mut permission_drift = warp_connector_configuration_fixture();
+    permission_drift["paths"]["/accounts/{account_id}/warp_connector/{tunnel_id}/configurations"]
+        ["put"]["x-api-token-group"] = json!(["Cloudflare One Connectors Write"]);
+    let snapshot = normalize_openapi(&permission_drift).expect("permission drift");
+    let capability = snapshot
+        .get("cloudflare-tunnel-configuration-update-warp-connector-configuration")
+        .expect("permission-drifted WARP Connector configuration");
+    assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(capability.risk, RiskClass::Unknown);
+
+    let mut schema_drift = warp_connector_configuration_fixture();
+    schema_drift["paths"]["/accounts/{account_id}/warp_connector/{tunnel_id}/configurations"]["put"]
+        ["requestBody"]["content"]["application/json"]["schema"]["properties"]["config"]["oneOf"]
+        [1]["properties"]["routing_table"] = json!({"type": "string"});
+    let snapshot = normalize_openapi(&schema_drift).expect("schema drift");
+    let capability = snapshot
+        .get("cloudflare-tunnel-configuration-update-warp-connector-configuration")
+        .expect("schema-drifted WARP Connector configuration");
+    assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(capability.risk, RiskClass::Unknown);
+    assert!(!capability.cost.known);
+
+    let mut read_drift = warp_connector_configuration_fixture();
+    read_drift["paths"]["/accounts/{account_id}/warp_connector/{tunnel_id}/configurations"]["get"]
+        ["x-api-token-group"] = json!(["Cloudflare One Connector: WARP Read"]);
+    let snapshot = normalize_openapi(&read_drift).expect("read drift");
+    let capability = snapshot
+        .get("cloudflare-tunnel-configuration-update-warp-connector-configuration")
+        .expect("read-drifted WARP Connector configuration");
+    assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(capability.risk, RiskClass::Unknown);
+    assert!(!capability.cost.known);
+}
+
 #[test]
 fn create_contract_binds_a_schema_proven_id_and_exact_read_delete_pair() {
     let document = create_lifecycle_fixture();
