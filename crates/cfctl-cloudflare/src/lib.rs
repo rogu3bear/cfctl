@@ -353,9 +353,9 @@ impl Executor {
             });
         }
 
-        if strategy == "same_resource_returns_not_found_after_delete" {
+        if is_delete_verifier(strategy) {
             return self
-                .verify_exact_resource_delete(plan, apply_response, &input, credential)
+                .verify_resource_delete(plan, apply_response, &input, credential)
                 .await;
         }
         if is_same_path_field_verifier(strategy) {
@@ -372,6 +372,28 @@ impl Executor {
         Err(CloudflareError::UnsupportedVerificationStrategy(
             strategy.to_owned(),
         ))
+    }
+
+    async fn verify_resource_delete(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        match plan.capability.verification.strategy.as_str() {
+            "same_resource_returns_not_found_after_delete" => {
+                self.verify_exact_resource_delete(plan, apply_response, input, credential)
+                    .await
+            }
+            "parent_collection_omits_deleted_resource_id" => {
+                self.verify_parent_collection_delete(plan, apply_response, input, credential)
+                    .await
+            }
+            strategy => Err(CloudflareError::UnsupportedVerificationStrategy(
+                strategy.to_owned(),
+            )),
+        }
     }
 
     async fn verify_exact_resource_delete(
@@ -404,6 +426,102 @@ impl Executor {
             format!(
                 "exact resource deletion was not proven (apply success={}, readback HTTP {}, readback success={})",
                 apply_response.success, readback.status, readback.success
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback,
+        })
+    }
+
+    async fn verify_parent_collection_delete(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let target = plan.capability.deleted_resource.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the hash-bound deleted-resource contract is absent".to_owned(),
+            )
+        })?;
+        let deleted_identity = input
+            .selectors
+            .get(&target.identity_selector)
+            .and_then(Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the planned delete selector has no non-empty resource identity".to_owned(),
+                )
+            })?;
+        let mut selectors = input.selectors.as_object().cloned().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "planned delete selectors are not an object".to_owned(),
+            )
+        })?;
+        selectors.remove(&target.identity_selector);
+        let collection = CapabilityV1::new(
+            &target.read_capability_id,
+            "Deleted resource collection verification readback",
+            "GET",
+            &target.collection_path,
+        );
+        let request = self.builder.build(
+            &collection,
+            &CallInput {
+                selectors: Value::Object(selectors),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send_paginated(&request, credential).await?;
+        let pagination_complete = !target.requires_page_number_completion
+            || readback.result_info.as_ref().is_some_and(|result_info| {
+                let page = result_info.get("page").and_then(Value::as_u64);
+                let total_pages = result_info.get("total_pages").and_then(Value::as_u64);
+                page.is_some_and(|page| page > 0 && Some(page) == total_pages)
+            });
+        let identities = readback.result.as_array().map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.pointer(&target.response_item_identity_pointer)
+                        .and_then(Value::as_str)
+                        .filter(|identity| !identity.is_empty())
+                })
+                .collect::<Vec<_>>()
+        });
+        let identity_shape_valid = identities
+            .as_ref()
+            .is_some_and(|identities| identities.iter().all(Option::is_some));
+        let deleted_identity_absent = identities.as_ref().is_some_and(|identities| {
+            identities
+                .iter()
+                .all(|identity| *identity != Some(deleted_identity))
+        });
+        let passed = apply_response.success
+            && readback.success
+            && pagination_complete
+            && identity_shape_valid
+            && deleted_identity_absent;
+        let basis = if passed {
+            "the complete schema-proven parent collection omitted the exact deleted resource identity"
+                .to_owned()
+        } else {
+            format!(
+                "parent collection did not prove deletion (apply success={}, readback HTTP {}, readback success={}, pagination complete={}, result array={}, item identities valid={}, deleted identity absent={})",
+                apply_response.success,
+                readback.status,
+                readback.success,
+                pagination_complete,
+                identities.is_some(),
+                identity_shape_valid,
+                deleted_identity_absent
             )
         };
         Ok(OperationVerificationV1 {
@@ -1020,6 +1138,32 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
             ));
         }
     }
+    if strategy == "parent_collection_omits_deleted_resource_id" {
+        let target = capability.deleted_resource.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the hash-bound deleted-resource contract is absent".to_owned(),
+            )
+        })?;
+        let expected_path = format!(
+            "{}/{{{}}}",
+            target.collection_path.trim_end_matches('/'),
+            target.identity_selector
+        );
+        if target.identity_selector.is_empty()
+            || capability.path != expected_path
+            || target.response_item_identity_pointer != "/id"
+            || target.read_capability_id.is_empty()
+            || input
+                .selectors
+                .get(&target.identity_selector)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return Err(CloudflareError::MissingVerificationTarget(
+                "the hash-bound deleted-resource contract is malformed".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1028,6 +1172,14 @@ fn is_same_path_field_verifier(strategy: &str) -> bool {
         strategy,
         "same_resource_contains_planned_fields_after_update"
             | "same_path_result_contains_planned_fields_after_update"
+    )
+}
+
+fn is_delete_verifier(strategy: &str) -> bool {
+    matches!(
+        strategy,
+        "same_resource_returns_not_found_after_delete"
+            | "parent_collection_omits_deleted_resource_id"
     )
 }
 

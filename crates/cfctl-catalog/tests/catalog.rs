@@ -6,7 +6,8 @@ use cfctl_catalog::{
     normalize_openapi,
 };
 use cfctl_core::{
-    AdapterStatus, BillingModelV1, CostExposureV1, EffectClass, KnowledgeReferenceV1, RiskClass,
+    AdapterStatus, BillingModelV1, CostExposureV1, DeletedResourceContractV1, EffectClass,
+    KnowledgeReferenceV1, RiskClass, hash_value,
 };
 use chrono::Utc;
 use serde_json::json;
@@ -156,6 +157,57 @@ fn stored_catalog_rejects_capability_drift_from_its_content_hash() {
         .to_string();
 
     assert!(error.contains("catalog content hash mismatch"), "{error}");
+}
+
+#[test]
+fn legacy_catalog_hash_survives_an_absent_deleted_resource_contract() {
+    let snapshot = normalize_openapi(&fixture()).expect("catalog");
+    let mut stored = serde_json::to_value(&snapshot).expect("serialize catalog");
+    let capabilities = stored["capabilities"]
+        .as_object_mut()
+        .expect("capabilities object");
+    for capability in capabilities.values_mut() {
+        capability
+            .as_object_mut()
+            .expect("capability object")
+            .remove("deleted_resource");
+    }
+    stored["schema_hash"] = json!(hash_value(&stored["capabilities"]).expect("legacy hash"));
+
+    let loaded: CatalogSnapshot = serde_json::from_value(stored).expect("legacy catalog decodes");
+
+    loaded
+        .validate_hash()
+        .expect("legacy catalog hash remains valid");
+}
+
+#[test]
+fn legacy_delete_contract_hash_survives_an_absent_default_pagination_flag() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    snapshot
+        .capabilities
+        .get_mut("dns-records-delete")
+        .expect("delete capability")
+        .deleted_resource = Some(DeletedResourceContractV1 {
+        collection_path: "/zones/{zone_id}/dns_records".to_owned(),
+        identity_selector: "record_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "dns-records-list".to_owned(),
+        requires_page_number_completion: false,
+    });
+    snapshot.refresh_hash().expect("refresh catalog hash");
+    let stored = serde_json::to_value(&snapshot).expect("serialize catalog");
+    assert!(
+        stored["capabilities"]["dns-records-delete"]["deleted_resource"]
+            .get("requires_page_number_completion")
+            .is_none()
+    );
+
+    let loaded: CatalogSnapshot = serde_json::from_value(stored).expect("legacy catalog decodes");
+
+    loaded
+        .validate_hash()
+        .expect("legacy delete contract hash remains valid");
 }
 
 #[test]
@@ -672,6 +724,136 @@ fn exact_resource_deletes_pair_with_same_path_readback_contracts() {
     assert_ne!(
         collection.verification.strategy,
         "same_resource_returns_not_found_after_delete"
+    );
+}
+
+#[test]
+fn exact_resource_deletes_use_schema_proven_parent_collection_readback() {
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/accounts/{account_id}/widgets": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}}
+                ],
+                "get": {
+                    "operationId":"widgets-list",
+                    "summary":"List Widgets",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Read"],
+                    "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
+                        "type":"object",
+                        "properties":{"result":{"type":"array","items":{"type":"object","properties":{
+                            "id":{"type":"string"},"name":{"type":"string"}
+                        }}}}
+                    }}}}}
+                }
+            },
+            "/accounts/{account_id}/widgets/{widget_id}": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+                    {"in":"path","name":"widget_id","required":true,"schema":{"type":"string"}}
+                ],
+                "delete": {
+                    "operationId":"widgets-delete",
+                    "summary":"Delete Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"]
+                }
+            }
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("widget catalog");
+    let capability = snapshot.get("widgets-delete").expect("delete widget");
+    assert_eq!(capability.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(
+        capability.verification.strategy,
+        "parent_collection_omits_deleted_resource_id"
+    );
+    let target = capability
+        .deleted_resource
+        .as_ref()
+        .expect("deleted-resource contract");
+    assert_eq!(target.collection_path, "/accounts/{account_id}/widgets");
+    assert_eq!(target.identity_selector, "widget_id");
+    assert_eq!(target.response_item_identity_pointer, "/id");
+    assert_eq!(target.read_capability_id, "widgets-list");
+    assert!(!target.requires_page_number_completion);
+    assert_eq!(capability.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert!(capability.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn parent_collection_delete_contracts_reject_unverifiable_pagination_and_broadening_bodies() {
+    let mut document = json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/accounts/{account_id}/widgets": {
+                "get": {
+                    "operationId":"widgets-list",
+                    "summary":"List Widgets",
+                    "tags":["Widgets"],
+                    "parameters":[
+                        {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+                        {"in":"query","name":"page","schema":{"type":"integer"}},
+                        {"in":"query","name":"per_page","schema":{"type":"integer"}}
+                    ],
+                    "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
+                        "type":"object",
+                        "properties":{"result":{"type":"array","items":{"type":"object","properties":{
+                            "id":{"type":"string"}
+                        }}}}
+                    }}}}}
+                }
+            },
+            "/accounts/{account_id}/widgets/{widget_id}": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+                    {"in":"path","name":"widget_id","required":true,"schema":{"type":"string"}}
+                ],
+                "delete": {
+                    "operationId":"widgets-delete",
+                    "summary":"Delete Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"]
+                }
+            }
+        }
+    });
+
+    let paginated = normalize_openapi(&document).expect("paginated catalog");
+    let delete = paginated.get("widgets-delete").expect("delete widget");
+    assert!(delete.deleted_resource.is_none());
+    assert_ne!(
+        delete.verification.strategy,
+        "parent_collection_omits_deleted_resource_id"
+    );
+
+    document["paths"]["/accounts/{account_id}/widgets"]["get"]["responses"]["200"]["content"]["application/json"]
+        ["schema"]["properties"]["result_info"] = json!({
+        "type":"object",
+        "properties":{"page":{"type":"integer"},"total_pages":{"type":"integer"}}
+    });
+    let supported = normalize_openapi(&document).expect("supported paginated catalog");
+    let target = supported
+        .get("widgets-delete")
+        .and_then(|capability| capability.deleted_resource.as_ref())
+        .expect("page-number collection contract");
+    assert!(target.requires_page_number_completion);
+
+    document["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["delete"]["requestBody"] = json!({"required":true,"content":{"application/json":{"schema":{
+        "type":"object","properties":{"cascade":{"type":"boolean"}}
+    }}}});
+
+    let broadening = normalize_openapi(&document).expect("broadening catalog");
+    let delete = broadening.get("widgets-delete").expect("delete widget");
+    assert!(delete.deleted_resource.is_none());
+    assert_ne!(
+        delete.verification.strategy,
+        "parent_collection_omits_deleted_resource_id"
     );
 }
 

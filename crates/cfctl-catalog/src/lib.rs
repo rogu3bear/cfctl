@@ -8,7 +8,8 @@ use std::{
 
 use cfctl_core::{
     AdapterStatus, BillingModelV1, CapabilityV1, CostExposureV1, CreatedResourceContractV1,
-    EffectClass, KnowledgeReferenceV1, Maturity, RiskClass, SelectorV1, hash_value,
+    DeletedResourceContractV1, EffectClass, KnowledgeReferenceV1, Maturity, RiskClass, SelectorV1,
+    hash_value,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -888,6 +889,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     }
 
     classify_exact_resource_contracts(&mut capabilities);
+    classify_parent_collection_delete_contracts(document, &mut capabilities);
     classify_same_path_object_update_contracts(document, &mut capabilities);
     classify_created_resource_contracts(&mut capabilities, &creates_with_schema_proven_string_ids);
 
@@ -1093,6 +1095,122 @@ fn classify_exact_resource_contracts(capabilities: &mut BTreeMap<String, Capabil
     }
 }
 
+fn classify_parent_collection_delete_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let list_targets = capabilities
+        .values()
+        .filter(|capability| capability.method == "GET")
+        .filter_map(|capability| {
+            let operation = document.get("paths")?.get(&capability.path)?.get("get")?;
+            complete_collection_readback_contract(document, operation, capability).map(
+                |requires_page_number_completion| {
+                    (
+                        (capability.path.clone(), capability.product.clone()),
+                        (capability.id.clone(), requires_page_number_completion),
+                    )
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for capability in capabilities.values_mut() {
+        if capability.method != "DELETE"
+            || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
+            || !path_targets_exact_resource(&capability.path)
+            || capability.request_schema.is_some()
+            || capability
+                .selectors
+                .iter()
+                .any(|selector| selector.location != "path")
+        {
+            continue;
+        }
+        let Some((collection_path, identity_segment)) = capability.path.rsplit_once('/') else {
+            continue;
+        };
+        let Some(identity_selector) = identity_segment
+            .strip_prefix('{')
+            .and_then(|segment| segment.strip_suffix('}'))
+            .filter(|selector| !selector.is_empty())
+        else {
+            continue;
+        };
+        let Some((read_capability_id, requires_page_number_completion)) =
+            list_targets.get(&(collection_path.to_owned(), capability.product.clone()))
+        else {
+            continue;
+        };
+
+        capability.deleted_resource = Some(DeletedResourceContractV1 {
+            collection_path: collection_path.to_owned(),
+            identity_selector: identity_selector.to_owned(),
+            response_item_identity_pointer: "/id".to_owned(),
+            read_capability_id: read_capability_id.clone(),
+            requires_page_number_completion: *requires_page_number_completion,
+        });
+        capability.cost = cfctl_core::CostV1::default();
+        capability.cost.exposure = CostExposureV1::DownstreamUsage;
+        capability.cost.basis = Some(
+            "deleting an existing resource has no incremental operation charge; refunds, retained usage, and downstream billing are not claimed"
+                .to_owned(),
+        );
+        "parent_collection_omits_deleted_resource_id"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "deletion is irreversible without a prior resource snapshot; any recreation must be a separately reviewed plan"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
+
+fn complete_collection_readback_contract(
+    document: &Value,
+    operation: &Value,
+    capability: &CapabilityV1,
+) -> Option<bool> {
+    if capability
+        .selectors
+        .iter()
+        .any(|selector| selector.required && selector.location != "path")
+    {
+        return None;
+    }
+
+    let query_names = capability
+        .selectors
+        .iter()
+        .filter(|selector| selector.location == "query")
+        .map(|selector| selector.name.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let page_number_pagination = query_names.contains("page") || query_names.contains("per_page");
+    let unsupported_pagination = query_names.iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "cursor"
+                | "limit"
+                | "offset"
+                | "after"
+                | "before"
+                | "starting_after"
+                | "ending_before"
+                | "continuation_token"
+                | "page_token"
+        ) || (name.contains("page") && !matches!(name.as_str(), "page" | "per_page"))
+    });
+    if unsupported_pagination {
+        return None;
+    }
+    if !success_response_declares_complete_collection(document, operation, page_number_pagination) {
+        return None;
+    }
+    Some(page_number_pagination)
+}
+
 fn path_targets_exact_resource(path: &str) -> bool {
     path.rsplit('/').next().is_some_and(|segment| {
         segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2
@@ -1157,6 +1275,110 @@ fn success_response_declares_result_string_id(document: &Value, operation: &Valu
         .filter(|(status, _)| status.starts_with('2'))
         .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
         .any(|schema| schema_declares_string_path(document, schema, &["result", "id"], 0))
+}
+
+fn success_response_declares_complete_collection(
+    document: &Value,
+    operation: &Value,
+    requires_page_number_completion: bool,
+) -> bool {
+    operation
+        .get("responses")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(status, _)| status.starts_with('2'))
+        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
+        .any(|schema| {
+            schema_declares_result_array_string_id(document, schema, 0)
+                && (!requires_page_number_completion
+                    || [["result_info", "page"], ["result_info", "total_pages"]]
+                        .iter()
+                        .all(|path| schema_declares_numeric_path(document, schema, path, 0)))
+        })
+}
+
+fn schema_declares_result_array_string_id(document: &Value, schema: &Value, depth: usize) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                schema_declares_result_array_string_id(document, resolved, depth + 1)
+            });
+    }
+    if let Some(result) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get("result"))
+        && schema_declares_array_item_string_id(document, result, depth + 1)
+    {
+        return true;
+    }
+    if schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| schema_declares_result_array_string_id(document, member, depth + 1))
+        })
+    {
+        return true;
+    }
+    for alternative in ["oneOf", "anyOf"] {
+        if let Some(members) = schema.get(alternative).and_then(Value::as_array) {
+            return !members.is_empty()
+                && members.iter().all(|member| {
+                    schema_declares_result_array_string_id(document, member, depth + 1)
+                });
+        }
+    }
+    false
+}
+
+fn schema_declares_array_item_string_id(document: &Value, schema: &Value, depth: usize) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                schema_declares_array_item_string_id(document, resolved, depth + 1)
+            });
+    }
+    if schema.get("type").and_then(Value::as_str) == Some("array")
+        && schema
+            .get("items")
+            .is_some_and(|items| schema_declares_string_path(document, items, &["id"], depth + 1))
+    {
+        return true;
+    }
+    if schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| schema_declares_array_item_string_id(document, member, depth + 1))
+        })
+    {
+        return true;
+    }
+    for alternative in ["oneOf", "anyOf"] {
+        if let Some(members) = schema.get(alternative).and_then(Value::as_array) {
+            return !members.is_empty()
+                && members.iter().all(|member| {
+                    schema_declares_array_item_string_id(document, member, depth + 1)
+                });
+        }
+    }
+    false
 }
 
 fn success_response_declares_result_fields(
@@ -1272,6 +1494,65 @@ fn schema_declares_string_path(
                 && members
                     .iter()
                     .all(|member| schema_declares_string_path(document, member, path, depth + 1));
+        }
+    }
+    false
+}
+
+fn schema_declares_numeric_path(
+    document: &Value,
+    schema: &Value,
+    path: &[&str],
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                schema_declares_numeric_path(document, resolved, path, depth + 1)
+            });
+    }
+    if path.is_empty() {
+        return matches!(
+            schema.get("type").and_then(Value::as_str),
+            Some("integer" | "number")
+        ) || schema
+            .get("allOf")
+            .and_then(Value::as_array)
+            .is_some_and(|members| {
+                members
+                    .iter()
+                    .any(|member| schema_declares_numeric_path(document, member, path, depth + 1))
+            });
+    }
+    if let Some(property) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(path[0]))
+    {
+        return schema_declares_numeric_path(document, property, &path[1..], depth + 1);
+    }
+    if schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| schema_declares_numeric_path(document, member, path, depth + 1))
+        })
+    {
+        return true;
+    }
+    for alternative in ["oneOf", "anyOf"] {
+        if let Some(members) = schema.get(alternative).and_then(Value::as_array) {
+            return !members.is_empty()
+                && members
+                    .iter()
+                    .all(|member| schema_declares_numeric_path(document, member, path, depth + 1));
         }
     }
     false

@@ -203,6 +203,29 @@ pub struct CreatedResourceContractV1 {
     pub delete_capability_id: String,
 }
 
+/// Hash-bound coordinates for proving an exact resource deletion through a
+/// schema-proven parent collection when the API has no detail read endpoint.
+/// The identity pointer is relative to each item in the collection response's
+/// `result` array.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedResourceContractV1 {
+    pub collection_path: String,
+    pub identity_selector: String,
+    pub response_item_identity_pointer: String,
+    pub read_capability_id: String,
+    /// When true, verification succeeds only after the live response proves
+    /// every numbered page was collected through numeric `page` and
+    /// `total_pages` metadata.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_page_number_completion: bool,
+}
+
+// Serde skip predicates receive a shared reference to the field value.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityV1 {
     pub schema_version: u8,
@@ -226,6 +249,8 @@ pub struct CapabilityV1 {
     pub rollback: RollbackSpecV1,
     #[serde(default)]
     pub created_resource: Option<CreatedResourceContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_resource: Option<DeletedResourceContractV1>,
     pub adapter_status: AdapterStatus,
     pub blocked_reason: Option<String>,
     pub request_schema: Option<Value>,
@@ -295,6 +320,7 @@ impl CapabilityV1 {
                 },
             },
             created_resource: None,
+            deleted_resource: None,
             adapter_status: AdapterStatus::DynamicApi,
             blocked_reason: None,
             request_schema: None,
@@ -430,6 +456,9 @@ impl CapabilityV1 {
             "same_resource_returns_not_found_after_delete" => {
                 self.method == "DELETE" && path_targets_exact_resource(&self.path)
             }
+            "parent_collection_omits_deleted_resource_id" => {
+                self.method == "DELETE" && self.deleted_resource_contract_supported()
+            }
             "same_resource_contains_planned_fields_after_update" => {
                 matches!(self.method.as_str(), "PATCH" | "PUT")
                     && path_targets_exact_resource(&self.path)
@@ -502,6 +531,20 @@ impl CapabilityV1 {
                 && target.response_result_identity_pointer == "/id"
                 && !target.read_capability_id.is_empty()
                 && !target.delete_capability_id.is_empty()
+        })
+    }
+
+    fn deleted_resource_contract_supported(&self) -> bool {
+        self.deleted_resource.as_ref().is_some_and(|target| {
+            let expected_path = format!(
+                "{}/{{{}}}",
+                target.collection_path.trim_end_matches('/'),
+                target.identity_selector
+            );
+            !target.identity_selector.is_empty()
+                && self.path == expected_path
+                && target.response_item_identity_pointer == "/id"
+                && !target.read_capability_id.is_empty()
         })
     }
 }

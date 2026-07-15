@@ -1,7 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use cfctl_core::{
-    CapabilityV1, CostV1, CreatedResourceContractV1, EffectClass, PolicyDisposition, RiskClass,
+    CapabilityV1, CostV1, CreatedResourceContractV1, DeletedResourceContractV1, EffectClass,
+    PolicyDisposition, RiskClass,
 };
 use cfctl_planner::{ImpactContext, PolicyEngine};
 
@@ -101,6 +102,42 @@ fn paid_operations_with_unknown_cost_are_blocked() {
     let decision = engine.evaluate(&paid, &ImpactContext::default());
     assert_eq!(decision.disposition, PolicyDisposition::Blocked);
     assert!(decision.requires_cost_ceiling);
+}
+
+#[test]
+fn destructive_subscription_deletes_always_require_exact_approval() {
+    let mut delete = CapabilityV1::new(
+        "account-subscriptions-delete-subscription",
+        "Delete Subscription",
+        "DELETE",
+        "/accounts/{account_id}/subscriptions/{subscription_identifier}",
+    );
+    delete.risk = RiskClass::Destructive;
+    delete.effect = EffectClass::Destructive;
+    delete.cost = CostV1::default();
+    delete.permissions = vec!["Billing Write".to_owned()];
+    "parent_collection_omits_deleted_resource_id".clone_into(&mut delete.verification.strategy);
+    delete.deleted_resource = Some(DeletedResourceContractV1 {
+        collection_path: "/accounts/{account_id}/subscriptions".to_owned(),
+        identity_selector: "subscription_identifier".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "account-subscriptions-list-subscriptions".to_owned(),
+        requires_page_number_completion: false,
+    });
+    delete.rollback.warning = Some(
+        "subscription deletion is irreversible without a separately reviewed recreation plan"
+            .to_owned(),
+    );
+
+    let decision = PolicyEngine.evaluate(&delete, &ImpactContext::default());
+
+    assert_eq!(decision.disposition, PolicyDisposition::ApprovalRequired);
+    assert!(
+        decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("Destructive"))
+    );
 }
 
 #[test]
