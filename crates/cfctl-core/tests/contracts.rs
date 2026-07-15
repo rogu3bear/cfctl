@@ -1,10 +1,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use cfctl_core::{
-    AdapterStatus, CapabilityV1, CostV1, CreatedResourceContractV1, EffectClass, EvidenceClass,
-    EvidenceV1, GuideStage, PlanStatus, PlanV1, ResultEnvelopeV2, RiskClass,
-    SamePathReadContractV1, SelectorV1, TransactionStageV1, UpdatedResourceContractV1,
-    guide_stages, redact_json,
+    AdapterStatus, CapabilityV1, CostV1, CreatedCollectionResourceContractV1,
+    CreatedResourceContractV1, EffectClass, EvidenceClass, EvidenceV1, GuideStage, PlanStatus,
+    PlanV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1, SelectorV1, TransactionStageV1,
+    UpdatedResourceContractV1, guide_stages, redact_json,
 };
 use serde_json::json;
 
@@ -122,7 +122,8 @@ fn updated_resource_contract_rejects_noncanonical_field_allowlists() {
         "type": "object",
         "properties": {
             "name": {"type":"string"},
-            "enabled": {"type":"boolean"}
+            "enabled": {"type":"boolean"},
+            "secret": {"type":"string", "writeOnly":true}
         }
     }));
     capability.updated_resource = Some(UpdatedResourceContractV1 {
@@ -142,6 +143,20 @@ fn updated_resource_contract_rejects_noncanonical_field_allowlists() {
         .expect("updated-resource contract")
         .verified_response_fields = vec!["enabled".to_owned(), "name".to_owned()];
     assert!(capability.verification_contract_supported());
+
+    capability
+        .updated_resource
+        .as_mut()
+        .expect("updated-resource contract")
+        .verified_response_fields
+        .push("secret".to_owned());
+    assert!(!capability.verification_contract_supported());
+    capability
+        .updated_resource
+        .as_mut()
+        .expect("updated-resource contract")
+        .verified_response_fields
+        .pop();
 
     capability.selectors.push(SelectorV1 {
         name: "mode".to_owned(),
@@ -209,7 +224,8 @@ fn same_path_read_contracts_require_hash_bound_canonical_fields() {
         "type": "object",
         "properties": {
             "name": {"type":"string"},
-            "enabled": {"type":"boolean"}
+            "enabled": {"type":"boolean"},
+            "secret": {"type":"string", "writeOnly":true}
         }
     }));
     update.same_path_read = Some(SamePathReadContractV1 {
@@ -226,6 +242,20 @@ fn same_path_read_contracts_require_hash_bound_canonical_fields() {
         .expect("same-path contract")
         .verified_response_fields = vec!["enabled".to_owned(), "name".to_owned()];
     assert!(update.verification_contract_supported());
+
+    update
+        .same_path_read
+        .as_mut()
+        .expect("same-path contract")
+        .verified_response_fields
+        .push("secret".to_owned());
+    assert!(!update.verification_contract_supported());
+    update
+        .same_path_read
+        .as_mut()
+        .expect("same-path contract")
+        .verified_response_fields
+        .pop();
 
     update.selectors.push(SelectorV1 {
         name: "cf-r2-jurisdiction".to_owned(),
@@ -294,6 +324,14 @@ fn created_resource_contract_rejects_noncanonical_field_allowlists() {
     );
     capability.verification.strategy =
         "created_resource_contains_planned_fields_by_returned_id".to_owned();
+    capability.request_schema = Some(json!({
+        "type": "object",
+        "properties": {
+            "name": {"type":"string"},
+            "enabled": {"type":"boolean"},
+            "secret": {"type":"string", "writeOnly":true}
+        }
+    }));
     capability.created_resource = Some(CreatedResourceContractV1 {
         detail_path: "/accounts/{account_id}/widgets/{widget_id}".to_owned(),
         identity_selector: "widget_id".to_owned(),
@@ -311,6 +349,20 @@ fn created_resource_contract_rejects_noncanonical_field_allowlists() {
         .expect("created-resource contract")
         .verified_response_fields = vec!["enabled".to_owned(), "name".to_owned()];
     assert!(capability.verification_contract_supported());
+
+    capability
+        .created_resource
+        .as_mut()
+        .expect("created-resource contract")
+        .verified_response_fields
+        .push("secret".to_owned());
+    assert!(!capability.verification_contract_supported());
+    capability
+        .created_resource
+        .as_mut()
+        .expect("created-resource contract")
+        .verified_response_fields
+        .pop();
     capability.rollback.supported = true;
     capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
     assert!(capability.rollback_contract_supported());
@@ -324,6 +376,45 @@ fn created_resource_contract_rejects_noncanonical_field_allowlists() {
         serde_json::from_value(legacy_value).expect("deserialize legacy capability");
     assert!(!legacy.verification_contract_supported());
     assert!(!legacy.rollback_contract_supported());
+}
+
+#[test]
+fn created_collection_contract_excludes_write_only_fields_from_its_allowlist() {
+    let mut capability = CapabilityV1::new(
+        "widgets-create",
+        "Create widget",
+        "POST",
+        "/accounts/{account_id}/widgets",
+    );
+    capability.verification.strategy =
+        "parent_collection_contains_created_resource_id_and_planned_fields".to_owned();
+    capability.request_schema = Some(json!({
+        "type": "object",
+        "properties": {
+            "name": {"type":"string"},
+            "secret": {"type":"string", "writeOnly":true}
+        }
+    }));
+    capability.created_collection_resource = Some(CreatedCollectionResourceContractV1 {
+        collection_path: capability.path.clone(),
+        identity_selector: "widget_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+        requires_page_number_completion: true,
+    });
+
+    assert!(capability.verification_contract_supported());
+
+    capability
+        .created_collection_resource
+        .as_mut()
+        .expect("created collection contract")
+        .verified_response_fields
+        .push("secret".to_owned());
+    assert!(!capability.verification_contract_supported());
 }
 
 #[test]

@@ -1065,20 +1065,7 @@ fn created_resource_contract(
     read_targets: &ExactReadTargets,
     delete_targets: &ExactDeleteTargets,
 ) -> Option<CreatedResourceContractV1> {
-    let mut verified_response_fields = capability
-        .request_schema
-        .as_ref()
-        .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))?
-        .get("properties")?
-        .as_object()?
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    if verified_response_fields.is_empty() {
-        return None;
-    }
-    verified_response_fields.sort();
-    verified_response_fields.dedup();
+    let verified_response_fields = canonical_verifiable_request_object_fields(capability)?;
     let field_names = verified_response_fields
         .iter()
         .map(String::as_str)
@@ -1208,20 +1195,7 @@ fn created_collection_resource_contract(
     list_targets: &CollectionReadTargets,
     delete_targets: &ExactDeleteTargets,
 ) -> Option<CreatedCollectionResourceContractV1> {
-    let mut verified_response_fields = capability
-        .request_schema
-        .as_ref()
-        .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))?
-        .get("properties")?
-        .as_object()?
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    if verified_response_fields.is_empty() {
-        return None;
-    }
-    verified_response_fields.sort();
-    verified_response_fields.dedup();
+    let verified_response_fields = canonical_verifiable_request_object_fields(capability)?;
 
     let (read_capability_id, read_selectors) =
         list_targets.get(&(capability.path.clone(), capability.product.clone()))?;
@@ -1332,7 +1306,7 @@ fn classify_exact_resource_contracts(
                 );
             }
             "PATCH" | "PUT" => {
-                let Some(fields) = canonical_request_object_fields(capability) else {
+                let Some(fields) = canonical_verifiable_request_object_fields(capability) else {
                     continue;
                 };
                 let Some(read_operation) = document
@@ -1442,6 +1416,10 @@ fn canonical_request_object_fields(capability: &CapabilityV1) -> Option<Vec<Stri
     fields.sort();
     fields.dedup();
     Some(fields)
+}
+
+fn canonical_verifiable_request_object_fields(capability: &CapabilityV1) -> Option<Vec<String>> {
+    capability.verifiable_request_object_fields()
 }
 
 fn classify_parent_collection_delete_contracts(
@@ -1565,19 +1543,10 @@ fn classify_parent_collection_update_contracts(
         else {
             continue;
         };
-        let Some(mut verified_response_fields) = capability
-            .request_schema
-            .as_ref()
-            .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))
-            .and_then(|schema| schema.get("properties"))
-            .and_then(Value::as_object)
-            .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
-            .filter(|fields| !fields.is_empty())
+        let Some(verified_response_fields) = canonical_verifiable_request_object_fields(capability)
         else {
             continue;
         };
-        verified_response_fields.sort();
-        verified_response_fields.dedup();
         let field_names = verified_response_fields
             .iter()
             .map(String::as_str)
@@ -1790,6 +1759,7 @@ fn normalize_request_schema_contract(
 fn copy_request_schema_value_constraints(resolved: &Value, contract: &mut Map<String, Value>) {
     for key in [
         "type",
+        "writeOnly",
         "enum",
         "format",
         "nullable",

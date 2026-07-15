@@ -15,6 +15,34 @@ use tokio::{
     net::TcpListener,
 };
 
+async fn json_response_sequence_server(
+    bodies: Vec<&'static str>,
+) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for body in bodies {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buffer = vec![0_u8; 8192];
+            let read = stream.read(&mut buffer).await.expect("read request");
+            requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        }
+        requests
+    });
+    (address.to_string(), server)
+}
+
 #[test]
 fn request_builder_resolves_path_and_query_selectors_without_leaking_auth() {
     let mut capability = CapabilityV1::new(
@@ -1104,7 +1132,6 @@ async fn account_token_creation_is_verified_by_id_and_active_readback() {
         &format!("http://{address}/client/v4"),
     )
     .expect("executor");
-
     let verification = executor
         .verify_plan(
             &plan,
@@ -2352,6 +2379,111 @@ async fn created_resource_is_read_back_by_schema_proven_id_and_planned_fields() 
     assert!(!request.contains("mutation_mode"));
     assert!(!request.contains("mutation-etag"));
     assert!(!request.contains("\"name\":\"created\""));
+}
+
+#[tokio::test]
+async fn created_resource_verification_projects_write_only_request_values() {
+    let (address, server) = json_response_sequence_server(vec![
+            r#"{"success":true,"result":{"id":"widget-1","name":"created","credentials":{"username":"operator"},"headers":[{"name":"Authorization"}]},"errors":[]}"#,
+            r#"{"success":true,"result":{"id":"widget-1","name":"created","credentials":{"username":"different"},"headers":[{"name":"Authorization"}]},"errors":[]}"#,
+        ])
+        .await;
+    let mut plan = dns_record_plan(
+        "widgets-create",
+        "POST",
+        "/accounts/{account_id}/widgets",
+        "created_resource_contains_planned_fields_by_returned_id",
+        json!({"account_id":"account-1"}),
+        Some(json!({
+            "name":"created",
+            "secret":"must-not-be-returned",
+            "credentials":{"username":"operator","password":"must-not-be-returned"},
+            "headers":[{"name":"Authorization","value":"must-not-be-returned"}]
+        })),
+    );
+    plan.capability.request_schema = Some(json!({
+        "type":"object",
+        "properties": {
+            "name":{"type":"string"},
+            "secret":{"type":"string","writeOnly":true},
+            "credentials":{
+                "type":"object",
+                "properties":{
+                    "username":{"type":"string"},
+                    "password":{"type":"string","writeOnly":true}
+                }
+            },
+            "headers":{
+                "type":"array",
+                "items":{
+                    "type":"object",
+                    "properties":{
+                        "name":{"type":"string"},
+                        "value":{"type":"string","writeOnly":true}
+                    }
+                }
+            }
+        }
+    }));
+    plan.capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/widgets/{widget_id}".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-get".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
+        verified_response_fields: vec!["credentials", "headers", "name"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    });
+    let apply = CloudflareResponseV1 {
+        status: 201,
+        success: true,
+        result: json!({"id":"widget-1"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("write-only inputs should not be required in a readback");
+    assert!(verification.passed, "{}", verification.basis);
+    assert!(!verification.basis.contains("must-not-be-returned"));
+    let drifted = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("observable sibling drift should produce a failed verification result");
+    assert!(!drifted.passed, "{}", drifted.basis);
+    assert!(drifted.basis.contains("credentials"), "{}", drifted.basis);
+    assert!(!drifted.basis.contains("must-not-be-returned"));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request
+                .starts_with("GET /client/v4/accounts/account-1/widgets/widget-1 "))
+    );
 }
 
 #[tokio::test]

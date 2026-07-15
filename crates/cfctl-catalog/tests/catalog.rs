@@ -2188,6 +2188,45 @@ fn create_contract_uses_a_complete_parent_collection_when_detail_read_is_absent(
 }
 
 #[test]
+fn create_contract_separates_write_only_inputs_from_observable_readback_fields() {
+    let mut document = create_collection_lifecycle_fixture();
+    document["paths"]["/accounts/{account_id}/widgets"]["post"]["requestBody"]["content"]["application/json"]
+        ["schema"]["properties"]["secret"] = json!({
+        "type": "string",
+        "writeOnly": true
+    });
+    document["paths"]["/accounts/{account_id}/widgets"]["post"]["requestBody"]["content"]["application/json"]
+        ["schema"]["properties"]["credentials"] = json!({
+        "type": "object",
+        "properties": {
+            "username": {"type": "string"},
+            "password": {"type": "string", "writeOnly": true}
+        }
+    });
+    document["components"]["schemas"]["Widget"]["properties"]["credentials"] = json!({
+        "type": "object",
+        "properties": {"username": {"type": "string"}}
+    });
+
+    let snapshot = normalize_openapi(&document).expect("write-only catalog");
+    let create = snapshot.get("widgets-create").expect("create widget");
+    let request = create.request_schema.as_ref().expect("request schema");
+    assert_eq!(request["properties"]["secret"]["writeOnly"], true);
+    assert_eq!(
+        request["properties"]["credentials"]["properties"]["password"]["writeOnly"],
+        true
+    );
+    assert_eq!(
+        create
+            .created_collection_resource
+            .as_ref()
+            .expect("observable collection readback")
+            .verified_response_fields,
+        ["credentials", "enabled", "name"]
+    );
+}
+
+#[test]
 fn create_collection_contract_rejects_unobservable_fields_non_id_children_and_incomplete_pages() {
     let mut hidden_field = create_collection_lifecycle_fixture();
     hidden_field["components"]["schemas"]["Widget"]["properties"]

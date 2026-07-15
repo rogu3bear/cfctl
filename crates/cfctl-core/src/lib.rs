@@ -601,6 +601,52 @@ impl CapabilityV1 {
         }
     }
 
+    /// Returns the canonical top-level request fields that a response
+    /// readback can observe. Fully write-only inputs remain valid request
+    /// fields but are deliberately absent from this list.
+    #[must_use]
+    pub fn verifiable_request_object_fields(&self) -> Option<Vec<String>> {
+        let mut fields = self
+            .request_schema
+            .as_ref()
+            .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))?
+            .get("properties")?
+            .as_object()?
+            .iter()
+            .filter(|(_, schema)| schema.get("writeOnly").and_then(Value::as_bool) != Some(true))
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            return None;
+        }
+        fields.sort();
+        fields.dedup();
+        Some(fields)
+    }
+
+    /// Returns whether a top-level request field is explicitly declared as
+    /// write-only by the hash-bound request schema.
+    #[must_use]
+    pub fn request_object_field_is_write_only(&self, field: &str) -> bool {
+        self.request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("properties"))
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get(field))
+            .and_then(|schema| schema.get("writeOnly"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    }
+
+    fn verified_response_fields_match_request_schema(&self, fields: &[String]) -> bool {
+        match self.request_schema.as_ref() {
+            None => true,
+            Some(_) => self
+                .verifiable_request_object_fields()
+                .is_some_and(|request_fields| fields == request_fields),
+        }
+    }
+
     fn created_resource_contract_supported(&self) -> bool {
         self.created_resource.as_ref().is_some_and(|target| {
             let expected_path = format!(
@@ -614,6 +660,8 @@ impl CapabilityV1 {
                 && !target.read_capability_id.is_empty()
                 && !target.delete_capability_id.is_empty()
                 && !target.verified_response_fields.is_empty()
+                && self
+                    .verified_response_fields_match_request_schema(&target.verified_response_fields)
                 && target
                     .verified_response_fields
                     .iter()
@@ -633,18 +681,9 @@ impl CapabilityV1 {
             if !require_fields {
                 return target.verified_response_fields.is_empty();
             }
-            let Some(mut request_fields) = self
-                .request_schema
-                .as_ref()
-                .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))
-                .and_then(|schema| schema.get("properties"))
-                .and_then(Value::as_object)
-                .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
-            else {
+            let Some(request_fields) = self.verifiable_request_object_fields() else {
                 return false;
             };
-            request_fields.sort();
-            request_fields.dedup();
             !request_fields.is_empty() && target.verified_response_fields == request_fields
         })
     }
@@ -683,6 +722,9 @@ impl CapabilityV1 {
                     && !target.read_capability_id.is_empty()
                     && !target.delete_capability_id.is_empty()
                     && !target.verified_response_fields.is_empty()
+                    && self.verified_response_fields_match_request_schema(
+                        &target.verified_response_fields,
+                    )
                     && target
                         .verified_response_fields
                         .iter()
@@ -715,18 +757,9 @@ impl CapabilityV1 {
                 target.collection_path.trim_end_matches('/'),
                 target.identity_selector
             );
-            let Some(mut request_fields) = self
-                .request_schema
-                .as_ref()
-                .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))
-                .and_then(|schema| schema.get("properties"))
-                .and_then(Value::as_object)
-                .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
-            else {
+            let Some(request_fields) = self.verifiable_request_object_fields() else {
                 return false;
             };
-            request_fields.sort();
-            request_fields.dedup();
             !target.identity_selector.is_empty()
                 && self.path == expected_path
                 && target.response_item_identity_pointer == "/id"

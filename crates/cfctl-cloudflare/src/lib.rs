@@ -668,7 +668,8 @@ impl Executor {
             },
         )?;
         let readback = self.send(&request, credential).await?;
-        let mismatches = mismatched_planned_fields(planned, &readback.result);
+        let mismatches =
+            mismatched_verifiable_planned_fields(&plan.capability, planned, &readback.result);
         let passed = apply_response.success && readback.success && mismatches.is_empty();
         let basis = if passed {
             "the exact resource readback contained every planned update field".to_owned()
@@ -785,9 +786,9 @@ impl Executor {
                     == Some(updated_identity)
             })
             .collect::<Vec<_>>();
-        let planned_fields_match = matching_items
-            .first()
-            .is_some_and(|item| contains_planned_value(item, &Value::Object(planned.clone())));
+        let planned_fields_match = matching_items.first().is_some_and(|item| {
+            mismatched_verifiable_planned_fields(&plan.capability, planned, item).is_empty()
+        });
         let passed = apply_response.success
             && readback.success
             && pagination_complete
@@ -880,7 +881,8 @@ impl Executor {
             .result
             .pointer(&target.response_result_identity_pointer)
             .and_then(Value::as_str);
-        let mismatches = mismatched_planned_fields(planned, &readback.result);
+        let mismatches =
+            mismatched_verifiable_planned_fields(&plan.capability, planned, &readback.result);
         let passed = apply_response.success
             && readback.success
             && readback_identity == Some(resource_id)
@@ -978,9 +980,9 @@ impl Executor {
                     == Some(resource_id)
             })
             .collect::<Vec<_>>();
-        let planned_fields_match = matching_items
-            .first()
-            .is_some_and(|item| contains_planned_value(item, &Value::Object(planned.clone())));
+        let planned_fields_match = matching_items.first().is_some_and(|item| {
+            mismatched_verifiable_planned_fields(&plan.capability, planned, item).is_empty()
+        });
         let passed = apply_response.success
             && readback.success
             && pagination_complete
@@ -1420,6 +1422,147 @@ fn mismatched_planned_fields(
         .collect()
 }
 
+fn mismatched_verifiable_planned_fields(
+    capability: &CapabilityV1,
+    planned: &serde_json::Map<String, Value>,
+    actual: &Value,
+) -> Vec<String> {
+    let schema = capability.request_schema.as_ref();
+    planned
+        .iter()
+        .filter(|(name, planned_value)| {
+            let mut path = vec![RequestSchemaPathStep::Property((*name).clone())];
+            !contains_verifiable_planned_value(
+                actual.get(name.as_str()),
+                planned_value,
+                schema,
+                &mut path,
+                0,
+            )
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RequestSchemaPathStep {
+    Property(String),
+    Item,
+}
+
+fn contains_verifiable_planned_value(
+    actual: Option<&Value>,
+    planned: &Value,
+    schema: Option<&Value>,
+    path: &mut Vec<RequestSchemaPathStep>,
+    depth: usize,
+) -> bool {
+    if depth > MAX_REQUEST_VALIDATION_DEPTH {
+        return false;
+    }
+    if schema.is_some_and(|schema| request_schema_path_is_write_only(schema, path)) {
+        return true;
+    }
+    let Some(actual) = actual else {
+        return false;
+    };
+    match (actual, planned) {
+        (Value::Object(actual), Value::Object(planned)) => planned.iter().all(|(name, value)| {
+            path.push(RequestSchemaPathStep::Property(name.clone()));
+            let matches =
+                contains_verifiable_planned_value(actual.get(name), value, schema, path, depth + 1);
+            path.pop();
+            matches
+        }),
+        (Value::Array(actual), Value::Array(planned)) => {
+            if actual.len() != planned.len() {
+                return false;
+            }
+            path.push(RequestSchemaPathStep::Item);
+            let matches = actual.iter().zip(planned).all(|(actual, planned)| {
+                contains_verifiable_planned_value(Some(actual), planned, schema, path, depth + 1)
+            });
+            path.pop();
+            matches
+        }
+        _ => actual == planned,
+    }
+}
+
+fn request_schema_path_is_write_only(schema: &Value, path: &[RequestSchemaPathStep]) -> bool {
+    let candidates = request_schema_path_candidates(schema, path, 0);
+    !candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|candidate| schema_declares_write_only(candidate, 0))
+}
+
+fn request_schema_path_candidates<'a>(
+    schema: &'a Value,
+    path: &[RequestSchemaPathStep],
+    depth: usize,
+) -> Vec<&'a Value> {
+    if depth > MAX_REQUEST_VALIDATION_DEPTH {
+        return Vec::new();
+    }
+    let Some((step, remaining)) = path.split_first() else {
+        return vec![schema];
+    };
+    let mut candidates = Vec::new();
+    let child = match step {
+        RequestSchemaPathStep::Property(name) => schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get(name)),
+        RequestSchemaPathStep::Item => schema.get("items"),
+    };
+    if let Some(child) = child {
+        candidates.extend(request_schema_path_candidates(child, remaining, depth + 1));
+    }
+    for composition in ["allOf", "oneOf", "anyOf"] {
+        for member in schema
+            .get(composition)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            candidates.extend(request_schema_path_candidates(member, path, depth + 1));
+        }
+    }
+    candidates
+}
+
+fn schema_declares_write_only(schema: &Value, depth: usize) -> bool {
+    if depth > MAX_REQUEST_VALIDATION_DEPTH {
+        return false;
+    }
+    if schema.get("writeOnly").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    if schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| schema_declares_write_only(member, depth + 1))
+        })
+    {
+        return true;
+    }
+    ["oneOf", "anyOf"].iter().any(|composition| {
+        schema
+            .get(*composition)
+            .and_then(Value::as_array)
+            .is_some_and(|members| {
+                !members.is_empty()
+                    && members
+                        .iter()
+                        .all(|member| schema_declares_write_only(member, depth + 1))
+            })
+    })
+}
+
 fn contains_planned_value(actual: &Value, planned: &Value) -> bool {
     match (actual, planned) {
         (Value::Object(actual), Value::Object(planned)) => planned.iter().all(|(name, value)| {
@@ -1580,10 +1723,7 @@ fn validate_same_path_update_target(capability: &CapabilityV1, input: &CallInput
         ));
     };
     if planned.keys().any(|field| {
-        target
-            .verified_response_fields
-            .binary_search(field)
-            .is_err()
+        !planned_field_is_bound_to_readback(capability, &target.verified_response_fields, field)
     }) {
         return Err(CloudflareError::MissingVerificationTarget(
             "the planned update contains a field outside the hash-bound same-path readback fields"
@@ -1631,10 +1771,7 @@ fn validate_created_resource_target(capability: &CapabilityV1, input: &CallInput
         ));
     };
     if planned.keys().any(|field| {
-        target
-            .verified_response_fields
-            .binary_search(field)
-            .is_err()
+        !planned_field_is_bound_to_readback(capability, &target.verified_response_fields, field)
     }) {
         return Err(CloudflareError::MissingVerificationTarget(
             "the planned create contains a field outside the hash-bound exact readback fields"
@@ -1692,10 +1829,7 @@ fn validate_created_collection_resource_target(
         ));
     };
     if planned.keys().any(|field| {
-        target
-            .verified_response_fields
-            .binary_search(field)
-            .is_err()
+        !planned_field_is_bound_to_readback(capability, &target.verified_response_fields, field)
     }) {
         return Err(CloudflareError::MissingVerificationTarget(
             "the planned create contains a field outside the hash-bound collection readback fields"
@@ -1782,10 +1916,7 @@ fn validate_updated_resource_target(capability: &CapabilityV1, input: &CallInput
         ));
     };
     if planned.keys().any(|field| {
-        target
-            .verified_response_fields
-            .binary_search(field)
-            .is_err()
+        !planned_field_is_bound_to_readback(capability, &target.verified_response_fields, field)
     }) {
         return Err(CloudflareError::MissingVerificationTarget(
             "the planned update contains a field outside the hash-bound collection readback fields"
@@ -1793,6 +1924,17 @@ fn validate_updated_resource_target(capability: &CapabilityV1, input: &CallInput
         ));
     }
     Ok(())
+}
+
+fn planned_field_is_bound_to_readback(
+    capability: &CapabilityV1,
+    verified_response_fields: &[String],
+    field: &str,
+) -> bool {
+    verified_response_fields
+        .binary_search_by(|candidate| candidate.as_str().cmp(field))
+        .is_ok()
+        || capability.request_object_field_is_write_only(field)
 }
 
 fn is_update_verifier(strategy: &str) -> bool {
