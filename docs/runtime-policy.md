@@ -30,6 +30,11 @@ selectors, request body hash, workspace graph, source-config hashes, local and
 Cloudflare diffs, cost, verification, compensation, and non-reversible
 warnings. It expires within 24 hours and any relevant drift invalidates it.
 
+Account-token mint plans additionally bind a fresh live permission-group
+inventory receipt and the normalized metadata for only the selected groups.
+cfctl re-reads those groups before durable consumption; permission or account
+scope drift invalidates the plan without crossing the token-create boundary.
+
 The plan is durably consumed before cfctl crosses the API, subprocess, or UI
 boundary. A crash after consumption cannot automatically replay the action.
 Crash-stale local locks expire after 15 minutes; nonce ownership prevents an

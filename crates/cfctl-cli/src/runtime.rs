@@ -638,6 +638,7 @@ async fn execute_read(
     envelope.profile_id = Some(profile.id.clone());
     envelope.account_id = account_id;
     envelope.ok = response.success;
+    envelope.performed = true;
     envelope.verification.state = VerificationState::NotApplicable;
     envelope.verification.basis = Some(format!(
         "live Cloudflare read pinned to catalog {}",
@@ -991,6 +992,7 @@ fn create_plan(
                     .to_owned(),
             )
         })?;
+    validate_api_token_creation_contract(&capability, &input, &adapter_targets, account_id)?;
     let impact = plan_impact(store, &capability, &input, account_id)?;
     let policy = PolicyEngine.evaluate(&capability, &impact.policy);
     if policy.disposition == PolicyDisposition::Blocked {
@@ -1065,6 +1067,165 @@ fn create_plan(
     envelope.policy_decision = Some(policy);
     envelope.verification.state = VerificationState::Pending;
     Ok(envelope)
+}
+
+fn validate_api_token_creation_contract(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    adapter_targets: &Value,
+    account_id: &str,
+) -> Result<()> {
+    if !matches!(
+        capability.id.as_str(),
+        "account-api-tokens-create-token" | "user-api-tokens-create-token"
+    ) {
+        return Ok(());
+    }
+    if capability.id != "account-api-tokens-create-token" {
+        return Err(CliError::Input(
+            "user-token minting is blocked until a dedicated least-privilege inventory workflow is implemented; use account-scoped `cfctl keys mint`"
+                .to_owned(),
+        ));
+    }
+    let inventory = adapter_targets
+        .get("permission_inventory")
+        .ok_or_else(|| {
+            CliError::Input(
+                "direct token-create calls are blocked because they do not bind a fresh permission inventory; use `cfctl keys mint`"
+                    .to_owned(),
+            )
+        })?;
+    if inventory
+        .get("source_capability_id")
+        .and_then(Value::as_str)
+        != Some("account-api-tokens-list-permission-groups")
+    {
+        return Err(CliError::Input(
+            "token mint permission metadata is not bound to the account permission-group inventory capability"
+                .to_owned(),
+        ));
+    }
+    let selected_groups = inventory
+        .get("selected_groups")
+        .and_then(Value::as_array)
+        .filter(|groups| !groups.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "token mint permission inventory contains no selected groups".to_owned(),
+            )
+        })?;
+    let selected_ids = selected_groups
+        .iter()
+        .map(|group| {
+            group
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "token mint permission inventory contains a group without an ID".to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let normalized_groups =
+        validate_selected_permission_groups(&selected_ids, &Value::Array(selected_groups.clone()))?;
+    let expected_hash = inventory
+        .get("selected_groups_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("token mint permission inventory hash is missing".to_owned())
+        })?;
+    if hash_value(&serde_json::to_value(&normalized_groups)?)? != expected_hash {
+        return Err(CliError::Input(
+            "token mint permission inventory metadata does not match its bound hash".to_owned(),
+        ));
+    }
+    let evidence_hashes = inventory
+        .get("evidence_hashes")
+        .and_then(Value::as_array)
+        .filter(|hashes| {
+            !hashes.is_empty()
+                && hashes.iter().all(|hash| {
+                    hash.as_str()
+                        .is_some_and(|hash| hash.starts_with("sha256:") && hash.len() == 71)
+                })
+        })
+        .ok_or_else(|| {
+            CliError::Input(
+                "token mint permission inventory is missing a live-read evidence hash".to_owned(),
+            )
+        })?;
+    if evidence_hashes.len() != 1 {
+        return Err(CliError::Input(
+            "token mint permission inventory must bind exactly one live-read evidence receipt"
+                .to_owned(),
+        ));
+    }
+    validate_token_policy_body(input.body.as_ref(), &selected_ids, account_id)
+}
+
+fn validate_token_policy_body(
+    body: Option<&Value>,
+    selected_ids: &[String],
+    account_id: &str,
+) -> Result<()> {
+    let policies = body
+        .and_then(|body| body.get("policies"))
+        .and_then(Value::as_array)
+        .filter(|policies| policies.len() == 1)
+        .ok_or_else(|| {
+            CliError::Input(
+                "token minting requires exactly one hash-bound least-privilege policy".to_owned(),
+            )
+        })?;
+    let policy = &policies[0];
+    if policy.get("effect").and_then(Value::as_str) != Some("allow") {
+        return Err(CliError::Input(
+            "token minting requires one explicit allow policy".to_owned(),
+        ));
+    }
+    let mut body_ids = policy
+        .get("permission_groups")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliError::Input("token mint policy has no permission-group list".to_owned())
+        })?
+        .iter()
+        .map(|group| {
+            group
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "token mint policy contains a permission group without an ID".to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let original_len = body_ids.len();
+    body_ids.sort();
+    body_ids.dedup();
+    if original_len != body_ids.len() || body_ids != selected_ids {
+        return Err(CliError::Input(
+            "token mint policy permissions do not exactly match the bound live inventory selection"
+                .to_owned(),
+        ));
+    }
+    let resources = policy
+        .get("resources")
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("token mint policy has no resource scope".to_owned()))?;
+    let expected_resource = format!("com.cloudflare.api.account.{account_id}");
+    if resources.len() != 1
+        || resources.get(&expected_resource).and_then(Value::as_str) != Some("*")
+    {
+        return Err(CliError::Input(format!(
+            "token mint policy must be scoped only to account `{account_id}`"
+        )));
+    }
+    Ok(())
 }
 
 struct PlannedImpact {
@@ -1299,6 +1460,16 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     let credential = fresh_credential(profile, &PlatformSecretStore).await?;
     let secrets = PlatformSecretStore;
     let execution_input = resolved_plan_input(&plan, &secrets)?;
+    let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    validate_api_token_creation_contract(
+        &plan.capability,
+        &execution_input,
+        adapter_targets,
+        &plan.account_id,
+    )?;
+    let permission_inventory_evidence =
+        validate_live_permission_inventory_precondition(store, &catalog, &plan, &credential)
+            .await?;
     plan.mark_consumed()?;
     store.save_plan(&plan)?;
     persist_transaction_stage(
@@ -1337,7 +1508,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         }
         return result;
     }
-    execute_api_plan(
+    let mut envelope = execute_api_plan(
         store,
         &catalog.schema_hash,
         &mut plan,
@@ -1345,7 +1516,112 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         &credential,
         &secrets,
     )
-    .await
+    .await?;
+    if let Some(evidence) = permission_inventory_evidence {
+        envelope.evidence.insert(0, evidence);
+    }
+    Ok(envelope)
+}
+
+async fn validate_live_permission_inventory_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    if plan.capability.id != "account-api-tokens-create-token" {
+        return Ok(None);
+    }
+    let inventory_contract = plan
+        .targets
+        .pointer("/adapter/permission_inventory")
+        .ok_or_else(|| {
+            CliError::Input(
+                "token mint plan predates the live permission-inventory contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let source_capability_id = inventory_contract
+        .get("source_capability_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("token mint permission-inventory capability is missing".to_owned())
+        })?;
+    let source_capability = catalog.get(source_capability_id).ok_or_else(|| {
+        CliError::Input(format!(
+            "token mint permission-inventory capability `{source_capability_id}` no longer exists"
+        ))
+    })?;
+    if source_capability.id != "account-api-tokens-list-permission-groups"
+        || source_capability.method != "GET"
+        || source_capability.path != "/accounts/{account_id}/tokens/permission_groups"
+    {
+        return Err(CliError::Input(
+            "token mint permission-inventory capability drifted from the governed account read"
+                .to_owned(),
+        ));
+    }
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source_capability,
+            &CallInput {
+                selectors: json!({"account_id": plan.account_id}),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    if !response.success {
+        return Err(CliError::Input(
+            "Cloudflare rejected the permission-inventory precondition read; the token mint boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    validate_current_permission_groups(inventory_contract, &response.result)?;
+    let evidence =
+        store.write_evidence(EvidenceClass::LiveRead, &serde_json::to_value(&response)?)?;
+    Ok(Some(evidence))
+}
+
+fn validate_current_permission_groups(inventory_contract: &Value, current: &Value) -> Result<()> {
+    let selected_groups = inventory_contract
+        .get("selected_groups")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliError::Input("token mint selected permission groups are missing".to_owned())
+        })?;
+    let selected_ids = selected_groups
+        .iter()
+        .map(|group| {
+            group
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "token mint selected permission group is missing an ID".to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let expected_hash = inventory_contract
+        .get("selected_groups_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("token mint selected permission-group hash is missing".to_owned())
+        })?;
+    let current_groups = validate_selected_permission_groups(&selected_ids, current)?;
+    let current_hash = hash_value(&serde_json::to_value(&current_groups)?)?;
+    if current_hash != expected_hash {
+        return Err(CliError::Input(
+            "selected permission-group metadata drifted after planning; create and review a new token mint plan"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn execute_api_plan(
@@ -1929,11 +2205,39 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
                 .to_owned(),
         ));
     }
+    let inventory = key_permissions(
+        store,
+        &KeyPermissionArgs {
+            account: Some(account.to_owned()),
+        },
+    )
+    .await?;
+    if !inventory.ok || !inventory.performed || inventory.account_id.as_deref() != Some(account) {
+        return Err(CliError::Input(
+            "fresh account permission inventory did not produce an account-bound live-read receipt"
+                .to_owned(),
+        ));
+    }
+    let selected_groups = validate_selected_permission_groups(
+        &arguments.permissions,
+        inventory.result.get("result").unwrap_or(&Value::Null),
+    )?;
+    let selected_group_ids = selected_groups
+        .iter()
+        .filter_map(|group| group.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let selected_groups_hash = hash_value(&serde_json::to_value(&selected_groups)?)?;
+    let inventory_evidence_hashes = inventory
+        .evidence
+        .iter()
+        .map(|evidence| evidence.content_hash.clone())
+        .collect::<Vec<_>>();
     let mut body = json!({
         "name": arguments.name,
         "policies": [{
             "effect": "allow",
-            "permission_groups": arguments.permissions.iter().map(|id| json!({"id": id})).collect::<Vec<_>>(),
+            "permission_groups": selected_group_ids.iter().map(|id| json!({"id": id})).collect::<Vec<_>>(),
             "resources": {format!("com.cloudflare.api.account.{account}"): "*"}
         }]
     });
@@ -1946,7 +2250,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
         .get("account-api-tokens-create-token")
         .cloned()
         .ok_or_else(|| capability_missing("account-api-tokens-create-token"))?;
-    create_plan(
+    let mut plan = create_plan(
         store,
         &catalog,
         capability,
@@ -1958,8 +2262,92 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
         },
         None,
         Some(account),
-        json!({"value_out": value_out}),
-    )
+        json!({
+            "value_out": value_out,
+            "permission_inventory": {
+                "source_capability_id": "account-api-tokens-list-permission-groups",
+                "selected_groups": selected_groups,
+                "selected_groups_hash": selected_groups_hash,
+                "evidence_hashes": inventory_evidence_hashes,
+            }
+        }),
+    )?;
+    plan.evidence.splice(0..0, inventory.evidence);
+    Ok(plan)
+}
+
+fn validate_selected_permission_groups(
+    requested_ids: &[String],
+    inventory: &Value,
+) -> Result<Vec<Value>> {
+    if requested_ids.is_empty() {
+        return Err(CliError::Input(
+            "at least one permission group ID must be selected".to_owned(),
+        ));
+    }
+    let groups = inventory.as_array().ok_or_else(|| {
+        CliError::Input("live permission inventory result is not an array".to_owned())
+    })?;
+    let mut requested_ids = requested_ids.to_vec();
+    requested_ids.sort();
+    requested_ids.dedup();
+    let mut selected = Vec::with_capacity(requested_ids.len());
+    for requested_id in requested_ids {
+        let matches = groups
+            .iter()
+            .filter(|group| group.get("id").and_then(Value::as_str) == Some(&requested_id))
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(CliError::Input(format!(
+                "permission group `{requested_id}` is not unique in the fresh account inventory (matched {})",
+                matches.len()
+            )));
+        }
+        let group = matches[0];
+        let name = group
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                CliError::Input(format!(
+                    "permission group `{requested_id}` has no auditable name in the fresh account inventory"
+                ))
+            })?;
+        let mut scopes = group
+            .get("scopes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                CliError::Input(format!(
+                    "permission group `{requested_id}` has no auditable scope list in the fresh account inventory"
+                ))
+            })?
+            .iter()
+            .map(|scope| {
+                scope.as_str().map(str::to_owned).ok_or_else(|| {
+                    CliError::Input(format!(
+                        "permission group `{requested_id}` contains a non-string scope"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        scopes.sort();
+        scopes.dedup();
+        if scopes.is_empty() {
+            return Err(CliError::Input(format!(
+                "permission group `{requested_id}` has an empty scope list"
+            )));
+        }
+        let mut normalized = Map::from_iter([
+            ("id".to_owned(), Value::String(requested_id)),
+            ("name".to_owned(), Value::String(name.to_owned())),
+            ("scopes".to_owned(), serde_json::to_value(scopes)?),
+        ]);
+        if let Some(category) = group.get("category").and_then(Value::as_str) {
+            normalized.insert("category".to_owned(), Value::String(category.to_owned()));
+        }
+        selected.push(Value::Object(normalized));
+    }
+    Ok(selected)
 }
 
 async fn key_rotate(store: &StateStore, arguments: &KeyRotateArgs) -> Result<ResultEnvelopeV2> {
@@ -3059,11 +3447,13 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 mod tests {
     use super::{
         CallInput, compensation_request, find_secret_value, persist_secret_lifecycle,
-        redact_secret_result, sink_secret_result,
+        redact_secret_result, sink_secret_result, validate_api_token_creation_contract,
+        validate_current_permission_groups, validate_selected_permission_groups,
     };
     use cfctl_auth::{AuthError, SecretStore};
     use cfctl_core::{
         CapabilityV1, CreatedResourceContractV1, PlanStatus, PlanV1, RiskClass, TransactionStageV1,
+        hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use serde_json::json;
@@ -3081,6 +3471,145 @@ mod tests {
 
         fn delete(&self, _key: &str) -> cfctl_auth::Result<()> {
             Err(AuthError::SecretStore("injected delete failure".to_owned()))
+        }
+    }
+
+    #[test]
+    fn selected_permission_groups_must_match_unique_live_inventory_entries() {
+        let inventory = json!([
+            {
+                "id": "group-b",
+                "name": "Workers Scripts Write",
+                "scopes": ["com.cloudflare.api.account"]
+            },
+            {
+                "id": "group-a",
+                "name": "Account Settings Read",
+                "scopes": ["com.cloudflare.api.account", "com.cloudflare.api.zone"]
+            }
+        ]);
+
+        let selected = validate_selected_permission_groups(
+            &["group-b".to_owned(), "group-a".to_owned()],
+            &inventory,
+        )
+        .expect("selected groups resolve");
+
+        assert_eq!(selected[0]["id"], "group-a");
+        assert_eq!(selected[0]["name"], "Account Settings Read");
+        assert_eq!(selected[1]["id"], "group-b");
+        assert_eq!(selected[1]["scopes"], json!(["com.cloudflare.api.account"]));
+
+        let missing =
+            validate_selected_permission_groups(&["group-missing".to_owned()], &inventory)
+                .expect_err("missing group is rejected");
+        assert!(missing.to_string().contains("group-missing"));
+
+        let duplicate_inventory = json!([
+            {"id":"group-a","name":"First","scopes":["com.cloudflare.api.account"]},
+            {"id":"group-a","name":"Second","scopes":["com.cloudflare.api.account"]}
+        ]);
+        let duplicate =
+            validate_selected_permission_groups(&["group-a".to_owned()], &duplicate_inventory)
+                .expect_err("ambiguous group is rejected");
+        assert!(duplicate.to_string().contains("not unique"));
+    }
+
+    #[test]
+    fn token_creation_requires_inventory_bound_permissions_and_exact_account_scope() {
+        let capability = CapabilityV1::new(
+            "account-api-tokens-create-token",
+            "Create account token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        let groups = json!([{
+            "id": "group-a",
+            "name": "Workers Scripts Write",
+            "scopes": ["com.cloudflare.api.account"]
+        }]);
+        let groups_hash = hash_value(&groups).expect("group hash");
+        let adapter = json!({
+            "permission_inventory": {
+                "source_capability_id": "account-api-tokens-list-permission-groups",
+                "selected_groups": groups,
+                "selected_groups_hash": groups_hash,
+                "evidence_hashes": [format!("sha256:{}", "a".repeat(64))]
+            }
+        });
+        let input = CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            query: json!({}),
+            body: Some(json!({
+                "name":"least-privilege token",
+                "policies":[{
+                    "effect":"allow",
+                    "permission_groups":[{"id":"group-a"}],
+                    "resources":{"com.cloudflare.api.account.account-a":"*"}
+                }]
+            })),
+            ..CallInput::default()
+        };
+
+        validate_api_token_creation_contract(&capability, &input, &adapter, "account-a")
+            .expect("inventory-bound token plan is valid");
+
+        let direct =
+            validate_api_token_creation_contract(&capability, &input, &json!({}), "account-a")
+                .expect_err("direct token call is rejected");
+        assert!(direct.to_string().contains("cfctl keys mint"));
+
+        let mut widened = input.clone();
+        widened.body = Some(json!({
+            "name":"widened token",
+            "policies":[{
+                "effect":"allow",
+                "permission_groups":[{"id":"group-a"}],
+                "resources":{"com.cloudflare.api.account.other-account":"*"}
+            }]
+        }));
+        let widened =
+            validate_api_token_creation_contract(&capability, &widened, &adapter, "account-a")
+                .expect_err("cross-account scope is rejected");
+        assert!(widened.to_string().contains("account-a"));
+    }
+
+    #[test]
+    fn token_permission_precondition_rejects_renamed_or_rescoped_groups() {
+        let selected = json!([{
+            "id":"group-a",
+            "name":"Workers Scripts Write",
+            "scopes":["com.cloudflare.api.account"]
+        }]);
+        let contract = json!({
+            "selected_groups": selected,
+            "selected_groups_hash": hash_value(&selected).expect("selected hash")
+        });
+        validate_current_permission_groups(
+            &contract,
+            &json!([{
+                "id":"group-a",
+                "name":"Workers Scripts Write",
+                "scopes":["com.cloudflare.api.account"]
+            }]),
+        )
+        .expect("unchanged permission group passes");
+
+        for drifted in [
+            json!([{
+                "id":"group-a",
+                "name":"Workers Scripts Administrator",
+                "scopes":["com.cloudflare.api.account"]
+            }]),
+            json!([{
+                "id":"group-a",
+                "name":"Workers Scripts Write",
+                "scopes":["com.cloudflare.api.account", "com.cloudflare.api.user"]
+            }]),
+        ] {
+            let error = validate_current_permission_groups(&contract, &drifted)
+                .expect_err("permission metadata drift is rejected");
+            assert!(error.to_string().contains("drifted after planning"));
         }
     }
 

@@ -132,6 +132,15 @@ before a crash cannot be replayed. The local
 durability suite reopens the state store after an injected crash between every
 journal transition and proves recovery stops at the last persisted checkpoint.
 
+`cfctl keys mint` validates every selected permission-group ID against a fresh,
+account-bound live inventory before it creates a plan. The plan binds only the
+normalized ID, name, category, and scopes for the selected groups plus the
+live-read evidence hash; it never copies arbitrary inventory fields. Execution
+repeats that read before durable consumption and rejects renamed, rescoped,
+missing, duplicate, cross-account, or widened policy input. Direct token-create
+calls and user-token minting remain blocked until they can carry the same
+least-privilege contract.
+
 When a token or DNS-record creation receipt proves the returned resource ID
 and the catalog declares a compensating delete, `plans rectify` can derive a
 separate hash-bound revoke/delete plan. It never runs that plan automatically:

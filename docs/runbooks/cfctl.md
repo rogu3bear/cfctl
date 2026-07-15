@@ -75,6 +75,20 @@ uncertain or unsupported result.
 Secret outputs require `--value-out /new/secure/path`; cfctl refuses an
 existing destination.
 
+Mint an account token only through the dedicated key workflow:
+
+```bash
+cfctl keys permissions --account <account-id> --json
+cfctl keys mint --name <name> --permission <reviewed-group-id> \
+  --account <account-id> --ttl-hours <hours> \
+  --value-out /new/secure/path --json
+```
+
+Mint planning repeats the live permission inventory and binds the exact group
+metadata and account-only resource policy. Running the approved plan repeats
+that inventory read before consumption; drift requires a new plan. Do not use
+generic `call` for token creation.
+
 ## Agent entry
 
 ```bash
