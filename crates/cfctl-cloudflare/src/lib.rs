@@ -637,10 +637,17 @@ impl Executor {
         input: &CallInput,
         credential: &AuthCredential,
     ) -> Result<OperationVerificationV1> {
+        let operation = if plan.capability.verification.strategy
+            == "same_path_result_contains_planned_fields_after_mutation"
+        {
+            "mutation"
+        } else {
+            "update"
+        };
         let target = plan.capability.same_path_read.as_ref().ok_or_else(|| {
-            CloudflareError::MissingVerificationTarget(
-                "the hash-bound same-path update readback contract is absent".to_owned(),
-            )
+            CloudflareError::MissingVerificationTarget(format!(
+                "the hash-bound same-path {operation} readback contract is absent"
+            ))
         })?;
         let planned = input
             .body
@@ -648,14 +655,15 @@ impl Executor {
             .and_then(Value::as_object)
             .filter(|body| !body.is_empty())
             .ok_or_else(|| {
-                CloudflareError::MissingVerificationTarget(
-                    "planned update body is absent, empty, or not an object".to_owned(),
-                )
+                CloudflareError::MissingVerificationTarget(format!(
+                    "planned {operation} body is absent, empty, or not an object"
+                ))
             })?;
+        let readback_title = format!("Exact resource {operation} verification readback");
         let details = same_path_verification_capability(
             &plan.capability,
             &target.read_capability_id,
-            "Exact resource update verification readback",
+            &readback_title,
             &target.path,
         );
         let request = self.builder.build(
@@ -672,10 +680,10 @@ impl Executor {
             mismatched_verifiable_planned_fields(&plan.capability, planned, &readback.result);
         let passed = apply_response.success && readback.success && mismatches.is_empty();
         let basis = if passed {
-            "the exact resource readback contained every planned update field".to_owned()
+            format!("the exact resource readback contained every planned {operation} field")
         } else {
             format!(
-                "exact resource update was not proven (apply success={}, readback HTTP {}, readback success={}, fields={})",
+                "exact resource {operation} was not proven (apply success={}, readback HTTP {}, readback success={}, fields={})",
                 apply_response.success,
                 readback.status,
                 readback.success,
@@ -699,7 +707,8 @@ impl Executor {
     ) -> Result<OperationVerificationV1> {
         match plan.capability.verification.strategy.as_str() {
             "same_resource_contains_planned_fields_after_update"
-            | "same_path_result_contains_planned_fields_after_update" => {
+            | "same_path_result_contains_planned_fields_after_update"
+            | "same_path_result_contains_planned_fields_after_mutation" => {
                 self.verify_exact_resource_update(plan, apply_response, input, credential)
                     .await
             }
@@ -1639,6 +1648,7 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
         | "same_path_result_contains_planned_fields_after_update"
         | "parent_collection_item_contains_planned_fields_after_update"
         | "dns_record_details_match_planned_id_and_fields" => Some("update"),
+        "same_path_result_contains_planned_fields_after_mutation" => Some("mutation"),
         _ => None,
     };
     if let Some(label) = body_label {
@@ -1658,7 +1668,8 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
             validate_same_path_delete_target(capability, input)
         }
         "same_resource_contains_planned_fields_after_update"
-        | "same_path_result_contains_planned_fields_after_update" => {
+        | "same_path_result_contains_planned_fields_after_update"
+        | "same_path_result_contains_planned_fields_after_mutation" => {
             validate_same_path_update_target(capability, input)
         }
         "created_resource_contains_planned_fields_by_returned_id" => {
@@ -1736,10 +1747,17 @@ fn validate_same_path_delete_target(capability: &CapabilityV1, input: &CallInput
 }
 
 fn validate_same_path_update_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    let operation = if capability.verification.strategy
+        == "same_path_result_contains_planned_fields_after_mutation"
+    {
+        "mutation"
+    } else {
+        "update"
+    };
     let target = capability.same_path_read.as_ref().ok_or_else(|| {
-        CloudflareError::MissingVerificationTarget(
-            "the hash-bound same-path update readback contract is absent".to_owned(),
-        )
+        CloudflareError::MissingVerificationTarget(format!(
+            "the hash-bound same-path {operation} readback contract is absent"
+        ))
     })?;
     if target.path != capability.path
         || target.read_capability_id.is_empty()
@@ -1749,28 +1767,26 @@ fn validate_same_path_update_target(capability: &CapabilityV1, input: &CallInput
             .windows(2)
             .any(|fields| fields[0] >= fields[1])
     {
-        return Err(CloudflareError::MissingVerificationTarget(
-            "the hash-bound same-path update readback contract is malformed".to_owned(),
-        ));
+        return Err(CloudflareError::MissingVerificationTarget(format!(
+            "the hash-bound same-path {operation} readback contract is malformed"
+        )));
     }
     if !clean_verification_query(input) {
-        return Err(CloudflareError::MissingVerificationTarget(
-            "the planned update contains query controls outside the hash-bound same-path readback contract"
-                .to_owned(),
-        ));
+        return Err(CloudflareError::MissingVerificationTarget(format!(
+            "the planned {operation} contains query controls outside the hash-bound same-path readback contract"
+        )));
     }
     let Some(planned) = input.body.as_ref().and_then(Value::as_object) else {
-        return Err(CloudflareError::MissingVerificationTarget(
-            "planned update body is absent, empty, or not an object".to_owned(),
-        ));
+        return Err(CloudflareError::MissingVerificationTarget(format!(
+            "planned {operation} body is absent, empty, or not an object"
+        )));
     };
     if planned.keys().any(|field| {
         !planned_field_is_bound_to_readback(capability, &target.verified_response_fields, field)
     }) {
-        return Err(CloudflareError::MissingVerificationTarget(
-            "the planned update contains a field outside the hash-bound same-path readback fields"
-                .to_owned(),
-        ));
+        return Err(CloudflareError::MissingVerificationTarget(format!(
+            "the planned {operation} contains a field outside the hash-bound same-path readback fields"
+        )));
     }
     Ok(())
 }
@@ -2006,6 +2022,7 @@ fn is_update_verifier(strategy: &str) -> bool {
         strategy,
         "same_resource_contains_planned_fields_after_update"
             | "same_path_result_contains_planned_fields_after_update"
+            | "same_path_result_contains_planned_fields_after_mutation"
             | "parent_collection_item_contains_planned_fields_after_update"
     )
 }

@@ -2010,6 +2010,131 @@ fn same_path_object_updates_require_schema_proven_readback_fields() {
     );
 }
 
+fn same_path_post_mutation_fixture() -> serde_json::Value {
+    json!({
+        "openapi":"3.0.3",
+        "info":{"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/accounts/{account_id}/settings/example": {
+                "get": {
+                    "operationId":"settings-get",
+                    "tags":["Account Settings"],
+                    "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
+                        "type":"object",
+                        "properties":{"result":{"type":"object","properties":{
+                            "enabled":{"type":"boolean"},"mode":{"type":"string"}
+                        }}}
+                    }}}}}
+                },
+                "post": {
+                    "operationId":"settings-apply",
+                    "tags":["Account Settings"],
+                    "x-api-token-group":["Settings Write"],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "type":"object",
+                        "properties":{"mode":{"type":"string"},"enabled":{"type":"boolean"}}
+                    }}}}
+                }
+            },
+            "/accounts/{account_id}/settings/incomplete": {
+                "get": {
+                    "operationId":"incomplete-settings-get",
+                    "tags":["Incomplete Settings"],
+                    "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
+                        "type":"object",
+                        "properties":{"result":{"type":"object","properties":{"mode":{"type":"string"}}}}
+                    }}}}}
+                },
+                "post": {
+                    "operationId":"incomplete-settings-apply",
+                    "tags":["Incomplete Settings"],
+                    "x-api-token-group":["Settings Write"],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "type":"object",
+                        "properties":{"mode":{"type":"string"},"hidden":{"type":"boolean"}}
+                    }}}}
+                }
+            },
+            "/accounts/{account_id}/widgets": {
+                "get": {
+                    "operationId":"widgets-list-shaped-as-object",
+                    "tags":["Widgets"],
+                    "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
+                        "type":"object",
+                        "properties":{"result":{"type":"object","properties":{"name":{"type":"string"}}}}
+                    }}}}}
+                },
+                "post": {
+                    "operationId":"widgets-create",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "type":"object","properties":{"name":{"type":"string"}}
+                    }}}},
+                    "responses":{"201":{"description":"created","content":{"application/json":{"schema":{
+                        "type":"object","properties":{"result":{"type":"object","properties":{
+                            "id":{"type":"string"},"name":{"type":"string"}
+                        }}}
+                    }}}}}
+                }
+            },
+            "/accounts/{account_id}/widgets/{widget_id}": {
+                "get": {
+                    "operationId":"widgets-get",
+                    "tags":["Widgets"],
+                    "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
+                        "type":"object","properties":{"result":{"type":"object","properties":{
+                            "id":{"type":"string"},"name":{"type":"string"}
+                        }}}
+                    }}}}}
+                },
+                "delete": {
+                    "operationId":"widgets-delete",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"]
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn same_path_post_mutations_require_schema_proven_readback_fields() {
+    let document = same_path_post_mutation_fixture();
+    let snapshot = normalize_openapi(&document).expect("settings catalog");
+    let mutation = snapshot.get("settings-apply").expect("settings apply");
+    assert_eq!(
+        mutation.verification.strategy,
+        "same_path_result_contains_planned_fields_after_mutation"
+    );
+    let target = mutation
+        .same_path_read
+        .as_ref()
+        .expect("hash-bound same-path readback");
+    assert_eq!(target.path, mutation.path);
+    assert_eq!(target.read_capability_id, "settings-get");
+    assert_eq!(target.verified_response_fields, ["enabled", "mode"]);
+    assert!(!mutation.rollback.supported);
+    assert!(mutation.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("prior state") && warning.contains("separately reviewed")
+    }));
+    assert_ne!(
+        snapshot
+            .get("incomplete-settings-apply")
+            .expect("incomplete settings apply")
+            .verification
+            .strategy,
+        "same_path_result_contains_planned_fields_after_mutation"
+    );
+    let create = snapshot.get("widgets-create").expect("widgets create");
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    assert!(create.created_resource.is_some());
+    assert!(create.same_path_read.is_none());
+}
+
 fn create_lifecycle_fixture() -> serde_json::Value {
     json!({
         "openapi": "3.0.3",

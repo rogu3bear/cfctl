@@ -3221,6 +3221,69 @@ async fn same_path_object_update_verifies_schema_proven_fields_with_a_clean_get(
 }
 
 #[tokio::test]
+async fn same_path_post_mutation_verifies_schema_proven_fields_with_a_clean_get() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let read = stream.read(&mut buffer).await.expect("read verification");
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let body = r#"{"success":true,"result":{"enabled":true,"mode":"strict"},"errors":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+        request
+    });
+    let plan = dns_record_plan(
+        "settings-apply",
+        "POST",
+        "/accounts/{account_id}/settings/example",
+        "same_path_result_contains_planned_fields_after_mutation",
+        json!({"account_id":"account-1"}),
+        Some(json!({"enabled":true,"mode":"strict"})),
+    );
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    assert!(verification.basis.contains("planned mutation field"));
+    assert!(!verification.basis.contains("planned update field"));
+    let request = server.await.expect("server joins");
+    assert!(request.starts_with("GET /client/v4/accounts/account-1/settings/example "));
+}
+
+#[tokio::test]
 async fn dns_record_verification_rejects_live_field_drift_without_echoing_values() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -3315,6 +3378,7 @@ fn dns_record_plan(
         verification_strategy,
         "same_resource_contains_planned_fields_after_update"
             | "same_path_result_contains_planned_fields_after_update"
+            | "same_path_result_contains_planned_fields_after_mutation"
             | "parent_collection_item_contains_planned_fields_after_update"
     ) {
         let mut fields = body

@@ -550,6 +550,11 @@ impl CapabilityV1 {
                     && self.same_path_readback_selectors_supported()
                     && self.same_path_read_contract_supported(true)
             }
+            "same_path_result_contains_planned_fields_after_mutation" => {
+                self.method == "POST"
+                    && self.same_path_readback_selectors_supported()
+                    && self.same_path_read_contract_supported(true)
+            }
             "created_resource_contains_planned_fields_by_returned_id" => {
                 self.method == "POST" && self.created_resource_contract_supported()
             }

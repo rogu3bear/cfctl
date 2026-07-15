@@ -888,9 +888,9 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     classify_exact_resource_contracts(document, &mut capabilities);
     classify_parent_collection_delete_contracts(document, &mut capabilities);
     classify_parent_collection_update_contracts(document, &mut capabilities);
-    classify_same_path_object_update_contracts(document, &mut capabilities);
     classify_created_resource_contracts(document, &mut capabilities);
     classify_created_collection_resource_contracts(document, &mut capabilities);
+    classify_same_path_object_mutation_contracts(document, &mut capabilities);
 
     let source_hash = hash_value(document)?;
     let mut snapshot = CatalogSnapshot {
@@ -905,7 +905,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     Ok(snapshot)
 }
 
-fn classify_same_path_object_update_contracts(
+fn classify_same_path_object_mutation_contracts(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
 ) {
@@ -928,7 +928,7 @@ fn classify_same_path_object_update_contracts(
         .collect::<BTreeMap<_, _>>();
 
     for capability in capabilities.values_mut() {
-        if !matches!(capability.method.as_str(), "PATCH" | "PUT")
+        if !matches!(capability.method.as_str(), "PATCH" | "POST" | "PUT")
             || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
         {
             continue;
@@ -964,14 +964,22 @@ fn classify_same_path_object_update_contracts(
             read_capability_id: read_capability_id.clone(),
             verified_response_fields: fields,
         });
-        "same_path_result_contains_planned_fields_after_update"
-            .clone_into(&mut capability.verification.strategy);
+        if capability.method == "POST" {
+            "same_path_result_contains_planned_fields_after_mutation"
+                .clone_into(&mut capability.verification.strategy);
+        } else {
+            "same_path_result_contains_planned_fields_after_update"
+                .clone_into(&mut capability.verification.strategy);
+        }
         capability.rollback.supported = false;
         capability.rollback.strategy = None;
-        capability.rollback.warning = Some(
+        capability.rollback.warning = Some(if capability.method == "POST" {
+            "automatic reversal is unsupported because the plan does not bind prior state; reversal requires a separately reviewed operation built from trusted evidence"
+                .to_owned()
+        } else {
             "automatic restoration is unsupported because the plan does not bind a pre-change snapshot; restoration requires a separately reviewed update plan built from trusted evidence"
-                .to_owned(),
-        );
+                .to_owned()
+        });
         refresh_dynamic_mutation_contract(capability);
     }
 }

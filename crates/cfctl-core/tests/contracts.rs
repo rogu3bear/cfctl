@@ -109,6 +109,40 @@ fn mutation_contracts_reject_declared_but_unimplemented_strategies() {
 }
 
 #[test]
+fn same_path_post_state_contract_requires_the_exact_post_method_and_readback() {
+    let mut capability = CapabilityV1::new(
+        "settings-apply",
+        "Apply settings",
+        "POST",
+        "/accounts/{account_id}/settings/example",
+    );
+    capability.verification.strategy =
+        "same_path_result_contains_planned_fields_after_mutation".to_owned();
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{"enabled":{"type":"boolean"},"mode":{"type":"string"}}
+    }));
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: capability.path.clone(),
+        read_capability_id: "settings-get".to_owned(),
+        verified_response_fields: vec!["enabled".to_owned(), "mode".to_owned()],
+    });
+
+    assert!(capability.verification_contract_supported());
+
+    capability.method = "PUT".to_owned();
+    assert!(!capability.verification_contract_supported());
+
+    capability.method = "POST".to_owned();
+    capability
+        .same_path_read
+        .as_mut()
+        .expect("same-path contract")
+        .verified_response_fields = vec!["mode".to_owned()];
+    assert!(!capability.verification_contract_supported());
+}
+
+#[test]
 fn updated_resource_contract_rejects_noncanonical_field_allowlists() {
     let mut capability = CapabilityV1::new(
         "widgets-update",
