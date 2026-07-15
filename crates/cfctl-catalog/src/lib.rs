@@ -3467,6 +3467,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         classify_dns_record_lifecycle(capability);
     } else if let Some(kind) = access_authorization_configuration_kind(capability) {
         classify_access_authorization_configuration(capability, kind);
+    } else if turnstile_widget_create_contract_supported(capability) {
+        classify_turnstile_widget_create(capability);
     } else if turnstile_widget_update_contract_supported(capability) {
         classify_turnstile_widget_update(capability);
     } else if let Some(kind) = load_balancing_configuration_kind(capability) {
@@ -3489,12 +3491,35 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
     true
 }
 
+fn turnstile_widget_create_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "accounts-turnstile-widget-create"
+        && capability.method == "POST"
+        && capability.path == "/accounts/{account_id}/challenges/widgets"
+        && capability.product == "Turnstile"
+        && turnstile_widget_write_permissions_supported(capability)
+        && turnstile_widget_collection_selectors_supported(capability)
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(turnstile_widget_response_contract_supported)
+        && turnstile_widget_configuration_request_contract_supported(capability)
+}
+
 fn turnstile_widget_update_contract_supported(capability: &CapabilityV1) -> bool {
     capability.id == "accounts-turnstile-widget-update"
         && capability.method == "PUT"
         && capability.path == "/accounts/{account_id}/challenges/widgets/{sitekey}"
         && capability.product == "Turnstile"
-        && capability.permissions.len() == 2
+        && turnstile_widget_write_permissions_supported(capability)
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(turnstile_widget_response_contract_supported)
+        && turnstile_widget_configuration_request_contract_supported(capability)
+}
+
+fn turnstile_widget_write_permissions_supported(capability: &CapabilityV1) -> bool {
+    capability.permissions.len() == 2
         && capability
             .permissions
             .iter()
@@ -3503,18 +3528,79 @@ fn turnstile_widget_update_contract_supported(capability: &CapabilityV1) -> bool
             .permissions
             .iter()
             .any(|permission| permission == "Account Settings Write")
-        && capability
-            .response_contract
-            .as_ref()
-            .is_some_and(|response| {
-                response.success_statuses == ["200"]
-                    && response.success_media_types == ["application/json"]
-                    && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
-            })
-        && turnstile_widget_update_request_contract_supported(capability)
 }
 
-fn turnstile_widget_update_request_contract_supported(capability: &CapabilityV1) -> bool {
+fn turnstile_widget_response_contract_supported(response: &ResponseContractV1) -> bool {
+    response.success_statuses == ["200"]
+        && response.success_media_types == ["application/json"]
+        && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+}
+
+fn turnstile_widget_collection_selectors_supported(capability: &CapabilityV1) -> bool {
+    let expected = [
+        (
+            "account_id",
+            "path",
+            true,
+            serde_json::json!({"maxLength":32,"type":"string"}),
+        ),
+        (
+            "page",
+            "query",
+            false,
+            serde_json::json!({"minimum":1,"type":"number"}),
+        ),
+        (
+            "per_page",
+            "query",
+            false,
+            serde_json::json!({"maximum":1000,"minimum":5,"type":"number"}),
+        ),
+        (
+            "order",
+            "query",
+            false,
+            serde_json::json!({"enum":["id","sitekey","name","created_on","modified_on"],"type":"string"}),
+        ),
+        (
+            "direction",
+            "query",
+            false,
+            serde_json::json!({"enum":["asc","desc"],"type":"string"}),
+        ),
+        (
+            "filter",
+            "query",
+            false,
+            serde_json::json!({"type":"string"}),
+        ),
+    ];
+    capability.selectors.len() == expected.len()
+        && expected.iter().all(|(name, location, required, schema)| {
+            capability
+                .selectors
+                .iter()
+                .find(|selector| selector.name == *name && selector.location == *location)
+                .is_some_and(|selector| {
+                    selector.required == *required
+                        && selector.contract.as_ref().is_some_and(|contract| {
+                            contract.schema == *schema
+                                && if *location == "query" {
+                                    contract.query.as_ref().is_some_and(|query| {
+                                        query.style == "form"
+                                            && query.explode
+                                            && !query.allow_reserved
+                                            && !query.allow_empty_value
+                                    })
+                                } else {
+                                    contract.query.is_none()
+                                }
+                        })
+                })
+        })
+}
+
+fn turnstile_widget_configuration_request_contract_supported(capability: &CapabilityV1) -> bool {
     let Some(schema) = capability.request_schema.as_ref() else {
         return false;
     };
@@ -3577,16 +3663,38 @@ fn turnstile_widget_update_request_contract_supported(capability: &CapabilityV1)
         })
 }
 
+fn classify_turnstile_widget_create(capability: &mut CapabilityV1) {
+    capability
+        .selectors
+        .retain(|selector| selector.location == "path");
+    capability.risk = RiskClass::SecretSensitive;
+    capability.effect = EffectClass::IdentityOrOwnership;
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+    classify_turnstile_widget_cost_and_entitlement(
+        capability,
+        "creating a Turnstile widget consumes widget capacity but does not purchase a plan or add a usage charge, so its direct incremental ceiling is zero; Free accounts remain limited to 20 widgets and Enterprise capacity is separately negotiated",
+    );
+}
+
 fn classify_turnstile_widget_update(capability: &mut CapabilityV1) {
     capability.risk = RiskClass::CrossConfig;
     capability.effect = EffectClass::ReversibleWrite;
+    classify_turnstile_widget_cost_and_entitlement(
+        capability,
+        "updating an existing Turnstile widget does not purchase a plan, add a widget, or add usage charges, so its direct incremental ceiling is zero; Enterprise-only fields remain subject to the account's separately negotiated subscription",
+    );
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+}
+
+fn classify_turnstile_widget_cost_and_entitlement(capability: &mut CapabilityV1, basis: &str) {
     capability.cost = cfctl_core::CostV1::default();
     capability.cost.billing_model = BillingModelV1::Subscription;
     capability.cost.exposure = CostExposureV1::AccountQuote;
-    capability.cost.basis = Some(
-        "updating an existing Turnstile widget does not purchase a plan, add a widget, or add usage charges, so its direct incremental ceiling is zero; Enterprise-only fields remain subject to the account's separately negotiated subscription"
-            .to_owned(),
-    );
+    capability.cost.basis = Some(basis.to_owned());
     capability.cost.references = vec![
         KnowledgeReferenceV1 {
             title: "Cloudflare Turnstile plans".to_owned(),
@@ -3607,9 +3715,6 @@ fn classify_turnstile_widget_update(capability: &mut CapabilityV1) {
         Some("https://developers.cloudflare.com/turnstile/plans/".to_owned());
     capability.entitlement.blocker = None;
     capability.entitlement.requires_live_resolution = false;
-    capability.verification.required = true;
-    "post_change_read_or_operation_specific_verifier"
-        .clone_into(&mut capability.verification.strategy);
 }
 
 fn is_workers_ai_model_run(capability: &CapabilityV1) -> bool {

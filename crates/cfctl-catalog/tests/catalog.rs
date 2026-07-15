@@ -3786,96 +3786,133 @@ fn email_security_settings_classifier_rejects_retargeting_and_permission_drift()
     assert!(drifted_create.entitlement.blocker.is_none());
 }
 
+fn turnstile_widget_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "bot_fight_mode": {"type":"boolean"},
+            "clearance_level": {
+                "type":"string",
+                "enum":["no_clearance","jschallenge","managed","interactive"]
+            },
+            "domains": {"type":"array","items":{"type":"string"},"maxLength":10},
+            "ephemeral_id": {"type":"boolean"},
+            "mode": {"type":"string","enum":["non-interactive","invisible","managed"]},
+            "name": {"type":"string","minLength":1,"maxLength":254},
+            "offlabel": {"type":"boolean"},
+            "region": {"type":"string","enum":["world","china"]},
+            "secret": {"type":"string"},
+            "sitekey": {"type":"string","maxLength":32}
+        }
+    })
+}
+
+fn turnstile_widget_request_schema() -> serde_json::Value {
+    let mut schema = turnstile_widget_schema();
+    let properties = schema["properties"]
+        .as_object_mut()
+        .expect("widget properties");
+    properties.remove("secret");
+    properties.remove("sitekey");
+    schema["required"] = json!(["name", "mode", "domains"]);
+    schema
+}
+
+fn turnstile_widget_collection_fixture() -> serde_json::Value {
+    json!({
+        "parameters": [
+            {"in":"path","name":"account_id","required":true,"schema":{"type":"string","maxLength":32}},
+            {"in":"query","name":"page","required":false,"schema":{"type":"number","minimum":1}},
+            {"in":"query","name":"per_page","required":false,"schema":{"type":"number","minimum":5,"maximum":1000}},
+            {"in":"query","name":"order","required":false,"schema":{"type":"string","enum":["id","sitekey","name","created_on","modified_on"]}},
+            {"in":"query","name":"direction","required":false,"schema":{"type":"string","enum":["asc","desc"]}},
+            {"in":"query","name":"filter","required":false,"schema":{"type":"string"}}
+        ],
+        "post": {
+            "operationId":"accounts-turnstile-widget-create",
+            "summary":"Create a Turnstile Widget",
+            "tags":["Turnstile"],
+            "x-api-token-group":["Turnstile Sites Write","Account Settings Write"],
+            "requestBody": {
+                "required": true,
+                "content":{"application/json":{"schema":turnstile_widget_request_schema()}}
+            },
+            "responses": {
+                "200": {
+                    "description":"Widget created",
+                    "content":{"application/json":{"schema":{"$ref":"#/components/schemas/WidgetResponse"}}}
+                }
+            }
+        }
+    })
+}
+
+fn turnstile_widget_detail_fixture() -> serde_json::Value {
+    json!({
+        "parameters": [
+            {"in":"path","name":"account_id","required":true,"schema":{"type":"string","maxLength":32}},
+            {"in":"path","name":"sitekey","required":true,"schema":{"type":"string","maxLength":32}}
+        ],
+        "get": {
+            "operationId":"accounts-turnstile-widget-get",
+            "summary":"Turnstile Widget Details",
+            "tags":["Turnstile"],
+            "responses": {
+                "200": {
+                    "description":"Widget",
+                    "content":{"application/json":{"schema":{"$ref":"#/components/schemas/WidgetResponse"}}}
+                }
+            }
+        },
+        "delete": {
+            "operationId":"accounts-turnstile-widget-delete",
+            "summary":"Delete a Turnstile Widget",
+            "tags":["Turnstile"],
+            "x-api-token-group":["Turnstile Sites Write","Account Settings Write"],
+            "responses": {
+                "200": {
+                    "description":"Widget deleted",
+                    "content":{"application/json":{"schema":{"$ref":"#/components/schemas/WidgetResponse"}}}
+                }
+            }
+        },
+        "put": {
+            "operationId":"accounts-turnstile-widget-update",
+            "summary":"Update a Turnstile Widget",
+            "description":"Update the configuration of a widget.",
+            "tags":["Turnstile"],
+            "x-api-token-group":["Turnstile Sites Write","Account Settings Write"],
+            "requestBody": {
+                "required": true,
+                "content":{"application/json":{"schema":turnstile_widget_request_schema()}}
+            },
+            "responses": {
+                "200": {
+                    "description":"Widget updated",
+                    "content":{"application/json":{"schema":{"$ref":"#/components/schemas/WidgetResponse"}}}
+                }
+            }
+        }
+    })
+}
+
 fn turnstile_widget_update_fixture() -> serde_json::Value {
     json!({
         "openapi": "3.0.3",
         "info": {"title":"Cloudflare API","version":"4.0.0"},
-        "components": {
-            "schemas": {
-                "Widget": {
-                    "type": "object",
-                    "properties": {
-                        "bot_fight_mode": {"type":"boolean"},
-                        "clearance_level": {
-                            "type":"string",
-                            "enum":["no_clearance","jschallenge","managed","interactive"]
-                        },
-                        "domains": {"type":"array","items":{"type":"string"},"maxLength":10},
-                        "ephemeral_id": {"type":"boolean"},
-                        "mode": {
-                            "type":"string",
-                            "enum":["non-interactive","invisible","managed"]
-                        },
-                        "name": {"type":"string","minLength":1,"maxLength":254},
-                        "offlabel": {"type":"boolean"},
-                        "region": {"type":"string","enum":["world","china"]},
-                        "secret": {"type":"string"},
-                        "sitekey": {"type":"string","maxLength":32}
-                    }
-                },
-                "WidgetResponse": {
-                    "type": "object",
-                    "properties": {
-                        "success": {"type":"boolean"},
-                        "result": {"$ref":"#/components/schemas/Widget"}
-                    }
+        "components": {"schemas": {
+            "Widget": turnstile_widget_schema(),
+            "WidgetResponse": {
+                "type": "object",
+                "properties": {
+                    "success": {"type":"boolean"},
+                    "result": {"$ref":"#/components/schemas/Widget"}
                 }
             }
-        },
+        }},
         "paths": {
-            "/accounts/{account_id}/challenges/widgets/{sitekey}": {
-                "parameters": [
-                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string","maxLength":32}},
-                    {"in":"path","name":"sitekey","required":true,"schema":{"type":"string","maxLength":32}}
-                ],
-                "get": {
-                    "operationId":"accounts-turnstile-widget-get",
-                    "summary":"Turnstile Widget Details",
-                    "tags":["Turnstile"],
-                    "responses": {
-                        "200": {
-                            "description":"Widget",
-                            "content":{"application/json":{"schema":{"$ref":"#/components/schemas/WidgetResponse"}}}
-                        }
-                    }
-                },
-                "put": {
-                    "operationId":"accounts-turnstile-widget-update",
-                    "summary":"Update a Turnstile Widget",
-                    "description":"Update the configuration of a widget.",
-                    "tags":["Turnstile"],
-                    "x-api-token-group":["Turnstile Sites Write","Account Settings Write"],
-                    "requestBody": {
-                        "required": true,
-                        "content":{"application/json":{"schema":{
-                            "type":"object",
-                            "required":["name","mode","domains"],
-                            "properties":{
-                                "bot_fight_mode":{"type":"boolean"},
-                                "clearance_level":{
-                                    "type":"string",
-                                    "enum":["no_clearance","jschallenge","managed","interactive"]
-                                },
-                                "domains":{"type":"array","items":{"type":"string"},"maxLength":10},
-                                "ephemeral_id":{"type":"boolean"},
-                                "mode":{
-                                    "type":"string",
-                                    "enum":["non-interactive","invisible","managed"]
-                                },
-                                "name":{"type":"string","minLength":1,"maxLength":254},
-                                "offlabel":{"type":"boolean"},
-                                "region":{"type":"string","enum":["world","china"]}
-                            }
-                        }}}
-                    },
-                    "responses": {
-                        "200": {
-                            "description":"Widget updated",
-                            "content":{"application/json":{"schema":{"$ref":"#/components/schemas/WidgetResponse"}}}
-                        }
-                    }
-                }
-            }
+            "/accounts/{account_id}/challenges/widgets": turnstile_widget_collection_fixture(),
+            "/accounts/{account_id}/challenges/widgets/{sitekey}": turnstile_widget_detail_fixture()
         }
     })
 }
@@ -3913,6 +3950,105 @@ fn turnstile_widget_update_has_exact_cost_entitlement_and_risk_contracts() {
     assert!(update.same_path_read.is_some());
     assert!(!update.rollback.supported);
     assert!(update.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn turnstile_widget_create_sinks_secret_and_binds_sitekey_lifecycle() {
+    let snapshot =
+        normalize_openapi(&turnstile_widget_update_fixture()).expect("Turnstile catalog");
+    let create = snapshot
+        .get("accounts-turnstile-widget-create")
+        .expect("Turnstile create");
+
+    assert_eq!(
+        create.adapter_status,
+        AdapterStatus::DynamicApi,
+        "{:?}",
+        create.mutation_contract_gaps()
+    );
+    assert_eq!(create.risk, RiskClass::SecretSensitive);
+    assert_eq!(create.effect, EffectClass::IdentityOrOwnership);
+    assert!(create.cost.known);
+    assert!(!create.cost.incremental);
+    assert_eq!(create.cost.maximum, Some(0.0));
+    assert_eq!(create.cost.billing_model, BillingModelV1::Subscription);
+    assert_eq!(create.cost.exposure, CostExposureV1::AccountQuote);
+    assert_eq!(create.entitlement.available, Some(true));
+    assert_eq!(create.entitlement.plans.get("free"), Some(&true));
+    assert_eq!(create.entitlement.plans.get("enterprise"), Some(&true));
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    let target = create
+        .created_resource
+        .as_ref()
+        .expect("created widget target");
+    assert_eq!(target.identity_selector, "sitekey");
+    assert_eq!(target.response_result_identity_pointer, "/sitekey");
+    assert_eq!(target.read_capability_id, "accounts-turnstile-widget-get");
+    assert_eq!(
+        target.delete_capability_id,
+        "accounts-turnstile-widget-delete"
+    );
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    assert!(
+        create
+            .selectors
+            .iter()
+            .all(|selector| selector.location == "path")
+    );
+    assert!(create.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn turnstile_widget_create_classifier_rejects_query_permission_and_identity_drift() {
+    let mut query_drift = turnstile_widget_update_fixture();
+    query_drift["paths"]["/accounts/{account_id}/challenges/widgets"]["parameters"]
+        .as_array_mut()
+        .expect("collection parameters")
+        .push(json!({
+            "in":"query",
+            "name":"provision_enterprise_capacity",
+            "required":false,
+            "schema":{"type":"boolean"}
+        }));
+    let query_snapshot = normalize_openapi(&query_drift).expect("query drift");
+    let drifted_query = query_snapshot
+        .get("accounts-turnstile-widget-create")
+        .expect("query-drifted create");
+    assert_eq!(drifted_query.risk, RiskClass::Unknown);
+    assert!(!drifted_query.cost.known);
+
+    let mut permission_drift = turnstile_widget_update_fixture();
+    permission_drift["paths"]["/accounts/{account_id}/challenges/widgets"]["post"]["x-api-token-group"] =
+        json!(["Account Settings Write"]);
+    let permission_snapshot = normalize_openapi(&permission_drift).expect("permission drift");
+    let drifted_permission = permission_snapshot
+        .get("accounts-turnstile-widget-create")
+        .expect("permission-drifted create");
+    assert_eq!(drifted_permission.risk, RiskClass::Unknown);
+    assert!(!drifted_permission.cost.known);
+
+    let mut identity_drift = turnstile_widget_update_fixture();
+    identity_drift["components"]["schemas"]["Widget"]["properties"]["sitekey"]["type"] =
+        json!("integer");
+    let identity_snapshot = normalize_openapi(&identity_drift).expect("identity drift");
+    let drifted_identity = identity_snapshot
+        .get("accounts-turnstile-widget-create")
+        .expect("identity-drifted create");
+    assert_eq!(drifted_identity.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(drifted_identity.risk, RiskClass::SecretSensitive);
+    assert!(drifted_identity.created_resource.is_none());
+    assert!(
+        drifted_identity
+            .mutation_contract_gaps()
+            .iter()
+            .any(|gap| gap.contains("verification"))
+    );
 }
 
 #[test]
