@@ -231,15 +231,35 @@ Rust 1.93 is pinned. The local proof lane is:
 cargo xtask verify
 ```
 
-The release lane builds Apple arm64/x86_64 and Linux musl arm64/x86_64 twice,
-compares hashes, creates SPDX SBOMs and provenance, renders the Homebrew formula
-and checksum-verifying Linux installer, signs manifests, and can upload to an
-existing GitHub release:
+The assembly lane builds Apple arm64/x86_64 and Linux musl arm64/x86_64 twice,
+compares hashes, creates SPDX SBOMs and provenance, and renders the Homebrew
+formula and checksum-verifying Linux installer. The release lane repeats that
+proof and signs the manifests before they can be uploaded to an existing
+GitHub release:
+
+The local release host needs the four Rust standard-library targets, Zig and
+`cargo-zigbuild`, `cargo-auditable` 0.7.5, Syft, and Cosign. The auditable build
+metadata is what lets each platform SBOM enumerate the actual Rust dependency
+graph instead of treating `cfctl` as one opaque file.
 
 ```bash
-cargo xtask release
-cargo xtask publish --tag v2.0.0
+cargo xtask assemble
+cargo xtask release \
+  --certificate-identity '<expected Fulcio identity>' \
+  --certificate-oidc-issuer '<expected OIDC issuer>'
+cargo xtask publish \
+  --tag v2.0.0-alpha.1 \
+  --certificate-identity '<expected Fulcio identity>' \
+  --certificate-oidc-issuer '<expected OIDC issuer>'
 ```
+
+`assemble` deliberately stops before identity-bearing Sigstore activity;
+`release` requires a clean source commit, signs checksums and provenance, and
+verifies both bundles against the exact expected identity and issuer.
+`publish` accepts only the complete four-platform artifact set, rechecks the
+checksums and provenance, and uploads one asset at a time to an empty draft
+release without clobbering. If an upload fails, it removes only the assets from
+that failed attempt. Making the draft public remains a separate operator action.
 
 GitHub-hosted Rust builds are intentionally absent.
 
