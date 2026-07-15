@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use cfctl_auth::AuthCredential;
-use cfctl_core::{CapabilityV1, PlanStatus, PlanV1};
+use cfctl_core::{CapabilityV1, PlanStatus, PlanV1, SelectorV1};
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -182,8 +182,12 @@ fn add_declared_header_selectors(
                 selector.name.clone(),
             ));
         }
-        let rendered = scalar(value)
-            .ok_or_else(|| CloudflareError::InvalidHeaderSelector(selector.name.clone()))?;
+        let rendered = if selector.name == "cf-r2-jurisdiction" {
+            value.as_str().map(str::to_owned)
+        } else {
+            scalar(value)
+        }
+        .ok_or_else(|| CloudflareError::InvalidHeaderSelector(selector.name.clone()))?;
         let name = HeaderName::from_bytes(selector.name.as_bytes())
             .map_err(|_| CloudflareError::InvalidHeaderSelector(selector.name.clone()))?;
         let value = HeaderValue::from_str(&rendered)
@@ -496,10 +500,10 @@ impl Executor {
                 "the hash-bound same-path delete readback contract is absent".to_owned(),
             )
         })?;
-        let details = CapabilityV1::new(
+        let details = same_path_verification_capability(
+            &plan.capability,
             &target.read_capability_id,
             "Exact resource deletion verification readback",
-            "GET",
             &target.path,
         );
         let request = self.builder.build(
@@ -643,10 +647,10 @@ impl Executor {
                     "planned update body is absent, empty, or not an object".to_owned(),
                 )
             })?;
-        let details = CapabilityV1::new(
+        let details = same_path_verification_capability(
+            &plan.capability,
             &target.read_capability_id,
             "Exact resource update verification readback",
-            "GET",
             &target.path,
         );
         let request = self.builder.build(
@@ -1489,6 +1493,31 @@ fn clean_verification_query(input: &CallInput) -> bool {
             .query
             .as_object()
             .is_some_and(serde_json::Map::is_empty)
+}
+
+fn same_path_verification_capability(
+    mutation: &CapabilityV1,
+    read_capability_id: &str,
+    title: &str,
+    path: &str,
+) -> CapabilityV1 {
+    let mut readback = CapabilityV1::new(read_capability_id, title, "GET", path);
+    readback.product.clone_from(&mutation.product);
+    readback.selectors = mutation
+        .selectors
+        .iter()
+        .filter(|selector| same_path_routing_header(mutation, selector))
+        .cloned()
+        .collect();
+    readback
+}
+
+fn same_path_routing_header(capability: &CapabilityV1, selector: &SelectorV1) -> bool {
+    selector.location == "header"
+        && selector.name == "cf-r2-jurisdiction"
+        && !selector.required
+        && matches!(selector.value_type.as_str(), "string" | "unknown")
+        && matches!(capability.product.as_str(), "R2 Bucket" | "R2 Object")
 }
 
 fn validate_same_path_delete_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {

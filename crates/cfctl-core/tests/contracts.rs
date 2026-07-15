@@ -227,6 +227,22 @@ fn same_path_read_contracts_require_hash_bound_canonical_fields() {
         .verified_response_fields = vec!["enabled".to_owned(), "name".to_owned()];
     assert!(update.verification_contract_supported());
 
+    update.selectors.push(SelectorV1 {
+        name: "cf-r2-jurisdiction".to_owned(),
+        location: "header".to_owned(),
+        required: false,
+        value_type: "unknown".to_owned(),
+        description: None,
+    });
+    assert!(!update.verification_contract_supported());
+
+    update.product = "R2 Bucket".to_owned();
+    assert!(update.verification_contract_supported());
+
+    update.selectors[0].name = "x-unbound-routing-control".to_owned();
+    assert!(!update.verification_contract_supported());
+    update.selectors.clear();
+
     let mut legacy_value = serde_json::to_value(&update).expect("serialize capability");
     legacy_value
         .as_object_mut()
@@ -247,6 +263,16 @@ fn same_path_read_contracts_require_hash_bound_canonical_fields() {
         path: delete.path.clone(),
         read_capability_id: "widgets-get".to_owned(),
         verified_response_fields: Vec::new(),
+    });
+    assert!(delete.verification_contract_supported());
+
+    delete.product = "R2 Object".to_owned();
+    delete.selectors.push(SelectorV1 {
+        name: "cf-r2-jurisdiction".to_owned(),
+        location: "header".to_owned(),
+        required: false,
+        value_type: "unknown".to_owned(),
+        description: None,
     });
     assert!(delete.verification_contract_supported());
 

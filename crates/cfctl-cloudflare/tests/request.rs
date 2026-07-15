@@ -64,7 +64,7 @@ fn request_builder_sends_only_catalog_declared_header_selectors() {
         name: "cf-r2-jurisdiction".to_owned(),
         location: "header".to_owned(),
         required: false,
-        value_type: "string".to_owned(),
+        value_type: "unknown".to_owned(),
         description: None,
     }];
     let request = RequestBuilder::new("https://api.cloudflare.com/client/v4")
@@ -91,6 +91,23 @@ fn request_builder_sends_only_catalog_declared_header_selectors() {
         Some("eu")
     );
     assert!(request.headers.get("authorization").is_none());
+
+    let error = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("valid base URL")
+        .build(
+            &capability,
+            &CallInput {
+                selectors: json!({
+                    "account_id":"account-1",
+                    "bucket_name":"bucket-1",
+                    "cf-r2-jurisdiction":true
+                }),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("R2 jurisdiction must remain a string")
+        .to_string();
+    assert!(error.contains("cf-r2-jurisdiction"));
 }
 
 #[test]
@@ -741,8 +758,20 @@ async fn exact_resource_deletion_is_verified_by_same_path_not_found_readback() {
         json!({"account_id":"account-1", "widget_id":"widget-1"}),
         None,
     );
+    plan.capability.product = "R2 Bucket".to_owned();
+    plan.capability.selectors.push(SelectorV1 {
+        name: "cf-r2-jurisdiction".to_owned(),
+        location: "header".to_owned(),
+        required: false,
+        value_type: "unknown".to_owned(),
+        description: None,
+    });
     plan.input = serde_json::to_value(CallInput {
-        selectors: json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        selectors: json!({
+            "account_id":"account-1",
+            "widget_id":"widget-1",
+            "cf-r2-jurisdiction":"eu"
+        }),
         query: json!({}),
         body: None,
         if_match: Some("mutation-only-etag".to_owned()),
@@ -782,6 +811,7 @@ async fn exact_resource_deletion_is_verified_by_same_path_not_found_readback() {
         "{request}"
     );
     assert!(!request.contains("mutation-only"));
+    assert!(request.contains("cf-r2-jurisdiction: eu\r\n"));
 }
 
 #[tokio::test]
@@ -1589,8 +1619,20 @@ async fn exact_resource_update_is_verified_by_same_path_planned_fields() {
             "settings":{"enabled":true,"mode":"strict"}
         })),
     );
+    plan.capability.product = "R2 Object".to_owned();
+    plan.capability.selectors.push(SelectorV1 {
+        name: "cf-r2-jurisdiction".to_owned(),
+        location: "header".to_owned(),
+        required: false,
+        value_type: "unknown".to_owned(),
+        description: None,
+    });
     plan.input = serde_json::to_value(CallInput {
-        selectors: json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        selectors: json!({
+            "account_id":"account-1",
+            "widget_id":"widget-1",
+            "cf-r2-jurisdiction":"fedramp"
+        }),
         query: json!({}),
         body: Some(json!({
             "name":"after",
@@ -1631,6 +1673,7 @@ async fn exact_resource_update_is_verified_by_same_path_planned_fields() {
     assert!(request.starts_with("GET /client/v4/accounts/account-1/widgets/widget-1 "));
     assert!(!request.contains("mutation_mode"));
     assert!(!request.contains("mutation-etag"));
+    assert!(request.contains("cf-r2-jurisdiction: fedramp\r\n"));
 }
 
 #[tokio::test]

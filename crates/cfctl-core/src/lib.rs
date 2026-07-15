@@ -519,10 +519,7 @@ impl CapabilityV1 {
                 self.method == "DELETE"
                     && path_targets_exact_resource(&self.path)
                     && self.request_schema.is_none()
-                    && self
-                        .selectors
-                        .iter()
-                        .all(|selector| selector.location == "path")
+                    && self.same_path_readback_selectors_supported()
                     && self.same_path_read_contract_supported(false)
             }
             "parent_collection_omits_deleted_resource_id" => {
@@ -545,18 +542,12 @@ impl CapabilityV1 {
             "same_resource_contains_planned_fields_after_update" => {
                 matches!(self.method.as_str(), "PATCH" | "PUT")
                     && path_targets_exact_resource(&self.path)
-                    && self
-                        .selectors
-                        .iter()
-                        .all(|selector| selector.location == "path")
+                    && self.same_path_readback_selectors_supported()
                     && self.same_path_read_contract_supported(true)
             }
             "same_path_result_contains_planned_fields_after_update" => {
                 matches!(self.method.as_str(), "PATCH" | "PUT")
-                    && self
-                        .selectors
-                        .iter()
-                        .all(|selector| selector.location == "path")
+                    && self.same_path_readback_selectors_supported()
                     && self.same_path_read_contract_supported(true)
             }
             "created_resource_contains_planned_fields_by_returned_id" => {
@@ -656,6 +647,29 @@ impl CapabilityV1 {
             request_fields.dedup();
             !request_fields.is_empty() && target.verified_response_fields == request_fields
         })
+    }
+
+    fn same_path_readback_selectors_supported(&self) -> bool {
+        let mut routing_headers = 0_u8;
+        for selector in &self.selectors {
+            if selector.location == "path" {
+                continue;
+            }
+            if selector.location == "header"
+                && selector.name == "cf-r2-jurisdiction"
+                && !selector.required
+                && matches!(selector.value_type.as_str(), "string" | "unknown")
+                && matches!(self.product.as_str(), "R2 Bucket" | "R2 Object")
+            {
+                routing_headers += 1;
+                if routing_headers > 1 {
+                    return false;
+                }
+                continue;
+            }
+            return false;
+        }
+        true
     }
 
     fn created_collection_resource_contract_supported(&self) -> bool {

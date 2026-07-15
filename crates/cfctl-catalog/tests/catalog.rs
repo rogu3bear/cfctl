@@ -679,13 +679,21 @@ fn exact_resource_deletes_pair_with_same_path_readback_contracts() {
                 "get": {
                     "operationId":"widgets-get",
                     "summary":"Get Widget",
-                    "tags":["Widgets"],
+                    "tags":["R2 Object"],
+                    "parameters":[
+                        {"in":"header","name":"cf-r2-jurisdiction","required":false,"schema":{"type":"string"}},
+                        {"in":"header","name":"If-None-Match","required":false,"schema":{"type":"string"}},
+                        {"in":"header","name":"If-Modified-Since","required":false,"schema":{"type":"string"}}
+                    ],
                     "x-api-token-group":["Widgets Read"]
                 },
                 "delete": {
                     "operationId":"widgets-delete",
                     "summary":"Delete Widget",
-                    "tags":["Widgets"],
+                    "tags":["R2 Object"],
+                    "parameters":[
+                        {"in":"header","name":"cf-r2-jurisdiction","required":false,"schema":{"type":"string"}}
+                    ],
                     "x-api-token-group":["Widgets Write"]
                 }
             },
@@ -1098,7 +1106,10 @@ fn exact_resource_update_fixture() -> serde_json::Value {
                 "get": {
                     "operationId":"widgets-get",
                     "summary":"Get Widget",
-                    "tags":["Widgets"],
+                    "tags":["R2 Bucket"],
+                    "parameters":[
+                        {"in":"header","name":"cf-r2-jurisdiction","required":false,"schema":{"type":"string"}}
+                    ],
                     "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
                         "type":"object","properties":{"result":{"type":"object","properties":{
                             "name":{"type":"string"},"enabled":{"type":"boolean"}
@@ -1108,7 +1119,10 @@ fn exact_resource_update_fixture() -> serde_json::Value {
                 "patch": {
                     "operationId":"widgets-patch",
                     "summary":"Patch Widget",
-                    "tags":["Widgets"],
+                    "tags":["R2 Bucket"],
+                    "parameters":[
+                        {"in":"header","name":"cf-r2-jurisdiction","required":false,"schema":{"type":"string"}}
+                    ],
                     "x-api-token-group":["Widgets Write"],
                     "requestBody":{"required":true,"content":{"application/json":{"schema":{
                         "type":"object","properties":{"enabled":{"type":"boolean"},"name":{"type":"string"}}
@@ -1117,7 +1131,10 @@ fn exact_resource_update_fixture() -> serde_json::Value {
                 "put": {
                     "operationId":"widgets-update",
                     "summary":"Update Widget",
-                    "tags":["Widgets"],
+                    "tags":["R2 Bucket"],
+                    "parameters":[
+                        {"in":"header","name":"cf-r2-jurisdiction","required":false,"schema":{"type":"string"}}
+                    ],
                     "x-api-token-group":["Widgets Write"],
                     "requestBody":{"required":true,"content":{"application/json":{"schema":{
                         "type":"object","properties":{"enabled":{"type":"boolean"},"name":{"type":"string"}}
@@ -1235,7 +1252,10 @@ fn same_path_object_updates_require_schema_proven_readback_fields() {
             "/zones/{zone_id}/settings/example": {
                 "get": {
                     "operationId":"settings-get",
-                    "tags":["Example Settings"],
+                    "tags":["R2 Bucket"],
+                    "parameters":[
+                        {"in":"header","name":"cf-r2-jurisdiction","required":false,"schema":{"type":"string"}}
+                    ],
                     "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
                         "type":"object",
                         "properties":{"result":{"type":"object","properties":{
@@ -1245,7 +1265,10 @@ fn same_path_object_updates_require_schema_proven_readback_fields() {
                 },
                 "put": {
                     "operationId":"settings-update",
-                    "tags":["Example Settings"],
+                    "tags":["R2 Bucket"],
+                    "parameters":[
+                        {"in":"header","name":"cf-r2-jurisdiction","required":false,"schema":{"type":"string"}}
+                    ],
                     "x-api-token-group":["Settings Write"],
                     "requestBody":{"required":true,"content":{"application/json":{"schema":{
                         "type":"object",

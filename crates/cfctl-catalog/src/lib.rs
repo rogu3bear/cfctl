@@ -923,34 +923,36 @@ fn classify_same_path_object_update_contracts(
 ) {
     let readback_targets = capabilities
         .values()
-        .filter(|capability| {
-            capability.method == "GET"
-                && capability
-                    .selectors
-                    .iter()
-                    .all(|selector| selector.location == "path")
-        })
-        .map(|capability| {
-            (
-                (capability.path.clone(), capability.product.clone()),
+        .filter_map(|capability| {
+            if capability.method != "GET" {
+                return None;
+            }
+            let routing_headers = same_path_readback_routing_headers(capability)?;
+            Some((
+                (
+                    capability.path.clone(),
+                    capability.product.clone(),
+                    routing_headers,
+                ),
                 capability.id.clone(),
-            )
+            ))
         })
         .collect::<BTreeMap<_, _>>();
 
     for capability in capabilities.values_mut() {
         if !matches!(capability.method.as_str(), "PATCH" | "PUT")
             || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
-            || capability
-                .selectors
-                .iter()
-                .any(|selector| selector.location != "path")
         {
             continue;
         }
-        let Some(read_capability_id) =
-            readback_targets.get(&(capability.path.clone(), capability.product.clone()))
-        else {
+        let Some(routing_headers) = same_path_mutation_routing_headers(capability) else {
+            continue;
+        };
+        let Some(read_capability_id) = readback_targets.get(&(
+            capability.path.clone(),
+            capability.product.clone(),
+            routing_headers,
+        )) else {
             continue;
         };
         let Some(fields) = canonical_request_object_fields(capability) else {
@@ -1267,18 +1269,19 @@ fn classify_exact_resource_contracts(
 ) {
     let readback_targets = capabilities
         .values()
-        .filter(|capability| {
-            capability.method == "GET"
-                && capability
-                    .selectors
-                    .iter()
-                    .all(|selector| selector.location == "path")
-        })
-        .map(|capability| {
-            (
-                (capability.path.clone(), capability.product.clone()),
+        .filter_map(|capability| {
+            if capability.method != "GET" {
+                return None;
+            }
+            let routing_headers = same_path_readback_routing_headers(capability)?;
+            Some((
+                (
+                    capability.path.clone(),
+                    capability.product.clone(),
+                    routing_headers,
+                ),
                 capability.id.clone(),
-            )
+            ))
         })
         .collect::<BTreeMap<_, _>>();
 
@@ -1292,16 +1295,17 @@ fn classify_exact_resource_contracts(
         if !contract_incomplete
             || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
             || !path_targets_exact_resource(&capability.path)
-            || capability
-                .selectors
-                .iter()
-                .any(|selector| selector.location != "path")
         {
             continue;
         }
-        let Some(read_capability_id) =
-            readback_targets.get(&(capability.path.clone(), capability.product.clone()))
-        else {
+        let Some(routing_headers) = same_path_mutation_routing_headers(capability) else {
+            continue;
+        };
+        let Some(read_capability_id) = readback_targets.get(&(
+            capability.path.clone(),
+            capability.product.clone(),
+            routing_headers,
+        )) else {
             continue;
         };
 
@@ -1362,6 +1366,49 @@ fn classify_exact_resource_contracts(
         capability.rollback.strategy = None;
         refresh_dynamic_mutation_contract(capability);
     }
+}
+
+fn same_path_mutation_routing_headers(capability: &CapabilityV1) -> Option<Vec<String>> {
+    same_path_routing_headers(capability, false)
+}
+
+fn same_path_readback_routing_headers(capability: &CapabilityV1) -> Option<Vec<String>> {
+    same_path_routing_headers(capability, true)
+}
+
+fn same_path_routing_headers(
+    capability: &CapabilityV1,
+    allow_read_conditionals: bool,
+) -> Option<Vec<String>> {
+    let mut routing_headers = Vec::new();
+    for selector in &capability.selectors {
+        if selector.location == "path" {
+            continue;
+        }
+        if allow_read_conditionals
+            && selector.location == "header"
+            && !selector.required
+            && selector.value_type == "string"
+            && matches!(
+                selector.name.to_ascii_lowercase().as_str(),
+                "if-none-match" | "if-modified-since"
+            )
+        {
+            continue;
+        }
+        if selector.location == "header"
+            && selector.name == "cf-r2-jurisdiction"
+            && !selector.required
+            && matches!(selector.value_type.as_str(), "string" | "unknown")
+            && matches!(capability.product.as_str(), "R2 Bucket" | "R2 Object")
+            && routing_headers.is_empty()
+        {
+            routing_headers.push(selector.name.clone());
+            continue;
+        }
+        return None;
+    }
+    Some(routing_headers)
 }
 
 fn canonical_request_object_fields(capability: &CapabilityV1) -> Option<Vec<String>> {
