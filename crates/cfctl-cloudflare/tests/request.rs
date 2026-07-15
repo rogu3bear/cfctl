@@ -3567,6 +3567,83 @@ async fn same_path_delete_rejects_broadening_inputs_before_the_mutation_boundary
 }
 
 #[tokio::test]
+async fn same_path_delete_accepts_only_its_hash_bound_required_empty_body() {
+    let (address, server) =
+        json_response_sequence_server(vec![r#"{"success":true,"result":null,"errors":[]}"#]).await;
+    let mut plan = dns_record_plan(
+        "widgets-delete",
+        "DELETE",
+        "/accounts/{account_id}/widgets/{widget_id}",
+        "same_resource_returns_not_found_after_delete",
+        json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        Some(json!({})),
+    );
+    plan.capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{},
+        "additionalProperties":false,
+        "x-cfctl-body-required":true
+    }));
+    plan.status = PlanStatus::Consumed;
+    let input: CallInput = serde_json::from_value(plan.input.clone()).expect("input");
+    let catalog_hash = plan.catalog_hash.clone();
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_consumed_plan_with_input(
+        &mut plan,
+        &catalog_hash,
+        &AuthCredential::Bearer {
+            token: "governing-token".to_owned(),
+        },
+        &input,
+    )
+    .await
+    .expect("strict empty body reaches the boundary");
+
+    assert!(response.success);
+    let requests = server.await.expect("server joins");
+    assert!(requests[0].starts_with("DELETE /client/v4/accounts/account-1/widgets/widget-1 "));
+    assert!(requests[0].ends_with("{}"));
+
+    let mut broadened = dns_record_plan(
+        "widgets-delete",
+        "DELETE",
+        "/accounts/{account_id}/widgets/{widget_id}",
+        "same_resource_returns_not_found_after_delete",
+        json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        Some(json!({"cascade":"must-not-cross-boundary"})),
+    );
+    broadened.capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{},
+        "additionalProperties":false,
+        "x-cfctl-body-required":true
+    }));
+    broadened.status = PlanStatus::Consumed;
+    let input: CallInput = serde_json::from_value(broadened.input.clone()).expect("input");
+    let catalog_hash = broadened.catalog_hash.clone();
+    let error = Executor::new(reqwest::Client::new(), "http://127.0.0.1:9/client/v4")
+        .expect("executor")
+        .execute_consumed_plan_with_input(
+            &mut broadened,
+            &catalog_hash,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect_err("non-empty body must fail before the network boundary")
+        .to_string();
+    assert!(error.contains("hash-bound required empty body"));
+    assert!(!error.contains("must-not-cross-boundary"));
+    assert_eq!(broadened.status, PlanStatus::Consumed);
+}
+
+#[tokio::test]
 async fn same_path_delete_rejects_query_controls_before_the_mutation_boundary() {
     let mut plan = dns_record_plan(
         "widgets-delete",

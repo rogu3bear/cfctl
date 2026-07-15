@@ -597,7 +597,8 @@ impl CapabilityV1 {
             "same_resource_returns_not_found_after_delete" => {
                 self.method == "DELETE"
                     && path_targets_exact_resource(&self.path)
-                    && self.request_schema.is_none()
+                    && (self.request_schema.is_none()
+                        || self.required_empty_request_body_contract())
                     && self.same_path_readback_selectors_supported()
                     && self.same_path_read_contract_supported(false)
             }
@@ -724,6 +725,35 @@ impl CapabilityV1 {
             .and_then(request_object_property_schemas)
             .and_then(|fields| fields.get(field).cloned())
             .is_some_and(|schemas| property_schemas_are_write_only(&schemas))
+    }
+
+    /// Returns whether this capability's pinned request contract requires one
+    /// exact empty JSON object. Catalog classifiers may deliberately narrow an
+    /// official open object to this safe subset, but only when `{}` is valid
+    /// under the source schema.
+    #[must_use]
+    pub fn required_empty_request_body_contract(&self) -> bool {
+        self.request_schema.as_ref().is_some_and(|schema| {
+            schema.get("type").and_then(Value::as_str) == Some("object")
+                && schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(serde_json::Map::is_empty)
+                && schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
+                && schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+                && schema.get("x-cfctl-body-required").and_then(Value::as_bool) == Some(true)
+                && ["allOf", "oneOf", "anyOf"]
+                    .iter()
+                    .all(|composition| schema.get(*composition).is_none())
+                && schema
+                    .get("minProperties")
+                    .and_then(Value::as_u64)
+                    .is_none_or(|minimum| minimum == 0)
+                && schema.get("enum").is_none()
+        })
     }
 
     fn verified_response_fields_match_request_schema(&self, fields: &[String]) -> bool {

@@ -1616,6 +1616,97 @@ fn exact_resource_deletes_reject_broadening_inputs_and_required_read_controls() 
     );
 }
 
+#[test]
+fn exact_resource_deletes_narrow_open_bodies_and_omit_optional_read_controls() {
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/zones/{zone_id}/schema_validation/schemas/{schema_id}": {
+                "parameters": [
+                    {"in":"path","name":"zone_id","required":true,"schema":{"type":"string"}},
+                    {"in":"path","name":"schema_id","required":true,"schema":{"type":"string"}}
+                ],
+                "get": {
+                    "operationId":"schema-validation-get-schema",
+                    "summary":"Get details of a schema",
+                    "tags":["Schema Validation"],
+                    "parameters":[
+                        {
+                            "description":"Omit the source-files of schemas and only retrieve their meta-data.",
+                            "in":"query",
+                            "name":"omit_source",
+                            "required":false,
+                            "schema":{"type":"boolean"}
+                        }
+                    ],
+                    "responses": cloudflare_envelope_responses()
+                },
+                "delete": {
+                    "operationId":"schema-validation-delete-schema",
+                    "summary":"Delete a schema",
+                    "description":"Permanently deletes the schema.",
+                    "tags":["Schema Validation"],
+                    "x-api-token-group":["Schema Validation Write"],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "type":"object"
+                    }}}},
+                    "responses": cloudflare_envelope_responses()
+                }
+            },
+            "/accounts/{account_id}/jobs/{job_id}": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+                    {"in":"path","name":"job_id","required":true,"schema":{"type":"string"}}
+                ],
+                "get": {
+                    "operationId":"jobs-get",
+                    "summary":"Get Job",
+                    "tags":["Jobs"],
+                    "responses": cloudflare_envelope_responses()
+                },
+                "delete": {
+                    "operationId":"jobs-delete-cancel",
+                    "summary":"Cancel Job",
+                    "description":"Cancels a running job without deleting its history.",
+                    "tags":["Jobs"],
+                    "x-api-token-group":["Jobs Write"],
+                    "responses": cloudflare_envelope_responses()
+                }
+            }
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("delete catalog");
+    let deletion = snapshot
+        .get("schema-validation-delete-schema")
+        .expect("delete schema");
+    assert_eq!(
+        deletion.verification.strategy,
+        "same_resource_returns_not_found_after_delete"
+    );
+    assert_eq!(
+        deletion
+            .same_path_read
+            .as_ref()
+            .expect("same-path readback")
+            .read_capability_id,
+        "schema-validation-get-schema"
+    );
+    assert_eq!(
+        deletion.request_schema.as_ref().expect("narrow body")["properties"],
+        json!({})
+    );
+    assert!(deletion.mutation_contract_gaps().is_empty());
+
+    let cancellation = snapshot.get("jobs-delete-cancel").expect("cancel job");
+    assert_ne!(
+        cancellation.verification.strategy,
+        "same_resource_returns_not_found_after_delete"
+    );
+    assert!(cancellation.same_path_read.is_none());
+}
+
 fn assert_d1_update_contract(update: &CapabilityV1) {
     assert_eq!(
         update.verification.strategy,

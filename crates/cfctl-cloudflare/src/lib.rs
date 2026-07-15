@@ -1831,10 +1831,28 @@ fn validate_same_path_delete_target(capability: &CapabilityV1, input: &CallInput
     if target.path != capability.path
         || target.read_capability_id.is_empty()
         || !target.verified_response_fields.is_empty()
-        || input.body.is_some()
     {
         return Err(CloudflareError::MissingVerificationTarget(
             "the exact delete contains inputs outside its hash-bound same-path readback contract"
+                .to_owned(),
+        ));
+    }
+    if capability.request_schema.is_none() {
+        if input.body.is_some() {
+            return Err(CloudflareError::MissingVerificationTarget(
+                "the exact delete contains inputs outside its hash-bound same-path readback contract"
+                    .to_owned(),
+            ));
+        }
+    } else if !capability.required_empty_request_body_contract()
+        || !input
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the exact delete does not match its hash-bound required empty body contract"
                 .to_owned(),
         ));
     }

@@ -439,7 +439,10 @@ fn same_path_read_contracts_require_hash_bound_canonical_fields() {
     let legacy: CapabilityV1 =
         serde_json::from_value(legacy_value).expect("deserialize legacy capability");
     assert!(!legacy.verification_contract_supported());
+}
 
+#[test]
+fn same_path_delete_contracts_accept_only_hash_bound_empty_bodies_and_routing_headers() {
     let mut delete = CapabilityV1::new(
         "widgets-delete",
         "Delete widget",
@@ -453,6 +456,18 @@ fn same_path_read_contracts_require_hash_bound_canonical_fields() {
         verified_response_fields: Vec::new(),
     });
     assert!(delete.verification_contract_supported());
+
+    delete.request_schema = Some(json!({
+        "type":"object",
+        "properties":{},
+        "additionalProperties":false,
+        "x-cfctl-body-required":true
+    }));
+    assert!(delete.verification_contract_supported());
+    delete.request_schema.as_mut().expect("request schema")["properties"] =
+        json!({"cascade":{"type":"boolean"}});
+    assert!(!delete.verification_contract_supported());
+    delete.request_schema = None;
 
     delete.product = "R2 Object".to_owned();
     delete.selectors.push(uncontracted_selector(

@@ -1188,6 +1188,7 @@ fn direct_child_selector(collection_path: &str, detail_path: &str) -> Option<Str
 
 type CollectionReadTargets = BTreeMap<(String, String), (String, Vec<SelectorV1>)>;
 type ExactReadTargets = BTreeMap<(String, String), (String, Vec<SelectorV1>)>;
+type SamePathReadbackTargets = BTreeMap<(String, String, Vec<String>), String>;
 type ExactDeleteTargets = BTreeMap<(String, String), (String, Vec<SelectorV1>)>;
 
 fn classify_created_collection_resource_contracts(
@@ -1345,23 +1346,8 @@ fn classify_exact_resource_contracts(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
 ) {
-    let readback_targets = capabilities
-        .values()
-        .filter_map(|capability| {
-            if capability.method != "GET" {
-                return None;
-            }
-            let routing_headers = same_path_readback_routing_headers(capability)?;
-            Some((
-                (
-                    capability.path.clone(),
-                    capability.product.clone(),
-                    routing_headers,
-                ),
-                capability.id.clone(),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let readback_targets = same_path_readback_targets(capabilities, false);
+    let delete_readback_targets = same_path_readback_targets(capabilities, true);
 
     for capability in capabilities.values_mut() {
         let contract_incomplete = capability.adapter_status == AdapterStatus::DynamicApi
@@ -1379,17 +1365,26 @@ fn classify_exact_resource_contracts(
         let Some(routing_headers) = same_path_mutation_routing_headers(capability) else {
             continue;
         };
-        let Some(read_capability_id) = readback_targets.get(&(
+        if capability.method == "DELETE" && !declares_exact_resource_deletion(capability) {
+            continue;
+        }
+        let target_key = (
             capability.path.clone(),
             capability.product.clone(),
             routing_headers,
-        )) else {
+        );
+        let read_capability_id = if capability.method == "DELETE" {
+            delete_readback_targets.get(&target_key)
+        } else {
+            readback_targets.get(&target_key)
+        };
+        let Some(read_capability_id) = read_capability_id else {
             continue;
         };
 
         match capability.method.as_str() {
             "DELETE" => {
-                if capability.request_schema.is_some() {
+                if !narrow_required_open_delete_body(capability) {
                     continue;
                 }
                 capability.same_path_read = Some(SamePathReadContractV1 {
@@ -1446,21 +1441,58 @@ fn classify_exact_resource_contracts(
     }
 }
 
+fn same_path_readback_targets(
+    capabilities: &BTreeMap<String, CapabilityV1>,
+    allow_delete_projections: bool,
+) -> SamePathReadbackTargets {
+    capabilities
+        .values()
+        .filter_map(|capability| {
+            if capability.method != "GET" {
+                return None;
+            }
+            let routing_headers = if allow_delete_projections {
+                same_path_delete_readback_routing_headers(capability)?
+            } else {
+                same_path_readback_routing_headers(capability)?
+            };
+            Some((
+                (
+                    capability.path.clone(),
+                    capability.product.clone(),
+                    routing_headers,
+                ),
+                capability.id.clone(),
+            ))
+        })
+        .collect()
+}
+
 fn same_path_mutation_routing_headers(capability: &CapabilityV1) -> Option<Vec<String>> {
-    same_path_routing_headers(capability, false)
+    same_path_routing_headers(capability, false, false)
 }
 
 fn same_path_readback_routing_headers(capability: &CapabilityV1) -> Option<Vec<String>> {
-    same_path_routing_headers(capability, true)
+    same_path_routing_headers(capability, true, false)
+}
+
+fn same_path_delete_readback_routing_headers(capability: &CapabilityV1) -> Option<Vec<String>> {
+    same_path_routing_headers(capability, true, true)
 }
 
 fn same_path_routing_headers(
     capability: &CapabilityV1,
     allow_readback_controls: bool,
+    allow_omitted_optional_query: bool,
 ) -> Option<Vec<String>> {
     let mut routing_headers = Vec::new();
     for selector in &capability.selectors {
         if selector.location == "path" {
+            continue;
+        }
+        if allow_omitted_optional_query
+            && safe_omitted_delete_readback_projection(capability, selector)
+        {
             continue;
         }
         if allow_readback_controls && safe_omitted_readback_projection(capability, selector) {
@@ -1492,6 +1524,63 @@ fn same_path_routing_headers(
     Some(routing_headers)
 }
 
+fn declares_exact_resource_deletion(capability: &CapabilityV1) -> bool {
+    if capability.method != "DELETE" {
+        return false;
+    }
+    let declaration = capability.title.to_ascii_lowercase();
+    [
+        "delete",
+        "remove",
+        "revoke",
+        "destroy",
+        "decommission",
+        "leave",
+        "unprotect",
+        "detach",
+    ]
+    .iter()
+    .any(|term| declaration.contains(term))
+}
+
+fn narrow_required_open_delete_body(capability: &mut CapabilityV1) -> bool {
+    let Some(schema) = capability.request_schema.as_mut() else {
+        return true;
+    };
+    let Some(contract) = schema.as_object_mut() else {
+        return false;
+    };
+    let properties_are_open = contract
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_none_or(serde_json::Map::is_empty);
+    let required_is_empty = contract
+        .get("required")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty);
+    let empty_object_is_valid = contract.get("type").and_then(Value::as_str) == Some("object")
+        && contract
+            .get("x-cfctl-body-required")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && properties_are_open
+        && required_is_empty
+        && ["allOf", "oneOf", "anyOf"]
+            .iter()
+            .all(|composition| !contract.contains_key(*composition))
+        && contract
+            .get("minProperties")
+            .and_then(Value::as_u64)
+            .is_none_or(|minimum| minimum == 0)
+        && contract.get("enum").is_none();
+    if !empty_object_is_valid {
+        return false;
+    }
+    contract.insert("properties".to_owned(), Value::Object(Map::new()));
+    contract.insert("additionalProperties".to_owned(), Value::Bool(false));
+    true
+}
+
 fn safe_omitted_readback_projection(capability: &CapabilityV1, selector: &SelectorV1) -> bool {
     capability.product == "D1"
         && capability.path == "/accounts/{account_id}/d1/database/{database_id}"
@@ -1502,6 +1591,57 @@ fn safe_omitted_readback_projection(capability: &CapabilityV1, selector: &Select
         && selector.description.as_deref().is_some_and(|description| {
             description.contains("When omitted") && description.contains("all fields are returned.")
         })
+}
+
+fn safe_omitted_delete_readback_projection(
+    capability: &CapabilityV1,
+    selector: &SelectorV1,
+) -> bool {
+    if selector.location != "query" || selector.required {
+        return false;
+    }
+    let Some(description) = selector.description.as_deref() else {
+        return false;
+    };
+    match (
+        capability.product.as_str(),
+        capability.path.as_str(),
+        selector.name.as_str(),
+        selector.value_type.as_str(),
+    ) {
+        (
+            "Physical Devices",
+            "/accounts/{account_id}/devices/physical-devices/{device_id}",
+            "include",
+            "string",
+        )
+        | (
+            "Registrations",
+            "/accounts/{account_id}/devices/registrations/{registration_id}",
+            "include",
+            "string",
+        ) => {
+            description.contains("additional information")
+                && description.contains("included in")
+                && description.contains("response")
+        }
+        (
+            "API Shield Labels",
+            "/zones/{zone_id}/api_gateway/labels/user/{name}",
+            "with_mapped_resource_counts",
+            "boolean",
+        ) => description.contains("Include `mapped_resources` for each label"),
+        (
+            "Schema Validation",
+            "/zones/{zone_id}/schema_validation/schemas/{schema_id}",
+            "omit_source",
+            "boolean",
+        ) => {
+            description.contains("Omit the source-files")
+                && description.contains("only retrieve their meta-data")
+        }
+        _ => false,
+    }
 }
 
 fn canonical_request_object_fields(capability: &CapabilityV1) -> Option<Vec<String>> {
