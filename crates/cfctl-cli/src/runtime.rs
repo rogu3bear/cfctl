@@ -461,10 +461,7 @@ async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2> {
         Err(error) => json!({"status": "not_refreshed", "reason": error.to_string()}),
     };
     let current_path = store.paths().catalog_file();
-    if current_path.is_file() {
-        let current = CatalogSnapshot::load(&current_path)?;
-        store.write_json(&store.paths().catalog_previous_file(), &current)?;
-    }
+    let previous_catalog = preserve_previous_catalog(store)?;
     store.write_json(&current_path, &catalog)?;
     store.write_json(&docs_file(store), &feeds)?;
     let index_path = catalog_index_file(store);
@@ -478,6 +475,7 @@ async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "docs_index_url": feeds.docs_index_url,
             "changelog_url": feeds.changelog_url,
             "oauth_scope_inventory": oauth_scope_status.clone(),
+            "previous_catalog": previous_catalog.clone(),
         }),
     )?;
     Ok(ResultEnvelopeV2::success(
@@ -486,10 +484,33 @@ async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "coverage": catalog.coverage(),
             "docs_fetched_at": feeds.fetched_at,
             "oauth_scope_inventory": oauth_scope_status,
+            "previous_catalog": previous_catalog,
             "message": format!("Catalog synced: {} API, CLI, and governed UI capabilities indexed.", catalog.capabilities.len())
         }),
     )
     .with_evidence(evidence))
+}
+
+fn preserve_previous_catalog(store: &StateStore) -> Result<Value> {
+    let current_path = store.paths().catalog_file();
+    if !current_path.is_file() {
+        return Ok(json!({"status": "absent"}));
+    }
+
+    match CatalogSnapshot::load(&current_path) {
+        Ok(current) => {
+            let schema_hash = current.schema_hash.clone();
+            store.write_json(&store.paths().catalog_previous_file(), &current)?;
+            Ok(json!({
+                "status": "preserved",
+                "schema_hash": schema_hash,
+            }))
+        }
+        Err(error) => Ok(json!({
+            "status": "discarded_invalid",
+            "reason": error.to_string(),
+        })),
+    }
 }
 
 async fn guide_command(store: &StateStore, arguments: &GuideArgs) -> Result<ResultEnvelopeV2> {
@@ -3868,19 +3889,74 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 mod tests {
     use super::{
         CallInput, compensation_request, find_secret_value, guide_document,
-        persist_secret_lifecycle, redact_secret_result, sink_secret_result,
-        validate_api_token_creation_contract, validate_current_permission_groups,
-        validate_selected_permission_groups,
+        persist_secret_lifecycle, preserve_previous_catalog, redact_secret_result,
+        sink_secret_result, validate_api_token_creation_contract,
+        validate_current_permission_groups, validate_selected_permission_groups,
     };
     use cfctl_auth::{AuthError, SecretStore};
+    use cfctl_catalog::CatalogSnapshot;
     use cfctl_core::{
         AdapterStatus, CapabilityV1, CreatedResourceContractV1, PlanStatus, PlanV1, RiskClass,
         SelectorV1, TransactionStageV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
+    use chrono::Utc;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     struct DeleteFailingSecretStore;
+
+    fn test_catalog() -> CatalogSnapshot {
+        let capability = CapabilityV1::new("accounts-list", "List accounts", "GET", "/accounts");
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "https://example.invalid/openapi.json".to_owned(),
+            source_hash: "source-sha".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability.id.clone(), capability)]),
+        };
+        catalog.refresh_hash().expect("catalog hash");
+        catalog
+    }
+
+    #[test]
+    fn catalog_sync_preserves_only_a_valid_current_snapshot() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let catalog = test_catalog();
+        store
+            .write_json(&store.paths().catalog_file(), &catalog)
+            .expect("current catalog");
+
+        let preserved = preserve_previous_catalog(&store).expect("preserve current catalog");
+        assert_eq!(preserved["status"], "preserved");
+        assert_eq!(preserved["schema_hash"], catalog.schema_hash);
+        assert_eq!(
+            CatalogSnapshot::load(&store.paths().catalog_previous_file())
+                .expect("previous catalog"),
+            catalog
+        );
+
+        let mut tampered = serde_json::to_value(&catalog).expect("catalog JSON");
+        tampered["capabilities"]["accounts-list"]["title"] = json!("Tampered account listing");
+        store
+            .write_json(&store.paths().catalog_file(), &tampered)
+            .expect("tampered current catalog");
+
+        let discarded = preserve_previous_catalog(&store).expect("discard invalid current");
+        assert_eq!(discarded["status"], "discarded_invalid");
+        assert!(
+            discarded["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("catalog content hash mismatch"))
+        );
+        assert_eq!(
+            CatalogSnapshot::load(&store.paths().catalog_previous_file())
+                .expect("last valid previous catalog remains"),
+            catalog
+        );
+    }
 
     impl SecretStore for DeleteFailingSecretStore {
         fn put(&self, _key: &str, _value: &str) -> cfctl_auth::Result<()> {

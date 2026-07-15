@@ -122,6 +122,43 @@ fn sqlite_index_is_rebuildable_from_the_authoritative_snapshot() {
 }
 
 #[test]
+fn stored_catalog_rejects_capability_drift_from_its_content_hash() {
+    let snapshot = normalize_openapi(&fixture()).expect("catalog");
+    let root = tempfile::tempdir().expect("temp catalog");
+    let path = root.path().join("catalog.json");
+    snapshot.save(&path).expect("save catalog");
+
+    let mut drifted = snapshot.clone();
+    "api_token_details_match_created_id_and_active_status".clone_into(
+        &mut drifted
+            .capabilities
+            .get_mut("dns-records-delete")
+            .expect("delete capability")
+            .verification
+            .strategy,
+    );
+    assert!(drifted.save(&root.path().join("drifted.json")).is_err());
+    assert!(CatalogIndex::rebuild(&root.path().join("drifted.sqlite3"), &drifted).is_err());
+
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read stored catalog"))
+            .expect("decode stored catalog");
+    stored["capabilities"]["dns-records-delete"]["verification"]["strategy"] =
+        json!("api_token_details_match_created_id_and_active_status");
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&stored).expect("encode tampered catalog"),
+    )
+    .expect("write tampered catalog");
+
+    let error = CatalogSnapshot::load(&path)
+        .expect_err("capability drift must not load")
+        .to_string();
+
+    assert!(error.contains("catalog content hash mismatch"), "{error}");
+}
+
+#[test]
 fn sqlite_search_tolerates_natural_language_and_ranks_the_intended_operation() {
     let snapshot = normalize_openapi(&fixture()).expect("catalog");
     let root = tempfile::tempdir().expect("temp catalog");
@@ -168,6 +205,7 @@ fn search_exposes_exact_mutation_contract_debt() {
             url: "https://developers.cloudflare.com/widgets/pricing/".to_owned(),
             source: "official fixture".to_owned(),
         });
+    snapshot.refresh_hash().expect("refresh catalog hash");
 
     for query in [
         "verification missing",

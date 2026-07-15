@@ -10,6 +10,12 @@ cfctl docs changes --json
 cfctl agents doctor --json
 ```
 
+If a command reports `catalog content hash mismatch`, do not edit the stored
+hash. Run `cfctl catalog sync --json` to fetch a fresh official snapshot and
+inspect `previous_catalog`. `discarded_invalid` means the corrupt current file
+was replaced without overwriting the last valid previous snapshot; ordinary
+catalog reads and plans remain fail-closed until that explicit repair succeeds.
+
 Use `mutation_contract_gap_counts` to distinguish unknown risk, effect, cost,
 verification, rollback, permissions, and entitlement debt. Counts overlap;
 `capabilities_with_mutation_contract_gaps` counts affected operations once,

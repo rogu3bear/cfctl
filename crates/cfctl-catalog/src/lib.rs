@@ -28,6 +28,8 @@ pub enum CatalogError {
     MissingPaths,
     #[error("duplicate operation id `{0}`")]
     DuplicateOperation(String),
+    #[error("catalog content hash mismatch: recorded {recorded}, actual {actual}")]
+    ContentHashMismatch { recorded: String, actual: String },
     #[error(transparent)]
     Core(#[from] cfctl_core::CoreError),
     #[error(transparent)]
@@ -59,6 +61,17 @@ pub struct CatalogSnapshot {
 impl CatalogSnapshot {
     pub fn refresh_hash(&mut self) -> Result<()> {
         self.schema_hash = hash_value(&serde_json::to_value(&self.capabilities)?)?;
+        Ok(())
+    }
+
+    pub fn validate_hash(&self) -> Result<()> {
+        let actual = hash_value(&serde_json::to_value(&self.capabilities)?)?;
+        if self.schema_hash != actual {
+            return Err(CatalogError::ContentHashMismatch {
+                recorded: self.schema_hash.clone(),
+                actual,
+            });
+        }
         Ok(())
     }
 
@@ -199,6 +212,7 @@ impl CatalogSnapshot {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.validate_hash()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| catalog_io(parent, source))?;
         }
@@ -208,7 +222,9 @@ impl CatalogSnapshot {
 
     pub fn load(path: &Path) -> Result<Self> {
         let encoded = fs::read(path).map_err(|source| catalog_io(path, source))?;
-        Ok(serde_json::from_slice(&encoded)?)
+        let snapshot: Self = serde_json::from_slice(&encoded)?;
+        snapshot.validate_hash()?;
+        Ok(snapshot)
     }
 }
 
@@ -238,6 +254,7 @@ pub struct CatalogIndex {
 
 impl CatalogIndex {
     pub fn rebuild(path: &Path, snapshot: &CatalogSnapshot) -> Result<Self> {
+        snapshot.validate_hash()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| catalog_io(parent, source))?;
         }
