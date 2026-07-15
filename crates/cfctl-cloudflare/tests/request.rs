@@ -51,7 +51,22 @@ fn request_builder_resolves_path_and_query_selectors_without_leaking_auth() {
         "GET",
         "/zones/{zone_id}/dns_records",
     );
-    capability.selectors = vec![];
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "zone_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+        },
+        SelectorV1 {
+            name: "name".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "string".to_owned(),
+            description: None,
+        },
+    ];
     let request = RequestBuilder::new("https://api.cloudflare.com/client/v4")
         .expect("valid base URL")
         .build(
@@ -78,6 +93,99 @@ fn request_builder_resolves_path_and_query_selectors_without_leaking_auth() {
             .and_then(|value| value.to_str().ok()),
         Some("etag-1")
     );
+}
+
+#[test]
+fn request_builder_rejects_query_controls_outside_the_catalog_contract() {
+    let mut capability = CapabilityV1::new(
+        "workers-ai-run",
+        "Run model",
+        "GET",
+        "/accounts/{account_id}/ai/run/{model_name}",
+    );
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+        },
+        SelectorV1 {
+            name: "model_name".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+        },
+        SelectorV1 {
+            name: "queueRequest".to_owned(),
+            location: "query".to_owned(),
+            required: true,
+            value_type: "boolean".to_owned(),
+            description: None,
+        },
+    ];
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    let selectors = json!({"account_id":"account-1", "model_name":"@cf/example/model"});
+
+    let undeclared = builder
+        .build(
+            &capability,
+            &CallInput {
+                selectors: selectors.clone(),
+                query: json!({"queueRequest":"true", "bypass":"1"}),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("undeclared query controls must fail closed");
+    assert!(matches!(
+        undeclared,
+        CloudflareError::UndeclaredQuerySelector(name) if name == "bypass"
+    ));
+
+    let missing = builder
+        .build(
+            &capability,
+            &CallInput {
+                selectors: selectors.clone(),
+                query: json!({}),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("required query controls must be present");
+    assert!(matches!(
+        missing,
+        CloudflareError::MissingQuerySelector(name) if name == "queueRequest"
+    ));
+
+    let invalid = builder
+        .build(
+            &capability,
+            &CallInput {
+                selectors: selectors.clone(),
+                query: json!({"queueRequest":{"nested":true}}),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("query controls must satisfy their catalog type");
+    assert!(matches!(
+        invalid,
+        CloudflareError::InvalidQuerySelector { name, expected }
+            if name == "queueRequest" && expected == "boolean"
+    ));
+
+    let request = builder
+        .build(
+            &capability,
+            &CallInput {
+                selectors,
+                query: json!({"queueRequest":"true"}),
+                ..CallInput::default()
+            },
+        )
+        .expect("CLI string form of a declared boolean query should build");
+    assert_eq!(request.url.query(), Some("queueRequest=true"));
 }
 
 #[test]

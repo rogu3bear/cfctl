@@ -538,7 +538,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
                 .to_owned(),
         ));
     }
-    let mut prepared = call_input(&arguments)?;
+    let mut prepared = call_input(&capability, &arguments)?;
     preflight_call_input(&capability, &prepared.input, prepared.secret_body.as_ref())?;
     if !capability.mutating {
         if prepared.secret_body.is_some() {
@@ -3706,9 +3706,9 @@ struct PreparedCallInput {
     secret_body: Option<Value>,
 }
 
-fn call_input(arguments: &CallArgs) -> Result<PreparedCallInput> {
+fn call_input(capability: &CapabilityV1, arguments: &CallArgs) -> Result<PreparedCallInput> {
     let selectors = object_from_pairs(&arguments.selectors);
-    let query = object_from_pairs(&arguments.query);
+    let query = query_object_from_pairs(capability, &arguments.query)?;
     let body = if arguments.body_stdin {
         Some(serde_json::from_str(&read_stdin()?)?)
     } else {
@@ -3737,6 +3737,32 @@ fn call_input(arguments: &CallArgs) -> Result<PreparedCallInput> {
         },
         secret_body: contains_secret.then_some(body).flatten(),
     })
+}
+
+fn query_object_from_pairs(capability: &CapabilityV1, pairs: &[(String, String)]) -> Result<Value> {
+    let mut grouped = BTreeMap::<String, Vec<String>>::new();
+    for (name, value) in pairs {
+        grouped.entry(name.clone()).or_default().push(value.clone());
+    }
+    let mut query = Map::new();
+    for (name, values) in grouped {
+        let array_typed = capability.selectors.iter().any(|selector| {
+            selector.location == "query" && selector.name == name && selector.value_type == "array"
+        });
+        if array_typed {
+            query.insert(
+                name,
+                Value::Array(values.into_iter().map(Value::String).collect()),
+            );
+        } else if values.len() == 1 {
+            query.insert(name, Value::String(values[0].clone()));
+        } else {
+            return Err(CliError::Input(format!(
+                "query control `{name}` is repeated but its catalog type is not an array"
+            )));
+        }
+    }
+    Ok(Value::Object(query))
 }
 
 fn object_from_pairs(pairs: &[(String, String)]) -> Value {
@@ -4521,7 +4547,7 @@ mod tests {
         CallInput, apply_zone_account_response, apply_zone_entitlement_response,
         boundary_response_artifact, compensation_request, find_secret_value, guide_document,
         persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
-        redact_secret_result, required_entitlement_precondition,
+        query_object_from_pairs, redact_secret_result, required_entitlement_precondition,
         required_zone_account_precondition, should_bind_zone_account,
         should_resolve_zone_entitlement, sink_secret_result, validate_api_token_creation_contract,
         validate_current_permission_groups, validate_entitlement_receipt_precondition,
@@ -4590,6 +4616,53 @@ mod tests {
             workspace_resource_keys(&kv, &input),
             vec!["kv_namespace:shared-name"]
         );
+    }
+
+    #[test]
+    fn typed_query_input_preserves_array_values_and_rejects_ambiguous_scalars() {
+        let mut capability = CapabilityV1::new(
+            "query-read",
+            "Query read",
+            "GET",
+            "/accounts/{account_id}/items",
+        );
+        capability.selectors = vec![
+            SelectorV1 {
+                name: "tags".to_owned(),
+                location: "query".to_owned(),
+                required: false,
+                value_type: "array".to_owned(),
+                description: None,
+            },
+            SelectorV1 {
+                name: "cursor".to_owned(),
+                location: "query".to_owned(),
+                required: false,
+                value_type: "string".to_owned(),
+                description: None,
+            },
+        ];
+        let query = query_object_from_pairs(
+            &capability,
+            &[
+                ("tags".to_owned(), "one".to_owned()),
+                ("tags".to_owned(), "two".to_owned()),
+                ("cursor".to_owned(), "next".to_owned()),
+            ],
+        )
+        .expect("typed query");
+        assert_eq!(query, json!({"tags":["one","two"], "cursor":"next"}));
+
+        let error = query_object_from_pairs(
+            &capability,
+            &[
+                ("cursor".to_owned(), "one".to_owned()),
+                ("cursor".to_owned(), "two".to_owned()),
+            ],
+        )
+        .expect_err("duplicate scalar query controls must fail closed")
+        .to_string();
+        assert!(error.contains("cursor") && error.contains("repeated"));
     }
 
     #[test]

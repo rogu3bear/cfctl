@@ -26,6 +26,14 @@ pub enum CloudflareError {
     MissingHeaderSelector(String),
     #[error("selector `{0}` must be a string, number, or boolean")]
     InvalidSelector(String),
+    #[error("query input must be an object of catalog-declared controls")]
+    InvalidQueryObject,
+    #[error("query control `{0}` is not declared by the catalog capability")]
+    UndeclaredQuerySelector(String),
+    #[error("catalog query control `{0}` is required")]
+    MissingQuerySelector(String),
+    #[error("catalog query control `{name}` must have type `{expected}`")]
+    InvalidQuerySelector { name: String, expected: String },
     #[error("required request body is missing for capability `{0}`")]
     MissingRequestBody(String),
     #[error("request body does not satisfy the pinned schema: {0}")]
@@ -2044,7 +2052,72 @@ fn is_delete_verifier(strategy: &str) -> bool {
 }
 
 pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    validate_query_contract(capability, &input.query)?;
     validate_request_body(capability, input.body.as_ref())
+}
+
+fn validate_query_contract(capability: &CapabilityV1, query: &Value) -> Result<()> {
+    let values = match query {
+        Value::Null => None,
+        Value::Object(values) => Some(values),
+        _ => return Err(CloudflareError::InvalidQueryObject),
+    };
+    if let Some(values) = values {
+        for (name, value) in values {
+            let selector = capability
+                .selectors
+                .iter()
+                .find(|selector| selector.location == "query" && selector.name == *name)
+                .ok_or_else(|| CloudflareError::UndeclaredQuerySelector(name.clone()))?;
+            if !query_value_matches_type(value, &selector.value_type) {
+                return Err(CloudflareError::InvalidQuerySelector {
+                    name: name.clone(),
+                    expected: selector.value_type.clone(),
+                });
+            }
+        }
+    }
+    for selector in capability
+        .selectors
+        .iter()
+        .filter(|selector| selector.location == "query" && selector.required)
+    {
+        if values.is_none_or(|values| !values.contains_key(&selector.name)) {
+            return Err(CloudflareError::MissingQuerySelector(selector.name.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn query_value_matches_type(value: &Value, expected: &str) -> bool {
+    match expected {
+        "string" => value.is_string(),
+        "boolean" => {
+            value.is_boolean()
+                || value
+                    .as_str()
+                    .is_some_and(|value| matches!(value, "true" | "false"))
+        }
+        "integer" => {
+            value.as_i64().is_some()
+                || value.as_u64().is_some()
+                || value.as_str().is_some_and(|value| {
+                    value.parse::<i64>().is_ok() || value.parse::<u64>().is_ok()
+                })
+        }
+        "number" => {
+            value.is_number()
+                || value
+                    .as_str()
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .is_some_and(f64::is_finite)
+        }
+        "array" => value
+            .as_array()
+            .is_some_and(|values| values.iter().all(|value| scalar(value).is_some())),
+        "unknown" => scalar(value).is_some(),
+        _ => false,
+    }
 }
 
 fn validate_request_body(capability: &CapabilityV1, body: Option<&Value>) -> Result<()> {
