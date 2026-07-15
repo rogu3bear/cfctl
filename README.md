@@ -377,5 +377,6 @@ under `site/`; these external steps are not silently performed or claimed.
 - [Security contract](docs/v2-security.md)
 - [Agent landing](docs/agent-landing.md)
 - [v1 parity and shell-removal audit](docs/v1-parity.md)
+- [v2 stacked review, merge, and rollback runbook](docs/v2-pr-sequence.md)
 - [Rust clean-break ADR](docs/architecture/adr/0001-rust-clean-break.md)
 - [Risk-based approval ADR](docs/architecture/adr/0002-risk-based-approval.md)
