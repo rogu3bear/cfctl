@@ -2172,6 +2172,13 @@ fn local_schema_value_type(document: &Value, schema: &Value, depth: u8) -> Optio
     {
         return local_schema_value_type(document, resolved, depth + 1);
     }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        let mut resolved = values.iter().map(json_value_type);
+        let first = resolved.next()??;
+        return resolved
+            .all(|value_type| value_type == Some(first))
+            .then(|| first.to_owned());
+    }
     if let Some(members) = schema.get("allOf").and_then(Value::as_array) {
         let mut resolved = members
             .iter()
@@ -2194,6 +2201,18 @@ fn local_schema_value_type(document: &Value, schema: &Value, depth: u8) -> Optio
             .then_some(first);
     }
     None
+}
+
+fn json_value_type(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Bool(_) => Some("boolean"),
+        Value::Number(number) if number.is_i64() || number.is_u64() => Some("integer"),
+        Value::Number(_) => Some("number"),
+        Value::String(_) => Some("string"),
+        Value::Array(_) => Some("array"),
+        Value::Object(_) => Some("object"),
+        Value::Null => None,
+    }
 }
 
 fn local_schema_description(document: &Value, schema: &Value, depth: u8) -> Option<String> {

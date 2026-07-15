@@ -145,6 +145,38 @@ fn request_contract_resolves_local_schema_without_copying_secret_values() {
 }
 
 #[test]
+fn selector_types_follow_homogeneous_enums_without_guessing_mixed_values() {
+    let mut document = fixture();
+    let parameters = document["paths"]["/zones/{zone_id}/dns_records"]["get"]["parameters"]
+        .as_array_mut()
+        .expect("parameters");
+    parameters.push(json!({
+        "in": "query",
+        "name": "sort",
+        "schema": {"enum": ["asc", "desc"]}
+    }));
+    parameters.push(json!({
+        "in": "query",
+        "name": "mixed-enum",
+        "schema": {"enum": ["auto", 1]}
+    }));
+
+    let snapshot = normalize_openapi(&document).expect("catalog");
+    let capability = snapshot.get("dns-records-list").expect("list capability");
+    let selector_type = |name| {
+        capability
+            .selectors
+            .iter()
+            .find(|selector| selector.name == name)
+            .expect("selector")
+            .value_type
+            .as_str()
+    };
+    assert_eq!(selector_type("sort"), "string");
+    assert_eq!(selector_type("mixed-enum"), "unknown");
+}
+
+#[test]
 fn official_cli_help_becomes_delegated_capabilities() {
     let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
     ingest_cli_help(
