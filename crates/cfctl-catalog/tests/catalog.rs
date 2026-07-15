@@ -3786,6 +3786,196 @@ fn email_security_settings_classifier_rejects_retargeting_and_permission_drift()
     assert!(drifted_create.entitlement.blocker.is_none());
 }
 
+fn queue_configuration_fixture() -> serde_json::Value {
+    let mut document = create_lifecycle_fixture();
+    document["components"]["schemas"]["Widget"]["properties"] = json!({
+        "queue_id": {"type": "string"},
+        "queue_name": {"type": "string"},
+        "settings": {
+            "type": "object",
+            "properties": {
+                "delivery_delay": {"type": "number"},
+                "delivery_paused": {"type": "boolean"},
+                "message_retention_period": {"type": "number"}
+            }
+        }
+    });
+
+    let mut collection = document["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets")
+        .expect("widget collection");
+    collection["post"]["operationId"] = json!("queues-create");
+    collection["post"]["summary"] = json!("Create Queue");
+    collection["post"]["tags"] = json!(["Queue"]);
+    collection["post"]["x-api-token-group"] = json!(["Queues Write", "Workers Scripts Write"]);
+    collection["post"]["requestBody"]["content"]["application/json"]["schema"] = json!({
+        "type": "object",
+        "required": ["queue_name"],
+        "properties": {"queue_name": {"type": "string"}}
+    });
+
+    let mut detail = document["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets/{widget_id}")
+        .expect("widget detail");
+    detail["parameters"] = json!([
+        {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+        {"in":"path","name":"queue_id","required":true,"schema":{"type":"string"}}
+    ]);
+    detail["get"]["operationId"] = json!("queues-get");
+    detail["get"]["tags"] = json!(["Queue"]);
+    detail["delete"]["operationId"] = json!("queues-delete");
+    detail["delete"]["tags"] = json!(["Queue"]);
+    detail["delete"]["x-api-token-group"] = json!(["Queues Write", "Workers Scripts Write"]);
+    let update = json!({
+        "summary": "Update Queue",
+        "tags": ["Queue"],
+        "x-api-token-group": ["Queues Write", "Workers Scripts Write"],
+        "requestBody": {
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "properties": {
+                    "queue_name": {"type": "string"},
+                    "settings": {
+                        "type": "object",
+                        "properties": {
+                            "delivery_delay": {"type": "number"},
+                            "delivery_paused": {"type": "boolean"},
+                            "message_retention_period": {"type": "number"}
+                        }
+                    }
+                }
+            }}}
+        },
+        "responses": {
+            "200": {
+                "description": "Queue updated",
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/WidgetResponse"}
+                    }
+                }
+            }
+        }
+    });
+    detail["put"] = update.clone();
+    detail["put"]["operationId"] = json!("queues-update");
+    detail["patch"] = update;
+    detail["patch"]["operationId"] = json!("queues-update-partial");
+    document["paths"]["/accounts/{account_id}/queues"] = collection;
+    document["paths"]["/accounts/{account_id}/queues/{queue_id}"] = detail;
+    document
+}
+
+#[test]
+fn queue_configuration_has_exact_cost_entitlement_risk_and_data_loss_contracts() {
+    let snapshot = normalize_openapi(&queue_configuration_fixture()).expect("Queue catalog");
+    let create = snapshot.get("queues-create").expect("queue create");
+    assert_eq!(create.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(create.risk, RiskClass::CrossConfig);
+    assert_eq!(create.effect, EffectClass::ReversibleWrite);
+    assert!(create.rollback.supported);
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+
+    for capability in [
+        create,
+        snapshot.get("queues-update").expect("queue update"),
+        snapshot
+            .get("queues-update-partial")
+            .expect("queue partial update"),
+    ] {
+        assert_eq!(capability.adapter_status, AdapterStatus::DynamicApi);
+        assert!(capability.cost.known);
+        assert!(!capability.cost.incremental);
+        assert_eq!(capability.cost.maximum, Some(0.0));
+        assert_eq!(capability.cost.billing_model, BillingModelV1::UsageBased);
+        assert_eq!(capability.cost.exposure, CostExposureV1::DownstreamUsage);
+        assert!(capability.cost.references.iter().any(|reference| {
+            reference.url == "https://developers.cloudflare.com/queues/platform/pricing/"
+        }));
+        assert!(capability.cost.references.iter().any(|reference| {
+            reference.url == "https://developers.cloudflare.com/queues/platform/limits/"
+        }));
+        assert_eq!(capability.entitlement.available, Some(true));
+        assert_eq!(
+            capability.entitlement.plans.get("workers_free"),
+            Some(&true)
+        );
+        assert_eq!(
+            capability.entitlement.plans.get("workers_paid"),
+            Some(&true)
+        );
+        assert!(!capability.entitlement.requires_live_resolution);
+        assert_eq!(
+            capability.entitlement.source.as_deref(),
+            Some("https://developers.cloudflare.com/changelog/post/2026-02-04-queues-free-plan/")
+        );
+        assert!(capability.mutation_contract_gaps().is_empty());
+    }
+
+    for id in ["queues-update", "queues-update-partial"] {
+        let update = snapshot.get(id).expect("queue update");
+        assert_eq!(update.risk, RiskClass::Destructive);
+        assert_eq!(update.effect, EffectClass::Destructive);
+        assert!(update.same_path_read.is_some());
+        assert!(!update.rollback.supported);
+        assert!(
+            update.rollback.warning.as_deref().is_some_and(|warning| {
+                warning.contains("retention")
+                    && warning.contains("expired messages")
+                    && warning.contains("cannot be restored")
+            }),
+            "{id}: {:?}",
+            update.rollback.warning
+        );
+    }
+}
+
+#[test]
+fn queue_configuration_classifier_rejects_permission_and_request_schema_drift() {
+    let mut permission_drift = queue_configuration_fixture();
+    permission_drift["paths"]["/accounts/{account_id}/queues"]["post"]["x-api-token-group"] =
+        json!(["Queues Write"]);
+    let permission_snapshot = normalize_openapi(&permission_drift).expect("permission drift");
+    let drifted_create = permission_snapshot
+        .get("queues-create")
+        .expect("permission-drifted queue create");
+    assert_eq!(drifted_create.risk, RiskClass::Unknown);
+    assert!(!drifted_create.cost.known);
+    assert_eq!(drifted_create.entitlement.available, None);
+
+    let mut create_schema_drift = queue_configuration_fixture();
+    create_schema_drift["paths"]["/accounts/{account_id}/queues"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["billing_plan"] = json!({"type": "string"});
+    let create_schema_snapshot =
+        normalize_openapi(&create_schema_drift).expect("create schema drift");
+    let drifted_create = create_schema_snapshot
+        .get("queues-create")
+        .expect("schema-drifted queue create");
+    assert_eq!(drifted_create.risk, RiskClass::Unknown);
+    assert!(!drifted_create.cost.known);
+    assert_eq!(drifted_create.entitlement.available, None);
+
+    let mut update_schema_drift = queue_configuration_fixture();
+    update_schema_drift["paths"]["/accounts/{account_id}/queues/{queue_id}"]["patch"]["requestBody"]
+        ["content"]["application/json"]["schema"]["properties"]["settings"]["properties"]["subscription_tier"] =
+        json!({"type": "string"});
+    let update_schema_snapshot =
+        normalize_openapi(&update_schema_drift).expect("update schema drift");
+    let drifted_update = update_schema_snapshot
+        .get("queues-update-partial")
+        .expect("schema-drifted queue update");
+    assert_eq!(drifted_update.risk, RiskClass::Unknown);
+    assert!(!drifted_update.cost.known);
+    assert_eq!(drifted_update.entitlement.available, None);
+}
+
 #[test]
 fn create_contract_binds_a_schema_proven_id_and_exact_read_delete_pair() {
     let document = create_lifecycle_fixture();

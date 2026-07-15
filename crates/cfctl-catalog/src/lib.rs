@@ -1760,10 +1760,14 @@ fn classify_exact_resource_contracts(
                 });
                 "same_resource_contains_planned_fields_after_update"
                     .clone_into(&mut capability.verification.strategy);
-                capability.rollback.warning = Some(
-                    "automatic restoration is unsupported because the plan does not bind a pre-change snapshot; restoration requires a separately reviewed update plan built from trusted evidence"
-                        .to_owned(),
-                );
+                if capability.rollback.warning.as_deref()
+                    == Some("rollback semantics have not been declared")
+                {
+                    capability.rollback.warning = Some(
+                        "automatic restoration is unsupported because the plan does not bind a pre-change snapshot; restoration requires a separately reviewed update plan built from trusted evidence"
+                            .to_owned(),
+                    );
+                }
             }
             _ => continue,
         }
@@ -3461,6 +3465,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         classify_load_balancing_configuration(capability, kind);
     } else if is_email_security_settings_configuration(capability) {
         classify_email_security_settings_configuration(capability);
+    } else if let Some(kind) = queue_configuration_kind(capability) {
+        classify_queue_configuration(capability, kind);
     } else {
         return false;
     }
@@ -4114,6 +4120,166 @@ fn classify_email_security_settings_configuration(capability: &mut CapabilityV1)
     capability.entitlement.source =
         Some("https://www.cloudflare.com/plans/zero-trust-services/".to_owned());
     capability.entitlement.requires_live_resolution = false;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueConfigurationKind {
+    Create,
+    Update,
+}
+
+struct QueueConfigurationContract {
+    id: &'static str,
+    method: &'static str,
+    path: &'static str,
+    kind: QueueConfigurationKind,
+}
+
+const QUEUE_CONFIGURATION_CONTRACTS: &[QueueConfigurationContract] = &[
+    QueueConfigurationContract {
+        id: "queues-create",
+        method: "POST",
+        path: "/accounts/{account_id}/queues",
+        kind: QueueConfigurationKind::Create,
+    },
+    QueueConfigurationContract {
+        id: "queues-update",
+        method: "PUT",
+        path: "/accounts/{account_id}/queues/{queue_id}",
+        kind: QueueConfigurationKind::Update,
+    },
+    QueueConfigurationContract {
+        id: "queues-update-partial",
+        method: "PATCH",
+        path: "/accounts/{account_id}/queues/{queue_id}",
+        kind: QueueConfigurationKind::Update,
+    },
+];
+
+fn queue_configuration_kind(capability: &CapabilityV1) -> Option<QueueConfigurationKind> {
+    QUEUE_CONFIGURATION_CONTRACTS
+        .iter()
+        .find(|contract| {
+            capability.id == contract.id
+                && capability.method == contract.method
+                && capability.path == contract.path
+                && capability.product == "Queue"
+                && capability.permissions.len() == 2
+                && capability.permissions[0] == "Queues Write"
+                && capability.permissions[1] == "Workers Scripts Write"
+                && queue_configuration_request_contract_supported(capability, contract.kind)
+        })
+        .map(|contract| contract.kind)
+}
+
+fn queue_configuration_request_contract_supported(
+    capability: &CapabilityV1,
+    kind: QueueConfigurationKind,
+) -> bool {
+    let Some(properties) = capability
+        .request_schema
+        .as_ref()
+        .and_then(|schema| schema.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let queue_name_is_string = properties
+        .get("queue_name")
+        .and_then(|field| field.get("type"))
+        .and_then(Value::as_str)
+        == Some("string");
+    match kind {
+        QueueConfigurationKind::Create => properties.len() == 1 && queue_name_is_string,
+        QueueConfigurationKind::Update => {
+            let settings = properties.get("settings");
+            let settings_properties = settings
+                .and_then(|settings| settings.get("properties"))
+                .and_then(Value::as_object);
+            properties.len() == 2
+                && queue_name_is_string
+                && settings
+                    .and_then(|settings| settings.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("object")
+                && settings_properties.is_some_and(|settings_properties| {
+                    settings_properties.len() == 3
+                        && settings_properties
+                            .get("delivery_delay")
+                            .and_then(|field| field.get("type"))
+                            .and_then(Value::as_str)
+                            == Some("number")
+                        && settings_properties
+                            .get("delivery_paused")
+                            .and_then(|field| field.get("type"))
+                            .and_then(Value::as_str)
+                            == Some("boolean")
+                        && settings_properties
+                            .get("message_retention_period")
+                            .and_then(|field| field.get("type"))
+                            .and_then(Value::as_str)
+                            == Some("number")
+                })
+        }
+    }
+}
+
+fn classify_queue_configuration(capability: &mut CapabilityV1, kind: QueueConfigurationKind) {
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "the queue-management request does not write, read, or delete messages, so its direct incremental ceiling is zero; downstream message operations remain usage-based under Workers Free or Paid included quantities and overage terms, and retention limits are plan-dependent"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Queues pricing".to_owned(),
+            url: "https://developers.cloudflare.com/queues/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Queues limits".to_owned(),
+            url: "https://developers.cloudflare.com/queues/platform/limits/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Queues on Workers Free".to_owned(),
+            url: "https://developers.cloudflare.com/changelog/post/2026-02-04-queues-free-plan/"
+                .to_owned(),
+            source: "official Cloudflare changelog".to_owned(),
+        },
+    ];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans = BTreeMap::from([
+        ("workers_free".to_owned(), true),
+        ("workers_paid".to_owned(), true),
+    ]);
+    capability.entitlement.blocker = None;
+    capability.entitlement.source = Some(
+        "https://developers.cloudflare.com/changelog/post/2026-02-04-queues-free-plan/".to_owned(),
+    );
+    capability.entitlement.requires_live_resolution = false;
+
+    match kind {
+        QueueConfigurationKind::Create => {
+            capability.risk = RiskClass::CrossConfig;
+            capability.effect = EffectClass::ReversibleWrite;
+        }
+        QueueConfigurationKind::Update => {
+            capability.risk = RiskClass::Destructive;
+            capability.effect = EffectClass::Destructive;
+            capability.rollback.supported = false;
+            capability.rollback.strategy = None;
+            capability.rollback.warning = Some(
+                "changing retention can cause queued messages to expire and changing delivery state affects connected consumers; configuration restoration requires a separately reviewed update, and expired messages cannot be restored"
+                    .to_owned(),
+            );
+        }
+    }
 }
 
 fn is_dns_record_lifecycle(capability_id: &str) -> bool {
