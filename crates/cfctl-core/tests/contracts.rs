@@ -171,6 +171,57 @@ fn every_transaction_checkpoint_survives_crash_reload_and_detects_tampering() {
 }
 
 #[test]
+fn transaction_artifacts_survive_crash_reload_and_detect_tampering() {
+    let capability = CapabilityV1::new(
+        "account-api-tokens-create-token",
+        "Create account token",
+        "POST",
+        "/accounts/{account_id}/tokens",
+    );
+    let mut plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "schema-sha",
+        capability,
+        json!({"account_id":"account-a"}),
+    )
+    .expect("plan");
+    plan.approve(true, None).expect("approve");
+    plan.mark_consumed().expect("consume");
+    plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+        .expect("attempt checkpoint");
+    plan.record_transaction_stage_with_artifact(
+        TransactionStageV1::BoundaryResponsePersisted,
+        json!({
+            "apply_evidence_hash": "sha256:apply",
+            "resource_id": "token-id",
+            "status": 200,
+            "success": true
+        }),
+    )
+    .expect("response receipt checkpoint");
+
+    let encoded = serde_json::to_vec(&plan).expect("crash snapshot");
+    let mut reloaded: PlanV1 = serde_json::from_slice(&encoded).expect("crash reload");
+    reloaded
+        .validate_transaction_journal()
+        .expect("receipt remains hash-bound after reload");
+    assert_eq!(
+        reloaded
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .and_then(|artifact| artifact.get("resource_id"))
+            .and_then(serde_json::Value::as_str),
+        Some("token-id")
+    );
+
+    reloaded
+        .transaction_artifacts
+        .get_mut("boundary_response_persisted")
+        .expect("response receipt")["resource_id"] = json!("tampered-token-id");
+    assert!(reloaded.validate_transaction_journal().is_err());
+}
+
+#[test]
 fn evidence_and_envelopes_do_not_conflate_artifact_presence_with_verification() {
     let evidence = EvidenceV1::new(EvidenceClass::Preview, "sha256:abc", "/tmp/evidence.json");
     let envelope =

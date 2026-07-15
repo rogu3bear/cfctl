@@ -124,7 +124,15 @@ workspace graph, source configuration, impact, costs, verification,
 compensation, and warnings. They expire within 24 hours. Drift invalidates
 approval. A hash-chained transaction journal persists the reviewed plan,
 approval, consumption, adapter boundary, secret sink, verification, and close
-checkpoints; a plan durably consumed before a crash cannot be replayed.
+checkpoints. Apply, sink, and verification checkpoints bind non-secret receipt
+hashes, so changing a returned resource ID or evidence hash invalidates the
+journal; a plan durably consumed before a crash cannot be replayed.
+
+When a token-creation receipt proves the returned resource ID and the catalog
+declares revocation as its rollback, `plans rectify` can derive a separate
+hash-bound revoke plan. It never runs that plan automatically: the destructive
+compensation has its own operation ID, review, approval, execution, and
+not-found verification.
 
 Generated write capabilities stay blocked until risk and effect are classified,
 incremental cost and plan entitlement are known, permissions are declared, and

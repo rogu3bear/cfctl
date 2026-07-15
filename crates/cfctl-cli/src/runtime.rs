@@ -1192,7 +1192,7 @@ async fn plans_command(store: &StateStore, command: PlansCommand) -> Result<Resu
         PlansCommand::Approve(arguments) => approve_plan(store, &arguments),
         PlansCommand::Run(selector) => run_plan(store, &selector).await,
         PlansCommand::Resume(selector) => resume_plan(store, &selector).await,
-        PlansCommand::Rectify(selector) => rectify_plan(store, &selector),
+        PlansCommand::Rectify(selector) => rectify_plan(store, &selector).await,
     }
 }
 
@@ -1208,6 +1208,17 @@ fn persist_transaction_stage(
     stage: TransactionStageV1,
 ) -> Result<()> {
     plan.record_transaction_stage(stage)?;
+    store.save_plan(plan)?;
+    Ok(())
+}
+
+fn persist_transaction_stage_with_artifact(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    stage: TransactionStageV1,
+    artifact: Value,
+) -> Result<()> {
+    plan.record_transaction_stage_with_artifact(stage, artifact)?;
     store.save_plan(plan)?;
     Ok(())
 }
@@ -1322,10 +1333,7 @@ async fn execute_api_plan(
         .execute_consumed_plan_with_input(plan, catalog_hash, credential, execution_input)
         .await;
     let response = match response_result {
-        Ok(response) => {
-            persist_transaction_stage(store, plan, TransactionStageV1::BoundaryResponsePersisted)?;
-            response
-        }
+        Ok(response) => response,
         Err(error) => {
             plan.status = PlanStatus::RectificationRequired;
             store.save_plan(plan)?;
@@ -1333,21 +1341,34 @@ async fn execute_api_plan(
             return Err(error.into());
         }
     };
-    delete_plan_secret(store, plan, secrets)?;
     let mut response_value = serde_json::to_value(&response)?;
     if is_secret_output_plan(plan) {
         response_value = redact_secret_result(&response_value);
     }
     let apply_evidence = store.write_evidence(EvidenceClass::Apply, &response_value)?;
+    persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::BoundaryResponsePersisted,
+        boundary_response_artifact(&response, &apply_evidence),
+    )?;
+    delete_plan_secret(store, plan, secrets)?;
+    let mut sink_path = None;
     if response.success
         && is_secret_output_plan(plan)
-        && let Err(error) = sink_secret_result(plan, &response.result)
+        && let Err(error) =
+            sink_secret_result(plan, &response.result).map(|path| sink_path = Some(path))
     {
         plan.status = PlanStatus::RectificationRequired;
         store.save_plan(plan)?;
         return Err(error);
     }
-    persist_transaction_stage(store, plan, TransactionStageV1::SecretSinkPersisted)?;
+    persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::SecretSinkPersisted,
+        secret_sink_artifact(plan, response.success, sink_path.as_deref()),
+    )?;
     let performed = response.success;
     let verification = verify_api_plan(store, &executor, plan, &response, credential).await?;
     if matches!(plan.status, PlanStatus::Verified | PlanStatus::Failed) {
@@ -1380,6 +1401,40 @@ struct ApiVerificationOutcome {
     error: Option<ErrorV1>,
 }
 
+fn boundary_response_artifact(
+    response: &CloudflareResponseV1,
+    apply_evidence: &EvidenceV1,
+) -> Value {
+    json!({
+        "apply_evidence_hash": apply_evidence.content_hash,
+        "http_status": response.status,
+        "success": response.success,
+        "resource_id": response.result.get("id").and_then(Value::as_str),
+        "resource_status": response.result.get("status").and_then(Value::as_str),
+        "etag": response.etag,
+        "cf_ray": response.cf_ray,
+    })
+}
+
+fn secret_sink_artifact(plan: &PlanV1, response_success: bool, path: Option<&Path>) -> Value {
+    let required = is_secret_output_plan(plan);
+    json!({
+        "required": required,
+        "completed": !required || (response_success && path.is_some()),
+        "path": path.map(|path| path.display().to_string()),
+        "create_new": required,
+        "unix_mode": cfg!(unix).then_some("0600"),
+    })
+}
+
+fn verification_response_artifact(outcome: &ApiVerificationOutcome) -> Result<Value> {
+    Ok(json!({
+        "state": outcome.state.as_str(),
+        "basis_hash": hash_value(&json!(outcome.basis))?,
+        "evidence_hash": outcome.evidence.as_ref().map(|evidence| evidence.content_hash.as_str()),
+    }))
+}
+
 async fn verify_api_plan(
     store: &StateStore,
     executor: &Executor,
@@ -1403,26 +1458,29 @@ async fn verify_api_plan(
     )?;
     if !plan.capability.verification.required {
         plan.status = PlanStatus::Verified;
-        persist_transaction_stage(
-            store,
-            plan,
-            TransactionStageV1::VerificationResponsePersisted,
-        )?;
-        return Ok(ApiVerificationOutcome {
+        let outcome = ApiVerificationOutcome {
             state: VerificationState::Passed,
             basis: "operation declares no post-change verifier".to_owned(),
             evidence: None,
             error: None,
-        });
+        };
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            TransactionStageV1::VerificationResponsePersisted,
+            verification_response_artifact(&outcome)?,
+        )?;
+        return Ok(outcome);
     }
     let outcome = match executor.verify_plan(plan, response, credential).await {
         Ok(verification) => verification_outcome(store, plan, verification)?,
         Err(error) => verification_error_outcome(store, plan, &error)?,
     };
-    persist_transaction_stage(
+    persist_transaction_stage_with_artifact(
         store,
         plan,
         TransactionStageV1::VerificationResponsePersisted,
+        verification_response_artifact(&outcome)?,
     )?;
     Ok(outcome)
 }
@@ -1508,8 +1566,100 @@ async fn resume_plan(store: &StateStore, selector: &PlanSelector) -> Result<Resu
     }
 }
 
-fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
+struct CompensationRequest {
+    capability_id: String,
+    input: CallInput,
+    requested_account: Option<String>,
+}
+
+fn token_compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
+    if !matches!(
+        plan.status,
+        PlanStatus::Consumed | PlanStatus::Running | PlanStatus::RectificationRequired
+    ) || !plan.capability.rollback.supported
+    {
+        return Ok(None);
+    }
+    let capability_id = match plan.capability.id.as_str() {
+        "account-api-tokens-create-token" => "account-api-tokens-delete-token",
+        "user-api-tokens-create-token" => "user-api-tokens-delete-token",
+        _ => return Ok(None),
+    };
+    let Some(artifact) = plan.transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+    else {
+        return Ok(None);
+    };
+    if artifact.get("success").and_then(Value::as_bool) != Some(true) {
+        return Ok(None);
+    }
+    let resource_id = artifact
+        .get("resource_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "the token creation response is recorded, but its hash-bound receipt has no resource id; inspect live token state before compensating"
+                    .to_owned(),
+            )
+        })?;
+    let selectors = if plan.capability.id == "account-api-tokens-create-token" {
+        json!({"account_id": plan.account_id, "token_id": resource_id})
+    } else {
+        json!({"token_id": resource_id})
+    };
+    Ok(Some(CompensationRequest {
+        capability_id: capability_id.to_owned(),
+        input: CallInput {
+            selectors,
+            query: json!({}),
+            body: None,
+            ..CallInput::default()
+        },
+        requested_account: Some(plan.account_id.clone()),
+    }))
+}
+
+async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
     let plan = load_validated_plan(store, &selector.operation_id)?;
+    if let Some(request) = token_compensation_request(&plan)? {
+        let catalog = ensure_catalog(store).await?;
+        let capability = catalog
+            .get(&request.capability_id)
+            .cloned()
+            .ok_or_else(|| capability_missing(&request.capability_id))?;
+        let source_receipt_hash = plan
+            .transaction_journal
+            .iter()
+            .find(|checkpoint| checkpoint.stage == TransactionStageV1::BoundaryResponsePersisted)
+            .and_then(|checkpoint| checkpoint.artifact_hash.as_deref());
+        let mut envelope = create_plan(
+            store,
+            &catalog,
+            capability,
+            request.input,
+            Some(&plan.profile_id),
+            request.requested_account.as_deref(),
+            json!({
+                "compensates_operation_id": plan.operation_id,
+                "compensates_capability_id": plan.capability.id,
+                "source_receipt_hash": source_receipt_hash,
+            }),
+        )?;
+        "plans rectify".clone_into(&mut envelope.command);
+        if let Some(result) = envelope.result.as_object_mut() {
+            result.insert(
+                "compensates_operation_id".to_owned(),
+                Value::String(plan.operation_id.clone()),
+            );
+            result.insert(
+                "message".to_owned(),
+                Value::String(
+                    "A separate hash-bound compensation plan was created from the verified response receipt. It has not run; review and explicitly approve its operation ID."
+                        .to_owned(),
+                ),
+            );
+        }
+        return Ok(envelope);
+    }
     Ok(ResultEnvelopeV2::success(
         "plans rectify",
         json!({
@@ -1518,7 +1668,7 @@ fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnv
             "compensation_steps": plan.compensation_steps,
             "verification_steps": plan.verification_steps,
             "non_reversible_warnings": plan.non_reversible_warnings,
-            "message": "Rectification is intentionally not automatic for this capability. Inspect live state with the catalog, then create a new hash-bound plan."
+            "message": "No safe automatic compensation plan can be derived from the hash-bound receipts for this capability. Inspect live state with the catalog, then create a new hash-bound plan."
         }),
     ))
 }
@@ -2496,14 +2646,8 @@ fn plan_secret_body_ref(plan: &PlanV1) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-fn sink_secret_result(plan: &PlanV1, result: &Value) -> Result<()> {
-    let encoded;
-    let secret = if let Some(secret) = find_secret_value(result) {
-        secret
-    } else if !result.is_null() {
-        encoded = serde_json::to_string_pretty(result)?;
-        &encoded
-    } else {
+fn sink_secret_result(plan: &PlanV1, result: &Value) -> Result<PathBuf> {
+    let Some(secret) = find_secret_value(result) else {
         return Err(CliError::Input(
             "Cloudflare reported success but no one-time credential value was present; the operation requires rectification"
                 .to_owned(),
@@ -2522,7 +2666,8 @@ fn sink_secret_result(plan: &PlanV1, result: &Value) -> Result<()> {
         .map_err(|source| cli_io(&path, source))?;
     file.write_all(secret.as_bytes())
         .map_err(|source| cli_io(&path, source))?;
-    file.sync_all().map_err(|source| cli_io(&path, source))
+    file.sync_all().map_err(|source| cli_io(&path, source))?;
+    Ok(path)
 }
 
 fn secret_sink_path(plan: &PlanV1) -> Result<PathBuf> {
@@ -2541,26 +2686,59 @@ fn find_secret_value(value: &Value) -> Option<&str> {
     if let Some(value) = value.as_str() {
         return Some(value);
     }
-    for key in ["value", "token", "secret", "access_token"] {
-        if let Some(value) = value.get(key).and_then(Value::as_str) {
-            return Some(value);
+    if let Some(object) = value.as_object() {
+        for key in ["value", "token", "secret", "access_token"] {
+            if let Some(candidate) = object.get(key) {
+                if let Some(value) = candidate.as_str() {
+                    return Some(value);
+                }
+                if (candidate.is_object() || candidate.is_array())
+                    && let Some(value) = find_secret_value(candidate)
+                {
+                    return Some(value);
+                }
+            }
         }
+        return object
+            .values()
+            .filter(|candidate| candidate.is_object() || candidate.is_array())
+            .find_map(find_secret_value);
     }
-    value
-        .as_object()
-        .and_then(|object| object.values().find_map(find_secret_value))
+    value.as_array()?.iter().find_map(find_secret_value)
 }
 
 fn redact_secret_result(value: &Value) -> Value {
     if let Value::Object(object) = value {
         let mut redacted = object.clone();
-        if redacted.contains_key("result") {
-            redacted.insert("result".to_owned(), Value::String("[SUNK]".to_owned()));
+        if let Some(result) = object.get("result") {
+            redacted.insert("result".to_owned(), redact_secret_payload(result, true));
         }
         return Value::Object(redacted);
     }
+    redact_secret_payload(value, true)
+}
+
+fn redact_secret_payload(value: &Value, root: bool) -> Value {
     match value {
-        Value::Array(values) => Value::Array(values.iter().map(redact_secret_result).collect()),
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, item)| {
+                    if matches!(key.as_str(), "value" | "token" | "secret" | "access_token") {
+                        (key.clone(), Value::String("[SUNK]".to_owned()))
+                    } else {
+                        (key.clone(), redact_secret_payload(item, false))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|item| redact_secret_payload(item, true))
+                .collect(),
+        ),
+        Value::String(_) if root => Value::String("[SUNK]".to_owned()),
         _ => value.clone(),
     }
 }
@@ -2670,5 +2848,115 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
     CliError::Io {
         path: path.display().to_string(),
         source,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::{
+        find_secret_value, redact_secret_result, sink_secret_result, token_compensation_request,
+    };
+    use cfctl_core::{CapabilityV1, PlanStatus, PlanV1, TransactionStageV1};
+    use serde_json::json;
+
+    #[test]
+    fn secret_response_preserves_safe_receipt_metadata() {
+        let response = json!({
+            "status": 200,
+            "success": true,
+            "result": {
+                "id": "token-id",
+                "name": "automation token",
+                "status": "active",
+                "value": "must-not-survive"
+            }
+        });
+
+        let redacted = redact_secret_result(&response);
+
+        assert_eq!(redacted["result"]["id"], "token-id");
+        assert_eq!(redacted["result"]["status"], "active");
+        assert_eq!(redacted["result"]["value"], "[SUNK]");
+        assert!(!redacted.to_string().contains("must-not-survive"));
+    }
+
+    #[test]
+    fn resource_metadata_is_not_mistaken_for_a_secret_value() {
+        assert_eq!(
+            find_secret_value(&json!({"id":"token-id","status":"active"})),
+            None
+        );
+        assert_eq!(
+            find_secret_value(&json!({
+                "id": "token-id",
+                "nested": {"value": "one-time-secret"}
+            })),
+            Some("one-time-secret")
+        );
+    }
+
+    #[test]
+    fn metadata_only_secret_response_is_rejected_without_creating_a_sink() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("credential.txt");
+        let capability = CapabilityV1::new(
+            "account-api-tokens-create-token",
+            "Create account token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        let plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"adapter":{"value_out":path}}),
+        )
+        .expect("plan");
+
+        assert!(sink_secret_result(&plan, &json!({"id":"token-id","status":"active"})).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn token_creation_rectification_builds_a_separate_revoke_request() {
+        let mut capability = CapabilityV1::new(
+            "account-api-tokens-create-token",
+            "Create account token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some(
+            "revoke_created_api_token_by_returned_id_if_downstream_installation_fails".to_owned(),
+        );
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"account_id":"account-a"}),
+        )
+        .expect("plan");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"resource_id":"token-id","success":true}),
+        )
+        .expect("response receipt");
+        plan.status = PlanStatus::RectificationRequired;
+
+        let request = token_compensation_request(&plan)
+            .expect("request resolves")
+            .expect("compensation is supported");
+
+        assert_eq!(request.capability_id, "account-api-tokens-delete-token");
+        assert_eq!(request.input.selectors["account_id"], "account-a");
+        assert_eq!(request.input.selectors["token_id"], "token-id");
+        assert_eq!(request.requested_account.as_deref(), Some("account-a"));
     }
 }

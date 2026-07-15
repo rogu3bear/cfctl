@@ -60,4 +60,10 @@ retry.
 10. Close verified/rejected transactions or require rectification without replay.
 11. Write redacted, content-addressed evidence.
 
+Apply, sink, and verification responses carry compact non-secret artifacts whose
+hashes are part of their journal checkpoints. These mutable execution facts are
+not part of the pre-execution approval hash, but they cannot be changed after
+the boundary without invalidating the transaction chain. A supported rollback
+uses them only to create a new compensation plan with independent authority.
+
 See [ADR 0001](architecture/adr/0001-rust-clean-break.md) and [ADR 0002](architecture/adr/0002-risk-based-approval.md).

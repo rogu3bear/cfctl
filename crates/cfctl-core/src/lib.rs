@@ -455,6 +455,23 @@ pub enum TransactionStageV1 {
 }
 
 impl TransactionStageV1 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PlanPrepared => "plan_prepared",
+            Self::ApprovalPersisted => "approval_persisted",
+            Self::ConsumptionPersisted => "consumption_persisted",
+            Self::BoundaryAttemptPersisted => "boundary_attempt_persisted",
+            Self::BoundaryResponsePersisted => "boundary_response_persisted",
+            Self::SecretSinkPersisted => "secret_sink_persisted",
+            Self::VerificationAttemptPersisted => "verification_attempt_persisted",
+            Self::VerificationResponsePersisted => "verification_response_persisted",
+            Self::CompensationAttemptPersisted => "compensation_attempt_persisted",
+            Self::CompensationResponsePersisted => "compensation_response_persisted",
+            Self::Closed => "closed",
+        }
+    }
+
     const fn rank(self) -> u8 {
         match self {
             Self::PlanPrepared => 0,
@@ -478,6 +495,8 @@ pub struct TransactionCheckpointV1 {
     pub recorded_at: DateTime<Utc>,
     pub plan_content_hash: String,
     pub previous_checkpoint_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_hash: Option<String>,
     pub checkpoint_hash: String,
 }
 
@@ -525,6 +544,8 @@ pub struct PlanV1 {
     pub transaction_stage: TransactionStageV1,
     #[serde(default)]
     pub transaction_journal: Vec<TransactionCheckpointV1>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub transaction_artifacts: BTreeMap<String, Value>,
 }
 
 fn default_permission_lane() -> String {
@@ -571,6 +592,7 @@ impl PlanV1 {
             content_hash: String::new(),
             transaction_stage: TransactionStageV1::PlanPrepared,
             transaction_journal: Vec::new(),
+            transaction_artifacts: BTreeMap::new(),
         };
         plan.refresh_hash()?;
         plan.record_transaction_stage(TransactionStageV1::PlanPrepared)?;
@@ -674,6 +696,31 @@ impl PlanV1 {
     /// Appends a forward-only, hash-chained transaction checkpoint. Runtime
     /// persistence is performed by the caller immediately after this method.
     pub fn record_transaction_stage(&mut self, stage: TransactionStageV1) -> Result<()> {
+        self.record_transaction_stage_inner(stage, None)
+    }
+
+    /// Appends a checkpoint whose non-secret receipt is independently hashed
+    /// and linked into the transaction chain. Artifacts are mutable execution
+    /// facts rather than reviewed plan content, so their integrity is carried
+    /// by the checkpoint instead of the approval hash.
+    pub fn record_transaction_stage_with_artifact(
+        &mut self,
+        stage: TransactionStageV1,
+        artifact: Value,
+    ) -> Result<()> {
+        self.record_transaction_stage_inner(stage, Some(artifact))
+    }
+
+    #[must_use]
+    pub fn transaction_artifact(&self, stage: TransactionStageV1) -> Option<&Value> {
+        self.transaction_artifacts.get(stage.as_str())
+    }
+
+    fn record_transaction_stage_inner(
+        &mut self,
+        stage: TransactionStageV1,
+        artifact: Option<Value>,
+    ) -> Result<()> {
         if self.transaction_journal.is_empty() {
             if stage != TransactionStageV1::PlanPrepared {
                 return Err(self.invalid_transaction_journal(
@@ -689,22 +736,37 @@ impl PlanV1 {
                 )));
             }
         }
+        if artifact
+            .as_ref()
+            .is_some_and(|value| redact_json(value) != *value)
+        {
+            return Err(self.invalid_transaction_journal(format!(
+                "checkpoint {stage:?} artifact contains secret-bearing fields"
+            )));
+        }
         let recorded_at = Utc::now();
         let previous_checkpoint_hash = self
             .transaction_journal
             .last()
             .map(|checkpoint| checkpoint.checkpoint_hash.clone());
+        let artifact_hash = artifact.as_ref().map(hash_value).transpose()?;
         let checkpoint_hash = self.transaction_checkpoint_hash(
             stage,
             recorded_at,
             &self.content_hash,
             previous_checkpoint_hash.as_deref(),
+            artifact_hash.as_deref(),
         )?;
+        if let Some(artifact) = artifact {
+            self.transaction_artifacts
+                .insert(stage.as_str().to_owned(), artifact);
+        }
         self.transaction_journal.push(TransactionCheckpointV1 {
             stage,
             recorded_at,
             plan_content_hash: self.content_hash.clone(),
             previous_checkpoint_hash,
+            artifact_hash,
             checkpoint_hash,
         });
         self.transaction_stage = stage;
@@ -725,6 +787,7 @@ impl PlanV1 {
         }
         let mut previous_stage: Option<TransactionStageV1> = None;
         let mut previous_hash: Option<&str> = None;
+        let mut artifact_count = 0_usize;
         for checkpoint in &self.transaction_journal {
             if let Some(stage) = previous_stage
                 && checkpoint.stage.rank() <= stage.rank()
@@ -740,11 +803,34 @@ impl PlanV1 {
                     checkpoint.stage
                 )));
             }
+            match (
+                checkpoint.artifact_hash.as_deref(),
+                self.transaction_artifacts.get(checkpoint.stage.as_str()),
+            ) {
+                (Some(expected_hash), Some(artifact)) => {
+                    if redact_json(artifact) != *artifact || hash_value(artifact)? != expected_hash
+                    {
+                        return Err(self.invalid_transaction_journal(format!(
+                            "checkpoint {:?} artifact hash does not match",
+                            checkpoint.stage
+                        )));
+                    }
+                    artifact_count += 1;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(self.invalid_transaction_journal(format!(
+                        "checkpoint {:?} artifact presence does not match",
+                        checkpoint.stage
+                    )));
+                }
+            }
             let expected = self.transaction_checkpoint_hash(
                 checkpoint.stage,
                 checkpoint.recorded_at,
                 &checkpoint.plan_content_hash,
                 checkpoint.previous_checkpoint_hash.as_deref(),
+                checkpoint.artifact_hash.as_deref(),
             )?;
             if checkpoint.checkpoint_hash != expected {
                 return Err(self.invalid_transaction_journal(format!(
@@ -754,6 +840,11 @@ impl PlanV1 {
             }
             previous_stage = Some(checkpoint.stage);
             previous_hash = Some(checkpoint.checkpoint_hash.as_str());
+        }
+        if artifact_count != self.transaction_artifacts.len() {
+            return Err(self.invalid_transaction_journal(
+                "transaction artifacts contain a receipt without a matching checkpoint".to_owned(),
+            ));
         }
         if previous_stage != Some(self.transaction_stage) {
             return Err(self.invalid_transaction_journal(
@@ -769,14 +860,24 @@ impl PlanV1 {
         recorded_at: DateTime<Utc>,
         plan_content_hash: &str,
         previous_checkpoint_hash: Option<&str>,
+        artifact_hash: Option<&str>,
     ) -> Result<String> {
-        hash_value(&serde_json::json!({
+        let mut value = serde_json::json!({
             "operation_id": self.operation_id,
             "plan_content_hash": plan_content_hash,
             "stage": stage,
             "recorded_at": recorded_at,
             "previous_checkpoint_hash": previous_checkpoint_hash,
-        }))
+        });
+        if let Some(artifact_hash) = artifact_hash
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert(
+                "artifact_hash".to_owned(),
+                Value::String(artifact_hash.to_owned()),
+            );
+        }
+        hash_value(&value)
     }
 
     fn invalid_transaction_journal(&self, reason: String) -> CoreError {
