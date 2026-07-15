@@ -434,6 +434,241 @@ async fn account_token_revocation_is_verified_by_not_found_readback() {
     );
 }
 
+#[tokio::test]
+async fn dns_record_creation_is_verified_by_created_id_and_planned_fields() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let read = stream.read(&mut buffer).await.expect("read verification");
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let body = r#"{"success":true,"result":{"id":"record-1","type":"A","name":"www.example.com","content":"192.0.2.1","ttl":300},"errors":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+        request
+    });
+    let planned_fields = json!({
+        "type":"A",
+        "name":"www.example.com",
+        "content":"192.0.2.1",
+        "ttl":300
+    });
+    let plan = dns_record_plan(
+        "dns-records-for-a-zone-create-dns-record",
+        "POST",
+        "/zones/{zone_id}/dns_records",
+        "dns_record_details_match_created_id_and_planned_fields",
+        json!({"zone_id":"zone-1"}),
+        Some(planned_fields.clone()),
+    );
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"record-1", "type":"A", "name":"www.example.com", "content":"192.0.2.1", "ttl":300}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let request = server.await.expect("server joins");
+    assert!(
+        request.starts_with("GET /client/v4/zones/zone-1/dns_records/record-1 "),
+        "{request}"
+    );
+}
+
+#[tokio::test]
+async fn dns_record_deletion_is_verified_by_not_found_readback() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let read = stream.read(&mut buffer).await.expect("read verification");
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let body =
+            r#"{"success":false,"result":null,"errors":[{"code":81044,"message":"not found"}]}"#;
+        let response = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+        request
+    });
+    let plan = dns_record_plan(
+        "dns-records-for-a-zone-delete-dns-record",
+        "DELETE",
+        "/zones/{zone_id}/dns_records/{dns_record_id}",
+        "dns_record_details_returns_not_found_after_delete",
+        json!({"zone_id":"zone-1", "dns_record_id":"record-1"}),
+        None,
+    );
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"record-1"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let request = server.await.expect("server joins");
+    assert!(
+        request.starts_with("GET /client/v4/zones/zone-1/dns_records/record-1 "),
+        "{request}"
+    );
+}
+
+#[tokio::test]
+async fn dns_record_verification_rejects_live_field_drift_without_echoing_values() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let _ = stream.read(&mut buffer).await.expect("read verification");
+        let body = r#"{"success":true,"result":{"id":"record-1","type":"TXT","name":"www.example.com","content":"unexpected-live-value","ttl":300},"errors":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+    });
+    let plan = dns_record_plan(
+        "dns-records-for-a-zone-patch-dns-record",
+        "PATCH",
+        "/zones/{zone_id}/dns_records/{dns_record_id}",
+        "dns_record_details_match_planned_id_and_fields",
+        json!({"zone_id":"zone-1", "dns_record_id":"record-1"}),
+        Some(json!({
+            "type":"TXT",
+            "name":"www.example.com",
+            "content":"planned-secret-like-value",
+            "ttl":300
+        })),
+    );
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({
+            "id":"record-1",
+            "type":"TXT",
+            "name":"www.example.com",
+            "content":"planned-secret-like-value",
+            "ttl":300
+        }),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("content"));
+    assert!(!verification.basis.contains("planned-secret-like-value"));
+    assert!(!verification.basis.contains("unexpected-live-value"));
+    server.await.expect("server joins");
+}
+
+fn dns_record_plan(
+    id: &str,
+    method: &str,
+    path: &str,
+    verification_strategy: &str,
+    selectors: serde_json::Value,
+    body: Option<serde_json::Value>,
+) -> PlanV1 {
+    let mut capability = CapabilityV1::new(id, id, method, path);
+    verification_strategy.clone_into(&mut capability.verification.strategy);
+    let mut plan = PlanV1::draft(
+        "profile",
+        "account-1",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("plan");
+    plan.input = serde_json::to_value(CallInput {
+        selectors,
+        query: json!({}),
+        body,
+        ..CallInput::default()
+    })
+    .expect("input");
+    plan
+}
+
 fn token_plan(
     id: &str,
     method: &str,

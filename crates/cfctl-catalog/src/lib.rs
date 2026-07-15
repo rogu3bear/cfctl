@@ -1020,6 +1020,9 @@ fn classify(capability: &mut CapabilityV1) {
     {
         classify_api_token_lifecycle(capability);
         return;
+    } else if is_dns_record_lifecycle(&capability.id) {
+        classify_dns_record_lifecycle(capability);
+        return;
     } else if capability.method == "DELETE"
         || ["delete", "purge", "revoke", "remove"]
             .iter()
@@ -1069,6 +1072,74 @@ fn classify(capability: &mut CapabilityV1) {
     capability.verification.required = true;
     "post_change_read_or_operation_specific_verifier"
         .clone_into(&mut capability.verification.strategy);
+}
+
+fn is_dns_record_lifecycle(capability_id: &str) -> bool {
+    [
+        "dns-records-for-a-zone-create-dns-record",
+        "dns-records-for-a-zone-patch-dns-record",
+        "dns-records-for-a-zone-update-dns-record",
+        "dns-records-for-a-zone-delete-dns-record",
+    ]
+    .contains(&capability_id)
+}
+
+fn classify_dns_record_lifecycle(capability: &mut CapabilityV1) {
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "official Cloudflare DNS API access has no direct incremental charge; DNS query volume on Enterprise and products reached through the record can have plan-specific downstream pricing"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Cloudflare DNS product".to_owned(),
+            url: "https://www.cloudflare.com/products/dns/".to_owned(),
+            source: "official Cloudflare product page".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare DNS pricing FAQ".to_owned(),
+            url: "https://developers.cloudflare.com/dns/faq/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+    ];
+    capability.verification.required = true;
+
+    if capability.id.ends_with("create-dns-record") {
+        capability.risk = RiskClass::ScopedWrite;
+        capability.effect = EffectClass::ReversibleWrite;
+        "dns_record_details_match_created_id_and_planned_fields"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_dns_record_by_returned_id".to_owned());
+        capability.rollback.warning = Some(
+            "compensation creates a separate DNS-record delete plan that must be reviewed and explicitly approved"
+                .to_owned(),
+        );
+    } else if capability.id.ends_with("delete-dns-record") {
+        capability.risk = RiskClass::Destructive;
+        capability.effect = EffectClass::Destructive;
+        "dns_record_details_returns_not_found_after_delete"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "deletion cannot be reversed without a prior record snapshot; recreation must be a separately reviewed plan"
+                .to_owned(),
+        );
+    } else {
+        capability.risk = RiskClass::ScopedWrite;
+        capability.effect = EffectClass::ReversibleWrite;
+        "dns_record_details_match_planned_id_and_fields"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "automatic restoration is blocked because the plan does not capture a prior record snapshot; create a separate restoration plan from trusted source or live evidence"
+                .to_owned(),
+        );
+    }
 }
 
 fn classify_api_token_lifecycle(capability: &mut CapabilityV1) {

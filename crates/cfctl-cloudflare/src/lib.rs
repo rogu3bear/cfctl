@@ -276,41 +276,85 @@ impl Executor {
         let strategy = plan.capability.verification.strategy.as_str();
         let input: CallInput = serde_json::from_value(plan.input.clone())
             .map_err(cfctl_core::CoreError::Serialization)?;
-        let (token_id, expectation) = token_verification_target(strategy, &input, apply_response)?;
-        let account_scoped = plan.capability.path.starts_with("/accounts/");
-        let details_path = if account_scoped {
-            "/accounts/{account_id}/tokens/{token_id}"
-        } else {
-            "/user/tokens/{token_id}"
-        };
-        let details = CapabilityV1::new(
-            "api-token-verification-readback",
-            "API token verification readback",
-            "GET",
-            details_path,
-        );
-        let selectors = if account_scoped {
-            serde_json::json!({"account_id": plan.account_id, "token_id": token_id})
-        } else {
-            serde_json::json!({"token_id": token_id})
-        };
-        let request = self.builder.build(
-            &details,
-            &CallInput {
-                selectors,
-                query: Value::Object(serde_json::Map::new()),
-                body: None,
-                ..CallInput::default()
-            },
-        )?;
-        let readback = self.send(&request, credential).await?;
-        let (passed, basis) = evaluate_token_readback(expectation, &token_id, &readback);
-        Ok(OperationVerificationV1 {
-            strategy: strategy.to_owned(),
-            passed,
-            basis,
-            readback,
-        })
+        if strategy.starts_with("api_token_details_") {
+            let (token_id, expectation) =
+                token_verification_target(strategy, &input, apply_response)?;
+            let account_scoped = plan.capability.path.starts_with("/accounts/");
+            let details_path = if account_scoped {
+                "/accounts/{account_id}/tokens/{token_id}"
+            } else {
+                "/user/tokens/{token_id}"
+            };
+            let details = CapabilityV1::new(
+                "api-token-verification-readback",
+                "API token verification readback",
+                "GET",
+                details_path,
+            );
+            let selectors = if account_scoped {
+                serde_json::json!({"account_id": plan.account_id, "token_id": token_id})
+            } else {
+                serde_json::json!({"token_id": token_id})
+            };
+            let request = self.builder.build(
+                &details,
+                &CallInput {
+                    selectors,
+                    query: Value::Object(serde_json::Map::new()),
+                    body: None,
+                    ..CallInput::default()
+                },
+            )?;
+            let readback = self.send(&request, credential).await?;
+            let (passed, basis) = evaluate_token_readback(expectation, &token_id, &readback);
+            return Ok(OperationVerificationV1 {
+                strategy: strategy.to_owned(),
+                passed,
+                basis,
+                readback,
+            });
+        }
+
+        if strategy.starts_with("dns_record_details_") {
+            let (zone_id, record_id, expectation) =
+                dns_record_verification_target(strategy, &input, apply_response)?;
+            let details = CapabilityV1::new(
+                "dns-record-verification-readback",
+                "DNS record verification readback",
+                "GET",
+                "/zones/{zone_id}/dns_records/{dns_record_id}",
+            );
+            let request = self.builder.build(
+                &details,
+                &CallInput {
+                    selectors: serde_json::json!({
+                        "zone_id": zone_id,
+                        "dns_record_id": record_id,
+                    }),
+                    query: Value::Object(serde_json::Map::new()),
+                    body: None,
+                    ..CallInput::default()
+                },
+            )?;
+            let readback = self.send(&request, credential).await?;
+            let (passed, basis) = evaluate_dns_record_readback(
+                expectation,
+                &record_id,
+                input.body.as_ref(),
+                apply_response,
+                &readback,
+            )?;
+            return Ok(OperationVerificationV1 {
+                strategy: strategy.to_owned(),
+                passed,
+                basis,
+                readback,
+            });
+        }
+
+        Err(CloudflareError::UnsupportedVerificationStrategy(
+            strategy.to_owned(),
+        ))
     }
 
     async fn send(
@@ -584,6 +628,151 @@ fn evaluate_token_readback(
             };
             (passed, basis)
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DnsRecordVerificationExpectation {
+    MatchesPlannedFields,
+    Deleted,
+}
+
+fn dns_record_verification_target(
+    strategy: &str,
+    input: &CallInput,
+    apply_response: &CloudflareResponseV1,
+) -> Result<(String, String, DnsRecordVerificationExpectation)> {
+    let zone_id = planned_selector(input, "zone_id")?;
+    match strategy {
+        "dns_record_details_match_created_id_and_planned_fields" => apply_response
+            .result
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(|record_id| {
+                (
+                    zone_id,
+                    record_id.to_owned(),
+                    DnsRecordVerificationExpectation::MatchesPlannedFields,
+                )
+            })
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "created DNS record id is absent".to_owned(),
+                )
+            }),
+        "dns_record_details_match_planned_id_and_fields" => Ok((
+            zone_id,
+            planned_selector(input, "dns_record_id")?,
+            DnsRecordVerificationExpectation::MatchesPlannedFields,
+        )),
+        "dns_record_details_returns_not_found_after_delete" => Ok((
+            zone_id,
+            planned_selector(input, "dns_record_id")?,
+            DnsRecordVerificationExpectation::Deleted,
+        )),
+        other => Err(CloudflareError::UnsupportedVerificationStrategy(
+            other.to_owned(),
+        )),
+    }
+}
+
+fn planned_selector(input: &CallInput, name: &str) -> Result<String> {
+    input
+        .selectors
+        .get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(format!("planned {name} selector is absent"))
+        })
+}
+
+fn evaluate_dns_record_readback(
+    expectation: DnsRecordVerificationExpectation,
+    record_id: &str,
+    planned_body: Option<&Value>,
+    apply_response: &CloudflareResponseV1,
+    readback: &CloudflareResponseV1,
+) -> Result<(bool, String)> {
+    if expectation == DnsRecordVerificationExpectation::Deleted {
+        let passed = readback.status == 404 && !readback.success;
+        let basis = if passed {
+            format!("live DNS record details returned not found for deleted record `{record_id}`")
+        } else {
+            format!(
+                "deleted DNS record `{record_id}` still produced HTTP {} with success={}",
+                readback.status, readback.success
+            )
+        };
+        return Ok((passed, basis));
+    }
+
+    let planned = planned_body.and_then(Value::as_object).ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "planned DNS record request body is absent or not an object".to_owned(),
+        )
+    })?;
+    let apply_id = apply_response.result.get("id").and_then(Value::as_str);
+    let readback_id = readback.result.get("id").and_then(Value::as_str);
+    let apply_mismatches = mismatched_planned_fields(planned, &apply_response.result);
+    let readback_mismatches = mismatched_planned_fields(planned, &readback.result);
+    let passed = apply_response.success
+        && readback.success
+        && apply_id == Some(record_id)
+        && readback_id == Some(record_id)
+        && apply_mismatches.is_empty()
+        && readback_mismatches.is_empty();
+    let basis = if passed {
+        format!(
+            "mutation response and live DNS record details matched record `{record_id}` and every planned field"
+        )
+    } else {
+        format!(
+            "DNS record `{record_id}` verification mismatch (apply success={}, apply id={}, readback success={}, readback id={}, apply fields={}, readback fields={})",
+            apply_response.success,
+            apply_id.unwrap_or("missing"),
+            readback.success,
+            readback_id.unwrap_or("missing"),
+            render_field_names(&apply_mismatches),
+            render_field_names(&readback_mismatches),
+        )
+    };
+    Ok((passed, basis))
+}
+
+fn mismatched_planned_fields(
+    planned: &serde_json::Map<String, Value>,
+    actual: &Value,
+) -> Vec<String> {
+    planned
+        .iter()
+        .filter(|(name, planned_value)| {
+            actual
+                .get(name.as_str())
+                .is_none_or(|actual_value| !contains_planned_value(actual_value, planned_value))
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+fn contains_planned_value(actual: &Value, planned: &Value) -> bool {
+    match (actual, planned) {
+        (Value::Object(actual), Value::Object(planned)) => planned.iter().all(|(name, value)| {
+            actual
+                .get(name)
+                .is_some_and(|actual_value| contains_planned_value(actual_value, value))
+        }),
+        _ => actual == planned,
+    }
+}
+
+fn render_field_names(fields: &[String]) -> String {
+    if fields.is_empty() {
+        "none".to_owned()
+    } else {
+        fields.join(",")
     }
 }
 

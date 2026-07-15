@@ -15,7 +15,8 @@
 - Transport failures, governed-adapter handoff failures, input cleanup failures, and absent sink-only output receive explicit redacted response or sink checkpoints. They do not rely on an unjournaled status update to block replay.
 - Local crash injection covers every transaction-stage transition by reopening the filesystem store and validating the last durable journal. Account-backed boundary interruption remains a separate smoke-test lane.
 - Native token mint, value-roll, and revoke operations use live token-detail readbacks. Creation and rotation require the planned token to be active; revocation requires a not-found readback.
-- Token-creation rectification may derive a separate revoke plan only from the hash-bound returned resource ID. Compensation is never implicit: the new destructive plan requires its own review, approval, execution, and verification.
+- Token and DNS-record creation rectification may derive a separate revoke/delete plan only from the hash-bound returned resource ID. Compensation is never implicit: the new destructive plan requires its own review, approval, execution, and verification.
+- Core DNS create, patch, replace, and delete mutations use exact record-detail readbacks. Create and update require the returned ID and every planned field to match both the apply response and live state; delete requires not-found. Mismatch evidence names fields but does not echo record values. Batch, import, scan, and review remain blocked until they have distinct safety contracts.
 - The journal detects local file drift and inconsistent stage transitions. It is not a substitute for operating-system account integrity or a hardware-backed signature against a privileged local attacker.
 - Telemetry is off. Local receipts leave the machine only through an explicit operator action such as attaching one to a pull request.
 

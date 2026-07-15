@@ -281,6 +281,93 @@ fn account_token_mutations_have_complete_native_execution_contracts() {
     );
 }
 
+#[test]
+fn dns_record_crud_has_complete_operation_specific_contracts() {
+    let mut document = fixture();
+    document["paths"]["/zones/{zone_id}/dns_records"]["post"] = json!({
+        "operationId":"dns-records-for-a-zone-create-dns-record",
+        "summary":"Create DNS Record",
+        "tags":["DNS Records for a Zone"],
+        "x-api-token-group":["DNS Write"],
+        "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true}
+    });
+    for (method, id, summary) in [
+        (
+            "patch",
+            "dns-records-for-a-zone-patch-dns-record",
+            "Update DNS Record",
+        ),
+        (
+            "put",
+            "dns-records-for-a-zone-update-dns-record",
+            "Overwrite DNS Record",
+        ),
+        (
+            "delete",
+            "dns-records-for-a-zone-delete-dns-record",
+            "Delete DNS Record",
+        ),
+    ] {
+        document["paths"]["/zones/{zone_id}/dns_records/{dns_record_id}"][method] = json!({
+            "operationId":id,
+            "summary":summary,
+            "tags":["DNS Records for a Zone"],
+            "x-api-token-group":["DNS Write"],
+            "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true},
+            "parameters":[
+                {"in":"path","name":"zone_id","required":true,"schema":{"type":"string"}},
+                {"in":"path","name":"dns_record_id","required":true,"schema":{"type":"string"}}
+            ]
+        });
+    }
+
+    let snapshot = normalize_openapi(&document).expect("DNS record catalog");
+    for id in [
+        "dns-records-for-a-zone-create-dns-record",
+        "dns-records-for-a-zone-patch-dns-record",
+        "dns-records-for-a-zone-update-dns-record",
+        "dns-records-for-a-zone-delete-dns-record",
+    ] {
+        let capability = snapshot.get(id).expect("DNS record capability");
+        assert_eq!(capability.adapter_status, AdapterStatus::DynamicApi);
+        assert!(capability.cost.known);
+        assert_eq!(capability.cost.maximum, Some(0.0));
+        assert_eq!(capability.cost.exposure, CostExposureV1::DownstreamUsage);
+        assert_eq!(capability.cost.references.len(), 2);
+        assert!(
+            capability
+                .cost
+                .references
+                .iter()
+                .any(|reference| reference.url == "https://developers.cloudflare.com/dns/faq/")
+        );
+        assert!(capability.mutation_contract_gaps().is_empty());
+    }
+
+    let create = snapshot
+        .get("dns-records-for-a-zone-create-dns-record")
+        .expect("create DNS record");
+    assert_eq!(create.risk, RiskClass::ScopedWrite);
+    assert_eq!(create.effect, EffectClass::ReversibleWrite);
+    assert!(create.rollback.supported);
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_dns_record_by_returned_id")
+    );
+
+    let delete = snapshot
+        .get("dns-records-for-a-zone-delete-dns-record")
+        .expect("delete DNS record");
+    assert_eq!(delete.risk, RiskClass::Destructive);
+    assert!(
+        delete
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("prior record snapshot"))
+    );
+}
+
 fn pricing_feeds_fixture() -> OfficialTextFeedsV1 {
     OfficialTextFeedsV1 {
         fetched_at: Utc::now(),

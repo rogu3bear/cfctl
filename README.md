@@ -132,11 +132,22 @@ before a crash cannot be replayed. The local
 durability suite reopens the state store after an injected crash between every
 journal transition and proves recovery stops at the last persisted checkpoint.
 
-When a token-creation receipt proves the returned resource ID and the catalog
-declares revocation as its rollback, `plans rectify` can derive a separate
-hash-bound revoke plan. It never runs that plan automatically: the destructive
-compensation has its own operation ID, review, approval, execution, and
-not-found verification.
+When a token or DNS-record creation receipt proves the returned resource ID
+and the catalog declares a compensating delete, `plans rectify` can derive a
+separate hash-bound revoke/delete plan. It never runs that plan automatically:
+the destructive compensation has its own operation ID, review, approval,
+execution, and not-found verification. Core DNS create, patch, replace, and
+delete use exact record-detail readbacks; create/update verify every planned
+field without copying record contents into the verification basis. DNS batch,
+import, scan, and review operations remain blocked pending their distinct
+operation contracts.
+
+DNS record API mutations have a known zero direct incremental charge, while
+Enterprise DNS query volume and the Workers, storage, traffic, or other
+products reached through the record can have plan-specific downstream pricing.
+The catalog models those facts separately and links the official DNS product
+and pricing FAQ; zero direct charge is not a promise that downstream usage is
+free.
 
 Generated write capabilities stay blocked until risk and effect are classified,
 incremental cost and plan entitlement are known, permissions are declared, and

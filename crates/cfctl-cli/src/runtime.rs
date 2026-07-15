@@ -1709,7 +1709,7 @@ struct CompensationRequest {
     requested_account: Option<String>,
 }
 
-fn token_compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
+fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
     if !matches!(
         plan.status,
         PlanStatus::Consumed | PlanStatus::Running | PlanStatus::RectificationRequired
@@ -1720,6 +1720,7 @@ fn token_compensation_request(plan: &PlanV1) -> Result<Option<CompensationReques
     let capability_id = match plan.capability.id.as_str() {
         "account-api-tokens-create-token" => "account-api-tokens-delete-token",
         "user-api-tokens-create-token" => "user-api-tokens-delete-token",
+        "dns-records-for-a-zone-create-dns-record" => "dns-records-for-a-zone-delete-dns-record",
         _ => return Ok(None),
     };
     let Some(artifact) = plan.transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
@@ -1734,14 +1735,31 @@ fn token_compensation_request(plan: &PlanV1) -> Result<Option<CompensationReques
         .and_then(Value::as_str)
         .ok_or_else(|| {
             CliError::Input(
-                "the token creation response is recorded, but its hash-bound receipt has no resource id; inspect live token state before compensating"
+                "the creation response is recorded, but its hash-bound receipt has no resource id; inspect live resource state before compensating"
                     .to_owned(),
             )
         })?;
-    let selectors = if plan.capability.id == "account-api-tokens-create-token" {
-        json!({"account_id": plan.account_id, "token_id": resource_id})
-    } else {
-        json!({"token_id": resource_id})
+    let selectors = match plan.capability.id.as_str() {
+        "account-api-tokens-create-token" => {
+            json!({"account_id": plan.account_id, "token_id": resource_id})
+        }
+        "user-api-tokens-create-token" => json!({"token_id": resource_id}),
+        "dns-records-for-a-zone-create-dns-record" => {
+            let input: CallInput = serde_json::from_value(plan.input.clone())?;
+            let zone_id = input
+                .selectors
+                .get("zone_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "the DNS record creation receipt is valid, but its source plan has no zone_id selector; inspect live DNS state before compensating"
+                            .to_owned(),
+                    )
+                })?;
+            json!({"zone_id": zone_id, "dns_record_id": resource_id})
+        }
+        _ => unreachable!("capability was selected above"),
     };
     Ok(Some(CompensationRequest {
         capability_id: capability_id.to_owned(),
@@ -1757,7 +1775,7 @@ fn token_compensation_request(plan: &PlanV1) -> Result<Option<CompensationReques
 
 async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
     let plan = load_validated_plan(store, &selector.operation_id)?;
-    if let Some(request) = token_compensation_request(&plan)? {
+    if let Some(request) = compensation_request(&plan)? {
         let catalog = ensure_catalog(store).await?;
         let capability = catalog
             .get(&request.capability_id)
@@ -2992,8 +3010,8 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        find_secret_value, persist_secret_lifecycle, redact_secret_result, sink_secret_result,
-        token_compensation_request,
+        CallInput, compensation_request, find_secret_value, persist_secret_lifecycle,
+        redact_secret_result, sink_secret_result,
     };
     use cfctl_auth::{AuthError, SecretStore};
     use cfctl_core::{CapabilityV1, PlanStatus, PlanV1, RiskClass, TransactionStageV1};
@@ -3106,13 +3124,63 @@ mod tests {
         .expect("response receipt");
         plan.status = PlanStatus::RectificationRequired;
 
-        let request = token_compensation_request(&plan)
+        let request = compensation_request(&plan)
             .expect("request resolves")
             .expect("compensation is supported");
 
         assert_eq!(request.capability_id, "account-api-tokens-delete-token");
         assert_eq!(request.input.selectors["account_id"], "account-a");
         assert_eq!(request.input.selectors["token_id"], "token-id");
+        assert_eq!(request.requested_account.as_deref(), Some("account-a"));
+    }
+
+    #[test]
+    fn dns_record_creation_rectification_builds_a_separate_delete_request() {
+        let mut capability = CapabilityV1::new(
+            "dns-records-for-a-zone-create-dns-record",
+            "Create DNS record",
+            "POST",
+            "/zones/{zone_id}/dns_records",
+        );
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_dns_record_by_returned_id".to_owned());
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"zone_id":"zone-a"}),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors: json!({"zone_id":"zone-a"}),
+            query: json!({}),
+            body: Some(json!({"type":"A","name":"www.example.com","content":"192.0.2.1"})),
+            ..CallInput::default()
+        })
+        .expect("call input");
+        plan.refresh_hash().expect("bind call input");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"resource_id":"record-id","success":true}),
+        )
+        .expect("response receipt");
+        plan.status = PlanStatus::RectificationRequired;
+
+        let request = compensation_request(&plan)
+            .expect("request resolves")
+            .expect("compensation is supported");
+
+        assert_eq!(
+            request.capability_id,
+            "dns-records-for-a-zone-delete-dns-record"
+        );
+        assert_eq!(request.input.selectors["zone_id"], "zone-a");
+        assert_eq!(request.input.selectors["dns_record_id"], "record-id");
         assert_eq!(request.requested_account.as_deref(), Some("account-a"));
     }
 
