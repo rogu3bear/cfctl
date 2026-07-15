@@ -2572,6 +2572,8 @@ fn classify(capability: &mut CapabilityV1) {
     {
         classify_api_token_lifecycle(capability);
         return;
+    } else if is_workers_ai_model_run(capability) {
+        return classify_workers_ai_model_run(capability);
     } else if is_d1_read_replication_update(capability) {
         classify_d1_read_replication_update(capability);
         return;
@@ -2627,6 +2629,48 @@ fn classify(capability: &mut CapabilityV1) {
     capability.verification.required = true;
     "post_change_read_or_operation_specific_verifier"
         .clone_into(&mut capability.verification.strategy);
+}
+
+fn is_workers_ai_model_run(capability: &CapabilityV1) -> bool {
+    capability.method == "POST"
+        && capability.id.starts_with("workers-ai-post-run-")
+        && capability.product.starts_with("Workers AI")
+        && capability
+            .path
+            .starts_with("/accounts/{account_id}/ai/run/")
+        && capability.permissions.len() == 2
+        && capability
+            .permissions
+            .iter()
+            .any(|permission| permission == "Workers AI Write")
+        && capability
+            .permissions
+            .iter()
+            .any(|permission| permission == "Workers AI Read")
+}
+
+fn classify_workers_ai_model_run(capability: &mut CapabilityV1) {
+    capability.risk = RiskClass::Spend;
+    capability.effect = EffectClass::Spend;
+    capability.cost.incremental = true;
+    capability.cost.currency = None;
+    capability.cost.maximum = None;
+    capability.cost.known = false;
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "Workers AI inference has input- and output-dependent metered usage; the OpenAPI request schema does not declare enough bounds to derive a hard ceiling"
+            .to_owned(),
+    );
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "completed inference and any resulting billed usage cannot be rolled back; submit a separately reviewed request if another inference is needed"
+            .to_owned(),
+    );
 }
 
 fn is_d1_read_replication_update(capability: &CapabilityV1) -> bool {

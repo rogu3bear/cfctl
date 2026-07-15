@@ -2732,6 +2732,73 @@ fn pricing_feeds_fixture() -> OfficialTextFeedsV1 {
 }
 
 #[test]
+fn workers_ai_model_runs_are_metered_irreversible_actions_without_a_fictitious_ceiling() {
+    let mut document = fixture();
+    document["paths"]["/accounts/{account_id}/ai/run/@cf/example/model"]["post"] = json!({
+        "operationId": "workers-ai-post-run-cf-example-model",
+        "summary": "Execute a Workers AI model",
+        "tags": ["Workers AI Text Generation"],
+        "parameters": [
+            {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+            {"in":"query","name":"queueRequest","schema":{"type":"string"}},
+            {"in":"query","name":"tags","schema":{"type":"string"}}
+        ],
+        "x-api-token-group": ["Workers AI Write", "Workers AI Read"],
+        "requestBody": {"content":{"application/json":{"schema":{
+            "type":"object",
+            "required":["prompt"],
+            "properties":{
+                "prompt":{"type":"string","minLength":1},
+                "max_tokens":{"type":"integer"},
+                "stream":{"type":"boolean"}
+            }
+        }}}},
+        "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true}
+    });
+    document["paths"]["/accounts/{account_id}/ai/configure"]["post"] = json!({
+        "operationId": "workers-ai-configure",
+        "summary": "Configure Workers AI",
+        "tags": ["Workers AI"],
+        "x-api-token-group": ["Workers AI Write", "Workers AI Read"]
+    });
+
+    let snapshot = normalize_openapi(&document).expect("catalog");
+    let run = snapshot
+        .get("workers-ai-post-run-cf-example-model")
+        .expect("Workers AI run");
+    assert_eq!(run.risk, RiskClass::Spend);
+    assert_eq!(run.effect, EffectClass::Spend);
+    assert!(run.cost.incremental);
+    assert!(!run.cost.known);
+    assert_eq!(run.cost.maximum, None);
+    assert_eq!(run.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(run.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert!(run.cost.basis.as_deref().is_some_and(|basis| {
+        basis.contains("Workers AI") && basis.contains("input") && basis.contains("hard ceiling")
+    }));
+    assert!(!run.rollback.supported);
+    assert!(run.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("inference")
+            && warning.contains("cannot be rolled back")
+            && warning.contains("billed usage")
+    }));
+    assert!(run.blocked_reason.as_deref().is_some_and(|reason| {
+        reason.contains("operation-specific incremental cost is unknown")
+            && reason.contains("operation-specific verification is not declared")
+            && !reason.contains("operation-specific risk classification is missing")
+            && !reason.contains("operation-specific effect classification is missing")
+            && !reason
+                .contains("operation-specific rollback or irreversibility behavior is not declared")
+    }));
+
+    let nearby = snapshot
+        .get("workers-ai-configure")
+        .expect("nearby Workers AI mutation");
+    assert_eq!(nearby.risk, RiskClass::Unknown);
+    assert_eq!(nearby.effect, EffectClass::Unknown);
+}
+
+#[test]
 fn official_product_indexes_attach_pricing_without_claiming_a_bounded_cost() {
     let mut document = fixture();
     document["paths"]["/accounts/{account_id}/d1/database"]["post"] = json!({
