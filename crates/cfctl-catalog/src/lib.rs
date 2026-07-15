@@ -9,9 +9,9 @@ use std::{
 use cfctl_core::{
     AdapterStatus, BillingModelV1, CapabilityV1, CostExposureV1,
     CreatedCollectionResourceContractV1, CreatedResourceContractV1, DeletedResourceContractV1,
-    EffectClass, KnowledgeReferenceV1, Maturity, QuerySerializationV1, RiskClass,
-    SamePathReadContractV1, SelectorContractV1, SelectorV1, UpdatedResourceContractV1, hash_value,
-    request_header_is_reserved,
+    EffectClass, KnowledgeReferenceV1, Maturity, QuerySerializationV1, ResponseBodyModeV1,
+    ResponseContractV1, RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1,
+    UpdatedResourceContractV1, hash_value, request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -41,6 +41,12 @@ pub enum CatalogError {
     InvalidParameter(String),
     #[error("duplicate `{location}` parameter `{name}`")]
     DuplicateParameter { location: String, name: String },
+    #[error("unsupported OpenAPI response reference `{0}`")]
+    UnsupportedResponseReference(String),
+    #[error("OpenAPI response reference `{0}` does not resolve")]
+    UnresolvedResponseReference(String),
+    #[error("OpenAPI response reference depth exceeds the safety limit at `{0}`")]
+    ResponseReferenceDepth(String),
     #[error("catalog content hash mismatch: recorded {recorded}, actual {actual}")]
     ContentHashMismatch { recorded: String, actual: String },
     #[error(transparent)]
@@ -879,6 +885,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
                 .map(str::to_owned)
                 .collect();
             capability.request_schema = request_schema_contract(document, operation);
+            capability.response_contract = success_response_contract(document, operation)?;
             capability.entitlement.plans = operation_object
                 .get("x-cfPlanAvailability")
                 .and_then(Value::as_object)
@@ -894,6 +901,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
             capability.maturity = maturity(operation_object);
             classify(&mut capability);
             block_required_reserved_header_selectors(&mut capability);
+            block_unsupported_response_contract(&mut capability);
             block_incomplete_dynamic_mutation(&mut capability);
             capabilities.insert(id, capability);
         }
@@ -1808,6 +1816,74 @@ fn request_schema_contract(document: &Value, operation: &Value) -> Option<Value>
     Some(Value::Object(contract))
 }
 
+fn success_response_contract(
+    document: &Value,
+    operation: &Value,
+) -> Result<Option<ResponseContractV1>> {
+    let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let mut success_media_types = BTreeSet::new();
+    let mut success_response_count = 0_usize;
+    let mut every_success_is_cloudflare_json = true;
+    for (status, response) in responses {
+        if !status.starts_with('2') {
+            continue;
+        }
+        success_response_count += 1;
+        let response = resolve_local_response(document, response, 0)?;
+        let media = response
+            .get("content")
+            .and_then(Value::as_object)
+            .map(|content| content.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        success_media_types.extend(media.iter().cloned());
+        if media.as_slice() != ["application/json"] {
+            every_success_is_cloudflare_json = false;
+            continue;
+        }
+        let envelope_proven = response
+            .pointer("/content/application~1json/schema")
+            .is_some_and(|schema| schema_declares_boolean_path(document, schema, &["success"], 0));
+        every_success_is_cloudflare_json &= envelope_proven;
+    }
+    if success_response_count == 0 || success_media_types.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ResponseContractV1 {
+        success_media_types: success_media_types.into_iter().collect(),
+        body_mode: if every_success_is_cloudflare_json {
+            ResponseBodyModeV1::CloudflareJsonEnvelope
+        } else {
+            ResponseBodyModeV1::Unsupported
+        },
+    }))
+}
+
+fn resolve_local_response<'a>(
+    document: &'a Value,
+    response: &'a Value,
+    depth: u8,
+) -> Result<&'a Value> {
+    let Some(reference) = response.get("$ref") else {
+        return Ok(response);
+    };
+    let reference = reference
+        .as_str()
+        .ok_or_else(|| CatalogError::UnsupportedResponseReference("non-string $ref".to_owned()))?;
+    if depth >= 16 {
+        return Err(CatalogError::ResponseReferenceDepth(reference.to_owned()));
+    }
+    let pointer = reference
+        .strip_prefix('#')
+        .filter(|pointer| pointer.starts_with('/'))
+        .ok_or_else(|| CatalogError::UnsupportedResponseReference(reference.to_owned()))?;
+    let resolved = document
+        .pointer(pointer)
+        .ok_or_else(|| CatalogError::UnresolvedResponseReference(reference.to_owned()))?;
+    resolve_local_response(document, resolved, depth + 1)
+}
+
 const MAX_REQUEST_SCHEMA_CONTRACT_DEPTH: usize = 16;
 
 fn normalize_request_schema_contract(
@@ -2310,6 +2386,63 @@ fn schema_declares_string_path(
     false
 }
 
+fn schema_declares_boolean_path(
+    document: &Value,
+    schema: &Value,
+    path: &[&str],
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                schema_declares_boolean_path(document, resolved, path, depth + 1)
+            });
+    }
+    if path.is_empty() {
+        return schema.get("type").and_then(Value::as_str) == Some("boolean")
+            || schema
+                .get("allOf")
+                .and_then(Value::as_array)
+                .is_some_and(|members| {
+                    members.iter().any(|member| {
+                        schema_declares_boolean_path(document, member, path, depth + 1)
+                    })
+                });
+    }
+    if let Some(property) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(path[0]))
+    {
+        return schema_declares_boolean_path(document, property, &path[1..], depth + 1);
+    }
+    if schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| schema_declares_boolean_path(document, member, path, depth + 1))
+        })
+    {
+        return true;
+    }
+    for alternative in ["oneOf", "anyOf"] {
+        if let Some(members) = schema.get(alternative).and_then(Value::as_array) {
+            return !members.is_empty()
+                && members
+                    .iter()
+                    .all(|member| schema_declares_boolean_path(document, member, path, depth + 1));
+        }
+    }
+    false
+}
+
 fn schema_declares_numeric_path(
     document: &Value,
     schema: &Value,
@@ -2779,6 +2912,29 @@ fn block_required_reserved_header_selectors(capability: &mut CapabilityV1) {
         "required credential or transport header selector(s) are reserved for governed runtime handling: {}",
         reserved.join(", ")
     ));
+}
+
+fn block_unsupported_response_contract(capability: &mut CapabilityV1) {
+    let Some(response) = capability
+        .response_contract
+        .as_ref()
+        .filter(|response| response.body_mode == ResponseBodyModeV1::Unsupported)
+    else {
+        return;
+    };
+    if capability.adapter_status == AdapterStatus::Blocked {
+        return;
+    }
+    capability.adapter_status = AdapterStatus::Blocked;
+    capability.blocked_reason = Some(if response.success_media_types == ["application/json"] {
+        "response contract unsupported: the official success JSON schema does not prove a Cloudflare success envelope"
+            .to_owned()
+    } else {
+        format!(
+            "response contract unsupported: declared successful media types are {}; the executor currently requires exactly application/json",
+            response.success_media_types.join(", ")
+        )
+    });
 }
 
 fn classify_workers_ai_model_run(capability: &mut CapabilityV1) {

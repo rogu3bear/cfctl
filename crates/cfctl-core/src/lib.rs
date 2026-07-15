@@ -122,6 +122,19 @@ pub struct SelectorV1 {
     pub contract: Option<SelectorContractV1>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseBodyModeV1 {
+    CloudflareJsonEnvelope,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseContractV1 {
+    pub success_media_types: Vec<String>,
+    pub body_mode: ResponseBodyModeV1,
+}
+
 #[must_use]
 pub fn request_header_is_reserved(name: &str) -> bool {
     matches!(
@@ -357,6 +370,8 @@ pub struct CapabilityV1 {
     pub adapter_status: AdapterStatus,
     pub blocked_reason: Option<String>,
     pub request_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_contract: Option<ResponseContractV1>,
 }
 
 impl CapabilityV1 {
@@ -430,6 +445,7 @@ impl CapabilityV1 {
             adapter_status: AdapterStatus::DynamicApi,
             blocked_reason: None,
             request_schema: None,
+            response_contract: None,
         }
     }
 

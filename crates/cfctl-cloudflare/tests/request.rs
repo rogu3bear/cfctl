@@ -6,8 +6,9 @@ use cfctl_cloudflare::{
 };
 use cfctl_core::{
     CapabilityV1, CreatedCollectionResourceContractV1, CreatedResourceContractV1,
-    DeletedResourceContractV1, PlanStatus, PlanV1, QuerySerializationV1, SamePathReadContractV1,
-    SelectorContractV1, SelectorV1, UpdatedResourceContractV1,
+    DeletedResourceContractV1, PlanStatus, PlanV1, QuerySerializationV1, ResponseBodyModeV1,
+    ResponseContractV1, SamePathReadContractV1, SelectorContractV1, SelectorV1,
+    UpdatedResourceContractV1,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -39,6 +40,30 @@ async fn json_response_sequence_server(
                 .expect("write response");
         }
         requests
+    });
+    (address.to_string(), server)
+}
+
+async fn single_raw_response_server(
+    content_type: &'static str,
+    body: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept request");
+        let mut buffer = vec![0_u8; 8192];
+        let _ = stream.read(&mut buffer).await.expect("read request");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
     });
     (address.to_string(), server)
 }
@@ -1287,6 +1312,92 @@ async fn executor_retries_rate_limits_and_applies_only_the_selected_credential()
             .iter()
             .all(|request| !request.contains("x-auth-key"))
     );
+}
+
+#[tokio::test]
+async fn executor_enforces_pinned_json_response_contract_without_echoing_bodies() {
+    let mut capability = CapabilityV1::new("zones-list", "List zones", "GET", "/zones");
+    capability.response_contract = Some(ResponseContractV1 {
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    let credential = AuthCredential::Bearer {
+        token: "selected-token".to_owned(),
+    };
+
+    let (address, server) = single_raw_response_server(
+        "text/plain",
+        r#"{"success":true,"result":{"private":"media-marker"}}"#,
+    )
+    .await;
+    let error = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(&capability, &CallInput::default(), &credential)
+    .await
+    .expect_err("unexpected success media must fail closed");
+    assert!(matches!(
+        error,
+        CloudflareError::UnexpectedResponseMediaType { status: 200, .. }
+    ));
+    assert!(!error.to_string().contains("media-marker"));
+    server.await.expect("server joins");
+
+    let (address, server) = single_raw_response_server(
+        "application/json; charset=utf-8",
+        r#"{"result":{"private":"envelope-marker"}}"#,
+    )
+    .await;
+    let error = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(&capability, &CallInput::default(), &credential)
+    .await
+    .expect_err("a JSON object without the pinned envelope must fail closed");
+    assert!(matches!(
+        error,
+        CloudflareError::InvalidResponseEnvelope { status: 200 }
+    ));
+    assert!(!error.to_string().contains("envelope-marker"));
+    server.await.expect("server joins");
+
+    let (address, server) = single_raw_response_server(
+        "application/json; charset=utf-8",
+        r#"{"success":true,"result":[{"id":"zone-1"}],"errors":[]}"#,
+    )
+    .await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(&capability, &CallInput::default(), &credential)
+    .await
+    .expect("the pinned JSON envelope should be accepted");
+    assert!(response.success);
+    server.await.expect("server joins");
+}
+
+#[test]
+fn request_builder_rejects_an_unsupported_pinned_response_contract() {
+    let mut capability = CapabilityV1::new("object-read", "Read object", "GET", "/object");
+    capability.response_contract = Some(ResponseContractV1 {
+        success_media_types: vec!["application/octet-stream".to_owned()],
+        body_mode: ResponseBodyModeV1::Unsupported,
+    });
+    let error = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build(&capability, &CallInput::default())
+        .expect_err("unsupported response contracts must fail before authentication");
+    assert!(matches!(
+        error,
+        CloudflareError::UnsupportedResponseContract(media)
+            if media == "application/octet-stream"
+    ));
 }
 
 #[tokio::test]

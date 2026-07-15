@@ -7,7 +7,10 @@ use std::{
 };
 
 use cfctl_auth::AuthCredential;
-use cfctl_core::{CapabilityV1, PlanStatus, PlanV1, SelectorV1, request_header_is_reserved};
+use cfctl_core::{
+    CapabilityV1, PlanStatus, PlanV1, ResponseBodyModeV1, ResponseContractV1, SelectorV1,
+    request_header_is_reserved,
+};
 use chrono::DateTime;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use serde::{Deserialize, Serialize};
@@ -50,6 +53,14 @@ pub enum CloudflareError {
     MissingRequestBody(String),
     #[error("request body does not satisfy the pinned schema: {0}")]
     InvalidRequestBody(String),
+    #[error("catalog response contract is unsupported by the executor: {0}")]
+    UnsupportedResponseContract(String),
+    #[error(
+        "Cloudflare returned HTTP {status} with response media `{received}`, which does not match the pinned application/json contract"
+    )]
+    UnexpectedResponseMediaType { status: u16, received: String },
+    #[error("Cloudflare returned HTTP {status} without the pinned JSON success envelope")]
+    InvalidResponseEnvelope { status: u16 },
     #[error("capability `{0}` mutates state and requires a consumable approved plan")]
     ApprovedPlanRequired(String),
     #[error("Cloudflare API base URL cannot accept path segments")]
@@ -97,6 +108,7 @@ pub struct PreparedRequest {
     pub url: Url,
     pub headers: HeaderMap,
     pub body: Option<Value>,
+    pub response_contract: Option<ResponseContractV1>,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +210,7 @@ impl RequestBuilder {
             url,
             headers,
             body: input.body.clone(),
+            response_contract: capability.response_contract.clone(),
         })
     }
 }
@@ -1074,7 +1087,25 @@ impl Executor {
                 .get(HeaderName::from_static("cf-ray"))
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
+            let content_type = header_text(response.headers(), reqwest::header::CONTENT_TYPE);
+            if request.response_contract.as_ref().is_some_and(|contract| {
+                contract.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            }) && !content_type.as_deref().is_some_and(is_application_json)
+            {
+                return Err(CloudflareError::UnexpectedResponseMediaType {
+                    status: status_code,
+                    received: content_type.unwrap_or_else(|| "missing".to_owned()),
+                });
+            }
             let body = response.json::<Value>().await?;
+            if request.response_contract.as_ref().is_some_and(|contract| {
+                contract.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            }) && body.get("success").and_then(Value::as_bool).is_none()
+            {
+                return Err(CloudflareError::InvalidResponseEnvelope {
+                    status: status_code,
+                });
+            }
             return Ok(parse_response(status_code, &body, etag, cf_ray));
         }
     }
@@ -1166,6 +1197,13 @@ fn header_text(headers: &HeaderMap, name: HeaderName) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+}
+
+fn is_application_json(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
 }
 
 fn apply_credential(
@@ -2058,9 +2096,23 @@ fn is_delete_verifier(strategy: &str) -> bool {
 }
 
 pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    validate_response_contract(capability)?;
     validate_selector_contract(capability, &input.selectors)?;
     validate_query_contract(capability, &input.query)?;
     validate_request_body(capability, input.body.as_ref())
+}
+
+fn validate_response_contract(capability: &CapabilityV1) -> Result<()> {
+    if let Some(response) = capability
+        .response_contract
+        .as_ref()
+        .filter(|response| response.body_mode == ResponseBodyModeV1::Unsupported)
+    {
+        return Err(CloudflareError::UnsupportedResponseContract(
+            response.success_media_types.join(", "),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_selector_contract(capability: &CapabilityV1, selectors: &Value) -> Result<()> {

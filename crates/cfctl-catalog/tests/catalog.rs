@@ -7,7 +7,7 @@ use cfctl_catalog::{
 };
 use cfctl_core::{
     AdapterStatus, BillingModelV1, CapabilityV1, CostExposureV1, DeletedResourceContractV1,
-    EffectClass, KnowledgeReferenceV1, RiskClass, hash_value,
+    EffectClass, KnowledgeReferenceV1, ResponseBodyModeV1, RiskClass, hash_value,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -889,6 +889,128 @@ fn required_credential_headers_block_dynamic_execution() {
         .as_deref()
         .expect("blocked reason");
     assert!(reason.contains("R2-Access-Key-Id") && reason.contains("credential"));
+}
+
+#[test]
+fn declared_success_responses_require_one_proven_cloudflare_json_envelope() {
+    let mut document = fixture();
+    document["components"]["schemas"]["ApiEnvelope"] = json!({
+        "type": "object",
+        "required": ["success", "result"],
+        "properties": {
+            "success": {"type": "boolean"},
+            "result": {"type": "object"},
+            "errors": {"type": "array"}
+        }
+    });
+    document["components"]["responses"]["ApiEnvelopeResponse"] = json!({
+        "description": "ok",
+        "content": {
+            "application/json": {
+                "schema": {"$ref":"#/components/schemas/ApiEnvelope"}
+            }
+        }
+    });
+    for (id, suffix, content) in [
+        (
+            "widgets-json",
+            "json",
+            json!({"application/json":{"schema":{"$ref":"#/components/schemas/ApiEnvelope"}}}),
+        ),
+        (
+            "widgets-binary",
+            "binary",
+            json!({"application/octet-stream":{"schema":{"type":"string", "format":"binary"}}}),
+        ),
+        (
+            "widgets-mixed",
+            "mixed",
+            json!({
+                "application/json":{"schema":{"$ref":"#/components/schemas/ApiEnvelope"}},
+                "text/event-stream":{"schema":{"type":"string"}}
+            }),
+        ),
+        (
+            "widgets-raw-json",
+            "raw-json",
+            json!({"application/json":{"schema":{
+                "type":"object",
+                "properties":{"result":{"type":"object"}}
+            }}}),
+        ),
+    ] {
+        document["paths"][format!("/accounts/{{account_id}}/widgets/{suffix}")]["get"] = json!({
+        "operationId": id,
+        "summary": id,
+        "responses": {"200":{"description":"ok", "content":content}}
+        });
+    }
+    document["paths"]["/accounts/{account_id}/widgets/json"]["get"]["responses"]["200"] =
+        json!({"$ref":"#/components/responses/ApiEnvelopeResponse"});
+
+    let snapshot = normalize_openapi(&document).expect("catalog");
+    let supported = snapshot.get("widgets-json").expect("JSON capability");
+    let response = supported
+        .response_contract
+        .as_ref()
+        .expect("response contract");
+    assert_eq!(response.success_media_types, vec!["application/json"]);
+    assert_eq!(
+        response.body_mode,
+        ResponseBodyModeV1::CloudflareJsonEnvelope
+    );
+    assert_eq!(supported.adapter_status, AdapterStatus::DynamicApi);
+
+    for id in ["widgets-binary", "widgets-mixed", "widgets-raw-json"] {
+        let capability = snapshot.get(id).expect("unsupported capability");
+        assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+        assert!(
+            capability
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("response contract")),
+            "{id} must name its response-contract blocker"
+        );
+    }
+}
+
+#[test]
+fn response_contract_rejects_external_broken_and_cyclic_references() {
+    for (name, reference) in [
+        ("external", "https://example.invalid/response.json"),
+        ("broken", "#/components/responses/Missing"),
+    ] {
+        let mut document = fixture();
+        document["paths"][format!("/accounts/{{account_id}}/{name}")]["get"] = json!({
+            "operationId": format!("response-{name}"),
+            "responses": {"200":{"$ref":reference}}
+        });
+        let error = normalize_openapi(&document).expect_err("untrusted response reference");
+        match name {
+            "external" => assert!(matches!(
+                error,
+                cfctl_catalog::CatalogError::UnsupportedResponseReference(_)
+            )),
+            "broken" => assert!(matches!(
+                error,
+                cfctl_catalog::CatalogError::UnresolvedResponseReference(_)
+            )),
+            _ => unreachable!(),
+        }
+    }
+
+    let mut document = fixture();
+    document["components"]["responses"]["CycleA"] = json!({"$ref":"#/components/responses/CycleB"});
+    document["components"]["responses"]["CycleB"] = json!({"$ref":"#/components/responses/CycleA"});
+    document["paths"]["/accounts/{account_id}/cycle"]["get"] = json!({
+        "operationId": "response-cycle",
+        "responses": {"200":{"$ref":"#/components/responses/CycleA"}}
+    });
+    let error = normalize_openapi(&document).expect_err("cyclic response reference");
+    assert!(matches!(
+        error,
+        cfctl_catalog::CatalogError::ResponseReferenceDepth(_)
+    ));
 }
 
 #[test]
