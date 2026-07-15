@@ -965,14 +965,26 @@ fn d1_database_readback_omits_only_the_documented_fields_projection() {
             .strategy,
         "same_resource_returns_not_found_after_delete"
     );
+    let update = snapshot
+        .get("d1-update-partial-database")
+        .expect("update D1 database");
     assert_eq!(
-        snapshot
-            .get("d1-update-partial-database")
-            .expect("update D1 database")
-            .verification
-            .strategy,
+        update.verification.strategy,
         "same_resource_contains_planned_fields_after_update"
     );
+    assert_eq!(update.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(update.risk, RiskClass::ScopedWrite);
+    assert_eq!(update.effect, EffectClass::ReversibleWrite);
+    assert_eq!(update.cost.maximum, Some(0.0));
+    assert_eq!(update.cost.references.len(), 2);
+    assert!(
+        update
+            .cost
+            .basis
+            .as_deref()
+            .is_some_and(|basis| basis.contains("no incremental operation or replica charge"))
+    );
+    assert!(!update.rollback.supported);
 
     let mut unrelated = document;
     unrelated["paths"]["/accounts/{account_id}/d1/database/{database_id}"]["get"]["tags"] =
@@ -987,6 +999,13 @@ fn d1_database_readback_omits_only_the_documented_fields_projection() {
             .verification
             .strategy,
         "same_resource_returns_not_found_after_delete"
+    );
+    assert_eq!(
+        unrelated_snapshot
+            .get("d1-update-partial-database")
+            .expect("unrelated update")
+            .adapter_status,
+        AdapterStatus::Blocked
     );
 }
 

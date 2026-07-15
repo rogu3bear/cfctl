@@ -2329,6 +2329,9 @@ fn classify(capability: &mut CapabilityV1) {
     {
         classify_api_token_lifecycle(capability);
         return;
+    } else if is_d1_read_replication_update(capability) {
+        classify_d1_read_replication_update(capability);
+        return;
     } else if is_dns_record_lifecycle(&capability.id) {
         classify_dns_record_lifecycle(capability);
         return;
@@ -2378,6 +2381,46 @@ fn classify(capability: &mut CapabilityV1) {
         capability.blocked_reason =
             Some("official schema marks the operation as not implemented".to_owned());
     }
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+}
+
+fn is_d1_read_replication_update(capability: &CapabilityV1) -> bool {
+    matches!(
+        capability.id.as_str(),
+        "d1-update-database" | "d1-update-partial-database"
+    ) && matches!(capability.method.as_str(), "PUT" | "PATCH")
+        && capability.product == "D1"
+        && capability.path == "/accounts/{account_id}/d1/database/{database_id}"
+        && capability.permissions.len() == 1
+        && capability.permissions[0] == "D1 Write"
+        && canonical_request_object_fields(capability)
+            .is_some_and(|fields| fields.len() == 1 && fields[0] == "read_replication")
+}
+
+fn classify_d1_read_replication_update(capability: &mut CapabilityV1) {
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "enabling or disabling D1 read replication has no incremental operation or replica charge; ordinary rows-read, rows-written, and storage billing continues"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "D1 pricing".to_owned(),
+            url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "D1 global read replication".to_owned(),
+            url: "https://developers.cloudflare.com/d1/best-practices/read-replication/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+    ];
     capability.verification.required = true;
     "post_change_read_or_operation_specific_verifier"
         .clone_into(&mut capability.verification.strategy);
