@@ -1619,6 +1619,7 @@ fn intent_score(capability: &CapabilityV1, terms: &[Vec<String>]) -> usize {
                 .to_ascii_lowercase(),
             1,
         ),
+        (mutation_contract_search_text(capability), 5),
     ];
     terms
         .iter()
@@ -1635,6 +1636,19 @@ fn intent_score(capability: &CapabilityV1, terms: &[Vec<String>]) -> usize {
                 .unwrap_or_default()
         })
         .sum()
+}
+
+fn mutation_contract_search_text(capability: &CapabilityV1) -> String {
+    let mut terms = vec![adapter_status_name(capability.adapter_status).replace('_', " ")];
+    if let Some(reason) = capability.blocked_reason.as_deref() {
+        terms.push(reason.to_ascii_lowercase());
+    }
+    for gap in capability.mutation_contract_gaps() {
+        let code = mutation_contract_gap_code(&gap);
+        terms.push(code.to_owned());
+        terms.push(code.replace('_', " "));
+    }
+    terms.join(" ")
 }
 
 fn catalog_io(path: &Path, source: std::io::Error) -> CatalogError {

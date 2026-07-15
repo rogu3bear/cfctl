@@ -39,7 +39,10 @@ operations, pricing-reference coverage, declared verification and rollback
 contracts, and fully complete mutation contracts separately. It also reports
 overlapping, stable mutation-gap classes (`risk_unknown`, `cost_unbounded`,
 `verification_missing`, and the other execution guards) plus adapters that are
-blocked for a reason outside the generic mutation contract.
+blocked for a reason outside the generic mutation contract. Those stable gap
+names and their human-readable forms are searchable directly, so `catalog
+search "verification missing"` finds the affected operations without granting
+them execution authority.
 
 ## Public commands
 

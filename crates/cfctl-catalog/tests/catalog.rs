@@ -139,6 +139,74 @@ fn sqlite_search_tolerates_natural_language_and_ranks_the_intended_operation() {
 }
 
 #[test]
+fn search_exposes_exact_mutation_contract_debt() {
+    let document = json!({
+        "openapi":"3.0.3",
+        "info":{"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/accounts/{account_id}/widgets": {
+                "post": {
+                    "operationId":"widgets-create",
+                    "summary":"Create Widget",
+                    "tags":["Widgets"],
+                    "parameters":[
+                        {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}}
+                    ]
+                }
+            }
+        }
+    });
+    let mut snapshot = normalize_openapi(&document).expect("catalog");
+    snapshot
+        .capabilities
+        .get_mut("widgets-create")
+        .expect("widget capability")
+        .cost
+        .references
+        .push(KnowledgeReferenceV1 {
+            title: "Widget pricing".to_owned(),
+            url: "https://developers.cloudflare.com/widgets/pricing/".to_owned(),
+            source: "official fixture".to_owned(),
+        });
+
+    for query in [
+        "verification missing",
+        "rollback irreversibility missing",
+        "cost unbounded",
+        "permission lane missing",
+    ] {
+        assert_eq!(
+            snapshot
+                .search(query)
+                .first()
+                .map(|capability| capability.id.as_str()),
+            Some("widgets-create"),
+            "in-memory search did not expose {query}"
+        );
+    }
+
+    let root = tempfile::tempdir().expect("temp catalog");
+    let index = CatalogIndex::rebuild(&root.path().join("catalog.sqlite3"), &snapshot)
+        .expect("rebuild index");
+    for query in [
+        "verification_missing",
+        "rollback_or_irreversibility_missing",
+        "cost_unbounded",
+        "permission_lane_missing",
+    ] {
+        assert_eq!(
+            index
+                .search(query, 10)
+                .expect("indexed safety search")
+                .first()
+                .map(|capability| capability.id.as_str()),
+            Some("widgets-create"),
+            "indexed search did not expose {query}"
+        );
+    }
+}
+
+#[test]
 fn normalizes_every_openapi_operation_into_a_searchable_capability() {
     let snapshot = normalize_openapi(&fixture()).expect("fixture should normalize");
     assert_eq!(snapshot.capabilities.len(), 2);

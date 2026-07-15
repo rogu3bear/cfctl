@@ -17,6 +17,16 @@ Coverage includes stable `mutation_contract_gap_counts`. The counts overlap by
 design because one capability can lack risk, cost, permissions, verification,
 rollback, and entitlement knowledge simultaneously.
 
+Use the same gap name in search to find affected operations:
+
+```bash
+cfctl catalog search "verification_missing" --json
+cfctl catalog search "cost unbounded" --json
+```
+
+Search derives these terms from the current catalog contract; it does not make
+a blocked operation executable.
+
 Search before acting:
 
 ```bash

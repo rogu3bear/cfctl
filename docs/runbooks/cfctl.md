@@ -14,7 +14,9 @@ Use `mutation_contract_gap_counts` to distinguish unknown risk, effect, cost,
 verification, rollback, permissions, and entitlement debt. Counts overlap;
 `capabilities_with_mutation_contract_gaps` counts affected operations once,
 while `blocked_adapters_without_contract_gaps` identifies separate adapter or
-workflow blockers.
+workflow blockers. Search a stable gap name such as `verification_missing` or
+its spaced form (`verification missing`) to list matching operations before
+choosing a repair slice.
 
 Find and inspect an operation:
 
