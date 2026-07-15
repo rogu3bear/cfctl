@@ -124,9 +124,11 @@ workspace graph, source configuration, impact, costs, verification,
 compensation, and warnings. They expire within 24 hours. Drift invalidates
 approval. A hash-chained transaction journal persists the reviewed plan,
 approval, consumption, adapter boundary, secret sink, verification, and close
-checkpoints. Apply, sink, and verification checkpoints bind non-secret receipt
-hashes, so changing a returned resource ID or evidence hash invalidates the
-journal; a plan durably consumed before a crash cannot be replayed. The local
+checkpoints. Every checkpoint binds the plan status; apply, sink, and
+verification checkpoints also bind non-secret receipt hashes. Changing a
+status, returned resource ID, or evidence hash therefore invalidates the
+journal, and storage rejects the plan on save or load. A plan durably consumed
+before a crash cannot be replayed. The local
 durability suite reopens the state store after an injected crash between every
 journal transition and proves recovery stops at the last persisted checkpoint.
 

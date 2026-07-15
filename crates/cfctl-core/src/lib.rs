@@ -494,6 +494,7 @@ pub struct TransactionCheckpointV1 {
     pub stage: TransactionStageV1,
     pub recorded_at: DateTime<Utc>,
     pub plan_content_hash: String,
+    pub plan_status: PlanStatus,
     pub previous_checkpoint_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_hash: Option<String>,
@@ -728,7 +729,7 @@ impl PlanV1 {
                 ));
             }
         } else {
-            self.validate_transaction_journal()?;
+            self.validate_transaction_journal_inner(false)?;
             if stage.rank() <= self.transaction_stage.rank() {
                 return Err(self.invalid_transaction_journal(format!(
                     "checkpoint {stage:?} does not advance past {:?}",
@@ -754,6 +755,7 @@ impl PlanV1 {
             stage,
             recorded_at,
             &self.content_hash,
+            self.status,
             previous_checkpoint_hash.as_deref(),
             artifact_hash.as_deref(),
         )?;
@@ -765,6 +767,7 @@ impl PlanV1 {
             stage,
             recorded_at,
             plan_content_hash: self.content_hash.clone(),
+            plan_status: self.status,
             previous_checkpoint_hash,
             artifact_hash,
             checkpoint_hash,
@@ -775,6 +778,10 @@ impl PlanV1 {
 
     /// Validates stage ordering and the complete checkpoint hash chain.
     pub fn validate_transaction_journal(&self) -> Result<()> {
+        self.validate_transaction_journal_inner(true)
+    }
+
+    fn validate_transaction_journal_inner(&self, bind_current_status: bool) -> Result<()> {
         if self.transaction_journal.is_empty() {
             return if self.status == PlanStatus::Draft
                 && self.transaction_stage == TransactionStageV1::PlanPrepared
@@ -829,6 +836,7 @@ impl PlanV1 {
                 checkpoint.stage,
                 checkpoint.recorded_at,
                 &checkpoint.plan_content_hash,
+                checkpoint.plan_status,
                 checkpoint.previous_checkpoint_hash.as_deref(),
                 checkpoint.artifact_hash.as_deref(),
             )?;
@@ -851,6 +859,16 @@ impl PlanV1 {
                 "current transaction stage does not match the journal tail".to_owned(),
             ));
         }
+        if bind_current_status
+            && self
+                .transaction_journal
+                .last()
+                .is_some_and(|checkpoint| checkpoint.plan_status != self.status)
+        {
+            return Err(self.invalid_transaction_journal(
+                "current plan status does not match the journal tail".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -859,12 +877,14 @@ impl PlanV1 {
         stage: TransactionStageV1,
         recorded_at: DateTime<Utc>,
         plan_content_hash: &str,
+        plan_status: PlanStatus,
         previous_checkpoint_hash: Option<&str>,
         artifact_hash: Option<&str>,
     ) -> Result<String> {
         let mut value = serde_json::json!({
             "operation_id": self.operation_id,
             "plan_content_hash": plan_content_hash,
+            "plan_status": plan_status,
             "stage": stage,
             "recorded_at": recorded_at,
             "previous_checkpoint_hash": previous_checkpoint_hash,

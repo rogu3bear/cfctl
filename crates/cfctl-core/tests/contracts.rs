@@ -222,6 +222,29 @@ fn transaction_artifacts_survive_crash_reload_and_detect_tampering() {
 }
 
 #[test]
+fn transaction_journal_rejects_an_uncheckpointed_status_change() {
+    let capability = CapabilityV1::new(
+        "account-api-tokens-create-token",
+        "Create account token",
+        "POST",
+        "/accounts/{account_id}/tokens",
+    );
+    let mut plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "schema-sha",
+        capability,
+        json!({"account_id":"account-a"}),
+    )
+    .expect("plan");
+    plan.approve(true, None).expect("approve");
+    plan.mark_consumed().expect("consume");
+    plan.status = PlanStatus::Verified;
+
+    assert!(plan.validate_transaction_journal().is_err());
+}
+
+#[test]
 fn evidence_and_envelopes_do_not_conflate_artifact_presence_with_verification() {
     let evidence = EvidenceV1::new(EvidenceClass::Preview, "sha256:abc", "/tmp/evidence.json");
     let envelope =

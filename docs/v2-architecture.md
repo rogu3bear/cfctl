@@ -48,7 +48,11 @@ cross-repository resource impact.
 the point before a Cloudflare boundary from the persisted response, secret
 sink, and operation-specific verification. A network failure after a boundary
 attempt therefore enters rectification and cannot be mistaken for a safe
-retry. The storage crash matrix drops volatile state and reopens the real local
+retry. Each checkpoint hash includes the plan status, and the storage boundary
+validates the journal on both writes and reads. Adapter failures, missing
+receipts, request-body cleanup failures, and missing sink-only outputs advance
+through redacted response or sink artifacts instead of persisting a detached
+status. The storage crash matrix drops volatile state and reopens the real local
 store between each journal transition, proving recovery at every persisted
 stage; it does not claim account-backed network mutation proof.
 

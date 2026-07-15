@@ -732,6 +732,7 @@ async fn execute_delegated_plan(
     plan: &mut PlanV1,
     input: &CallInput,
     credential: &AuthCredential,
+    secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
     let receipt = run_delegated_cli(&plan.capability, input, credential).await?;
     let success = receipt
@@ -743,8 +744,21 @@ async fn execute_delegated_plan(
     } else {
         PlanStatus::Failed
     };
-    store.save_plan(plan)?;
     let evidence = store.write_evidence(EvidenceClass::Apply, &receipt)?;
+    persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::BoundaryResponsePersisted,
+        json!({
+            "adapter": "delegated_cli",
+            "apply_evidence_hash": evidence.content_hash,
+            "success": success,
+        }),
+    )?;
+    persist_secret_lifecycle(store, plan, success, Some(&receipt), secrets)?;
+    if plan.status == PlanStatus::Failed {
+        persist_transaction_stage(store, plan, TransactionStageV1::Closed)?;
+    }
     let mut envelope = ResultEnvelopeV2::success("plans run", receipt).with_evidence(evidence);
     envelope.ok = success;
     envelope.performed = success;
@@ -771,6 +785,7 @@ fn execute_governed_ui_plan(
     store: &StateStore,
     plan: &mut PlanV1,
     input: &CallInput,
+    secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
     let agent = configured_agent()?;
     let target = json!({
@@ -792,10 +807,21 @@ fn execute_governed_ui_plan(
         ),
         true,
     )?;
-    plan.status = PlanStatus::RectificationRequired;
-    store.save_plan(plan)?;
     let evidence =
         store.write_evidence(EvidenceClass::AgentAction, &serde_json::to_value(&action)?)?;
+    plan.status = PlanStatus::RectificationRequired;
+    persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::BoundaryResponsePersisted,
+        json!({
+            "adapter": "governed_ui",
+            "agent_action_evidence_hash": evidence.content_hash,
+            "performed": false,
+            "success": false,
+        }),
+    )?;
+    persist_secret_lifecycle(store, plan, false, None, secrets)?;
     let mut envelope = ResultEnvelopeV2::success(
         "plans run",
         json!({
@@ -930,20 +956,12 @@ fn redact_subprocess_text(text: &str, credential: &AuthCredential) -> String {
         .join("\n")
 }
 
-fn delete_plan_secret(
-    store: &StateStore,
-    plan: &mut PlanV1,
-    secrets: &dyn SecretStore,
-) -> Result<()> {
+fn delete_plan_secret(plan: &PlanV1, secrets: &dyn SecretStore) -> Result<bool> {
     let Some(reference) = plan_secret_body_ref(plan).map(str::to_owned) else {
-        return Ok(());
+        return Ok(false);
     };
-    if let Err(error) = secrets.delete(&reference) {
-        plan.status = PlanStatus::RectificationRequired;
-        store.save_plan(plan)?;
-        return Err(error.into());
-    }
-    Ok(())
+    secrets.delete(&reference)?;
+    Ok(true)
 }
 
 fn create_plan(
@@ -1268,6 +1286,13 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         )));
     }
     validate_plan_preconditions(store, &plan)?;
+    if plan.capability.adapter_status == AdapterStatus::Blocked {
+        return Err(CliError::Input(
+            plan.capability.blocked_reason.clone().unwrap_or_else(|| {
+                "the approved capability no longer has an executable adapter".to_owned()
+            }),
+        ));
+    }
     preflight_secret_sink(&plan)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(Some(&plan.profile_id))?;
@@ -1282,32 +1307,35 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         TransactionStageV1::BoundaryAttemptPersisted,
     )?;
     if plan.capability.adapter_status == AdapterStatus::DelegatedCli {
-        let result = execute_delegated_plan(store, &mut plan, &execution_input, &credential).await;
-        if result.is_err() {
+        let result =
+            execute_delegated_plan(store, &mut plan, &execution_input, &credential, &secrets).await;
+        if result.is_err() && plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted
+        {
             plan.status = PlanStatus::RectificationRequired;
-            store.save_plan(&plan)?;
+            persist_transaction_stage_with_artifact(
+                store,
+                &mut plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                boundary_failure_artifact("delegated_cli", "no_receipt"),
+            )?;
+            persist_secret_lifecycle(store, &mut plan, false, None, &secrets)?;
         }
-        delete_plan_secret(store, &mut plan, &secrets)?;
         return result;
     }
     if plan.capability.adapter_status == AdapterStatus::GovernedUi {
-        let result = execute_governed_ui_plan(store, &mut plan, &execution_input);
-        if result.is_err() {
+        let result = execute_governed_ui_plan(store, &mut plan, &execution_input, &secrets);
+        if result.is_err() && plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted
+        {
             plan.status = PlanStatus::RectificationRequired;
-            store.save_plan(&plan)?;
+            persist_transaction_stage_with_artifact(
+                store,
+                &mut plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                boundary_failure_artifact("governed_ui", "handoff_failed"),
+            )?;
+            persist_secret_lifecycle(store, &mut plan, false, None, &secrets)?;
         }
-        delete_plan_secret(store, &mut plan, &secrets)?;
         return result;
-    }
-    if plan.capability.adapter_status == AdapterStatus::Blocked {
-        plan.status = PlanStatus::Failed;
-        store.save_plan(&plan)?;
-        delete_plan_secret(store, &mut plan, &secrets)?;
-        return Err(CliError::Input(
-            plan.capability.blocked_reason.clone().unwrap_or_else(|| {
-                "the approved capability no longer has an executable adapter".to_owned()
-            }),
-        ));
     }
     execute_api_plan(
         store,
@@ -1336,8 +1364,13 @@ async fn execute_api_plan(
         Ok(response) => response,
         Err(error) => {
             plan.status = PlanStatus::RectificationRequired;
-            store.save_plan(plan)?;
-            delete_plan_secret(store, plan, secrets)?;
+            persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                boundary_failure_artifact("dynamic_api", "transport_error"),
+            )?;
+            persist_secret_lifecycle(store, plan, false, None, secrets)?;
             return Err(error.into());
         }
     };
@@ -1352,22 +1385,12 @@ async fn execute_api_plan(
         TransactionStageV1::BoundaryResponsePersisted,
         boundary_response_artifact(&response, &apply_evidence),
     )?;
-    delete_plan_secret(store, plan, secrets)?;
-    let mut sink_path = None;
-    if response.success
-        && is_secret_output_plan(plan)
-        && let Err(error) =
-            sink_secret_result(plan, &response.result).map(|path| sink_path = Some(path))
-    {
-        plan.status = PlanStatus::RectificationRequired;
-        store.save_plan(plan)?;
-        return Err(error);
-    }
-    persist_transaction_stage_with_artifact(
+    persist_secret_lifecycle(
         store,
         plan,
-        TransactionStageV1::SecretSinkPersisted,
-        secret_sink_artifact(plan, response.success, sink_path.as_deref()),
+        response.success,
+        Some(&response.result),
+        secrets,
     )?;
     let performed = response.success;
     let verification = verify_api_plan(store, &executor, plan, &response, credential).await?;
@@ -1416,15 +1439,129 @@ fn boundary_response_artifact(
     })
 }
 
-fn secret_sink_artifact(plan: &PlanV1, response_success: bool, path: Option<&Path>) -> Value {
-    let required = is_secret_output_plan(plan);
+fn boundary_failure_artifact(adapter: &str, outcome: &str) -> Value {
     json!({
-        "required": required,
-        "completed": !required || (response_success && path.is_some()),
-        "path": path.map(|path| path.display().to_string()),
-        "create_new": required,
-        "unix_mode": cfg!(unix).then_some("0600"),
+        "adapter": adapter,
+        "outcome": outcome,
+        "receipt_available": false,
+        "success": false,
     })
+}
+
+fn secret_sink_artifact(
+    plan: &PlanV1,
+    response_success: bool,
+    path: Option<&Path>,
+    input_cleanup_required: bool,
+    input_cleanup_completed: bool,
+    failure: Option<&str>,
+) -> Value {
+    let output_required = response_success && is_secret_output_plan(plan);
+    let output_completed = !output_required || path.is_some();
+    json!({
+        "completed": input_cleanup_completed && output_completed && failure.is_none(),
+        "failure": failure,
+        "input_cleanup": {
+            "required": input_cleanup_required,
+            "completed": input_cleanup_completed,
+        },
+        "output_sink": {
+            "required": output_required,
+            "completed": output_completed,
+            "create_new": output_required,
+            "unix_mode": cfg!(unix).then_some("0600"),
+        },
+        "path": path.map(|path| path.display().to_string()),
+    })
+}
+
+fn persist_secret_lifecycle(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    response_success: bool,
+    response_result: Option<&Value>,
+    secrets: &dyn SecretStore,
+) -> Result<Option<PathBuf>> {
+    let input_cleanup_required = plan_secret_body_ref(plan).is_some();
+    let input_cleanup_completed = match delete_plan_secret(plan, secrets) {
+        Ok(deleted) => !input_cleanup_required || deleted,
+        Err(error) => {
+            plan.status = PlanStatus::RectificationRequired;
+            persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::SecretSinkPersisted,
+                secret_sink_artifact(
+                    plan,
+                    response_success,
+                    None,
+                    input_cleanup_required,
+                    false,
+                    Some("input_cleanup_failed"),
+                ),
+            )?;
+            return Err(error);
+        }
+    };
+    let output_required = response_success && is_secret_output_plan(plan);
+    let sink_path = if output_required {
+        let Some(result) = response_result else {
+            plan.status = PlanStatus::RectificationRequired;
+            persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::SecretSinkPersisted,
+                secret_sink_artifact(
+                    plan,
+                    response_success,
+                    None,
+                    input_cleanup_required,
+                    input_cleanup_completed,
+                    Some("output_missing"),
+                ),
+            )?;
+            return Err(CliError::Input(
+                "the adapter reported success without returning the required sink-only value; do not replay the mutation"
+                    .to_owned(),
+            ));
+        };
+        match sink_secret_result(plan, result) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                plan.status = PlanStatus::RectificationRequired;
+                persist_transaction_stage_with_artifact(
+                    store,
+                    plan,
+                    TransactionStageV1::SecretSinkPersisted,
+                    secret_sink_artifact(
+                        plan,
+                        response_success,
+                        None,
+                        input_cleanup_required,
+                        input_cleanup_completed,
+                        Some("output_sink_failed"),
+                    ),
+                )?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::SecretSinkPersisted,
+        secret_sink_artifact(
+            plan,
+            response_success,
+            sink_path.as_deref(),
+            input_cleanup_required,
+            input_cleanup_completed,
+            None,
+        ),
+    )?;
+    Ok(sink_path)
 }
 
 fn verification_response_artifact(outcome: &ApiVerificationOutcome) -> Result<Value> {
@@ -2855,10 +2992,29 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        find_secret_value, redact_secret_result, sink_secret_result, token_compensation_request,
+        find_secret_value, persist_secret_lifecycle, redact_secret_result, sink_secret_result,
+        token_compensation_request,
     };
-    use cfctl_core::{CapabilityV1, PlanStatus, PlanV1, TransactionStageV1};
+    use cfctl_auth::{AuthError, SecretStore};
+    use cfctl_core::{CapabilityV1, PlanStatus, PlanV1, RiskClass, TransactionStageV1};
+    use cfctl_storage::{RuntimePaths, StateStore};
     use serde_json::json;
+
+    struct DeleteFailingSecretStore;
+
+    impl SecretStore for DeleteFailingSecretStore {
+        fn put(&self, _key: &str, _value: &str) -> cfctl_auth::Result<()> {
+            Ok(())
+        }
+
+        fn get(&self, _key: &str) -> cfctl_auth::Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn delete(&self, _key: &str) -> cfctl_auth::Result<()> {
+            Err(AuthError::SecretStore("injected delete failure".to_owned()))
+        }
+    }
 
     #[test]
     fn secret_response_preserves_safe_receipt_metadata() {
@@ -2958,5 +3114,108 @@ mod tests {
         assert_eq!(request.input.selectors["account_id"], "account-a");
         assert_eq!(request.input.selectors["token_id"], "token-id");
         assert_eq!(request.requested_account.as_deref(), Some("account-a"));
+    }
+
+    #[test]
+    fn input_cleanup_failure_is_a_hash_bound_rectification_checkpoint() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = CapabilityV1::new(
+            "dns-records-create",
+            "Create DNS record",
+            "POST",
+            "/zones/{zone_id}/dns_records",
+        );
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"adapter":{"secret_body_ref":"keychain:plan/operation/body"}}),
+        )
+        .expect("plan");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        plan.status = PlanStatus::Running;
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"success":true}),
+        )
+        .expect("response");
+
+        let error = persist_secret_lifecycle(
+            &store,
+            &mut plan,
+            true,
+            Some(&json!({})),
+            &DeleteFailingSecretStore,
+        )
+        .expect_err("cleanup fails");
+
+        assert!(error.to_string().contains("injected delete failure"));
+        assert_eq!(plan.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            plan.transaction_stage,
+            TransactionStageV1::SecretSinkPersisted
+        );
+        assert_eq!(
+            plan.transaction_artifact(TransactionStageV1::SecretSinkPersisted)
+                .and_then(|artifact| artifact.get("failure"))
+                .and_then(serde_json::Value::as_str),
+            Some("input_cleanup_failed")
+        );
+        plan.validate_transaction_journal()
+            .expect("failure receipt validates");
+        store
+            .load_plan(&plan.operation_id)
+            .expect("failure receipt is durable")
+            .validate_transaction_journal()
+            .expect("durable failure receipt validates");
+    }
+
+    #[test]
+    fn missing_sink_only_output_is_a_hash_bound_rectification_checkpoint() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut capability = CapabilityV1::new(
+            "account-api-tokens-create-token",
+            "Create account token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        capability.risk = RiskClass::SecretSensitive;
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"adapter":{"value_out":root.path().join("token.txt")}}),
+        )
+        .expect("plan");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        plan.status = PlanStatus::Running;
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"success":true}),
+        )
+        .expect("response");
+
+        persist_secret_lifecycle(&store, &mut plan, true, None, &DeleteFailingSecretStore)
+            .expect_err("missing output fails closed");
+
+        assert_eq!(plan.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            plan.transaction_artifact(TransactionStageV1::SecretSinkPersisted)
+                .and_then(|artifact| artifact.get("failure"))
+                .and_then(serde_json::Value::as_str),
+            Some("output_missing")
+        );
+        plan.validate_transaction_journal()
+            .expect("missing output receipt validates");
     }
 }

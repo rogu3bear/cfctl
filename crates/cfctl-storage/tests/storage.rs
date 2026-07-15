@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use cfctl_core::{CapabilityV1, EvidenceClass, PlanV1, TransactionStageV1};
+use cfctl_core::{CapabilityV1, EvidenceClass, PlanStatus, PlanV1, TransactionStageV1};
 use cfctl_storage::{RuntimePaths, StateStore, StorageError};
 use serde_json::json;
 
@@ -60,6 +60,72 @@ fn plans_are_atomic_and_raw_secret_material_is_rejected() {
     store.save_plan(&plan).expect("safe plan stores");
     let loaded = store.load_plan(&plan.operation_id).expect("plan loads");
     assert_eq!(loaded.content_hash, plan.content_hash);
+}
+
+#[test]
+fn storage_rejects_an_unjournaled_plan_status() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let capability = CapabilityV1::new(
+        "account-api-tokens-create-token",
+        "Create account token",
+        "POST",
+        "/accounts/{account_id}/tokens",
+    );
+    let mut plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "sha256:catalog",
+        capability,
+        json!({"account_id":"account-a"}),
+    )
+    .expect("plan");
+    plan.status = PlanStatus::Verified;
+
+    let error = store
+        .save_plan(&plan)
+        .expect_err("unjournaled status must not persist");
+    assert!(matches!(error, StorageError::InvalidPlan(_)));
+}
+
+#[test]
+fn storage_rejects_a_status_tampered_plan_on_load() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("storage opens");
+    let capability = CapabilityV1::new(
+        "account-api-tokens-create-token",
+        "Create account token",
+        "POST",
+        "/accounts/{account_id}/tokens",
+    );
+    let plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "sha256:catalog",
+        capability,
+        json!({"account_id":"account-a"}),
+    )
+    .expect("plan");
+    store.save_plan(&plan).expect("valid plan stores");
+    let path = paths
+        .data_dir
+        .join("plans")
+        .join(format!("{}.json", plan.operation_id));
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("stored plan reads"))
+            .expect("stored plan parses");
+    document["status"] = json!("verified");
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&document).expect("tampered plan encodes"),
+    )
+    .expect("tampered plan writes");
+
+    let error = store
+        .load_plan(&plan.operation_id)
+        .expect_err("status tampering must fail on load");
+    assert!(matches!(error, StorageError::InvalidPlan(_)));
 }
 
 #[test]

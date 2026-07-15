@@ -30,6 +30,8 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
     #[error("the document contains secret material; store a keychain reference instead")]
     SensitiveData,
+    #[error("plan transaction state is invalid: {0}")]
+    InvalidPlan(#[from] cfctl_core::CoreError),
     #[error("import path escapes the managed data directory: `{0}`")]
     UnsafeImportPath(String),
     #[error("plan `{0}` does not exist")]
@@ -141,6 +143,7 @@ impl StateStore {
     }
 
     pub fn save_plan(&self, plan: &PlanV1) -> Result<()> {
+        plan.validate_transaction_journal()?;
         let value = serde_json::to_value(plan)?;
         if redact_json(&value) != value {
             return Err(StorageError::SensitiveData);
@@ -153,7 +156,9 @@ impl StateStore {
         if !path.is_file() {
             return Err(StorageError::PlanNotFound(operation_id.to_owned()));
         }
-        self.read_json(&path)
+        let plan: PlanV1 = self.read_json(&path)?;
+        plan.validate_transaction_journal()?;
+        Ok(plan)
     }
 
     pub fn list_plans(&self) -> Result<Vec<PlanV1>> {
@@ -162,7 +167,9 @@ impl StateStore {
         for entry in fs::read_dir(&directory).map_err(|source| io_error(&directory, source))? {
             let entry = entry.map_err(|source| io_error(&directory, source))?;
             if entry.path().extension().and_then(std::ffi::OsStr::to_str) == Some("json") {
-                plans.push(self.read_json(&entry.path())?);
+                let plan: PlanV1 = self.read_json(&entry.path())?;
+                plan.validate_transaction_journal()?;
+                plans.push(plan);
             }
         }
         plans.sort_by_key(|plan: &PlanV1| plan.created_at);
