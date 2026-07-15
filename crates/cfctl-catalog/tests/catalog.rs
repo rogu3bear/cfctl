@@ -155,7 +155,12 @@ fn install_request_contract_fixture(document: &mut Value) {
                 "pattern": "^[^.]+$",
                 "description": "record name"
             },
-            "ttl": {"type": "integer", "minimum": 1, "maximum": 86400},
+            "ttl": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 86400,
+                "multipleOf": 1
+            },
             "tags": {
                 "type": "array",
                 "minItems": 1,
@@ -203,6 +208,7 @@ fn assert_request_schema_bounds(schema: &Value) {
     assert_eq!(schema["properties"]["ttl"]["type"], "integer");
     assert_eq!(schema["properties"]["ttl"]["minimum"], 1);
     assert_eq!(schema["properties"]["ttl"]["maximum"], 86400);
+    assert_eq!(schema["properties"]["ttl"]["multipleOf"], 1);
     assert_eq!(schema["properties"]["name"]["minLength"], 1);
     assert_eq!(schema["properties"]["name"]["maxLength"], 253);
     assert!(schema["properties"]["name"].get("pattern").is_none());

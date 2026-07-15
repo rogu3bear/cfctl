@@ -1964,6 +1964,17 @@ fn validate_request_schema_bounds(
     depth: usize,
     remaining_steps: &mut usize,
 ) -> Result<()> {
+    if let Some(multiple) = schema.get("multipleOf")
+        && let Some(number) = value.as_number()
+    {
+        let valid = multiple
+            .as_number()
+            .and_then(|multiple| exact_decimal_multiple(number, multiple))
+            .unwrap_or(false);
+        if !valid {
+            return invalid_request_bound(path, "is not a multiple of the pinned multipleOf value");
+        }
+    }
     if let Some(number) = value.as_f64() {
         if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64) {
             let exclusive = schema
@@ -2036,6 +2047,101 @@ fn validate_request_schema_bounds(
         )?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecimalMagnitude {
+    coefficient: u128,
+    exponent: i32,
+}
+
+fn exact_decimal_multiple(
+    number: &serde_json::Number,
+    multiple: &serde_json::Number,
+) -> Option<bool> {
+    let value = decimal_magnitude(number)?;
+    let divisor = decimal_magnitude(multiple)?;
+    if divisor.coefficient == 0 || multiple.to_string().starts_with('-') {
+        return None;
+    }
+    if value.coefficient == 0 {
+        return Some(true);
+    }
+
+    let common = greatest_common_divisor(value.coefficient, divisor.coefficient);
+    let numerator = value.coefficient / common;
+    let denominator = divisor.coefficient / common;
+    let exponent_difference = value.exponent.checked_sub(divisor.exponent)?;
+    if exponent_difference >= 0 {
+        let available_tens = u32::try_from(exponent_difference).ok()?;
+        let (denominator, twos) = remove_factor(denominator, 2);
+        let (denominator, fives) = remove_factor(denominator, 5);
+        return Some(denominator == 1 && twos <= available_tens && fives <= available_tens);
+    }
+
+    let required_tens = exponent_difference.unsigned_abs();
+    let (_, twos) = remove_factor(numerator, 2);
+    let (_, fives) = remove_factor(numerator, 5);
+    Some(twos >= required_tens && fives >= required_tens)
+}
+
+fn decimal_magnitude(number: &serde_json::Number) -> Option<DecimalMagnitude> {
+    let rendered = number.to_string();
+    let unsigned = rendered
+        .strip_prefix('-')
+        .or_else(|| rendered.strip_prefix('+'))
+        .unwrap_or(&rendered);
+    let (mantissa, explicit_exponent) =
+        if let Some((mantissa, exponent)) = unsigned.split_once(['e', 'E']) {
+            (mantissa, exponent.parse::<i32>().ok()?)
+        } else {
+            (unsigned, 0)
+        };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut digits = String::with_capacity(whole.len() + fraction.len());
+    digits.push_str(whole);
+    digits.push_str(fraction);
+    let mut coefficient = digits.parse::<u128>().ok()?;
+    let fractional_digits = i32::try_from(fraction.len()).ok()?;
+    let mut exponent = explicit_exponent.checked_sub(fractional_digits)?;
+    if coefficient == 0 {
+        return Some(DecimalMagnitude {
+            coefficient,
+            exponent: 0,
+        });
+    }
+    while coefficient.is_multiple_of(10) {
+        coefficient /= 10;
+        exponent = exponent.checked_add(1)?;
+    }
+    Some(DecimalMagnitude {
+        coefficient,
+        exponent,
+    })
+}
+
+fn greatest_common_divisor(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn remove_factor(mut value: u128, factor: u128) -> (u128, u32) {
+    let mut count = 0_u32;
+    while value.is_multiple_of(factor) {
+        value /= factor;
+        count = count.saturating_add(1);
+    }
+    (value, count)
 }
 
 fn validate_string_format(schema: &Value, value: &str, path: &str) -> Result<()> {

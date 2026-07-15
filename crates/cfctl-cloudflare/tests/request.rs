@@ -336,6 +336,83 @@ fn unchecked_request_enforces_scalar_and_collection_bounds() {
 }
 
 #[test]
+fn unchecked_request_enforces_exact_decimal_multiples() {
+    let mut capability = CapabilityV1::new("multiple-create", "Create", "POST", "/multiple");
+    capability.request_schema = Some(json!({
+        "type": "object",
+        "required": ["tenths", "cents", "whole"],
+        "properties": {
+            "tenths": {"type": "number", "multipleOf": 0.1},
+            "cents": {"type": "number", "multipleOf": 0.01},
+            "whole": {"type": "number", "multipleOf": 1}
+        }
+    }));
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    for body in [
+        json!({"tenths": 0.3, "cents": 1.23, "whole": 3}),
+        json!({"tenths": -1.2, "cents": 0, "whole": -4.0}),
+        json!({"tenths": 1e20, "cents": 1e-2, "whole": 1e3}),
+    ] {
+        assert!(
+            builder
+                .build_unchecked(
+                    &capability,
+                    &CallInput {
+                        body: Some(body),
+                        ..CallInput::default()
+                    }
+                )
+                .is_ok()
+        );
+    }
+
+    for (field, value) in [
+        ("tenths", json!(0.300_000_000_000_000_04)),
+        ("cents", json!(1.234)),
+        ("whole", json!(3.1)),
+    ] {
+        let mut body = json!({"tenths": 0.3, "cents": 1.23, "whole": 3});
+        body[field] = value;
+        let error = builder
+            .build_unchecked(
+                &capability,
+                &CallInput {
+                    body: Some(body),
+                    ..CallInput::default()
+                },
+            )
+            .expect_err("non-multiples must fail before request construction");
+        assert!(matches!(
+            error,
+            CloudflareError::InvalidRequestBody(reason)
+                if reason.contains("multipleOf") && !reason.contains("0.30000000000000004")
+        ));
+    }
+}
+
+#[test]
+fn unchecked_request_rejects_invalid_multiple_contracts() {
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    for invalid_multiple in [json!(0), json!(-0.1), json!("0.1")] {
+        let mut capability = CapabilityV1::new("multiple-create", "Create", "POST", "/multiple");
+        capability.request_schema = Some(json!({
+            "type": "number",
+            "multipleOf": invalid_multiple
+        }));
+        let error = builder
+            .build_unchecked(
+                &capability,
+                &CallInput {
+                    body: Some(json!(1)),
+                    ..CallInput::default()
+                },
+            )
+            .expect_err("invalid multipleOf contracts must fail closed");
+        assert!(matches!(error, CloudflareError::InvalidRequestBody(_)));
+    }
+}
+
+#[test]
 fn unchecked_request_enforces_executable_string_formats() {
     let mut capability = CapabilityV1::new("formatted-create", "Create", "POST", "/formatted");
     capability.request_schema = Some(json!({

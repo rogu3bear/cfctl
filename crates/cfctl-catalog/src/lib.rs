@@ -1716,28 +1716,7 @@ fn normalize_request_schema_contract(
     }
     let resolved = resolve_local_schema(document, schema);
     let mut contract = Map::new();
-    for key in [
-        "type",
-        "required",
-        "enum",
-        "format",
-        "nullable",
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "minLength",
-        "maxLength",
-        "minItems",
-        "maxItems",
-        "uniqueItems",
-        "minProperties",
-        "maxProperties",
-    ] {
-        if let Some(value) = resolved.get(key) {
-            contract.insert(key.to_owned(), value.clone());
-        }
-    }
+    copy_request_schema_value_constraints(resolved, &mut contract);
     if let Some(additional) = resolved.get("additionalProperties") {
         let additional = if additional.is_object() {
             if depth < MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
@@ -1804,6 +1783,37 @@ fn normalize_request_schema_contract(
         active_references.remove(reference);
     }
     Value::Object(contract)
+}
+
+fn copy_request_schema_value_constraints(resolved: &Value, contract: &mut Map<String, Value>) {
+    for key in [
+        "type",
+        "required",
+        "enum",
+        "format",
+        "nullable",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minProperties",
+        "maxProperties",
+    ] {
+        if let Some(value) = resolved.get(key) {
+            contract.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(multiple) = resolved
+        .get("multipleOf")
+        .filter(|value| value.as_f64().is_some_and(|multiple| multiple > 0.0))
+    {
+        contract.insert("multipleOf".to_owned(), multiple.clone());
+    }
 }
 
 fn success_response_declares_result_string_id(document: &Value, operation: &Value) -> bool {
