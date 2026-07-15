@@ -135,7 +135,26 @@ cfctl keys mint --name <name> --permission <reviewed-group-id> \
 Mint planning repeats the live permission inventory and binds the exact group
 metadata and account-only resource policy. Running the approved plan repeats
 that inventory read before consumption; drift requires a new plan. Do not use
-generic `call` for token creation.
+generic `call` for account API-token creation.
+
+Create an Access service token through its separate exact lifecycle. The input
+is intentionally limited to `name` and optional `duration`; version and grace
+period fields belong to rotation, not initial creation. The new sink is JSON
+with exactly `client_id` and `client_secret`:
+
+```bash
+printf '%s' '{"name":"deployment automation"}' | \
+  cfctl call access-service-tokens-create-a-service-token \
+    --selector account_id=<account-id> --body-stdin \
+    --value-out /new/secure/access-service-token.json --json
+```
+
+Review, approve, and run the returned operation ID normally. A successful run
+requires the mode-0600 sink plus an exact readback of the returned service-token
+ID, name, and duration. `plans rectify` may create a separate reviewed delete
+plan; it never deletes automatically. Keep
+`access-service-tokens-rotate-a-service-token` blocked while its official
+operation schema omits the required permission lane.
 
 Turnstile secret rotation requires an explicit cutover choice. `false` keeps
 the prior secret valid for two hours and prevents another rotation during that

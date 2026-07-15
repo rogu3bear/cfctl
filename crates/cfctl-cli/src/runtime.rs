@@ -547,7 +547,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         .get(&arguments.capability_id)
         .cloned()
         .ok_or_else(|| capability_missing(&arguments.capability_id))?;
-    if capability.risk == RiskClass::SecretSensitive && arguments.value_out.is_none() {
+    if is_secret_output_capability(&capability) && arguments.value_out.is_none() {
         return Err(CliError::Input(
             "secret-producing capabilities require `--value-out <new-path>`; the value is never written to stdout or evidence"
                 .to_owned(),
@@ -5221,6 +5221,7 @@ fn secret_sink_artifact(
             "required": output_required,
             "completed": output_completed,
             "create_new": output_required,
+            "format": secret_sink_format(&plan.capability),
             "unix_mode": cfg!(unix).then_some("0600"),
         },
         "path": path.map(|path| path.display().to_string()),
@@ -7091,8 +7092,13 @@ fn capability_call_argv(capability: &CapabilityV1) -> Option<Vec<String>> {
     if capability_has_meaningful_request_body(capability) {
         argv.push("--body-stdin".to_owned());
     }
-    if capability.risk == RiskClass::SecretSensitive {
-        argv.extend(["--value-out".to_owned(), "<new-mode-0600-path>".to_owned()]);
+    if is_secret_output_capability(capability) {
+        let sink = if is_access_service_token_create_capability(capability) {
+            "<new-mode-0600-json-path>"
+        } else {
+            "<new-mode-0600-path>"
+        };
+        argv.extend(["--value-out".to_owned(), sink.to_owned()]);
     }
     argv.push("--json".to_owned());
     Some(argv)
@@ -7785,12 +7791,7 @@ fn plan_secret_body_ref(plan: &PlanV1) -> Option<&str> {
 }
 
 fn sink_secret_result(plan: &PlanV1, result: &Value) -> Result<PathBuf> {
-    let Some(secret) = find_secret_value(result) else {
-        return Err(CliError::Input(
-            "Cloudflare reported success but no one-time credential value was present; the operation requires rectification"
-                .to_owned(),
-        ));
-    };
+    let payload = secret_sink_payload(&plan.capability, result)?;
     let path = secret_sink_path(plan)?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -7802,10 +7803,64 @@ fn sink_secret_result(plan: &PlanV1, result: &Value) -> Result<PathBuf> {
     let mut file = options
         .open(&path)
         .map_err(|source| cli_io(&path, source))?;
-    file.write_all(secret.as_bytes())
+    file.write_all(&payload)
         .map_err(|source| cli_io(&path, source))?;
     file.sync_all().map_err(|source| cli_io(&path, source))?;
     Ok(path)
+}
+
+fn secret_sink_payload(capability: &CapabilityV1, result: &Value) -> Result<Vec<u8>> {
+    if is_access_service_token_create_capability(capability) {
+        let client_id = result
+            .get("client_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "Cloudflare reported Access service-token creation success without a non-empty client_id; no credential sink was created and the operation requires rectification"
+                        .to_owned(),
+                )
+            })?;
+        let client_secret = result
+            .get("client_secret")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "Cloudflare reported Access service-token creation success without a non-empty client_secret; no credential sink was created and the operation requires rectification"
+                        .to_owned(),
+                )
+            })?;
+        return Ok(serde_json::to_vec(&json!({
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }))?);
+    }
+
+    let Some(secret) = find_secret_value(result) else {
+        return Err(CliError::Input(
+            "Cloudflare reported success but no one-time credential value was present; the operation requires rectification"
+                .to_owned(),
+        ));
+    };
+    Ok(secret.as_bytes().to_vec())
+}
+
+fn is_access_service_token_create_capability(capability: &CapabilityV1) -> bool {
+    capability.id == "access-service-tokens-create-a-service-token"
+        && capability.method == "POST"
+        && capability.path == "/accounts/{account_id}/access/service_tokens"
+        && capability.product == "Access service tokens"
+}
+
+fn secret_sink_format(capability: &CapabilityV1) -> Option<&'static str> {
+    if !is_secret_output_capability(capability) {
+        None
+    } else if is_access_service_token_create_capability(capability) {
+        Some("access_service_token_json")
+    } else {
+        Some("opaque_text")
+    }
 }
 
 fn secret_sink_path(plan: &PlanV1) -> Result<PathBuf> {
@@ -7817,7 +7872,12 @@ fn secret_sink_path(plan: &PlanV1) -> Result<PathBuf> {
 }
 
 fn is_secret_output_plan(plan: &PlanV1) -> bool {
-    plan.capability.risk == RiskClass::SecretSensitive
+    is_secret_output_capability(&plan.capability)
+}
+
+fn is_secret_output_capability(capability: &CapabilityV1) -> bool {
+    capability.risk == RiskClass::SecretSensitive
+        || is_access_service_token_create_capability(capability)
 }
 
 fn find_secret_value(value: &Value) -> Option<&str> {
@@ -8005,20 +8065,22 @@ mod tests {
         apply_zone_account_response, apply_zone_entitlement_response,
         bind_required_empty_compensation_body, boundary_response_artifact, capability_call_argv,
         compensation_request, find_secret_value, guide_document, is_live_plan_precondition_hash,
-        non_readback_verification_basis, persist_prepared_plan, persist_secret_lifecycle,
-        preflight_call_input, preserve_previous_catalog, query_object_from_pairs,
-        redact_secret_result, required_cloudflare_tunnel_configuration_state_precondition,
+        is_secret_output_capability, non_readback_verification_basis, persist_prepared_plan,
+        persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
+        query_object_from_pairs, redact_secret_result,
+        required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
         required_oauth_client_secret_state_precondition,
         required_warp_connector_configuration_state_precondition,
         required_web_analytics_rum_state_precondition, required_zone_account_precondition,
-        should_bind_cloudflare_tunnel_configuration_state, should_bind_d1_read_replication_state,
-        should_bind_dns_record_state, should_bind_global_warp_override_state,
-        should_bind_oauth_client_secret_state, should_bind_warp_connector_configuration_state,
-        should_bind_web_analytics_rum_state, should_bind_zone_account,
-        should_resolve_zone_entitlement, sink_secret_result, validate_api_token_creation_contract,
-        validate_current_permission_groups, validate_entitlement_receipt_precondition,
+        secret_sink_format, should_bind_cloudflare_tunnel_configuration_state,
+        should_bind_d1_read_replication_state, should_bind_dns_record_state,
+        should_bind_global_warp_override_state, should_bind_oauth_client_secret_state,
+        should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
+        should_bind_zone_account, should_resolve_zone_entitlement, sink_secret_result,
+        validate_api_token_creation_contract, validate_current_permission_groups,
+        validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
         validate_selected_permission_groups, validate_zone_account_receipt_precondition,
         workspace_resource_keys, zone_target,
@@ -8034,8 +8096,8 @@ mod tests {
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::Utc;
-    use serde_json::json;
-    use std::collections::BTreeMap;
+    use serde_json::{Value, json};
+    use std::{collections::BTreeMap, fs};
 
     struct DeleteFailingSecretStore;
 
@@ -11538,6 +11600,122 @@ mod tests {
         assert_eq!(redacted["result"]["client_secret"], "[SUNK]");
         assert_eq!(redacted["result"]["client_id"], "public-client-id");
         assert!(!redacted.to_string().contains("must-not-survive"));
+    }
+
+    #[test]
+    fn access_service_token_credentials_are_sunk_as_a_complete_json_bundle() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("access-service-token.json");
+        let mut capability = CapabilityV1::new(
+            "access-service-tokens-create-a-service-token",
+            "Create a service token",
+            "POST",
+            "/accounts/{account_id}/access/service_tokens",
+        );
+        capability.product = "Access service tokens".to_owned();
+        capability.risk = RiskClass::SecretSensitive;
+        capability.verification.strategy =
+            "created_resource_contains_planned_fields_by_returned_id".to_owned();
+        let plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"adapter":{"value_out":path}}),
+        )
+        .expect("plan");
+
+        let written = sink_secret_result(
+            &plan,
+            &json!({
+                "id":"service-token-id",
+                "client_id":"service-token-client-id.access",
+                "client_secret":"service-token-secret-must-not-leak",
+                "name":"deployment automation"
+            }),
+        )
+        .expect("credential bundle");
+        assert_eq!(written, path);
+        let payload: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("credential bundle contents"))
+                .expect("credential bundle JSON");
+        assert_eq!(
+            payload,
+            json!({
+                "client_id":"service-token-client-id.access",
+                "client_secret":"service-token-secret-must-not-leak"
+            })
+        );
+        assert!(!payload.to_string().contains("service-token-id"));
+        assert!(!payload.to_string().contains("deployment automation"));
+        assert_eq!(
+            capability_call_argv(&plan.capability)
+                .expect("service-token call")
+                .iter()
+                .find(|argument| argument.contains("0600"))
+                .map(String::as_str),
+            Some("<new-mode-0600-json-path>")
+        );
+        let mut risk_metadata_drift = plan.capability.clone();
+        risk_metadata_drift.risk = RiskClass::Unknown;
+        assert!(is_secret_output_capability(&risk_metadata_drift));
+        assert_eq!(
+            secret_sink_format(&risk_metadata_drift),
+            Some("access_service_token_json")
+        );
+        assert_eq!(
+            capability_call_argv(&risk_metadata_drift)
+                .expect("service-token call despite risk metadata drift")
+                .iter()
+                .find(|argument| argument.contains("0600"))
+                .map(String::as_str),
+            Some("<new-mode-0600-json-path>")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("credential bundle metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn access_service_token_sink_rejects_incomplete_credentials_before_file_creation() {
+        for result in [
+            json!({"client_id":"service-token-client-id.access"}),
+            json!({"client_secret":"service-token-secret"}),
+            json!({"client_id":"","client_secret":"service-token-secret"}),
+        ] {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = directory.path().join("access-service-token.json");
+            let mut capability = CapabilityV1::new(
+                "access-service-tokens-create-a-service-token",
+                "Create a service token",
+                "POST",
+                "/accounts/{account_id}/access/service_tokens",
+            );
+            capability.product = "Access service tokens".to_owned();
+            capability.risk = RiskClass::SecretSensitive;
+            capability.verification.strategy =
+                "created_resource_contains_planned_fields_by_returned_id".to_owned();
+            let plan = PlanV1::draft(
+                "profile-a",
+                "account-a",
+                "catalog-sha",
+                capability,
+                json!({"adapter":{"value_out":path}}),
+            )
+            .expect("plan");
+
+            assert!(sink_secret_result(&plan, &result).is_err());
+            assert!(!path.exists());
+        }
     }
 
     #[test]

@@ -948,23 +948,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
         }
     }
 
-    classify_exact_resource_contracts(document, &mut capabilities);
-    classify_parent_collection_delete_contracts(document, &mut capabilities);
-    classify_parent_collection_update_contracts(document, &mut capabilities);
-    classify_created_resource_contracts(document, &mut capabilities);
-    classify_created_collection_resource_contracts(document, &mut capabilities);
-    classify_global_warp_override_contract(document, &mut capabilities);
-    classify_same_path_object_mutation_contracts(document, &mut capabilities);
-    finalize_oauth_client_secret_rotation_contract(document, &mut capabilities);
-    finalize_global_warp_override_rollback_contract(&mut capabilities);
-    finalize_d1_read_replication_rollback_contract(&mut capabilities);
-    finalize_cloudflare_tunnel_configuration_rollback_contract(&mut capabilities);
-    finalize_warp_connector_configuration_rollback_contract(&mut capabilities);
-    finalize_web_analytics_rum_rollback_contract(document, &mut capabilities);
-    finalize_dns_record_rollback_contract(document, &mut capabilities);
-    for capability in capabilities.values_mut() {
-        block_unsupported_response_contract(capability);
-    }
+    apply_post_normalization_contracts(document, &mut capabilities);
 
     let source_hash = hash_value(document)?;
     let mut snapshot = CatalogSnapshot {
@@ -977,6 +961,30 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     };
     snapshot.refresh_hash()?;
     Ok(snapshot)
+}
+
+fn apply_post_normalization_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    classify_exact_resource_contracts(document, capabilities);
+    classify_parent_collection_delete_contracts(document, capabilities);
+    classify_parent_collection_update_contracts(document, capabilities);
+    classify_access_service_token_create_contract(document, capabilities);
+    classify_created_resource_contracts(document, capabilities);
+    classify_created_collection_resource_contracts(document, capabilities);
+    classify_global_warp_override_contract(document, capabilities);
+    classify_same_path_object_mutation_contracts(document, capabilities);
+    finalize_oauth_client_secret_rotation_contract(document, capabilities);
+    finalize_global_warp_override_rollback_contract(capabilities);
+    finalize_d1_read_replication_rollback_contract(capabilities);
+    finalize_cloudflare_tunnel_configuration_rollback_contract(capabilities);
+    finalize_warp_connector_configuration_rollback_contract(capabilities);
+    finalize_web_analytics_rum_rollback_contract(document, capabilities);
+    finalize_dns_record_rollback_contract(document, capabilities);
+    for capability in capabilities.values_mut() {
+        block_unsupported_response_contract(capability);
+    }
 }
 
 fn classify_same_path_object_mutation_contracts(
@@ -4296,6 +4304,226 @@ const ACCESS_AUTHORIZATION_CONFIGURATION_CONTRACTS: &[AccessAuthorizationConfigu
         kind: AccessAuthorizationConfigurationKind::Policy,
     },
 ];
+
+const ACCESS_SERVICE_TOKEN_CREATE_CAPABILITY_ID: &str =
+    "access-service-tokens-create-a-service-token";
+const ACCESS_SERVICE_TOKEN_GET_CAPABILITY_ID: &str = "access-service-tokens-get-a-service-token";
+const ACCESS_SERVICE_TOKEN_DELETE_CAPABILITY_ID: &str =
+    "access-service-tokens-delete-a-service-token";
+const ACCESS_SERVICE_TOKEN_COLLECTION_PATH: &str = "/accounts/{account_id}/access/service_tokens";
+const ACCESS_SERVICE_TOKEN_DETAIL_PATH: &str =
+    "/accounts/{account_id}/access/service_tokens/{service_token_id}";
+
+fn classify_access_service_token_create_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    if !access_service_token_create_contract_supported(document, capabilities) {
+        return;
+    }
+    let Some(capability) = capabilities.get_mut(ACCESS_SERVICE_TOKEN_CREATE_CAPABILITY_ID) else {
+        return;
+    };
+
+    capability.request_schema = Some(serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+            "duration": {"type": "string"},
+            "name": {"type": "string"}
+        },
+        "x-cfctl-body-required": true
+    }));
+    capability.risk = RiskClass::SecretSensitive;
+    capability.effect = EffectClass::IdentityOrOwnership;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.billing_model = BillingModelV1::Subscription;
+    capability.cost.exposure = CostExposureV1::AccountQuote;
+    capability.cost.basis = Some(
+        "creating an Access service token has no direct operation charge; the account's service-token capacity and any separately negotiated increase remain part of its existing Zero Trust subscription"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Cloudflare Access service tokens".to_owned(),
+            url: "https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/"
+                .to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare One account limits".to_owned(),
+            url: "https://developers.cloudflare.com/cloudflare-one/account-limits/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Create an Access service token".to_owned(),
+            url: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/methods/create/"
+                .to_owned(),
+            source: "official Cloudflare API".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare Zero Trust and SASE plans".to_owned(),
+            url: "https://www.cloudflare.com/plans/zero-trust-services/".to_owned(),
+            source: "official Cloudflare pricing".to_owned(),
+        },
+    ];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans = BTreeMap::from([
+        ("free".to_owned(), true),
+        ("pay_as_you_go".to_owned(), true),
+        ("contract".to_owned(), true),
+    ]);
+    capability.entitlement.blocker = None;
+    capability.entitlement.source =
+        Some("https://www.cloudflare.com/plans/zero-trust-services/".to_owned());
+    capability.entitlement.requires_live_resolution = false;
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+    refresh_dynamic_mutation_contract(capability);
+}
+
+fn access_service_token_create_contract_supported(
+    document: &Value,
+    capabilities: &BTreeMap<String, CapabilityV1>,
+) -> bool {
+    let Some(create) = capabilities.get(ACCESS_SERVICE_TOKEN_CREATE_CAPABILITY_ID) else {
+        return false;
+    };
+    let Some(read) = capabilities.get(ACCESS_SERVICE_TOKEN_GET_CAPABILITY_ID) else {
+        return false;
+    };
+    let Some(delete) = capabilities.get(ACCESS_SERVICE_TOKEN_DELETE_CAPABILITY_ID) else {
+        return false;
+    };
+    if create.method != "POST"
+        || create.path != ACCESS_SERVICE_TOKEN_COLLECTION_PATH
+        || create.product != "Access service tokens"
+        || create.permissions != ["Access: Service Tokens Write"]
+        || !access_service_token_collection_selectors_supported(create)
+        || !access_service_token_source_create_request_supported(create)
+        || !create.description.as_deref().is_some_and(|description| {
+            description.contains("only time you can get the Client Secret")
+                && description.contains("rotate the Client Secret or create a new service token")
+        })
+        || !access_service_token_response_contract_supported(
+            create.response_contract.as_ref(),
+            "201",
+        )
+        || read.method != "GET"
+        || read.path != ACCESS_SERVICE_TOKEN_DETAIL_PATH
+        || read.product != "Access service tokens"
+        || read.permissions.len() != 2
+        || !read
+            .permissions
+            .iter()
+            .any(|permission| permission == "Access: Service Tokens Write")
+        || !read
+            .permissions
+            .iter()
+            .any(|permission| permission == "Access: Service Tokens Read")
+        || !access_service_token_detail_selectors_supported(read)
+        || !access_service_token_response_contract_supported(read.response_contract.as_ref(), "200")
+        || delete.method != "DELETE"
+        || delete.path != ACCESS_SERVICE_TOKEN_DETAIL_PATH
+        || delete.product != "Access service tokens"
+        || delete.permissions != ["Access: Service Tokens Write"]
+        || delete.request_schema.is_some()
+        || !access_service_token_detail_selectors_supported(delete)
+        || !access_service_token_response_contract_supported(
+            delete.response_contract.as_ref(),
+            "200",
+        )
+    {
+        return false;
+    }
+
+    let Some(create_operation) = document
+        .get("paths")
+        .and_then(Value::as_object)
+        .and_then(|paths| paths.get(ACCESS_SERVICE_TOKEN_COLLECTION_PATH))
+        .and_then(|path| path.get("post"))
+    else {
+        return false;
+    };
+    let Some(read_operation) = document
+        .get("paths")
+        .and_then(Value::as_object)
+        .and_then(|paths| paths.get(ACCESS_SERVICE_TOKEN_DETAIL_PATH))
+        .and_then(|path| path.get("get"))
+    else {
+        return false;
+    };
+    ["id", "client_id", "client_secret"].iter().all(|field| {
+        success_response_declares_result_string_field(document, create_operation, field)
+    }) && ["id", "client_id", "duration", "name"]
+        .iter()
+        .all(|field| success_response_declares_result_string_field(document, read_operation, field))
+}
+
+fn access_service_token_response_contract_supported(
+    response: Option<&ResponseContractV1>,
+    status: &str,
+) -> bool {
+    response.is_some_and(|response| {
+        response.success_statuses == [status]
+            && response.success_media_types == ["application/json"]
+            && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+    })
+}
+
+fn access_service_token_collection_selectors_supported(capability: &CapabilityV1) -> bool {
+    capability.selectors.len() == 1
+        && access_service_token_selector_supported(capability, "account_id", 32)
+}
+
+fn access_service_token_detail_selectors_supported(capability: &CapabilityV1) -> bool {
+    capability.selectors.len() == 2
+        && access_service_token_selector_supported(capability, "account_id", 32)
+        && access_service_token_selector_supported(capability, "service_token_id", 36)
+}
+
+fn access_service_token_selector_supported(
+    capability: &CapabilityV1,
+    name: &str,
+    max_length: u64,
+) -> bool {
+    capability.selectors.iter().any(|selector| {
+        selector.name == name
+            && selector.location == "path"
+            && selector.required
+            && selector.value_type == "string"
+            && selector.contract.as_ref().is_some_and(|contract| {
+                contract.schema == serde_json::json!({"maxLength":max_length,"type":"string"})
+                    && contract.query.is_none()
+            })
+    })
+}
+
+fn access_service_token_source_create_request_supported(capability: &CapabilityV1) -> bool {
+    let Some(schema) = capability.request_schema.as_ref() else {
+        return false;
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    if schema
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value_type| value_type != "object")
+        || schema.get("required") != Some(&serde_json::json!(["name"]))
+        || schema.get("x-cfctl-body-required").and_then(Value::as_bool) != Some(true)
+        || properties.len() != 4
+    {
+        return false;
+    }
+    properties.get("client_secret_version") == Some(&serde_json::json!({"type":"number"}))
+        && properties.get("duration") == Some(&serde_json::json!({"type":"string"}))
+        && properties.get("name") == Some(&serde_json::json!({"type":"string"}))
+        && properties.get("previous_client_secret_expires_at")
+            == Some(&serde_json::json!({"format":"date-time","type":"string"}))
+}
 
 fn access_authorization_configuration_kind(
     capability: &CapabilityV1,

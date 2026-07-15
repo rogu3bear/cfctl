@@ -3259,6 +3259,246 @@ fn access_authorization_configuration_classifier_rejects_retargeting_and_permiss
     assert_eq!(drifted_create.adapter_status, AdapterStatus::Blocked);
 }
 
+fn access_service_token_fixture() -> serde_json::Value {
+    let mut fixture = json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "components": {
+            "schemas": {
+                "ServiceToken": {
+                    "type":"object",
+                    "properties": {
+                        "id":{"type":"string"},
+                        "client_id":{"type":"string"},
+                        "client_secret":{"type":"string"},
+                        "client_secret_version":{"type":"number"},
+                        "created_at":{"type":"string","format":"date-time"},
+                        "duration":{"type":"string"},
+                        "expires_at":{"type":"string","format":"date-time"},
+                        "name":{"type":"string"},
+                        "previous_client_secret_expires_at":{"type":"string","format":"date-time"},
+                        "updated_at":{"type":"string","format":"date-time"}
+                    }
+                },
+                "ServiceTokenResponse": {
+                    "type":"object",
+                    "properties": {
+                        "success":{"type":"boolean"},
+                        "result":{"$ref":"#/components/schemas/ServiceToken"}
+                    }
+                }
+            }
+        },
+        "paths": {
+            "/accounts/{account_id}/access/service_tokens": {
+                "parameters":[
+                    {"in":"path","name":"account_id","required":true,"description":"Identifier.","schema":{"type":"string","maxLength":32}}
+                ],
+                "post": {
+                    "operationId":"access-service-tokens-create-a-service-token",
+                    "summary":"Create a service token",
+                    "description":"Generates a new service token. **Note:** This is the only time you can get the Client Secret. If you lose the Client Secret, you will have to rotate the Client Secret or create a new service token.",
+                    "tags":["Access service tokens"],
+                    "x-api-token-group":["Access: Service Tokens Write"],
+                    "requestBody": {
+                        "required":true,
+                        "content":{"application/json":{"schema":{
+                            "type":"object",
+                            "required":["name"],
+                            "properties":{
+                                "client_secret_version":{"type":"number"},
+                                "duration":{"type":"string"},
+                                "name":{"type":"string"},
+                                "previous_client_secret_expires_at":{"type":"string","format":"date-time"}
+                            }
+                        }}}
+                    },
+                    "responses":{"201":{
+                        "description":"Service token created",
+                        "content":{"application/json":{"schema":{"$ref":"#/components/schemas/ServiceTokenResponse"}}}
+                    }}
+                }
+            },
+            "/accounts/{account_id}/access/service_tokens/{service_token_id}": {
+                "parameters":[
+                    {"in":"path","name":"service_token_id","required":true,"description":"UUID.","schema":{"type":"string","maxLength":36}},
+                    {"in":"path","name":"account_id","required":true,"description":"Identifier.","schema":{"type":"string","maxLength":32}}
+                ],
+                "get": {
+                    "operationId":"access-service-tokens-get-a-service-token",
+                    "summary":"Get a service token",
+                    "tags":["Access service tokens"],
+                    "x-api-token-group":["Access: Service Tokens Write","Access: Service Tokens Read"],
+                    "responses":{"200":{
+                        "description":"Service token",
+                        "content":{"application/json":{"schema":{"$ref":"#/components/schemas/ServiceTokenResponse"}}}
+                    }}
+                },
+                "delete": {
+                    "operationId":"access-service-tokens-delete-a-service-token",
+                    "summary":"Delete a service token",
+                    "tags":["Access service tokens"],
+                    "x-api-token-group":["Access: Service Tokens Write"],
+                    "responses":{"200":{
+                        "description":"Service token deleted",
+                        "content":{"application/json":{"schema":{"$ref":"#/components/schemas/ServiceTokenResponse"}}}
+                    }}
+                }
+            }
+        }
+    });
+    fixture["paths"]
+        .as_object_mut()
+        .expect("Access service-token paths")
+        .insert(
+            "/accounts/{account_id}/access/service_tokens/{service_token_id}/rotate".to_owned(),
+            access_service_token_rotate_fixture(),
+        );
+    fixture
+}
+
+fn access_service_token_rotate_fixture() -> serde_json::Value {
+    json!({
+        "parameters":[
+            {"in":"path","name":"service_token_id","required":true,"description":"UUID.","schema":{"type":"string","maxLength":36}},
+            {"in":"path","name":"account_id","required":true,"description":"Identifier.","schema":{"type":"string","maxLength":32}}
+        ],
+        "post": {
+            "operationId":"access-service-tokens-rotate-a-service-token",
+            "summary":"Rotate a service token",
+            "description":"Generates a new Client Secret for a service token and revokes the old one.",
+            "tags":["Access service tokens"],
+            "requestBody": {
+                "required":false,
+                "content":{"application/json":{"schema":{
+                    "type":"object",
+                    "properties":{"previous_client_secret_expires_at":{"type":"string","format":"date-time"}}
+                }}}
+            },
+            "responses":{"200":{
+                "description":"Service token rotated",
+                "content":{"application/json":{"schema":{"$ref":"#/components/schemas/ServiceTokenResponse"}}}
+            }}
+        }
+    })
+}
+
+#[test]
+fn access_service_token_creation_is_a_secret_safe_exact_resource_lifecycle() {
+    let snapshot =
+        normalize_openapi(&access_service_token_fixture()).expect("Access token catalog");
+    let create = snapshot
+        .get("access-service-tokens-create-a-service-token")
+        .expect("Access service-token create");
+
+    assert_eq!(create.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(create.risk, RiskClass::SecretSensitive);
+    assert_eq!(create.effect, EffectClass::IdentityOrOwnership);
+    assert!(create.cost.known);
+    assert!(!create.cost.incremental);
+    assert_eq!(create.cost.maximum, Some(0.0));
+    assert_eq!(create.cost.billing_model, BillingModelV1::Subscription);
+    assert_eq!(create.cost.exposure, CostExposureV1::AccountQuote);
+    assert!(create.cost.references.iter().any(|reference| {
+        reference.url
+            == "https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/"
+    }));
+    assert!(create.cost.references.iter().any(|reference| {
+        reference.url == "https://developers.cloudflare.com/cloudflare-one/account-limits/"
+    }));
+    assert_eq!(create.entitlement.available, Some(true));
+    assert_eq!(create.entitlement.plans.get("free"), Some(&true));
+    assert_eq!(create.entitlement.plans.get("pay_as_you_go"), Some(&true));
+    assert_eq!(create.entitlement.plans.get("contract"), Some(&true));
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    let target = create
+        .created_resource
+        .as_ref()
+        .expect("exact resource target");
+    assert_eq!(
+        target.detail_path,
+        "/accounts/{account_id}/access/service_tokens/{service_token_id}"
+    );
+    assert_eq!(target.identity_selector, "service_token_id");
+    assert_eq!(target.response_result_identity_pointer, "/id");
+    assert_eq!(
+        target.read_capability_id,
+        "access-service-tokens-get-a-service-token"
+    );
+    assert_eq!(
+        target.delete_capability_id,
+        "access-service-tokens-delete-a-service-token"
+    );
+    assert_eq!(target.verified_response_fields, ["duration", "name"]);
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    assert_eq!(
+        create
+            .request_schema
+            .as_ref()
+            .expect("narrow create schema"),
+        &json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":["name"],
+            "properties":{
+                "duration":{"type":"string"},
+                "name":{"type":"string"}
+            },
+            "x-cfctl-body-required":true
+        })
+    );
+    assert!(create.mutation_contract_gaps().is_empty());
+
+    let rotate = snapshot
+        .get("access-service-tokens-rotate-a-service-token")
+        .expect("Access service-token rotate");
+    assert_eq!(rotate.adapter_status, AdapterStatus::Blocked);
+    assert!(rotate.permissions.is_empty());
+    assert!(rotate.blocked_reason.as_deref().is_some_and(|reason| {
+        reason.contains("required Cloudflare permission lane is not declared")
+    }));
+}
+
+#[test]
+fn access_service_token_creation_classifier_rejects_authority_and_schema_drift() {
+    let blocked = |document: serde_json::Value| {
+        normalize_openapi(&document)
+            .expect("drifted Access service-token catalog")
+            .get("access-service-tokens-create-a-service-token")
+            .expect("Access service-token create")
+            .adapter_status
+            == AdapterStatus::Blocked
+    };
+
+    let mut permission = access_service_token_fixture();
+    permission["paths"]["/accounts/{account_id}/access/service_tokens"]["post"]["x-api-token-group"] =
+        json!(["Account Settings Write"]);
+    assert!(blocked(permission));
+
+    let mut request = access_service_token_fixture();
+    request["paths"]["/accounts/{account_id}/access/service_tokens"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["tamper_mode"] = json!({"type":"boolean"});
+    assert!(blocked(request));
+
+    let mut secret = access_service_token_fixture();
+    secret["components"]["schemas"]["ServiceToken"]["properties"]["client_secret"]["type"] =
+        json!("integer");
+    assert!(blocked(secret));
+
+    let mut detail = access_service_token_fixture();
+    detail["components"]["schemas"]["ServiceToken"]["properties"]
+        .as_object_mut()
+        .expect("service-token fields")
+        .remove("client_id");
+    assert!(blocked(detail));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoadBalancingFixtureKind {
     MonitorOrPool,

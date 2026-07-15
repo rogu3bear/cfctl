@@ -114,7 +114,9 @@ truth; use a live `call` for edge/account assertions.
 - The global-key profile is emergency-only and never selected silently.
 - Keychain on macOS and Secret Service on Linux hold credentials.
 - Secret inputs come from stdin and become opaque key-store references.
-- Secret outputs require `--value-out` to a new mode-0600 file.
+- Secret outputs require `--value-out` to a new mode-0600 file. Access
+  service-token creation writes a JSON object containing exactly `client_id`
+  and `client_secret`; other secret outputs remain opaque text.
 - stdout, plans, logs, subprocess receipts, and evidence are redacted.
 
 ## Adapter rules

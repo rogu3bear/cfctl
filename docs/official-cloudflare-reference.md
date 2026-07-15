@@ -44,6 +44,18 @@ Docs access patterns worth remembering:
   https://developers.cloudflare.com/tunnel/advanced/tunnel-tokens/
 - Access service tokens:
   https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/
+- Access service-token API overview:
+  https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/
+- Create an Access service token:
+  https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/methods/create/
+- Get an Access service token:
+  https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/methods/get/
+- Rotate an Access service token:
+  https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/methods/rotate/
+- Cloudflare One account limits:
+  https://developers.cloudflare.com/cloudflare-one/account-limits/
+- Cloudflare Zero Trust and SASE plans:
+  https://www.cloudflare.com/plans/zero-trust-services/
 - Zero Trust API reference:
   https://developers.cloudflare.com/api/resources/zero_trust/
 - GraphQL Analytics API:
