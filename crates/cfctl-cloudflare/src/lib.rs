@@ -388,79 +388,21 @@ impl Executor {
             .map_err(cfctl_core::CoreError::Serialization)?;
         validate_verification_preconditions(&plan.capability, &input)?;
         if strategy.starts_with("api_token_details_") {
-            let (token_id, expectation) =
-                token_verification_target(strategy, &input, apply_response)?;
-            let account_scoped = plan.capability.path.starts_with("/accounts/");
-            let details_path = if account_scoped {
-                "/accounts/{account_id}/tokens/{token_id}"
-            } else {
-                "/user/tokens/{token_id}"
-            };
-            let details = CapabilityV1::new(
-                "api-token-verification-readback",
-                "API token verification readback",
-                "GET",
-                details_path,
-            );
-            let selectors = if account_scoped {
-                serde_json::json!({"account_id": plan.account_id, "token_id": token_id})
-            } else {
-                serde_json::json!({"token_id": token_id})
-            };
-            let request = self.builder.build(
-                &details,
-                &CallInput {
-                    selectors,
-                    query: Value::Object(serde_json::Map::new()),
-                    body: None,
-                    ..CallInput::default()
-                },
-            )?;
-            let readback = self.send(&request, credential).await?;
-            let (passed, basis) = evaluate_token_readback(expectation, &token_id, &readback);
-            return Ok(OperationVerificationV1 {
-                strategy: strategy.to_owned(),
-                passed,
-                basis,
-                readback,
-            });
+            return self
+                .verify_api_token(plan, apply_response, &input, credential)
+                .await;
         }
 
         if strategy.starts_with("dns_record_details_") {
-            let (zone_id, record_id, expectation) =
-                dns_record_verification_target(strategy, &input, apply_response)?;
-            let details = CapabilityV1::new(
-                "dns-record-verification-readback",
-                "DNS record verification readback",
-                "GET",
-                "/zones/{zone_id}/dns_records/{dns_record_id}",
-            );
-            let request = self.builder.build(
-                &details,
-                &CallInput {
-                    selectors: serde_json::json!({
-                        "zone_id": zone_id,
-                        "dns_record_id": record_id,
-                    }),
-                    query: Value::Object(serde_json::Map::new()),
-                    body: None,
-                    ..CallInput::default()
-                },
-            )?;
-            let readback = self.send(&request, credential).await?;
-            let (passed, basis) = evaluate_dns_record_readback(
-                expectation,
-                &record_id,
-                input.body.as_ref(),
-                apply_response,
-                &readback,
-            )?;
-            return Ok(OperationVerificationV1 {
-                strategy: strategy.to_owned(),
-                passed,
-                basis,
-                readback,
-            });
+            return self
+                .verify_dns_record(plan, apply_response, &input, credential)
+                .await;
+        }
+
+        if strategy.starts_with("oauth_client_") {
+            return self
+                .verify_oauth_client_secret_rotation(plan, apply_response, &input, credential)
+                .await;
         }
 
         if is_delete_verifier(strategy) {
@@ -482,6 +424,148 @@ impl Executor {
         Err(CloudflareError::UnsupportedVerificationStrategy(
             strategy.to_owned(),
         ))
+    }
+
+    async fn verify_api_token(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let strategy = plan.capability.verification.strategy.as_str();
+        let (token_id, expectation) = token_verification_target(strategy, input, apply_response)?;
+        let account_scoped = plan.capability.path.starts_with("/accounts/");
+        let details_path = if account_scoped {
+            "/accounts/{account_id}/tokens/{token_id}"
+        } else {
+            "/user/tokens/{token_id}"
+        };
+        let details = CapabilityV1::new(
+            "api-token-verification-readback",
+            "API token verification readback",
+            "GET",
+            details_path,
+        );
+        let selectors = if account_scoped {
+            serde_json::json!({"account_id": plan.account_id, "token_id": token_id})
+        } else {
+            serde_json::json!({"token_id": token_id})
+        };
+        let request = self.builder.build(
+            &details,
+            &CallInput {
+                selectors,
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let (passed, basis) = evaluate_token_readback(expectation, &token_id, &readback);
+        Ok(OperationVerificationV1 {
+            strategy: strategy.to_owned(),
+            passed,
+            basis,
+            readback,
+        })
+    }
+
+    async fn verify_dns_record(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let strategy = plan.capability.verification.strategy.as_str();
+        let (zone_id, record_id, expectation) =
+            dns_record_verification_target(strategy, input, apply_response)?;
+        let details = CapabilityV1::new(
+            "dns-record-verification-readback",
+            "DNS record verification readback",
+            "GET",
+            "/zones/{zone_id}/dns_records/{dns_record_id}",
+        );
+        let request = self.builder.build(
+            &details,
+            &CallInput {
+                selectors: serde_json::json!({
+                    "zone_id": zone_id,
+                    "dns_record_id": record_id,
+                }),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let (passed, basis) = evaluate_dns_record_readback(
+            expectation,
+            &record_id,
+            input.body.as_ref(),
+            apply_response,
+            &readback,
+        )?;
+        Ok(OperationVerificationV1 {
+            strategy: strategy.to_owned(),
+            passed,
+            basis,
+            readback,
+        })
+    }
+
+    async fn verify_oauth_client_secret_rotation(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let strategy = plan.capability.verification.strategy.as_str();
+        let target = plan.capability.same_path_read.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the hash-bound OAuth client detail readback contract is absent".to_owned(),
+            )
+        })?;
+        let oauth_client_id = input
+            .selectors
+            .get("oauth_client_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the planned OAuth client selector is absent or empty".to_owned(),
+                )
+            })?;
+        let details = same_path_verification_capability(
+            &plan.capability,
+            &target.read_capability_id,
+            "OAuth client secret rotation verification readback",
+            &target.path,
+        );
+        let request = self.builder.build(
+            &details,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let (passed, basis) = evaluate_oauth_client_secret_readback(
+            strategy,
+            oauth_client_id,
+            apply_response,
+            &readback,
+        )?;
+        Ok(OperationVerificationV1 {
+            strategy: strategy.to_owned(),
+            passed,
+            basis,
+            readback,
+        })
     }
 
     async fn verify_resource_create(
@@ -1746,12 +1830,89 @@ fn render_field_names(fields: &[String]) -> String {
     }
 }
 
+fn evaluate_oauth_client_secret_readback(
+    strategy: &str,
+    oauth_client_id: &str,
+    apply_response: &CloudflareResponseV1,
+    readback: &CloudflareResponseV1,
+) -> Result<(bool, String)> {
+    let readback_identity_matches =
+        readback.result.get("client_id").and_then(Value::as_str) == Some(oauth_client_id);
+    let apply_status_matches = apply_response.status == 200;
+    let readback_status_matches = readback.status == 200;
+    let rotated_state = readback
+        .result
+        .get("has_rotated_secret")
+        .and_then(Value::as_bool);
+    match strategy {
+        "oauth_client_reports_rotated_secret_after_value_roll" => {
+            let client_secret_present = apply_response
+                .result
+                .get("client_secret")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty());
+            let rotated_state_matches = rotated_state == Some(true);
+            let passed = apply_response.success
+                && apply_status_matches
+                && client_secret_present
+                && readback.success
+                && readback_status_matches
+                && readback_identity_matches
+                && rotated_state_matches;
+            let basis = format!(
+                "OAuth client rotation proof (apply HTTP {}, apply success={}, one-time client secret present={}, readback HTTP {}, readback success={}, readback client identity matches={}, has_rotated_secret=true={})",
+                apply_response.status,
+                apply_response.success,
+                client_secret_present,
+                readback.status,
+                readback.success,
+                readback_identity_matches,
+                rotated_state_matches
+            );
+            Ok((passed, basis))
+        }
+        "oauth_client_reports_no_rotated_secret_after_old_secret_delete" => {
+            let apply_identity_matches =
+                apply_response.result.get("id").and_then(Value::as_str) == Some(oauth_client_id);
+            let rotated_state_matches = rotated_state == Some(false);
+            let passed = apply_response.success
+                && apply_status_matches
+                && apply_identity_matches
+                && readback.success
+                && readback_status_matches
+                && readback_identity_matches
+                && rotated_state_matches;
+            let basis = format!(
+                "OAuth client old-secret deletion proof (apply HTTP {}, apply success={}, apply identity matches={}, readback HTTP {}, readback success={}, readback client identity matches={}, has_rotated_secret=false={})",
+                apply_response.status,
+                apply_response.success,
+                apply_identity_matches,
+                readback.status,
+                readback.success,
+                readback_identity_matches,
+                rotated_state_matches
+            );
+            Ok((passed, basis))
+        }
+        _ => Err(CloudflareError::UnsupportedVerificationStrategy(
+            strategy.to_owned(),
+        )),
+    }
+}
+
 fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
     let strategy = capability.verification.strategy.as_str();
     if !capability.verification_contract_supported() {
         return Err(CloudflareError::UnsupportedVerificationStrategy(
             strategy.to_owned(),
         ));
+    }
+    if matches!(
+        strategy,
+        "oauth_client_reports_rotated_secret_after_value_roll"
+            | "oauth_client_reports_no_rotated_secret_after_old_secret_delete"
+    ) {
+        return validate_oauth_client_secret_target(capability, input);
     }
     let body_label = match strategy {
         "created_resource_contains_planned_fields_by_returned_id"
@@ -1799,6 +1960,45 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
         }
         _ => Ok(()),
     }
+}
+
+fn validate_oauth_client_secret_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    let target = capability.same_path_read.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the hash-bound OAuth client detail readback contract is absent".to_owned(),
+        )
+    })?;
+    if target.path != "/accounts/{account_id}/oauth_clients/{oauth_client_id}"
+        || target.read_capability_id != "oauth-clients-get"
+        || target.verified_response_fields != ["client_id", "has_rotated_secret"]
+        || capability.request_schema.is_some()
+        || input.body.is_some()
+        || !clean_verification_query(input)
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the OAuth client secret operation does not match its hash-bound body-free detail readback contract"
+                .to_owned(),
+        ));
+    }
+    let selectors = input.selectors.as_object().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the planned OAuth client selectors are not an object".to_owned(),
+        )
+    })?;
+    if selectors.len() != 2
+        || ["account_id", "oauth_client_id"].iter().any(|name| {
+            selectors
+                .get(*name)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        })
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned OAuth client selectors are missing, empty, or broader than the exact account and client target"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn clean_verification_query(input: &CallInput) -> bool {

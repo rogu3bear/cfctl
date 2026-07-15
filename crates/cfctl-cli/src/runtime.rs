@@ -1199,8 +1199,210 @@ const DNS_RECORD_DETAIL_READ_CAPABILITY_ID: &str = "dns-records-for-a-zone-dns-r
 const DNS_RECORD_DETAIL_PATH: &str = "/zones/{zone_id}/dns_records/{dns_record_id}";
 const DNS_RECORD_STATE_PRECONDITION: &str = "dns_record_state";
 const DNS_RECORD_RESTORE_CAPABILITY_ID: &str = "dns-records-for-a-zone-update-dns-record";
+const OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID: &str = "oauth-clients-get";
+const OAUTH_CLIENT_DETAIL_PATH: &str = "/accounts/{account_id}/oauth_clients/{oauth_client_id}";
+const OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION: &str = "oauth_client_key_overlap";
 const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str = "zone-subscription-zone-subscription-details";
+
+fn oauth_client_secret_expected_prior_state(capability: &CapabilityV1) -> Option<bool> {
+    match (
+        capability.id.as_str(),
+        capability.method.as_str(),
+        capability.verification.strategy.as_str(),
+    ) {
+        (
+            "oauth-clients-rotate-secret",
+            "POST",
+            "oauth_client_reports_rotated_secret_after_value_roll",
+        ) => Some(false),
+        (
+            "oauth-clients-delete-rotated-secret",
+            "DELETE",
+            "oauth_client_reports_no_rotated_secret_after_old_secret_delete",
+        ) => Some(true),
+        _ => None,
+    }
+}
+
+fn should_bind_oauth_client_secret_state(capability: &CapabilityV1) -> bool {
+    oauth_client_secret_expected_prior_state(capability).is_some()
+        && capability.mutating
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.verification_contract_supported()
+}
+
+fn oauth_client_detail_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == OAUTH_CLIENT_DETAIL_PATH
+        && capability.product == "OAuth Clients"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && capability.permissions == ["OAuth Client Read"]
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.selectors.len() == 2
+        && ["account_id", "oauth_client_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|contract| {
+                matches!(
+                    contract.body_mode,
+                    cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                ) && contract.success_statuses == ["200"]
+                    && contract.success_media_types == ["application/json"]
+            })
+}
+
+fn apply_oauth_client_secret_state_response(
+    capability: &CapabilityV1,
+    account_id: &str,
+    oauth_client_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !should_bind_oauth_client_secret_state(capability) {
+        return Err(CliError::Input(
+            "OAuth client secret operation drifted from its governed two-secret cutover contract"
+                .to_owned(),
+        ));
+    }
+    if !response.success || response.status != 200 {
+        return Err(CliError::Input(format!(
+            "OAuth client state read did not return the exact successful HTTP 200 contract (received {}); the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    if response.result.get("client_id").and_then(Value::as_str) != Some(oauth_client_id) {
+        return Err(CliError::Input(
+            "OAuth client state read returned a different or missing client id; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    let has_rotated_secret = response
+        .result
+        .get("has_rotated_secret")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth client state read omitted the two-secret state; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+    let expected = oauth_client_secret_expected_prior_state(capability)
+        .ok_or_else(|| CliError::Input("OAuth client cutover phase is unsupported".to_owned()))?;
+    if has_rotated_secret != expected {
+        let required_state = if expected {
+            "two active secrets before deleting the old one"
+        } else {
+            "one active secret before creating the overlap secret"
+        };
+        return Err(CliError::Input(format!(
+            "OAuth client secret operation requires {required_state}; the mutation boundary was not crossed"
+        )));
+    }
+    Ok(json!({
+        "schema_version": 1,
+        "source_capability_id": OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID,
+        "source_path": OAUTH_CLIENT_DETAIL_PATH,
+        "target_capability_id": capability.id,
+        "target_method": capability.method,
+        "target_scope": "account",
+        "account_id": account_id,
+        "oauth_client_id": oauth_client_id,
+        "key_overlap_active": has_rotated_secret,
+    }))
+}
+
+async fn read_live_oauth_client_secret_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !should_bind_oauth_client_secret_state(capability) {
+        return Err(CliError::Input(
+            "OAuth client secret operation drifted from its governed prior-state contract"
+                .to_owned(),
+        ));
+    }
+    let selected_account = input
+        .selectors
+        .get("account_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth client state precondition requires string selector `account_id`".to_owned(),
+            )
+        })?;
+    if selected_account != account_id {
+        return Err(CliError::Input(
+            "OAuth client target account differs from the selected account; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    let oauth_client_id = input
+        .selectors
+        .get("oauth_client_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth client state precondition requires string selector `oauth_client_id`"
+                    .to_owned(),
+            )
+        })?;
+    let source_capability = catalog
+        .get(OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID))?;
+    if !oauth_client_detail_read_contract_supported(source_capability) {
+        return Err(CliError::Input(
+            "OAuth client state source capability drifted from the governed client detail read"
+                .to_owned(),
+        ));
+    }
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source_capability,
+            &CallInput {
+                selectors: json!({
+                    "account_id":account_id,
+                    "oauth_client_id":oauth_client_id
+                }),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt = apply_oauth_client_secret_state_response(
+        capability,
+        account_id,
+        oauth_client_id,
+        &response,
+    )?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
 
 fn is_global_warp_override_mutation(capability: &CapabilityV1) -> bool {
     capability.id == GLOBAL_WARP_OVERRIDE_MUTATION_CAPABILITY_ID
@@ -2581,6 +2783,7 @@ fn plan_requires_live_credential(capability: &CapabilityV1) -> bool {
         || should_bind_warp_connector_configuration_state(capability)
         || should_bind_web_analytics_rum_state(capability)
         || should_bind_dns_record_state(capability)
+        || should_bind_oauth_client_secret_state(capability)
 }
 
 async fn create_plan(
@@ -2796,6 +2999,25 @@ async fn prepare_dns_record_state_precondition(
         .map(Some)
 }
 
+async fn prepare_oauth_client_secret_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !should_bind_oauth_client_secret_state(capability) {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input("OAuth client state precondition credential was not resolved".to_owned())
+    })?;
+    read_live_oauth_client_secret_state(store, catalog, capability, input, account_id, credential)
+        .await
+        .map(Some)
+}
+
 async fn prepare_live_plan_preconditions(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -2833,6 +3055,10 @@ async fn prepare_live_plan_preconditions(
             store, catalog, capability, input, account_id, credential,
         )
         .await?,
+        oauth_client_secret_state: prepare_oauth_client_secret_state_precondition(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await?,
     })
 }
 
@@ -2850,6 +3076,7 @@ struct LivePlanPreconditions {
     warp_connector_configuration_state: Option<(Value, EvidenceV1)>,
     web_analytics_rum_state: Option<(Value, EvidenceV1)>,
     dns_record_state: Option<(Value, EvidenceV1)>,
+    oauth_client_secret_state: Option<(Value, EvidenceV1)>,
 }
 
 fn plan_targets(
@@ -2882,6 +3109,9 @@ fn plan_targets(
     }
     if let Some((receipt, _)) = &live_preconditions.dns_record_state {
         targets["live_preconditions"][DNS_RECORD_STATE_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.oauth_client_secret_state {
+        targets["live_preconditions"][OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION] = receipt.clone();
     }
     targets
 }
@@ -2916,6 +3146,10 @@ fn bind_live_plan_preconditions(
         (
             DNS_RECORD_STATE_PRECONDITION,
             &live_preconditions.dns_record_state,
+        ),
+        (
+            OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION,
+            &live_preconditions.oauth_client_secret_state,
         ),
     ] {
         if let Some((receipt, _)) = precondition {
@@ -3004,6 +3238,16 @@ fn planned_cloudflare_diff(
     if let Some((receipt, _)) = &live_preconditions.dns_record_state {
         diff["observed_before"] = receipt.get("prior_record").cloned().unwrap_or(Value::Null);
         diff["planned_after"] = input.body.clone().unwrap_or(Value::Null);
+    }
+    if let Some((receipt, _)) = &live_preconditions.oauth_client_secret_state {
+        let observed_before = receipt
+            .get("key_overlap_active")
+            .cloned()
+            .unwrap_or(Value::Null);
+        diff["observed_before"] = json!({"key_overlap_active": observed_before});
+        diff["planned_after"] = json!({
+            "key_overlap_active": !observed_before.as_bool().unwrap_or(false)
+        });
     }
     diff
 }
@@ -3561,6 +3805,7 @@ struct LivePreconditionEvidence {
     warp_connector_configuration_state: Option<EvidenceV1>,
     web_analytics_rum_state: Option<EvidenceV1>,
     dns_record_state: Option<EvidenceV1>,
+    oauth_client_secret_state: Option<EvidenceV1>,
 }
 
 async fn validate_live_plan_precondition_evidence(
@@ -3606,6 +3851,10 @@ async fn validate_live_plan_precondition_evidence(
         )
         .await?,
         dns_record_state: validate_live_dns_record_state_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        oauth_client_secret_state: validate_live_oauth_client_secret_state_precondition(
             store, catalog, plan, input, credential,
         )
         .await?,
@@ -3676,6 +3925,7 @@ fn prepend_live_precondition_evidence(
     evidence: LivePreconditionEvidence,
 ) {
     for item in [
+        evidence.oauth_client_secret_state,
         evidence.dns_record_state,
         evidence.web_analytics_rum_state,
         evidence.warp_connector_configuration_state,
@@ -4395,6 +4645,126 @@ async fn validate_live_dns_record_state_precondition(
         ));
     }
     Ok(Some(evidence))
+}
+
+async fn validate_live_oauth_client_secret_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_oauth_client_secret_state_precondition(plan)? else {
+        return Ok(None);
+    };
+    let (receipt, evidence) = read_live_oauth_client_secret_state(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live OAuth client two-secret state drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
+}
+
+fn validate_oauth_client_secret_state_receipt(plan: &PlanV1, receipt: &Value) -> Result<()> {
+    let account_id = plan
+        .targets
+        .pointer("/selectors/account_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth client plan omitted its hash-bound account selector; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let oauth_client_id = plan
+        .targets
+        .pointer("/selectors/oauth_client_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth client plan omitted its hash-bound client selector; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let expected_state =
+        oauth_client_secret_expected_prior_state(&plan.capability).ok_or_else(|| {
+            CliError::Input(
+                "OAuth client plan has an unsupported hash-bound cutover phase; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let exact = receipt.as_object().is_some_and(|object| object.len() == 9)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("source_capability_id").and_then(Value::as_str)
+            == Some(OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID)
+        && receipt.get("source_path").and_then(Value::as_str) == Some(OAUTH_CLIENT_DETAIL_PATH)
+        && receipt.get("target_capability_id").and_then(Value::as_str)
+            == Some(plan.capability.id.as_str())
+        && receipt.get("target_method").and_then(Value::as_str)
+            == Some(plan.capability.method.as_str())
+        && receipt.get("target_scope").and_then(Value::as_str) == Some("account")
+        && receipt.get("account_id").and_then(Value::as_str) == Some(account_id)
+        && account_id == plan.account_id
+        && receipt.get("oauth_client_id").and_then(Value::as_str) == Some(oauth_client_id)
+        && receipt.get("key_overlap_active").and_then(Value::as_bool) == Some(expected_state);
+    if !exact {
+        return Err(CliError::Input(
+            "plan OAuth client prior-state receipt has an invalid account, client, source, phase, or two-secret state; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn required_oauth_client_secret_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    if oauth_client_secret_expected_prior_state(&plan.capability).is_none() {
+        return Ok(None);
+    }
+    if !should_bind_oauth_client_secret_state(&plan.capability) {
+        return Err(CliError::Input(
+            "OAuth client secret plan is inconsistent with its hash-bound two-secret cutover contract; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the live OAuth client two-secret state contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/oauth_client_key_overlap")
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the hash-bound OAuth client two-secret state receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    validate_oauth_client_secret_state_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "plan OAuth client prior-state receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
 }
 
 fn validate_dns_record_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Result<Value> {
@@ -6850,6 +7220,7 @@ enum GuideLiveRead {
     WarpConnectorConfigurationState,
     WebAnalyticsRumState,
     DnsRecordState,
+    OAuthClientSecretState,
 }
 
 fn guide_live_reads(capability: &CapabilityV1) -> Vec<GuideLiveRead> {
@@ -6885,6 +7256,10 @@ fn guide_live_reads(capability: &CapabilityV1) -> Vec<GuideLiveRead> {
         (
             should_bind_dns_record_state(capability),
             GuideLiveRead::DnsRecordState,
+        ),
+        (
+            should_bind_oauth_client_secret_state(capability),
+            GuideLiveRead::OAuthClientSecretState,
         ),
     ]
     .into_iter()
@@ -6923,6 +7298,7 @@ fn guide_stage_contract_state(
                         | GuideLiveRead::WarpConnectorConfigurationState
                         | GuideLiveRead::WebAnalyticsRumState
                         | GuideLiveRead::DnsRecordState
+                        | GuideLiveRead::OAuthClientSecretState
                 )
             }) =>
         {
@@ -7224,8 +7600,8 @@ fn operation_specific_current_state_command(capability: &CapabilityV1) -> Option
             "--json".to_owned(),
         ]);
     }
-    should_bind_dns_record_state(capability).then(|| {
-        vec![
+    if should_bind_dns_record_state(capability) {
+        return Some(vec![
             "cfctl".to_owned(),
             "call".to_owned(),
             DNS_RECORD_DETAIL_READ_CAPABILITY_ID.to_owned(),
@@ -7233,6 +7609,18 @@ fn operation_specific_current_state_command(capability: &CapabilityV1) -> Option
             "zone_id=<zone_id>".to_owned(),
             "--selector".to_owned(),
             "dns_record_id=<dns_record_id>".to_owned(),
+            "--json".to_owned(),
+        ]);
+    }
+    should_bind_oauth_client_secret_state(capability).then(|| {
+        vec![
+            "cfctl".to_owned(),
+            "call".to_owned(),
+            OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID.to_owned(),
+            "--selector".to_owned(),
+            "account_id=<account_id>".to_owned(),
+            "--selector".to_owned(),
+            "oauth_client_id=<oauth_client_id>".to_owned(),
             "--json".to_owned(),
         ]
     })
@@ -7437,7 +7825,7 @@ fn find_secret_value(value: &Value) -> Option<&str> {
         return Some(value);
     }
     if let Some(object) = value.as_object() {
-        for key in ["value", "token", "secret", "access_token"] {
+        for key in ["value", "token", "secret", "access_token", "client_secret"] {
             if let Some(candidate) = object.get(key) {
                 if let Some(value) = candidate.as_str() {
                     return Some(value);
@@ -7474,7 +7862,10 @@ fn redact_secret_payload(value: &Value, root: bool) -> Value {
             object
                 .iter()
                 .map(|(key, item)| {
-                    if matches!(key.as_str(), "value" | "token" | "secret" | "access_token") {
+                    if matches!(
+                        key.as_str(),
+                        "value" | "token" | "secret" | "access_token" | "client_secret"
+                    ) {
                         (key.clone(), Value::String("[SUNK]".to_owned()))
                     } else {
                         (key.clone(), redact_secret_payload(item, false))
@@ -7605,10 +7996,11 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        CallInput, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions, PlanAuthority,
+        CallInput, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
+        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority,
         apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_read_replication_state_response, apply_dns_record_state_response,
-        apply_global_warp_override_state_response,
+        apply_global_warp_override_state_response, apply_oauth_client_secret_state_response,
         apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
         apply_zone_account_response, apply_zone_entitlement_response,
         bind_required_empty_compensation_body, boundary_response_artifact, capability_call_argv,
@@ -7618,14 +8010,15 @@ mod tests {
         redact_secret_result, required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
+        required_oauth_client_secret_state_precondition,
         required_warp_connector_configuration_state_precondition,
         required_web_analytics_rum_state_precondition, required_zone_account_precondition,
         should_bind_cloudflare_tunnel_configuration_state, should_bind_d1_read_replication_state,
         should_bind_dns_record_state, should_bind_global_warp_override_state,
-        should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
-        should_bind_zone_account, should_resolve_zone_entitlement, sink_secret_result,
-        validate_api_token_creation_contract, validate_current_permission_groups,
-        validate_entitlement_receipt_precondition,
+        should_bind_oauth_client_secret_state, should_bind_warp_connector_configuration_state,
+        should_bind_web_analytics_rum_state, should_bind_zone_account,
+        should_resolve_zone_entitlement, sink_secret_result, validate_api_token_creation_contract,
+        validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
         validate_selected_permission_groups, validate_zone_account_receipt_precondition,
         workspace_resource_keys, zone_target,
@@ -7634,7 +8027,7 @@ mod tests {
     use cfctl_catalog::CatalogSnapshot;
     use cfctl_cloudflare::CloudflareResponseV1;
     use cfctl_core::{
-        AdapterStatus, CapabilityV1, CreatedCollectionResourceContractV1,
+        AdapterStatus, CapabilityV1, CostV1, CreatedCollectionResourceContractV1,
         CreatedResourceContractV1, EffectClass, EvidenceClass, EvidenceV1, PlanStatus, PlanV1,
         QuerySerializationV1, RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1,
         TransactionStageV1, hash_value,
@@ -8161,6 +8554,260 @@ mod tests {
         let error = required_dns_record_state_precondition(&plan)
             .expect_err("a rehashed cross-record receipt must fail");
         assert!(error.to_string().contains("account, zone, record"));
+    }
+
+    fn oauth_client_secret_capability(id: &str, method: &str, strategy: &str) -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            id,
+            id,
+            method,
+            "/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret",
+        );
+        capability.product = "OAuth Clients".to_owned();
+        capability.permissions = vec!["OAuth Client Write".to_owned()];
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.cost = CostV1::default();
+        capability.entitlement.available = Some(true);
+        capability.verification.strategy = strategy.to_owned();
+        capability.rollback.supported = false;
+        capability.rollback.warning = Some(
+            "OAuth client secret cutover has no automatic rollback; preserve the old secret until dependents are verified"
+                .to_owned(),
+        );
+        if method == "POST" {
+            capability.risk = RiskClass::SecretSensitive;
+            capability.effect = EffectClass::IdentityOrOwnership;
+        } else {
+            capability.risk = RiskClass::Destructive;
+            capability.effect = EffectClass::Irreversible;
+        }
+        capability.selectors = ["account_id", "oauth_client_id"]
+            .into_iter()
+            .map(|name| SelectorV1 {
+                name: name.to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            })
+            .collect();
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: "/accounts/{account_id}/oauth_clients/{oauth_client_id}".to_owned(),
+            read_capability_id: "oauth-clients-get".to_owned(),
+            verified_response_fields: vec!["client_id".to_owned(), "has_rotated_secret".to_owned()],
+        });
+        capability
+    }
+
+    fn oauth_client_secret_state_response(has_rotated_secret: bool) -> CloudflareResponseV1 {
+        CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "client_id":"oauth-client-a",
+                "has_rotated_secret":has_rotated_secret,
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        }
+    }
+
+    #[test]
+    fn oauth_client_secret_state_precondition_is_phase_specific_and_target_bound() {
+        let rotate = oauth_client_secret_capability(
+            "oauth-clients-rotate-secret",
+            "POST",
+            "oauth_client_reports_rotated_secret_after_value_roll",
+        );
+        let delete_old = oauth_client_secret_capability(
+            "oauth-clients-delete-rotated-secret",
+            "DELETE",
+            "oauth_client_reports_no_rotated_secret_after_old_secret_delete",
+        );
+        assert!(should_bind_oauth_client_secret_state(&rotate));
+        assert!(should_bind_oauth_client_secret_state(&delete_old));
+        let guide = guide_document(&rotate);
+        assert_eq!(guide["stages"][4]["contract_state"], "live_read_required");
+        assert_eq!(
+            guide["stages"][4]["commands"][0],
+            json!([
+                "cfctl",
+                "call",
+                "oauth-clients-get",
+                "--selector",
+                "account_id=<account_id>",
+                "--selector",
+                "oauth_client_id=<oauth_client_id>",
+                "--json"
+            ])
+        );
+        let rotate_receipt = apply_oauth_client_secret_state_response(
+            &rotate,
+            "account-a",
+            "oauth-client-a",
+            &oauth_client_secret_state_response(false),
+        )
+        .expect("one-secret state permits rotation planning");
+        assert_eq!(rotate_receipt["key_overlap_active"], false);
+        apply_oauth_client_secret_state_response(
+            &rotate,
+            "account-a",
+            "oauth-client-a",
+            &oauth_client_secret_state_response(true),
+        )
+        .expect_err("a second rotation must be refused while two secrets exist");
+
+        let delete_receipt = apply_oauth_client_secret_state_response(
+            &delete_old,
+            "account-a",
+            "oauth-client-a",
+            &oauth_client_secret_state_response(true),
+        )
+        .expect("two-secret state permits old-secret deletion planning");
+        assert_eq!(delete_receipt["key_overlap_active"], true);
+        apply_oauth_client_secret_state_response(
+            &delete_old,
+            "account-a",
+            "oauth-client-a",
+            &oauth_client_secret_state_response(false),
+        )
+        .expect_err("old-secret deletion must be refused without two secrets");
+
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            delete_old,
+            json!({
+                "selectors":{
+                    "account_id":"account-a",
+                    "oauth_client_id":"oauth-client-a"
+                },
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{"oauth_client_key_overlap":delete_receipt},
+            }),
+        )
+        .expect("plan");
+        plan.precondition_hashes.insert(
+            "oauth_client_key_overlap".to_owned(),
+            hash_value(&delete_receipt).expect("receipt hash"),
+        );
+        assert!(
+            required_oauth_client_secret_state_precondition(&plan)
+                .expect("bound OAuth precondition")
+                .is_some()
+        );
+
+        let mut retargeted = delete_receipt;
+        retargeted["oauth_client_id"] = json!("oauth-client-b");
+        plan.precondition_hashes.insert(
+            "oauth_client_key_overlap".to_owned(),
+            hash_value(&retargeted).expect("retargeted receipt hash"),
+        );
+        plan.targets["live_preconditions"]["oauth_client_key_overlap"] = retargeted;
+        required_oauth_client_secret_state_precondition(&plan)
+            .expect_err("a rehashed cross-client receipt must fail");
+    }
+
+    #[test]
+    fn prepared_oauth_client_rotation_plan_carries_exact_two_secret_transition() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = oauth_client_secret_capability(
+            "oauth-clients-rotate-secret",
+            "POST",
+            "oauth_client_reports_rotated_secret_after_value_roll",
+        );
+        assert!(capability.mutation_contract_gaps().is_empty());
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "https://example.invalid/openapi.json".to_owned(),
+            source_hash: "source-sha".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability.id.clone(), capability.clone())]),
+        };
+        catalog.refresh_hash().expect("catalog hash");
+        let profile = ProfileMetadata::new("profile-a", ProfileKind::ApiToken, Some("account-a"));
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "oauth_client_id":"oauth-client-a"
+            }),
+            query: json!({}),
+            body: None,
+            ..CallInput::default()
+        };
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "client_id":"oauth-client-a",
+                "has_rotated_secret":false,
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let receipt = apply_oauth_client_secret_state_response(
+            &capability,
+            "account-a",
+            "oauth-client-a",
+            &response,
+        )
+        .expect("OAuth state receipt");
+        let receipt_hash = hash_value(&receipt).expect("receipt hash");
+        let evidence = store
+            .write_evidence(EvidenceClass::LiveRead, &receipt)
+            .expect("live read evidence");
+        let sink = root.path().join("oauth-client-secret");
+
+        let envelope = persist_prepared_plan(
+            &store,
+            &catalog,
+            capability,
+            input,
+            PlanAuthority {
+                profile: &profile,
+                account_id: "account-a",
+            },
+            json!({"value_out":sink}),
+            LivePlanPreconditions {
+                entitlement: None,
+                zone_account: None,
+                global_warp_override_state: None,
+                d1_read_replication_state: None,
+                cloudflare_tunnel_configuration_state: None,
+                warp_connector_configuration_state: None,
+                web_analytics_rum_state: None,
+                dns_record_state: None,
+                oauth_client_secret_state: Some((receipt.clone(), evidence)),
+            },
+        )
+        .expect("prepared OAuth rotation plan");
+        let plan = &envelope.result["plan"];
+
+        assert_eq!(
+            plan["precondition_hashes"][OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION],
+            receipt_hash
+        );
+        assert_eq!(
+            plan["targets"]["live_preconditions"][OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION],
+            receipt
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["observed_before"],
+            json!({"key_overlap_active":false})
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["planned_after"],
+            json!({"key_overlap_active":true})
+        );
     }
 
     #[test]
@@ -8961,6 +9608,7 @@ mod tests {
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
                 dns_record_state: None,
+                oauth_client_secret_state: None,
             },
         )
         .expect("prepared plan");
@@ -9044,6 +9692,7 @@ mod tests {
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
                 dns_record_state: None,
+                oauth_client_secret_state: None,
             },
         )
         .expect("prepared plan");
@@ -9132,6 +9781,7 @@ mod tests {
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
                 dns_record_state: None,
+                oauth_client_secret_state: None,
             },
         )
         .expect("prepared plan");
@@ -9216,6 +9866,7 @@ mod tests {
                 warp_connector_configuration_state: Some((receipt.clone(), evidence)),
                 web_analytics_rum_state: None,
                 dns_record_state: None,
+                oauth_client_secret_state: None,
             },
         )
         .expect("prepared plan");
@@ -9294,6 +9945,7 @@ mod tests {
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: Some((receipt.clone(), evidence)),
                 dns_record_state: None,
+                oauth_client_secret_state: None,
             },
         )
         .expect("prepared plan");
@@ -9388,6 +10040,7 @@ mod tests {
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
                 dns_record_state: Some((receipt.clone(), receipt_evidence)),
+                oauth_client_secret_state: None,
             },
         )
         .expect("prepared plan");
@@ -10865,6 +11518,26 @@ mod tests {
             })),
             Some("one-time-secret")
         );
+    }
+
+    #[test]
+    fn oauth_client_secret_is_extracted_and_redacted_as_sink_only_material() {
+        let response = json!({
+            "success": true,
+            "result": {
+                "client_secret": "oauth-client-secret-must-not-survive",
+                "client_id": "public-client-id"
+            }
+        });
+
+        assert_eq!(
+            find_secret_value(&response["result"]),
+            Some("oauth-client-secret-must-not-survive")
+        );
+        let redacted = redact_secret_result(&response);
+        assert_eq!(redacted["result"]["client_secret"], "[SUNK]");
+        assert_eq!(redacted["result"]["client_id"], "public-client-id");
+        assert!(!redacted.to_string().contains("must-not-survive"));
     }
 
     #[test]

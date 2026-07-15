@@ -58,6 +58,15 @@ mode-0600 sink. The plan explains that immediate invalidation is irreversible,
 while the non-immediate path keeps the old secret for only two hours and blocks
 another rotation during that grace period.
 
+OAuth client secret rotation is a two-plan cutover. Before planning and again
+before consumption, cfctl reads the exact client and requires one active secret
+for rotation or two active secrets for old-secret deletion. Rotation writes the
+one-time `client_secret` only to a new mode-0600 sink, then verifies the same
+client reports `has_rotated_secret=true`. Deleting the old secret is a separate
+irreversible plan, allowed only after dependents have been moved to the new
+value; its readback must report `has_rotated_secret=false`. Neither phase is
+presented as rollback for the other.
+
 ## Deterministic execution
 
 Use `cfctl call` with the selectors declared by the capability:

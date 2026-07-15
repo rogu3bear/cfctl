@@ -74,6 +74,12 @@ Secret results require `--value-out`, which must not exist and is created mode
 receipts are redacted. When an API cannot read a newly issued credential back,
 the truthful terminal proof is the successful Cloudflare response plus the
 durable sink receipt; cfctl does not claim that a later read verified the value.
+OAuth client rotation combines that sink receipt with a separate state proof:
+the secret value itself remains unreadable, while an exact client-detail read
+must prove the transition from one secret to two. Old-secret deletion is a
+separate irreversible operation that requires and rechecks the two-secret
+pre-state, then proves the transition back to one. The delete is not a rollback
+for rotation because it retains the new value and destroys the old one.
 
 ## Adapter boundary
 

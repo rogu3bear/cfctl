@@ -955,6 +955,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     classify_created_collection_resource_contracts(document, &mut capabilities);
     classify_global_warp_override_contract(document, &mut capabilities);
     classify_same_path_object_mutation_contracts(document, &mut capabilities);
+    finalize_oauth_client_secret_rotation_contract(document, &mut capabilities);
     finalize_global_warp_override_rollback_contract(&mut capabilities);
     finalize_d1_read_replication_rollback_contract(&mut capabilities);
     finalize_cloudflare_tunnel_configuration_rollback_contract(&mut capabilities);
@@ -3459,6 +3460,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
     .contains(&capability.id.as_str())
     {
         classify_api_token_lifecycle(capability);
+    } else if let Some(kind) = oauth_client_secret_operation_kind(capability) {
+        classify_oauth_client_secret_operation(capability, kind);
     } else if is_workers_ai_model_run(capability) {
         classify_workers_ai_model_run(capability);
     } else if is_d1_read_replication_update(capability) {
@@ -3491,6 +3494,209 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         return false;
     }
     true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OAuthClientSecretOperationKind {
+    Rotate,
+    DeleteOld,
+}
+
+const OAUTH_CLIENT_DETAIL_PATH: &str = "/accounts/{account_id}/oauth_clients/{oauth_client_id}";
+const OAUTH_CLIENT_SECRET_PATH: &str =
+    "/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret";
+const OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID: &str = "oauth-clients-get";
+
+fn oauth_client_secret_operation_kind(
+    capability: &CapabilityV1,
+) -> Option<OAuthClientSecretOperationKind> {
+    if capability.product != "OAuth Clients"
+        || capability.path != OAUTH_CLIENT_SECRET_PATH
+        || capability.permissions != ["OAuth Client Write"]
+        || capability.request_schema.is_some()
+        || !oauth_client_selectors_supported(capability)
+        || !capability
+            .response_contract
+            .as_ref()
+            .is_some_and(oauth_client_json_response_supported)
+        || !oauth_client_all_plan_entitlement_supported(capability)
+    {
+        return None;
+    }
+    match (capability.id.as_str(), capability.method.as_str()) {
+        ("oauth-clients-rotate-secret", "POST")
+            if capability
+                .description
+                .as_deref()
+                .is_some_and(|description| {
+                    description.contains("Creates a second client secret")
+                        && description.contains("has_rotated_secret")
+                        && description.contains("set to `true`")
+                }) =>
+        {
+            Some(OAuthClientSecretOperationKind::Rotate)
+        }
+        ("oauth-clients-delete-rotated-secret", "DELETE")
+            if capability
+                .description
+                .as_deref()
+                .is_some_and(|description| {
+                    description.contains("Removes the old client secret after a rotation")
+                        && description.contains("keeping only the new one")
+                        && description.contains("has_rotated_secret")
+                }) =>
+        {
+            Some(OAuthClientSecretOperationKind::DeleteOld)
+        }
+        _ => None,
+    }
+}
+
+fn oauth_client_selectors_supported(capability: &CapabilityV1) -> bool {
+    let expected = [
+        (
+            "account_id",
+            serde_json::json!({"allOf":[{"maxLength":32,"minLength":32,"type":"string"}]}),
+        ),
+        ("oauth_client_id", serde_json::json!({"type":"string"})),
+    ];
+    capability.selectors.len() == expected.len()
+        && expected.iter().all(|(name, schema)| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+                    && selector.contract.as_ref().is_some_and(|contract| {
+                        contract.schema == *schema && contract.query.is_none()
+                    })
+            })
+        })
+}
+
+fn oauth_client_json_response_supported(response: &ResponseContractV1) -> bool {
+    response.success_statuses == ["200"]
+        && response.success_media_types == ["application/json"]
+        && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+}
+
+fn oauth_client_all_plan_entitlement_supported(capability: &CapabilityV1) -> bool {
+    capability.entitlement.plans
+        == BTreeMap::from([
+            ("business".to_owned(), true),
+            ("enterprise".to_owned(), true),
+            ("free".to_owned(), true),
+            ("pro".to_owned(), true),
+        ])
+}
+
+fn classify_oauth_client_secret_operation(
+    capability: &mut CapabilityV1,
+    kind: OAuthClientSecretOperationKind,
+) {
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.basis = Some(
+        "rotating or deleting one OAuth client secret does not purchase a plan or add usage charges, so the direct incremental ceiling is zero"
+            .to_owned(),
+    );
+    capability.cost.references = vec![KnowledgeReferenceV1 {
+        title: "Create your OAuth client".to_owned(),
+        url: "https://developers.cloudflare.com/fundamentals/oauth/create-an-oauth-client/"
+            .to_owned(),
+        source: "official Cloudflare docs".to_owned(),
+    }];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.source = Some("official OpenAPI x-cfPlanAvailability".to_owned());
+    capability.verification.required = true;
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    match kind {
+        OAuthClientSecretOperationKind::Rotate => {
+            capability.risk = RiskClass::SecretSensitive;
+            capability.effect = EffectClass::IdentityOrOwnership;
+            "oauth_client_reports_rotated_secret_after_value_roll"
+                .clone_into(&mut capability.verification.strategy);
+            capability.rollback.warning = Some(
+                "rotation creates a second secret but cannot restore a one-secret state that keeps only the old value; keep the old secret active, install and verify the new sink, and do not delete the old secret until every dependent has cut over"
+                    .to_owned(),
+            );
+        }
+        OAuthClientSecretOperationKind::DeleteOld => {
+            capability.risk = RiskClass::Destructive;
+            capability.effect = EffectClass::Irreversible;
+            "oauth_client_reports_no_rotated_secret_after_old_secret_delete"
+                .clone_into(&mut capability.verification.strategy);
+            capability.rollback.warning = Some(
+                "deleting the old OAuth client secret is irreversible and the value cannot be restored; run it only after every dependent has been verified against the new secret"
+                    .to_owned(),
+            );
+        }
+    }
+}
+
+fn finalize_oauth_client_secret_rotation_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let read_supported = capabilities
+        .get(OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.id == OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID
+                && capability.method == "GET"
+                && capability.path == OAUTH_CLIENT_DETAIL_PATH
+                && capability.product == "OAuth Clients"
+                && capability.permissions == ["OAuth Client Read"]
+                && capability.request_schema.is_none()
+                && oauth_client_selectors_supported(capability)
+                && capability
+                    .response_contract
+                    .as_ref()
+                    .is_some_and(oauth_client_json_response_supported)
+        })
+        && document
+            .pointer("/paths/~1accounts~1{account_id}~1oauth_clients~1{oauth_client_id}/get")
+            .is_some_and(|operation| {
+                success_response_declares_result_fields(
+                    document,
+                    operation,
+                    &["client_id", "has_rotated_secret"],
+                )
+            });
+    if !read_supported {
+        return;
+    }
+    for (capability_id, method, response_fields) in [
+        (
+            "oauth-clients-rotate-secret",
+            "post",
+            ["client_secret"].as_slice(),
+        ),
+        (
+            "oauth-clients-delete-rotated-secret",
+            "delete",
+            ["id"].as_slice(),
+        ),
+    ] {
+        let response_supported = document
+            .pointer(&format!(
+                "/paths/~1accounts~1{{account_id}}~1oauth_clients~1{{oauth_client_id}}~1rotate_secret/{method}"
+            ))
+            .is_some_and(|operation| {
+                success_response_declares_result_field_union(document, operation, response_fields)
+            });
+        if !response_supported {
+            continue;
+        }
+        let Some(capability) = capabilities.get_mut(capability_id) else {
+            continue;
+        };
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: OAUTH_CLIENT_DETAIL_PATH.to_owned(),
+            read_capability_id: OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID.to_owned(),
+            verified_response_fields: vec!["client_id".to_owned(), "has_rotated_secret".to_owned()],
+        });
+        refresh_dynamic_mutation_contract(capability);
+    }
 }
 
 fn turnstile_widget_rotation_contract_supported(capability: &CapabilityV1) -> bool {

@@ -4055,6 +4055,268 @@ async fn dns_record_verification_rejects_live_field_drift_without_echoing_values
     server.await.expect("server joins");
 }
 
+#[tokio::test]
+async fn oauth_client_rotation_verifies_two_secret_overlap_without_echoing_secret() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"client_id":"oauth-client-1","has_rotated_secret":true},"errors":[]}"#,
+    ])
+    .await;
+    let plan = oauth_client_secret_plan(
+        "oauth-clients-rotate-secret",
+        "POST",
+        "oauth_client_reports_rotated_secret_after_value_roll",
+    );
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"client_secret":"one-time-secret-must-not-echo"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("rotation verification");
+
+    assert!(verification.passed, "{}", verification.basis);
+    assert!(!verification.basis.contains("one-time-secret-must-not-echo"));
+    assert!(
+        !verification
+            .readback
+            .result
+            .to_string()
+            .contains("one-time-secret")
+    );
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].starts_with("GET /client/v4/accounts/account-1/oauth_clients/oauth-client-1 ")
+    );
+}
+
+#[tokio::test]
+async fn oauth_client_old_secret_delete_verifies_one_secret_state() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"client_id":"oauth-client-1","has_rotated_secret":false},"errors":[]}"#,
+    ])
+    .await;
+    let plan = oauth_client_secret_plan(
+        "oauth-clients-delete-rotated-secret",
+        "DELETE",
+        "oauth_client_reports_no_rotated_secret_after_old_secret_delete",
+    );
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"oauth-client-1"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("old-secret deletion verification");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].starts_with("GET /client/v4/accounts/account-1/oauth_clients/oauth-client-1 ")
+    );
+}
+
+#[tokio::test]
+async fn oauth_client_rotation_rejects_a_readback_without_two_secret_overlap() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"client_id":"oauth-client-1","has_rotated_secret":false},"errors":[]}"#,
+    ])
+    .await;
+    let plan = oauth_client_secret_plan(
+        "oauth-clients-rotate-secret",
+        "POST",
+        "oauth_client_reports_rotated_secret_after_value_roll",
+    );
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"client_secret":"one-time-secret-must-not-echo"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("rotation verification");
+
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("has_rotated_secret=true"));
+    assert!(!verification.basis.contains("one-time-secret-must-not-echo"));
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn oauth_client_rotation_rejects_an_apply_outside_the_exact_success_status() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"client_id":"oauth-client-1","has_rotated_secret":true},"errors":[]}"#,
+    ])
+    .await;
+    let plan = oauth_client_secret_plan(
+        "oauth-clients-rotate-secret",
+        "POST",
+        "oauth_client_reports_rotated_secret_after_value_roll",
+    );
+    let apply = CloudflareResponseV1 {
+        status: 201,
+        success: true,
+        result: json!({"client_secret":"one-time-secret-must-not-echo"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("rotation verification");
+
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("apply HTTP 201"));
+    assert!(!verification.basis.contains("one-time-secret-must-not-echo"));
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn oauth_client_old_secret_delete_rejects_a_different_result_identity() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"client_id":"oauth-client-1","has_rotated_secret":false},"errors":[]}"#,
+    ])
+    .await;
+    let plan = oauth_client_secret_plan(
+        "oauth-clients-delete-rotated-secret",
+        "DELETE",
+        "oauth_client_reports_no_rotated_secret_after_old_secret_delete",
+    );
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"different-oauth-client"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("old-secret deletion verification");
+
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("apply identity matches=false"));
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn oauth_client_verifier_rejects_a_grafted_permission_before_network() {
+    let mut plan = oauth_client_secret_plan(
+        "oauth-clients-rotate-secret",
+        "POST",
+        "oauth_client_reports_rotated_secret_after_value_roll",
+    );
+    plan.capability.permissions = vec!["Account Settings Write".to_owned()];
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"client_secret":"must-not-cross-boundary"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor =
+        Executor::new(reqwest::Client::new(), "http://127.0.0.1:9/client/v4").expect("executor");
+
+    let error = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect_err("a grafted OAuth verifier must fail before network")
+        .to_string();
+
+    assert!(error.contains("not implemented"));
+    assert!(!error.contains("must-not-cross-boundary"));
+}
+
 fn dns_record_plan(
     id: &str,
     method: &str,
@@ -4114,6 +4376,60 @@ fn dns_record_plan(
         selectors,
         query: json!({}),
         body,
+        ..CallInput::default()
+    })
+    .expect("input");
+    plan
+}
+
+fn oauth_client_secret_plan(id: &str, method: &str, verification_strategy: &str) -> PlanV1 {
+    let mut capability = CapabilityV1::new(
+        id,
+        id,
+        method,
+        "/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret",
+    );
+    "OAuth Clients".clone_into(&mut capability.product);
+    capability.permissions = vec!["OAuth Client Write".to_owned()];
+    verification_strategy.clone_into(&mut capability.verification.strategy);
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "oauth_client_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+    ];
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/accounts/{account_id}/oauth_clients/{oauth_client_id}".to_owned(),
+        read_capability_id: "oauth-clients-get".to_owned(),
+        verified_response_fields: vec!["client_id".to_owned(), "has_rotated_secret".to_owned()],
+    });
+    let mut plan = PlanV1::draft(
+        "profile",
+        "account-1",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("plan");
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({
+            "account_id":"account-1",
+            "oauth_client_id":"oauth-client-1"
+        }),
+        query: json!({}),
+        body: None,
         ..CallInput::default()
     })
     .expect("input");

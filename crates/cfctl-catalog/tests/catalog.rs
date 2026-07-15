@@ -4197,6 +4197,213 @@ fn turnstile_widget_update_classifier_rejects_route_permission_and_schema_drift(
     assert!(!drifted_schema.cost.known);
 }
 
+fn oauth_client_rotation_fixture() -> serde_json::Value {
+    json!({
+        "openapi": "3.0.3",
+        "info": {"title":"OAuth client rotation fixture","version":"1"},
+        "components": {
+            "schemas": {
+                "Identifier": {"type":"string","minLength":32,"maxLength":32},
+                "ApiEnvelope": {
+                    "type":"object",
+                    "required":["success","result"],
+                    "properties": {
+                        "success":{"type":"boolean"},
+                        "errors":{"type":"array"},
+                        "messages":{"type":"array"},
+                        "result":{"type":"object"}
+                    }
+                }
+            }
+        },
+        "paths": {
+            "/accounts/{account_id}/oauth_clients/{oauth_client_id}": {
+                "get": {
+                    "operationId":"oauth-clients-get",
+                    "summary":"OAuth Client Details",
+                    "description":"Get details of a specific OAuth client.",
+                    "tags":["OAuth Clients"],
+                    "x-api-token-group":["OAuth Client Read"],
+                    "x-cfPlanAvailability":{"business":true,"enterprise":true,"free":true,"pro":true},
+                    "parameters": [
+                        {"in":"path","name":"account_id","required":true,"schema":{"allOf":[{"$ref":"#/components/schemas/Identifier"}]}},
+                        {"in":"path","name":"oauth_client_id","required":true,"schema":{"type":"string"}}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description":"OAuth Client Details response",
+                            "content":{"application/json":{"schema":{
+                                "allOf":[
+                                    {"$ref":"#/components/schemas/ApiEnvelope"},
+                                    {"type":"object","properties":{"result":{"type":"object","required":["client_id","visibility"],"properties":{
+                                        "client_id":{"type":"string"},
+                                        "visibility":{"type":"string","enum":["public","private"]},
+                                        "has_rotated_secret":{"type":"boolean","readOnly":true}
+                                    }}}}
+                                ]
+                            }}}
+                        }
+                    }
+                }
+            },
+            "/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret": {
+                "post": {
+                    "operationId":"oauth-clients-rotate-secret",
+                    "summary":"Rotate OAuth Client Secret",
+                    "description":"Creates a second client secret so you can update your client configuration before deleting the old one. The `has_rotated_secret` field on the client will be set to `true`.",
+                    "tags":["OAuth Clients"],
+                    "x-api-token-group":["OAuth Client Write"],
+                    "x-cfPlanAvailability":{"business":true,"enterprise":true,"free":true,"pro":true},
+                    "parameters": [
+                        {"in":"path","name":"account_id","required":true,"schema":{"allOf":[{"$ref":"#/components/schemas/Identifier"}]}},
+                        {"in":"path","name":"oauth_client_id","required":true,"schema":{"type":"string"}}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description":"Rotate OAuth Client Secret response",
+                            "content":{"application/json":{"schema":{
+                                "allOf":[
+                                    {"$ref":"#/components/schemas/ApiEnvelope"},
+                                    {"type":"object","properties":{"result":{"type":"object","properties":{"client_secret":{"type":"string","readOnly":true,"x-sensitive":true}}}}}
+                                ]
+                            }}}
+                        }
+                    }
+                },
+                "delete": {
+                    "operationId":"oauth-clients-delete-rotated-secret",
+                    "summary":"Delete Rotated OAuth Client Secret",
+                    "description":"Removes the old client secret after a rotation, keeping only the new one. Use this after you have updated your client configuration to use the new secret. The `has_rotated_secret` field on the client indicates whether there is an old secret to delete.",
+                    "tags":["OAuth Clients"],
+                    "x-api-token-group":["OAuth Client Write"],
+                    "x-cfPlanAvailability":{"business":true,"enterprise":true,"free":true,"pro":true},
+                    "parameters": [
+                        {"in":"path","name":"account_id","required":true,"schema":{"allOf":[{"$ref":"#/components/schemas/Identifier"}]}},
+                        {"in":"path","name":"oauth_client_id","required":true,"schema":{"type":"string"}}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description":"Delete Rotated OAuth Client Secret response",
+                            "content":{"application/json":{"schema":{
+                                "allOf":[
+                                    {"$ref":"#/components/schemas/ApiEnvelope"},
+                                    {"type":"object","properties":{"result":{"type":"object","required":["id"],"properties":{"id":{"$ref":"#/components/schemas/Identifier"}}}}}
+                                ]
+                            }}}
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn oauth_client_rotation_is_a_sink_bound_two_secret_cutover() {
+    let snapshot = normalize_openapi(&oauth_client_rotation_fixture()).expect("OAuth catalog");
+    let rotate = snapshot
+        .get("oauth-clients-rotate-secret")
+        .expect("OAuth rotation");
+    let delete_old = snapshot
+        .get("oauth-clients-delete-rotated-secret")
+        .expect("OAuth old-secret delete");
+
+    assert_eq!(rotate.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(rotate.risk, RiskClass::SecretSensitive);
+    assert_eq!(rotate.effect, EffectClass::IdentityOrOwnership);
+    assert!(rotate.cost.known);
+    assert!(!rotate.cost.incremental);
+    assert_eq!(rotate.cost.maximum, Some(0.0));
+    assert_eq!(rotate.entitlement.available, Some(true));
+    assert_eq!(
+        rotate.verification.strategy,
+        "oauth_client_reports_rotated_secret_after_value_roll"
+    );
+    assert_eq!(
+        rotate
+            .same_path_read
+            .as_ref()
+            .expect("rotation readback")
+            .verified_response_fields,
+        ["client_id", "has_rotated_secret"]
+    );
+    assert!(!rotate.rollback.supported);
+    assert!(
+        rotate
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("do not delete the old secret"))
+    );
+    assert!(rotate.mutation_contract_gaps().is_empty());
+
+    assert_eq!(delete_old.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(delete_old.risk, RiskClass::Destructive);
+    assert_eq!(delete_old.effect, EffectClass::Irreversible);
+    assert!(delete_old.cost.known);
+    assert_eq!(delete_old.cost.maximum, Some(0.0));
+    assert_eq!(delete_old.entitlement.available, Some(true));
+    assert_eq!(
+        delete_old.verification.strategy,
+        "oauth_client_reports_no_rotated_secret_after_old_secret_delete"
+    );
+    assert_eq!(
+        delete_old
+            .same_path_read
+            .as_ref()
+            .expect("delete readback")
+            .verified_response_fields,
+        ["client_id", "has_rotated_secret"]
+    );
+    assert!(!delete_old.rollback.supported);
+    assert!(
+        delete_old
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("cannot be restored"))
+    );
+    assert!(delete_old.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn oauth_client_rotation_classifier_rejects_permission_response_state_and_plan_drift() {
+    let blocked = |document: serde_json::Value, capability_id: &str| {
+        normalize_openapi(&document)
+            .expect("drifted OAuth catalog")
+            .get(capability_id)
+            .expect("OAuth capability")
+            .adapter_status
+            == AdapterStatus::Blocked
+    };
+
+    let mut permission = oauth_client_rotation_fixture();
+    permission["paths"]["/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret"]["post"]
+        ["x-api-token-group"] = json!(["Account Settings Write"]);
+    assert!(blocked(permission, "oauth-clients-rotate-secret"));
+
+    let mut response = oauth_client_rotation_fixture();
+    response["paths"]["/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret"]["post"]
+        ["responses"]["200"]["content"]["application/json"]["schema"]["allOf"][1]["properties"]["result"]
+        ["properties"] = json!({"replacement":{"type":"string"}});
+    assert!(blocked(response, "oauth-clients-rotate-secret"));
+
+    let mut state = oauth_client_rotation_fixture();
+    state["paths"]["/accounts/{account_id}/oauth_clients/{oauth_client_id}"]["get"]
+        ["responses"]["200"]["content"]["application/json"]["schema"]["allOf"][1]
+        ["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("detail properties")
+        .remove("has_rotated_secret");
+    assert!(blocked(state.clone(), "oauth-clients-rotate-secret"));
+    assert!(blocked(state, "oauth-clients-delete-rotated-secret"));
+
+    let mut plan = oauth_client_rotation_fixture();
+    plan["paths"]["/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret"]["delete"]
+        ["x-cfPlanAvailability"]["free"] = json!(false);
+    assert!(blocked(plan, "oauth-clients-delete-rotated-secret"));
+}
+
 fn queue_configuration_fixture() -> serde_json::Value {
     let mut document = create_lifecycle_fixture();
     document["components"]["schemas"]["Widget"]["properties"] = json!({

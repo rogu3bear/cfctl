@@ -584,6 +584,11 @@ impl CapabilityV1 {
                         "account-api-tokens-delete-token" | "user-api-tokens-delete-token"
                     )
             }
+            "oauth_client_reports_rotated_secret_after_value_roll"
+            | "oauth_client_reports_no_rotated_secret_after_old_secret_delete" => {
+                oauth_client_secret_verification_contract_supported(self)
+                    && self.same_path_readback_selectors_supported()
+            }
             "dns_record_details_match_created_id_and_planned_fields" => {
                 self.method == "POST" && self.id == "dns-records-for-a-zone-create-dns-record"
             }
@@ -1052,6 +1057,45 @@ impl CapabilityV1 {
                     .all(|fields| fields[0] < fields[1])
         })
     }
+}
+
+fn oauth_client_secret_verification_contract_supported(capability: &CapabilityV1) -> bool {
+    let operation_supported = matches!(
+        (
+            capability.id.as_str(),
+            capability.method.as_str(),
+            capability.verification.strategy.as_str(),
+        ),
+        (
+            "oauth-clients-rotate-secret",
+            "POST",
+            "oauth_client_reports_rotated_secret_after_value_roll",
+        ) | (
+            "oauth-clients-delete-rotated-secret",
+            "DELETE",
+            "oauth_client_reports_no_rotated_secret_after_old_secret_delete",
+        )
+    );
+    operation_supported
+        && capability.product == "OAuth Clients"
+        && capability.account_scope == "account"
+        && capability.permissions == ["OAuth Client Write"]
+        && capability.path == "/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret"
+        && capability.request_schema.is_none()
+        && capability.selectors.len() == 2
+        && ["account_id", "oauth_client_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path == "/accounts/{account_id}/oauth_clients/{oauth_client_id}"
+                && read.read_capability_id == "oauth-clients-get"
+                && read.verified_response_fields == ["client_id", "has_rotated_secret"]
+        })
 }
 
 fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {

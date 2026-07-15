@@ -149,6 +149,31 @@ printf '%s' '{"invalidate_immediately":false}' | \
     --body-stdin --value-out /new/secure/path --json
 ```
 
+Rotate an OAuth client secret as a staged two-secret cutover. Planning and
+execution both require the exact client to report that no overlap secret exists;
+the new value is sink-only:
+
+```bash
+cfctl call oauth-clients-rotate-secret \
+  --selector account_id=<account-id> \
+  --selector oauth_client_id=<oauth-client-id> \
+  --value-out /new/secure/oauth-client-secret --json
+```
+
+Update and verify every dependent while the old value remains valid. Only then
+create, review, approve, and run the separate irreversible deletion plan:
+
+```bash
+cfctl call oauth-clients-delete-rotated-secret \
+  --selector account_id=<account-id> \
+  --selector oauth_client_id=<oauth-client-id> --json
+```
+
+The first phase must read back `has_rotated_secret=true`; the second requires
+that state before planning and must read back `false`. A second rotation, a
+delete from one-secret state, target drift, and a stale approval all fail before
+the mutation boundary.
+
 ## Agent entry
 
 ```bash

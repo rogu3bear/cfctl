@@ -233,6 +233,12 @@ cfctl call cloudflare-tunnel-get-a-cloudflare-tunnel-token \
 The destination is created mode 0600 on Unix. Raw values never enter stdout,
 plans, logs, delegated subprocess receipts, or evidence.
 
+OAuth client secrets use an explicit two-phase cutover. `oauth-clients-rotate-secret`
+requires a new sink and live one-secret pre-state; after dependents are verified,
+`oauth-clients-delete-rotated-secret` is reviewed and approved separately. Both
+plans recheck the exact client state before consumption and verify the expected
+`has_rotated_secret` transition afterward.
+
 ## Workspaces and agents
 
 Registered roots bound all discovery:
