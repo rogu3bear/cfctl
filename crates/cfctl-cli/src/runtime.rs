@@ -998,6 +998,9 @@ const GLOBAL_WARP_OVERRIDE_MUTATION_CAPABILITY_ID: &str =
 const GLOBAL_WARP_OVERRIDE_READ_CAPABILITY_ID: &str =
     "devices-resilience-retrieve-global-warp-override";
 const GLOBAL_WARP_OVERRIDE_PATH: &str = "/accounts/{account_id}/devices/resilience/disconnect";
+const D1_READ_REPLICATION_READ_CAPABILITY_ID: &str = "d1-get-database";
+const D1_READ_REPLICATION_PATH: &str = "/accounts/{account_id}/d1/database/{database_id}";
+const D1_READ_REPLICATION_PRECONDITION: &str = "d1_read_replication_state";
 const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str = "zone-subscription-zone-subscription-details";
 
@@ -1050,6 +1053,171 @@ fn global_warp_override_read_contract_supported(capability: &CapabilityV1) -> bo
                 ) && contract.success_statuses == ["200"]
                     && contract.success_media_types == ["application/json"]
             })
+}
+
+fn is_d1_read_replication_mutation(capability: &CapabilityV1) -> bool {
+    matches!(
+        capability.id.as_str(),
+        "d1-update-database" | "d1-update-partial-database"
+    )
+}
+
+fn should_bind_d1_read_replication_state(capability: &CapabilityV1) -> bool {
+    is_d1_read_replication_mutation(capability)
+        && capability.mutating
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.rollback.strategy.as_deref() == Some("restore_d1_read_replication_prior_mode")
+        && capability.rollback_contract_supported()
+}
+
+fn d1_read_replication_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == D1_READ_REPLICATION_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == D1_READ_REPLICATION_PATH
+        && capability.product == "D1"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.selectors.len() == 3
+        && ["account_id", "database_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name && selector.location == "path" && selector.required
+            })
+        })
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "fields"
+                && selector.location == "query"
+                && !selector.required
+                && selector.value_type == "array"
+                && selector.contract.as_ref().is_some_and(|contract| {
+                    contract.schema.get("type").and_then(Value::as_str) == Some("array")
+                        && contract.query.as_ref().is_some_and(|query| {
+                            query.style == "form"
+                                && !query.explode
+                                && !query.allow_reserved
+                                && !query.allow_empty_value
+                        })
+                })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|contract| {
+                matches!(
+                    contract.body_mode,
+                    cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                ) && contract.success_statuses == ["200"]
+                    && contract.success_media_types == ["application/json"]
+            })
+}
+
+fn apply_d1_read_replication_state_response(
+    capability: &CapabilityV1,
+    account_id: &str,
+    database_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the D1 read-replication state read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    let mode = response
+        .result
+        .pointer("/read_replication/mode")
+        .and_then(Value::as_str)
+        .filter(|mode| matches!(*mode, "auto" | "disabled"))
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 state read omitted the bounded read_replication.mode value; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+    Ok(json!({
+        "schema_version": 1,
+        "source_capability_id": D1_READ_REPLICATION_READ_CAPABILITY_ID,
+        "source_path": D1_READ_REPLICATION_PATH,
+        "target_capability_id": capability.id,
+        "target_method": capability.method,
+        "target_scope": "account",
+        "account_id": account_id,
+        "database_id": database_id,
+        "read_replication": {"mode": mode},
+    }))
+}
+
+async fn read_live_d1_read_replication_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !should_bind_d1_read_replication_state(capability) {
+        return Err(CliError::Input(
+            "D1 read-replication mutation drifted from its governed prior-state contract"
+                .to_owned(),
+        ));
+    }
+    let selected_account = input
+        .selectors
+        .get("account_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 state precondition requires string selector `account_id`".to_owned(),
+            )
+        })?;
+    if selected_account != account_id {
+        return Err(CliError::Input(format!(
+            "D1 target account `{selected_account}` differs from selected account `{account_id}`; the mutation boundary was not crossed"
+        )));
+    }
+    let database_id = input
+        .selectors
+        .get("database_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 state precondition requires string selector `database_id`".to_owned(),
+            )
+        })?;
+    let source_capability = catalog
+        .get(D1_READ_REPLICATION_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(D1_READ_REPLICATION_READ_CAPABILITY_ID))?;
+    if !d1_read_replication_read_contract_supported(source_capability) {
+        return Err(CliError::Input(
+            "D1 state source capability drifted from the governed database read".to_owned(),
+        ));
+    }
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source_capability,
+            &CallInput {
+                selectors: json!({"account_id": account_id, "database_id": database_id}),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt =
+        apply_d1_read_replication_state_response(capability, account_id, database_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
 }
 
 fn apply_global_warp_override_state_response(
@@ -1446,9 +1614,11 @@ async fn create_plan(
         })?;
     let resolve_entitlement = should_resolve_zone_entitlement(&capability);
     let bind_global_warp_override_state = should_bind_global_warp_override_state(&capability);
+    let bind_d1_read_replication_state = should_bind_d1_read_replication_state(&capability);
     let credential = if resolve_entitlement
         || should_bind_zone_account(&capability)
         || bind_global_warp_override_state
+        || bind_d1_read_replication_state
     {
         Some(fresh_credential(profile, &PlatformSecretStore).await?)
     } else {
@@ -1480,26 +1650,24 @@ async fn create_plan(
     } else {
         None
     };
-    let global_warp_override_state_precondition = if bind_global_warp_override_state {
-        let credential = credential.as_ref().ok_or_else(|| {
-            CliError::Input(
-                "Global WARP override state precondition credential was not resolved".to_owned(),
-            )
-        })?;
-        Some(
-            read_live_global_warp_override_state(
-                store,
-                catalog,
-                &capability,
-                &input,
-                account_id,
-                credential,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
+    let global_warp_override_state_precondition = prepare_global_warp_override_state_precondition(
+        store,
+        catalog,
+        &capability,
+        &input,
+        account_id,
+        credential.as_ref(),
+    )
+    .await?;
+    let d1_read_replication_state_precondition = prepare_d1_read_replication_state_precondition(
+        store,
+        catalog,
+        &capability,
+        &input,
+        account_id,
+        credential.as_ref(),
+    )
+    .await?;
     persist_prepared_plan(
         store,
         catalog,
@@ -1514,8 +1682,51 @@ async fn create_plan(
             entitlement: entitlement_precondition,
             zone_account: zone_account_precondition,
             global_warp_override_state: global_warp_override_state_precondition,
+            d1_read_replication_state: d1_read_replication_state_precondition,
         },
     )
+}
+
+async fn prepare_global_warp_override_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !should_bind_global_warp_override_state(capability) {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input(
+            "Global WARP override state precondition credential was not resolved".to_owned(),
+        )
+    })?;
+    read_live_global_warp_override_state(store, catalog, capability, input, account_id, credential)
+        .await
+        .map(Some)
+}
+
+async fn prepare_d1_read_replication_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !should_bind_d1_read_replication_state(capability) {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input(
+            "D1 read-replication state precondition credential was not resolved".to_owned(),
+        )
+    })?;
+    read_live_d1_read_replication_state(store, catalog, capability, input, account_id, credential)
+        .await
+        .map(Some)
 }
 
 struct PlanAuthority<'a> {
@@ -1527,6 +1738,7 @@ struct LivePlanPreconditions {
     entitlement: Option<(Value, EvidenceV1)>,
     zone_account: Option<(Value, EvidenceV1)>,
     global_warp_override_state: Option<(Value, EvidenceV1)>,
+    d1_read_replication_state: Option<(Value, EvidenceV1)>,
 }
 
 fn plan_targets(
@@ -1543,6 +1755,9 @@ fn plan_targets(
     if let Some((receipt, _)) = &live_preconditions.global_warp_override_state {
         targets["live_preconditions"]["global_warp_override_state"] = receipt.clone();
     }
+    if let Some((receipt, _)) = &live_preconditions.d1_read_replication_state {
+        targets["live_preconditions"][D1_READ_REPLICATION_PRECONDITION] = receipt.clone();
+    }
     targets
 }
 
@@ -1556,6 +1771,10 @@ fn bind_live_plan_preconditions(
         (
             "global_warp_override_state",
             &live_preconditions.global_warp_override_state,
+        ),
+        (
+            D1_READ_REPLICATION_PRECONDITION,
+            &live_preconditions.d1_read_replication_state,
         ),
     ] {
         if let Some((receipt, _)) = precondition {
@@ -1585,6 +1804,22 @@ fn planned_cloudflare_diff(
                 .body
                 .as_ref()
                 .and_then(|body| body.get("disconnect"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        });
+    }
+    if let Some((receipt, _)) = &live_preconditions.d1_read_replication_state {
+        diff["observed_before"] = json!({
+            "read_replication": receipt
+                .get("read_replication")
+                .cloned()
+                .unwrap_or(Value::Null),
+        });
+        diff["planned_after"] = json!({
+            "read_replication": input
+                .body
+                .as_ref()
+                .and_then(|body| body.get("read_replication"))
                 .cloned()
                 .unwrap_or(Value::Null),
         });
@@ -1680,6 +1915,9 @@ fn persist_prepared_plan(
         envelope.evidence.insert(0, evidence);
     }
     if let Some((_, evidence)) = live_preconditions.global_warp_override_state {
+        envelope.evidence.insert(0, evidence);
+    }
+    if let Some((_, evidence)) = live_preconditions.d1_read_replication_state {
         envelope.evidence.insert(0, evidence);
     }
     Ok(envelope)
@@ -2120,6 +2358,14 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
             &credential,
         )
         .await?;
+    let d1_read_replication_state_evidence = validate_live_d1_read_replication_state_precondition(
+        store,
+        &catalog,
+        &plan,
+        &execution_input,
+        &credential,
+    )
+    .await?;
     plan.mark_consumed()?;
     store.save_plan(&plan)?;
     persist_transaction_stage(
@@ -2139,6 +2385,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
             entitlement: entitlement_evidence,
             permission_inventory: permission_inventory_evidence,
             global_warp_override_state: global_warp_override_state_evidence,
+            d1_read_replication_state: d1_read_replication_state_evidence,
         },
     )
     .await
@@ -2149,6 +2396,7 @@ struct LivePreconditionEvidence {
     entitlement: Option<EvidenceV1>,
     permission_inventory: Option<EvidenceV1>,
     global_warp_override_state: Option<EvidenceV1>,
+    d1_read_replication_state: Option<EvidenceV1>,
 }
 
 async fn execute_consumed_plan(
@@ -2215,6 +2463,7 @@ fn prepend_live_precondition_evidence(
     evidence: LivePreconditionEvidence,
 ) {
     for item in [
+        evidence.d1_read_replication_state,
         evidence.global_warp_override_state,
         evidence.permission_inventory,
         evidence.entitlement,
@@ -2347,6 +2596,128 @@ fn global_warp_override_prior_disconnect_state(plan: &PlanV1) -> Result<bool> {
             )
         })?;
     validate_global_warp_override_prior_state_receipt(plan, receipt)
+}
+
+async fn validate_live_d1_read_replication_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_d1_read_replication_state_precondition(plan)? else {
+        return Ok(None);
+    };
+    let (receipt, evidence) = read_live_d1_read_replication_state(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live D1 read-replication state drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
+}
+
+fn validate_d1_read_replication_prior_state_receipt(
+    plan: &PlanV1,
+    receipt: &Value,
+) -> Result<String> {
+    let database_id = plan
+        .targets
+        .pointer("/selectors/database_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 plan omitted its hash-bound database selector; create a new plan".to_owned(),
+            )
+        })?;
+    let exact_identity = receipt.as_object().is_some_and(|object| object.len() == 9)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("source_capability_id").and_then(Value::as_str)
+            == Some(D1_READ_REPLICATION_READ_CAPABILITY_ID)
+        && receipt.get("source_path").and_then(Value::as_str) == Some(D1_READ_REPLICATION_PATH)
+        && receipt.get("target_capability_id").and_then(Value::as_str)
+            == Some(plan.capability.id.as_str())
+        && receipt.get("target_method").and_then(Value::as_str)
+            == Some(plan.capability.method.as_str())
+        && receipt.get("target_scope").and_then(Value::as_str) == Some("account")
+        && receipt.get("account_id").and_then(Value::as_str) == Some(plan.account_id.as_str())
+        && receipt.get("database_id").and_then(Value::as_str) == Some(database_id);
+    let replication = receipt.get("read_replication").and_then(Value::as_object);
+    let mode = replication
+        .and_then(|state| state.get("mode"))
+        .and_then(Value::as_str)
+        .filter(|mode| matches!(*mode, "auto" | "disabled"));
+    if !exact_identity || replication.is_none_or(|state| state.len() != 1) || mode.is_none() {
+        return Err(CliError::Input(
+            "plan D1 prior-state receipt has an invalid account, database, source, method, or mode shape; create a new plan"
+                .to_owned(),
+        ));
+    }
+    mode.map(str::to_owned).ok_or_else(|| {
+        CliError::Input(
+            "plan D1 prior-state receipt omitted its bounded mode; create a new plan".to_owned(),
+        )
+    })
+}
+
+fn required_d1_read_replication_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    if !is_d1_read_replication_mutation(&plan.capability) {
+        return Ok(None);
+    }
+    if !should_bind_d1_read_replication_state(&plan.capability) {
+        return Err(CliError::Input(
+            "D1 plan is inconsistent with its hash-bound prior-state contract; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(D1_READ_REPLICATION_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the live D1 prior-state contract; create a new plan".to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/d1_read_replication_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the hash-bound D1 prior-state receipt; create a new plan".to_owned(),
+            )
+        })?;
+    validate_d1_read_replication_prior_state_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "plan D1 prior-state receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+fn d1_read_replication_prior_mode(plan: &PlanV1) -> Result<String> {
+    required_d1_read_replication_state_precondition(plan)?.ok_or_else(|| {
+        CliError::Input("D1 compensation requires a hash-bound prior-state precondition".to_owned())
+    })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/d1_read_replication_state")
+        .ok_or_else(|| {
+            CliError::Input("D1 compensation requires a hash-bound prior-state receipt".to_owned())
+        })?;
+    validate_d1_read_replication_prior_state_receipt(plan, receipt)
 }
 
 async fn validate_live_zone_account_precondition(
@@ -2962,6 +3333,48 @@ fn global_warp_override_compensation_request(plan: &PlanV1) -> Result<Compensati
     })
 }
 
+fn d1_read_replication_compensation_request(plan: &PlanV1) -> Result<CompensationRequest> {
+    let database_id = plan
+        .targets
+        .pointer("/selectors/database_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("D1 compensation requires a hash-bound database selector".to_owned())
+        })?;
+    Ok(CompensationRequest {
+        capability_id: plan.capability.id.clone(),
+        expected_method: plan.capability.method.clone(),
+        expected_path: D1_READ_REPLICATION_PATH.to_owned(),
+        input: CallInput {
+            selectors: json!({
+                "account_id": plan.account_id,
+                "database_id": database_id,
+            }),
+            query: json!({}),
+            body: Some(json!({
+                "read_replication": {
+                    "mode": d1_read_replication_prior_mode(plan)?,
+                },
+            })),
+            ..CallInput::default()
+        },
+        requested_account: Some(plan.account_id.clone()),
+    })
+}
+
+fn compensation_resource_id(artifact: &Value) -> Result<&str> {
+    artifact
+        .get("resource_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "the creation response is recorded, but its hash-bound receipt has no resource id; inspect live resource state before compensating"
+                    .to_owned(),
+            )
+        })
+}
+
 fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
     if !matches!(
         plan.status,
@@ -2981,17 +3394,10 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
     if plan.capability.id == GLOBAL_WARP_OVERRIDE_MUTATION_CAPABILITY_ID {
         return global_warp_override_compensation_request(plan).map(Some);
     }
-    let resource_id = || {
-        artifact
-            .get("resource_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-            CliError::Input(
-                "the creation response is recorded, but its hash-bound receipt has no resource id; inspect live resource state before compensating"
-                    .to_owned(),
-            )
-        })
-    };
+    if is_d1_read_replication_mutation(&plan.capability) {
+        return d1_read_replication_compensation_request(plan).map(Some);
+    }
+    let resource_id = compensation_resource_id(artifact)?;
     let (capability_id, expected_method, expected_path, selectors, body) = match plan
         .capability
         .id
@@ -3001,14 +3407,14 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
             "account-api-tokens-delete-token".to_owned(),
             "DELETE".to_owned(),
             "/accounts/{account_id}/tokens/{token_id}".to_owned(),
-            json!({"account_id": plan.account_id, "token_id": resource_id()?}),
+            json!({"account_id": plan.account_id, "token_id": resource_id}),
             None,
         ),
         "user-api-tokens-create-token" => (
             "user-api-tokens-delete-token".to_owned(),
             "DELETE".to_owned(),
             "/user/tokens/{token_id}".to_owned(),
-            json!({"token_id": resource_id()?}),
+            json!({"token_id": resource_id}),
             None,
         ),
         "dns-records-for-a-zone-create-dns-record" => {
@@ -3028,7 +3434,7 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
                 "dns-records-for-a-zone-delete-dns-record".to_owned(),
                 "DELETE".to_owned(),
                 "/zones/{zone_id}/dns_records/{dns_record_id}".to_owned(),
-                json!({"zone_id": zone_id, "dns_record_id": resource_id()?}),
+                json!({"zone_id": zone_id, "dns_record_id": resource_id}),
                 None,
             )
         }
@@ -3039,7 +3445,7 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
                 return Ok(None);
             }
             let (capability_id, expected_path, selectors) =
-                generic_created_resource_compensation(plan, resource_id()?)?;
+                generic_created_resource_compensation(plan, resource_id)?;
             (
                 capability_id,
                 "DELETE".to_owned(),
@@ -3140,7 +3546,10 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
                 "compensates_operation_id": plan.operation_id,
                 "compensates_capability_id": plan.capability.id,
                 "source_receipt_hash": source_receipt_hash,
-                "source_precondition_hash": plan.precondition_hashes.get("global_warp_override_state"),
+                "source_precondition_hash": plan
+                    .precondition_hashes
+                    .get("global_warp_override_state")
+                    .or_else(|| plan.precondition_hashes.get(D1_READ_REPLICATION_PRECONDITION)),
             }),
         )
         .await?;
@@ -4446,6 +4855,7 @@ fn guide_stage_document(
     let zone_account_live_read = should_bind_zone_account(capability);
     let zone_entitlement_live_read = should_resolve_zone_entitlement(capability);
     let global_warp_override_state_live_read = should_bind_global_warp_override_state(capability);
+    let d1_read_replication_state_live_read = should_bind_d1_read_replication_state(capability);
     let entitlement_blocked = capability.entitlement.available == Some(false)
         || blocking_gaps.iter().any(|gap| gap.contains("entitlement"));
     let entitlement_unresolved = capability.mutating
@@ -4455,6 +4865,9 @@ fn guide_stage_document(
         GuideStage::SelectAccount if zone_account_live_read => "live_read_required",
         GuideStage::CheckEntitlement if zone_entitlement_live_read => "live_read_required",
         GuideStage::InspectCurrentState if global_warp_override_state_live_read => {
+            "live_read_required"
+        }
+        GuideStage::InspectCurrentState if d1_read_replication_state_live_read => {
             "live_read_required"
         }
         GuideStage::CheckEntitlement if entitlement_blocked => "blocked",
@@ -4499,12 +4912,15 @@ fn guide_stage_document(
         "Read the exact live zone subscription and evaluate its active plan against the official availability matrix."
     } else if stage == GuideStage::InspectCurrentState && global_warp_override_state_live_read {
         "Read and bind the exact live account-wide disconnect state; execution repeats this read and rejects drift before crossing the mutation boundary."
+    } else if stage == GuideStage::InspectCurrentState && d1_read_replication_state_live_read {
+        "Read and bind the exact live database read-replication mode; execution repeats this read and rejects drift before crossing the mutation boundary."
     } else {
         guide_stage_summary(stage, capability.mutating)
     };
     let evidence_class = if (stage == GuideStage::SelectAccount && zone_account_live_read)
         || (stage == GuideStage::CheckEntitlement && zone_entitlement_live_read)
         || (stage == GuideStage::InspectCurrentState && global_warp_override_state_live_read)
+        || (stage == GuideStage::InspectCurrentState && d1_read_replication_state_live_read)
     {
         "live_read"
     } else {
@@ -4601,6 +5017,31 @@ fn guide_stage_evidence_class(stage: cfctl_core::GuideStage, mutating: bool) -> 
     }
 }
 
+fn operation_specific_current_state_command(capability: &CapabilityV1) -> Option<Vec<String>> {
+    if should_bind_global_warp_override_state(capability) {
+        return Some(vec![
+            "cfctl".to_owned(),
+            "call".to_owned(),
+            GLOBAL_WARP_OVERRIDE_READ_CAPABILITY_ID.to_owned(),
+            "--selector".to_owned(),
+            "account_id=<account_id>".to_owned(),
+            "--json".to_owned(),
+        ]);
+    }
+    should_bind_d1_read_replication_state(capability).then(|| {
+        vec![
+            "cfctl".to_owned(),
+            "call".to_owned(),
+            D1_READ_REPLICATION_READ_CAPABILITY_ID.to_owned(),
+            "--selector".to_owned(),
+            "account_id=<account_id>".to_owned(),
+            "--selector".to_owned(),
+            "database_id=<database_id>".to_owned(),
+            "--json".to_owned(),
+        ]
+    })
+}
+
 fn guide_stage_commands(
     stage: cfctl_core::GuideStage,
     capability: &CapabilityV1,
@@ -4629,19 +5070,11 @@ fn guide_stage_commands(
         GuideStage::InspectCurrentState if !capability.mutating => {
             conditional(call_argv.map(<[String]>::to_vec))
         }
-        GuideStage::InspectCurrentState if should_bind_global_warp_override_state(capability) => {
-            vec![vec![
-                "cfctl".to_owned(),
-                "call".to_owned(),
-                GLOBAL_WARP_OVERRIDE_READ_CAPABILITY_ID.to_owned(),
-                "--selector".to_owned(),
-                "account_id=<account_id>".to_owned(),
-                "--json".to_owned(),
-            ]]
-        }
-        GuideStage::InspectCurrentState => {
-            vec![argv(&["cfctl", "workspace", "audit", "--json"])]
-        }
+        GuideStage::InspectCurrentState => operation_specific_current_state_command(capability)
+            .map_or_else(
+                || vec![argv(&["cfctl", "workspace", "audit", "--json"])],
+                |command| vec![command],
+            ),
         GuideStage::LoadStandards => vec![vec![
             "cfctl".to_owned(),
             "docs".to_owned(),
@@ -4976,12 +5409,14 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        CallInput, LivePlanPreconditions, PlanAuthority, apply_global_warp_override_state_response,
-        apply_zone_account_response, apply_zone_entitlement_response, boundary_response_artifact,
-        compensation_request, find_secret_value, guide_document, persist_prepared_plan,
-        persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
-        query_object_from_pairs, redact_secret_result, required_entitlement_precondition,
-        required_global_warp_override_state_precondition, required_zone_account_precondition,
+        CallInput, LivePlanPreconditions, PlanAuthority, apply_d1_read_replication_state_response,
+        apply_global_warp_override_state_response, apply_zone_account_response,
+        apply_zone_entitlement_response, boundary_response_artifact, compensation_request,
+        find_secret_value, guide_document, persist_prepared_plan, persist_secret_lifecycle,
+        preflight_call_input, preserve_previous_catalog, query_object_from_pairs,
+        redact_secret_result, required_d1_read_replication_state_precondition,
+        required_entitlement_precondition, required_global_warp_override_state_precondition,
+        required_zone_account_precondition, should_bind_d1_read_replication_state,
         should_bind_global_warp_override_state, should_bind_zone_account,
         should_resolve_zone_entitlement, sink_secret_result, validate_api_token_creation_contract,
         validate_current_permission_groups, validate_entitlement_receipt_precondition,
@@ -5069,6 +5504,181 @@ mod tests {
             Some("restore_global_warp_override_prior_disconnect_state".to_owned());
         capability.rollback.warning = Some("restoration requires explicit approval".to_owned());
         capability
+    }
+
+    fn d1_read_replication_update_capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            "d1-update-partial-database",
+            "Update D1 Database partially",
+            "PATCH",
+            "/accounts/{account_id}/d1/database/{database_id}",
+        );
+        capability.mutating = true;
+        capability.account_scope = "account".to_owned();
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.product = "D1".to_owned();
+        capability.risk = RiskClass::ScopedWrite;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.permissions = vec!["D1 Write".to_owned()];
+        capability.cost.known = true;
+        capability.cost.maximum = Some(0.0);
+        capability.cost.basis = Some("no incremental operation charge".to_owned());
+        capability.request_schema = Some(json!({
+            "type": "object",
+            "x-cfctl-body-required": true,
+            "properties": {
+                "read_replication": {
+                    "type": "object",
+                    "required": ["mode"],
+                    "properties": {
+                        "mode": {"type": "string", "enum": ["auto", "disabled"]},
+                    },
+                },
+            },
+        }));
+        capability.selectors = vec![
+            SelectorV1 {
+                name: "account_id".to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            },
+            SelectorV1 {
+                name: "database_id".to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            },
+        ];
+        capability.verification.strategy =
+            "same_resource_contains_planned_fields_after_update".to_owned();
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: "/accounts/{account_id}/d1/database/{database_id}".to_owned(),
+            read_capability_id: "d1-get-database".to_owned(),
+            verified_response_fields: vec!["read_replication".to_owned()],
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("restore_d1_read_replication_prior_mode".to_owned());
+        capability.rollback.warning = Some("restoration requires explicit approval".to_owned());
+        capability
+    }
+
+    #[test]
+    fn d1_state_receipt_binds_only_the_exact_database_mode() {
+        let capability = d1_read_replication_update_capability();
+        assert!(should_bind_d1_read_replication_state(&capability));
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "uuid": "database-a",
+                "read_replication": {
+                    "mode": "disabled",
+                    "ignored_future_field": true,
+                },
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+
+        let receipt = apply_d1_read_replication_state_response(
+            &capability,
+            "account-a",
+            "database-a",
+            &response,
+        )
+        .expect("D1 state receipt");
+        assert_eq!(
+            receipt,
+            json!({
+                "schema_version": 1,
+                "source_capability_id": "d1-get-database",
+                "source_path": "/accounts/{account_id}/d1/database/{database_id}",
+                "target_capability_id": "d1-update-partial-database",
+                "target_method": "PATCH",
+                "target_scope": "account",
+                "account_id": "account-a",
+                "database_id": "database-a",
+                "read_replication": {"mode":"disabled"},
+            })
+        );
+
+        let mut drifted = response;
+        drifted.result["read_replication"]["mode"] = json!("experimental");
+        let error = apply_d1_read_replication_state_response(
+            &capability,
+            "account-a",
+            "database-a",
+            &drifted,
+        )
+        .expect_err("unknown modes fail closed");
+        assert!(error.to_string().contains("bounded read_replication.mode"));
+    }
+
+    #[test]
+    fn d1_state_receipt_rejects_rehashed_cross_database_targets() {
+        let capability = d1_read_replication_update_capability();
+        let receipt = json!({
+            "schema_version": 1,
+            "source_capability_id": "d1-get-database",
+            "source_path": "/accounts/{account_id}/d1/database/{database_id}",
+            "target_capability_id": "d1-update-partial-database",
+            "target_method": "PATCH",
+            "target_scope": "account",
+            "account_id": "account-a",
+            "database_id": "database-a",
+            "read_replication": {"mode":"disabled"},
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({
+                "selectors":{"account_id":"account-a","database_id":"database-a"},
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{"d1_read_replication_state":receipt},
+            }),
+        )
+        .expect("plan");
+        plan.precondition_hashes.insert(
+            "d1_read_replication_state".to_owned(),
+            hash_value(&receipt).expect("receipt hash"),
+        );
+        assert_eq!(
+            required_d1_read_replication_state_precondition(&plan).expect("bound precondition"),
+            plan.precondition_hashes
+                .get("d1_read_replication_state")
+                .map(String::as_str)
+        );
+
+        let mut broadened = receipt.clone();
+        broadened["read_replication"]["future"] = json!(true);
+        plan.precondition_hashes.insert(
+            "d1_read_replication_state".to_owned(),
+            hash_value(&broadened).expect("broadened receipt hash"),
+        );
+        plan.targets["live_preconditions"]["d1_read_replication_state"] = broadened;
+        required_d1_read_replication_state_precondition(&plan)
+            .expect_err("a rehashed broadened state object must still fail");
+
+        let mut retargeted = receipt;
+        retargeted["database_id"] = json!("database-b");
+        plan.precondition_hashes.insert(
+            "d1_read_replication_state".to_owned(),
+            hash_value(&retargeted).expect("retargeted receipt hash"),
+        );
+        plan.targets["live_preconditions"]["d1_read_replication_state"] = retargeted;
+        let error = required_d1_read_replication_state_precondition(&plan)
+            .expect_err("a rehashed cross-database receipt must still fail");
+        assert!(error.to_string().contains("invalid account, database"));
     }
 
     #[test]
@@ -5249,6 +5859,7 @@ mod tests {
                 entitlement: None,
                 zone_account: None,
                 global_warp_override_state: Some((receipt.clone(), receipt_evidence)),
+                d1_read_replication_state: None,
             },
         )
         .expect("prepared plan");
@@ -5273,6 +5884,81 @@ mod tests {
         assert_eq!(
             plan["cloudflare_diffs"][0]["request_body"]["justification"],
             "controlled test plan"
+        );
+    }
+
+    #[test]
+    fn prepared_d1_plan_carries_exact_before_and_after_replication_mode() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = d1_read_replication_update_capability();
+        assert!(capability.mutation_contract_gaps().is_empty());
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "https://example.invalid/openapi.json".to_owned(),
+            source_hash: "source-sha".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability.id.clone(), capability.clone())]),
+        };
+        catalog.refresh_hash().expect("catalog hash");
+        let profile = ProfileMetadata::new("profile-a", ProfileKind::ApiToken, Some("account-a"));
+        let input = CallInput {
+            selectors: json!({"account_id":"account-a","database_id":"database-a"}),
+            body: Some(json!({"read_replication":{"mode":"auto"}})),
+            ..CallInput::default()
+        };
+        let receipt = json!({
+            "schema_version": 1,
+            "source_capability_id": "d1-get-database",
+            "source_path": "/accounts/{account_id}/d1/database/{database_id}",
+            "target_capability_id": "d1-update-partial-database",
+            "target_method": "PATCH",
+            "target_scope": "account",
+            "account_id": "account-a",
+            "database_id": "database-a",
+            "read_replication": {"mode":"disabled"},
+        });
+        let receipt_hash = hash_value(&receipt).expect("receipt hash");
+        let receipt_evidence = store
+            .write_evidence(EvidenceClass::LiveRead, &receipt)
+            .expect("live read evidence");
+
+        let envelope = persist_prepared_plan(
+            &store,
+            &catalog,
+            capability,
+            input,
+            PlanAuthority {
+                profile: &profile,
+                account_id: "account-a",
+            },
+            json!({}),
+            LivePlanPreconditions {
+                entitlement: None,
+                zone_account: None,
+                global_warp_override_state: None,
+                d1_read_replication_state: Some((receipt.clone(), receipt_evidence)),
+            },
+        )
+        .expect("prepared plan");
+        let plan = &envelope.result["plan"];
+
+        assert_eq!(
+            plan["precondition_hashes"]["d1_read_replication_state"],
+            receipt_hash
+        );
+        assert_eq!(
+            plan["targets"]["live_preconditions"]["d1_read_replication_state"],
+            receipt
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["observed_before"],
+            json!({"read_replication":{"mode":"disabled"}})
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["planned_after"],
+            json!({"read_replication":{"mode":"auto"}})
         );
     }
 
@@ -5343,6 +6029,75 @@ mod tests {
     }
 
     #[test]
+    fn d1_rectification_derives_a_separate_exact_mode_restore_request() {
+        let capability = d1_read_replication_update_capability();
+        let receipt = json!({
+            "schema_version": 1,
+            "source_capability_id": "d1-get-database",
+            "source_path": "/accounts/{account_id}/d1/database/{database_id}",
+            "target_capability_id": "d1-update-partial-database",
+            "target_method": "PATCH",
+            "target_scope": "account",
+            "account_id": "account-a",
+            "database_id": "database-a",
+            "read_replication": {"mode":"disabled"},
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability.clone(),
+            json!({
+                "selectors":{"account_id":"account-a","database_id":"database-a"},
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{"d1_read_replication_state":receipt},
+            }),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors: json!({"account_id":"account-a","database_id":"database-a"}),
+            query: json!({}),
+            body: Some(json!({"read_replication":{"mode":"auto"}})),
+            ..CallInput::default()
+        })
+        .expect("call input");
+        plan.precondition_hashes.insert(
+            "d1_read_replication_state".to_owned(),
+            hash_value(&receipt).expect("receipt hash"),
+        );
+        plan.refresh_hash().expect("bind source plan");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"success":true,"http_status":200}),
+        )
+        .expect("response receipt");
+        plan.status = PlanStatus::RectificationRequired;
+
+        let request = compensation_request(&plan)
+            .expect("request resolves")
+            .expect("compensation is supported");
+
+        assert_eq!(request.capability_id, capability.id);
+        assert_eq!(request.expected_method, "PATCH");
+        assert_eq!(request.expected_path, capability.path);
+        assert_eq!(
+            request.input.selectors,
+            json!({"account_id":"account-a","database_id":"database-a"})
+        );
+        assert_eq!(request.input.query, json!({}));
+        assert_eq!(
+            request.input.body,
+            Some(json!({"read_replication":{"mode":"disabled"}}))
+        );
+        assert_eq!(request.requested_account.as_deref(), Some("account-a"));
+    }
+
+    #[test]
     fn global_warp_override_guide_requires_the_exact_live_state_read() {
         let capability = global_warp_override_capability();
         let guide = guide_document(&capability);
@@ -5368,6 +6123,30 @@ mod tests {
             rectify["commands"][0],
             json!(["cfctl", "plans", "rectify", "<operation-id>", "--json"])
         );
+    }
+
+    #[test]
+    fn d1_guide_requires_the_exact_live_database_state_read() {
+        let capability = d1_read_replication_update_capability();
+        let guide = guide_document(&capability);
+        let current_state = &guide["stages"][4];
+        assert_eq!(current_state["name"], "inspect_current_state");
+        assert_eq!(current_state["contract_state"], "live_read_required");
+        assert_eq!(current_state["evidence_class"], "live_read");
+        assert_eq!(
+            current_state["commands"][0],
+            json!([
+                "cfctl",
+                "call",
+                "d1-get-database",
+                "--selector",
+                "account_id=<account_id>",
+                "--selector",
+                "database_id=<database_id>",
+                "--json"
+            ])
+        );
+        assert_eq!(guide["stages"][13]["contract_state"], "available");
     }
 
     #[test]

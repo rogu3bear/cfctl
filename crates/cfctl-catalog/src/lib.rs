@@ -942,6 +942,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     classify_global_warp_override_contract(document, &mut capabilities);
     classify_same_path_object_mutation_contracts(document, &mut capabilities);
     finalize_global_warp_override_rollback_contract(&mut capabilities);
+    finalize_d1_read_replication_rollback_contract(&mut capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
@@ -1134,6 +1135,28 @@ fn finalize_global_warp_override_rollback_contract(
             .to_owned(),
     );
     refresh_dynamic_mutation_contract(capability);
+}
+
+fn finalize_d1_read_replication_rollback_contract(
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    for capability_id in ["d1-update-database", "d1-update-partial-database"] {
+        let Some(capability) = capabilities.get_mut(capability_id) else {
+            continue;
+        };
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("restore_d1_read_replication_prior_mode".to_owned());
+        if !capability.rollback_contract_supported() {
+            capability.rollback.supported = false;
+            capability.rollback.strategy = None;
+            continue;
+        }
+        capability.rollback.warning = Some(
+            "rectification derives a separate hash-bound restoration plan from the prior read-replication mode; it never runs automatically and requires explicit approval"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
 }
 
 fn global_warp_override_source_contract_supported(

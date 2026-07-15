@@ -228,6 +228,57 @@ fn global_warp_restore_strategy_is_bound_to_the_exact_account_state_contract() {
 }
 
 #[test]
+fn d1_read_replication_restore_strategy_is_bound_to_the_exact_database_contract() {
+    let mut capability = CapabilityV1::new(
+        "d1-update-partial-database",
+        "Update D1 Database partially",
+        "PATCH",
+        "/accounts/{account_id}/d1/database/{database_id}",
+    );
+    capability.mutating = true;
+    capability.account_scope = "account".to_owned();
+    capability.product = "D1".to_owned();
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("restore_d1_read_replication_prior_mode".to_owned());
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{
+            "read_replication":{
+                "type":"object",
+                "required":["mode"],
+                "properties":{
+                    "mode":{"type":"string","enum":["auto","disabled"]}
+                }
+            }
+        }
+    }));
+    capability.verification.strategy =
+        "same_resource_contains_planned_fields_after_update".to_owned();
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/accounts/{account_id}/d1/database/{database_id}".to_owned(),
+        read_capability_id: "d1-get-database".to_owned(),
+        verified_response_fields: vec!["read_replication".to_owned()],
+    });
+
+    assert!(capability.rollback_contract_supported());
+
+    let mut put = capability.clone();
+    put.id = "d1-update-database".to_owned();
+    put.method = "PUT".to_owned();
+    put.request_schema.as_mut().expect("request schema")["required"] = json!(["read_replication"]);
+    assert!(put.rollback_contract_supported());
+
+    let mut grafted = capability.clone();
+    grafted.id = "widgets-update".to_owned();
+    assert!(!grafted.rollback_contract_supported());
+
+    let mut broadened = capability;
+    broadened.request_schema.as_mut().expect("request schema")["properties"]["read_replication"]
+        ["properties"]["mode"]["enum"] = json!(["auto", "disabled", "experimental"]);
+    assert!(!broadened.rollback_contract_supported());
+}
+
+#[test]
 fn same_path_post_state_contract_requires_the_exact_post_method_and_readback() {
     let mut capability = CapabilityV1::new(
         "settings-apply",

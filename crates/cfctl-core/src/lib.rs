@@ -696,6 +696,23 @@ impl CapabilityV1 {
                             && read.verified_response_fields == ["disconnect"]
                     })
             }
+            Some("restore_d1_read_replication_prior_mode") => {
+                matches!(
+                    (self.id.as_str(), self.method.as_str()),
+                    ("d1-update-database", "PUT") | ("d1-update-partial-database", "PATCH")
+                ) && self.product == "D1"
+                    && self.path == "/accounts/{account_id}/d1/database/{database_id}"
+                    && self.account_scope == "account"
+                    && self.verification.strategy
+                        == "same_resource_contains_planned_fields_after_update"
+                    && self.verification_contract_supported()
+                    && d1_read_replication_request_contract_supported(self)
+                    && self.same_path_read.as_ref().is_some_and(|read| {
+                        read.path == "/accounts/{account_id}/d1/database/{database_id}"
+                            && read.read_capability_id == "d1-get-database"
+                            && read.verified_response_fields == ["read_replication"]
+                    })
+            }
             _ => false,
         }
     }
@@ -942,6 +959,35 @@ fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
             .chars()
             .any(|character| matches!(character, '/' | '~'))
             && pointer.strip_prefix('/') == Some(selector))
+}
+
+fn d1_read_replication_request_contract_supported(capability: &CapabilityV1) -> bool {
+    let Some(schema) = capability.request_schema.as_ref() else {
+        return false;
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(replication) = properties.get("read_replication") else {
+        return false;
+    };
+    let replication_properties = replication.get("properties").and_then(Value::as_object);
+    schema.get("type").and_then(Value::as_str) == Some("object")
+        && properties.len() == 1
+        && replication.get("type").and_then(Value::as_str) == Some("object")
+        && replication.get("required")
+            == Some(&Value::Array(vec![Value::String("mode".to_owned())]))
+        && replication_properties.is_some_and(|properties| {
+            properties.len() == 1
+                && properties.get("mode").is_some_and(|mode| {
+                    mode.get("type").and_then(Value::as_str) == Some("string")
+                        && mode.get("enum")
+                            == Some(&Value::Array(vec![
+                                Value::String("auto".to_owned()),
+                                Value::String("disabled".to_owned()),
+                            ]))
+                })
+        })
 }
 
 const MAX_REQUEST_OBJECT_SCHEMA_DEPTH: usize = 64;

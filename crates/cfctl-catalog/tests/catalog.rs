@@ -1724,7 +1724,15 @@ fn assert_d1_update_contract(update: &CapabilityV1) {
             .as_deref()
             .is_some_and(|basis| basis.contains("no incremental operation or replica charge"))
     );
-    assert!(!update.rollback.supported);
+    assert!(update.rollback.supported);
+    assert_eq!(
+        update.rollback.strategy.as_deref(),
+        Some("restore_d1_read_replication_prior_mode")
+    );
+    assert!(update.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("separate hash-bound restoration plan")
+            && warning.contains("explicit approval")
+    }));
     assert_eq!(
         update.request_schema.as_ref().expect("request schema")["properties"]["read_replication"]["properties"]
             ["mode"]["enum"],
@@ -1801,7 +1809,6 @@ fn d1_database_readback_omits_only_the_documented_fields_projection() {
         .get("d1-update-partial-database")
         .expect("update D1 database");
     assert_d1_update_contract(update);
-
     let mut drifted_mode = document.clone();
     drifted_mode["components"]["schemas"]["D1ReadReplication"]["properties"]["mode"]["enum"] =
         json!(["auto", "disabled", "experimental"]);
