@@ -4615,6 +4615,160 @@ fn warp_connector_configuration_rejects_permission_schema_and_read_drift() {
     assert!(!capability.cost.known);
 }
 
+fn web_analytics_rum_fixture() -> serde_json::Value {
+    let response = json!({
+        "description": "Cloudflare API envelope",
+        "content": {"application/json": {"schema": {
+            "type": "object",
+            "required": ["success", "result"],
+            "properties": {
+                "success": {"type": "boolean"},
+                "result": {
+                    "type": "object",
+                    "properties": {
+                        "editable": {"type": "boolean"},
+                        "id": {"type": "string"},
+                        "value": {"type": "string"}
+                    }
+                }
+            }
+        }}}
+    });
+    json!({
+        "openapi": "3.0.3",
+        "info": {"title": "Cloudflare API", "version": "4.0.0"},
+        "servers": [{"url": "https://api.cloudflare.com/client/v4"}],
+        "paths": {
+            "/zones/{zone_id}/settings/rum": {
+                "parameters": [{
+                    "in": "path",
+                    "name": "zone_id",
+                    "required": true,
+                    "schema": {"type": "string", "maxLength": 32}
+                }],
+                "get": {
+                    "operationId": "web-analytics-get-rum-status",
+                    "summary": "Get RUM status",
+                    "tags": ["Web Analytics"],
+                    "x-api-token-group": ["Zone Settings Write", "Zone Settings Read"],
+                    "x-cfPlanAvailability": {
+                        "free": true,
+                        "pro": true,
+                        "business": true,
+                        "enterprise": true
+                    },
+                    "responses": {"200": response.clone()}
+                },
+                "patch": {
+                    "operationId": "web-analytics-toggle-rum",
+                    "summary": "Toggle RUM on/off for a zone",
+                    "tags": ["Web Analytics"],
+                    "x-api-token-group": ["Zone Settings Write"],
+                    "x-cfPlanAvailability": {
+                        "free": true,
+                        "pro": true,
+                        "business": true,
+                        "enterprise": true
+                    },
+                    "requestBody": {
+                        "required": true,
+                        "content": {"application/json": {"schema": {
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}}
+                        }}}
+                    },
+                    "responses": {"200": response}
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn web_analytics_rum_toggle_binds_exact_reversible_state() {
+    let snapshot =
+        normalize_openapi(&web_analytics_rum_fixture()).expect("Web Analytics RUM catalog");
+    let capability = snapshot
+        .get("web-analytics-toggle-rum")
+        .expect("Web Analytics RUM toggle");
+
+    assert_eq!(capability.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(capability.risk, RiskClass::CrossConfig);
+    assert_eq!(capability.effect, EffectClass::ReversibleWrite);
+    let request = capability.request_schema.as_ref().expect("request schema");
+    assert_eq!(
+        request.pointer("/additionalProperties"),
+        Some(&json!(false))
+    );
+    assert_eq!(request.pointer("/required"), Some(&json!(["value"])));
+    assert_eq!(
+        request.pointer("/properties/value/enum"),
+        Some(&json!(["on", "off"]))
+    );
+    assert!(capability.cost.known);
+    assert_eq!(capability.cost.maximum, Some(0.0));
+    assert_eq!(capability.cost.billing_model, BillingModelV1::None);
+    assert_eq!(capability.cost.exposure, CostExposureV1::None);
+    assert_eq!(capability.entitlement.available, Some(true));
+    for plan in ["free", "pro", "business", "enterprise"] {
+        assert_eq!(capability.entitlement.plans.get(plan), Some(&true));
+    }
+    let read = capability.same_path_read.as_ref().expect("same-path read");
+    assert_eq!(read.read_capability_id, "web-analytics-get-rum-status");
+    assert_eq!(read.verified_response_fields, ["value"]);
+    assert!(capability.rollback.supported);
+    assert_eq!(
+        capability.rollback.strategy.as_deref(),
+        Some("restore_web_analytics_rum_prior_value")
+    );
+    assert!(capability.mutation_contract_gaps().is_empty());
+
+    let mut enriched = snapshot;
+    attach_official_product_knowledge(&mut enriched, &pricing_feeds_fixture())
+        .expect("official product knowledge");
+    let enriched_capability = enriched
+        .get("web-analytics-toggle-rum")
+        .expect("enriched Web Analytics RUM toggle");
+    assert_eq!(enriched_capability.cost.billing_model, BillingModelV1::None);
+    assert_eq!(enriched_capability.cost.exposure, CostExposureV1::None);
+    assert_eq!(enriched_capability.cost.maximum, Some(0.0));
+}
+
+#[test]
+fn web_analytics_rum_toggle_rejects_permission_schema_and_read_drift() {
+    let mut permission_drift = web_analytics_rum_fixture();
+    permission_drift["paths"]["/zones/{zone_id}/settings/rum"]["patch"]["x-api-token-group"] =
+        json!(["Zone Settings Read"]);
+    let snapshot = normalize_openapi(&permission_drift).expect("permission drift");
+    let capability = snapshot
+        .get("web-analytics-toggle-rum")
+        .expect("permission-drifted Web Analytics RUM toggle");
+    assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(capability.risk, RiskClass::Unknown);
+
+    let mut schema_drift = web_analytics_rum_fixture();
+    schema_drift["paths"]["/zones/{zone_id}/settings/rum"]["patch"]["requestBody"]["content"]["application/json"]
+        ["schema"]["properties"]["rules"] = json!({"type": "array"});
+    let snapshot = normalize_openapi(&schema_drift).expect("schema drift");
+    let capability = snapshot
+        .get("web-analytics-toggle-rum")
+        .expect("schema-drifted Web Analytics RUM toggle");
+    assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(capability.risk, RiskClass::Unknown);
+    assert!(!capability.cost.known);
+
+    let mut read_drift = web_analytics_rum_fixture();
+    read_drift["paths"]["/zones/{zone_id}/settings/rum"]["get"]["x-api-token-group"] =
+        json!(["Zone Settings Read"]);
+    let snapshot = normalize_openapi(&read_drift).expect("read drift");
+    let capability = snapshot
+        .get("web-analytics-toggle-rum")
+        .expect("read-drifted Web Analytics RUM toggle");
+    assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(capability.risk, RiskClass::Unknown);
+    assert!(!capability.cost.known);
+}
+
 #[test]
 fn create_contract_binds_a_schema_proven_id_and_exact_read_delete_pair() {
     let document = create_lifecycle_fixture();

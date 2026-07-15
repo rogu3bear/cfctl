@@ -392,6 +392,52 @@ fn warp_connector_configuration_restore_strategy_is_bound_to_exact_mesh_ha_contr
 }
 
 #[test]
+fn web_analytics_rum_restore_strategy_is_bound_to_exact_toggle_contract() {
+    let request_schema = serde_json::from_str(include_str!(
+        "fixtures/web-analytics-rum-toggle-request-schema.json"
+    ))
+    .expect("pinned Web Analytics RUM toggle schema");
+    let mut capability = CapabilityV1::new(
+        "web-analytics-toggle-rum",
+        "Toggle RUM on/off for a zone",
+        "PATCH",
+        "/zones/{zone_id}/settings/rum",
+    );
+    capability.mutating = true;
+    capability.account_scope = "zone".to_owned();
+    capability.product = "Web Analytics".to_owned();
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("restore_web_analytics_rum_prior_value".to_owned());
+    capability.request_schema = Some(request_schema);
+    capability.verification.strategy =
+        "same_path_result_contains_planned_fields_after_update".to_owned();
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/zones/{zone_id}/settings/rum".to_owned(),
+        read_capability_id: "web-analytics-get-rum-status".to_owned(),
+        verified_response_fields: vec!["value".to_owned()],
+    });
+
+    assert!(capability.rollback_contract_supported());
+
+    let mut grafted = capability.clone();
+    grafted.id = "widgets-update".to_owned();
+    assert!(!grafted.rollback_contract_supported());
+
+    let mut broadened = capability.clone();
+    broadened.request_schema.as_mut().expect("request schema")["properties"]["value"]["enum"] =
+        json!(["on", "off", "manual"]);
+    assert!(!broadened.rollback_contract_supported());
+
+    let mut wrong_read = capability;
+    wrong_read
+        .same_path_read
+        .as_mut()
+        .expect("same-path read")
+        .read_capability_id = "settings-get".to_owned();
+    assert!(!wrong_read.rollback_contract_supported());
+}
+
+#[test]
 fn dns_record_restore_strategy_is_bound_to_the_exact_official_update_contract() {
     let request_schema = serde_json::from_str(include_str!(
         "fixtures/dns-record-update-request-schema.json"

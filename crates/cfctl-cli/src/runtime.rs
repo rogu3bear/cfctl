@@ -1176,6 +1176,10 @@ const WARP_CONNECTOR_CONFIGURATION_READ_CAPABILITY_ID: &str =
 const WARP_CONNECTOR_CONFIGURATION_PATH: &str =
     "/accounts/{account_id}/warp_connector/{tunnel_id}/configurations";
 const WARP_CONNECTOR_CONFIGURATION_STATE_PRECONDITION: &str = "warp_connector_configuration_state";
+const WEB_ANALYTICS_RUM_MUTATION_CAPABILITY_ID: &str = "web-analytics-toggle-rum";
+const WEB_ANALYTICS_RUM_READ_CAPABILITY_ID: &str = "web-analytics-get-rum-status";
+const WEB_ANALYTICS_RUM_PATH: &str = "/zones/{zone_id}/settings/rum";
+const WEB_ANALYTICS_RUM_STATE_PRECONDITION: &str = "web_analytics_rum_state";
 const DNS_RECORD_DETAIL_READ_CAPABILITY_ID: &str = "dns-records-for-a-zone-dns-record-details";
 const DNS_RECORD_DETAIL_PATH: &str = "/zones/{zone_id}/dns_records/{dns_record_id}";
 const DNS_RECORD_STATE_PRECONDITION: &str = "dns_record_state";
@@ -1400,6 +1404,57 @@ fn warp_connector_configuration_read_contract_supported(capability: &CapabilityV
             capability.selectors.iter().any(|selector| {
                 selector.name == *name && selector.location == "path" && selector.required
             })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|contract| {
+                matches!(
+                    contract.body_mode,
+                    cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                ) && contract.success_statuses == ["200"]
+                    && contract.success_media_types == ["application/json"]
+            })
+}
+
+fn is_web_analytics_rum_mutation(capability: &CapabilityV1) -> bool {
+    capability.id == WEB_ANALYTICS_RUM_MUTATION_CAPABILITY_ID
+}
+
+fn should_bind_web_analytics_rum_state(capability: &CapabilityV1) -> bool {
+    is_web_analytics_rum_mutation(capability)
+        && capability.mutating
+        && capability.method == "PATCH"
+        && capability.path == WEB_ANALYTICS_RUM_PATH
+        && capability.product == "Web Analytics"
+        && capability.account_scope == "zone"
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.rollback.strategy.as_deref() == Some("restore_web_analytics_rum_prior_value")
+        && capability.rollback_contract_supported()
+}
+
+fn web_analytics_rum_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == WEB_ANALYTICS_RUM_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == WEB_ANALYTICS_RUM_PATH
+        && capability.product == "Web Analytics"
+        && capability.account_scope == "zone"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.permissions == ["Zone Settings Write", "Zone Settings Read"]
+        && capability.selectors.len() == 1
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "zone_id"
+                && selector.location == "path"
+                && selector.required
+                && selector.value_type == "string"
         })
         && capability
             .response_contract
@@ -2036,6 +2091,107 @@ async fn read_live_warp_connector_configuration_state(
     Ok((receipt, evidence))
 }
 
+fn apply_web_analytics_rum_state_response(
+    capability: &CapabilityV1,
+    account_id: &str,
+    zone_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the Web Analytics RUM state read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    if response.result.get("id").and_then(Value::as_str) != Some("rum") {
+        return Err(CliError::Input(
+            "Web Analytics RUM state read did not identify setting `rum`; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    if response.result.get("editable").and_then(Value::as_bool) != Some(true) {
+        return Err(CliError::Input(
+            "Web Analytics RUM state is not explicitly editable; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    let prior_value = response
+        .result
+        .get("value")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "on" | "off"))
+        .ok_or_else(|| {
+            CliError::Input(
+                "Web Analytics RUM state is not an exactly restorable `on` or `off` value; `manual` and unknown states require operator inspection"
+                    .to_owned(),
+            )
+        })?;
+    Ok(json!({
+        "schema_version": 1,
+        "source_capability_id": WEB_ANALYTICS_RUM_READ_CAPABILITY_ID,
+        "source_path": WEB_ANALYTICS_RUM_PATH,
+        "target_capability_id": capability.id,
+        "target_method": capability.method,
+        "target_path": capability.path,
+        "target_scope": "zone",
+        "account_id": account_id,
+        "zone_id": zone_id,
+        "setting_id": "rum",
+        "editable": true,
+        "prior_value": prior_value,
+    }))
+}
+
+async fn read_live_web_analytics_rum_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !should_bind_web_analytics_rum_state(capability) {
+        return Err(CliError::Input(
+            "Web Analytics RUM mutation drifted from its governed prior-state contract".to_owned(),
+        ));
+    }
+    let zone_id = input
+        .selectors
+        .get("zone_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Web Analytics RUM state precondition requires string selector `zone_id`"
+                    .to_owned(),
+            )
+        })?;
+    let source_capability = catalog
+        .get(WEB_ANALYTICS_RUM_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(WEB_ANALYTICS_RUM_READ_CAPABILITY_ID))?;
+    if !web_analytics_rum_read_contract_supported(source_capability) {
+        return Err(CliError::Input(
+            "Web Analytics RUM state source capability drifted from the governed same-path read"
+                .to_owned(),
+        ));
+    }
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source_capability,
+            &CallInput {
+                selectors: json!({"zone_id": zone_id}),
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt =
+        apply_web_analytics_rum_state_response(capability, account_id, zone_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
+
 fn apply_global_warp_override_state_response(
     account_id: &str,
     response: &CloudflareResponseV1,
@@ -2408,6 +2564,7 @@ fn plan_requires_live_credential(capability: &CapabilityV1) -> bool {
         || should_bind_d1_read_replication_state(capability)
         || should_bind_cloudflare_tunnel_configuration_state(capability)
         || should_bind_warp_connector_configuration_state(capability)
+        || should_bind_web_analytics_rum_state(capability)
         || should_bind_dns_record_state(capability)
 }
 
@@ -2584,6 +2741,27 @@ async fn prepare_warp_connector_configuration_state_precondition(
     .map(Some)
 }
 
+async fn prepare_web_analytics_rum_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !should_bind_web_analytics_rum_state(capability) {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input(
+            "Web Analytics RUM state precondition credential was not resolved".to_owned(),
+        )
+    })?;
+    read_live_web_analytics_rum_state(store, catalog, capability, input, account_id, credential)
+        .await
+        .map(Some)
+}
+
 async fn prepare_dns_record_state_precondition(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -2632,6 +2810,10 @@ async fn prepare_live_plan_preconditions(
                 store, catalog, capability, input, account_id, credential,
             )
             .await?,
+        web_analytics_rum_state: prepare_web_analytics_rum_state_precondition(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await?,
         dns_record_state: prepare_dns_record_state_precondition(
             store, catalog, capability, input, account_id, credential,
         )
@@ -2651,6 +2833,7 @@ struct LivePlanPreconditions {
     d1_read_replication_state: Option<(Value, EvidenceV1)>,
     cloudflare_tunnel_configuration_state: Option<(Value, EvidenceV1)>,
     warp_connector_configuration_state: Option<(Value, EvidenceV1)>,
+    web_analytics_rum_state: Option<(Value, EvidenceV1)>,
     dns_record_state: Option<(Value, EvidenceV1)>,
 }
 
@@ -2678,6 +2861,9 @@ fn plan_targets(
     if let Some((receipt, _)) = &live_preconditions.warp_connector_configuration_state {
         targets["live_preconditions"][WARP_CONNECTOR_CONFIGURATION_STATE_PRECONDITION] =
             receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.web_analytics_rum_state {
+        targets["live_preconditions"][WEB_ANALYTICS_RUM_STATE_PRECONDITION] = receipt.clone();
     }
     if let Some((receipt, _)) = &live_preconditions.dns_record_state {
         targets["live_preconditions"][DNS_RECORD_STATE_PRECONDITION] = receipt.clone();
@@ -2707,6 +2893,10 @@ fn bind_live_plan_preconditions(
         (
             WARP_CONNECTOR_CONFIGURATION_STATE_PRECONDITION,
             &live_preconditions.warp_connector_configuration_state,
+        ),
+        (
+            WEB_ANALYTICS_RUM_STATE_PRECONDITION,
+            &live_preconditions.web_analytics_rum_state,
         ),
         (
             DNS_RECORD_STATE_PRECONDITION,
@@ -2782,6 +2972,19 @@ fn planned_cloudflare_diff(
             "config": receipt.get("prior_config").cloned().unwrap_or(Value::Null),
         });
         diff["planned_after"] = input.body.clone().unwrap_or(Value::Null);
+    }
+    if let Some((receipt, _)) = &live_preconditions.web_analytics_rum_state {
+        diff["observed_before"] = json!({
+            "value": receipt.get("prior_value").cloned().unwrap_or(Value::Null),
+        });
+        diff["planned_after"] = json!({
+            "value": input
+                .body
+                .as_ref()
+                .and_then(|body| body.get("value"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        });
     }
     if let Some((receipt, _)) = &live_preconditions.dns_record_state {
         diff["observed_before"] = receipt.get("prior_record").cloned().unwrap_or(Value::Null);
@@ -2887,6 +3090,9 @@ fn persist_prepared_plan(
         envelope.evidence.insert(0, evidence);
     }
     if let Some((_, evidence)) = live_preconditions.warp_connector_configuration_state {
+        envelope.evidence.insert(0, evidence);
+    }
+    if let Some((_, evidence)) = live_preconditions.web_analytics_rum_state {
         envelope.evidence.insert(0, evidence);
     }
     if let Some((_, evidence)) = live_preconditions.dns_record_state {
@@ -3337,6 +3543,7 @@ struct LivePreconditionEvidence {
     d1_read_replication_state: Option<EvidenceV1>,
     cloudflare_tunnel_configuration_state: Option<EvidenceV1>,
     warp_connector_configuration_state: Option<EvidenceV1>,
+    web_analytics_rum_state: Option<EvidenceV1>,
     dns_record_state: Option<EvidenceV1>,
 }
 
@@ -3378,6 +3585,10 @@ async fn validate_live_plan_precondition_evidence(
                 store, catalog, plan, input, credential,
             )
             .await?,
+        web_analytics_rum_state: validate_live_web_analytics_rum_state_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
         dns_record_state: validate_live_dns_record_state_precondition(
             store, catalog, plan, input, credential,
         )
@@ -3450,6 +3661,7 @@ fn prepend_live_precondition_evidence(
 ) {
     for item in [
         evidence.dns_record_state,
+        evidence.web_analytics_rum_state,
         evidence.warp_connector_configuration_state,
         evidence.cloudflare_tunnel_configuration_state,
         evidence.d1_read_replication_state,
@@ -4009,6 +4221,136 @@ fn warp_connector_configuration_prior_snapshot(plan: &PlanV1) -> Result<Value> {
             )
         })?;
     validate_warp_connector_configuration_prior_state_receipt(plan, receipt)
+}
+
+async fn validate_live_web_analytics_rum_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_web_analytics_rum_state_precondition(plan)? else {
+        return Ok(None);
+    };
+    let (receipt, evidence) = read_live_web_analytics_rum_state(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live Web Analytics RUM state drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
+}
+
+fn validate_web_analytics_rum_prior_state_receipt<'a>(
+    plan: &PlanV1,
+    receipt: &'a Value,
+) -> Result<&'a str> {
+    let zone_id = plan
+        .targets
+        .pointer("/selectors/zone_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Web Analytics RUM plan omitted its hash-bound zone selector; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let prior_value = receipt
+        .get("prior_value")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "on" | "off"));
+    let exact_identity = receipt.as_object().is_some_and(|object| object.len() == 12)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("source_capability_id").and_then(Value::as_str)
+            == Some(WEB_ANALYTICS_RUM_READ_CAPABILITY_ID)
+        && receipt.get("source_path").and_then(Value::as_str) == Some(WEB_ANALYTICS_RUM_PATH)
+        && receipt.get("target_capability_id").and_then(Value::as_str)
+            == Some(plan.capability.id.as_str())
+        && receipt.get("target_method").and_then(Value::as_str)
+            == Some(plan.capability.method.as_str())
+        && receipt.get("target_path").and_then(Value::as_str)
+            == Some(plan.capability.path.as_str())
+        && receipt.get("target_scope").and_then(Value::as_str) == Some("zone")
+        && receipt.get("account_id").and_then(Value::as_str) == Some(plan.account_id.as_str())
+        && receipt.get("zone_id").and_then(Value::as_str) == Some(zone_id)
+        && receipt.get("setting_id").and_then(Value::as_str) == Some("rum")
+        && receipt.get("editable").and_then(Value::as_bool) == Some(true);
+    if !exact_identity || prior_value.is_none() {
+        return Err(CliError::Input(
+            "plan Web Analytics RUM prior-state receipt has an invalid account, zone, source, method, path, editability, or on/off value; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(prior_value.unwrap_or_default())
+}
+
+fn required_web_analytics_rum_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    if !is_web_analytics_rum_mutation(&plan.capability) {
+        return Ok(None);
+    }
+    if !should_bind_web_analytics_rum_state(&plan.capability) {
+        return Err(CliError::Input(
+            "Web Analytics RUM plan is inconsistent with its hash-bound prior-state contract; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(WEB_ANALYTICS_RUM_STATE_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the live Web Analytics RUM prior-state contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/web_analytics_rum_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the hash-bound Web Analytics RUM prior-state receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    validate_web_analytics_rum_prior_state_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "plan Web Analytics RUM prior-state receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+fn web_analytics_rum_prior_value(plan: &PlanV1) -> Result<&str> {
+    required_web_analytics_rum_state_precondition(plan)?.ok_or_else(|| {
+        CliError::Input(
+            "Web Analytics RUM compensation requires a hash-bound prior-state precondition"
+                .to_owned(),
+        )
+    })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/web_analytics_rum_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "Web Analytics RUM compensation requires a hash-bound prior-state receipt"
+                    .to_owned(),
+            )
+        })?;
+    validate_web_analytics_rum_prior_state_receipt(plan, receipt)
 }
 
 async fn validate_live_dns_record_state_precondition(
@@ -4858,6 +5200,31 @@ fn warp_connector_configuration_compensation_request(plan: &PlanV1) -> Result<Co
     })
 }
 
+fn web_analytics_rum_compensation_request(plan: &PlanV1) -> Result<CompensationRequest> {
+    let zone_id = plan
+        .targets
+        .pointer("/selectors/zone_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Web Analytics RUM compensation requires a hash-bound zone selector".to_owned(),
+            )
+        })?;
+    Ok(CompensationRequest {
+        capability_id: WEB_ANALYTICS_RUM_MUTATION_CAPABILITY_ID.to_owned(),
+        expected_method: "PATCH".to_owned(),
+        expected_path: WEB_ANALYTICS_RUM_PATH.to_owned(),
+        input: CallInput {
+            selectors: json!({"zone_id": zone_id}),
+            query: json!({}),
+            body: Some(json!({"value": web_analytics_rum_prior_value(plan)?})),
+            ..CallInput::default()
+        },
+        requested_account: Some(plan.account_id.clone()),
+    })
+}
+
 fn dns_record_compensation_request(plan: &PlanV1) -> Result<CompensationRequest> {
     let zone_id = plan
         .targets
@@ -4908,6 +5275,25 @@ fn compensation_resource_id(artifact: &Value) -> Result<&str> {
         })
 }
 
+fn operation_specific_compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
+    let request = if plan.capability.id == GLOBAL_WARP_OVERRIDE_MUTATION_CAPABILITY_ID {
+        global_warp_override_compensation_request(plan)?
+    } else if is_d1_read_replication_mutation(&plan.capability) {
+        d1_read_replication_compensation_request(plan)?
+    } else if is_cloudflare_tunnel_configuration_mutation(&plan.capability) {
+        cloudflare_tunnel_configuration_compensation_request(plan)?
+    } else if is_warp_connector_configuration_mutation(&plan.capability) {
+        warp_connector_configuration_compensation_request(plan)?
+    } else if is_web_analytics_rum_mutation(&plan.capability) {
+        web_analytics_rum_compensation_request(plan)?
+    } else if is_dns_record_update_mutation(&plan.capability) {
+        dns_record_compensation_request(plan)?
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(request))
+}
+
 fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
     if !matches!(
         plan.status,
@@ -4924,20 +5310,8 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
     if artifact.get("success").and_then(Value::as_bool) != Some(true) {
         return Ok(None);
     }
-    if plan.capability.id == GLOBAL_WARP_OVERRIDE_MUTATION_CAPABILITY_ID {
-        return global_warp_override_compensation_request(plan).map(Some);
-    }
-    if is_d1_read_replication_mutation(&plan.capability) {
-        return d1_read_replication_compensation_request(plan).map(Some);
-    }
-    if is_cloudflare_tunnel_configuration_mutation(&plan.capability) {
-        return cloudflare_tunnel_configuration_compensation_request(plan).map(Some);
-    }
-    if is_warp_connector_configuration_mutation(&plan.capability) {
-        return warp_connector_configuration_compensation_request(plan).map(Some);
-    }
-    if is_dns_record_update_mutation(&plan.capability) {
-        return dns_record_compensation_request(plan).map(Some);
+    if let Some(request) = operation_specific_compensation_request(plan)? {
+        return Ok(Some(request));
     }
     let resource_id = compensation_resource_id(artifact)?;
     let (capability_id, expected_method, expected_path, selectors, body) = match plan
@@ -6035,6 +6409,7 @@ fn is_live_plan_precondition_hash(name: &str) -> bool {
             | D1_READ_REPLICATION_PRECONDITION
             | CLOUDFLARE_TUNNEL_CONFIGURATION_STATE_PRECONDITION
             | WARP_CONNECTOR_CONFIGURATION_STATE_PRECONDITION
+            | WEB_ANALYTICS_RUM_STATE_PRECONDITION
             | DNS_RECORD_STATE_PRECONDITION
     )
 }
@@ -6429,6 +6804,7 @@ enum GuideLiveRead {
     D1ReadReplicationState,
     CloudflareTunnelConfigurationState,
     WarpConnectorConfigurationState,
+    WebAnalyticsRumState,
     DnsRecordState,
 }
 
@@ -6457,6 +6833,10 @@ fn guide_live_reads(capability: &CapabilityV1) -> Vec<GuideLiveRead> {
         (
             should_bind_warp_connector_configuration_state(capability),
             GuideLiveRead::WarpConnectorConfigurationState,
+        ),
+        (
+            should_bind_web_analytics_rum_state(capability),
+            GuideLiveRead::WebAnalyticsRumState,
         ),
         (
             should_bind_dns_record_state(capability),
@@ -6497,6 +6877,7 @@ fn guide_stage_contract_state(
                         | GuideLiveRead::D1ReadReplicationState
                         | GuideLiveRead::CloudflareTunnelConfigurationState
                         | GuideLiveRead::WarpConnectorConfigurationState
+                        | GuideLiveRead::WebAnalyticsRumState
                         | GuideLiveRead::DnsRecordState
                 )
             }) =>
@@ -6584,6 +6965,13 @@ fn guide_live_read_summary(
                 "Read and bind the exact live WARP Connector high-availability mode and provider configuration; execution repeats this read and rejects drift before changing Cloudflare Mesh failover behavior.",
             )
         }
+        GuideStage::InspectCurrentState
+            if live_reads.contains(&GuideLiveRead::WebAnalyticsRumState) =>
+        {
+            Some(
+                "Read and bind the exact live editable Web Analytics RUM on/off value; execution repeats this read and rejects manual state or drift before changing zone-wide data collection.",
+            )
+        }
         GuideStage::InspectCurrentState if live_reads.contains(&GuideLiveRead::DnsRecordState) => {
             Some(
                 "Read and bind the exact live writable DNS record state; execution repeats this read and rejects drift before crossing the mutation boundary.",
@@ -6606,6 +6994,7 @@ fn guide_stage_uses_live_read(stage: cfctl_core::GuideStage, live_reads: &[Guide
                     | GuideLiveRead::D1ReadReplicationState
                     | GuideLiveRead::CloudflareTunnelConfigurationState
                     | GuideLiveRead::WarpConnectorConfigurationState
+                    | GuideLiveRead::WebAnalyticsRumState
                     | GuideLiveRead::DnsRecordState
             )
         }),
@@ -6771,6 +7160,16 @@ fn operation_specific_current_state_command(capability: &CapabilityV1) -> Option
             "account_id=<account_id>".to_owned(),
             "--selector".to_owned(),
             "tunnel_id=<tunnel_id>".to_owned(),
+            "--json".to_owned(),
+        ]);
+    }
+    if should_bind_web_analytics_rum_state(capability) {
+        return Some(vec![
+            "cfctl".to_owned(),
+            "call".to_owned(),
+            WEB_ANALYTICS_RUM_READ_CAPABILITY_ID.to_owned(),
+            "--selector".to_owned(),
+            "zone_id=<zone_id>".to_owned(),
             "--json".to_owned(),
         ]);
     }
@@ -7159,19 +7558,20 @@ mod tests {
         apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_read_replication_state_response, apply_dns_record_state_response,
         apply_global_warp_override_state_response,
-        apply_warp_connector_configuration_state_response, apply_zone_account_response,
-        apply_zone_entitlement_response, bind_required_empty_compensation_body,
-        boundary_response_artifact, capability_call_argv, compensation_request, find_secret_value,
-        guide_document, is_live_plan_precondition_hash, persist_prepared_plan,
-        persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
-        query_object_from_pairs, redact_secret_result,
+        apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
+        apply_zone_account_response, apply_zone_entitlement_response,
+        bind_required_empty_compensation_body, boundary_response_artifact, capability_call_argv,
+        compensation_request, find_secret_value, guide_document, is_live_plan_precondition_hash,
+        persist_prepared_plan, persist_secret_lifecycle, preflight_call_input,
+        preserve_previous_catalog, query_object_from_pairs, redact_secret_result,
         required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
         required_warp_connector_configuration_state_precondition,
-        required_zone_account_precondition, should_bind_cloudflare_tunnel_configuration_state,
-        should_bind_d1_read_replication_state, should_bind_dns_record_state,
-        should_bind_global_warp_override_state, should_bind_warp_connector_configuration_state,
+        required_web_analytics_rum_state_precondition, required_zone_account_precondition,
+        should_bind_cloudflare_tunnel_configuration_state, should_bind_d1_read_replication_state,
+        should_bind_dns_record_state, should_bind_global_warp_override_state,
+        should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
         should_bind_zone_account, should_resolve_zone_entitlement, sink_secret_result,
         validate_api_token_creation_contract, validate_current_permission_groups,
         validate_entitlement_receipt_precondition,
@@ -7204,6 +7604,7 @@ mod tests {
         assert!(is_live_plan_precondition_hash(
             "warp_connector_configuration_state"
         ));
+        assert!(is_live_plan_precondition_hash("web_analytics_rum_state"));
         assert!(!is_live_plan_precondition_hash("workspace_graph"));
     }
 
@@ -7439,6 +7840,52 @@ mod tests {
         capability.rollback.supported = true;
         capability.rollback.strategy =
             Some("restore_warp_connector_configuration_prior_snapshot".to_owned());
+        capability.rollback.warning = Some("restoration requires explicit approval".to_owned());
+        capability
+    }
+
+    fn web_analytics_rum_capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            "web-analytics-toggle-rum",
+            "Toggle RUM on/off for a zone",
+            "PATCH",
+            "/zones/{zone_id}/settings/rum",
+        );
+        capability.mutating = true;
+        capability.account_scope = "zone".to_owned();
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.product = "Web Analytics".to_owned();
+        capability.risk = RiskClass::CrossConfig;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.permissions = vec!["Zone Settings Write".to_owned()];
+        capability.cost.known = true;
+        capability.cost.maximum = Some(0.0);
+        capability.cost.basis = Some("no direct incremental operation charge".to_owned());
+        capability.entitlement.available = Some(true);
+        capability.request_schema = Some(
+            serde_json::from_str(include_str!(
+                "../../cfctl-core/tests/fixtures/web-analytics-rum-toggle-request-schema.json"
+            ))
+            .expect("pinned Web Analytics RUM toggle schema"),
+        );
+        capability.selectors = vec![SelectorV1 {
+            name: "zone_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        }];
+        capability.verification.required = true;
+        capability.verification.strategy =
+            "same_path_result_contains_planned_fields_after_update".to_owned();
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: "/zones/{zone_id}/settings/rum".to_owned(),
+            read_capability_id: "web-analytics-get-rum-status".to_owned(),
+            verified_response_fields: vec!["value".to_owned()],
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("restore_web_analytics_rum_prior_value".to_owned());
         capability.rollback.warning = Some("restoration requires explicit approval".to_owned());
         capability
     }
@@ -8124,6 +8571,163 @@ mod tests {
     }
 
     #[test]
+    fn web_analytics_rum_state_receipt_binds_only_editable_on_off_state() {
+        let capability = web_analytics_rum_capability();
+        assert!(should_bind_web_analytics_rum_state(&capability));
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "id":"rum",
+                "editable":true,
+                "value":"off",
+                "modified_on":"2026-07-15T12:00:00Z",
+                "future_read_only":"ignored"
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let receipt =
+            apply_web_analytics_rum_state_response(&capability, "account-a", "zone-a", &response)
+                .expect("Web Analytics RUM state receipt");
+        assert_eq!(
+            receipt,
+            json!({
+                "schema_version":1,
+                "source_capability_id":"web-analytics-get-rum-status",
+                "source_path":"/zones/{zone_id}/settings/rum",
+                "target_capability_id":"web-analytics-toggle-rum",
+                "target_method":"PATCH",
+                "target_path":"/zones/{zone_id}/settings/rum",
+                "target_scope":"zone",
+                "account_id":"account-a",
+                "zone_id":"zone-a",
+                "setting_id":"rum",
+                "editable":true,
+                "prior_value":"off",
+            })
+        );
+
+        for (result, expected) in [
+            (
+                json!({"id":"rum","editable":true,"value":"manual"}),
+                "restorable",
+            ),
+            (
+                json!({"id":"rum","editable":false,"value":"off"}),
+                "editable",
+            ),
+            (
+                json!({"id":"other","editable":true,"value":"off"}),
+                "identify setting",
+            ),
+        ] {
+            let mut invalid = response.clone();
+            invalid.result = result;
+            let error = apply_web_analytics_rum_state_response(
+                &capability,
+                "account-a",
+                "zone-a",
+                &invalid,
+            )
+            .expect_err("unrestorable RUM state must fail closed");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn web_analytics_rum_preflight_allows_only_exact_on_off_requests() {
+        let capability = web_analytics_rum_capability();
+        for value in ["on", "off"] {
+            preflight_call_input(
+                &capability,
+                &CallInput {
+                    selectors: json!({"zone_id":"zone-a"}),
+                    body: Some(json!({"value":value})),
+                    ..CallInput::default()
+                },
+                None,
+            )
+            .expect("exact RUM value is accepted");
+        }
+        for body in [
+            json!({"value":"manual"}),
+            json!({"value":"on","future":true}),
+            json!({}),
+        ] {
+            let error = preflight_call_input(
+                &capability,
+                &CallInput {
+                    selectors: json!({"zone_id":"zone-a"}),
+                    body: Some(body),
+                    ..CallInput::default()
+                },
+                None,
+            )
+            .expect_err("unsupported RUM request must fail closed");
+            assert!(
+                error.to_string().contains("request body") || error.to_string().contains("schema"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_analytics_rum_state_rejects_rehashed_cross_zone_targets() {
+        let capability = web_analytics_rum_capability();
+        let receipt = json!({
+            "schema_version":1,
+            "source_capability_id":"web-analytics-get-rum-status",
+            "source_path":"/zones/{zone_id}/settings/rum",
+            "target_capability_id":"web-analytics-toggle-rum",
+            "target_method":"PATCH",
+            "target_path":"/zones/{zone_id}/settings/rum",
+            "target_scope":"zone",
+            "account_id":"account-a",
+            "zone_id":"zone-a",
+            "setting_id":"rum",
+            "editable":true,
+            "prior_value":"off",
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({
+                "selectors":{"zone_id":"zone-a"},
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{"web_analytics_rum_state":receipt},
+            }),
+        )
+        .expect("plan");
+        plan.precondition_hashes.insert(
+            "web_analytics_rum_state".to_owned(),
+            hash_value(&receipt).expect("receipt hash"),
+        );
+        assert_eq!(
+            required_web_analytics_rum_state_precondition(&plan).expect("bound precondition"),
+            plan.precondition_hashes
+                .get("web_analytics_rum_state")
+                .map(String::as_str)
+        );
+
+        let mut retargeted = receipt;
+        retargeted["zone_id"] = json!("zone-b");
+        plan.precondition_hashes.insert(
+            "web_analytics_rum_state".to_owned(),
+            hash_value(&retargeted).expect("retargeted receipt hash"),
+        );
+        plan.targets["live_preconditions"]["web_analytics_rum_state"] = retargeted;
+        let error = required_web_analytics_rum_state_precondition(&plan)
+            .expect_err("a rehashed cross-zone receipt must still fail");
+        assert!(error.to_string().contains("account, zone"));
+    }
+
+    #[test]
     fn global_warp_override_state_receipt_binds_only_the_exact_account_state() {
         let response = CloudflareResponseV1 {
             status: 200,
@@ -8304,6 +8908,7 @@ mod tests {
                 d1_read_replication_state: None,
                 cloudflare_tunnel_configuration_state: None,
                 warp_connector_configuration_state: None,
+                web_analytics_rum_state: None,
                 dns_record_state: None,
             },
         )
@@ -8386,6 +8991,7 @@ mod tests {
                 d1_read_replication_state: Some((receipt.clone(), receipt_evidence)),
                 cloudflare_tunnel_configuration_state: None,
                 warp_connector_configuration_state: None,
+                web_analytics_rum_state: None,
                 dns_record_state: None,
             },
         )
@@ -8473,6 +9079,7 @@ mod tests {
                 d1_read_replication_state: None,
                 cloudflare_tunnel_configuration_state: Some((receipt.clone(), receipt_evidence)),
                 warp_connector_configuration_state: None,
+                web_analytics_rum_state: None,
                 dns_record_state: None,
             },
         )
@@ -8556,6 +9163,7 @@ mod tests {
                 d1_read_replication_state: None,
                 cloudflare_tunnel_configuration_state: None,
                 warp_connector_configuration_state: Some((receipt.clone(), evidence)),
+                web_analytics_rum_state: None,
                 dns_record_state: None,
             },
         )
@@ -8575,6 +9183,87 @@ mod tests {
             json!({"ha_mode":"disabled","config":null})
         );
         assert_eq!(plan["cloudflare_diffs"][0]["planned_after"], planned);
+    }
+
+    #[test]
+    fn prepared_web_analytics_rum_plan_carries_exact_before_and_after_state() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = web_analytics_rum_capability();
+        assert!(capability.mutation_contract_gaps().is_empty());
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "https://example.invalid/openapi.json".to_owned(),
+            source_hash: "source-sha".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability.id.clone(), capability.clone())]),
+        };
+        catalog.refresh_hash().expect("catalog hash");
+        let profile = ProfileMetadata::new("profile-a", ProfileKind::ApiToken, Some("account-a"));
+        let receipt = json!({
+            "schema_version":1,
+            "source_capability_id":"web-analytics-get-rum-status",
+            "source_path":"/zones/{zone_id}/settings/rum",
+            "target_capability_id":"web-analytics-toggle-rum",
+            "target_method":"PATCH",
+            "target_path":"/zones/{zone_id}/settings/rum",
+            "target_scope":"zone",
+            "account_id":"account-a",
+            "zone_id":"zone-a",
+            "setting_id":"rum",
+            "editable":true,
+            "prior_value":"off",
+        });
+        let receipt_hash = hash_value(&receipt).expect("receipt hash");
+        let evidence = store
+            .write_evidence(EvidenceClass::LiveRead, &receipt)
+            .expect("live read evidence");
+
+        let envelope = persist_prepared_plan(
+            &store,
+            &catalog,
+            capability,
+            CallInput {
+                selectors: json!({"zone_id":"zone-a"}),
+                body: Some(json!({"value":"on"})),
+                ..CallInput::default()
+            },
+            PlanAuthority {
+                profile: &profile,
+                account_id: "account-a",
+            },
+            json!({}),
+            LivePlanPreconditions {
+                entitlement: None,
+                zone_account: None,
+                global_warp_override_state: None,
+                d1_read_replication_state: None,
+                cloudflare_tunnel_configuration_state: None,
+                warp_connector_configuration_state: None,
+                web_analytics_rum_state: Some((receipt.clone(), evidence)),
+                dns_record_state: None,
+            },
+        )
+        .expect("prepared plan");
+        let plan = &envelope.result["plan"];
+
+        assert_eq!(
+            plan["precondition_hashes"]["web_analytics_rum_state"],
+            receipt_hash
+        );
+        assert_eq!(
+            plan["targets"]["live_preconditions"]["web_analytics_rum_state"],
+            receipt
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["observed_before"],
+            json!({"value":"off"})
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["planned_after"],
+            json!({"value":"on"})
+        );
     }
 
     #[test]
@@ -8646,6 +9335,7 @@ mod tests {
                 d1_read_replication_state: None,
                 cloudflare_tunnel_configuration_state: None,
                 warp_connector_configuration_state: None,
+                web_analytics_rum_state: None,
                 dns_record_state: Some((receipt.clone(), receipt_evidence)),
             },
         )
@@ -8951,6 +9641,70 @@ mod tests {
     }
 
     #[test]
+    fn web_analytics_rum_rectification_derives_an_exact_restore_patch() {
+        let capability = web_analytics_rum_capability();
+        let receipt = json!({
+            "schema_version":1,
+            "source_capability_id":"web-analytics-get-rum-status",
+            "source_path":"/zones/{zone_id}/settings/rum",
+            "target_capability_id":"web-analytics-toggle-rum",
+            "target_method":"PATCH",
+            "target_path":"/zones/{zone_id}/settings/rum",
+            "target_scope":"zone",
+            "account_id":"account-a",
+            "zone_id":"zone-a",
+            "setting_id":"rum",
+            "editable":true,
+            "prior_value":"off",
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability.clone(),
+            json!({
+                "selectors":{"zone_id":"zone-a"},
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{"web_analytics_rum_state":receipt},
+            }),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors: json!({"zone_id":"zone-a"}),
+            body: Some(json!({"value":"on"})),
+            ..CallInput::default()
+        })
+        .expect("call input");
+        plan.precondition_hashes.insert(
+            "web_analytics_rum_state".to_owned(),
+            hash_value(&receipt).expect("receipt hash"),
+        );
+        plan.refresh_hash().expect("bind source plan");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"success":true,"http_status":200}),
+        )
+        .expect("response receipt");
+        plan.status = PlanStatus::RectificationRequired;
+
+        let request = compensation_request(&plan)
+            .expect("request resolves")
+            .expect("compensation is supported");
+        assert_eq!(request.capability_id, capability.id);
+        assert_eq!(request.expected_method, "PATCH");
+        assert_eq!(request.expected_path, capability.path);
+        assert_eq!(request.input.selectors, json!({"zone_id":"zone-a"}));
+        assert_eq!(request.input.query, json!({}));
+        assert_eq!(request.input.body, Some(json!({"value":"off"})));
+        assert_eq!(request.requested_account.as_deref(), Some("account-a"));
+    }
+
+    #[test]
     fn dns_rectification_derives_a_separate_exact_put_restore_request() {
         let capability = dns_record_update_capability("PATCH");
         let receipt = json!({
@@ -9123,6 +9877,28 @@ mod tests {
                 "account_id=<account_id>",
                 "--selector",
                 "tunnel_id=<tunnel_id>",
+                "--json"
+            ])
+        );
+        assert_eq!(guide["stages"][13]["contract_state"], "available");
+    }
+
+    #[test]
+    fn web_analytics_rum_guide_requires_the_exact_live_setting_read() {
+        let capability = web_analytics_rum_capability();
+        let guide = guide_document(&capability);
+        let current_state = &guide["stages"][4];
+        assert_eq!(current_state["name"], "inspect_current_state");
+        assert_eq!(current_state["contract_state"], "live_read_required");
+        assert_eq!(current_state["evidence_class"], "live_read");
+        assert_eq!(
+            current_state["commands"][0],
+            json!([
+                "cfctl",
+                "call",
+                "web-analytics-get-rum-status",
+                "--selector",
+                "zone_id=<zone_id>",
                 "--json"
             ])
         );

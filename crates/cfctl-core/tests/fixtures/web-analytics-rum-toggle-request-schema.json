@@ -1,0 +1,17 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "value": {
+      "enum": [
+        "on",
+        "off"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "value"
+  ],
+  "type": "object",
+  "x-cfctl-body-required": true
+}

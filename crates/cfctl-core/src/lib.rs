@@ -723,6 +723,9 @@ impl CapabilityV1 {
             Some("restore_warp_connector_configuration_prior_snapshot") => {
                 warp_connector_configuration_rollback_contract_supported(self)
             }
+            Some("restore_web_analytics_rum_prior_value") => {
+                web_analytics_rum_rollback_contract_supported(self)
+            }
             Some("restore_dns_record_prior_snapshot_with_put") => {
                 matches!(
                     (self.id.as_str(), self.method.as_str()),
@@ -1145,6 +1148,31 @@ fn warp_connector_configuration_request_contract_supported(capability: &Capabili
         .and_then(|schema| canonical_hash_value(schema).ok())
         .as_deref()
         == Some(WARP_CONNECTOR_CONFIGURATION_REQUEST_SCHEMA_HASH)
+}
+
+const WEB_ANALYTICS_RUM_REQUEST_SCHEMA_HASH: &str =
+    "sha256:9499b763c96acee1138259b42b03394f697b0b812266c7b8b085cf3bb1fcc65d";
+
+fn web_analytics_rum_rollback_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "web-analytics-toggle-rum"
+        && capability.method == "PATCH"
+        && capability.product == "Web Analytics"
+        && capability.path == "/zones/{zone_id}/settings/rum"
+        && capability.account_scope == "zone"
+        && capability.verification.strategy
+            == "same_path_result_contains_planned_fields_after_update"
+        && capability.verification_contract_supported()
+        && capability
+            .request_schema
+            .as_ref()
+            .and_then(|schema| canonical_hash_value(schema).ok())
+            .as_deref()
+            == Some(WEB_ANALYTICS_RUM_REQUEST_SCHEMA_HASH)
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path == "/zones/{zone_id}/settings/rum"
+                && read.read_capability_id == "web-analytics-get-rum-status"
+                && read.verified_response_fields == ["value"]
+        })
 }
 
 const DNS_RECORD_UPDATE_REQUEST_SCHEMA_HASH: &str =

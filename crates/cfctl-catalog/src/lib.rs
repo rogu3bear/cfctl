@@ -408,6 +408,7 @@ pub fn attach_official_product_knowledge(
             .max()
             .unwrap_or_default();
         matches.retain(|entry| entry.product_terms.len() == most_specific);
+        let has_pricing_match = !matches.is_empty();
         for entry in matches {
             if capability
                 .cost
@@ -425,7 +426,7 @@ pub fn attach_official_product_knowledge(
             .cost
             .references
             .sort_by(|left, right| left.url.cmp(&right.url));
-        if !capability.cost.references.is_empty() {
+        if has_pricing_match {
             capability.cost.exposure = if capability.cost.billing_model == BillingModelV1::Contract
             {
                 CostExposureV1::AccountQuote
@@ -958,6 +959,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     finalize_d1_read_replication_rollback_contract(&mut capabilities);
     finalize_cloudflare_tunnel_configuration_rollback_contract(&mut capabilities);
     finalize_warp_connector_configuration_rollback_contract(&mut capabilities);
+    finalize_web_analytics_rum_rollback_contract(document, &mut capabilities);
     finalize_dns_record_rollback_contract(document, &mut capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
@@ -3475,6 +3477,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         classify_cloudflare_tunnel_configuration(capability);
     } else if warp_connector_configuration_contract_supported(capability) {
         classify_warp_connector_configuration(capability);
+    } else if web_analytics_rum_contract_supported(capability) {
+        classify_web_analytics_rum(capability);
     } else if let Some(kind) = queue_configuration_kind(capability) {
         classify_queue_configuration(capability, kind);
     } else {
@@ -5009,6 +5013,237 @@ fn finalize_warp_connector_configuration_rollback_contract(
     }
     capability.rollback.warning = Some(
         "rectification derives a separate hash-bound WARP Connector configuration PUT plan from the exact prior high-availability snapshot; it never runs automatically and requires explicit approval"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
+
+const WEB_ANALYTICS_RUM_MUTATION_CAPABILITY_ID: &str = "web-analytics-toggle-rum";
+const WEB_ANALYTICS_RUM_READ_CAPABILITY_ID: &str = "web-analytics-get-rum-status";
+const WEB_ANALYTICS_RUM_PATH: &str = "/zones/{zone_id}/settings/rum";
+
+fn web_analytics_plan_availability_supported(capability: &CapabilityV1) -> bool {
+    capability.entitlement.plans
+        == BTreeMap::from([
+            ("business".to_owned(), true),
+            ("enterprise".to_owned(), true),
+            ("free".to_owned(), true),
+            ("pro".to_owned(), true),
+        ])
+}
+
+fn web_analytics_rum_identity_supported(capability: &CapabilityV1) -> bool {
+    capability.id == WEB_ANALYTICS_RUM_MUTATION_CAPABILITY_ID
+        && capability.method == "PATCH"
+        && capability.path == WEB_ANALYTICS_RUM_PATH
+        && capability.product == "Web Analytics"
+        && capability.account_scope == "zone"
+        && capability.permissions == ["Zone Settings Write"]
+        && capability.selectors.len() == 1
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "zone_id"
+                && selector.location == "path"
+                && selector.required
+                && selector.value_type == "string"
+        })
+        && web_analytics_plan_availability_supported(capability)
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+                    && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            })
+}
+
+fn web_analytics_rum_source_schema_supported(schema: &Value) -> bool {
+    if !exact_schema_keys(schema, &["properties", "type", "x-cfctl-body-required"])
+        || schema.get("type").and_then(Value::as_str) != Some("object")
+        || schema.get("x-cfctl-body-required").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| {
+            properties.len() == 1 && exact_primitive_schema(properties.get("value"), "string")
+        })
+}
+
+fn web_analytics_rum_contract_supported(capability: &CapabilityV1) -> bool {
+    web_analytics_rum_identity_supported(capability)
+        && capability
+            .request_schema
+            .as_ref()
+            .is_some_and(web_analytics_rum_source_schema_supported)
+}
+
+fn harden_web_analytics_rum_request_schema(schema: &mut Value) -> bool {
+    let Some(root) = schema.as_object_mut() else {
+        return false;
+    };
+    root.insert("additionalProperties".to_owned(), Value::Bool(false));
+    root.insert("required".to_owned(), serde_json::json!(["value"]));
+    let Some(value) = root
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("value"))
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    value.insert("enum".to_owned(), serde_json::json!(["on", "off"]));
+    true
+}
+
+fn classify_web_analytics_rum(capability: &mut CapabilityV1) {
+    let Some(request_schema) = capability.request_schema.as_mut() else {
+        return;
+    };
+    if !harden_web_analytics_rum_request_schema(request_schema) {
+        return;
+    }
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.basis = Some(
+        "toggling Web Analytics RUM has no direct per-operation charge; Cloudflare documents Web Analytics as available on every plan"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Web Analytics overview".to_owned(),
+            url: "https://developers.cloudflare.com/web-analytics/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Web Analytics configuration".to_owned(),
+            url: "https://developers.cloudflare.com/web-analytics/get-started/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare public OpenAPI schema".to_owned(),
+            url: "https://github.com/cloudflare/api-schemas/blob/main/openapi.json".to_owned(),
+            source: "official Cloudflare API schema".to_owned(),
+        },
+    ];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.blocker = None;
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/web-analytics/".to_owned());
+    capability.entitlement.requires_live_resolution = false;
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "automatic restoration is unavailable unless cfctl binds an editable on/off live RUM value; manual state cannot be restored by the toggle endpoint"
+            .to_owned(),
+    );
+}
+
+fn web_analytics_rum_hardened_request_supported(capability: &CapabilityV1) -> bool {
+    let Some(schema) = capability.request_schema.as_ref() else {
+        return false;
+    };
+    let mut source_shape = schema.clone();
+    let Some(root) = source_shape.as_object_mut() else {
+        return false;
+    };
+    if root.remove("additionalProperties") != Some(Value::Bool(false))
+        || root.remove("required") != Some(serde_json::json!(["value"]))
+    {
+        return false;
+    }
+    let Some(value) = root
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("value"))
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    if value.remove("enum") != Some(serde_json::json!(["on", "off"])) {
+        return false;
+    }
+    web_analytics_rum_source_schema_supported(&source_shape)
+}
+
+fn web_analytics_rum_read_contract_supported(document: &Value, capability: &CapabilityV1) -> bool {
+    let response_fields_supported = document
+        .get("paths")
+        .and_then(Value::as_object)
+        .and_then(|paths| paths.get(WEB_ANALYTICS_RUM_PATH))
+        .and_then(|path| path.get("get"))
+        .is_some_and(|operation| {
+            success_response_declares_result_fields(
+                document,
+                operation,
+                &["editable", "id", "value"],
+            )
+        });
+    capability.id == WEB_ANALYTICS_RUM_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == WEB_ANALYTICS_RUM_PATH
+        && capability.product == "Web Analytics"
+        && capability.account_scope == "zone"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && capability.permissions == ["Zone Settings Write", "Zone Settings Read"]
+        && capability.selectors.len() == 1
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "zone_id"
+                && selector.location == "path"
+                && selector.required
+                && selector.value_type == "string"
+        })
+        && web_analytics_plan_availability_supported(capability)
+        && response_fields_supported
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+                    && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            })
+}
+
+fn finalize_web_analytics_rum_rollback_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let source_supported = capabilities
+        .get(WEB_ANALYTICS_RUM_READ_CAPABILITY_ID)
+        .is_some_and(|capability| web_analytics_rum_read_contract_supported(document, capability));
+    let Some(capability) = capabilities.get_mut(WEB_ANALYTICS_RUM_MUTATION_CAPABILITY_ID) else {
+        return;
+    };
+    if !web_analytics_rum_identity_supported(capability)
+        || !web_analytics_rum_hardened_request_supported(capability)
+    {
+        return;
+    }
+    if !source_supported {
+        capability.risk = RiskClass::Unknown;
+        capability.effect = EffectClass::Unknown;
+        capability.cost.known = false;
+        capability.cost.maximum = None;
+        refresh_dynamic_mutation_contract(capability);
+        return;
+    }
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("restore_web_analytics_rum_prior_value".to_owned());
+    if !capability.rollback_contract_supported() {
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        return;
+    }
+    capability.rollback.warning = Some(
+        "rectification derives a separate hash-bound RUM PATCH plan from the exact prior on/off value; it never runs automatically and requires explicit approval"
             .to_owned(),
     );
     refresh_dynamic_mutation_contract(capability);
