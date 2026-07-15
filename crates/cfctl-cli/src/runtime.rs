@@ -4454,14 +4454,7 @@ fn workspace_precondition_hashes(store: &StateStore) -> Result<BTreeMap<String, 
 fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> {
     let current = workspace_precondition_hashes(store)?;
     for (name, expected) in &plan.precondition_hashes {
-        if matches!(
-            name.as_str(),
-            "catalog"
-                | "request_input"
-                | "entitlement"
-                | "zone_account"
-                | "global_warp_override_state"
-        ) {
+        if is_live_plan_precondition_hash(name) {
             continue;
         }
         if current.get(name) != Some(expected) {
@@ -4471,6 +4464,18 @@ fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> 
         }
     }
     Ok(())
+}
+
+fn is_live_plan_precondition_hash(name: &str) -> bool {
+    matches!(
+        name,
+        "catalog"
+            | "request_input"
+            | "entitlement"
+            | "zone_account"
+            | "global_warp_override_state"
+            | D1_READ_REPLICATION_PRECONDITION
+    )
 }
 
 fn resolve_account_id(
@@ -5412,14 +5417,15 @@ mod tests {
         CallInput, LivePlanPreconditions, PlanAuthority, apply_d1_read_replication_state_response,
         apply_global_warp_override_state_response, apply_zone_account_response,
         apply_zone_entitlement_response, boundary_response_artifact, compensation_request,
-        find_secret_value, guide_document, persist_prepared_plan, persist_secret_lifecycle,
-        preflight_call_input, preserve_previous_catalog, query_object_from_pairs,
-        redact_secret_result, required_d1_read_replication_state_precondition,
-        required_entitlement_precondition, required_global_warp_override_state_precondition,
-        required_zone_account_precondition, should_bind_d1_read_replication_state,
-        should_bind_global_warp_override_state, should_bind_zone_account,
-        should_resolve_zone_entitlement, sink_secret_result, validate_api_token_creation_contract,
-        validate_current_permission_groups, validate_entitlement_receipt_precondition,
+        find_secret_value, guide_document, is_live_plan_precondition_hash, persist_prepared_plan,
+        persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
+        query_object_from_pairs, redact_secret_result,
+        required_d1_read_replication_state_precondition, required_entitlement_precondition,
+        required_global_warp_override_state_precondition, required_zone_account_precondition,
+        should_bind_d1_read_replication_state, should_bind_global_warp_override_state,
+        should_bind_zone_account, should_resolve_zone_entitlement, sink_secret_result,
+        validate_api_token_creation_contract, validate_current_permission_groups,
+        validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
         validate_selected_permission_groups, validate_zone_account_receipt_precondition,
         workspace_resource_keys, zone_target,
@@ -5438,6 +5444,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     struct DeleteFailingSecretStore;
+
+    #[test]
+    fn d1_state_hash_is_validated_by_the_live_precondition_lane() {
+        assert!(is_live_plan_precondition_hash("d1_read_replication_state"));
+        assert!(!is_live_plan_precondition_hash("workspace_graph"));
+    }
 
     fn test_catalog() -> CatalogSnapshot {
         let capability = CapabilityV1::new("accounts-list", "List accounts", "GET", "/accounts");
