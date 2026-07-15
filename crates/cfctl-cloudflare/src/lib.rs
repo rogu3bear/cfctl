@@ -357,6 +357,11 @@ impl Executor {
                 .verify_exact_resource_delete(plan, apply_response, &input, credential)
                 .await;
         }
+        if strategy == "same_resource_contains_planned_fields_after_update" {
+            return self
+                .verify_exact_resource_update(plan, apply_response, &input, credential)
+                .await;
+        }
 
         Err(CloudflareError::UnsupportedVerificationStrategy(
             strategy.to_owned(),
@@ -393,6 +398,60 @@ impl Executor {
             format!(
                 "exact resource deletion was not proven (apply success={}, readback HTTP {}, readback success={})",
                 apply_response.success, readback.status, readback.success
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback,
+        })
+    }
+
+    async fn verify_exact_resource_update(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let planned = input
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .filter(|body| !body.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "planned update body is absent, empty, or not an object".to_owned(),
+                )
+            })?;
+        let details = CapabilityV1::new(
+            "exact-resource-update-verification-readback",
+            "Exact resource update verification readback",
+            "GET",
+            &plan.capability.path,
+        );
+        let request = self.builder.build(
+            &details,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let mismatches = mismatched_planned_fields(planned, &readback.result);
+        let passed = apply_response.success && readback.success && mismatches.is_empty();
+        let basis = if passed {
+            "the exact resource readback contained every planned update field".to_owned()
+        } else {
+            format!(
+                "exact resource update was not proven (apply success={}, readback HTTP {}, readback success={}, fields={})",
+                apply_response.success,
+                readback.status,
+                readback.success,
+                render_field_names(&mismatches)
             )
         };
         Ok(OperationVerificationV1 {

@@ -126,6 +126,8 @@ impl CatalogSnapshot {
         let mut entitlement_metadata = 0;
         let mut plan_gated = 0;
         let mut cost_references = 0;
+        let mut verification_contracts = 0;
+        let mut rollback_contracts = 0;
         let mut complete_mutation_contracts = 0;
         for capability in self.capabilities.values() {
             *adapter_statuses
@@ -152,6 +154,10 @@ impl CatalogSnapshot {
                     .any(|available| !available),
             );
             cost_references += usize::from(!capability.cost.references.is_empty());
+            verification_contracts +=
+                usize::from(capability.mutating && capability.verification_contract_declared());
+            rollback_contracts +=
+                usize::from(capability.mutating && capability.rollback_contract_declared());
             complete_mutation_contracts +=
                 usize::from(capability.mutating && capability.mutation_contract_gaps().is_empty());
         }
@@ -164,6 +170,8 @@ impl CatalogSnapshot {
             entitlement_metadata,
             plan_gated,
             cost_references,
+            verification_contracts,
+            rollback_contracts,
             complete_mutation_contracts,
             adapter_statuses,
             sources,
@@ -194,6 +202,8 @@ pub struct CatalogCoverageV1 {
     pub entitlement_metadata: usize,
     pub plan_gated: usize,
     pub cost_references: usize,
+    pub verification_contracts: usize,
+    pub rollback_contracts: usize,
     pub complete_mutation_contracts: usize,
     pub adapter_statuses: BTreeMap<String, usize>,
     pub sources: BTreeMap<String, usize>,
@@ -833,7 +843,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
         }
     }
 
-    classify_exact_resource_delete_contracts(&mut capabilities);
+    classify_exact_resource_contracts(&mut capabilities);
 
     let source_hash = hash_value(document)?;
     let mut snapshot = CatalogSnapshot {
@@ -848,7 +858,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     Ok(snapshot)
 }
 
-fn classify_exact_resource_delete_contracts(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+fn classify_exact_resource_contracts(capabilities: &mut BTreeMap<String, CapabilityV1>) {
     let readback_paths = capabilities
         .values()
         .filter(|capability| capability.method == "GET")
@@ -863,7 +873,6 @@ fn classify_exact_resource_delete_contracts(capabilities: &mut BTreeMap<String, 
                     .as_deref()
                     .is_some_and(|reason| reason.starts_with("operation contract incomplete:")));
         if !contract_incomplete
-            || capability.method != "DELETE"
             || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
             || !path_targets_exact_resource(&capability.path)
             || !readback_paths.contains(&capability.path)
@@ -871,19 +880,32 @@ fn classify_exact_resource_delete_contracts(capabilities: &mut BTreeMap<String, 
             continue;
         }
 
-        capability.cost = cfctl_core::CostV1::default();
-        capability.cost.basis = Some(
-            "deleting an existing resource has no incremental operation charge; refunds, retained usage, and downstream billing are not claimed"
-                .to_owned(),
-        );
-        "same_resource_returns_not_found_after_delete"
-            .clone_into(&mut capability.verification.strategy);
+        match capability.method.as_str() {
+            "DELETE" => {
+                capability.cost = cfctl_core::CostV1::default();
+                capability.cost.basis = Some(
+                    "deleting an existing resource has no incremental operation charge; refunds, retained usage, and downstream billing are not claimed"
+                        .to_owned(),
+                );
+                "same_resource_returns_not_found_after_delete"
+                    .clone_into(&mut capability.verification.strategy);
+                capability.rollback.warning = Some(
+                    "deletion is irreversible without a prior resource snapshot; any recreation must be a separately reviewed plan"
+                        .to_owned(),
+                );
+            }
+            "PATCH" | "PUT" => {
+                "same_resource_contains_planned_fields_after_update"
+                    .clone_into(&mut capability.verification.strategy);
+                capability.rollback.warning = Some(
+                    "automatic restoration is unsupported because the plan does not bind a pre-change snapshot; restoration requires a separately reviewed update plan built from trusted evidence"
+                        .to_owned(),
+                );
+            }
+            _ => continue,
+        }
         capability.rollback.supported = false;
         capability.rollback.strategy = None;
-        capability.rollback.warning = Some(
-            "deletion is irreversible without a prior resource snapshot; any recreation must be a separately reviewed plan"
-                .to_owned(),
-        );
         refresh_incomplete_contract_reason(capability);
     }
 }

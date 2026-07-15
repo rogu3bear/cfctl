@@ -35,8 +35,8 @@ Catalog sync also joins official product pricing indexes to matching
 capabilities. Those references identify usage, subscription, pass-through, or
 contract exposure without pretending a variable downstream bill is a hard
 execution ceiling. `catalog coverage` reports entitlement metadata, plan-gated
-operations, pricing-reference coverage, and complete mutation contracts
-separately.
+operations, pricing-reference coverage, declared verification and rollback
+contracts, and fully complete mutation contracts separately.
 
 ## Public commands
 

@@ -705,6 +705,144 @@ async fn exact_resource_deletion_rejects_a_still_present_readback_without_echoin
 }
 
 #[tokio::test]
+async fn exact_resource_update_is_verified_by_same_path_planned_fields() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let read = stream.read(&mut buffer).await.expect("read verification");
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let body = r#"{"success":true,"result":{"id":"widget-1","name":"after","settings":{"enabled":true,"mode":"strict"},"server_default":"kept"},"errors":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+        request
+    });
+    let mut plan = dns_record_plan(
+        "widgets-update",
+        "PATCH",
+        "/accounts/{account_id}/widgets/{widget_id}",
+        "same_resource_contains_planned_fields_after_update",
+        json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        Some(json!({
+            "name":"after",
+            "settings":{"enabled":true,"mode":"strict"}
+        })),
+    );
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        query: json!({"mutation_mode":"replace"}),
+        body: Some(json!({
+            "name":"after",
+            "settings":{"enabled":true,"mode":"strict"}
+        })),
+        if_match: Some("mutation-etag".to_owned()),
+        ..CallInput::default()
+    })
+    .expect("input");
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"widget-1"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let request = server.await.expect("server joins");
+    assert!(request.starts_with("GET /client/v4/accounts/account-1/widgets/widget-1 "));
+    assert!(!request.contains("mutation_mode"));
+    assert!(!request.contains("mutation-etag"));
+}
+
+#[tokio::test]
+async fn exact_resource_update_rejects_field_drift_without_echoing_values() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let _ = stream.read(&mut buffer).await.expect("read verification");
+        let body = r#"{"success":true,"result":{"settings":{"mode":"unexpected-live-value"}},"errors":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+    });
+    let plan = dns_record_plan(
+        "widgets-update",
+        "PUT",
+        "/accounts/{account_id}/widgets/{widget_id}",
+        "same_resource_contains_planned_fields_after_update",
+        json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        Some(json!({"settings":{"mode":"planned-secret-like-value"}})),
+    );
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("settings"));
+    assert!(!verification.basis.contains("planned-secret-like-value"));
+    assert!(!verification.basis.contains("unexpected-live-value"));
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
 async fn dns_record_verification_rejects_live_field_drift_without_echoing_values() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

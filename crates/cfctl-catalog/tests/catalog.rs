@@ -438,6 +438,84 @@ fn exact_resource_deletes_pair_with_same_path_readback_contracts() {
     );
 }
 
+#[test]
+fn exact_resource_updates_pair_with_same_path_field_readback_contracts() {
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/accounts/{account_id}/widgets/{widget_id}": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+                    {"in":"path","name":"widget_id","required":true,"schema":{"type":"string"}}
+                ],
+                "get": {
+                    "operationId":"widgets-get",
+                    "summary":"Get Widget",
+                    "tags":["Widgets"]
+                },
+                "patch": {
+                    "operationId":"widgets-patch",
+                    "summary":"Patch Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"]
+                },
+                "put": {
+                    "operationId":"widgets-update",
+                    "summary":"Update Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"]
+                }
+            },
+            "/accounts/{account_id}/widgets": {
+                "get": {
+                    "operationId":"widgets-list",
+                    "summary":"List Widgets",
+                    "tags":["Widgets"]
+                },
+                "put": {
+                    "operationId":"widgets-replace-all",
+                    "summary":"Replace All Widgets",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"]
+                }
+            }
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("widget catalog");
+    for id in ["widgets-patch", "widgets-update"] {
+        let exact = snapshot.get(id).expect("exact update");
+        assert_eq!(
+            exact.verification.strategy,
+            "same_resource_contains_planned_fields_after_update"
+        );
+        assert!(!exact.rollback.supported);
+        assert!(
+            exact
+                .rollback
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("pre-change snapshot"))
+        );
+        let gaps = exact.mutation_contract_gaps();
+        assert!(gaps.iter().all(|gap| !gap.contains("verification")));
+        assert!(gaps.iter().all(|gap| !gap.contains("rollback")));
+        assert_eq!(exact.adapter_status, AdapterStatus::Blocked);
+    }
+
+    let collection = snapshot
+        .get("widgets-replace-all")
+        .expect("collection update");
+    assert_ne!(
+        collection.verification.strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+    let coverage = snapshot.coverage();
+    assert_eq!(coverage.verification_contracts, 2);
+    assert_eq!(coverage.rollback_contracts, 2);
+}
+
 fn pricing_feeds_fixture() -> OfficialTextFeedsV1 {
     OfficialTextFeedsV1 {
         fetched_at: Utc::now(),

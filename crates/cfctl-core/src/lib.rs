@@ -315,26 +315,11 @@ impl CapabilityV1 {
                 ));
             }
         }
-        if self.verification.required
-            && matches!(
-                self.verification.strategy.as_str(),
-                "" | "required" | "post_change_read_or_operation_specific_verifier"
-            )
-        {
+        if !self.verification_contract_declared() {
             gaps.push("operation-specific verification is not declared".to_owned());
         }
 
-        let rollback_declared = if self.rollback.supported {
-            self.rollback
-                .strategy
-                .as_deref()
-                .is_some_and(|strategy| !strategy.trim().is_empty())
-        } else {
-            self.rollback.warning.as_deref().is_some_and(|warning| {
-                !warning.trim().is_empty() && warning != "rollback semantics have not been declared"
-            })
-        };
-        if !rollback_declared {
+        if !self.rollback_contract_declared() {
             gaps.push(
                 "operation-specific rollback or irreversibility behavior is not declared"
                     .to_owned(),
@@ -357,6 +342,29 @@ impl CapabilityV1 {
             );
         }
         gaps
+    }
+
+    #[must_use]
+    pub fn verification_contract_declared(&self) -> bool {
+        !self.verification.required
+            || !matches!(
+                self.verification.strategy.as_str(),
+                "" | "required" | "post_change_read_or_operation_specific_verifier"
+            )
+    }
+
+    #[must_use]
+    pub fn rollback_contract_declared(&self) -> bool {
+        if self.rollback.supported {
+            self.rollback
+                .strategy
+                .as_deref()
+                .is_some_and(|strategy| !strategy.trim().is_empty())
+        } else {
+            self.rollback.warning.as_deref().is_some_and(|warning| {
+                !warning.trim().is_empty() && warning != "rollback semantics have not been declared"
+            })
+        }
     }
 }
 
