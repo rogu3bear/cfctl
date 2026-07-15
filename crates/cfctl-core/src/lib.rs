@@ -530,10 +530,9 @@ impl CapabilityV1 {
         }
         let plan_gated = self.entitlement.plans.values().any(|available| !available);
         if plan_gated && self.entitlement.available != Some(true) {
-            gaps.push(
-                "account entitlement has not been resolved for this plan-gated operation"
-                    .to_owned(),
-            );
+            gaps.push(self.entitlement.blocker.clone().unwrap_or_else(|| {
+                "account entitlement has not been resolved for this plan-gated operation".to_owned()
+            }));
         }
         gaps
     }

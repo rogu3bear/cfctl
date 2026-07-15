@@ -3965,6 +3965,17 @@ fn guide_next_action(
             "Run the exact call to perform the governed live zone-subscription read. cfctl creates a plan only when the active plan is allowed by the official matrix, then binds and rechecks that entitlement before execution.",
             call_argv.unwrap_or_default().to_vec(),
         )
+    } else if blocked_text.contains("product-scoped subscription join key") {
+        (
+            "cfctl cannot safely map the account's product-scoped subscriptions to this operation's generic plan matrix because the official schema supplies no product-scoped subscription join key. Keep the operation blocked; do not treat any active account subscription as proof of entitlement.",
+            vec![
+                "cfctl".to_owned(),
+                "docs".to_owned(),
+                "search".to_owned(),
+                format!("{} plans subscriptions", capability.product),
+                "--json".to_owned(),
+            ],
+        )
     } else if blocked_text.contains("cost") {
         (
             "Resolve and bind the operation's official pricing contract before planning it.",
@@ -5257,6 +5268,46 @@ mod tests {
                 "--json"
             ])
         );
+    }
+
+    #[test]
+    fn guide_does_not_pretend_an_ambiguous_account_subscription_proves_entitlement() {
+        let mut capability = CapabilityV1::new(
+            "account-widgets-create",
+            "Create account widget",
+            "POST",
+            "/accounts/{account_id}/widgets",
+        );
+        capability.product = "Widgets".to_owned();
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.entitlement.plans = BTreeMap::from([
+            ("free".to_owned(), false),
+            ("pro".to_owned(), true),
+            ("business".to_owned(), true),
+            ("enterprise".to_owned(), true),
+        ]);
+        capability.entitlement.blocker = Some(
+            "live account entitlement resolution is unsupported because the official plan matrix has no product-scoped subscription join key"
+                .to_owned(),
+        );
+        capability.blocked_reason = Some(format!(
+            "operation contract incomplete: {}",
+            capability.entitlement.blocker.as_deref().expect("blocker")
+        ));
+
+        let guide = guide_document(&capability);
+
+        assert_eq!(guide["contract_state"], "blocked");
+        assert!(
+            guide["next_action"]["summary"]
+                .as_str()
+                .is_some_and(|summary| {
+                    summary.contains("cannot safely map")
+                        && summary.contains("product-scoped subscription")
+                })
+        );
+        assert_eq!(guide["next_action"]["argv"][1], "docs");
+        assert!(guide["call_argv"].is_null());
     }
 
     #[test]

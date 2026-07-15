@@ -381,11 +381,19 @@ pub fn attach_official_product_knowledge(
         if !capability.entitlement.plans.is_empty() {
             capability.entitlement.source =
                 Some("official OpenAPI x-cfPlanAvailability".to_owned());
-            capability.entitlement.requires_live_resolution = capability
+            let plan_gated = capability
                 .entitlement
                 .plans
                 .values()
                 .any(|available| !available);
+            capability.entitlement.requires_live_resolution =
+                plan_gated && supports_live_zone_entitlement_resolution(capability);
+            capability.entitlement.blocker =
+                if plan_gated && !capability.entitlement.requires_live_resolution {
+                    Some(unsupported_entitlement_resolution_reason(capability))
+                } else {
+                    None
+                };
         }
 
         let mut matches: Vec<_> = pricing
@@ -432,6 +440,24 @@ pub fn attach_official_product_knowledge(
         refresh_dynamic_mutation_contract(capability);
     }
     snapshot.refresh_hash()
+}
+
+fn supports_live_zone_entitlement_resolution(capability: &CapabilityV1) -> bool {
+    capability.account_scope == "zone"
+        && capability.selectors.iter().any(|selector| {
+            selector.location == "path" && selector.required && selector.name == "zone_id"
+        })
+}
+
+fn unsupported_entitlement_resolution_reason(capability: &CapabilityV1) -> String {
+    if capability.account_scope == "zone" {
+        return "live zone entitlement resolution is unsupported because the operation has no exact required zone_id selector for the zone subscription join"
+            .to_owned();
+    }
+    format!(
+        "live {} entitlement resolution is unsupported because the official plan matrix has no product-scoped subscription join key for this operation",
+        capability.account_scope
+    )
 }
 
 #[derive(Debug)]
@@ -3287,9 +3313,7 @@ fn mutation_contract_gap_code(gap: &str) -> &'static str {
             "rollback_unsupported"
         }
         "required Cloudflare permission lane is not declared" => "permission_lane_missing",
-        "account entitlement has not been resolved for this plan-gated operation" => {
-            "entitlement_unresolved"
-        }
+        _ if gap.contains("entitlement") => "entitlement_unresolved",
         _ if gap.starts_with("operation-specific cost is not bounded;") => "cost_unbounded",
         _ if gap.starts_with("known incremental cost has no ") => "cost_invalid",
         _ => "unclassified",

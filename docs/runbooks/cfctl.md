@@ -46,6 +46,12 @@ and execution rechecks it. Do not substitute account subscription output or
 manually edit `observed_plan`; ambiguous, inactive, unavailable, and drifted
 entitlements remain blocked.
 
+For account-, global-, or user-scoped plan gates, `check_entitlement` remains
+`blocked` when the official schema has no product-scoped subscription join key.
+The generated next action explains the missing join and opens the matching
+official plan documentation. An arbitrary active entry from
+`GET /accounts/{account_id}/subscriptions` is not entitlement proof.
+
 For an executable zone mutation, `select_account` is also
 `live_read_required`. The exact call reads `GET /zones/{zone_id}` and requires
 the returned zone and `account.id` to match the target and selected account.

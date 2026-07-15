@@ -3350,6 +3350,64 @@ fn official_product_indexes_attach_pricing_without_claiming_a_bounded_cost() {
 }
 
 #[test]
+fn plan_gate_resolution_requires_a_scope_specific_subscription_join() {
+    let document = json!({
+        "openapi":"3.0.3",
+        "info":{"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/accounts/{account_id}/widgets": {
+                "post": {
+                    "operationId":"account-widgets-create",
+                    "summary":"Create account widget",
+                    "tags":["Widgets"],
+                    "parameters":[
+                        {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}}
+                    ],
+                    "x-cfPlanAvailability":{"free":false,"pro":true,"business":true,"enterprise":true}
+                }
+            },
+            "/zones/{zone_id}/widgets": {
+                "post": {
+                    "operationId":"zone-widgets-create",
+                    "summary":"Create zone widget",
+                    "tags":["Widgets"],
+                    "parameters":[
+                        {"in":"path","name":"zone_id","required":true,"schema":{"type":"string"}}
+                    ],
+                    "x-cfPlanAvailability":{"free":false,"pro":true,"business":true,"enterprise":true}
+                }
+            }
+        }
+    });
+    let mut snapshot = normalize_openapi(&document).expect("catalog");
+
+    attach_official_product_knowledge(&mut snapshot, &pricing_feeds_fixture())
+        .expect("knowledge attaches");
+
+    let account = snapshot
+        .get("account-widgets-create")
+        .expect("account operation");
+    assert!(!account.entitlement.requires_live_resolution);
+    assert!(
+        account
+            .entitlement
+            .blocker
+            .as_deref()
+            .is_some_and(|blocker| { blocker.contains("product-scoped subscription join key") })
+    );
+    assert!(
+        account
+            .mutation_contract_gaps()
+            .iter()
+            .any(|gap| { gap.contains("product-scoped subscription join key") })
+    );
+
+    let zone = snapshot.get("zone-widgets-create").expect("zone operation");
+    assert!(zone.entitlement.requires_live_resolution);
+    assert!(zone.entitlement.blocker.is_none());
+}
+
+#[test]
 fn executable_catalog_hash_changes_when_a_local_contract_changes() {
     let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
     let source_hash = snapshot.source_hash.clone();
