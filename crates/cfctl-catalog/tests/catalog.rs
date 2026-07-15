@@ -3349,6 +3349,56 @@ fn access_service_token_fixture() -> serde_json::Value {
     fixture
 }
 
+fn zone_access_service_token_fixture() -> serde_json::Value {
+    let mut fixture = access_service_token_fixture();
+    let paths = fixture["paths"]
+        .as_object_mut()
+        .expect("Access service-token paths");
+    let mut collection = paths
+        .remove("/accounts/{account_id}/access/service_tokens")
+        .expect("account service-token collection");
+    let mut detail = paths
+        .remove("/accounts/{account_id}/access/service_tokens/{service_token_id}")
+        .expect("account service-token detail");
+
+    collection["parameters"][0]["name"] = json!("zone_id");
+    collection["post"]["operationId"] =
+        json!("zone-level-access-service-tokens-create-a-service-token");
+    collection["post"]["description"] = json!(
+        "Generates a new service token. **Note:** This is the only time you can get the Client Secret. If you lose the Client Secret, you will have to create a new service token."
+    );
+    collection["post"]["tags"] = json!(["Zone-Level Access service tokens"]);
+
+    for parameter in detail["parameters"]
+        .as_array_mut()
+        .expect("service-token detail parameters")
+    {
+        if parameter["name"] == "account_id" {
+            parameter["name"] = json!("zone_id");
+        }
+    }
+    detail["get"]["operationId"] = json!("zone-level-access-service-tokens-get-a-service-token");
+    detail["get"]["tags"] = json!(["Zone-Level Access service tokens"]);
+    detail["delete"]["operationId"] =
+        json!("zone-level-access-service-tokens-delete-a-service-token");
+    detail["delete"]["tags"] = json!(["Zone-Level Access service tokens"]);
+    detail
+        .as_object_mut()
+        .expect("service-token detail operations")
+        .remove("put");
+
+    paths.clear();
+    paths.insert(
+        "/zones/{zone_id}/access/service_tokens".to_owned(),
+        collection,
+    );
+    paths.insert(
+        "/zones/{zone_id}/access/service_tokens/{service_token_id}".to_owned(),
+        detail,
+    );
+    fixture
+}
+
 fn access_service_token_detail_fixture() -> serde_json::Value {
     json!({
         "parameters":[
@@ -3530,6 +3580,96 @@ fn access_service_token_creation_is_a_secret_safe_exact_resource_lifecycle() {
     assert!(rotate.blocked_reason.as_deref().is_some_and(|reason| {
         reason.contains("required Cloudflare permission lane is not declared")
     }));
+}
+
+#[test]
+fn zone_access_service_token_creation_is_a_secret_safe_exact_resource_lifecycle() {
+    let snapshot = normalize_openapi(&zone_access_service_token_fixture())
+        .expect("zone Access service-token catalog");
+    let create = snapshot
+        .get("zone-level-access-service-tokens-create-a-service-token")
+        .expect("zone Access service-token create");
+
+    assert_eq!(create.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(create.risk, RiskClass::SecretSensitive);
+    assert_eq!(create.effect, EffectClass::IdentityOrOwnership);
+    assert!(create.cost.known);
+    assert!(!create.cost.incremental);
+    assert_eq!(create.cost.maximum, Some(0.0));
+    assert_eq!(create.cost.billing_model, BillingModelV1::Subscription);
+    assert_eq!(create.cost.exposure, CostExposureV1::AccountQuote);
+    assert_eq!(create.entitlement.available, Some(true));
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    let target = create
+        .created_resource
+        .as_ref()
+        .expect("exact zone service-token target");
+    assert_eq!(
+        target.detail_path,
+        "/zones/{zone_id}/access/service_tokens/{service_token_id}"
+    );
+    assert_eq!(target.identity_selector, "service_token_id");
+    assert_eq!(target.response_result_identity_pointer, "/id");
+    assert_eq!(
+        target.read_capability_id,
+        "zone-level-access-service-tokens-get-a-service-token"
+    );
+    assert_eq!(
+        target.delete_capability_id,
+        "zone-level-access-service-tokens-delete-a-service-token"
+    );
+    assert_eq!(target.verified_response_fields, ["duration", "name"]);
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    assert_eq!(
+        create
+            .request_schema
+            .as_ref()
+            .expect("narrow zone create schema"),
+        &json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":["name"],
+            "properties":{
+                "duration":{"type":"string"},
+                "name":{"type":"string"}
+            },
+            "x-cfctl-body-required":true
+        })
+    );
+    assert!(create.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn zone_access_service_token_creation_rejects_authority_and_schema_drift() {
+    let blocked = |document: serde_json::Value| {
+        normalize_openapi(&document)
+            .expect("drifted zone Access service-token catalog")
+            .get("zone-level-access-service-tokens-create-a-service-token")
+            .expect("zone Access service-token create")
+            .adapter_status
+            == AdapterStatus::Blocked
+    };
+
+    let mut permission = zone_access_service_token_fixture();
+    permission["paths"]["/zones/{zone_id}/access/service_tokens"]["post"]["x-api-token-group"] =
+        json!(["Account Settings Write"]);
+    assert!(blocked(permission));
+
+    let mut request = zone_access_service_token_fixture();
+    request["paths"]["/zones/{zone_id}/access/service_tokens"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["tamper_mode"] = json!({"type":"boolean"});
+    assert!(blocked(request));
+
+    let mut secret = zone_access_service_token_fixture();
+    secret["components"]["schemas"]["ServiceToken"]["properties"]["client_secret"]["type"] =
+        json!("integer");
+    assert!(blocked(secret));
 }
 
 #[test]

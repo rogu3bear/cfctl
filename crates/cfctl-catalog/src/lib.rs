@@ -4308,7 +4308,7 @@ const ACCESS_AUTHORIZATION_CONFIGURATION_CONTRACTS: &[AccessAuthorizationConfigu
     },
 ];
 
-const ACCESS_SERVICE_TOKEN_CREATE_CAPABILITY_ID: &str =
+const ACCOUNT_ACCESS_SERVICE_TOKEN_CREATE_CAPABILITY_ID: &str =
     "access-service-tokens-create-a-service-token";
 const ACCESS_SERVICE_TOKEN_GET_CAPABILITY_ID: &str = "access-service-tokens-get-a-service-token";
 const ACCESS_SERVICE_TOKEN_DELETE_CAPABILITY_ID: &str =
@@ -4320,6 +4320,40 @@ const ACCESS_SERVICE_TOKEN_DETAIL_PATH: &str =
     "/accounts/{account_id}/access/service_tokens/{service_token_id}";
 const ACCESS_SERVICE_TOKEN_REFRESH_PATH: &str =
     "/accounts/{account_id}/access/service_tokens/{service_token_id}/refresh";
+
+struct AccessServiceTokenCreateContract {
+    id: &'static str,
+    collection_path: &'static str,
+    detail_path: &'static str,
+    product: &'static str,
+    scope_selector: &'static str,
+    read_id: &'static str,
+    delete_id: &'static str,
+    description: &'static str,
+}
+
+const ACCESS_SERVICE_TOKEN_CREATE_CONTRACTS: &[AccessServiceTokenCreateContract] = &[
+    AccessServiceTokenCreateContract {
+        id: ACCOUNT_ACCESS_SERVICE_TOKEN_CREATE_CAPABILITY_ID,
+        collection_path: ACCESS_SERVICE_TOKEN_COLLECTION_PATH,
+        detail_path: ACCESS_SERVICE_TOKEN_DETAIL_PATH,
+        product: "Access service tokens",
+        scope_selector: "account_id",
+        read_id: ACCESS_SERVICE_TOKEN_GET_CAPABILITY_ID,
+        delete_id: ACCESS_SERVICE_TOKEN_DELETE_CAPABILITY_ID,
+        description: "Generates a new service token. **Note:** This is the only time you can get the Client Secret. If you lose the Client Secret, you will have to rotate the Client Secret or create a new service token.",
+    },
+    AccessServiceTokenCreateContract {
+        id: "zone-level-access-service-tokens-create-a-service-token",
+        collection_path: "/zones/{zone_id}/access/service_tokens",
+        detail_path: "/zones/{zone_id}/access/service_tokens/{service_token_id}",
+        product: "Zone-Level Access service tokens",
+        scope_selector: "zone_id",
+        read_id: "zone-level-access-service-tokens-get-a-service-token",
+        delete_id: "zone-level-access-service-tokens-delete-a-service-token",
+        description: "Generates a new service token. **Note:** This is the only time you can get the Client Secret. If you lose the Client Secret, you will have to create a new service token.",
+    },
+];
 
 fn apply_access_service_token_commercial_contract(capability: &mut CapabilityV1) {
     capability.cost = cfctl_core::CostV1::default();
@@ -4384,7 +4418,7 @@ fn access_service_token_update_contract_supported(capability: &CapabilityV1) -> 
         && capability.product == "Access service tokens"
         && capability.permissions == ["Access: Service Tokens Write"]
         && capability.description.as_deref() == Some("Updates a configured service token.")
-        && access_service_token_detail_selectors_supported(capability)
+        && access_service_token_detail_selectors_supported(capability, "account_id")
         && access_service_token_source_update_request_supported(capability)
         && access_service_token_response_contract_supported(
             capability.response_contract.as_ref(),
@@ -4420,30 +4454,32 @@ fn classify_access_service_token_create_contract(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
 ) {
-    if !access_service_token_create_contract_supported(document, capabilities) {
-        return;
-    }
-    let Some(capability) = capabilities.get_mut(ACCESS_SERVICE_TOKEN_CREATE_CAPABILITY_ID) else {
-        return;
-    };
+    for contract in ACCESS_SERVICE_TOKEN_CREATE_CONTRACTS {
+        if !access_service_token_create_contract_supported(document, capabilities, contract) {
+            continue;
+        }
+        let Some(capability) = capabilities.get_mut(contract.id) else {
+            continue;
+        };
 
-    capability.request_schema = Some(serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["name"],
-        "properties": {
-            "duration": {"type": "string"},
-            "name": {"type": "string"}
-        },
-        "x-cfctl-body-required": true
-    }));
-    capability.risk = RiskClass::SecretSensitive;
-    capability.effect = EffectClass::IdentityOrOwnership;
-    apply_access_service_token_commercial_contract(capability);
-    capability.verification.required = true;
-    "post_change_read_or_operation_specific_verifier"
-        .clone_into(&mut capability.verification.strategy);
-    refresh_dynamic_mutation_contract(capability);
+        capability.request_schema = Some(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {
+                "duration": {"type": "string"},
+                "name": {"type": "string"}
+            },
+            "x-cfctl-body-required": true
+        }));
+        capability.risk = RiskClass::SecretSensitive;
+        capability.effect = EffectClass::IdentityOrOwnership;
+        apply_access_service_token_commercial_contract(capability);
+        capability.verification.required = true;
+        "post_change_read_or_operation_specific_verifier"
+            .clone_into(&mut capability.verification.strategy);
+        refresh_dynamic_mutation_contract(capability);
+    }
 }
 
 fn classify_access_service_token_refresh_contract(
@@ -4493,7 +4529,7 @@ fn access_service_token_refresh_contract_supported(
         || refresh.permissions != ["Access: Service Tokens Write"]
         || refresh.description.as_deref() != Some("Refreshes the expiration of a service token.")
         || refresh.request_schema.is_some()
-        || !access_service_token_detail_selectors_supported(refresh)
+        || !access_service_token_detail_selectors_supported(refresh, "account_id")
         || !access_service_token_response_contract_supported(
             refresh.response_contract.as_ref(),
             "200",
@@ -4510,7 +4546,7 @@ fn access_service_token_refresh_contract_supported(
             .permissions
             .iter()
             .any(|permission| permission == "Access: Service Tokens Read")
-        || !access_service_token_detail_selectors_supported(read)
+        || !access_service_token_detail_selectors_supported(read, "account_id")
         || !access_service_token_response_contract_supported(read.response_contract.as_ref(), "200")
     {
         return false;
@@ -4541,33 +4577,31 @@ fn access_service_token_refresh_contract_supported(
 fn access_service_token_create_contract_supported(
     document: &Value,
     capabilities: &BTreeMap<String, CapabilityV1>,
+    contract: &AccessServiceTokenCreateContract,
 ) -> bool {
-    let Some(create) = capabilities.get(ACCESS_SERVICE_TOKEN_CREATE_CAPABILITY_ID) else {
+    let Some(create) = capabilities.get(contract.id) else {
         return false;
     };
-    let Some(read) = capabilities.get(ACCESS_SERVICE_TOKEN_GET_CAPABILITY_ID) else {
+    let Some(read) = capabilities.get(contract.read_id) else {
         return false;
     };
-    let Some(delete) = capabilities.get(ACCESS_SERVICE_TOKEN_DELETE_CAPABILITY_ID) else {
+    let Some(delete) = capabilities.get(contract.delete_id) else {
         return false;
     };
     if create.method != "POST"
-        || create.path != ACCESS_SERVICE_TOKEN_COLLECTION_PATH
-        || create.product != "Access service tokens"
+        || create.path != contract.collection_path
+        || create.product != contract.product
         || create.permissions != ["Access: Service Tokens Write"]
-        || !access_service_token_collection_selectors_supported(create)
+        || !access_service_token_collection_selectors_supported(create, contract.scope_selector)
         || !access_service_token_source_create_request_supported(create)
-        || !create.description.as_deref().is_some_and(|description| {
-            description.contains("only time you can get the Client Secret")
-                && description.contains("rotate the Client Secret or create a new service token")
-        })
+        || create.description.as_deref() != Some(contract.description)
         || !access_service_token_response_contract_supported(
             create.response_contract.as_ref(),
             "201",
         )
         || read.method != "GET"
-        || read.path != ACCESS_SERVICE_TOKEN_DETAIL_PATH
-        || read.product != "Access service tokens"
+        || read.path != contract.detail_path
+        || read.product != contract.product
         || read.permissions.len() != 2
         || !read
             .permissions
@@ -4577,14 +4611,14 @@ fn access_service_token_create_contract_supported(
             .permissions
             .iter()
             .any(|permission| permission == "Access: Service Tokens Read")
-        || !access_service_token_detail_selectors_supported(read)
+        || !access_service_token_detail_selectors_supported(read, contract.scope_selector)
         || !access_service_token_response_contract_supported(read.response_contract.as_ref(), "200")
         || delete.method != "DELETE"
-        || delete.path != ACCESS_SERVICE_TOKEN_DETAIL_PATH
-        || delete.product != "Access service tokens"
+        || delete.path != contract.detail_path
+        || delete.product != contract.product
         || delete.permissions != ["Access: Service Tokens Write"]
         || delete.request_schema.is_some()
-        || !access_service_token_detail_selectors_supported(delete)
+        || !access_service_token_detail_selectors_supported(delete, contract.scope_selector)
         || !access_service_token_response_contract_supported(
             delete.response_contract.as_ref(),
             "200",
@@ -4596,7 +4630,7 @@ fn access_service_token_create_contract_supported(
     let Some(create_operation) = document
         .get("paths")
         .and_then(Value::as_object)
-        .and_then(|paths| paths.get(ACCESS_SERVICE_TOKEN_COLLECTION_PATH))
+        .and_then(|paths| paths.get(contract.collection_path))
         .and_then(|path| path.get("post"))
     else {
         return false;
@@ -4604,7 +4638,7 @@ fn access_service_token_create_contract_supported(
     let Some(read_operation) = document
         .get("paths")
         .and_then(Value::as_object)
-        .and_then(|paths| paths.get(ACCESS_SERVICE_TOKEN_DETAIL_PATH))
+        .and_then(|paths| paths.get(contract.detail_path))
         .and_then(|path| path.get("get"))
     else {
         return false;
@@ -4627,14 +4661,20 @@ fn access_service_token_response_contract_supported(
     })
 }
 
-fn access_service_token_collection_selectors_supported(capability: &CapabilityV1) -> bool {
+fn access_service_token_collection_selectors_supported(
+    capability: &CapabilityV1,
+    scope_selector: &str,
+) -> bool {
     capability.selectors.len() == 1
-        && access_service_token_selector_supported(capability, "account_id", 32)
+        && access_service_token_selector_supported(capability, scope_selector, 32)
 }
 
-fn access_service_token_detail_selectors_supported(capability: &CapabilityV1) -> bool {
+fn access_service_token_detail_selectors_supported(
+    capability: &CapabilityV1,
+    scope_selector: &str,
+) -> bool {
     capability.selectors.len() == 2
-        && access_service_token_selector_supported(capability, "account_id", 32)
+        && access_service_token_selector_supported(capability, scope_selector, 32)
         && access_service_token_selector_supported(capability, "service_token_id", 36)
 }
 

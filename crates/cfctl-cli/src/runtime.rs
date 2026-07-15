@@ -7847,10 +7847,28 @@ fn secret_sink_payload(capability: &CapabilityV1, result: &Value) -> Result<Vec<
 }
 
 fn is_access_service_token_create_capability(capability: &CapabilityV1) -> bool {
-    capability.id == "access-service-tokens-create-a-service-token"
+    let exact_operation = matches!(
+        (
+            capability.id.as_str(),
+            capability.path.as_str(),
+            capability.product.as_str(),
+            capability.account_scope.as_str(),
+        ),
+        (
+            "access-service-tokens-create-a-service-token",
+            "/accounts/{account_id}/access/service_tokens",
+            "Access service tokens",
+            "account",
+        ) | (
+            "zone-level-access-service-tokens-create-a-service-token",
+            "/zones/{zone_id}/access/service_tokens",
+            "Zone-Level Access service tokens",
+            "zone",
+        )
+    );
+    exact_operation
         && capability.method == "POST"
-        && capability.path == "/accounts/{account_id}/access/service_tokens"
-        && capability.product == "Access service tokens"
+        && capability.permissions == ["Access: Service Tokens Write"]
 }
 
 fn secret_sink_format(capability: &CapabilityV1) -> Option<&'static str> {
@@ -11613,6 +11631,7 @@ mod tests {
             "/accounts/{account_id}/access/service_tokens",
         );
         capability.product = "Access service tokens".to_owned();
+        capability.permissions = vec!["Access: Service Tokens Write".to_owned()];
         capability.risk = RiskClass::SecretSensitive;
         capability.verification.strategy =
             "created_resource_contains_planned_fields_by_returned_id".to_owned();
@@ -11686,6 +11705,65 @@ mod tests {
     }
 
     #[test]
+    fn zone_access_service_token_credentials_use_the_complete_json_sink_despite_risk_drift() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("zone-access-service-token.json");
+        let mut capability = CapabilityV1::new(
+            "zone-level-access-service-tokens-create-a-service-token",
+            "Create a service token",
+            "POST",
+            "/zones/{zone_id}/access/service_tokens",
+        );
+        capability.product = "Zone-Level Access service tokens".to_owned();
+        capability.permissions = vec!["Access: Service Tokens Write".to_owned()];
+        capability.risk = RiskClass::Unknown;
+        capability.verification.strategy =
+            "created_resource_contains_planned_fields_by_returned_id".to_owned();
+        let plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"adapter":{"value_out":path}}),
+        )
+        .expect("plan");
+
+        let written = sink_secret_result(
+            &plan,
+            &json!({
+                "id":"zone-service-token-id",
+                "client_id":"zone-service-token-client-id.access",
+                "client_secret":"zone-service-token-secret-must-not-leak",
+                "name":"zone deployment automation"
+            }),
+        )
+        .expect("zone credential bundle");
+        assert_eq!(written, path);
+        let payload: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("credential bundle contents"))
+                .expect("credential bundle JSON");
+        assert_eq!(
+            payload,
+            json!({
+                "client_id":"zone-service-token-client-id.access",
+                "client_secret":"zone-service-token-secret-must-not-leak"
+            })
+        );
+        assert_eq!(
+            secret_sink_format(&plan.capability),
+            Some("access_service_token_json")
+        );
+        assert_eq!(
+            capability_call_argv(&plan.capability)
+                .expect("zone service-token call")
+                .iter()
+                .find(|argument| argument.contains("0600"))
+                .map(String::as_str),
+            Some("<new-mode-0600-json-path>")
+        );
+    }
+
+    #[test]
     fn access_service_token_sink_rejects_incomplete_credentials_before_file_creation() {
         for result in [
             json!({"client_id":"service-token-client-id.access"}),
@@ -11701,6 +11779,7 @@ mod tests {
                 "/accounts/{account_id}/access/service_tokens",
             );
             capability.product = "Access service tokens".to_owned();
+            capability.permissions = vec!["Access: Service Tokens Write".to_owned()];
             capability.risk = RiskClass::SecretSensitive;
             capability.verification.strategy =
                 "created_resource_contains_planned_fields_by_returned_id".to_owned();

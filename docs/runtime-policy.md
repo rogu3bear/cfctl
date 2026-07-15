@@ -74,11 +74,12 @@ Secret results require `--value-out`, which must not exist and is created mode
 receipts are redacted. When an API cannot read a newly issued credential back,
 the truthful terminal proof is the successful Cloudflare response plus the
 durable sink receipt; cfctl does not claim that a later read verified the value.
-Access service-token creation is the structured exception to the opaque-text
-sink: cfctl requires both non-empty response fields and writes only `client_id`
-and `client_secret` as one mode-0600 JSON object. The exact resource readback
-proves the returned ID, name, and duration, but never claims to re-read the
-one-time secret.
+Account- and zone-scoped Access service-token creation are the structured
+exceptions to the opaque-text sink: cfctl recognizes only the two exact
+operation/path/product/permission tuples, requires both non-empty response
+fields, and writes only `client_id` and `client_secret` as one mode-0600 JSON
+object. The same-scope exact resource readback proves the returned ID, name,
+and duration, but never claims to re-read the one-time secret.
 
 Service-token update accepts only observable `name` and `duration` fields.
 Secret-version and prior-secret-expiration inputs stay outside that generic

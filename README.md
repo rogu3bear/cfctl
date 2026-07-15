@@ -178,15 +178,15 @@ missing, duplicate, cross-account, or widened policy input. Direct token-create
 calls and user-token minting remain blocked until they can carry the same
 least-privilege contract.
 
-Access service tokens use a separate, account-scoped lifecycle. Initial
-creation accepts only `name` and optional `duration`, requires `Access: Service
-Tokens Write`, writes the returned `client_id` and `client_secret` together as
-a mode-0600 JSON credential bundle, and verifies the exact returned resource
-by ID and planned metadata. If that verification needs rectification, cfctl can
-derive a separate reviewed delete plan. The published rotate endpoint remains
-blocked because Cloudflare's current operation schema does not declare its
-required permission lane; cfctl does not borrow authority from the create
-operation.
+Access service tokens use separate, exactly allowlisted account- and zone-scoped
+creation lifecycles. Each accepts only `name` and optional `duration`, requires
+`Access: Service Tokens Write`, writes the returned `client_id` and
+`client_secret` together as a mode-0600 JSON credential bundle, and verifies
+the exact returned resource by ID and planned metadata. If that verification
+needs rectification, cfctl can derive a separate reviewed exact-scope delete
+plan. The published account-level rotate endpoint remains blocked because
+Cloudflare's current operation schema does not declare its required permission
+lane; cfctl does not borrow authority from either create operation.
 
 Updating an Access service token is similarly narrowed to `name` and
 `duration`. cfctl excludes `client_secret_version`, which Cloudflare documents
