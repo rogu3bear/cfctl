@@ -9,8 +9,8 @@ use std::{
 use cfctl_core::{
     AdapterStatus, BillingModelV1, CapabilityV1, CostExposureV1,
     CreatedCollectionResourceContractV1, CreatedResourceContractV1, DeletedResourceContractV1,
-    EffectClass, KnowledgeReferenceV1, Maturity, RiskClass, SelectorV1, UpdatedResourceContractV1,
-    hash_value,
+    EffectClass, KnowledgeReferenceV1, Maturity, RiskClass, SamePathReadContractV1, SelectorV1,
+    UpdatedResourceContractV1, hash_value,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -889,7 +889,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
         }
     }
 
-    classify_exact_resource_contracts(&mut capabilities);
+    classify_exact_resource_contracts(document, &mut capabilities);
     classify_parent_collection_delete_contracts(document, &mut capabilities);
     classify_parent_collection_update_contracts(document, &mut capabilities);
     classify_same_path_object_update_contracts(document, &mut capabilities);
@@ -921,28 +921,39 @@ fn classify_same_path_object_update_contracts(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
 ) {
-    let readback_products = capabilities
+    let readback_targets = capabilities
         .values()
-        .filter(|capability| capability.method == "GET")
-        .map(|capability| (capability.path.clone(), capability.product.clone()))
-        .collect::<BTreeSet<_>>();
+        .filter(|capability| {
+            capability.method == "GET"
+                && capability
+                    .selectors
+                    .iter()
+                    .all(|selector| selector.location == "path")
+        })
+        .map(|capability| {
+            (
+                (capability.path.clone(), capability.product.clone()),
+                capability.id.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
 
     for capability in capabilities.values_mut() {
         if !matches!(capability.method.as_str(), "PATCH" | "PUT")
             || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
-            || !readback_products.contains(&(capability.path.clone(), capability.product.clone()))
+            || capability
+                .selectors
+                .iter()
+                .any(|selector| selector.location != "path")
         {
             continue;
         }
-        let Some(fields) = capability
-            .request_schema
-            .as_ref()
-            .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))
-            .and_then(|schema| schema.get("properties"))
-            .and_then(Value::as_object)
-            .map(|properties| properties.keys().map(String::as_str).collect::<Vec<_>>())
-            .filter(|fields| !fields.is_empty())
+        let Some(read_capability_id) =
+            readback_targets.get(&(capability.path.clone(), capability.product.clone()))
         else {
+            continue;
+        };
+        let Some(fields) = canonical_request_object_fields(capability) else {
             continue;
         };
         let Some(read_operation) = document
@@ -953,10 +964,16 @@ fn classify_same_path_object_update_contracts(
         else {
             continue;
         };
-        if !success_response_declares_result_fields(document, read_operation, &fields) {
+        let field_names = fields.iter().map(String::as_str).collect::<Vec<_>>();
+        if !success_response_declares_result_fields(document, read_operation, &field_names) {
             continue;
         }
 
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: capability.path.clone(),
+            read_capability_id: read_capability_id.clone(),
+            verified_response_fields: fields,
+        });
         "same_path_result_contains_planned_fields_after_update"
             .clone_into(&mut capability.verification.strategy);
         capability.rollback.supported = false;
@@ -982,7 +999,7 @@ fn classify_created_resource_contracts(
                 && !capability
                     .selectors
                     .iter()
-                    .any(|selector| selector.required && selector.location != "path")
+                    .any(|selector| selector.location != "path")
         })
         .map(|capability| {
             (
@@ -1014,6 +1031,10 @@ fn classify_created_resource_contracts(
         if capability.method != "POST"
             || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
             || !creates_with_schema_proven_string_ids.contains(&capability.id)
+            || capability
+                .selectors
+                .iter()
+                .any(|selector| selector.location != "path")
         {
             continue;
         }
@@ -1150,6 +1171,10 @@ fn classify_created_collection_resource_contracts(
         if capability.method != "POST"
             || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
             || !creates_with_schema_proven_string_ids.contains(&capability.id)
+            || capability
+                .selectors
+                .iter()
+                .any(|selector| selector.location != "path")
         {
             continue;
         }
@@ -1236,12 +1261,26 @@ fn created_collection_resource_contract(
     })
 }
 
-fn classify_exact_resource_contracts(capabilities: &mut BTreeMap<String, CapabilityV1>) {
-    let readback_paths = capabilities
+fn classify_exact_resource_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let readback_targets = capabilities
         .values()
-        .filter(|capability| capability.method == "GET")
-        .map(|capability| capability.path.clone())
-        .collect::<BTreeSet<_>>();
+        .filter(|capability| {
+            capability.method == "GET"
+                && capability
+                    .selectors
+                    .iter()
+                    .all(|selector| selector.location == "path")
+        })
+        .map(|capability| {
+            (
+                (capability.path.clone(), capability.product.clone()),
+                capability.id.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
 
     for capability in capabilities.values_mut() {
         let contract_incomplete = capability.adapter_status == AdapterStatus::DynamicApi
@@ -1253,13 +1292,29 @@ fn classify_exact_resource_contracts(capabilities: &mut BTreeMap<String, Capabil
         if !contract_incomplete
             || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
             || !path_targets_exact_resource(&capability.path)
-            || !readback_paths.contains(&capability.path)
+            || capability
+                .selectors
+                .iter()
+                .any(|selector| selector.location != "path")
         {
             continue;
         }
+        let Some(read_capability_id) =
+            readback_targets.get(&(capability.path.clone(), capability.product.clone()))
+        else {
+            continue;
+        };
 
         match capability.method.as_str() {
             "DELETE" => {
+                if capability.request_schema.is_some() {
+                    continue;
+                }
+                capability.same_path_read = Some(SamePathReadContractV1 {
+                    path: capability.path.clone(),
+                    read_capability_id: read_capability_id.clone(),
+                    verified_response_fields: Vec::new(),
+                });
                 capability.cost = cfctl_core::CostV1::default();
                 capability.cost.basis = Some(
                     "deleting an existing resource has no incremental operation charge; refunds, retained usage, and downstream billing are not claimed"
@@ -1273,6 +1328,27 @@ fn classify_exact_resource_contracts(capabilities: &mut BTreeMap<String, Capabil
                 );
             }
             "PATCH" | "PUT" => {
+                let Some(fields) = canonical_request_object_fields(capability) else {
+                    continue;
+                };
+                let Some(read_operation) = document
+                    .get("paths")
+                    .and_then(Value::as_object)
+                    .and_then(|paths| paths.get(&capability.path))
+                    .and_then(|path| path.get("get"))
+                else {
+                    continue;
+                };
+                let field_names = fields.iter().map(String::as_str).collect::<Vec<_>>();
+                if !success_response_declares_result_fields(document, read_operation, &field_names)
+                {
+                    continue;
+                }
+                capability.same_path_read = Some(SamePathReadContractV1 {
+                    path: capability.path.clone(),
+                    read_capability_id: read_capability_id.clone(),
+                    verified_response_fields: fields,
+                });
                 "same_resource_contains_planned_fields_after_update"
                     .clone_into(&mut capability.verification.strategy);
                 capability.rollback.warning = Some(
@@ -1286,6 +1362,24 @@ fn classify_exact_resource_contracts(capabilities: &mut BTreeMap<String, Capabil
         capability.rollback.strategy = None;
         refresh_dynamic_mutation_contract(capability);
     }
+}
+
+fn canonical_request_object_fields(capability: &CapabilityV1) -> Option<Vec<String>> {
+    let mut fields = capability
+        .request_schema
+        .as_ref()
+        .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))?
+        .get("properties")?
+        .as_object()?
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    if fields.is_empty() {
+        return None;
+    }
+    fields.sort();
+    fields.dedup();
+    Some(fields)
 }
 
 fn classify_parent_collection_delete_contracts(

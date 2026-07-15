@@ -262,6 +262,17 @@ pub struct UpdatedResourceContractV1 {
     pub requires_page_number_completion: bool,
 }
 
+/// Hash-bound same-path GET used to verify an exact delete or an update.
+/// Update contracts carry the canonical request fields proven observable on
+/// the response schema; delete contracts intentionally carry no fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SamePathReadContractV1 {
+    pub path: String,
+    pub read_capability_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_response_fields: Vec<String>,
+}
+
 // Serde skip predicates receive a shared reference to the field value.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(value: &bool) -> bool {
@@ -297,6 +308,8 @@ pub struct CapabilityV1 {
     pub deleted_resource: Option<DeletedResourceContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_resource: Option<UpdatedResourceContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_path_read: Option<SamePathReadContractV1>,
     pub adapter_status: AdapterStatus,
     pub blocked_reason: Option<String>,
     pub request_schema: Option<Value>,
@@ -369,6 +382,7 @@ impl CapabilityV1 {
             created_collection_resource: None,
             deleted_resource: None,
             updated_resource: None,
+            same_path_read: None,
             adapter_status: AdapterStatus::DynamicApi,
             blocked_reason: None,
             request_schema: None,
@@ -502,7 +516,14 @@ impl CapabilityV1 {
                 self.method == "DELETE" && self.id == "dns-records-for-a-zone-delete-dns-record"
             }
             "same_resource_returns_not_found_after_delete" => {
-                self.method == "DELETE" && path_targets_exact_resource(&self.path)
+                self.method == "DELETE"
+                    && path_targets_exact_resource(&self.path)
+                    && self.request_schema.is_none()
+                    && self
+                        .selectors
+                        .iter()
+                        .all(|selector| selector.location == "path")
+                    && self.same_path_read_contract_supported(false)
             }
             "parent_collection_omits_deleted_resource_id" => {
                 self.method == "DELETE" && self.deleted_resource_contract_supported()
@@ -514,16 +535,19 @@ impl CapabilityV1 {
             "same_resource_contains_planned_fields_after_update" => {
                 matches!(self.method.as_str(), "PATCH" | "PUT")
                     && path_targets_exact_resource(&self.path)
+                    && self
+                        .selectors
+                        .iter()
+                        .all(|selector| selector.location == "path")
+                    && self.same_path_read_contract_supported(true)
             }
             "same_path_result_contains_planned_fields_after_update" => {
                 matches!(self.method.as_str(), "PATCH" | "PUT")
-                    && self.request_schema.as_ref().is_some_and(|schema| {
-                        schema.get("type").and_then(Value::as_str) == Some("object")
-                            && schema
-                                .get("properties")
-                                .and_then(Value::as_object)
-                                .is_some_and(|properties| !properties.is_empty())
-                    })
+                    && self
+                        .selectors
+                        .iter()
+                        .all(|selector| selector.location == "path")
+                    && self.same_path_read_contract_supported(true)
             }
             "created_resource_contains_planned_fields_by_returned_id" => {
                 self.method == "POST" && self.created_resource_contract_supported()
@@ -597,6 +621,30 @@ impl CapabilityV1 {
                     .verified_response_fields
                     .windows(2)
                     .all(|fields| fields[0] < fields[1])
+        })
+    }
+
+    fn same_path_read_contract_supported(&self, require_fields: bool) -> bool {
+        self.same_path_read.as_ref().is_some_and(|target| {
+            if target.path != self.path || target.read_capability_id.is_empty() {
+                return false;
+            }
+            if !require_fields {
+                return target.verified_response_fields.is_empty();
+            }
+            let Some(mut request_fields) = self
+                .request_schema
+                .as_ref()
+                .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))
+                .and_then(|schema| schema.get("properties"))
+                .and_then(Value::as_object)
+                .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+            else {
+                return false;
+            };
+            request_fields.sort();
+            request_fields.dedup();
+            !request_fields.is_empty() && target.verified_response_fields == request_fields
         })
     }
 

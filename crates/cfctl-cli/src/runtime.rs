@@ -4508,8 +4508,8 @@ mod tests {
     use cfctl_cloudflare::CloudflareResponseV1;
     use cfctl_core::{
         AdapterStatus, CapabilityV1, CreatedCollectionResourceContractV1,
-        CreatedResourceContractV1, EffectClass, PlanStatus, PlanV1, RiskClass, SelectorV1,
-        TransactionStageV1, hash_value,
+        CreatedResourceContractV1, EffectClass, PlanStatus, PlanV1, RiskClass,
+        SamePathReadContractV1, SelectorV1, TransactionStageV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::Utc;
@@ -4691,6 +4691,11 @@ mod tests {
         capability.permissions = vec!["Zone Settings Write".to_owned()];
         capability.verification.strategy =
             "same_resource_returns_not_found_after_delete".to_owned();
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: "/zones/{zone_id}/custom_pages/{identifier}".to_owned(),
+            read_capability_id: "custom-pages-get".to_owned(),
+            verified_response_fields: Vec::new(),
+        });
         capability.rollback.supported = false;
         capability.rollback.warning =
             Some("deletion is irreversible without a prior resource snapshot".to_owned());

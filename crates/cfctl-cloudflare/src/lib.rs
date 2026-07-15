@@ -426,11 +426,16 @@ impl Executor {
         input: &CallInput,
         credential: &AuthCredential,
     ) -> Result<OperationVerificationV1> {
+        let target = plan.capability.same_path_read.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the hash-bound same-path delete readback contract is absent".to_owned(),
+            )
+        })?;
         let details = CapabilityV1::new(
-            "exact-resource-delete-verification-readback",
+            &target.read_capability_id,
             "Exact resource deletion verification readback",
             "GET",
-            &plan.capability.path,
+            &target.path,
         );
         let request = self.builder.build(
             &details,
@@ -558,6 +563,11 @@ impl Executor {
         input: &CallInput,
         credential: &AuthCredential,
     ) -> Result<OperationVerificationV1> {
+        let target = plan.capability.same_path_read.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the hash-bound same-path update readback contract is absent".to_owned(),
+            )
+        })?;
         let planned = input
             .body
             .as_ref()
@@ -569,10 +579,10 @@ impl Executor {
                 )
             })?;
         let details = CapabilityV1::new(
-            "exact-resource-update-verification-readback",
+            &target.read_capability_id,
             "Exact resource update verification readback",
             "GET",
-            &plan.capability.path,
+            &target.path,
         );
         let request = self.builder.build(
             &details,
@@ -1385,6 +1395,13 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
             })?;
     }
     match strategy {
+        "same_resource_returns_not_found_after_delete" => {
+            validate_same_path_delete_target(capability, input)
+        }
+        "same_resource_contains_planned_fields_after_update"
+        | "same_path_result_contains_planned_fields_after_update" => {
+            validate_same_path_update_target(capability, input)
+        }
         "created_resource_contains_planned_fields_by_returned_id" => {
             validate_created_resource_target(capability, input)
         }
@@ -1399,6 +1416,82 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
         }
         _ => Ok(()),
     }
+}
+
+fn clean_verification_query(input: &CallInput) -> bool {
+    input.query.is_null()
+        || input
+            .query
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+}
+
+fn validate_same_path_delete_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    let target = capability.same_path_read.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the hash-bound same-path delete readback contract is absent".to_owned(),
+        )
+    })?;
+    if target.path != capability.path
+        || target.read_capability_id.is_empty()
+        || !target.verified_response_fields.is_empty()
+        || input.body.is_some()
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the exact delete contains inputs outside its hash-bound same-path readback contract"
+                .to_owned(),
+        ));
+    }
+    if !clean_verification_query(input) {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned delete contains query controls outside the hash-bound same-path readback contract"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_same_path_update_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    let target = capability.same_path_read.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the hash-bound same-path update readback contract is absent".to_owned(),
+        )
+    })?;
+    if target.path != capability.path
+        || target.read_capability_id.is_empty()
+        || target.verified_response_fields.is_empty()
+        || target
+            .verified_response_fields
+            .windows(2)
+            .any(|fields| fields[0] >= fields[1])
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the hash-bound same-path update readback contract is malformed".to_owned(),
+        ));
+    }
+    if !clean_verification_query(input) {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned update contains query controls outside the hash-bound same-path readback contract"
+                .to_owned(),
+        ));
+    }
+    let Some(planned) = input.body.as_ref().and_then(Value::as_object) else {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "planned update body is absent, empty, or not an object".to_owned(),
+        ));
+    };
+    if planned.keys().any(|field| {
+        target
+            .verified_response_fields
+            .binary_search(field)
+            .is_err()
+    }) {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned update contains a field outside the hash-bound same-path readback fields"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_created_resource_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
@@ -1425,6 +1518,12 @@ fn validate_created_resource_target(capability: &CapabilityV1, input: &CallInput
     {
         return Err(CloudflareError::MissingVerificationTarget(
             "the hash-bound created-resource contract is malformed".to_owned(),
+        ));
+    }
+    if !clean_verification_query(input) {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned create contains query controls outside the hash-bound exact readback contract"
+                .to_owned(),
         ));
     }
     let Some(planned) = input.body.as_ref().and_then(Value::as_object) else {
@@ -1480,6 +1579,12 @@ fn validate_created_collection_resource_target(
     {
         return Err(CloudflareError::MissingVerificationTarget(
             "the hash-bound created-collection-resource contract is malformed".to_owned(),
+        ));
+    }
+    if !clean_verification_query(input) {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned create contains query controls outside the hash-bound collection readback contract"
+                .to_owned(),
         ));
     }
     let Some(planned) = input.body.as_ref().and_then(Value::as_object) else {

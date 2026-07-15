@@ -2,8 +2,9 @@
 
 use cfctl_core::{
     AdapterStatus, CapabilityV1, CostV1, CreatedResourceContractV1, EffectClass, EvidenceClass,
-    EvidenceV1, GuideStage, PlanStatus, PlanV1, ResultEnvelopeV2, RiskClass, TransactionStageV1,
-    UpdatedResourceContractV1, guide_stages, redact_json,
+    EvidenceV1, GuideStage, PlanStatus, PlanV1, ResultEnvelopeV2, RiskClass,
+    SamePathReadContractV1, TransactionStageV1, UpdatedResourceContractV1, guide_stages,
+    redact_json,
 };
 use serde_json::json;
 
@@ -134,6 +135,68 @@ fn updated_resource_contract_rejects_noncanonical_field_allowlists() {
         .expect("updated-resource contract")
         .verified_response_fields = vec!["enabled".to_owned(), "name".to_owned()];
     assert!(capability.verification_contract_supported());
+}
+
+#[test]
+fn same_path_read_contracts_require_hash_bound_canonical_fields() {
+    let mut update = CapabilityV1::new(
+        "widgets-update",
+        "Update widget",
+        "PATCH",
+        "/accounts/{account_id}/widgets/{widget_id}",
+    );
+    update.verification.strategy = "same_resource_contains_planned_fields_after_update".to_owned();
+    update.request_schema = Some(json!({
+        "type": "object",
+        "properties": {
+            "name": {"type":"string"},
+            "enabled": {"type":"boolean"}
+        }
+    }));
+    update.same_path_read = Some(SamePathReadContractV1 {
+        path: update.path.clone(),
+        read_capability_id: "widgets-get".to_owned(),
+        verified_response_fields: vec!["name".to_owned(), "enabled".to_owned()],
+    });
+
+    assert!(!update.verification_contract_supported());
+
+    update
+        .same_path_read
+        .as_mut()
+        .expect("same-path contract")
+        .verified_response_fields = vec!["enabled".to_owned(), "name".to_owned()];
+    assert!(update.verification_contract_supported());
+
+    let mut legacy_value = serde_json::to_value(&update).expect("serialize capability");
+    legacy_value
+        .as_object_mut()
+        .expect("capability object")
+        .remove("same_path_read");
+    let legacy: CapabilityV1 =
+        serde_json::from_value(legacy_value).expect("deserialize legacy capability");
+    assert!(!legacy.verification_contract_supported());
+
+    let mut delete = CapabilityV1::new(
+        "widgets-delete",
+        "Delete widget",
+        "DELETE",
+        "/accounts/{account_id}/widgets/{widget_id}",
+    );
+    delete.verification.strategy = "same_resource_returns_not_found_after_delete".to_owned();
+    delete.same_path_read = Some(SamePathReadContractV1 {
+        path: delete.path.clone(),
+        read_capability_id: "widgets-get".to_owned(),
+        verified_response_fields: Vec::new(),
+    });
+    assert!(delete.verification_contract_supported());
+
+    delete
+        .same_path_read
+        .as_mut()
+        .expect("same-path contract")
+        .verified_response_fields = vec!["id".to_owned()];
+    assert!(!delete.verification_contract_supported());
 }
 
 #[test]
@@ -300,10 +363,19 @@ fn plan_hash_binds_all_reviewed_content_and_is_not_replayable_after_consumption(
         .expect("updated-resource contract must rehash");
     assert_ne!(with_created_resource_contract, plan.content_hash);
     let with_updated_resource_contract = plan.content_hash.clone();
+    plan.capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/zones/{zone_id}/dns_records/{record_id}".to_owned(),
+        read_capability_id: "dns.records.get".to_owned(),
+        verified_response_fields: vec!["content".to_owned(), "type".to_owned()],
+    });
+    plan.refresh_hash()
+        .expect("same-path read contract must rehash");
+    assert_ne!(with_updated_resource_contract, plan.content_hash);
+    let with_same_path_read_contract = plan.content_hash.clone();
     plan.targets = json!({"zone_id":"zone-a","record_id":"record-b"});
     plan.refresh_hash().expect("test fixture must rehash");
 
-    assert_ne!(with_updated_resource_contract, plan.content_hash);
+    assert_ne!(with_same_path_read_contract, plan.content_hash);
     assert_eq!(plan.status, PlanStatus::Draft);
     plan.approve(true, None)
         .expect("test fixture must approve with explicit yes");

@@ -175,6 +175,10 @@ fn legacy_catalog_hash_survives_absent_optional_resource_contracts() {
             .as_object_mut()
             .expect("capability object")
             .remove("updated_resource");
+        capability
+            .as_object_mut()
+            .expect("capability object")
+            .remove("same_path_read");
     }
     stored["schema_hash"] = json!(hash_value(&stored["capabilities"]).expect("legacy hash"));
 
@@ -711,6 +715,13 @@ fn exact_resource_deletes_pair_with_same_path_readback_contracts() {
         exact.verification.strategy,
         "same_resource_returns_not_found_after_delete"
     );
+    let target = exact
+        .same_path_read
+        .as_ref()
+        .expect("hash-bound same-path readback");
+    assert_eq!(target.path, exact.path);
+    assert_eq!(target.read_capability_id, "widgets-get");
+    assert!(target.verified_response_fields.is_empty());
     assert!(!exact.rollback.supported);
     assert!(
         exact
@@ -727,6 +738,76 @@ fn exact_resource_deletes_pair_with_same_path_readback_contracts() {
     assert_eq!(collection.adapter_status, AdapterStatus::Blocked);
     assert_ne!(
         collection.verification.strategy,
+        "same_resource_returns_not_found_after_delete"
+    );
+}
+
+#[test]
+fn exact_resource_deletes_reject_broadening_inputs_and_required_read_controls() {
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/accounts/{account_id}/widgets/{widget_id}": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+                    {"in":"path","name":"widget_id","required":true,"schema":{"type":"string"}}
+                ],
+                "get": {
+                    "operationId":"widgets-get",
+                    "summary":"Get Widget",
+                    "tags":["Widgets"]
+                },
+                "delete": {
+                    "operationId":"widgets-delete",
+                    "summary":"Delete Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"]
+                }
+            }
+        }
+    });
+
+    let mut body = document.clone();
+    body["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["delete"]["requestBody"] = json!({"content":{"application/json":{"schema":{
+        "type":"object","properties":{"cascade":{"type":"boolean"}}
+    }}}});
+    let body_snapshot = normalize_openapi(&body).expect("delete-body catalog");
+    assert_ne!(
+        body_snapshot
+            .get("widgets-delete")
+            .expect("delete widget")
+            .verification
+            .strategy,
+        "same_resource_returns_not_found_after_delete"
+    );
+
+    let mut delete_query = document.clone();
+    delete_query["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["delete"]["parameters"] = json!([
+        {"in":"query","name":"cascade","required":false,"schema":{"type":"boolean"}}
+    ]);
+    let delete_query_snapshot = normalize_openapi(&delete_query).expect("delete-query catalog");
+    assert_ne!(
+        delete_query_snapshot
+            .get("widgets-delete")
+            .expect("delete widget")
+            .verification
+            .strategy,
+        "same_resource_returns_not_found_after_delete"
+    );
+
+    let mut required_read_query = document;
+    required_read_query["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["get"]["parameters"] = json!([
+        {"in":"query","name":"view","required":true,"schema":{"type":"string"}}
+    ]);
+    let read_query_snapshot =
+        normalize_openapi(&required_read_query).expect("required-read-query catalog");
+    assert_ne!(
+        read_query_snapshot
+            .get("widgets-delete")
+            .expect("delete widget")
+            .verification
+            .strategy,
         "same_resource_returns_not_found_after_delete"
     );
 }
@@ -1004,9 +1085,8 @@ fn parent_collection_update_contracts_reject_unobservable_fields_and_update_mode
     );
 }
 
-#[test]
-fn exact_resource_updates_pair_with_same_path_field_readback_contracts() {
-    let document = json!({
+fn exact_resource_update_fixture() -> serde_json::Value {
+    json!({
         "openapi": "3.0.3",
         "info": {"title":"Cloudflare API","version":"4.0.0"},
         "paths": {
@@ -1018,19 +1098,30 @@ fn exact_resource_updates_pair_with_same_path_field_readback_contracts() {
                 "get": {
                     "operationId":"widgets-get",
                     "summary":"Get Widget",
-                    "tags":["Widgets"]
+                    "tags":["Widgets"],
+                    "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
+                        "type":"object","properties":{"result":{"type":"object","properties":{
+                            "name":{"type":"string"},"enabled":{"type":"boolean"}
+                        }}}
+                    }}}}}
                 },
                 "patch": {
                     "operationId":"widgets-patch",
                     "summary":"Patch Widget",
                     "tags":["Widgets"],
-                    "x-api-token-group":["Widgets Write"]
+                    "x-api-token-group":["Widgets Write"],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "type":"object","properties":{"enabled":{"type":"boolean"},"name":{"type":"string"}}
+                    }}}}
                 },
                 "put": {
                     "operationId":"widgets-update",
                     "summary":"Update Widget",
                     "tags":["Widgets"],
-                    "x-api-token-group":["Widgets Write"]
+                    "x-api-token-group":["Widgets Write"],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "type":"object","properties":{"enabled":{"type":"boolean"},"name":{"type":"string"}}
+                    }}}}
                 }
             },
             "/accounts/{account_id}/widgets": {
@@ -1047,7 +1138,12 @@ fn exact_resource_updates_pair_with_same_path_field_readback_contracts() {
                 }
             }
         }
-    });
+    })
+}
+
+#[test]
+fn exact_resource_updates_pair_with_same_path_field_readback_contracts() {
+    let document = exact_resource_update_fixture();
 
     let snapshot = normalize_openapi(&document).expect("widget catalog");
     for id in ["widgets-patch", "widgets-update"] {
@@ -1056,6 +1152,13 @@ fn exact_resource_updates_pair_with_same_path_field_readback_contracts() {
             exact.verification.strategy,
             "same_resource_contains_planned_fields_after_update"
         );
+        let target = exact
+            .same_path_read
+            .as_ref()
+            .expect("hash-bound same-path readback");
+        assert_eq!(target.path, exact.path);
+        assert_eq!(target.read_capability_id, "widgets-get");
+        assert_eq!(target.verified_response_fields, ["enabled", "name"]);
         assert!(!exact.rollback.supported);
         assert!(
             exact
@@ -1080,6 +1183,47 @@ fn exact_resource_updates_pair_with_same_path_field_readback_contracts() {
     let coverage = snapshot.coverage();
     assert_eq!(coverage.verification_contracts, 2);
     assert_eq!(coverage.rollback_contracts, 2);
+
+    let mut hidden_field = document.clone();
+    hidden_field["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["patch"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["hidden"] = json!({"type":"boolean"});
+    let hidden_snapshot = normalize_openapi(&hidden_field).expect("hidden-field update catalog");
+    assert_ne!(
+        hidden_snapshot
+            .get("widgets-patch")
+            .expect("patch widget")
+            .verification
+            .strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+
+    let mut update_query = document.clone();
+    update_query["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["patch"]["parameters"] =
+        json!([{"in":"query","name":"mode","schema":{"type":"string"}}]);
+    let update_query_snapshot = normalize_openapi(&update_query).expect("update-query catalog");
+    assert_ne!(
+        update_query_snapshot
+            .get("widgets-patch")
+            .expect("patch widget")
+            .verification
+            .strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+
+    let mut required_read_query = document;
+    required_read_query["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["get"]["parameters"] = json!([
+        {"in":"query","name":"view","required":true,"schema":{"type":"string"}}
+    ]);
+    let read_query_snapshot =
+        normalize_openapi(&required_read_query).expect("required-read-query update catalog");
+    assert_ne!(
+        read_query_snapshot
+            .get("widgets-patch")
+            .expect("patch widget")
+            .verification
+            .strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
 }
 
 #[test]
@@ -1137,6 +1281,13 @@ fn same_path_object_updates_require_schema_proven_readback_fields() {
         update.verification.strategy,
         "same_path_result_contains_planned_fields_after_update"
     );
+    let target = update
+        .same_path_read
+        .as_ref()
+        .expect("hash-bound same-path readback");
+    assert_eq!(target.path, update.path);
+    assert_eq!(target.read_capability_id, "settings-get");
+    assert_eq!(target.verified_response_fields, ["enabled", "mode"]);
     assert!(!update.rollback.supported);
     assert!(
         update
@@ -1150,6 +1301,20 @@ fn same_path_object_updates_require_schema_proven_readback_fields() {
         .expect("partial update");
     assert_ne!(
         partial.verification.strategy,
+        "same_path_result_contains_planned_fields_after_update"
+    );
+
+    let mut header_control = document;
+    header_control["paths"]["/zones/{zone_id}/settings/example"]["put"]["parameters"] = json!([
+        {"in":"header","name":"x-setting-scope","schema":{"type":"string"}}
+    ]);
+    let header_snapshot = normalize_openapi(&header_control).expect("header-control catalog");
+    assert_ne!(
+        header_snapshot
+            .get("settings-update")
+            .expect("settings update")
+            .verification
+            .strategy,
         "same_path_result_contains_planned_fields_after_update"
     );
 }
@@ -1381,6 +1546,19 @@ fn create_contract_rejects_non_id_children_and_broadening_read_or_delete_inputs(
     let delete_body = normalize_openapi(&delete_body_document).expect("delete-body widget catalog");
     assert!(
         delete_body
+            .get("widgets-create")
+            .expect("create widget")
+            .created_resource
+            .is_none()
+    );
+
+    let mut create_query_document = create_lifecycle_fixture();
+    create_query_document["paths"]["/accounts/{account_id}/widgets"]["post"]["parameters"] =
+        json!([{"in":"query","name":"deploy","schema":{"type":"boolean"}}]);
+    let create_query =
+        normalize_openapi(&create_query_document).expect("create-query widget catalog");
+    assert!(
+        create_query
             .get("widgets-create")
             .expect("create widget")
             .created_resource
