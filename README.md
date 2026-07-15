@@ -258,6 +258,21 @@ cargo xtask publish \
   --macos-signing-identity 'Developer ID Application: Example Corp (TEAMID)'
 ```
 
+An account-backed disposable token smoke test is intentionally separate from
+the local proof lane because it mutates a real account. After selecting an
+explicit disposable account/profile and reviewing its acknowledgement gate,
+the operator can run `tests/account-backed-smoke.sh`. It mints, rotates,
+revokes, and verifies one short-lived token and attempts exact-ID revocation as
+compensation if interrupted.
+
+```bash
+CFCTL_PUBLIC_CONTRACT_ACCOUNT_ID='<disposable-account-id>' \
+CFCTL_PUBLIC_CONTRACT_PROFILE='<selected-profile>' \
+CFCTL_PUBLIC_CONTRACT_PERMISSION_GROUP_ID='<reviewed-permission-group-id>' \
+CFCTL_PUBLIC_CONTRACT_CONFIRM='mint-rotate-revoke-disposable-token' \
+  tests/account-backed-smoke.sh
+```
+
 `assemble` deliberately stops before identity-bearing Apple or Sigstore
 activity, and its rendered Linux installer refuses to run. `release` requires
 a clean source commit, signs both macOS binaries
@@ -293,5 +308,6 @@ under `site/`; these external steps are not silently performed or claimed.
 - [Runtime policy](docs/runtime-policy.md)
 - [Security contract](docs/v2-security.md)
 - [Agent landing](docs/agent-landing.md)
+- [v1 parity and shell-removal audit](docs/v1-parity.md)
 - [Rust clean-break ADR](docs/architecture/adr/0001-rust-clean-break.md)
 - [Risk-based approval ADR](docs/architecture/adr/0002-risk-based-approval.md)

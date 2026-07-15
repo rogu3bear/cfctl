@@ -101,6 +101,87 @@ fn help_and_version_are_successful_public_commands() {
 }
 
 #[test]
+fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let workspace = tempfile::tempdir().expect("workspace root");
+
+    let doctor = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run isolated doctor");
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let doctor: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("doctor JSON envelope");
+    assert_eq!(doctor["schema_version"], 2);
+    assert_eq!(doctor["ok"], true);
+    assert_eq!(doctor["performed"], false);
+    assert_eq!(doctor["command"], "doctor");
+    assert_eq!(doctor["result"]["catalog"]["present"], false);
+    assert!(doctor["result"]["public_oauth"].is_string());
+
+    let add = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args([
+            "workspace",
+            "add",
+            workspace.path().to_str().expect("UTF-8 workspace path"),
+            "--json",
+        ])
+        .output()
+        .expect("register workspace");
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let add: serde_json::Value = serde_json::from_slice(&add.stdout).expect("workspace add JSON");
+    assert_eq!(add["schema_version"], 2);
+    assert_eq!(add["ok"], true);
+    assert_eq!(add["performed"], false);
+    assert_eq!(add["command"], "workspace add");
+    let reported_path = add["result"]["path"]
+        .as_str()
+        .map(std::path::Path::new)
+        .expect("workspace add reports a path");
+    assert_eq!(
+        reported_path
+            .canonicalize()
+            .expect("canonical reported path"),
+        workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace")
+    );
+
+    let discover = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args(["workspace", "discover", "--json"])
+        .output()
+        .expect("discover registered workspace");
+    assert!(
+        discover.status.success(),
+        "{}",
+        String::from_utf8_lossy(&discover.stderr)
+    );
+    let discover: serde_json::Value =
+        serde_json::from_slice(&discover.stdout).expect("workspace discover JSON");
+    assert_eq!(discover["schema_version"], 2);
+    assert_eq!(discover["ok"], true);
+    assert_eq!(discover["performed"], false);
+    assert_eq!(discover["command"], "workspace discover");
+    assert_eq!(
+        discover["result"]["repositories"].as_array().map(Vec::len),
+        Some(0),
+        "a registered configless, non-Git directory is bounded but is not fabricated as a repository"
+    );
+}
+
+#[test]
 fn v1_migration_imports_safe_state_without_copying_secret_content() {
     let source = tempfile::tempdir().expect("source root");
     let runtime = tempfile::tempdir().expect("runtime root");

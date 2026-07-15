@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "audited_at": "2026-07-14",
+  "policy": "rust_v2_clean_break",
+  "archive": {
+    "evidence_class": "local proof",
+    "local_path": ".cfctl-private-archive/v1-shell-2026-07-14/runtime.tar.gz",
+    "runtime_tar_sha256": "10c8b5fe9d0e9a98c7d97fe9fe28d320d470785207a565ff080188225e626dcb",
+    "dirty_source_intent_patch_sha256": "90fecfa9a30b666da2ca9dedafab1ef8dd555090155c219f7e2ab693b7c5f3cc",
+    "all_removed_paths_present": true,
+    "changed_after_archive": [
+      {
+        "legacy_path": "scripts/verify_public_contract.sh",
+        "v2_disposition": "moved to tests/account-backed-smoke.sh"
+      },
+      {
+        "legacy_path": "scripts/verify_static_contract.sh",
+        "v2_disposition": "ported into xtask and cfctl-cli integration tests"
+      }
+    ]
+  },
+  "removed_estate": {
+    "total_paths": 147,
+    "shell_files": 140,
+    "python_files": 7,
+    "roots": [
+      {
+        "path": "commands",
+        "count": 1
+      },
+      {
+        "path": "lib",
+        "count": 19
+      },
+      {
+        "path": "scripts",
+        "count": 127
+      }
+    ],
+    "repository_guard": "cargo xtask verify fails if commands, lib, or scripts reappears"
+  },
+  "behavioral_outcomes": [
+    {
+      "v1": ["doctor"],
+      "status": "equivalent",
+      "v2": ["doctor"]
+    },
+    {
+      "v1": ["lanes"],
+      "status": "equivalent",
+      "v2": ["auth status", "auth profiles", "auth use"]
+    },
+    {
+      "v1": ["surfaces", "list surfaces", "explain", "can"],
+      "status": "expanded",
+      "v2": ["catalog search", "catalog show", "catalog coverage", "guide"]
+    },
+    {
+      "v1": ["docs"],
+      "status": "expanded",
+      "v2": ["docs search", "docs changes", "docs coverage"]
+    },
+    {
+      "v1": ["classify", "guide"],
+      "status": "expanded",
+      "v2": ["catalog show", "guide"]
+    },
+    {
+      "v1": ["list", "get", "snapshot", "verify"],
+      "status": "expanded",
+      "v2": ["call <read-capability-id>"]
+    },
+    {
+      "v1": ["apply"],
+      "status": "strengthened",
+      "v2": ["call <mutation-capability-id>", "plans approve", "plans run", "plans status", "plans rectify"]
+    },
+    {
+      "v1": ["previews", "locks"],
+      "status": "strengthened",
+      "v2": ["plans show", "plans status", "plans resume", "plans rectify"]
+    },
+    {
+      "v1": ["token permission-groups", "token mint", "token rotate", "token revoke"],
+      "status": "strengthened",
+      "v2": ["keys permissions", "keys mint", "keys rotate", "keys revoke"]
+    },
+    {
+      "v1": ["bootstrap permissions"],
+      "status": "decomposed",
+      "v2": ["auth login", "auth status", "keys permissions", "doctor"]
+    },
+    {
+      "v1": ["standards audit", "ownership", "diff"],
+      "status": "expanded",
+      "v2": ["workspace add", "workspace discover", "workspace graph", "workspace audit", "plans show"]
+    },
+    {
+      "v1": ["wrangler", "cloudflared"],
+      "status": "strengthened",
+      "v2": ["catalog search", "call <delegated-cli-capability-id>"]
+    },
+    {
+      "v1": ["hostname", "maildesk-cf", "form-intake"],
+      "status": "decomposed",
+      "v2": ["workspace graph", "catalog search", "guide", "call", "plans"]
+    },
+    {
+      "v1": ["audit trust", "audit access", "audit state"],
+      "status": "decomposed",
+      "v2": ["doctor", "auth status", "workspace audit", "catalog coverage"]
+    },
+    {
+      "v1": ["skills list", "skills choose", "skills record", "skills metrics"],
+      "status": "replaced",
+      "v2": ["catalog capability status", "agents install", "agents doctor", "agent action evidence"]
+    },
+    {
+      "v1": ["admin authorize-backend", "admin authorizations", "admin revoke-backend"],
+      "status": "retired_security_boundary",
+      "reason": "v2 has no shell mutation backend or bypass authorization lane"
+    },
+    {
+      "v1": ["env run"],
+      "status": "retired_security_boundary",
+      "reason": "v2 delegates only cataloged CLI capabilities with a cleared environment and selected credential"
+    }
+  ],
+  "script_family_outcomes": [
+    {
+      "family": "inventory",
+      "paths": 59,
+      "v2": "schema-derived catalog reads through catalog search, guide, and call"
+    },
+    {
+      "family": "mutation",
+      "paths": 29,
+      "v2": "hash-bound PlanV1 lifecycle; generated writes stay blocked until operation-specific contracts are complete"
+    },
+    {
+      "family": "token_and_permission",
+      "paths": 9,
+      "v2": "native keys commands with secret sinks, rotation compensation, and live verification"
+    },
+    {
+      "family": "python_composite_and_generation",
+      "paths": 6,
+      "v2": "Rust workspace, generated catalog, bounded workspace graph, and deterministic guides"
+    },
+    {
+      "family": "verification",
+      "paths": 14,
+      "v2": "Rust unit/integration tests plus cargo xtask verify; account mutation proof preserved under tests"
+    },
+    {
+      "family": "wrappers_and_orchestration",
+      "paths": 10,
+      "v2": "cataloged delegated CLI calls, workspace graph, and repository-owned deployment workflows"
+    }
+  ],
+  "non_public_shell": [
+    {
+      "path": "cfctl",
+      "purpose": "source-checkout Rust launcher"
+    },
+    {
+      "path": "bootstrap.sh",
+      "purpose": "source verification and cargo install"
+    },
+    {
+      "path": "packaging/install.sh",
+      "purpose": "release-rendered identity-verifying Linux installer"
+    },
+    {
+      "path": "tests/account-backed-smoke.sh",
+      "purpose": "explicitly acknowledged disposable token lifecycle proof"
+    }
+  ],
+  "retained_v1_data": {
+    "executable": false,
+    "state": {
+      "path": "state",
+      "purpose": "local desired-state input for migrate v1 during the compatibility window"
+    },
+    "static_catalog": {
+      "path": "catalog",
+      "purpose": "non-executable v1 reference data; it is not loaded by the Rust v2 runtime"
+    },
+    "rule": "credentials and secret-shaped content are never imported"
+  },
+  "conclusion": {
+    "silent_behavior_loss": false,
+    "exact_flag_parity_claimed": false,
+    "unmapped_v1_public_commands": [],
+    "remaining_v1_executables": [],
+    "security_retirements_are_explicit": true,
+    "shell_runtime_removed": true
+  }
+}

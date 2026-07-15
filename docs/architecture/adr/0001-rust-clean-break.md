@@ -21,3 +21,17 @@ Existing desired state and non-secret evidence are imported only by `cfctl migra
 - The source launcher may build the Rust binary for contributors, but installed releases contain only the native executable.
 - Catalog and evidence SQLite files are rebuildable indexes; JSON artifacts remain authoritative.
 - The cutover is incomplete until the v2 proof lane and public-contract checks pass.
+
+## Implementation status
+
+The 147-path shell/Python executable estate was hash-bound to the ignored
+private archive, audited, and removed. `cargo xtask verify` now rejects any
+return of `commands/`, `lib/`, or `scripts/`. The account-backed disposable
+token proof moved to `tests/` and requires explicit operator acknowledgement;
+all other static proof moved into Rust tests and `xtask`.
+
+The exact behavioral disposition is recorded in
+[`compat/v1-parity-audit.json`](../../../compat/v1-parity-audit.json). Checked-in
+v1 desired state remains inert migration input during the one-release window;
+the static v1 catalog remains non-executable reference data. Neither is a
+public command contract.

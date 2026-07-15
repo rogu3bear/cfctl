@@ -10,7 +10,7 @@ PERMISSION_GROUP_ID="${CFCTL_PUBLIC_CONTRACT_PERMISSION_GROUP_ID:-}"
 CONFIRM="${CFCTL_PUBLIC_CONTRACT_CONFIRM:-}"
 
 die() {
-  echo "public-contract verification failed: $*" >&2
+  echo "account-backed smoke verification failed: $*" >&2
   exit 1
 }
 
@@ -161,4 +161,4 @@ jq -e '
 ' <<< "${revoke_run}" >/dev/null || die "revocation was not proven by live not-found readback"
 revoked=true
 
-echo "public-contract verification passed: disposable token was minted, rotated, revoked, and verified"
+echo "account-backed smoke verification passed: disposable token was minted, rotated, revoked, and verified"

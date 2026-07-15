@@ -127,6 +127,8 @@ enum TaskError {
     ReleaseAlreadyHasAssets { tag: String, assets: String },
     #[error("release upload failed: {upload}; compensation failures: {rollback}")]
     PublishFailed { upload: String, rollback: String },
+    #[error("source contract is invalid: {0}")]
+    InvalidSourceContract(String),
 }
 
 fn main() -> ExitCode {
@@ -196,7 +198,148 @@ fn verify() -> Result<(), TaskError> {
             "--locked",
         ],
     )?;
-    run("bash", &["scripts/verify_static_contract.sh"])?;
+    verify_source_contract()?;
+    Ok(())
+}
+
+fn verify_source_contract() -> Result<(), TaskError> {
+    run(
+        "sh",
+        &[
+            "-n",
+            "bootstrap.sh",
+            "cfctl",
+            "packaging/install.sh",
+            "tests/account-backed-smoke.sh",
+        ],
+    )?;
+
+    verify_workspace_contract()?;
+    verify_v1_cutover_contract()?;
+    verify_documented_contracts()
+}
+
+fn verify_workspace_contract() -> Result<(), TaskError> {
+    let metadata: serde_json::Value = serde_json::from_str(&output(
+        "cargo",
+        &["metadata", "--locked", "--no-deps", "--format-version", "1"],
+    )?)
+    .map_err(|error| TaskError::InvalidSourceContract(format!("cargo metadata: {error}")))?;
+    let members = metadata
+        .get("workspace_members")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            TaskError::InvalidSourceContract("workspace_members must be an array".to_owned())
+        })?;
+    if members.len() != 10 {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "expected 10 workspace members, found {}",
+            members.len()
+        )));
+    }
+    let package_names = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| TaskError::InvalidSourceContract("packages must be an array".to_owned()))?
+        .iter()
+        .filter_map(|package| package.get("name").and_then(serde_json::Value::as_str))
+        .collect::<BTreeSet<_>>();
+    for required in [
+        "cfctl-cli",
+        "cfctl-core",
+        "cfctl-cloudflare",
+        "cfctl-workspace",
+        "xtask",
+    ] {
+        if !package_names.contains(required) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "workspace is missing {required}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_v1_cutover_contract() -> Result<(), TaskError> {
+    for forbidden in ["commands", "lib", "scripts"] {
+        if Path::new(forbidden).exists() {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "archived v1 runtime path still exists: {forbidden}/"
+            )));
+        }
+    }
+
+    let audit_path = Path::new("compat/v1-parity-audit.json");
+    let audit: serde_json::Value = serde_json::from_slice(
+        &fs::read(audit_path).map_err(|source| io_error(audit_path, source))?,
+    )
+    .map_err(|error| TaskError::InvalidSourceContract(format!("v1 parity audit: {error}")))?;
+    let removed_root_count = audit
+        .pointer("/removed_estate/roots")
+        .and_then(serde_json::Value::as_array)
+        .map(|roots| {
+            roots
+                .iter()
+                .filter_map(|root| root.get("count").and_then(serde_json::Value::as_u64))
+                .sum::<u64>()
+        });
+    let script_family_count = audit
+        .get("script_family_outcomes")
+        .and_then(serde_json::Value::as_array)
+        .map(|families| {
+            families
+                .iter()
+                .filter_map(|family| family.get("paths").and_then(serde_json::Value::as_u64))
+                .sum::<u64>()
+        });
+    if audit
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || audit
+            .pointer("/removed_estate/total_paths")
+            .and_then(serde_json::Value::as_u64)
+            != Some(147)
+        || audit
+            .pointer("/archive/runtime_tar_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some("10c8b5fe9d0e9a98c7d97fe9fe28d320d470785207a565ff080188225e626dcb")
+        || audit
+            .pointer("/archive/all_removed_paths_present")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || removed_root_count != Some(147)
+        || script_family_count != Some(127)
+        || audit
+            .pointer("/conclusion/unmapped_v1_public_commands")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|commands| !commands.is_empty())
+        || audit
+            .pointer("/conclusion/remaining_v1_executables")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|paths| !paths.is_empty())
+    {
+        return Err(TaskError::InvalidSourceContract(
+            "v1 parity audit does not bind the reviewed 147-path archive".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_documented_contracts() -> Result<(), TaskError> {
+    for (path, phrase) in [
+        ("README.md", "hash-chained transaction journal"),
+        ("docs/v2-security.md", "operation-specific verification"),
+        ("docs/v2-architecture.md", "Wrangler TOML/JSONC, Terraform"),
+    ] {
+        let content =
+            fs::read_to_string(path).map_err(|source| io_error(Path::new(path), source))?;
+        if !content.contains(phrase) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "{path} omits required contract text `{phrase}`"
+            )));
+        }
+    }
     Ok(())
 }
 

@@ -1,9 +1,10 @@
-# Compatibility
+# v1 cutover evidence
 
-This directory documents the transitional contract while the repo moves from a flat script estate to a `cfctl`-first runtime.
+`cfctl` v2 is a clean Rust CLI break. The shell runtime is not a compatibility
+backend and no bypass lane remains.
 
-- Public contract: `./cfctl`
-- Compatibility contract: existing `scripts/cf_*` entrypoints continue to run
-- Migration policy: keep old paths working, but stop teaching them as the primary interface
+- [Machine-readable parity audit](v1-parity-audit.json)
+- [Human-readable parity audit](../docs/v1-parity.md)
 
-Machine-readable mappings live in [script-entrypoints.json](compat/script-entrypoints.json).
+The ignored local archive is migration evidence only. It is neither shipped
+nor invoked by v2.
