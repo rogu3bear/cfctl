@@ -559,7 +559,7 @@ fn collect_wrangler_scope(
             "kv_namespaces",
             "wrangler_kv",
             "kv_namespace",
-            &["id", "binding"][..],
+            &["id", "preview_id"][..],
         ),
         (
             "d1_databases",
@@ -571,14 +571,9 @@ fn collect_wrangler_scope(
             "r2_buckets",
             "wrangler_r2",
             "r2_bucket",
-            &["bucket_name", "binding"][..],
+            &["bucket_name"][..],
         ),
-        (
-            "services",
-            "wrangler_service",
-            "service",
-            &["service", "binding"][..],
-        ),
+        ("services", "wrangler_service", "service", &["service"][..]),
     ] {
         for binding in scope
             .get(field)
@@ -586,9 +581,9 @@ fn collect_wrangler_scope(
             .into_iter()
             .flatten()
         {
-            if let Some(identity) = identity_fields
+            for identity in identity_fields
                 .iter()
-                .find_map(|field| binding.get(*field).and_then(Value::as_str))
+                .filter_map(|field| binding.get(*field).and_then(Value::as_str))
             {
                 push_resource(resources, path, kind, format!("{prefix}:{identity}"));
             }
@@ -609,7 +604,8 @@ fn collect_wrangler_scope(
 
 fn resources_from_terraform(path: &Path, content: &str) -> Vec<ResourceNode> {
     let mut resources = Vec::new();
-    for line in content.lines() {
+    let mut lines = content.lines();
+    while let Some(line) = lines.next() {
         let trimmed = line.trim_start();
         if !(trimmed.starts_with("resource ") || trimmed.starts_with("data ")) {
             continue;
@@ -629,8 +625,92 @@ fn resources_from_terraform(path: &Path, content: &str) -> Vec<ResourceNode> {
             category,
             format!("terraform:{}.{}", quoted[0], quoted[1]),
         );
+        let resource_type = quoted[0];
+        let mut depth = hcl_brace_delta(trimmed);
+        while depth > 0 {
+            let Some(body_line) = lines.next() else {
+                break;
+            };
+            if depth == 1
+                && let Some((property, value)) = hcl_literal_string_assignment(body_line)
+            {
+                push_literal_iac_identity(
+                    &mut resources,
+                    path,
+                    category,
+                    resource_type,
+                    property,
+                    &value,
+                );
+            }
+            depth += hcl_brace_delta(body_line);
+        }
     }
     resources
+}
+
+fn hcl_brace_delta(line: &str) -> i32 {
+    let mut delta = 0;
+    let mut characters = line.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(character) = characters.next() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if character == '"' {
+            in_string = true;
+        } else if character == '#' || (character == '/' && characters.peek() == Some(&'/')) {
+            break;
+        } else if character == '{' {
+            delta += 1;
+        } else if character == '}' {
+            delta -= 1;
+        }
+    }
+    delta
+}
+
+fn hcl_literal_string_assignment(line: &str) -> Option<(&str, String)> {
+    let (property, expression) = line.trim().split_once('=')?;
+    let property = property.trim();
+    if property.is_empty()
+        || !property
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    let expression = expression.trim();
+    let mut escaped = false;
+    let mut closing_quote = None;
+    for (index, character) in expression.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            closing_quote = Some(index);
+            break;
+        }
+    }
+    let closing_quote = closing_quote?;
+    if !expression.starts_with('"') {
+        return None;
+    }
+    let remainder = expression.get(closing_quote + 1..)?.trim();
+    if !remainder.is_empty() && !remainder.starts_with('#') && !remainder.starts_with("//") {
+        return None;
+    }
+    let value = serde_json::from_str::<String>(expression.get(..=closing_quote)?).ok()?;
+    (!value.contains("${") && !value.contains("%{")).then_some((property, value))
 }
 
 fn resources_from_terraform_json(path: &Path, document: &Value) -> Vec<ResourceNode> {
@@ -654,6 +734,20 @@ fn resources_from_terraform_json(path: &Path, document: &Value) -> Vec<ResourceN
                     kind,
                     format!("terraform:{resource_type}.{name}"),
                 );
+                if let Some(properties) = instances.get(name).and_then(Value::as_object) {
+                    for (property, value) in properties {
+                        if let Some(value) = value.as_str() {
+                            push_literal_iac_identity(
+                                &mut resources,
+                                path,
+                                kind,
+                                resource_type,
+                                property,
+                                value,
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -681,8 +775,77 @@ fn resources_from_pulumi(path: &Path, document: &Value) -> Vec<ResourceNode> {
             "pulumi",
             format!("pulumi:{resource_type}.{name}"),
         );
+        if let Some(properties) = resource.get("properties").and_then(Value::as_object) {
+            for (property, value) in properties {
+                if let Some(value) = value.as_str() {
+                    push_literal_iac_identity(
+                        &mut resources,
+                        path,
+                        "pulumi",
+                        resource_type,
+                        property,
+                        value,
+                    );
+                }
+            }
+        }
     }
     resources
+}
+
+fn push_literal_iac_identity(
+    resources: &mut Vec<ResourceNode>,
+    path: &Path,
+    kind: &str,
+    resource_type: &str,
+    property: &str,
+    value: &str,
+) {
+    if value.contains("${") || value.contains("%{") {
+        return;
+    }
+    let resource_type = alphanumeric_key(resource_type);
+    let property = alphanumeric_key(property);
+    let key = if resource_type.ends_with("workersscript")
+        && matches!(property.as_str(), "name" | "scriptname")
+    {
+        Some(format!("worker:{value}"))
+    } else if resource_type.ends_with("r2bucket")
+        && matches!(property.as_str(), "bucketname" | "name")
+    {
+        Some(format!("r2_bucket:{value}"))
+    } else if resource_type.ends_with("d1database")
+        && matches!(property.as_str(), "databasename" | "name")
+    {
+        Some(format!("d1_database:{value}"))
+    } else if resource_type.ends_with("queue") && matches!(property.as_str(), "name" | "queuename")
+    {
+        Some(format!("queue:{value}"))
+    } else if resource_type.ends_with("workersroute") && property == "pattern" {
+        hostname_from_pattern(value).map(|hostname| format!("hostname:{hostname}"))
+    } else if matches!(
+        resource_type.as_str(),
+        "cloudflarerecord" | "cloudflarednsrecord"
+    ) && property == "name"
+        && value.contains('.')
+    {
+        hostname_from_pattern(value).map(|hostname| format!("hostname:{hostname}"))
+    } else if resource_type == "cloudflarezone" && matches!(property.as_str(), "name" | "zone") {
+        Some(format!("zone:{value}"))
+    } else {
+        None
+    };
+    if let Some(key) = key {
+        push_resource(resources, path, kind, key);
+    }
+}
+
+fn alphanumeric_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn push_resource(resources: &mut Vec<ResourceNode>, path: &Path, kind: &str, key: String) {

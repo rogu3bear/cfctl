@@ -1657,7 +1657,7 @@ fn plan_impact(
             }
         }
     }
-    let workspace_resource_keys = workspace_resource_keys(input);
+    let workspace_resource_keys = workspace_resource_keys(capability, input);
     affected_resources.extend(workspace_resource_keys.iter().cloned());
     affected_resources.sort();
     affected_resources.dedup();
@@ -1683,12 +1683,12 @@ fn plan_impact(
     })
 }
 
-fn workspace_resource_keys(input: &CallInput) -> Vec<String> {
+fn workspace_resource_keys(capability: &CapabilityV1, input: &CallInput) -> Vec<String> {
     let mut resources = Vec::new();
-    collect_workspace_resource_keys(&input.selectors, None, &mut resources);
-    collect_workspace_resource_keys(&input.query, None, &mut resources);
+    collect_workspace_resource_keys(capability, &input.selectors, None, &mut resources);
+    collect_workspace_resource_keys(capability, &input.query, None, &mut resources);
     if let Some(body) = &input.body {
-        collect_workspace_resource_keys(body, None, &mut resources);
+        collect_workspace_resource_keys(capability, body, None, &mut resources);
     }
     resources.sort();
     resources.dedup();
@@ -1696,6 +1696,7 @@ fn workspace_resource_keys(input: &CallInput) -> Vec<String> {
 }
 
 fn collect_workspace_resource_keys(
+    capability: &CapabilityV1,
     value: &Value,
     field: Option<&str>,
     resources: &mut Vec<String>,
@@ -1703,19 +1704,24 @@ fn collect_workspace_resource_keys(
     match value {
         Value::Object(object) => {
             for (key, value) in object {
-                collect_workspace_resource_keys(value, Some(key), resources);
+                collect_workspace_resource_keys(capability, value, Some(key), resources);
             }
         }
         Value::Array(values) => {
             for value in values {
-                collect_workspace_resource_keys(value, field, resources);
+                collect_workspace_resource_keys(capability, value, field, resources);
             }
         }
         Value::String(value) => {
             let field = field.unwrap_or_default().to_ascii_lowercase();
-            let resource = if field.contains("hostname")
-                || field == "pattern"
-                || (field == "name" && value.contains('.'))
+            let product = capability.product.to_ascii_lowercase();
+            let is_hostname_name = field == "name"
+                && value.contains('.')
+                && (capability.path.contains("/dns_records") || product.contains("dns record"));
+            let is_hostname_pattern = field == "pattern"
+                && (capability.path.contains("/workers/routes")
+                    || product.contains("worker route"));
+            let resource = if field.contains("hostname") || is_hostname_name || is_hostname_pattern
             {
                 hostname_from_resource_value(value).map(|hostname| format!("hostname:{hostname}"))
             } else if field == "zone_name" {
@@ -1726,7 +1732,10 @@ fn collect_workspace_resource_keys(
                 Some(format!("r2_bucket:{value}"))
             } else if matches!(field.as_str(), "database_id" | "database_name") {
                 Some(format!("d1_database:{value}"))
-            } else if matches!(field.as_str(), "namespace_id" | "kv_namespace_id") {
+            } else if matches!(field.as_str(), "namespace_id" | "kv_namespace_id")
+                && (capability.path.contains("/storage/kv/namespaces")
+                    || product == "workers kv namespace")
+            {
                 Some(format!("kv_namespace:{value}"))
             } else if matches!(field.as_str(), "queue" | "queue_name") {
                 Some(format!("queue:{value}"))
@@ -4517,7 +4526,7 @@ mod tests {
         should_resolve_zone_entitlement, sink_secret_result, validate_api_token_creation_contract,
         validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_selected_permission_groups, validate_zone_account_receipt_precondition,
-        zone_target,
+        workspace_resource_keys, zone_target,
     };
     use cfctl_auth::{AuthError, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
@@ -4546,6 +4555,41 @@ mod tests {
         };
         catalog.refresh_hash().expect("catalog hash");
         catalog
+    }
+
+    #[test]
+    fn workspace_resource_keys_require_capability_context_for_ambiguous_names() {
+        let dns = CapabilityV1::new(
+            "dns-record-create",
+            "Create DNS record",
+            "POST",
+            "/zones/{zone_id}/dns_records",
+        );
+        let generic = CapabilityV1::new(
+            "widgets-create",
+            "Create widget",
+            "POST",
+            "/accounts/{account_id}/widgets",
+        );
+        let input = CallInput {
+            selectors: json!({"namespace_id":"shared-name"}),
+            body: Some(json!({"name":"api.example.com","pattern":"*.example.com"})),
+            ..CallInput::default()
+        };
+
+        assert_eq!(
+            workspace_resource_keys(&dns, &input),
+            vec!["hostname:api.example.com"]
+        );
+        assert!(workspace_resource_keys(&generic, &input).is_empty());
+
+        let mut kv = generic;
+        kv.product = "Workers KV Namespace".to_owned();
+        kv.path = "/accounts/{account_id}/storage/kv/namespaces/{namespace_id}".to_owned();
+        assert_eq!(
+            workspace_resource_keys(&kv, &input),
+            vec!["kv_namespace:shared-name"]
+        );
     }
 
     #[test]

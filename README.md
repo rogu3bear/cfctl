@@ -249,7 +249,10 @@ configuration. Supported files include Wrangler TOML/JSON/JSONC, Terraform
 HCL/JSON, and Pulumi YAML. Each is linked to catalog targets with
 current-content, `HEAD`-content, and exact
 worktree-diff hashes so dirty or unmanaged dependencies remain visible in a
-plan. The fixture matrix includes staged, unstaged, and untracked configuration,
+plan. Terraform and Pulumi runtime links require literal properties specific to
+the declared resource type; dynamic expressions and Wrangler binding names are
+kept as local symbols, not Cloudflare resource identities. The fixture matrix
+includes staged, unstaged, and untracked configuration,
 configless repositories, and duplicate repository basenames without collapsing
 their canonical identities.
 

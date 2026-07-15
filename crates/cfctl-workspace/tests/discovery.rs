@@ -240,8 +240,89 @@ resources:
         !graph
             .resources
             .iter()
+            .any(|resource| resource.key == "worker:${project}-worker")
+    );
+    assert!(
+        !graph
+            .resources
+            .iter()
             .any(|resource| resource.key.contains("random:RandomString"))
     );
+}
+
+#[test]
+fn literal_iac_identities_connect_runtime_targets_to_exact_repositories() {
+    let root = tempfile::tempdir().expect("workspace root");
+    let terraform_hcl = root.path().join("terraform-hcl");
+    let terraform_json = root.path().join("terraform-json");
+    let pulumi = root.path().join("pulumi");
+    init_repo(
+        &terraform_hcl,
+        "main.tf",
+        "resource \"cloudflare_workers_script\" \"edge\" {\n  script_name = \"literal-worker\"\n}\nresource \"cloudflare_dns_record\" \"api\" {\n  name = \"api.example.com\"\n}\n",
+    );
+    init_repo(
+        &terraform_json,
+        "main.tf.json",
+        r#"{"resource":{"cloudflare_r2_bucket":{"assets":{"name":"literal-assets"}}}}"#,
+    );
+    init_repo(
+        &pulumi,
+        "Pulumi.yaml",
+        "name: edge\nruntime: yaml\nresources:\n  queue:\n    type: cloudflare:Queue\n    properties:\n      queueName: literal-jobs\n  record:\n    type: cloudflare:Record\n    properties:\n      name: pulumi.example.com\n",
+    );
+
+    let graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
+        .expect("literal identity discovery");
+
+    for (key, repository) in [
+        ("worker:literal-worker", &terraform_hcl),
+        ("hostname:api.example.com", &terraform_hcl),
+        ("r2_bucket:literal-assets", &terraform_json),
+        ("queue:literal-jobs", &pulumi),
+        ("hostname:pulumi.example.com", &pulumi),
+    ] {
+        let canonical = repository
+            .canonicalize()
+            .expect("canonical fixture repository")
+            .display()
+            .to_string();
+        assert_eq!(
+            graph.repositories_for(key),
+            vec![canonical],
+            "missing {key}"
+        );
+    }
+}
+
+#[test]
+fn local_bindings_and_dynamic_iac_expressions_are_not_cloudflare_identities() {
+    let root = tempfile::tempdir().expect("workspace root");
+    let wrangler = root.path().join("wrangler");
+    let terraform = root.path().join("terraform");
+    init_repo(
+        &wrangler,
+        "wrangler.toml",
+        "name = \"worker\"\nkv_namespaces = [{ binding = \"CACHE\" }]\nr2_buckets = [{ binding = \"ASSETS\" }]\n",
+    );
+    init_repo(
+        &terraform,
+        "main.tf",
+        "resource \"cloudflare_workers_script\" \"edge\" {\n  script_name = var.worker_name\n}\n",
+    );
+
+    let graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
+        .expect("poison identity discovery");
+    for key in [
+        "kv_namespace:CACHE",
+        "r2_bucket:ASSETS",
+        "worker:var.worker_name",
+    ] {
+        assert!(
+            graph.repositories_for(key).is_empty(),
+            "invented identity {key}"
+        );
+    }
 }
 
 #[test]

@@ -52,7 +52,10 @@ supported representations are Wrangler TOML/JSON/JSONC, Terraform HCL/JSON,
 and Pulumi YAML. Resource links
 use canonical absolute repository paths, and every source-config snapshot
 records the current hash, `HEAD` hash, exact worktree-diff hash, and dirty
-status. The supported-IaC fixture matrix exercises all of those formats plus
+status. Terraform and Pulumi resources also expose runtime identity links only
+from literal, resource-type-specific properties; dynamic expressions and local
+binding symbols never masquerade as Cloudflare identities. The supported-IaC
+fixture matrix exercises all of those formats plus
 staged, unstaged, and untracked state, duplicate repository basenames, and
 cross-repository resource impact.
 
