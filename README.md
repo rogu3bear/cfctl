@@ -163,6 +163,12 @@ unavailable tiers, and any drift all fail before the Cloudflare mutation
 boundary. Account-level subscription lists remain blocked until each
 product-scoped subscription can be mapped without ambiguity.
 
+Every executable zone-scoped mutation also performs a Zone Read of the exact
+target before planning and again before durable consumption. The returned zone
+ID and `account.id` must match the selector and selected account. The normalized
+ownership receipt is hash-bound to the plan; missing access, cross-account
+targets, substituted responses, and ownership drift fail before mutation.
+
 `cfctl keys mint` validates every selected permission-group ID against a fresh,
 account-bound live inventory before it creates a plan. The plan binds only the
 normalized ID, name, category, and scopes for the selected groups plus the

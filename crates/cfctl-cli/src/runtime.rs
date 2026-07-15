@@ -978,6 +978,7 @@ fn delete_plan_secret(plan: &PlanV1, secrets: &dyn SecretStore) -> Result<bool> 
 
 const ENTITLEMENT_UNRESOLVED_GAP: &str =
     "account entitlement has not been resolved for this plan-gated operation";
+const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str = "zone-subscription-zone-subscription-details";
 
 fn should_resolve_zone_entitlement(capability: &CapabilityV1) -> bool {
@@ -993,7 +994,19 @@ fn should_resolve_zone_entitlement(capability: &CapabilityV1) -> bool {
         && capability.mutation_contract_gaps() == [ENTITLEMENT_UNRESOLVED_GAP]
 }
 
-fn zone_entitlement_target(capability: &CapabilityV1, input: &CallInput) -> Result<String> {
+fn should_bind_zone_account(capability: &CapabilityV1) -> bool {
+    capability.mutating
+        && capability.account_scope == "zone"
+        && (matches!(
+            capability.adapter_status,
+            AdapterStatus::Native
+                | AdapterStatus::DynamicApi
+                | AdapterStatus::DelegatedCli
+                | AdapterStatus::GovernedUi
+        ) || should_resolve_zone_entitlement(capability))
+}
+
+fn zone_target(capability: &CapabilityV1, input: &CallInput) -> Result<String> {
     let zone_selectors = capability
         .path
         .split('/')
@@ -1006,7 +1019,7 @@ fn zone_entitlement_target(capability: &CapabilityV1, input: &CallInput) -> Resu
         .collect::<Vec<_>>();
     let [selector] = zone_selectors.as_slice() else {
         return Err(CliError::Input(format!(
-            "zone entitlement resolution requires exactly one zone selector in capability `{}`",
+            "live zone preconditions require exactly one zone selector in capability `{}`",
             capability.id
         )));
     };
@@ -1018,7 +1031,7 @@ fn zone_entitlement_target(capability: &CapabilityV1, input: &CallInput) -> Resu
         .map(str::to_owned)
         .ok_or_else(|| {
             CliError::Input(format!(
-                "zone entitlement resolution requires string selector `{selector}`"
+                "live zone preconditions require string selector `{selector}`"
             ))
         })
 }
@@ -1135,7 +1148,7 @@ async fn read_live_zone_entitlement(
                 .to_owned(),
         ));
     }
-    let zone_id = zone_entitlement_target(capability, input)?;
+    let zone_id = zone_target(capability, input)?;
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
     let response = executor
         .execute_read(
@@ -1150,6 +1163,97 @@ async fn read_live_zone_entitlement(
         )
         .await?;
     let receipt = apply_zone_entitlement_response(capability, &zone_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
+
+fn apply_zone_account_response(
+    zone_id: &str,
+    expected_account_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the zone-account ownership read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    let observed_zone_id = response
+        .result
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("zone-account ownership read omitted the zone ID".to_owned())
+        })?;
+    if observed_zone_id != zone_id {
+        return Err(CliError::Input(format!(
+            "zone-account ownership read for `{zone_id}` returned zone `{observed_zone_id}`; the mutation boundary was not crossed"
+        )));
+    }
+    let observed_account_id = response
+        .result
+        .pointer("/account/id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("zone-account ownership read omitted the account ID".to_owned())
+        })?;
+    if observed_account_id != expected_account_id {
+        return Err(CliError::Input(format!(
+            "zone `{zone_id}` belongs to account `{observed_account_id}`, not selected account `{expected_account_id}`; the mutation boundary was not crossed"
+        )));
+    }
+    Ok(json!({
+        "schema_version": 1,
+        "source_capability_id": ZONE_DETAILS_CAPABILITY_ID,
+        "source_path": "/zones/{zone_id}",
+        "target_scope": "zone",
+        "target_id": zone_id,
+        "expected_account_id": expected_account_id,
+        "observed_account_id": observed_account_id,
+        "account_matches": true,
+    }))
+}
+
+async fn read_live_zone_account(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    let source_capability = catalog
+        .get(ZONE_DETAILS_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(ZONE_DETAILS_CAPABILITY_ID))?;
+    if source_capability.method != "GET"
+        || source_capability.path != "/zones/{zone_id}"
+        || source_capability.mutating
+        || !matches!(
+            source_capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+    {
+        return Err(CliError::Input(
+            "zone-account source capability drifted from the governed zone-details read".to_owned(),
+        ));
+    }
+    let zone_id = zone_target(capability, input)?;
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source_capability,
+            &CallInput {
+                selectors: json!({"zone_id": zone_id}),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt = apply_zone_account_response(&zone_id, account_id, &response)?;
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
@@ -1181,12 +1285,17 @@ async fn create_plan(
                     .to_owned(),
             )
         })?;
-    let entitlement_precondition = if should_resolve_zone_entitlement(&capability) {
-        let credential = fresh_credential(profile, &PlatformSecretStore).await?;
-        Some(
-            read_live_zone_entitlement(store, catalog, &mut capability, &input, &credential)
-                .await?,
-        )
+    let resolve_entitlement = should_resolve_zone_entitlement(&capability);
+    let credential = if resolve_entitlement || should_bind_zone_account(&capability) {
+        Some(fresh_credential(profile, &PlatformSecretStore).await?)
+    } else {
+        None
+    };
+    let entitlement_precondition = if resolve_entitlement {
+        let credential = credential.as_ref().ok_or_else(|| {
+            CliError::Input("live zone precondition credential was not resolved".to_owned())
+        })?;
+        Some(read_live_zone_entitlement(store, catalog, &mut capability, &input, credential).await?)
     } else {
         None
     };
@@ -1197,6 +1306,17 @@ async fn create_plan(
             }),
         ));
     }
+    let zone_account_precondition = if should_bind_zone_account(&capability) {
+        let credential = credential.as_ref().ok_or_else(|| {
+            CliError::Input("live zone precondition credential was not resolved".to_owned())
+        })?;
+        Some(
+            read_live_zone_account(store, catalog, &capability, &input, account_id, credential)
+                .await?,
+        )
+    } else {
+        None
+    };
     persist_prepared_plan(
         store,
         catalog,
@@ -1207,13 +1327,21 @@ async fn create_plan(
             account_id,
         },
         adapter_targets,
-        entitlement_precondition,
+        LivePlanPreconditions {
+            entitlement: entitlement_precondition,
+            zone_account: zone_account_precondition,
+        },
     )
 }
 
 struct PlanAuthority<'a> {
     profile: &'a ProfileMetadata,
     account_id: &'a str,
+}
+
+struct LivePlanPreconditions {
+    entitlement: Option<(Value, EvidenceV1)>,
+    zone_account: Option<(Value, EvidenceV1)>,
 }
 
 fn persist_prepared_plan(
@@ -1223,7 +1351,7 @@ fn persist_prepared_plan(
     input: CallInput,
     authority: PlanAuthority<'_>,
     adapter_targets: Value,
-    entitlement_precondition: Option<(Value, EvidenceV1)>,
+    live_preconditions: LivePlanPreconditions,
 ) -> Result<ResultEnvelopeV2> {
     let PlanAuthority {
         profile,
@@ -1261,9 +1389,13 @@ fn persist_prepared_plan(
         .insert("catalog".to_owned(), catalog.schema_hash.clone());
     plan.precondition_hashes
         .insert("request_input".to_owned(), hash_value(&plan.input)?);
-    if let Some((receipt, _)) = &entitlement_precondition {
+    if let Some((receipt, _)) = &live_preconditions.entitlement {
         plan.precondition_hashes
             .insert("entitlement".to_owned(), hash_value(receipt)?);
+    }
+    if let Some((receipt, _)) = &live_preconditions.zone_account {
+        plan.precondition_hashes
+            .insert("zone_account".to_owned(), hash_value(receipt)?);
     }
     plan.precondition_hashes
         .extend(workspace_precondition_hashes(store)?);
@@ -1307,7 +1439,10 @@ fn persist_prepared_plan(
     envelope.account_id = Some(account_id.to_owned());
     envelope.policy_decision = Some(policy);
     envelope.verification.state = VerificationState::Pending;
-    if let Some((_, evidence)) = entitlement_precondition {
+    if let Some((_, evidence)) = live_preconditions.entitlement {
+        envelope.evidence.insert(0, evidence);
+    }
+    if let Some((_, evidence)) = live_preconditions.zone_account {
         envelope.evidence.insert(0, evidence);
     }
     Ok(envelope)
@@ -1711,6 +1846,14 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         adapter_targets,
         &plan.account_id,
     )?;
+    let zone_account_evidence = validate_live_zone_account_precondition(
+        store,
+        &catalog,
+        &plan,
+        &execution_input,
+        &credential,
+    )
+    .await?;
     let entitlement_evidence = validate_live_entitlement_precondition(
         store,
         &catalog,
@@ -1729,53 +1872,150 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         &mut plan,
         TransactionStageV1::BoundaryAttemptPersisted,
     )?;
-    if plan.capability.adapter_status == AdapterStatus::DelegatedCli {
-        let result =
-            execute_delegated_plan(store, &mut plan, &execution_input, &credential, &secrets).await;
-        if result.is_err() && plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted
-        {
-            plan.status = PlanStatus::RectificationRequired;
-            persist_transaction_stage_with_artifact(
-                store,
-                &mut plan,
-                TransactionStageV1::BoundaryResponsePersisted,
-                boundary_failure_artifact("delegated_cli", "no_receipt"),
-            )?;
-            persist_secret_lifecycle(store, &mut plan, false, None, &secrets)?;
-        }
-        return result;
-    }
-    if plan.capability.adapter_status == AdapterStatus::GovernedUi {
-        let result = execute_governed_ui_plan(store, &mut plan, &execution_input, &secrets);
-        if result.is_err() && plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted
-        {
-            plan.status = PlanStatus::RectificationRequired;
-            persist_transaction_stage_with_artifact(
-                store,
-                &mut plan,
-                TransactionStageV1::BoundaryResponsePersisted,
-                boundary_failure_artifact("governed_ui", "handoff_failed"),
-            )?;
-            persist_secret_lifecycle(store, &mut plan, false, None, &secrets)?;
-        }
-        return result;
-    }
-    let mut envelope = execute_api_plan(
+    execute_consumed_plan(
         store,
         &catalog.schema_hash,
         &mut plan,
         &execution_input,
         &credential,
         &secrets,
+        LivePreconditionEvidence {
+            zone_account: zone_account_evidence,
+            entitlement: entitlement_evidence,
+            permission_inventory: permission_inventory_evidence,
+        },
+    )
+    .await
+}
+
+struct LivePreconditionEvidence {
+    zone_account: Option<EvidenceV1>,
+    entitlement: Option<EvidenceV1>,
+    permission_inventory: Option<EvidenceV1>,
+}
+
+async fn execute_consumed_plan(
+    store: &StateStore,
+    catalog_hash: &str,
+    plan: &mut PlanV1,
+    execution_input: &CallInput,
+    credential: &AuthCredential,
+    secrets: &dyn SecretStore,
+    evidence: LivePreconditionEvidence,
+) -> Result<ResultEnvelopeV2> {
+    if plan.capability.adapter_status == AdapterStatus::DelegatedCli {
+        let mut result =
+            execute_delegated_plan(store, plan, execution_input, credential, secrets).await;
+        if result.is_err() && plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted
+        {
+            plan.status = PlanStatus::RectificationRequired;
+            persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                boundary_failure_artifact("delegated_cli", "no_receipt"),
+            )?;
+            persist_secret_lifecycle(store, plan, false, None, secrets)?;
+        }
+        if let Ok(envelope) = &mut result {
+            prepend_live_precondition_evidence(envelope, evidence);
+        }
+        return result;
+    }
+    if plan.capability.adapter_status == AdapterStatus::GovernedUi {
+        let mut result = execute_governed_ui_plan(store, plan, execution_input, secrets);
+        if result.is_err() && plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted
+        {
+            plan.status = PlanStatus::RectificationRequired;
+            persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                boundary_failure_artifact("governed_ui", "handoff_failed"),
+            )?;
+            persist_secret_lifecycle(store, plan, false, None, secrets)?;
+        }
+        if let Ok(envelope) = &mut result {
+            prepend_live_precondition_evidence(envelope, evidence);
+        }
+        return result;
+    }
+    let mut envelope = execute_api_plan(
+        store,
+        catalog_hash,
+        plan,
+        execution_input,
+        credential,
+        secrets,
     )
     .await?;
-    if let Some(evidence) = entitlement_evidence {
-        envelope.evidence.insert(0, evidence);
-    }
-    if let Some(evidence) = permission_inventory_evidence {
-        envelope.evidence.insert(0, evidence);
-    }
+    prepend_live_precondition_evidence(&mut envelope, evidence);
     Ok(envelope)
+}
+
+fn prepend_live_precondition_evidence(
+    envelope: &mut ResultEnvelopeV2,
+    evidence: LivePreconditionEvidence,
+) {
+    for item in [
+        evidence.permission_inventory,
+        evidence.entitlement,
+        evidence.zone_account,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        envelope.evidence.insert(0, item);
+    }
+}
+
+async fn validate_live_zone_account_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_zone_account_precondition(plan)? else {
+        return Ok(None);
+    };
+    let (receipt, evidence) = read_live_zone_account(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    validate_zone_account_receipt_precondition(expected_hash, &receipt)?;
+    Ok(Some(evidence))
+}
+
+fn validate_zone_account_receipt_precondition(expected_hash: &str, receipt: &Value) -> Result<()> {
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live zone-account ownership drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn required_zone_account_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    if !plan.capability.mutating || plan.capability.account_scope != "zone" {
+        return Ok(None);
+    }
+    plan.precondition_hashes
+        .get("zone_account")
+        .map(String::as_str)
+        .map(Some)
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the live zone-account ownership contract; create a new plan"
+                    .to_owned(),
+            )
+        })
 }
 
 async fn validate_live_entitlement_precondition(
@@ -3351,7 +3591,10 @@ fn workspace_precondition_hashes(store: &StateStore) -> Result<BTreeMap<String, 
 fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> {
     let current = workspace_precondition_hashes(store)?;
     for (name, expected) in &plan.precondition_hashes {
-        if matches!(name.as_str(), "catalog" | "request_input" | "entitlement") {
+        if matches!(
+            name.as_str(),
+            "catalog" | "request_input" | "entitlement" | "zone_account"
+        ) {
             continue;
         }
         if current.get(name) != Some(expected) {
@@ -3705,6 +3948,7 @@ fn guide_stage_document(
 ) -> Value {
     use cfctl_core::GuideStage;
 
+    let zone_account_live_read = should_bind_zone_account(capability);
     let zone_entitlement_live_read = should_resolve_zone_entitlement(capability);
     let entitlement_blocked = capability.entitlement.available == Some(false)
         || blocking_gaps.iter().any(|gap| gap.contains("entitlement"));
@@ -3712,6 +3956,7 @@ fn guide_stage_document(
         && capability.entitlement.available != Some(true)
         && capability.entitlement.plans.is_empty();
     let contract_state = match stage {
+        GuideStage::SelectAccount if zone_account_live_read => "live_read_required",
         GuideStage::CheckEntitlement if zone_entitlement_live_read => "live_read_required",
         GuideStage::CheckEntitlement if entitlement_blocked => "blocked",
         GuideStage::CheckEntitlement if entitlement_unresolved => "manual_review",
@@ -3749,12 +3994,16 @@ fn guide_stage_document(
         GuideStage::CloseWithEvidence if capability.mutating && !contract_ready => "blocked",
         _ => "available",
     };
-    let summary = if stage == GuideStage::CheckEntitlement && zone_entitlement_live_read {
+    let summary = if stage == GuideStage::SelectAccount && zone_account_live_read {
+        "Read the exact live zone details and require its account ID to match the selected account."
+    } else if stage == GuideStage::CheckEntitlement && zone_entitlement_live_read {
         "Read the exact live zone subscription and evaluate its active plan against the official availability matrix."
     } else {
         guide_stage_summary(stage, capability.mutating)
     };
-    let evidence_class = if stage == GuideStage::CheckEntitlement && zone_entitlement_live_read {
+    let evidence_class = if (stage == GuideStage::SelectAccount && zone_account_live_read)
+        || (stage == GuideStage::CheckEntitlement && zone_entitlement_live_read)
+    {
         "live_read"
     } else {
         guide_stage_evidence_class(stage, capability.mutating)
@@ -3862,7 +4111,9 @@ fn guide_stage_commands(
     let conditional =
         |command: Option<Vec<String>>| available.then_some(command).flatten().into_iter().collect();
     match stage {
-        GuideStage::CheckEntitlement if contract_state == "live_read_required" => {
+        GuideStage::SelectAccount | GuideStage::CheckEntitlement
+            if contract_state == "live_read_required" =>
+        {
             call_argv.map(<[String]>::to_vec).into_iter().collect()
         }
         GuideStage::Discover | GuideStage::CheckEntitlement | GuideStage::CalculateCost => {
@@ -4213,12 +4464,14 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        CallInput, apply_zone_entitlement_response, compensation_request, find_secret_value,
-        guide_document, persist_secret_lifecycle, preserve_previous_catalog, redact_secret_result,
-        required_entitlement_precondition, should_resolve_zone_entitlement, sink_secret_result,
-        validate_api_token_creation_contract, validate_current_permission_groups,
-        validate_entitlement_receipt_precondition, validate_selected_permission_groups,
-        zone_entitlement_target,
+        CallInput, apply_zone_account_response, apply_zone_entitlement_response,
+        compensation_request, find_secret_value, guide_document, persist_secret_lifecycle,
+        preserve_previous_catalog, redact_secret_result, required_entitlement_precondition,
+        required_zone_account_precondition, should_bind_zone_account,
+        should_resolve_zone_entitlement, sink_secret_result, validate_api_token_creation_contract,
+        validate_current_permission_groups, validate_entitlement_receipt_precondition,
+        validate_selected_permission_groups, validate_zone_account_receipt_precondition,
+        zone_target,
     };
     use cfctl_auth::{AuthError, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
@@ -4323,7 +4576,7 @@ mod tests {
         };
 
         assert_eq!(
-            zone_entitlement_target(&capability, &input).expect("zone target"),
+            zone_target(&capability, &input).expect("zone target"),
             "zone-a"
         );
         let receipt = apply_zone_entitlement_response(&mut capability, "zone-a", &response)
@@ -4431,6 +4684,8 @@ mod tests {
                 .as_str()
                 .is_some_and(|summary| summary.contains("live zone-subscription read"))
         );
+        assert_eq!(guide["stages"][2]["contract_state"], "live_read_required");
+        assert_eq!(guide["stages"][2]["evidence_class"], "live_read");
         assert_eq!(guide["stages"][3]["contract_state"], "live_read_required");
         assert_eq!(guide["stages"][3]["evidence_class"], "live_read");
         let response = CloudflareResponseV1 {
@@ -4494,6 +4749,89 @@ mod tests {
             required_entitlement_precondition(&plan).expect("entitlement precondition"),
             plan.precondition_hashes
                 .get("entitlement")
+                .map(String::as_str)
+        );
+    }
+
+    #[test]
+    fn zone_account_receipt_binds_the_exact_target_and_selected_account() {
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "id": "zone-a",
+                "account": {"id": "account-a", "name": "Example"},
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+
+        let receipt = apply_zone_account_response("zone-a", "account-a", &response)
+            .expect("zone account receipt");
+        assert_eq!(receipt["target_id"], "zone-a");
+        assert_eq!(receipt["expected_account_id"], "account-a");
+        assert_eq!(receipt["observed_account_id"], "account-a");
+        assert_eq!(receipt["account_matches"], true);
+        let receipt_hash = hash_value(&receipt).expect("zone-account receipt hash");
+        validate_zone_account_receipt_precondition(&receipt_hash, &receipt)
+            .expect("unchanged zone-account receipt");
+
+        let mut drifted = receipt.clone();
+        drifted["observed_account_id"] = json!("account-b");
+        let drift = validate_zone_account_receipt_precondition(&receipt_hash, &drifted)
+            .expect_err("zone-account receipt drift must fail");
+        assert!(drift.to_string().contains("ownership drifted"));
+
+        let mismatch = apply_zone_account_response("zone-a", "account-b", &response)
+            .expect_err("cross-account zone must fail");
+        assert!(
+            mismatch
+                .to_string()
+                .contains("belongs to account `account-a`")
+        );
+
+        let wrong_zone = apply_zone_account_response("zone-b", "account-a", &response)
+            .expect_err("wrong zone response must fail");
+        assert!(wrong_zone.to_string().contains("returned zone `zone-a`"));
+    }
+
+    #[test]
+    fn every_executable_zone_mutation_requires_an_account_precondition() {
+        let mut capability = CapabilityV1::new(
+            "custom-pages-delete",
+            "Delete custom page",
+            "DELETE",
+            "/zones/{zone_id}/custom_pages/{identifier}",
+        );
+        capability.account_scope = "zone".to_owned();
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        assert!(should_bind_zone_account(&capability));
+        let guide = guide_document(&capability);
+        assert_eq!(guide["stages"][2]["contract_state"], "live_read_required");
+        assert_eq!(guide["stages"][2]["evidence_class"], "live_read");
+
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("plan");
+        let missing = required_zone_account_precondition(&plan)
+            .expect_err("missing zone-account precondition must fail");
+        assert!(missing.to_string().contains("zone-account ownership"));
+
+        plan.precondition_hashes.insert(
+            "zone_account".to_owned(),
+            format!("sha256:{}", "b".repeat(64)),
+        );
+        assert_eq!(
+            required_zone_account_precondition(&plan).expect("zone-account precondition"),
+            plan.precondition_hashes
+                .get("zone_account")
                 .map(String::as_str)
         );
     }

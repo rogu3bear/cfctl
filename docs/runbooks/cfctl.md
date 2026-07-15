@@ -46,6 +46,12 @@ and execution rechecks it. Do not substitute account subscription output or
 manually edit `observed_plan`; ambiguous, inactive, unavailable, and drifted
 entitlements remain blocked.
 
+For an executable zone mutation, `select_account` is also
+`live_read_required`. The exact call reads `GET /zones/{zone_id}` and requires
+the returned zone and `account.id` to match the target and selected account.
+That ownership receipt is re-read before plan consumption; do not infer
+ownership from a profile label, workspace pin, or local IaC.
+
 ## Authentication
 
 Normal OAuth login uses a public client and PKCE:

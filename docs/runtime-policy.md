@@ -42,6 +42,13 @@ and official matrix hash, then repeats the read before durable consumption.
 An ambiguous account subscription list is not treated as equivalent zone-plan
 proof.
 
+Every executable zone-scoped mutation requires a fresh
+`GET /zones/{zone_id}` ownership read during planning. The normalized receipt
+binds the requested zone, selected account, returned zone, and returned
+`account.id`; execution repeats the read before durable consumption. A profile
+or workspace account pin selects authority but is not accepted as ownership
+proof.
+
 The plan is durably consumed before cfctl crosses the API, subprocess, or UI
 boundary. A crash after consumption cannot automatically replay the action.
 Crash-stale local locks expire after 15 minutes; nonce ownership prevents an
