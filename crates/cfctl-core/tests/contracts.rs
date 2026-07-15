@@ -3,8 +3,8 @@
 use cfctl_core::{
     AdapterStatus, CapabilityV1, CostV1, CreatedResourceContractV1, EffectClass, EvidenceClass,
     EvidenceV1, GuideStage, PlanStatus, PlanV1, ResultEnvelopeV2, RiskClass,
-    SamePathReadContractV1, TransactionStageV1, UpdatedResourceContractV1, guide_stages,
-    redact_json,
+    SamePathReadContractV1, SelectorV1, TransactionStageV1, UpdatedResourceContractV1,
+    guide_stages, redact_json,
 };
 use serde_json::json;
 
@@ -118,6 +118,13 @@ fn updated_resource_contract_rejects_noncanonical_field_allowlists() {
     );
     capability.verification.strategy =
         "parent_collection_item_contains_planned_fields_after_update".to_owned();
+    capability.request_schema = Some(json!({
+        "type": "object",
+        "properties": {
+            "name": {"type":"string"},
+            "enabled": {"type":"boolean"}
+        }
+    }));
     capability.updated_resource = Some(UpdatedResourceContractV1 {
         collection_path: "/accounts/{account_id}/widgets".to_owned(),
         identity_selector: "widget_id".to_owned(),
@@ -135,6 +142,58 @@ fn updated_resource_contract_rejects_noncanonical_field_allowlists() {
         .expect("updated-resource contract")
         .verified_response_fields = vec!["enabled".to_owned(), "name".to_owned()];
     assert!(capability.verification_contract_supported());
+
+    capability.selectors.push(SelectorV1 {
+        name: "mode".to_owned(),
+        location: "query".to_owned(),
+        required: false,
+        value_type: "string".to_owned(),
+        description: None,
+    });
+    assert!(!capability.verification_contract_supported());
+
+    capability.selectors.clear();
+    capability.request_schema = Some(json!({
+        "type": "object",
+        "properties": {
+            "name": {"type":"string"},
+            "enabled": {"type":"boolean"},
+            "hidden": {"type":"boolean"}
+        }
+    }));
+    assert!(!capability.verification_contract_supported());
+}
+
+#[test]
+fn deleted_resource_contract_rejects_body_and_nonpath_controls() {
+    let mut capability = CapabilityV1::new(
+        "widgets-delete",
+        "Delete widget",
+        "DELETE",
+        "/accounts/{account_id}/widgets/{widget_id}",
+    );
+    capability.verification.strategy = "parent_collection_omits_deleted_resource_id".to_owned();
+    capability.deleted_resource = Some(cfctl_core::DeletedResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        requires_page_number_completion: false,
+    });
+    assert!(capability.verification_contract_supported());
+
+    capability.request_schema = Some(json!({"type":"object"}));
+    assert!(!capability.verification_contract_supported());
+
+    capability.request_schema = None;
+    capability.selectors.push(SelectorV1 {
+        name: "cascade".to_owned(),
+        location: "query".to_owned(),
+        required: false,
+        value_type: "boolean".to_owned(),
+        description: None,
+    });
+    assert!(!capability.verification_contract_supported());
 }
 
 #[test]

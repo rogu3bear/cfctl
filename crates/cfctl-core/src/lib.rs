@@ -526,10 +526,20 @@ impl CapabilityV1 {
                     && self.same_path_read_contract_supported(false)
             }
             "parent_collection_omits_deleted_resource_id" => {
-                self.method == "DELETE" && self.deleted_resource_contract_supported()
+                self.method == "DELETE"
+                    && self.request_schema.is_none()
+                    && self
+                        .selectors
+                        .iter()
+                        .all(|selector| selector.location == "path")
+                    && self.deleted_resource_contract_supported()
             }
             "parent_collection_item_contains_planned_fields_after_update" => {
                 matches!(self.method.as_str(), "PATCH" | "PUT")
+                    && self
+                        .selectors
+                        .iter()
+                        .all(|selector| selector.location == "path")
                     && self.updated_resource_contract_supported()
             }
             "same_resource_contains_planned_fields_after_update" => {
@@ -691,11 +701,24 @@ impl CapabilityV1 {
                 target.collection_path.trim_end_matches('/'),
                 target.identity_selector
             );
+            let Some(mut request_fields) = self
+                .request_schema
+                .as_ref()
+                .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))
+                .and_then(|schema| schema.get("properties"))
+                .and_then(Value::as_object)
+                .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+            else {
+                return false;
+            };
+            request_fields.sort();
+            request_fields.dedup();
             !target.identity_selector.is_empty()
                 && self.path == expected_path
                 && target.response_item_identity_pointer == "/id"
                 && !target.read_capability_id.is_empty()
-                && !target.verified_response_fields.is_empty()
+                && !request_fields.is_empty()
+                && target.verified_response_fields == request_fields
                 && target
                     .verified_response_fields
                     .iter()

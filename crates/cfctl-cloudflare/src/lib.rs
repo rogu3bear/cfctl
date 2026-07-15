@@ -1631,6 +1631,18 @@ fn validate_deleted_resource_target(capability: &CapabilityV1, input: &CallInput
             "the hash-bound deleted-resource contract is malformed".to_owned(),
         ));
     }
+    if input.body.is_some() {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned delete body is outside the hash-bound collection readback contract"
+                .to_owned(),
+        ));
+    }
+    if !clean_verification_query(input) {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned delete contains query controls outside the hash-bound collection readback contract"
+                .to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1657,6 +1669,12 @@ fn validate_updated_resource_target(capability: &CapabilityV1, input: &CallInput
     {
         return Err(CloudflareError::MissingVerificationTarget(
             "the hash-bound updated-resource contract is malformed".to_owned(),
+        ));
+    }
+    if !clean_verification_query(input) {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned update contains query controls outside the hash-bound collection readback contract"
+                .to_owned(),
         ));
     }
     let Some(planned) = input.body.as_ref().and_then(Value::as_object) else {

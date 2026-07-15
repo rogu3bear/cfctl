@@ -1137,7 +1137,7 @@ async fn parent_collection_update_rejects_unbound_fields_before_the_mutation_bou
         "/accounts/{account_id}/widgets/{widget_id}",
         "parent_collection_item_contains_planned_fields_after_update",
         json!({"account_id":"account-1", "widget_id":"widget-1"}),
-        Some(json!({"hidden":true})),
+        Some(json!({"name":"planned"})),
     );
     plan.capability.updated_resource = Some(UpdatedResourceContractV1 {
         collection_path: "/accounts/{account_id}/widgets".to_owned(),
@@ -1147,6 +1147,13 @@ async fn parent_collection_update_rejects_unbound_fields_before_the_mutation_bou
         verified_response_fields: vec!["name".to_owned()],
         requires_page_number_completion: false,
     });
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        query: json!({}),
+        body: Some(json!({"name":"planned", "hidden":true})),
+        ..CallInput::default()
+    })
+    .expect("input");
     plan.status = PlanStatus::Consumed;
     let input: CallInput = serde_json::from_value(plan.input.clone()).expect("input");
     let catalog_hash = plan.catalog_hash.clone();
@@ -1167,6 +1174,103 @@ async fn parent_collection_update_rejects_unbound_fields_before_the_mutation_bou
         .to_string();
 
     assert!(error.contains("outside the hash-bound collection readback fields"));
+    assert_eq!(plan.status, PlanStatus::Consumed);
+}
+
+#[tokio::test]
+async fn parent_collection_update_rejects_query_controls_before_the_mutation_boundary() {
+    let mut plan = dns_record_plan(
+        "widgets-update",
+        "PATCH",
+        "/accounts/{account_id}/widgets/{widget_id}",
+        "parent_collection_item_contains_planned_fields_after_update",
+        json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        Some(json!({"name":"planned"})),
+    );
+    plan.capability.updated_resource = Some(UpdatedResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+        requires_page_number_completion: false,
+    });
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        query: json!({"mode":"must-not-cross-boundary"}),
+        body: Some(json!({"name":"planned"})),
+        ..CallInput::default()
+    })
+    .expect("input");
+    plan.status = PlanStatus::Consumed;
+    let input: CallInput = serde_json::from_value(plan.input.clone()).expect("input");
+    let catalog_hash = plan.catalog_hash.clone();
+    let executor =
+        Executor::new(reqwest::Client::new(), "http://127.0.0.1:9/client/v4").expect("executor");
+
+    let error = executor
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            &catalog_hash,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect_err("query controls must fail before network execution")
+        .to_string();
+
+    assert!(error.contains("query controls outside the hash-bound collection readback contract"));
+    assert!(!error.contains("must-not-cross-boundary"));
+    assert_eq!(plan.status, PlanStatus::Consumed);
+}
+
+#[tokio::test]
+async fn parent_collection_delete_rejects_broadening_inputs_before_the_mutation_boundary() {
+    let mut plan = dns_record_plan(
+        "widgets-delete",
+        "DELETE",
+        "/accounts/{account_id}/widgets/{widget_id}",
+        "parent_collection_omits_deleted_resource_id",
+        json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        None,
+    );
+    plan.capability.deleted_resource = Some(DeletedResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        requires_page_number_completion: false,
+    });
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({"account_id":"account-1", "widget_id":"widget-1"}),
+        query: json!({"cascade":true}),
+        body: Some(json!({"reason":"must-not-cross-boundary"})),
+        ..CallInput::default()
+    })
+    .expect("input");
+    plan.status = PlanStatus::Consumed;
+    let input: CallInput = serde_json::from_value(plan.input.clone()).expect("input");
+    let catalog_hash = plan.catalog_hash.clone();
+    let executor =
+        Executor::new(reqwest::Client::new(), "http://127.0.0.1:9/client/v4").expect("executor");
+
+    let error = executor
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            &catalog_hash,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect_err("broadening inputs must fail before network execution")
+        .to_string();
+
+    assert!(error.contains("outside the hash-bound collection readback contract"));
+    assert!(!error.contains("must-not-cross-boundary"));
     assert_eq!(plan.status, PlanStatus::Consumed);
 }
 
@@ -2159,6 +2263,7 @@ fn dns_record_plan(
         verification_strategy,
         "same_resource_contains_planned_fields_after_update"
             | "same_path_result_contains_planned_fields_after_update"
+            | "parent_collection_item_contains_planned_fields_after_update"
     ) {
         let mut fields = body
             .as_ref()
