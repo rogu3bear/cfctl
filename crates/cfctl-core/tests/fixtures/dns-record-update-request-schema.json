@@ -1,0 +1,1746 @@
+{
+  "anyOf": [
+    {
+      "oneOf": [
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "content": {
+                  "format": "ipv4",
+                  "type": "string"
+                },
+                "private_routing": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "enum": [
+                    "A"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "content": {
+                  "format": "ipv6",
+                  "type": "string"
+                },
+                "private_routing": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "enum": [
+                    "AAAA"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "settings": {
+                  "properties": {
+                    "flatten_cname": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "CNAME"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "content": {
+                  "format": "hostname",
+                  "type": "string"
+                },
+                "priority": {
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "type": {
+                  "enum": [
+                    "MX"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "type": {
+                  "enum": [
+                    "NS"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "type": {
+                  "enum": [
+                    "OPENPGPKEY"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "type": {
+                  "enum": [
+                    "PTR"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "type": {
+                  "enum": [
+                    "TXT"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        }
+      ],
+      "type": "object"
+    },
+    {
+      "oneOf": [
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data": {
+                  "properties": {
+                    "flags": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "tag": {
+                      "type": "string"
+                    },
+                    "value": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "CAA"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data": {
+                  "properties": {
+                    "algorithm": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "certificate": {
+                      "type": "string"
+                    },
+                    "key_tag": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "type": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "number"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "CERT"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data": {
+                  "properties": {
+                    "algorithm": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "flags": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "protocol": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "public_key": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "DNSKEY"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data": {
+                  "properties": {
+                    "algorithm": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "digest": {
+                      "type": "string"
+                    },
+                    "digest_type": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "key_tag": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "number"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "DS"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data": {
+                  "properties": {
+                    "priority": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "target": {
+                      "type": "string"
+                    },
+                    "value": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "HTTPS"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data": {
+                  "properties": {
+                    "altitude": {
+                      "maximum": 42849672.95,
+                      "minimum": -100000,
+                      "type": "number"
+                    },
+                    "lat_degrees": {
+                      "maximum": 90,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "lat_direction": {
+                      "enum": [
+                        "N",
+                        "S"
+                      ],
+                      "type": "string"
+                    },
+                    "lat_minutes": {
+                      "maximum": 59,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "lat_seconds": {
+                      "maximum": 59.999,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "long_degrees": {
+                      "maximum": 180,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "long_direction": {
+                      "enum": [
+                        "E",
+                        "W"
+                      ],
+                      "type": "string"
+                    },
+                    "long_minutes": {
+                      "maximum": 59,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "long_seconds": {
+                      "maximum": 59.999,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "precision_horz": {
+                      "maximum": 90000000,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "precision_vert": {
+                      "maximum": 90000000,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "size": {
+                      "maximum": 90000000,
+                      "minimum": 0,
+                      "type": "number"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "LOC"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data": {
+                  "properties": {
+                    "flags": {
+                      "type": "string"
+                    },
+                    "order": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "preference": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "regex": {
+                      "type": "string"
+                    },
+                    "replacement": {
+                      "type": "string"
+                    },
+                    "service": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "NAPTR"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data": {
+                  "properties": {
+                    "certificate": {
+                      "type": "string"
+                    },
+                    "matching_type": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "selector": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "usage": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "SMIMEA"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data": {
+                  "properties": {
+                    "port": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "priority": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "target": {
+                      "format": "hostname",
+                      "type": "string"
+                    },
+                    "weight": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "number"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "SRV"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data": {
+                  "properties": {
+                    "algorithm": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "fingerprint": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "SSHFP"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data": {
+                  "properties": {
+                    "priority": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "target": {
+                      "type": "string"
+                    },
+                    "value": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "SVCB"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data": {
+                  "properties": {
+                    "certificate": {
+                      "type": "string"
+                    },
+                    "matching_type": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "selector": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "usage": {
+                      "maximum": 255,
+                      "minimum": 0,
+                      "type": "number"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": {
+                  "enum": [
+                    "TLSA"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "comment": {
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "proxied": {
+                  "type": "boolean"
+                },
+                "settings": {
+                  "properties": {
+                    "ipv4_only": {
+                      "type": "boolean"
+                    },
+                    "ipv6_only": {
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                },
+                "tags": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "ttl": {
+                  "anyOf": [
+                    {
+                      "maximum": 86400,
+                      "minimum": 30,
+                      "type": "number"
+                    },
+                    {
+                      "enum": [
+                        1
+                      ],
+                      "type": "number"
+                    }
+                  ],
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "properties": {
+                "data": {
+                  "properties": {
+                    "target": {
+                      "type": "string"
+                    },
+                    "weight": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "number"
+                    }
+                  },
+                  "type": "object"
+                },
+                "priority": {
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "type": {
+                  "enum": [
+                    "URI"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        }
+      ],
+      "type": "object"
+    }
+  ],
+  "type": "object",
+  "x-cfctl-body-required": true
+}

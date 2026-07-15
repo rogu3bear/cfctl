@@ -1460,6 +1460,100 @@ fn dns_record_crud_has_complete_operation_specific_contracts() {
 }
 
 #[test]
+fn dns_record_updates_bind_the_exact_detail_read_and_reviewed_restore_contract() {
+    let mut document = fixture();
+    let request_schema: Value = serde_json::from_str(include_str!(
+        "../../cfctl-core/tests/fixtures/dns-record-update-request-schema.json"
+    ))
+    .expect("pinned DNS record update request schema");
+    let parameters = json!([
+        {"in":"path","name":"zone_id","required":true,"schema":{"type":"string","maxLength":32}},
+        {"in":"path","name":"dns_record_id","required":true,"schema":{"type":"string","maxLength":32}},
+        {"in":"query","name":"include_shadow_metadata","required":false,"schema":{"type":"boolean"}}
+    ]);
+    document["paths"]["/zones/{zone_id}/dns_records/{dns_record_id}"]["get"] = json!({
+        "operationId":"dns-records-for-a-zone-dns-record-details",
+        "summary":"DNS Record Details",
+        "tags":["DNS Records for a Zone"],
+        "x-api-token-group":["DNS Read"],
+        "parameters":parameters,
+        "responses":{"200":{"description":"details","content":{"application/json":{"schema":{
+            "type":"object",
+            "required":["success","result"],
+            "properties":{
+                "success":{"type":"boolean"},
+                "result":{"type":"object","allOf":[
+                    {"anyOf":[
+                        {"type":"object","properties":{
+                            "comment":{},"content":{},"name":{},"priority":{},"proxied":{},
+                            "settings":{},"tags":{},"ttl":{},"type":{}
+                        }},
+                        {"type":"object","properties":{
+                            "comment":{},"data":{},"name":{},"priority":{},"private_routing":{},
+                            "proxied":{},"settings":{},"tags":{},"ttl":{},"type":{}
+                        }}
+                    ]},
+                    {"type":"object","properties":{"id":{"type":"string"}}}
+                ]}
+            }
+        }}}}}
+    });
+    for (method, id) in [
+        ("put", "dns-records-for-a-zone-update-dns-record"),
+        ("patch", "dns-records-for-a-zone-patch-dns-record"),
+    ] {
+        document["paths"]["/zones/{zone_id}/dns_records/{dns_record_id}"][method] = json!({
+            "operationId":id,
+            "summary":"Update DNS Record",
+            "tags":["DNS Records for a Zone"],
+            "x-api-token-group":["DNS Write"],
+            "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true},
+            "parameters":parameters,
+            "requestBody":{"required":true,"content":{"application/json":{"schema":request_schema}}},
+            "responses":cloudflare_envelope_responses()
+        });
+    }
+
+    let snapshot = normalize_openapi(&document).expect("DNS update catalog");
+    for id in [
+        "dns-records-for-a-zone-update-dns-record",
+        "dns-records-for-a-zone-patch-dns-record",
+    ] {
+        let capability = snapshot.get(id).expect("DNS update capability");
+        assert!(capability.rollback.supported);
+        assert_eq!(
+            capability.rollback.strategy.as_deref(),
+            Some("restore_dns_record_prior_snapshot_with_put")
+        );
+        assert_eq!(
+            capability
+                .same_path_read
+                .as_ref()
+                .expect("DNS detail read")
+                .read_capability_id,
+            "dns-records-for-a-zone-dns-record-details"
+        );
+        assert!(capability.rollback_contract_supported());
+    }
+
+    document["paths"]["/zones/{zone_id}/dns_records/{dns_record_id}"]["get"]
+        ["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["result"]
+        ["allOf"][0]["anyOf"][1]["properties"]
+        .as_object_mut()
+        .expect("response alternative fields")
+        .remove("private_routing");
+    let narrowed = normalize_openapi(&document).expect("narrowed DNS response catalog");
+    for id in [
+        "dns-records-for-a-zone-update-dns-record",
+        "dns-records-for-a-zone-patch-dns-record",
+    ] {
+        let capability = narrowed.get(id).expect("DNS update capability");
+        assert!(!capability.rollback.supported);
+        assert!(capability.same_path_read.is_none());
+    }
+}
+
+#[test]
 fn exact_resource_deletes_pair_with_same_path_readback_contracts() {
     let document = json!({
         "openapi": "3.0.3",

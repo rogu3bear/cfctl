@@ -1,6 +1,6 @@
 //! Versioned domain contracts for the cfctl v2 control plane.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -713,6 +713,38 @@ impl CapabilityV1 {
                             && read.verified_response_fields == ["read_replication"]
                     })
             }
+            Some("restore_dns_record_prior_snapshot_with_put") => {
+                matches!(
+                    (self.id.as_str(), self.method.as_str()),
+                    ("dns-records-for-a-zone-update-dns-record", "PUT")
+                        | ("dns-records-for-a-zone-patch-dns-record", "PATCH")
+                ) && self.product == "DNS Records for a Zone"
+                    && self.path == "/zones/{zone_id}/dns_records/{dns_record_id}"
+                    && self.account_scope == "zone"
+                    && self.verification.strategy
+                        == "dns_record_details_match_planned_id_and_fields"
+                    && self.verification_contract_supported()
+                    && dns_record_update_request_contract_supported(self)
+                    && self.same_path_read.as_ref().is_some_and(|read| {
+                        read.path == "/zones/{zone_id}/dns_records/{dns_record_id}"
+                            && read.read_capability_id
+                                == "dns-records-for-a-zone-dns-record-details"
+                            && read.verified_response_fields
+                                == [
+                                    "comment",
+                                    "content",
+                                    "data",
+                                    "name",
+                                    "priority",
+                                    "private_routing",
+                                    "proxied",
+                                    "settings",
+                                    "tags",
+                                    "ttl",
+                                    "type",
+                                ]
+                    })
+            }
             _ => false,
         }
     }
@@ -726,6 +758,62 @@ impl CapabilityV1 {
     pub fn request_object_fields(&self) -> Option<Vec<String>> {
         let fields = request_object_property_schemas(self.request_schema.as_ref()?)?;
         Some(fields.into_keys().collect())
+    }
+
+    /// Returns the exact writable leaf paths for every branch selected by a
+    /// single-string discriminator. Direct fields and nested `allOf`
+    /// compositions are unioned, while `oneOf` and `anyOf` remain isolated by
+    /// discriminator value. Ambiguous, duplicated, or over-budget schemas fail
+    /// closed.
+    #[must_use]
+    pub fn request_object_paths_by_discriminator(
+        &self,
+        discriminator: &str,
+    ) -> Option<BTreeMap<String, Vec<String>>> {
+        let schema = self.request_schema.as_ref()?;
+        let mut branches = Vec::new();
+        let mut remaining_steps = MAX_REQUEST_OBJECT_SCHEMA_STEPS;
+        collect_discriminated_object_branches(
+            schema,
+            discriminator,
+            0,
+            &mut remaining_steps,
+            &mut branches,
+        )?;
+        if branches.is_empty() {
+            return None;
+        }
+        let mut paths_by_value = BTreeMap::new();
+        for (value, branch) in branches {
+            let mut fields = BTreeMap::new();
+            if collect_composed_object_property_schemas(
+                branch,
+                0,
+                &mut remaining_steps,
+                &mut fields,
+            ) != RequestObjectSchemaCollection::Object
+            {
+                return None;
+            }
+            let mut paths = BTreeSet::new();
+            for (name, schemas) in fields {
+                collect_request_property_paths(
+                    &schemas,
+                    &name,
+                    0,
+                    &mut remaining_steps,
+                    &mut paths,
+                )?;
+            }
+            if paths.is_empty()
+                || paths_by_value
+                    .insert(value, paths.into_iter().collect())
+                    .is_some()
+            {
+                return None;
+            }
+        }
+        Some(paths_by_value)
     }
 
     /// Returns the canonical top-level request fields that a response
@@ -990,8 +1078,156 @@ fn d1_read_replication_request_contract_supported(capability: &CapabilityV1) -> 
         })
 }
 
+const DNS_RECORD_UPDATE_REQUEST_SCHEMA_HASH: &str =
+    "sha256:13a888c46013d663dc09187c7a625ab91a8d9ffbcdc68ce4a294e14d3ab279f9";
+
+fn dns_record_update_request_contract_supported(capability: &CapabilityV1) -> bool {
+    capability
+        .request_schema
+        .as_ref()
+        .and_then(|schema| canonical_hash_value(schema).ok())
+        .as_deref()
+        == Some(DNS_RECORD_UPDATE_REQUEST_SCHEMA_HASH)
+}
+
 const MAX_REQUEST_OBJECT_SCHEMA_DEPTH: usize = 64;
 const MAX_REQUEST_OBJECT_SCHEMA_STEPS: usize = 4_096;
+
+fn collect_discriminated_object_branches<'a>(
+    schema: &'a Value,
+    discriminator: &str,
+    depth: usize,
+    remaining_steps: &mut usize,
+    branches: &mut Vec<(String, &'a Value)>,
+) -> Option<()> {
+    if depth > MAX_REQUEST_OBJECT_SCHEMA_DEPTH || *remaining_steps == 0 {
+        return None;
+    }
+    *remaining_steps -= 1;
+    let mut direct_fields = BTreeMap::new();
+    collect_direct_and_all_of_property_schemas(schema, depth, remaining_steps, &mut direct_fields)?;
+    if let Some(value) = direct_fields
+        .get(discriminator)
+        .and_then(|schemas| exact_single_string_enum(schemas))
+    {
+        branches.push((value, schema));
+        return Some(());
+    }
+    for composition in ["oneOf", "anyOf"] {
+        let Some(members) = schema.get(composition) else {
+            continue;
+        };
+        let members = members.as_array().filter(|members| !members.is_empty())?;
+        for member in members {
+            collect_discriminated_object_branches(
+                member,
+                discriminator,
+                depth + 1,
+                remaining_steps,
+                branches,
+            )?;
+        }
+    }
+    Some(())
+}
+
+fn collect_direct_and_all_of_property_schemas<'a>(
+    schema: &'a Value,
+    depth: usize,
+    remaining_steps: &mut usize,
+    fields: &mut BTreeMap<String, Vec<&'a Value>>,
+) -> Option<()> {
+    if depth > MAX_REQUEST_OBJECT_SCHEMA_DEPTH || *remaining_steps == 0 {
+        return None;
+    }
+    *remaining_steps -= 1;
+    match schema.get("type") {
+        None => {}
+        Some(Value::String(value_type)) if value_type == "object" => {}
+        _ => return Some(()),
+    }
+    if let Some(properties) = schema.get("properties") {
+        for (name, property_schema) in properties.as_object()? {
+            fields
+                .entry(name.clone())
+                .or_default()
+                .push(property_schema);
+        }
+    }
+    if let Some(members) = schema.get("allOf") {
+        for member in members.as_array().filter(|members| !members.is_empty())? {
+            collect_direct_and_all_of_property_schemas(member, depth + 1, remaining_steps, fields)?;
+        }
+    }
+    Some(())
+}
+
+fn exact_single_string_enum(schemas: &[&Value]) -> Option<String> {
+    let mut values = BTreeSet::new();
+    for schema in schemas {
+        if schema.get("type").and_then(Value::as_str) != Some("string") {
+            return None;
+        }
+        let entries = schema.get("enum")?.as_array()?;
+        if entries.len() != 1 {
+            return None;
+        }
+        values.insert(entries.first()?.as_str()?.to_owned());
+    }
+    let mut values = values.into_iter();
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn collect_request_property_paths(
+    schemas: &[&Value],
+    prefix: &str,
+    depth: usize,
+    remaining_steps: &mut usize,
+    paths: &mut BTreeSet<String>,
+) -> Option<()> {
+    if depth > MAX_REQUEST_OBJECT_SCHEMA_DEPTH || *remaining_steps == 0 || schemas.is_empty() {
+        return None;
+    }
+    let mut nested_fields = BTreeMap::new();
+    let mut object_schemas = 0_usize;
+    let mut scalar_schemas = 0_usize;
+    for schema in schemas {
+        let mut fields = BTreeMap::new();
+        match collect_composed_object_property_schemas(
+            schema,
+            depth + 1,
+            remaining_steps,
+            &mut fields,
+        ) {
+            RequestObjectSchemaCollection::Object if !fields.is_empty() => {
+                object_schemas += 1;
+                merge_request_object_property_schemas(&mut nested_fields, fields);
+            }
+            RequestObjectSchemaCollection::Object | RequestObjectSchemaCollection::Ineligible => {
+                scalar_schemas += 1;
+            }
+            RequestObjectSchemaCollection::LimitExceeded => return None,
+        }
+    }
+    if object_schemas > 0 && scalar_schemas > 0 {
+        return None;
+    }
+    if object_schemas == 0 {
+        paths.insert(prefix.to_owned());
+        return Some(());
+    }
+    for (name, schemas) in nested_fields {
+        collect_request_property_paths(
+            &schemas,
+            &format!("{prefix}.{name}"),
+            depth + 1,
+            remaining_steps,
+            paths,
+        )?;
+    }
+    Some(())
+}
 
 fn request_object_property_schemas(schema: &Value) -> Option<BTreeMap<String, Vec<&Value>>> {
     let mut fields = BTreeMap::new();
@@ -1923,6 +2159,25 @@ pub fn hash_value(value: &Value) -> Result<String> {
     let encoded = serde_json::to_vec(value)?;
     let digest = Sha256::digest(encoded);
     Ok(format!("sha256:{}", hex::encode(digest)))
+}
+
+fn canonical_hash_value(value: &Value) -> Result<String> {
+    hash_value(&canonical_json_value(value))
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_json_value(value)))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
+        _ => value.clone(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

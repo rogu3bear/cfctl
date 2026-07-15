@@ -1001,6 +1001,10 @@ const GLOBAL_WARP_OVERRIDE_PATH: &str = "/accounts/{account_id}/devices/resilien
 const D1_READ_REPLICATION_READ_CAPABILITY_ID: &str = "d1-get-database";
 const D1_READ_REPLICATION_PATH: &str = "/accounts/{account_id}/d1/database/{database_id}";
 const D1_READ_REPLICATION_PRECONDITION: &str = "d1_read_replication_state";
+const DNS_RECORD_DETAIL_READ_CAPABILITY_ID: &str = "dns-records-for-a-zone-dns-record-details";
+const DNS_RECORD_DETAIL_PATH: &str = "/zones/{zone_id}/dns_records/{dns_record_id}";
+const DNS_RECORD_STATE_PRECONDITION: &str = "dns_record_state";
+const DNS_RECORD_RESTORE_CAPABILITY_ID: &str = "dns-records-for-a-zone-update-dns-record";
 const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str = "zone-subscription-zone-subscription-details";
 
@@ -1116,6 +1120,269 @@ fn d1_read_replication_read_contract_supported(capability: &CapabilityV1) -> boo
                 ) && contract.success_statuses == ["200"]
                     && contract.success_media_types == ["application/json"]
             })
+}
+
+fn is_dns_record_update_mutation(capability: &CapabilityV1) -> bool {
+    matches!(
+        (capability.id.as_str(), capability.method.as_str()),
+        ("dns-records-for-a-zone-update-dns-record", "PUT")
+            | ("dns-records-for-a-zone-patch-dns-record", "PATCH")
+    )
+}
+
+fn should_bind_dns_record_state(capability: &CapabilityV1) -> bool {
+    is_dns_record_update_mutation(capability)
+        && capability.mutating
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.rollback.strategy.as_deref()
+            == Some("restore_dns_record_prior_snapshot_with_put")
+        && capability.rollback_contract_supported()
+        && dns_record_routing_contract_supported(capability)
+}
+
+fn dns_record_routing_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.path == DNS_RECORD_DETAIL_PATH
+        && capability.account_scope == "zone"
+        && capability.selectors.len() == 3
+        && ["zone_id", "dns_record_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name && selector.location == "path" && selector.required
+            })
+        })
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "include_shadow_metadata"
+                && selector.location == "query"
+                && !selector.required
+                && selector.value_type == "boolean"
+                && selector.contract.as_ref().is_some_and(|contract| {
+                    contract.schema.get("type").and_then(Value::as_str) == Some("boolean")
+                        && contract.query.as_ref().is_some_and(|query| {
+                            query.style == "form"
+                                && query.explode
+                                && !query.allow_reserved
+                                && !query.allow_empty_value
+                        })
+                })
+        })
+}
+
+fn apply_dns_record_state_response(
+    capability: &CapabilityV1,
+    account_id: &str,
+    zone_id: &str,
+    dns_record_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the DNS record state read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    if response.result.get("id").and_then(Value::as_str) != Some(dns_record_id) {
+        return Err(CliError::Input(
+            "DNS record state read returned a different or missing record id; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    let prior_record = project_dns_record_snapshot(capability, &response.result)?;
+    validate_request_contract(
+        capability,
+        &CallInput {
+            selectors: json!({"zone_id":zone_id,"dns_record_id":dns_record_id}),
+            query: json!({}),
+            body: Some(prior_record.clone()),
+            ..CallInput::default()
+        },
+    )?;
+    Ok(json!({
+        "schema_version": 1,
+        "source_capability_id": DNS_RECORD_DETAIL_READ_CAPABILITY_ID,
+        "source_path": DNS_RECORD_DETAIL_PATH,
+        "target_capability_id": capability.id,
+        "target_method": capability.method,
+        "target_scope": "zone",
+        "account_id": account_id,
+        "zone_id": zone_id,
+        "dns_record_id": dns_record_id,
+        "prior_record": prior_record,
+    }))
+}
+
+fn project_dns_record_snapshot(capability: &CapabilityV1, source: &Value) -> Result<Value> {
+    let record_type = source
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "DNS record state read omitted its bounded record type; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+    let paths = capability
+        .request_object_paths_by_discriminator("type")
+        .and_then(|branches| branches.get(record_type).cloned())
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "DNS record type `{record_type}` is outside the reviewed restoration schema; the mutation boundary was not crossed"
+            ))
+        })?;
+    let mut snapshot = serde_json::Map::new();
+    for path in &paths {
+        let Some(value) = value_at_dotted_path(source, path) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        insert_dotted_object_path(&mut snapshot, path, value.clone())?;
+    }
+    let snapshot = Value::Object(snapshot);
+    if snapshot.get("type").and_then(Value::as_str) != Some(record_type)
+        || snapshot
+            .get("name")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || (paths.contains(&"content".to_owned()) && snapshot.get("content").is_none())
+        || (paths.iter().any(|path| path.starts_with("data."))
+            && snapshot
+                .get("data")
+                .and_then(Value::as_object)
+                .is_none_or(serde_json::Map::is_empty))
+    {
+        return Err(CliError::Input(
+            "DNS record state read omitted fields required to reconstruct the reviewed record type; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+fn value_at_dotted_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.')
+        .try_fold(value, |current, segment| current.as_object()?.get(segment))
+}
+
+fn insert_dotted_object_path(
+    object: &mut serde_json::Map<String, Value>,
+    path: &str,
+    value: Value,
+) -> Result<()> {
+    let segments = path.split('.').collect::<Vec<_>>();
+    insert_object_path_segments(object, &segments, value)
+}
+
+fn insert_object_path_segments(
+    object: &mut serde_json::Map<String, Value>,
+    segments: &[&str],
+    value: Value,
+) -> Result<()> {
+    let Some((segment, remaining)) = segments.split_first() else {
+        return Err(CliError::Input(
+            "DNS record restoration schema produced an empty writable path".to_owned(),
+        ));
+    };
+    if remaining.is_empty() {
+        object.insert((*segment).to_owned(), value);
+        return Ok(());
+    }
+    let nested = object
+        .entry((*segment).to_owned())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            CliError::Input(
+                "DNS record restoration schema produced conflicting writable paths".to_owned(),
+            )
+        })?;
+    insert_object_path_segments(nested, remaining, value)
+}
+
+fn dns_record_detail_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == DNS_RECORD_DETAIL_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == DNS_RECORD_DETAIL_PATH
+        && capability.product == "DNS Records for a Zone"
+        && capability.account_scope == "zone"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && dns_record_routing_contract_supported(capability)
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|contract| {
+                matches!(
+                    contract.body_mode,
+                    cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                ) && contract.success_statuses == ["200"]
+                    && contract.success_media_types == ["application/json"]
+            })
+}
+
+async fn read_live_dns_record_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !should_bind_dns_record_state(capability) {
+        return Err(CliError::Input(
+            "DNS record mutation drifted from its governed prior-state contract".to_owned(),
+        ));
+    }
+    let zone_id = input
+        .selectors
+        .get("zone_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("DNS state precondition requires string selector `zone_id`".to_owned())
+        })?;
+    let dns_record_id = input
+        .selectors
+        .get("dns_record_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "DNS state precondition requires string selector `dns_record_id`".to_owned(),
+            )
+        })?;
+    let source_capability = catalog
+        .get(DNS_RECORD_DETAIL_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(DNS_RECORD_DETAIL_READ_CAPABILITY_ID))?;
+    if !dns_record_detail_read_contract_supported(source_capability) {
+        return Err(CliError::Input(
+            "DNS state source capability drifted from the governed record detail read".to_owned(),
+        ));
+    }
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source_capability,
+            &CallInput {
+                selectors: json!({"zone_id":zone_id,"dns_record_id":dns_record_id}),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt =
+        apply_dns_record_state_response(capability, account_id, zone_id, dns_record_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
 }
 
 fn apply_d1_read_replication_state_response(
@@ -1585,6 +1852,14 @@ async fn read_live_zone_account(
     Ok((receipt, evidence))
 }
 
+fn plan_requires_live_credential(capability: &CapabilityV1) -> bool {
+    should_resolve_zone_entitlement(capability)
+        || should_bind_zone_account(capability)
+        || should_bind_global_warp_override_state(capability)
+        || should_bind_d1_read_replication_state(capability)
+        || should_bind_dns_record_state(capability)
+}
+
 async fn create_plan(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -1611,15 +1886,9 @@ async fn create_plan(
                 "this capability needs an explicit account; pin one on the profile or pass `--account`"
                     .to_owned(),
             )
-        })?;
+    })?;
     let resolve_entitlement = should_resolve_zone_entitlement(&capability);
-    let bind_global_warp_override_state = should_bind_global_warp_override_state(&capability);
-    let bind_d1_read_replication_state = should_bind_d1_read_replication_state(&capability);
-    let credential = if resolve_entitlement
-        || should_bind_zone_account(&capability)
-        || bind_global_warp_override_state
-        || bind_d1_read_replication_state
-    {
+    let credential = if plan_requires_live_credential(&capability) {
         Some(fresh_credential(profile, &PlatformSecretStore).await?)
     } else {
         None
@@ -1668,6 +1937,15 @@ async fn create_plan(
         credential.as_ref(),
     )
     .await?;
+    let dns_record_state_precondition = prepare_dns_record_state_precondition(
+        store,
+        catalog,
+        &capability,
+        &input,
+        account_id,
+        credential.as_ref(),
+    )
+    .await?;
     persist_prepared_plan(
         store,
         catalog,
@@ -1683,6 +1961,7 @@ async fn create_plan(
             zone_account: zone_account_precondition,
             global_warp_override_state: global_warp_override_state_precondition,
             d1_read_replication_state: d1_read_replication_state_precondition,
+            dns_record_state: dns_record_state_precondition,
         },
     )
 }
@@ -1729,6 +2008,25 @@ async fn prepare_d1_read_replication_state_precondition(
         .map(Some)
 }
 
+async fn prepare_dns_record_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !should_bind_dns_record_state(capability) {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input("DNS record state precondition credential was not resolved".to_owned())
+    })?;
+    read_live_dns_record_state(store, catalog, capability, input, account_id, credential)
+        .await
+        .map(Some)
+}
+
 struct PlanAuthority<'a> {
     profile: &'a ProfileMetadata,
     account_id: &'a str,
@@ -1739,6 +2037,7 @@ struct LivePlanPreconditions {
     zone_account: Option<(Value, EvidenceV1)>,
     global_warp_override_state: Option<(Value, EvidenceV1)>,
     d1_read_replication_state: Option<(Value, EvidenceV1)>,
+    dns_record_state: Option<(Value, EvidenceV1)>,
 }
 
 fn plan_targets(
@@ -1758,6 +2057,9 @@ fn plan_targets(
     if let Some((receipt, _)) = &live_preconditions.d1_read_replication_state {
         targets["live_preconditions"][D1_READ_REPLICATION_PRECONDITION] = receipt.clone();
     }
+    if let Some((receipt, _)) = &live_preconditions.dns_record_state {
+        targets["live_preconditions"][DNS_RECORD_STATE_PRECONDITION] = receipt.clone();
+    }
     targets
 }
 
@@ -1775,6 +2077,10 @@ fn bind_live_plan_preconditions(
         (
             D1_READ_REPLICATION_PRECONDITION,
             &live_preconditions.d1_read_replication_state,
+        ),
+        (
+            DNS_RECORD_STATE_PRECONDITION,
+            &live_preconditions.dns_record_state,
         ),
     ] {
         if let Some((receipt, _)) = precondition {
@@ -1823,6 +2129,10 @@ fn planned_cloudflare_diff(
                 .cloned()
                 .unwrap_or(Value::Null),
         });
+    }
+    if let Some((receipt, _)) = &live_preconditions.dns_record_state {
+        diff["observed_before"] = receipt.get("prior_record").cloned().unwrap_or(Value::Null);
+        diff["planned_after"] = input.body.clone().unwrap_or(Value::Null);
     }
     diff
 }
@@ -1918,6 +2228,9 @@ fn persist_prepared_plan(
         envelope.evidence.insert(0, evidence);
     }
     if let Some((_, evidence)) = live_preconditions.d1_read_replication_state {
+        envelope.evidence.insert(0, evidence);
+    }
+    if let Some((_, evidence)) = live_preconditions.dns_record_state {
         envelope.evidence.insert(0, evidence);
     }
     Ok(envelope)
@@ -2366,6 +2679,14 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         &credential,
     )
     .await?;
+    let dns_record_state_evidence = validate_live_dns_record_state_precondition(
+        store,
+        &catalog,
+        &plan,
+        &execution_input,
+        &credential,
+    )
+    .await?;
     plan.mark_consumed()?;
     store.save_plan(&plan)?;
     persist_transaction_stage(
@@ -2386,6 +2707,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
             permission_inventory: permission_inventory_evidence,
             global_warp_override_state: global_warp_override_state_evidence,
             d1_read_replication_state: d1_read_replication_state_evidence,
+            dns_record_state: dns_record_state_evidence,
         },
     )
     .await
@@ -2397,6 +2719,7 @@ struct LivePreconditionEvidence {
     permission_inventory: Option<EvidenceV1>,
     global_warp_override_state: Option<EvidenceV1>,
     d1_read_replication_state: Option<EvidenceV1>,
+    dns_record_state: Option<EvidenceV1>,
 }
 
 async fn execute_consumed_plan(
@@ -2463,6 +2786,7 @@ fn prepend_live_precondition_evidence(
     evidence: LivePreconditionEvidence,
 ) {
     for item in [
+        evidence.dns_record_state,
         evidence.d1_read_replication_state,
         evidence.global_warp_override_state,
         evidence.permission_inventory,
@@ -2718,6 +3042,149 @@ fn d1_read_replication_prior_mode(plan: &PlanV1) -> Result<String> {
             CliError::Input("D1 compensation requires a hash-bound prior-state receipt".to_owned())
         })?;
     validate_d1_read_replication_prior_state_receipt(plan, receipt)
+}
+
+async fn validate_live_dns_record_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_dns_record_state_precondition(plan)? else {
+        return Ok(None);
+    };
+    let (receipt, evidence) = read_live_dns_record_state(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live DNS record state drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
+}
+
+fn validate_dns_record_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Result<Value> {
+    let zone_id = plan
+        .targets
+        .pointer("/selectors/zone_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "DNS plan omitted its hash-bound zone selector; create a new plan".to_owned(),
+            )
+        })?;
+    let dns_record_id = plan
+        .targets
+        .pointer("/selectors/dns_record_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "DNS plan omitted its hash-bound record selector; create a new plan".to_owned(),
+            )
+        })?;
+    let exact_identity = receipt.as_object().is_some_and(|object| object.len() == 10)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("source_capability_id").and_then(Value::as_str)
+            == Some(DNS_RECORD_DETAIL_READ_CAPABILITY_ID)
+        && receipt.get("source_path").and_then(Value::as_str) == Some(DNS_RECORD_DETAIL_PATH)
+        && receipt.get("target_capability_id").and_then(Value::as_str)
+            == Some(plan.capability.id.as_str())
+        && receipt.get("target_method").and_then(Value::as_str)
+            == Some(plan.capability.method.as_str())
+        && receipt.get("target_scope").and_then(Value::as_str) == Some("zone")
+        && receipt.get("account_id").and_then(Value::as_str) == Some(plan.account_id.as_str())
+        && receipt.get("zone_id").and_then(Value::as_str) == Some(zone_id)
+        && receipt.get("dns_record_id").and_then(Value::as_str) == Some(dns_record_id);
+    let prior_record = receipt.get("prior_record").ok_or_else(|| {
+        CliError::Input(
+            "plan DNS prior-state receipt omitted its writable record snapshot; create a new plan"
+                .to_owned(),
+        )
+    })?;
+    let projected = project_dns_record_snapshot(&plan.capability, prior_record)?;
+    if !exact_identity || &projected != prior_record {
+        return Err(CliError::Input(
+            "plan DNS prior-state receipt has an invalid account, zone, record, source, method, or writable snapshot shape; create a new plan"
+                .to_owned(),
+        ));
+    }
+    validate_request_contract(
+        &plan.capability,
+        &CallInput {
+            selectors: json!({"zone_id":zone_id,"dns_record_id":dns_record_id}),
+            query: json!({}),
+            body: Some(projected.clone()),
+            ..CallInput::default()
+        },
+    )?;
+    Ok(projected)
+}
+
+fn required_dns_record_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    if !is_dns_record_update_mutation(&plan.capability) {
+        return Ok(None);
+    }
+    if !should_bind_dns_record_state(&plan.capability) {
+        return Err(CliError::Input(
+            "DNS record plan is inconsistent with its hash-bound prior-state contract; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(DNS_RECORD_STATE_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the live DNS record prior-state contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/dns_record_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the hash-bound DNS record prior-state receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    validate_dns_record_prior_state_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "plan DNS record prior-state receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+fn dns_record_prior_snapshot(plan: &PlanV1) -> Result<Value> {
+    required_dns_record_state_precondition(plan)?.ok_or_else(|| {
+        CliError::Input(
+            "DNS record compensation requires a hash-bound prior-state precondition".to_owned(),
+        )
+    })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/dns_record_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "DNS record compensation requires a hash-bound prior-state receipt".to_owned(),
+            )
+        })?;
+    validate_dns_record_prior_state_receipt(plan, receipt)
 }
 
 async fn validate_live_zone_account_precondition(
@@ -3363,6 +3830,44 @@ fn d1_read_replication_compensation_request(plan: &PlanV1) -> Result<Compensatio
     })
 }
 
+fn dns_record_compensation_request(plan: &PlanV1) -> Result<CompensationRequest> {
+    let zone_id = plan
+        .targets
+        .pointer("/selectors/zone_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "DNS record compensation requires a hash-bound zone selector".to_owned(),
+            )
+        })?;
+    let dns_record_id = plan
+        .targets
+        .pointer("/selectors/dns_record_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "DNS record compensation requires a hash-bound record selector".to_owned(),
+            )
+        })?;
+    Ok(CompensationRequest {
+        capability_id: DNS_RECORD_RESTORE_CAPABILITY_ID.to_owned(),
+        expected_method: "PUT".to_owned(),
+        expected_path: DNS_RECORD_DETAIL_PATH.to_owned(),
+        input: CallInput {
+            selectors: json!({
+                "zone_id": zone_id,
+                "dns_record_id": dns_record_id,
+            }),
+            query: json!({}),
+            body: Some(dns_record_prior_snapshot(plan)?),
+            ..CallInput::default()
+        },
+        requested_account: Some(plan.account_id.clone()),
+    })
+}
+
 fn compensation_resource_id(artifact: &Value) -> Result<&str> {
     artifact
         .get("resource_id")
@@ -3396,6 +3901,9 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
     }
     if is_d1_read_replication_mutation(&plan.capability) {
         return d1_read_replication_compensation_request(plan).map(Some);
+    }
+    if is_dns_record_update_mutation(&plan.capability) {
+        return dns_record_compensation_request(plan).map(Some);
     }
     let resource_id = compensation_resource_id(artifact)?;
     let (capability_id, expected_method, expected_path, selectors, body) = match plan
@@ -3549,7 +4057,8 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
                 "source_precondition_hash": plan
                     .precondition_hashes
                     .get("global_warp_override_state")
-                    .or_else(|| plan.precondition_hashes.get(D1_READ_REPLICATION_PRECONDITION)),
+                    .or_else(|| plan.precondition_hashes.get(D1_READ_REPLICATION_PRECONDITION))
+                    .or_else(|| plan.precondition_hashes.get(DNS_RECORD_STATE_PRECONDITION)),
             }),
         )
         .await?;
@@ -4475,6 +4984,7 @@ fn is_live_plan_precondition_hash(name: &str) -> bool {
             | "zone_account"
             | "global_warp_override_state"
             | D1_READ_REPLICATION_PRECONDITION
+            | DNS_RECORD_STATE_PRECONDITION
     )
 }
 
@@ -4861,6 +5371,7 @@ fn guide_stage_document(
     let zone_entitlement_live_read = should_resolve_zone_entitlement(capability);
     let global_warp_override_state_live_read = should_bind_global_warp_override_state(capability);
     let d1_read_replication_state_live_read = should_bind_d1_read_replication_state(capability);
+    let dns_record_state_live_read = should_bind_dns_record_state(capability);
     let entitlement_blocked = capability.entitlement.available == Some(false)
         || blocking_gaps.iter().any(|gap| gap.contains("entitlement"));
     let entitlement_unresolved = capability.mutating
@@ -4875,6 +5386,7 @@ fn guide_stage_document(
         GuideStage::InspectCurrentState if d1_read_replication_state_live_read => {
             "live_read_required"
         }
+        GuideStage::InspectCurrentState if dns_record_state_live_read => "live_read_required",
         GuideStage::CheckEntitlement if entitlement_blocked => "blocked",
         GuideStage::CheckEntitlement if entitlement_unresolved => "manual_review",
         GuideStage::CalculateCost if capability.mutating && !capability.cost.known => "blocked",
@@ -4919,6 +5431,8 @@ fn guide_stage_document(
         "Read and bind the exact live account-wide disconnect state; execution repeats this read and rejects drift before crossing the mutation boundary."
     } else if stage == GuideStage::InspectCurrentState && d1_read_replication_state_live_read {
         "Read and bind the exact live database read-replication mode; execution repeats this read and rejects drift before crossing the mutation boundary."
+    } else if stage == GuideStage::InspectCurrentState && dns_record_state_live_read {
+        "Read and bind the exact live writable DNS record state; execution repeats this read and rejects drift before crossing the mutation boundary."
     } else {
         guide_stage_summary(stage, capability.mutating)
     };
@@ -4926,6 +5440,7 @@ fn guide_stage_document(
         || (stage == GuideStage::CheckEntitlement && zone_entitlement_live_read)
         || (stage == GuideStage::InspectCurrentState && global_warp_override_state_live_read)
         || (stage == GuideStage::InspectCurrentState && d1_read_replication_state_live_read)
+        || (stage == GuideStage::InspectCurrentState && dns_record_state_live_read)
     {
         "live_read"
     } else {
@@ -5033,8 +5548,8 @@ fn operation_specific_current_state_command(capability: &CapabilityV1) -> Option
             "--json".to_owned(),
         ]);
     }
-    should_bind_d1_read_replication_state(capability).then(|| {
-        vec![
+    if should_bind_d1_read_replication_state(capability) {
+        return Some(vec![
             "cfctl".to_owned(),
             "call".to_owned(),
             D1_READ_REPLICATION_READ_CAPABILITY_ID.to_owned(),
@@ -5042,6 +5557,18 @@ fn operation_specific_current_state_command(capability: &CapabilityV1) -> Option
             "account_id=<account_id>".to_owned(),
             "--selector".to_owned(),
             "database_id=<database_id>".to_owned(),
+            "--json".to_owned(),
+        ]);
+    }
+    should_bind_dns_record_state(capability).then(|| {
+        vec![
+            "cfctl".to_owned(),
+            "call".to_owned(),
+            DNS_RECORD_DETAIL_READ_CAPABILITY_ID.to_owned(),
+            "--selector".to_owned(),
+            "zone_id=<zone_id>".to_owned(),
+            "--selector".to_owned(),
+            "dns_record_id=<dns_record_id>".to_owned(),
             "--json".to_owned(),
         ]
     })
@@ -5414,15 +5941,17 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        CallInput, LivePlanPreconditions, PlanAuthority, apply_d1_read_replication_state_response,
+        CallInput, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions, PlanAuthority,
+        apply_d1_read_replication_state_response, apply_dns_record_state_response,
         apply_global_warp_override_state_response, apply_zone_account_response,
         apply_zone_entitlement_response, boundary_response_artifact, compensation_request,
         find_secret_value, guide_document, is_live_plan_precondition_hash, persist_prepared_plan,
         persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
         query_object_from_pairs, redact_secret_result,
-        required_d1_read_replication_state_precondition, required_entitlement_precondition,
-        required_global_warp_override_state_precondition, required_zone_account_precondition,
-        should_bind_d1_read_replication_state, should_bind_global_warp_override_state,
+        required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
+        required_entitlement_precondition, required_global_warp_override_state_precondition,
+        required_zone_account_precondition, should_bind_d1_read_replication_state,
+        should_bind_dns_record_state, should_bind_global_warp_override_state,
         should_bind_zone_account, should_resolve_zone_entitlement, sink_secret_result,
         validate_api_token_creation_contract, validate_current_permission_groups,
         validate_entitlement_receipt_precondition,
@@ -5436,7 +5965,8 @@ mod tests {
     use cfctl_core::{
         AdapterStatus, CapabilityV1, CreatedCollectionResourceContractV1,
         CreatedResourceContractV1, EffectClass, EvidenceClass, EvidenceV1, PlanStatus, PlanV1,
-        RiskClass, SamePathReadContractV1, SelectorV1, TransactionStageV1, hash_value,
+        QuerySerializationV1, RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1,
+        TransactionStageV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::Utc;
@@ -5577,6 +6107,228 @@ mod tests {
         capability.rollback.strategy = Some("restore_d1_read_replication_prior_mode".to_owned());
         capability.rollback.warning = Some("restoration requires explicit approval".to_owned());
         capability
+    }
+
+    fn dns_record_update_capability(method: &str) -> CapabilityV1 {
+        let id = if method == "PUT" {
+            "dns-records-for-a-zone-update-dns-record"
+        } else {
+            "dns-records-for-a-zone-patch-dns-record"
+        };
+        let mut capability = CapabilityV1::new(
+            id,
+            "Update DNS Record",
+            method,
+            "/zones/{zone_id}/dns_records/{dns_record_id}",
+        );
+        capability.mutating = true;
+        capability.account_scope = "zone".to_owned();
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.product = "DNS Records for a Zone".to_owned();
+        capability.risk = RiskClass::ScopedWrite;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.permissions = vec!["DNS Write".to_owned()];
+        capability.cost.known = true;
+        capability.cost.maximum = Some(0.0);
+        capability.request_schema = Some(
+            serde_json::from_str(include_str!(
+                "../../cfctl-core/tests/fixtures/dns-record-update-request-schema.json"
+            ))
+            .expect("pinned DNS record schema"),
+        );
+        capability.selectors = vec![
+            SelectorV1 {
+                name: "dns_record_id".to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: Some(SelectorContractV1 {
+                    schema: json!({"type":"string","maxLength":32}),
+                    query: None,
+                }),
+            },
+            SelectorV1 {
+                name: "zone_id".to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: Some(SelectorContractV1 {
+                    schema: json!({"type":"string","maxLength":32}),
+                    query: None,
+                }),
+            },
+            SelectorV1 {
+                name: "include_shadow_metadata".to_owned(),
+                location: "query".to_owned(),
+                required: false,
+                value_type: "boolean".to_owned(),
+                description: None,
+                contract: Some(SelectorContractV1 {
+                    schema: json!({"type":"boolean"}),
+                    query: Some(QuerySerializationV1 {
+                        style: "form".to_owned(),
+                        explode: true,
+                        allow_reserved: false,
+                        allow_empty_value: false,
+                    }),
+                }),
+            },
+        ];
+        capability.verification.strategy =
+            "dns_record_details_match_planned_id_and_fields".to_owned();
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: "/zones/{zone_id}/dns_records/{dns_record_id}".to_owned(),
+            read_capability_id: "dns-records-for-a-zone-dns-record-details".to_owned(),
+            verified_response_fields: [
+                "comment",
+                "content",
+                "data",
+                "name",
+                "priority",
+                "private_routing",
+                "proxied",
+                "settings",
+                "tags",
+                "ttl",
+                "type",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy =
+            Some("restore_dns_record_prior_snapshot_with_put".to_owned());
+        capability
+    }
+
+    #[test]
+    fn dns_record_state_receipt_projects_only_the_exact_writable_type_branch() {
+        let capability = dns_record_update_capability("PATCH");
+        assert!(should_bind_dns_record_state(&capability));
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "id":"record-a",
+                "type":"TXT",
+                "name":"txt.example.com",
+                "content":"prior-value",
+                "ttl":300,
+                "proxied":false,
+                "comment":null,
+                "tags":[],
+                "settings":{"ipv4_only":false,"future_read_only":true},
+                "meta":{"auto_added":false},
+                "modified_on":"future",
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+
+        let receipt = apply_dns_record_state_response(
+            &capability,
+            "account-a",
+            "zone-a",
+            "record-a",
+            &response,
+        )
+        .expect("DNS state receipt");
+        assert_eq!(
+            receipt["prior_record"],
+            json!({
+                "type":"TXT",
+                "name":"txt.example.com",
+                "content":"prior-value",
+                "ttl":300,
+                "proxied":false,
+                "tags":[],
+                "settings":{"ipv4_only":false},
+            })
+        );
+        assert!(receipt["prior_record"].get("meta").is_none());
+
+        let mut unknown = response;
+        unknown.result["type"] = json!("FUTURE");
+        assert!(
+            apply_dns_record_state_response(
+                &capability,
+                "account-a",
+                "zone-a",
+                "record-a",
+                &unknown,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn dns_record_state_receipt_rejects_rehashed_broadening_and_retargeting() {
+        let capability = dns_record_update_capability("PATCH");
+        let receipt = json!({
+            "schema_version":1,
+            "source_capability_id":"dns-records-for-a-zone-dns-record-details",
+            "source_path":"/zones/{zone_id}/dns_records/{dns_record_id}",
+            "target_capability_id":"dns-records-for-a-zone-patch-dns-record",
+            "target_method":"PATCH",
+            "target_scope":"zone",
+            "account_id":"account-a",
+            "zone_id":"zone-a",
+            "dns_record_id":"record-a",
+            "prior_record":{
+                "type":"TXT",
+                "name":"txt.example.com",
+                "content":"prior-value",
+                "ttl":300,
+            },
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({
+                "selectors":{"zone_id":"zone-a","dns_record_id":"record-a"},
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{"dns_record_state":receipt},
+            }),
+        )
+        .expect("plan");
+        plan.precondition_hashes.insert(
+            "dns_record_state".to_owned(),
+            hash_value(&receipt).expect("receipt hash"),
+        );
+        assert_eq!(
+            required_dns_record_state_precondition(&plan).expect("bound DNS precondition"),
+            plan.precondition_hashes
+                .get("dns_record_state")
+                .map(String::as_str)
+        );
+
+        let mut broadened = receipt.clone();
+        broadened["prior_record"]["future"] = json!(true);
+        plan.precondition_hashes.insert(
+            "dns_record_state".to_owned(),
+            hash_value(&broadened).expect("broadened hash"),
+        );
+        plan.targets["live_preconditions"]["dns_record_state"] = broadened;
+        required_dns_record_state_precondition(&plan)
+            .expect_err("a rehashed broadened snapshot must fail");
+
+        let mut retargeted = receipt;
+        retargeted["dns_record_id"] = json!("record-b");
+        plan.precondition_hashes.insert(
+            "dns_record_state".to_owned(),
+            hash_value(&retargeted).expect("retargeted hash"),
+        );
+        plan.targets["live_preconditions"]["dns_record_state"] = retargeted;
+        let error = required_dns_record_state_precondition(&plan)
+            .expect_err("a rehashed cross-record receipt must fail");
+        assert!(error.to_string().contains("account, zone, record"));
     }
 
     #[test]
@@ -5872,6 +6624,7 @@ mod tests {
                 zone_account: None,
                 global_warp_override_state: Some((receipt.clone(), receipt_evidence)),
                 d1_read_replication_state: None,
+                dns_record_state: None,
             },
         )
         .expect("prepared plan");
@@ -5951,6 +6704,7 @@ mod tests {
                 zone_account: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: Some((receipt.clone(), receipt_evidence)),
+                dns_record_state: None,
             },
         )
         .expect("prepared plan");
@@ -5971,6 +6725,97 @@ mod tests {
         assert_eq!(
             plan["cloudflare_diffs"][0]["planned_after"],
             json!({"read_replication":{"mode":"auto"}})
+        );
+    }
+
+    #[test]
+    fn prepared_dns_record_plan_carries_exact_before_and_after_record_state() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = dns_record_update_capability("PATCH");
+        assert!(capability.mutation_contract_gaps().is_empty());
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "https://example.invalid/openapi.json".to_owned(),
+            source_hash: "source-sha".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability.id.clone(), capability.clone())]),
+        };
+        catalog.refresh_hash().expect("catalog hash");
+        let profile = ProfileMetadata::new("profile-a", ProfileKind::ApiToken, Some("account-a"));
+        let input = CallInput {
+            selectors: json!({"zone_id":"zone-a","dns_record_id":"record-a"}),
+            body: Some(json!({
+                "type":"TXT",
+                "name":"txt.example.com",
+                "content":"new-value",
+                "ttl":300,
+                "proxied":false,
+                "tags":[],
+            })),
+            ..CallInput::default()
+        };
+        let receipt = json!({
+            "schema_version":1,
+            "source_capability_id":"dns-records-for-a-zone-dns-record-details",
+            "source_path":"/zones/{zone_id}/dns_records/{dns_record_id}",
+            "target_capability_id":"dns-records-for-a-zone-patch-dns-record",
+            "target_method":"PATCH",
+            "target_scope":"zone",
+            "account_id":"account-a",
+            "zone_id":"zone-a",
+            "dns_record_id":"record-a",
+            "prior_record":{
+                "type":"TXT",
+                "name":"txt.example.com",
+                "content":"prior-value",
+                "ttl":300,
+                "proxied":false,
+                "tags":[],
+            },
+        });
+        let receipt_hash = hash_value(&receipt).expect("receipt hash");
+        let receipt_evidence = store
+            .write_evidence(EvidenceClass::LiveRead, &receipt)
+            .expect("live read evidence");
+
+        let envelope = persist_prepared_plan(
+            &store,
+            &catalog,
+            capability,
+            input,
+            PlanAuthority {
+                profile: &profile,
+                account_id: "account-a",
+            },
+            json!({}),
+            LivePlanPreconditions {
+                entitlement: None,
+                zone_account: None,
+                global_warp_override_state: None,
+                d1_read_replication_state: None,
+                dns_record_state: Some((receipt.clone(), receipt_evidence)),
+            },
+        )
+        .expect("prepared plan");
+        let plan = &envelope.result["plan"];
+
+        assert_eq!(
+            plan["precondition_hashes"][DNS_RECORD_STATE_PRECONDITION],
+            receipt_hash
+        );
+        assert_eq!(
+            plan["targets"]["live_preconditions"][DNS_RECORD_STATE_PRECONDITION],
+            receipt
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["observed_before"]["content"],
+            "prior-value"
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["planned_after"]["content"],
+            "new-value"
         );
     }
 
@@ -6110,6 +6955,85 @@ mod tests {
     }
 
     #[test]
+    fn dns_rectification_derives_a_separate_exact_put_restore_request() {
+        let capability = dns_record_update_capability("PATCH");
+        let receipt = json!({
+            "schema_version":1,
+            "source_capability_id":"dns-records-for-a-zone-dns-record-details",
+            "source_path":"/zones/{zone_id}/dns_records/{dns_record_id}",
+            "target_capability_id":"dns-records-for-a-zone-patch-dns-record",
+            "target_method":"PATCH",
+            "target_scope":"zone",
+            "account_id":"account-a",
+            "zone_id":"zone-a",
+            "dns_record_id":"record-a",
+            "prior_record":{
+                "type":"TXT",
+                "name":"txt.example.com",
+                "content":"prior-value",
+                "ttl":300,
+                "proxied":false,
+                "tags":[],
+            },
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({
+                "selectors":{"zone_id":"zone-a","dns_record_id":"record-a"},
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{"dns_record_state":receipt},
+            }),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors: json!({"zone_id":"zone-a","dns_record_id":"record-a"}),
+            query: json!({}),
+            body: Some(json!({"content":"new-value"})),
+            ..CallInput::default()
+        })
+        .expect("call input");
+        plan.precondition_hashes.insert(
+            "dns_record_state".to_owned(),
+            hash_value(&receipt).expect("receipt hash"),
+        );
+        plan.refresh_hash().expect("bind source plan");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"success":true,"http_status":200}),
+        )
+        .expect("response receipt");
+        plan.status = PlanStatus::RectificationRequired;
+
+        let request = compensation_request(&plan)
+            .expect("request resolves")
+            .expect("DNS compensation is supported");
+        assert_eq!(
+            request.capability_id,
+            "dns-records-for-a-zone-update-dns-record"
+        );
+        assert_eq!(request.expected_method, "PUT");
+        assert_eq!(
+            request.expected_path,
+            "/zones/{zone_id}/dns_records/{dns_record_id}"
+        );
+        assert_eq!(
+            request.input.selectors,
+            json!({"zone_id":"zone-a","dns_record_id":"record-a"})
+        );
+        assert_eq!(request.input.query, json!({}));
+        assert_eq!(request.input.body, Some(receipt["prior_record"].clone()));
+        assert_eq!(request.requested_account.as_deref(), Some("account-a"));
+    }
+
+    #[test]
     fn global_warp_override_guide_requires_the_exact_live_state_read() {
         let capability = global_warp_override_capability();
         let guide = guide_document(&capability);
@@ -6155,6 +7079,30 @@ mod tests {
                 "account_id=<account_id>",
                 "--selector",
                 "database_id=<database_id>",
+                "--json"
+            ])
+        );
+        assert_eq!(guide["stages"][13]["contract_state"], "available");
+    }
+
+    #[test]
+    fn dns_record_guide_requires_the_exact_live_record_state_read() {
+        let capability = dns_record_update_capability("PATCH");
+        let guide = guide_document(&capability);
+        let current_state = &guide["stages"][4];
+        assert_eq!(current_state["name"], "inspect_current_state");
+        assert_eq!(current_state["contract_state"], "live_read_required");
+        assert_eq!(current_state["evidence_class"], "live_read");
+        assert_eq!(
+            current_state["commands"][0],
+            json!([
+                "cfctl",
+                "call",
+                "dns-records-for-a-zone-dns-record-details",
+                "--selector",
+                "zone_id=<zone_id>",
+                "--selector",
+                "dns_record_id=<dns_record_id>",
                 "--json"
             ])
         );

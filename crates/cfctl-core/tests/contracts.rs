@@ -279,6 +279,116 @@ fn d1_read_replication_restore_strategy_is_bound_to_the_exact_database_contract(
 }
 
 #[test]
+fn dns_record_restore_strategy_is_bound_to_the_exact_official_update_contract() {
+    let request_schema = serde_json::from_str(include_str!(
+        "fixtures/dns-record-update-request-schema.json"
+    ))
+    .expect("pinned DNS record update schema");
+    let mut capability = CapabilityV1::new(
+        "dns-records-for-a-zone-update-dns-record",
+        "Overwrite DNS Record",
+        "PUT",
+        "/zones/{zone_id}/dns_records/{dns_record_id}",
+    );
+    capability.mutating = true;
+    capability.account_scope = "zone".to_owned();
+    capability.product = "DNS Records for a Zone".to_owned();
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("restore_dns_record_prior_snapshot_with_put".to_owned());
+    capability.request_schema = Some(request_schema);
+    capability.verification.strategy = "dns_record_details_match_planned_id_and_fields".to_owned();
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/zones/{zone_id}/dns_records/{dns_record_id}".to_owned(),
+        read_capability_id: "dns-records-for-a-zone-dns-record-details".to_owned(),
+        verified_response_fields: vec![
+            "comment".to_owned(),
+            "content".to_owned(),
+            "data".to_owned(),
+            "name".to_owned(),
+            "priority".to_owned(),
+            "private_routing".to_owned(),
+            "proxied".to_owned(),
+            "settings".to_owned(),
+            "tags".to_owned(),
+            "ttl".to_owned(),
+            "type".to_owned(),
+        ],
+    });
+
+    assert!(capability.rollback_contract_supported());
+
+    let mut patch = capability.clone();
+    patch.id = "dns-records-for-a-zone-patch-dns-record".to_owned();
+    patch.method = "PATCH".to_owned();
+    assert!(patch.rollback_contract_supported());
+
+    let mut grafted = capability.clone();
+    grafted.path = "/zones/{zone_id}/widgets/{dns_record_id}".to_owned();
+    assert!(!grafted.rollback_contract_supported());
+
+    let mut broadened = capability;
+    broadened
+        .request_schema
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .expect("request schema")
+        .insert("x-unreviewed".to_owned(), json!(true));
+    assert!(!broadened.rollback_contract_supported());
+}
+
+#[test]
+fn discriminated_request_paths_preserve_dns_branch_specific_nested_fields() {
+    let mut capability = CapabilityV1::new("dns-update", "DNS update", "PUT", "/dns");
+    capability.request_schema = Some(
+        serde_json::from_str(include_str!(
+            "fixtures/dns-record-update-request-schema.json"
+        ))
+        .expect("pinned DNS record update schema"),
+    );
+
+    let branches = capability
+        .request_object_paths_by_discriminator("type")
+        .expect("bounded discriminated request paths");
+    assert_eq!(branches.len(), 21);
+    assert_eq!(
+        branches.get("A").expect("A paths"),
+        &vec![
+            "comment".to_owned(),
+            "content".to_owned(),
+            "name".to_owned(),
+            "private_routing".to_owned(),
+            "proxied".to_owned(),
+            "settings.ipv4_only".to_owned(),
+            "settings.ipv6_only".to_owned(),
+            "tags".to_owned(),
+            "ttl".to_owned(),
+            "type".to_owned(),
+        ]
+    );
+    assert!(
+        branches
+            .get("CNAME")
+            .expect("CNAME paths")
+            .contains(&"settings.flatten_cname".to_owned())
+    );
+    assert!(
+        branches
+            .get("LOC")
+            .expect("LOC paths")
+            .contains(&"data.precision_vert".to_owned())
+    );
+    assert_eq!(
+        branches
+            .get("TXT")
+            .expect("TXT paths")
+            .iter()
+            .filter(|path| path.starts_with("data."))
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn same_path_post_state_contract_requires_the_exact_post_method_and_readback() {
     let mut capability = CapabilityV1::new(
         "settings-apply",

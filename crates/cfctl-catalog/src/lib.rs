@@ -943,6 +943,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     classify_same_path_object_mutation_contracts(document, &mut capabilities);
     finalize_global_warp_override_rollback_contract(&mut capabilities);
     finalize_d1_read_replication_rollback_contract(&mut capabilities);
+    finalize_dns_record_rollback_contract(document, &mut capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
@@ -1157,6 +1158,122 @@ fn finalize_d1_read_replication_rollback_contract(
         );
         refresh_dynamic_mutation_contract(capability);
     }
+}
+
+const DNS_RECORD_DETAIL_PATH: &str = "/zones/{zone_id}/dns_records/{dns_record_id}";
+const DNS_RECORD_DETAIL_READ_CAPABILITY_ID: &str = "dns-records-for-a-zone-dns-record-details";
+const DNS_RECORD_RESTORE_FIELDS: [&str; 11] = [
+    "comment",
+    "content",
+    "data",
+    "name",
+    "priority",
+    "private_routing",
+    "proxied",
+    "settings",
+    "tags",
+    "ttl",
+    "type",
+];
+
+fn finalize_dns_record_rollback_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let source_supported = capabilities
+        .get(DNS_RECORD_DETAIL_READ_CAPABILITY_ID)
+        .is_some_and(dns_record_detail_read_contract_supported)
+        && document
+            .get("paths")
+            .and_then(Value::as_object)
+            .and_then(|paths| paths.get(DNS_RECORD_DETAIL_PATH))
+            .and_then(|path| path.get("get"))
+            .is_some_and(|operation| {
+                let mut fields = DNS_RECORD_RESTORE_FIELDS.to_vec();
+                fields.push("id");
+                fields.sort_unstable();
+                success_response_declares_result_field_union(document, operation, &fields)
+            });
+    if !source_supported {
+        return;
+    }
+    for capability_id in [
+        "dns-records-for-a-zone-update-dns-record",
+        "dns-records-for-a-zone-patch-dns-record",
+    ] {
+        let Some(capability) = capabilities.get_mut(capability_id) else {
+            continue;
+        };
+        if !dns_record_detail_routing_contract_supported(capability) {
+            continue;
+        }
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: DNS_RECORD_DETAIL_PATH.to_owned(),
+            read_capability_id: DNS_RECORD_DETAIL_READ_CAPABILITY_ID.to_owned(),
+            verified_response_fields: DNS_RECORD_RESTORE_FIELDS
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy =
+            Some("restore_dns_record_prior_snapshot_with_put".to_owned());
+        if !capability.rollback_contract_supported() {
+            capability.rollback.supported = false;
+            capability.rollback.strategy = None;
+            capability.same_path_read = None;
+            continue;
+        }
+        capability.rollback.warning = Some(
+            "rectification derives a separate hash-bound DNS record PUT plan from the prior writable record snapshot; it never runs automatically and requires explicit approval"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
+
+fn dns_record_detail_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == DNS_RECORD_DETAIL_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == DNS_RECORD_DETAIL_PATH
+        && capability.product == "DNS Records for a Zone"
+        && capability.account_scope == "zone"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && dns_record_detail_routing_contract_supported(capability)
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|contract| {
+                contract.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                    && contract.success_statuses == ["200"]
+                    && contract.success_media_types == ["application/json"]
+            })
+}
+
+fn dns_record_detail_routing_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.path == DNS_RECORD_DETAIL_PATH
+        && capability.selectors.len() == 3
+        && ["zone_id", "dns_record_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name && selector.location == "path" && selector.required
+            })
+        })
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "include_shadow_metadata"
+                && selector.location == "query"
+                && !selector.required
+                && selector.value_type == "boolean"
+                && selector.contract.as_ref().is_some_and(|contract| {
+                    contract.schema.get("type").and_then(Value::as_str) == Some("boolean")
+                        && contract.query.as_ref().is_some_and(|query| {
+                            query.style == "form"
+                                && query.explode
+                                && !query.allow_reserved
+                                && !query.allow_empty_value
+                        })
+                })
+        })
 }
 
 fn global_warp_override_source_contract_supported(
@@ -2676,6 +2793,64 @@ fn success_response_declares_result_fields(
                 .iter()
                 .all(|field| schema_declares_path(document, schema, &["result", *field], 0))
         })
+}
+
+fn success_response_declares_result_field_union(
+    document: &Value,
+    operation: &Value,
+    fields: &[&str],
+) -> bool {
+    operation
+        .get("responses")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(status, _)| status.starts_with('2'))
+        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
+        .any(|schema| {
+            fields.iter().all(|field| {
+                schema_declares_path_in_union(document, schema, &["result", *field], 0)
+            })
+        })
+}
+
+fn schema_declares_path_in_union(
+    document: &Value,
+    schema: &Value,
+    path: &[&str],
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                schema_declares_path_in_union(document, resolved, path, depth + 1)
+            });
+    }
+    if path.is_empty() {
+        return true;
+    }
+    if let Some(property) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(path[0]))
+    {
+        return schema_declares_path_in_union(document, property, &path[1..], depth + 1);
+    }
+    ["allOf", "oneOf", "anyOf"].iter().any(|composition| {
+        schema
+            .get(composition)
+            .and_then(Value::as_array)
+            .is_some_and(|members| {
+                members
+                    .iter()
+                    .any(|member| schema_declares_path_in_union(document, member, path, depth + 1))
+            })
+    })
 }
 
 fn schema_declares_path(document: &Value, schema: &Value, path: &[&str], depth: usize) -> bool {
