@@ -79,6 +79,13 @@ sink: cfctl requires both non-empty response fields and writes only `client_id`
 and `client_secret` as one mode-0600 JSON object. The exact resource readback
 proves the returned ID, name, and duration, but never claims to re-read the
 one-time secret.
+
+Service-token update accepts only observable `name` and `duration` fields.
+Secret-version and prior-secret-expiration inputs stay outside that generic
+update path because they change credential cutover state. Exact field readback
+proves the requested metadata, while the irreversible expiration-clock reset is
+called out instead of being mislabeled as automatically restorable.
+
 OAuth client rotation combines that sink receipt with a separate state proof:
 the secret value itself remains unreadable, while an exact client-detail read
 must prove the transition from one secret to two. Old-secret deletion is a

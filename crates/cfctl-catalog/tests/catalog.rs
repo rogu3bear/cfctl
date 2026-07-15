@@ -3354,7 +3354,37 @@ fn access_service_token_fixture() -> serde_json::Value {
             "/accounts/{account_id}/access/service_tokens/{service_token_id}/rotate".to_owned(),
             access_service_token_rotate_fixture(),
         );
+    fixture["paths"]["/accounts/{account_id}/access/service_tokens/{service_token_id}"]
+        .as_object_mut()
+        .expect("Access service-token detail operations")
+        .insert("put".to_owned(), access_service_token_update_fixture());
     fixture
+}
+
+fn access_service_token_update_fixture() -> serde_json::Value {
+    json!({
+        "operationId":"access-service-tokens-update-a-service-token",
+        "summary":"Update a service token",
+        "description":"Updates a configured service token.",
+        "tags":["Access service tokens"],
+        "x-api-token-group":["Access: Service Tokens Write"],
+        "requestBody": {
+            "required":true,
+            "content":{"application/json":{"schema":{
+                "type":"object",
+                "properties":{
+                    "client_secret_version":{"type":"number"},
+                    "duration":{"type":"string"},
+                    "name":{"type":"string"},
+                    "previous_client_secret_expires_at":{"type":"string","format":"date-time"}
+                }
+            }}}
+        },
+        "responses":{"200":{
+            "description":"Service token updated",
+            "content":{"application/json":{"schema":{"$ref":"#/components/schemas/ServiceTokenResponse"}}}
+        }}
+    })
 }
 
 fn access_service_token_rotate_fixture() -> serde_json::Value {
@@ -3466,7 +3496,54 @@ fn access_service_token_creation_is_a_secret_safe_exact_resource_lifecycle() {
 }
 
 #[test]
-fn access_service_token_creation_classifier_rejects_authority_and_schema_drift() {
+fn access_service_token_update_excludes_rotation_controls_and_reads_back_metadata() {
+    let snapshot =
+        normalize_openapi(&access_service_token_fixture()).expect("Access token catalog");
+    let update = snapshot
+        .get("access-service-tokens-update-a-service-token")
+        .expect("Access service-token update");
+
+    assert_eq!(update.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(update.risk, RiskClass::IdentityOrOwnership);
+    assert_eq!(update.effect, EffectClass::IdentityOrOwnership);
+    assert!(update.cost.known);
+    assert_eq!(update.entitlement.available, Some(true));
+    assert_eq!(
+        update.verification.strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+    assert_eq!(
+        update
+            .same_path_read
+            .as_ref()
+            .expect("service-token update readback")
+            .verified_response_fields,
+        ["duration", "name"]
+    );
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .expect("narrow update schema"),
+        &json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{
+                "duration":{"type":"string"},
+                "name":{"type":"string"}
+            },
+            "x-cfctl-body-required":true
+        })
+    );
+    assert!(!update.rollback.supported);
+    assert!(update.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("exact prior expiration") && warning.contains("separately reviewed")
+    }));
+    assert!(update.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn access_service_token_classifiers_reject_authority_and_schema_drift() {
     let blocked = |document: serde_json::Value| {
         normalize_openapi(&document)
             .expect("drifted Access service-token catalog")
@@ -3485,6 +3562,33 @@ fn access_service_token_creation_classifier_rejects_authority_and_schema_drift()
     request["paths"]["/accounts/{account_id}/access/service_tokens"]["post"]["requestBody"]["content"]
         ["application/json"]["schema"]["properties"]["tamper_mode"] = json!({"type":"boolean"});
     assert!(blocked(request));
+
+    let mut update_permission = access_service_token_fixture();
+    update_permission["paths"]["/accounts/{account_id}/access/service_tokens/{service_token_id}"]
+        ["put"]["x-api-token-group"] = json!(["Account Settings Write"]);
+    let update_snapshot =
+        normalize_openapi(&update_permission).expect("permission-drifted service-token catalog");
+    assert_eq!(
+        update_snapshot
+            .get("access-service-tokens-update-a-service-token")
+            .expect("permission-drifted update")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+
+    let mut update_request = access_service_token_fixture();
+    update_request["paths"]["/accounts/{account_id}/access/service_tokens/{service_token_id}"]["put"]
+        ["requestBody"]["content"]["application/json"]["schema"]["properties"]["client_secret_version"]
+        ["type"] = json!("string");
+    let update_snapshot =
+        normalize_openapi(&update_request).expect("request-drifted service-token catalog");
+    assert_eq!(
+        update_snapshot
+            .get("access-service-tokens-update-a-service-token")
+            .expect("request-drifted update")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
 
     let mut secret = access_service_token_fixture();
     secret["components"]["schemas"]["ServiceToken"]["properties"]["client_secret"]["type"] =

@@ -3476,6 +3476,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         classify_d1_read_replication_update(capability);
     } else if is_dns_record_lifecycle(&capability.id) {
         classify_dns_record_lifecycle(capability);
+    } else if access_service_token_update_contract_supported(capability) {
+        classify_access_service_token_update(capability);
     } else if let Some(kind) = access_authorization_configuration_kind(capability) {
         classify_access_authorization_configuration(capability, kind);
     } else if turnstile_widget_rotation_contract_supported(capability) {
@@ -4314,6 +4316,95 @@ const ACCESS_SERVICE_TOKEN_COLLECTION_PATH: &str = "/accounts/{account_id}/acces
 const ACCESS_SERVICE_TOKEN_DETAIL_PATH: &str =
     "/accounts/{account_id}/access/service_tokens/{service_token_id}";
 
+fn apply_access_service_token_commercial_contract(capability: &mut CapabilityV1) {
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.billing_model = BillingModelV1::Subscription;
+    capability.cost.exposure = CostExposureV1::AccountQuote;
+    capability.cost.basis = Some(
+        "creating or updating an Access service token has no direct operation charge; the account's service-token capacity and any separately negotiated increase remain part of its existing Zero Trust subscription"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Cloudflare Access service tokens".to_owned(),
+            url: "https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/"
+                .to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare One account limits".to_owned(),
+            url: "https://developers.cloudflare.com/cloudflare-one/account-limits/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Create an Access service token".to_owned(),
+            url: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/methods/create/"
+                .to_owned(),
+            source: "official Cloudflare API".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Update an Access service token".to_owned(),
+            url: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/methods/update/"
+                .to_owned(),
+            source: "official Cloudflare API".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare Zero Trust and SASE plans".to_owned(),
+            url: "https://www.cloudflare.com/plans/zero-trust-services/".to_owned(),
+            source: "official Cloudflare pricing".to_owned(),
+        },
+    ];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans = BTreeMap::from([
+        ("free".to_owned(), true),
+        ("pay_as_you_go".to_owned(), true),
+        ("contract".to_owned(), true),
+    ]);
+    capability.entitlement.blocker = None;
+    capability.entitlement.source =
+        Some("https://www.cloudflare.com/plans/zero-trust-services/".to_owned());
+    capability.entitlement.requires_live_resolution = false;
+}
+
+fn access_service_token_update_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "access-service-tokens-update-a-service-token"
+        && capability.method == "PUT"
+        && capability.path == ACCESS_SERVICE_TOKEN_DETAIL_PATH
+        && capability.product == "Access service tokens"
+        && capability.permissions == ["Access: Service Tokens Write"]
+        && capability.description.as_deref() == Some("Updates a configured service token.")
+        && access_service_token_detail_selectors_supported(capability)
+        && access_service_token_source_update_request_supported(capability)
+        && access_service_token_response_contract_supported(
+            capability.response_contract.as_ref(),
+            "200",
+        )
+}
+
+fn classify_access_service_token_update(capability: &mut CapabilityV1) {
+    capability.request_schema = Some(serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "duration": {"type": "string"},
+            "name": {"type": "string"}
+        },
+        "x-cfctl-body-required": true
+    }));
+    capability.risk = RiskClass::IdentityOrOwnership;
+    capability.effect = EffectClass::IdentityOrOwnership;
+    apply_access_service_token_commercial_contract(capability);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "changing duration resets credential expiration, so cfctl cannot restore the exact prior expiration; name or duration restoration requires a separately reviewed update plan built from trusted evidence"
+            .to_owned(),
+    );
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+}
+
 fn classify_access_service_token_create_contract(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
@@ -4337,47 +4428,7 @@ fn classify_access_service_token_create_contract(
     }));
     capability.risk = RiskClass::SecretSensitive;
     capability.effect = EffectClass::IdentityOrOwnership;
-    capability.cost = cfctl_core::CostV1::default();
-    capability.cost.billing_model = BillingModelV1::Subscription;
-    capability.cost.exposure = CostExposureV1::AccountQuote;
-    capability.cost.basis = Some(
-        "creating an Access service token has no direct operation charge; the account's service-token capacity and any separately negotiated increase remain part of its existing Zero Trust subscription"
-            .to_owned(),
-    );
-    capability.cost.references = vec![
-        KnowledgeReferenceV1 {
-            title: "Cloudflare Access service tokens".to_owned(),
-            url: "https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/"
-                .to_owned(),
-            source: "official Cloudflare docs".to_owned(),
-        },
-        KnowledgeReferenceV1 {
-            title: "Cloudflare One account limits".to_owned(),
-            url: "https://developers.cloudflare.com/cloudflare-one/account-limits/".to_owned(),
-            source: "official Cloudflare docs".to_owned(),
-        },
-        KnowledgeReferenceV1 {
-            title: "Create an Access service token".to_owned(),
-            url: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/methods/create/"
-                .to_owned(),
-            source: "official Cloudflare API".to_owned(),
-        },
-        KnowledgeReferenceV1 {
-            title: "Cloudflare Zero Trust and SASE plans".to_owned(),
-            url: "https://www.cloudflare.com/plans/zero-trust-services/".to_owned(),
-            source: "official Cloudflare pricing".to_owned(),
-        },
-    ];
-    capability.entitlement.available = Some(true);
-    capability.entitlement.plans = BTreeMap::from([
-        ("free".to_owned(), true),
-        ("pay_as_you_go".to_owned(), true),
-        ("contract".to_owned(), true),
-    ]);
-    capability.entitlement.blocker = None;
-    capability.entitlement.source =
-        Some("https://www.cloudflare.com/plans/zero-trust-services/".to_owned());
-    capability.entitlement.requires_live_resolution = false;
+    apply_access_service_token_commercial_contract(capability);
     capability.verification.required = true;
     "post_change_read_or_operation_specific_verifier"
         .clone_into(&mut capability.verification.strategy);
@@ -4513,6 +4564,30 @@ fn access_service_token_source_create_request_supported(capability: &CapabilityV
         .and_then(Value::as_str)
         .is_some_and(|value_type| value_type != "object")
         || schema.get("required") != Some(&serde_json::json!(["name"]))
+        || schema.get("x-cfctl-body-required").and_then(Value::as_bool) != Some(true)
+        || properties.len() != 4
+    {
+        return false;
+    }
+    properties.get("client_secret_version") == Some(&serde_json::json!({"type":"number"}))
+        && properties.get("duration") == Some(&serde_json::json!({"type":"string"}))
+        && properties.get("name") == Some(&serde_json::json!({"type":"string"}))
+        && properties.get("previous_client_secret_expires_at")
+            == Some(&serde_json::json!({"format":"date-time","type":"string"}))
+}
+
+fn access_service_token_source_update_request_supported(capability: &CapabilityV1) -> bool {
+    let Some(schema) = capability.request_schema.as_ref() else {
+        return false;
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    if schema
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value_type| value_type != "object")
+        || schema.get("required").is_some()
         || schema.get("x-cfctl-body-required").and_then(Value::as_bool) != Some(true)
         || properties.len() != 4
     {

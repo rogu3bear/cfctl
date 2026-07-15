@@ -156,6 +156,22 @@ plan; it never deletes automatically. Keep
 `access-service-tokens-rotate-a-service-token` blocked while its official
 operation schema omits the required permission lane.
 
+Rename a service token or choose a new duration without entering the rotation
+lane:
+
+```bash
+printf '%s' '{"name":"deployment automation","duration":"17520h"}' | \
+  cfctl call access-service-tokens-update-a-service-token \
+    --selector account_id=<account-id> \
+    --selector service_token_id=<service-token-id> --body-stdin --json
+```
+
+cfctl reads the exact token back and compares every planned field. It rejects
+`client_secret_version` and `previous_client_secret_expires_at`: Cloudflare
+documents those as secret-rotation and old-secret grace controls. A duration
+update resets expiration, so restoring the exact prior expiration is not a
+valid rollback claim; correction requires a separate reviewed update plan.
+
 Turnstile secret rotation requires an explicit cutover choice. `false` keeps
 the prior secret valid for two hours and prevents another rotation during that
 window; `true` invalidates it immediately. In both cases the new secret is

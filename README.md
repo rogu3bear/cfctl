@@ -188,6 +188,14 @@ blocked because Cloudflare's current operation schema does not declare its
 required permission lane; cfctl does not borrow authority from the create
 operation.
 
+Updating an Access service token is similarly narrowed to `name` and
+`duration`. cfctl excludes `client_secret_version`, which Cloudflare documents
+as a rotation trigger, and `previous_client_secret_expires_at`, which changes
+the old-secret grace period. The exact token is read back after update. Because
+changing duration resets expiration relative to the update, cfctl does not
+claim it can restore the exact prior expiration; any corrective update is a
+separate reviewed plan.
+
 When a token or DNS-record creation receipt proves the returned resource ID
 and the catalog declares a compensating delete, `plans rectify` can derive a
 separate hash-bound revoke/delete plan. It never runs that plan automatically:
