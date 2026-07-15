@@ -417,6 +417,96 @@ fn selector_types_follow_homogeneous_enums_without_guessing_mixed_values() {
 }
 
 #[test]
+fn selector_contract_resolves_local_parameter_references_and_operation_overrides() {
+    let mut document = fixture();
+    document["components"]["parameters"] = json!({
+        "AccountId": {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {"type": "string"}
+        },
+        "PerPage": {
+            "in": "query",
+            "name": "per_page",
+            "required": true,
+            "schema": {"type": "integer"}
+        }
+    });
+    document["paths"]["/accounts/{account_id}/widgets"] = json!({
+        "parameters": [
+            {"$ref": "#/components/parameters/AccountId"},
+            {
+                "in": "query",
+                "name": "scope",
+                "schema": {"type": "string"}
+            }
+        ],
+        "get": {
+            "operationId": "widgets-list",
+            "summary": "List Widgets",
+            "parameters": [
+                {"$ref": "#/components/parameters/PerPage"},
+                {
+                    "in": "query",
+                    "name": "scope",
+                    "required": true,
+                    "schema": {"type": "boolean"}
+                }
+            ]
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("catalog");
+    let capability = snapshot.get("widgets-list").expect("list capability");
+    let selector = |name: &str| {
+        capability
+            .selectors
+            .iter()
+            .find(|selector| selector.name == name)
+            .expect("selector")
+    };
+    assert_eq!(capability.selectors.len(), 3);
+    assert_eq!(selector("account_id").location, "path");
+    assert!(selector("account_id").required);
+    assert_eq!(selector("per_page").value_type, "integer");
+    assert!(selector("per_page").required);
+    assert_eq!(selector("scope").value_type, "boolean");
+    assert!(selector("scope").required);
+}
+
+#[test]
+fn selector_contract_rejects_untrusted_broken_and_duplicate_parameters() {
+    let mut external = fixture();
+    external["paths"]["/zones/{zone_id}/dns_records"]["get"]["parameters"] = json!([{
+        "$ref": "https://example.invalid/parameters.json#/Page"
+    }]);
+    let error = normalize_openapi(&external)
+        .expect_err("external parameter references must fail closed")
+        .to_string();
+    assert!(error.contains("unsupported") && error.contains("example.invalid"));
+
+    let mut unresolved = fixture();
+    unresolved["paths"]["/zones/{zone_id}/dns_records"]["get"]["parameters"] = json!([{
+        "$ref": "#/components/parameters/Missing"
+    }]);
+    let error = normalize_openapi(&unresolved)
+        .expect_err("broken local parameter references must fail closed")
+        .to_string();
+    assert!(error.contains("does not resolve") && error.contains("Missing"));
+
+    let mut duplicate = fixture();
+    duplicate["paths"]["/zones/{zone_id}/dns_records"]["get"]["parameters"] = json!([
+        {"in":"path", "name":"zone_id", "required":true, "schema":{"type":"string"}},
+        {"in":"path", "name":"zone_id", "required":true, "schema":{"type":"string"}}
+    ]);
+    let error = normalize_openapi(&duplicate)
+        .expect_err("duplicates inside one parameter scope must fail closed")
+        .to_string();
+    assert!(error.contains("duplicate") && error.contains("zone_id"));
+}
+
+#[test]
 fn official_cli_help_becomes_delegated_capabilities() {
     let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
     ingest_cli_help(

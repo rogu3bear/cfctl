@@ -30,6 +30,16 @@ pub enum CatalogError {
     MissingPaths,
     #[error("duplicate operation id `{0}`")]
     DuplicateOperation(String),
+    #[error("unsupported OpenAPI parameter reference `{0}`")]
+    UnsupportedParameterReference(String),
+    #[error("OpenAPI parameter reference `{0}` does not resolve")]
+    UnresolvedParameterReference(String),
+    #[error("OpenAPI parameter reference depth exceeds the safety limit at `{0}`")]
+    ParameterReferenceDepth(String),
+    #[error("OpenAPI parameter is missing string field `{0}`")]
+    InvalidParameter(String),
+    #[error("duplicate `{location}` parameter `{name}`")]
+    DuplicateParameter { location: String, name: String },
     #[error("catalog content hash mismatch: recorded {recorded}, actual {actual}")]
     ContentHashMismatch { recorded: String, actual: String },
     #[error(transparent)]
@@ -853,10 +863,10 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
                 .and_then(Value::as_str)
                 .unwrap_or("Cloudflare API")
                 .clone_into(&mut capability.product);
-            capability.selectors = shared_and_operation_parameters(path_item, operation)
+            capability.selectors = shared_and_operation_parameters(document, path_item, operation)?
                 .into_iter()
-                .filter_map(|parameter| selector_from_parameter(document, parameter))
-                .collect();
+                .map(|parameter| selector_from_parameter(document, parameter))
+                .collect::<Result<Vec<_>>>()?;
             capability.permissions = operation_object
                 .get("x-api-token-group")
                 .and_then(Value::as_array)
@@ -2375,29 +2385,95 @@ fn fallback_id(method: &str, path: &str) -> String {
 }
 
 fn shared_and_operation_parameters<'a>(
+    document: &'a Value,
     path_item: &'a Value,
     operation: &'a Value,
-) -> Vec<&'a Value> {
-    path_item
+) -> Result<Vec<&'a Value>> {
+    let shared = path_item
         .get("parameters")
         .and_then(Value::as_array)
         .into_iter()
-        .flatten()
-        .chain(
-            operation
-                .get("parameters")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten(),
-        )
-        .collect()
+        .flatten();
+    let operation = operation
+        .get("parameters")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let mut merged = Vec::new();
+    let mut shared_keys = BTreeSet::new();
+    for parameter in shared {
+        let parameter = resolve_local_parameter(document, parameter, 0)?;
+        let key = parameter_identity(parameter)?;
+        if !shared_keys.insert(key.clone()) {
+            return Err(CatalogError::DuplicateParameter {
+                location: key.0,
+                name: key.1,
+            });
+        }
+        merged.push(parameter);
+    }
+    let mut operation_keys = BTreeSet::new();
+    for parameter in operation {
+        let parameter = resolve_local_parameter(document, parameter, 0)?;
+        let key = parameter_identity(parameter)?;
+        if !operation_keys.insert(key.clone()) {
+            return Err(CatalogError::DuplicateParameter {
+                location: key.0,
+                name: key.1,
+            });
+        }
+        if let Some(index) = merged
+            .iter()
+            .position(|candidate| parameter_identity(candidate).is_ok_and(|value| value == key))
+        {
+            merged[index] = parameter;
+        } else {
+            merged.push(parameter);
+        }
+    }
+    Ok(merged)
 }
 
-fn selector_from_parameter(document: &Value, parameter: &Value) -> Option<SelectorV1> {
-    let name = parameter.get("name")?.as_str()?.to_owned();
-    let location = parameter.get("in")?.as_str()?.to_owned();
+fn resolve_local_parameter<'a>(
+    document: &'a Value,
+    parameter: &'a Value,
+    depth: u8,
+) -> Result<&'a Value> {
+    let Some(reference) = parameter.get("$ref") else {
+        return Ok(parameter);
+    };
+    let reference = reference
+        .as_str()
+        .ok_or_else(|| CatalogError::InvalidParameter("$ref".to_owned()))?;
+    if depth >= 16 {
+        return Err(CatalogError::ParameterReferenceDepth(reference.to_owned()));
+    }
+    let pointer = reference
+        .strip_prefix('#')
+        .filter(|pointer| pointer.starts_with('/'))
+        .ok_or_else(|| CatalogError::UnsupportedParameterReference(reference.to_owned()))?;
+    let resolved = document
+        .pointer(pointer)
+        .ok_or_else(|| CatalogError::UnresolvedParameterReference(reference.to_owned()))?;
+    resolve_local_parameter(document, resolved, depth + 1)
+}
+
+fn parameter_identity(parameter: &Value) -> Result<(String, String)> {
+    let location = parameter
+        .get("in")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CatalogError::InvalidParameter("in".to_owned()))?;
+    let name = parameter
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CatalogError::InvalidParameter("name".to_owned()))?;
+    Ok((location.to_owned(), name.to_owned()))
+}
+
+fn selector_from_parameter(document: &Value, parameter: &Value) -> Result<SelectorV1> {
+    let (location, name) = parameter_identity(parameter)?;
     let schema = parameter.get("schema");
-    Some(SelectorV1 {
+    Ok(SelectorV1 {
         name,
         location,
         required: parameter
