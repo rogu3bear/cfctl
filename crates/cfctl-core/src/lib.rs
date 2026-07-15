@@ -340,7 +340,13 @@ impl CapabilityV1 {
                     .to_owned(),
             );
         }
-        if self.adapter_status == AdapterStatus::DynamicApi && self.permissions.is_empty() {
+        let dynamic_api_contract = self.adapter_status == AdapterStatus::DynamicApi
+            || (self.adapter_status == AdapterStatus::Blocked
+                && self
+                    .blocked_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("operation contract incomplete:")));
+        if dynamic_api_contract && self.permissions.is_empty() {
             gaps.push("required Cloudflare permission lane is not declared".to_owned());
         }
         let plan_gated = self.entitlement.plans.values().any(|available| !available);

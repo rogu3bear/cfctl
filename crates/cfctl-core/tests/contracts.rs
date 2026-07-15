@@ -1,8 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use cfctl_core::{
-    AdapterStatus, CapabilityV1, EffectClass, EvidenceClass, EvidenceV1, GuideStage, PlanStatus,
-    PlanV1, ResultEnvelopeV2, RiskClass, TransactionStageV1, guide_stages, redact_json,
+    AdapterStatus, CapabilityV1, CostV1, EffectClass, EvidenceClass, EvidenceV1, GuideStage,
+    PlanStatus, PlanV1, ResultEnvelopeV2, RiskClass, TransactionStageV1, guide_stages, redact_json,
 };
 use serde_json::json;
 
@@ -46,6 +46,34 @@ fn mutation_contract_gaps_name_every_missing_execution_guard() {
     assert!(gaps.iter().any(|gap| gap.contains("cost")));
     assert!(gaps.iter().any(|gap| gap.contains("verification")));
     assert!(gaps.iter().any(|gap| gap.contains("rollback")));
+}
+
+#[test]
+fn blocked_dynamic_api_contract_keeps_its_missing_permission_gap() {
+    let mut capability = CapabilityV1::new(
+        "widgets.delete",
+        "Delete widget",
+        "DELETE",
+        "/accounts/{account_id}/widgets/{widget_id}",
+    );
+    capability.risk = RiskClass::Destructive;
+    capability.effect = EffectClass::Destructive;
+    capability.cost = CostV1::default();
+    capability.verification.strategy = "same_resource_returns_not_found_after_delete".to_owned();
+    capability.rollback.warning =
+        Some("deletion is irreversible without a prior resource snapshot".to_owned());
+    capability.adapter_status = AdapterStatus::Blocked;
+    capability.blocked_reason = Some(
+        "operation contract incomplete: required Cloudflare permission lane is not declared"
+            .to_owned(),
+    );
+
+    assert!(
+        capability
+            .mutation_contract_gaps()
+            .iter()
+            .any(|gap| gap.contains("permission lane"))
+    );
 }
 
 #[test]

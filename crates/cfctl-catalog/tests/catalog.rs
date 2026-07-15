@@ -368,6 +368,76 @@ fn dns_record_crud_has_complete_operation_specific_contracts() {
     );
 }
 
+#[test]
+fn exact_resource_deletes_pair_with_same_path_readback_contracts() {
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/accounts/{account_id}/widgets/{widget_id}": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+                    {"in":"path","name":"widget_id","required":true,"schema":{"type":"string"}}
+                ],
+                "get": {
+                    "operationId":"widgets-get",
+                    "summary":"Get Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Read"]
+                },
+                "delete": {
+                    "operationId":"widgets-delete",
+                    "summary":"Delete Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"]
+                }
+            },
+            "/accounts/{account_id}/widgets": {
+                "get": {
+                    "operationId":"widgets-list",
+                    "summary":"List Widgets",
+                    "tags":["Widgets"]
+                },
+                "delete": {
+                    "operationId":"widgets-delete-all",
+                    "summary":"Delete All Widgets",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"]
+                }
+            }
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("widget catalog");
+    let exact = snapshot.get("widgets-delete").expect("exact delete");
+    assert_eq!(exact.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(exact.risk, RiskClass::Destructive);
+    assert_eq!(exact.effect, EffectClass::Destructive);
+    assert_eq!(exact.cost.maximum, Some(0.0));
+    assert_eq!(
+        exact.verification.strategy,
+        "same_resource_returns_not_found_after_delete"
+    );
+    assert!(!exact.rollback.supported);
+    assert!(
+        exact
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("prior resource snapshot"))
+    );
+    assert!(exact.mutation_contract_gaps().is_empty());
+
+    let collection = snapshot
+        .get("widgets-delete-all")
+        .expect("collection delete");
+    assert_eq!(collection.adapter_status, AdapterStatus::Blocked);
+    assert_ne!(
+        collection.verification.strategy,
+        "same_resource_returns_not_found_after_delete"
+    );
+}
+
 fn pricing_feeds_fixture() -> OfficialTextFeedsV1 {
     OfficialTextFeedsV1 {
         fetched_at: Utc::now(),

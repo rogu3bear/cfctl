@@ -352,9 +352,55 @@ impl Executor {
             });
         }
 
+        if strategy == "same_resource_returns_not_found_after_delete" {
+            return self
+                .verify_exact_resource_delete(plan, apply_response, &input, credential)
+                .await;
+        }
+
         Err(CloudflareError::UnsupportedVerificationStrategy(
             strategy.to_owned(),
         ))
+    }
+
+    async fn verify_exact_resource_delete(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let details = CapabilityV1::new(
+            "exact-resource-delete-verification-readback",
+            "Exact resource deletion verification readback",
+            "GET",
+            &plan.capability.path,
+        );
+        let request = self.builder.build(
+            &details,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let passed = apply_response.success && readback.status == 404 && !readback.success;
+        let basis = if passed {
+            "the exact planned resource path returned not found after deletion".to_owned()
+        } else {
+            format!(
+                "exact resource deletion was not proven (apply success={}, readback HTTP {}, readback success={})",
+                apply_response.success, readback.status, readback.success
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback,
+        })
     }
 
     async fn send(

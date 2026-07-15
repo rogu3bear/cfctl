@@ -833,6 +833,8 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
         }
     }
 
+    classify_exact_resource_delete_contracts(&mut capabilities);
+
     let source_hash = hash_value(document)?;
     let mut snapshot = CatalogSnapshot {
         schema_version: 1,
@@ -844,6 +846,52 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     };
     snapshot.refresh_hash()?;
     Ok(snapshot)
+}
+
+fn classify_exact_resource_delete_contracts(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    let readback_paths = capabilities
+        .values()
+        .filter(|capability| capability.method == "GET")
+        .map(|capability| capability.path.clone())
+        .collect::<BTreeSet<_>>();
+
+    for capability in capabilities.values_mut() {
+        let contract_incomplete = capability.adapter_status == AdapterStatus::DynamicApi
+            || (capability.adapter_status == AdapterStatus::Blocked
+                && capability
+                    .blocked_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("operation contract incomplete:")));
+        if !contract_incomplete
+            || capability.method != "DELETE"
+            || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
+            || !path_targets_exact_resource(&capability.path)
+            || !readback_paths.contains(&capability.path)
+        {
+            continue;
+        }
+
+        capability.cost = cfctl_core::CostV1::default();
+        capability.cost.basis = Some(
+            "deleting an existing resource has no incremental operation charge; refunds, retained usage, and downstream billing are not claimed"
+                .to_owned(),
+        );
+        "same_resource_returns_not_found_after_delete"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "deletion is irreversible without a prior resource snapshot; any recreation must be a separately reviewed plan"
+                .to_owned(),
+        );
+        refresh_incomplete_contract_reason(capability);
+    }
+}
+
+fn path_targets_exact_resource(path: &str) -> bool {
+    path.rsplit('/').next().is_some_and(|segment| {
+        segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2
+    })
 }
 
 pub async fn fetch_official(client: &reqwest::Client) -> Result<CatalogSnapshot> {
