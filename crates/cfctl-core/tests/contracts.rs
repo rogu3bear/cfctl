@@ -55,6 +55,59 @@ fn mutation_contract_gaps_name_every_missing_execution_guard() {
 }
 
 #[test]
+fn mutation_contracts_reject_declared_but_unimplemented_strategies() {
+    let mut capability = CapabilityV1::new(
+        "widgets.create",
+        "Create widget",
+        "POST",
+        "/accounts/{account_id}/widgets",
+    );
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost = CostV1::default();
+    capability.permissions = vec!["Widgets Write".to_owned()];
+    capability.verification.strategy = "phantom_readback".to_owned();
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("phantom_restore".to_owned());
+
+    let gaps = capability.mutation_contract_gaps();
+
+    assert!(
+        gaps.iter().any(|gap| {
+            gap == "declared verification strategy is unsupported: phantom_readback"
+        })
+    );
+    assert!(
+        gaps.iter()
+            .any(|gap| gap == "declared rollback strategy is unsupported: phantom_restore")
+    );
+
+    capability.verification.strategy =
+        "api_token_details_match_created_id_and_active_status".to_owned();
+    capability.rollback.strategy =
+        Some("revoke_created_api_token_by_returned_id_if_downstream_installation_fails".to_owned());
+    let grafted_gaps = capability.mutation_contract_gaps();
+    assert!(grafted_gaps.iter().any(|gap| {
+        gap == "declared verification strategy is unsupported: api_token_details_match_created_id_and_active_status"
+    }));
+    assert!(grafted_gaps.iter().any(|gap| {
+        gap == "declared rollback strategy is unsupported: revoke_created_api_token_by_returned_id_if_downstream_installation_fails"
+    }));
+
+    capability.verification.required = false;
+    capability.verification.strategy = "not_applicable".to_owned();
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some("no automatic rollback is available".to_owned());
+    assert!(
+        capability
+            .mutation_contract_gaps()
+            .iter()
+            .any(|gap| { gap == "declared verification strategy is unsupported: not_applicable" })
+    );
+}
+
+#[test]
 fn blocked_dynamic_api_contract_keeps_its_missing_permission_gap() {
     let mut capability = CapabilityV1::new(
         "widgets.delete",
@@ -85,7 +138,7 @@ fn blocked_dynamic_api_contract_keeps_its_missing_permission_gap() {
 #[test]
 fn entitlement_resolution_is_required_only_when_plan_availability_differs() {
     let mut capability = CapabilityV1::new(
-        "tokens.create",
+        "account-api-tokens-create-token",
         "Create account token",
         "POST",
         "/accounts/{account_id}/tokens",
@@ -97,7 +150,8 @@ fn entitlement_resolution_is_required_only_when_plan_availability_differs() {
     capability.verification.strategy =
         "api_token_details_match_created_id_and_active_status".to_owned();
     capability.rollback.supported = true;
-    capability.rollback.strategy = Some("revoke_created_token".to_owned());
+    capability.rollback.strategy =
+        Some("revoke_created_api_token_by_returned_id_if_downstream_installation_fails".to_owned());
     capability.entitlement.plans = [
         ("free".to_owned(), true),
         ("pro".to_owned(), true),

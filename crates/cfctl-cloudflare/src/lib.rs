@@ -977,6 +977,11 @@ fn render_field_names(fields: &[String]) -> String {
 
 fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
     let strategy = capability.verification.strategy.as_str();
+    if !capability.verification_contract_supported() {
+        return Err(CloudflareError::UnsupportedVerificationStrategy(
+            strategy.to_owned(),
+        ));
+    }
     let body_label = match strategy {
         "created_resource_contains_planned_fields_by_returned_id"
         | "dns_record_details_match_created_id_and_planned_fields" => Some("create"),

@@ -31,6 +31,12 @@ Generated API writes are executable only when their operation contract is
 complete. Reads remain dynamically executable; incomplete writes remain
 searchable and explain every missing contract field.
 
+Verification and automatic rollback strategies form a closed runtime set.
+Catalog metadata must select a strategy that is implemented for the exact
+operation identity and resource shape; a plausible but incompatible strategy
+is contract debt, not execution authority. The adapter validates the verifier
+again before network mutation to protect older or drifted plans.
+
 ## Workspace and transaction model
 
 Workspace discovery never scans outside explicitly registered roots. It finds

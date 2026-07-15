@@ -44,6 +44,12 @@ names and their human-readable forms are searchable directly, so `catalog
 search "verification missing"` finds the affected operations without granting
 them execution authority.
 
+Verification and rollback strategy names are executable contracts, not prose.
+Only strategies implemented by the runtime and valid for the capability's
+exact method, identity, and resource shape count as complete. Policy blocks an
+unknown or grafted strategy, and the Cloudflare adapter repeats the verifier
+check before sending a mutation.
+
 ## Public commands
 
 ```text

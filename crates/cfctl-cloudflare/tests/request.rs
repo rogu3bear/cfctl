@@ -1,7 +1,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use cfctl_auth::AuthCredential;
-use cfctl_cloudflare::{CallInput, CloudflareResponseV1, Executor, RequestBuilder};
+use cfctl_cloudflare::{
+    CallInput, CloudflareError, CloudflareResponseV1, Executor, RequestBuilder,
+};
 use cfctl_core::{CapabilityV1, CreatedResourceContractV1, PlanStatus, PlanV1};
 use serde_json::json;
 use tokio::{
@@ -200,6 +202,54 @@ async fn executor_refuses_a_plan_that_was_not_durably_marked_consumed() {
 }
 
 #[tokio::test]
+async fn executor_rejects_a_grafted_verifier_before_the_mutation_boundary() {
+    let mut capability = CapabilityV1::new(
+        "widgets-create",
+        "Create widget",
+        "POST",
+        "/accounts/{account_id}/widgets",
+    );
+    capability.verification.strategy =
+        "api_token_details_match_created_id_and_active_status".to_owned();
+    let mut plan = PlanV1::draft(
+        "profile",
+        "account",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("draft plan");
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({"account_id":"account"}),
+        query: json!({}),
+        body: Some(json!({"name":"test"})),
+        ..CallInput::default()
+    })
+    .expect("input");
+    plan.refresh_hash().expect("refresh hash");
+    plan.approve(true, None).expect("approve");
+    plan.mark_consumed().expect("consume");
+    let executor = Executor::new(reqwest::Client::new(), "http://127.0.0.1:9").expect("executor");
+
+    let error = executor
+        .execute_consumed_plan(
+            &mut plan,
+            "sha256:catalog",
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+        )
+        .await
+        .expect_err("unsupported verifier must fail before network");
+
+    assert!(matches!(
+        error,
+        CloudflareError::UnsupportedVerificationStrategy(strategy)
+            if strategy == "api_token_details_match_created_id_and_active_status"
+    ));
+}
+
+#[tokio::test]
 async fn executor_collects_all_cloudflare_result_pages() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -271,7 +321,9 @@ async fn consumed_mutation_carries_plan_id_as_idempotency_key() {
             .expect("write response");
         request
     });
-    let capability = CapabilityV1::new("record-create", "Create record", "POST", "/zones");
+    let mut capability =
+        CapabilityV1::new("zone-delete", "Delete zone", "DELETE", "/zones/{zone_id}");
+    capability.verification.strategy = "same_resource_returns_not_found_after_delete".to_owned();
     let mut plan = PlanV1::draft(
         "profile",
         "account",
@@ -280,7 +332,13 @@ async fn consumed_mutation_carries_plan_id_as_idempotency_key() {
         json!({}),
     )
     .expect("draft plan");
-    plan.input = serde_json::to_value(CallInput::default()).expect("serialize input");
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({"zone_id":"zone-1"}),
+        query: json!({}),
+        body: None,
+        ..CallInput::default()
+    })
+    .expect("serialize input");
     plan.refresh_hash().expect("refresh hash");
     plan.approve(true, None).expect("approve");
     plan.mark_consumed().expect("consume");

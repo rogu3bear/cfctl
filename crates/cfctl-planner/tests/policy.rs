@@ -1,6 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use cfctl_core::{CapabilityV1, EffectClass, PolicyDisposition, RiskClass};
+use cfctl_core::{
+    CapabilityV1, CostV1, CreatedResourceContractV1, EffectClass, PolicyDisposition, RiskClass,
+};
 use cfctl_planner::{ImpactContext, PolicyEngine};
 
 fn capability(method: &str) -> CapabilityV1 {
@@ -12,21 +14,38 @@ fn capability(method: &str) -> CapabilityV1 {
     )
 }
 
+fn reversible_write() -> CapabilityV1 {
+    let mut write = CapabilityV1::new(
+        "widgets-create",
+        "Create widget",
+        "POST",
+        "/accounts/{account_id}/widgets",
+    );
+    write.risk = RiskClass::ScopedWrite;
+    write.effect = EffectClass::ReversibleWrite;
+    write.cost = CostV1::default();
+    write.permissions = vec!["Widgets Write".to_owned()];
+    "created_resource_contains_planned_fields_by_returned_id"
+        .clone_into(&mut write.verification.strategy);
+    write.rollback.supported = true;
+    write.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    write.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/widgets/{widget_id}".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-get".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
+    });
+    write
+}
+
 #[test]
 fn reads_and_known_reversible_isolated_writes_can_auto_execute() {
     let engine = PolicyEngine;
     let read = engine.evaluate(&capability("GET"), &ImpactContext::default());
     assert_eq!(read.disposition, PolicyDisposition::AutoExecute);
 
-    let mut write = capability("PUT");
-    write.risk = RiskClass::ScopedWrite;
-    write.effect = EffectClass::ReversibleWrite;
-    write.rollback.supported = true;
-    write.rollback.strategy = Some("restore captured resource state".to_owned());
-    write.cost.known = true;
-    write.cost.incremental = false;
-    write.verification.strategy = "resource_readback_matches_requested_state".to_owned();
-    write.permissions = vec!["Test Write".to_owned()];
+    let write = reversible_write();
     let decision = engine.evaluate(&write, &ImpactContext::default());
     assert_eq!(decision.disposition, PolicyDisposition::AutoExecute);
 }
@@ -34,14 +53,7 @@ fn reads_and_known_reversible_isolated_writes_can_auto_execute() {
 #[test]
 fn blast_radius_and_real_world_effects_require_approval() {
     let engine = PolicyEngine;
-    let mut write = capability("PUT");
-    write.risk = RiskClass::ScopedWrite;
-    write.effect = EffectClass::ReversibleWrite;
-    write.rollback.supported = true;
-    write.rollback.strategy = Some("restore captured resource state".to_owned());
-    write.cost.known = true;
-    write.verification.strategy = "resource_readback_matches_requested_state".to_owned();
-    write.permissions = vec!["Test Write".to_owned()];
+    let mut write = reversible_write();
 
     let cross_repo = ImpactContext {
         affected_repositories: 2,
@@ -122,5 +134,34 @@ fn incomplete_mutation_contracts_are_blocked_before_approval() {
             .reasons
             .iter()
             .any(|reason| reason.contains("rollback"))
+    );
+}
+
+#[test]
+fn declared_but_unimplemented_runtime_contracts_are_blocked() {
+    let engine = PolicyEngine;
+    let mut write = capability("POST");
+    write.risk = RiskClass::ScopedWrite;
+    write.effect = EffectClass::ReversibleWrite;
+    write.cost = cfctl_core::CostV1::default();
+    write.permissions = vec!["Test Write".to_owned()];
+    write.verification.strategy = "phantom_readback".to_owned();
+    write.rollback.supported = true;
+    write.rollback.strategy = Some("phantom_restore".to_owned());
+
+    let decision = engine.evaluate(&write, &ImpactContext::default());
+
+    assert_eq!(decision.disposition, PolicyDisposition::Blocked);
+    assert!(
+        decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("verification strategy is unsupported"))
+    );
+    assert!(
+        decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("rollback strategy is unsupported"))
     );
 }

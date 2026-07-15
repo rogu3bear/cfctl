@@ -333,6 +333,11 @@ impl CapabilityV1 {
         }
         if !self.verification_contract_declared() {
             gaps.push("operation-specific verification is not declared".to_owned());
+        } else if !self.verification_contract_supported() {
+            gaps.push(format!(
+                "declared verification strategy is unsupported: {}",
+                self.verification.strategy
+            ));
         }
 
         if !self.rollback_contract_declared() {
@@ -340,6 +345,11 @@ impl CapabilityV1 {
                 "operation-specific rollback or irreversibility behavior is not declared"
                     .to_owned(),
             );
+        } else if !self.rollback_contract_supported() {
+            gaps.push(format!(
+                "declared rollback strategy is unsupported: {}",
+                self.rollback.strategy.as_deref().unwrap_or("<missing>")
+            ));
         }
         let dynamic_api_contract = self.adapter_status == AdapterStatus::DynamicApi
             || (self.adapter_status == AdapterStatus::Blocked
@@ -369,6 +379,78 @@ impl CapabilityV1 {
             )
     }
 
+    /// Returns whether the selected adapter has an implementation for this
+    /// capability's exact verification strategy and resource shape.
+    #[must_use]
+    pub fn verification_contract_supported(&self) -> bool {
+        if !self.mutating {
+            return true;
+        }
+        if !self.verification.required {
+            return self.risk == RiskClass::SecretSensitive
+                && self.verification.strategy == "sink_write_and_source_response_status";
+        }
+
+        match self.verification.strategy.as_str() {
+            "api_token_details_match_created_id_and_active_status" => {
+                self.method == "POST"
+                    && matches!(
+                        self.id.as_str(),
+                        "account-api-tokens-create-token" | "user-api-tokens-create-token"
+                    )
+            }
+            "api_token_details_report_active_after_value_roll" => {
+                self.method == "PUT"
+                    && matches!(
+                        self.id.as_str(),
+                        "account-api-tokens-roll-token" | "user-api-tokens-roll-token"
+                    )
+            }
+            "api_token_details_returns_not_found_after_revoke" => {
+                self.method == "DELETE"
+                    && matches!(
+                        self.id.as_str(),
+                        "account-api-tokens-delete-token" | "user-api-tokens-delete-token"
+                    )
+            }
+            "dns_record_details_match_created_id_and_planned_fields" => {
+                self.method == "POST" && self.id == "dns-records-for-a-zone-create-dns-record"
+            }
+            "dns_record_details_match_planned_id_and_fields" => {
+                matches!(self.method.as_str(), "PATCH" | "PUT")
+                    && matches!(
+                        self.id.as_str(),
+                        "dns-records-for-a-zone-patch-dns-record"
+                            | "dns-records-for-a-zone-update-dns-record"
+                    )
+            }
+            "dns_record_details_returns_not_found_after_delete" => {
+                self.method == "DELETE" && self.id == "dns-records-for-a-zone-delete-dns-record"
+            }
+            "same_resource_returns_not_found_after_delete" => {
+                self.method == "DELETE" && path_targets_exact_resource(&self.path)
+            }
+            "same_resource_contains_planned_fields_after_update" => {
+                matches!(self.method.as_str(), "PATCH" | "PUT")
+                    && path_targets_exact_resource(&self.path)
+            }
+            "same_path_result_contains_planned_fields_after_update" => {
+                matches!(self.method.as_str(), "PATCH" | "PUT")
+                    && self.request_schema.as_ref().is_some_and(|schema| {
+                        schema.get("type").and_then(Value::as_str) == Some("object")
+                            && schema
+                                .get("properties")
+                                .and_then(Value::as_object)
+                                .is_some_and(|properties| !properties.is_empty())
+                    })
+            }
+            "created_resource_contains_planned_fields_by_returned_id" => {
+                self.method == "POST" && self.created_resource_contract_supported()
+            }
+            _ => false,
+        }
+    }
+
     #[must_use]
     pub fn rollback_contract_declared(&self) -> bool {
         if self.rollback.supported {
@@ -382,6 +464,52 @@ impl CapabilityV1 {
             })
         }
     }
+
+    /// Returns whether a declared automatic rollback strategy can be turned
+    /// into a separate, hash-bound compensation plan by the runtime.
+    #[must_use]
+    pub fn rollback_contract_supported(&self) -> bool {
+        if !self.mutating || !self.rollback.supported {
+            return true;
+        }
+        match self.rollback.strategy.as_deref() {
+            Some("revoke_created_api_token_by_returned_id_if_downstream_installation_fails") => {
+                self.method == "POST"
+                    && matches!(
+                        self.id.as_str(),
+                        "account-api-tokens-create-token" | "user-api-tokens-create-token"
+                    )
+            }
+            Some("delete_created_dns_record_by_returned_id") => {
+                self.method == "POST" && self.id == "dns-records-for-a-zone-create-dns-record"
+            }
+            Some("delete_created_resource_by_returned_id") => {
+                self.method == "POST" && self.created_resource_contract_supported()
+            }
+            _ => false,
+        }
+    }
+
+    fn created_resource_contract_supported(&self) -> bool {
+        self.created_resource.as_ref().is_some_and(|target| {
+            let expected_path = format!(
+                "{}/{{{}}}",
+                self.path.trim_end_matches('/'),
+                target.identity_selector
+            );
+            !target.identity_selector.is_empty()
+                && target.detail_path == expected_path
+                && target.response_result_identity_pointer == "/id"
+                && !target.read_capability_id.is_empty()
+                && !target.delete_capability_id.is_empty()
+        })
+    }
+}
+
+fn path_targets_exact_resource(path: &str) -> bool {
+    path.rsplit('/').next().is_some_and(|segment| {
+        segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2
+    })
 }
 
 fn infer_scope(path: &str) -> &'static str {

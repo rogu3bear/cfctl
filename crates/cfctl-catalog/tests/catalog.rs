@@ -450,6 +450,37 @@ fn coverage_names_every_unresolved_mutation_contract_class() {
 }
 
 #[test]
+fn coverage_names_declared_but_unsupported_runtime_contracts() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    let capability = snapshot
+        .capabilities
+        .get_mut("dns-records-delete")
+        .expect("delete capability");
+    capability.verification.strategy = "phantom_readback".to_owned();
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("phantom_restore".to_owned());
+
+    let coverage = snapshot.coverage();
+
+    assert_eq!(
+        coverage
+            .mutation_contract_gap_counts
+            .get("verification_unsupported"),
+        Some(&1)
+    );
+    assert_eq!(
+        coverage
+            .mutation_contract_gap_counts
+            .get("rollback_unsupported"),
+        Some(&1)
+    );
+    assert_eq!(
+        coverage.mutation_contract_gap_counts.get("unclassified"),
+        None
+    );
+}
+
+#[test]
 fn dns_record_crud_has_complete_operation_specific_contracts() {
     let mut document = fixture();
     document["paths"]["/zones/{zone_id}/dns_records"]["post"] = json!({

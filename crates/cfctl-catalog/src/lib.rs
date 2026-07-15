@@ -1664,8 +1664,14 @@ fn mutation_contract_gap_code(gap: &str) -> &'static str {
         "operation-specific effect classification is missing" => "effect_unknown",
         "operation-specific incremental cost is unknown" => "cost_unknown",
         "operation-specific verification is not declared" => "verification_missing",
+        _ if gap.starts_with("declared verification strategy is unsupported:") => {
+            "verification_unsupported"
+        }
         "operation-specific rollback or irreversibility behavior is not declared" => {
             "rollback_or_irreversibility_missing"
+        }
+        _ if gap.starts_with("declared rollback strategy is unsupported:") => {
+            "rollback_unsupported"
         }
         "required Cloudflare permission lane is not declared" => "permission_lane_missing",
         "account entitlement has not been resolved for this plan-gated operation" => {

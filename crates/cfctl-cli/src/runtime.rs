@@ -1982,6 +1982,21 @@ struct CompensationRequest {
     requested_account: Option<String>,
 }
 
+fn validate_compensation_contract(capability: &CapabilityV1) -> Result<()> {
+    if capability.rollback_contract_supported() {
+        return Ok(());
+    }
+    Err(CliError::Input(format!(
+        "rollback strategy `{}` is not implemented for capability `{}`; inspect live state before compensating",
+        capability
+            .rollback
+            .strategy
+            .as_deref()
+            .unwrap_or("<missing>"),
+        capability.id
+    )))
+}
+
 fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
     if !matches!(
         plan.status,
@@ -1990,6 +2005,7 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
     {
         return Ok(None);
     }
+    validate_compensation_contract(&plan.capability)?;
     let Some(artifact) = plan.transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
     else {
         return Ok(None);
@@ -3384,9 +3400,19 @@ fn guide_stage_document(
         {
             "blocked"
         }
+        GuideStage::Verify
+            if !capability.verification_contract_declared()
+                || !capability.verification_contract_supported() =>
+        {
+            "blocked"
+        }
         GuideStage::Verify if !capability.verification.required => "not_applicable",
-        GuideStage::Verify if !capability.verification_contract_declared() => "blocked",
-        GuideStage::Rectify if !capability.rollback_contract_declared() => "blocked",
+        GuideStage::Rectify
+            if !capability.rollback_contract_declared()
+                || !capability.rollback_contract_supported() =>
+        {
+            "blocked"
+        }
         GuideStage::CloseWithEvidence if capability.mutating && !contract_ready => "blocked",
         _ => "available",
     };
@@ -4090,7 +4116,8 @@ mod tests {
         account_token.risk = RiskClass::SecretSensitive;
         account_token.effect = cfctl_core::EffectClass::IdentityOrOwnership;
         account_token.cost.known = true;
-        account_token.verification.strategy = "token_details_report_active".to_owned();
+        account_token.verification.strategy =
+            "api_token_details_match_created_id_and_active_status".to_owned();
         account_token.rollback.warning =
             Some("revoke the new token if installation fails".to_owned());
         account_token.permissions = vec!["API Tokens Write".to_owned()];
