@@ -85,6 +85,12 @@ fn multi_repository_fixture_covers_iac_kinds_and_exact_git_state() {
     )
     .expect("dirty config");
     fs::write(wrangler_toml.join("untracked.txt"), "local work\n").expect("untracked file");
+    fs::write(
+        terraform.join("main.tf"),
+        "resource \"cloudflare_dns_record\" \"api\" {\n  zone_id = \"zone-1\"\n  name = \"api.example.com\"\n  type = \"A\"\n  content = \"198.51.100.2\"\n}\n",
+    )
+    .expect("staged Terraform edit");
+    run_git(&terraform, &["add", "main.tf"]);
 
     let graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
         .expect("multi-repository discovery");
@@ -131,6 +137,29 @@ fn multi_repository_fixture_covers_iac_kinds_and_exact_git_state() {
     );
     assert!(config.worktree_diff_hash.is_some());
 
+    let staged = graph
+        .repositories
+        .iter()
+        .find(|repository| repository.name == "terraform")
+        .expect("staged repository");
+    assert!(staged.git.dirty);
+    assert!(staged.git.changes.iter().any(|change| {
+        change.path == Path::new("main.tf")
+            && change.index_status == "M"
+            && change.worktree_status == " "
+    }));
+    let staged_config = staged
+        .configs
+        .iter()
+        .find(|config| config.path.ends_with("main.tf"))
+        .expect("staged config inventory");
+    assert!(staged_config.dirty);
+    assert_ne!(
+        staged_config.content_hash,
+        staged_config.head_content_hash.as_deref().unwrap()
+    );
+    assert!(staged_config.worktree_diff_hash.is_some());
+
     let impact = graph.impact_for(&["hostname:changed.example.com".to_owned()]);
     assert!(impact.has_dirty_overlap);
     assert!(!impact.has_unmanaged_dependencies);
@@ -147,6 +176,169 @@ fn multi_repository_fixture_covers_iac_kinds_and_exact_git_state() {
         unmanaged.unmanaged_resources,
         vec!["hostname:unmanaged.example.com"]
     );
+}
+
+#[test]
+fn terraform_json_resources_and_data_sources_enter_the_dependency_graph() {
+    let root = tempfile::tempdir().expect("workspace root");
+    let repository = root.path().join("terraform-json");
+    init_repo(
+        &repository,
+        "main.tf.json",
+        r#"{
+  "resource": {
+    "cloudflare_dns_record": {
+      "api": {"zone_id":"zone-1","name":"api.example.com","type":"A","content":"192.0.2.1"}
+    }
+  },
+  "data": {
+    "cloudflare_zone": {
+      "primary": {"name":"example.com"}
+    }
+  }
+}
+"#,
+    );
+
+    let graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
+        .expect("Terraform JSON discovery");
+
+    assert!(graph.resources.iter().any(|resource| {
+        resource.key == "terraform:cloudflare_dns_record.api" && resource.kind == "terraform"
+    }));
+    assert!(graph.resources.iter().any(|resource| {
+        resource.key == "terraform:cloudflare_zone.primary" && resource.kind == "terraform_data"
+    }));
+}
+
+#[test]
+fn supported_iac_fixture_matrix_preserves_cross_repository_identity_and_untracked_state() {
+    let root = tempfile::tempdir().expect("workspace root");
+    let service_a = root.path().join("team-a/service");
+    let service_b = root.path().join("team-b/service");
+    let wrangler_jsonc = root.path().join("wrangler-jsonc");
+    let terraform_hcl = root.path().join("terraform-hcl");
+    let terraform_json = root.path().join("terraform-json");
+    let pulumi_project = root.path().join("pulumi-yaml");
+    let pulumi_stack = root.path().join("pulumi-yml");
+    let untracked = root.path().join("untracked-config");
+    let configless = root.path().join("configless");
+
+    init_repo(
+        &service_a,
+        "wrangler.toml",
+        "name = \"service-a\"\nroutes = [{ pattern = \"shared.example.com/*\", zone_name = \"example.com\" }]\n",
+    );
+    init_repo(
+        &service_b,
+        "wrangler.json",
+        "{\"name\":\"service-b\",\"routes\":[{\"pattern\":\"shared.example.com/*\",\"zone_name\":\"example.com\"}]}\n",
+    );
+    init_repo(
+        &wrangler_jsonc,
+        "wrangler.jsonc",
+        "{\n  // all supported JSONC features\n  \"name\": \"jsonc-worker\",\n  \"kv_namespaces\": [{\"binding\":\"CACHE\",\"id\":\"kv-1\"}],\n}\n",
+    );
+    init_repo(
+        &terraform_hcl,
+        "main.tf",
+        "data \"cloudflare_zone\" \"primary\" {\n  name = \"example.com\"\n}\n",
+    );
+    init_repo(
+        &terraform_json,
+        "main.tf.json",
+        "{\"resource\":{\"cloudflare_r2_bucket\":{\"assets\":{\"name\":\"assets\"}}}}\n",
+    );
+    init_repo(
+        &pulumi_project,
+        "Pulumi.yaml",
+        "name: yaml-stack\nruntime: yaml\nresources:\n  queue:\n    type: cloudflare:Queue\n",
+    );
+    init_repo(
+        &pulumi_stack,
+        "Pulumi.prod.yml",
+        "name: yml-stack\nruntime: yaml\nresources:\n  worker:\n    type: cloudflare:WorkersScript\n",
+    );
+    init_repo(
+        &untracked,
+        "README.md",
+        "The Cloudflare config is intentionally untracked.\n",
+    );
+    fs::write(
+        untracked.join("wrangler.json"),
+        "{\"name\":\"untracked-worker\"}\n",
+    )
+    .expect("untracked Cloudflare config");
+    init_repo(&configless, "README.md", "No Cloudflare configuration.\n");
+
+    let graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
+        .expect("supported IaC matrix discovery");
+
+    assert_eq!(graph.repositories.len(), 9);
+    assert_eq!(
+        graph
+            .repositories
+            .iter()
+            .filter(|repository| repository.name == "service")
+            .count(),
+        2
+    );
+    for (key, kind) in [
+        ("worker:service-a", "wrangler_worker"),
+        ("worker:service-b", "wrangler_worker"),
+        ("kv_namespace:kv-1", "wrangler_kv"),
+        ("terraform:cloudflare_zone.primary", "terraform_data"),
+        ("terraform:cloudflare_r2_bucket.assets", "terraform"),
+        ("pulumi:cloudflare:Queue.queue", "pulumi"),
+        ("pulumi:cloudflare:WorkersScript.worker", "pulumi"),
+        ("worker:untracked-worker", "wrangler_worker"),
+    ] {
+        assert!(
+            graph
+                .resources
+                .iter()
+                .any(|resource| resource.key == key && resource.kind == kind),
+            "missing {kind} resource {key}"
+        );
+    }
+
+    let shared = graph.impact_for(&["hostname:shared.example.com".to_owned()]);
+    assert_eq!(shared.affected_repositories.len(), 2);
+    let first_service_root = service_a.canonicalize().expect("canonical service A");
+    let second_service_root = service_b.canonicalize().expect("canonical service B");
+    assert!(
+        shared
+            .affected_repositories
+            .iter()
+            .any(|repository| repository == &first_service_root.display().to_string())
+    );
+    assert!(
+        shared
+            .affected_repositories
+            .iter()
+            .any(|repository| repository == &second_service_root.display().to_string())
+    );
+
+    let untracked_canonical = untracked.canonicalize().expect("canonical untracked repo");
+    let untracked_repository = graph
+        .repositories
+        .iter()
+        .find(|repository| repository.path == untracked_canonical)
+        .expect("untracked repository");
+    let untracked_config = untracked_repository
+        .configs
+        .iter()
+        .find(|config| config.path.ends_with("wrangler.json"))
+        .expect("untracked config");
+    assert!(untracked_config.dirty);
+    assert!(untracked_config.head_content_hash.is_none());
+    assert!(untracked_config.worktree_diff_hash.is_some());
+    let configless_canonical = configless
+        .canonicalize()
+        .expect("canonical configless repo");
+    assert!(graph.repositories.iter().any(|repository| {
+        repository.path == configless_canonical && repository.cloudflare_configs.is_empty()
+    }));
 }
 
 fn init_repo(path: &Path, config_name: &str, content: &str) {

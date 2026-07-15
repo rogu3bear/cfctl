@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use cfctl_core::{CapabilityV1, EvidenceClass, PlanV1};
+use cfctl_core::{CapabilityV1, EvidenceClass, PlanV1, TransactionStageV1};
 use cfctl_storage::{RuntimePaths, StateStore, StorageError};
 use serde_json::json;
 
@@ -125,4 +125,87 @@ fn plan_locks_are_exclusive_and_expired_crash_locks_are_reclaimed() {
             .expect("stale lock reclaimed"),
     );
     assert!(!lock_path.exists());
+}
+
+#[test]
+fn crash_injection_matrix_recovers_the_last_durable_transaction_stage() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let mut store = StateStore::open(paths.clone()).expect("storage opens");
+    let capability = CapabilityV1::new(
+        "account-api-tokens-create-token",
+        "Create account token",
+        "POST",
+        "/accounts/{account_id}/tokens",
+    );
+    let mut durable = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "sha256:catalog",
+        capability,
+        json!({"account_id":"account-a"}),
+    )
+    .expect("plan");
+    store.save_plan(&durable).expect("initial checkpoint");
+
+    for next_stage in [
+        TransactionStageV1::ApprovalPersisted,
+        TransactionStageV1::ConsumptionPersisted,
+        TransactionStageV1::BoundaryAttemptPersisted,
+        TransactionStageV1::BoundaryResponsePersisted,
+        TransactionStageV1::SecretSinkPersisted,
+        TransactionStageV1::VerificationAttemptPersisted,
+        TransactionStageV1::VerificationResponsePersisted,
+        TransactionStageV1::CompensationAttemptPersisted,
+        TransactionStageV1::CompensationResponsePersisted,
+        TransactionStageV1::Closed,
+    ] {
+        let persisted_stage = durable.transaction_stage;
+        let mut volatile = durable.clone();
+        advance_transaction(&mut volatile, next_stage);
+        drop(volatile);
+        drop(store);
+
+        store = StateStore::open(paths.clone()).expect("storage reopens after injected crash");
+        let recovered = store
+            .load_plan(&durable.operation_id)
+            .expect("last durable plan reloads");
+        recovered
+            .validate_transaction_journal()
+            .expect("recovered journal validates");
+        assert_eq!(recovered.transaction_stage, persisted_stage);
+
+        advance_transaction(&mut durable, next_stage);
+        store
+            .save_plan(&durable)
+            .expect("next stage becomes durable");
+        drop(store);
+        store = StateStore::open(paths.clone()).expect("storage reopens after durable stage");
+        durable = store
+            .load_plan(&durable.operation_id)
+            .expect("durable stage reloads");
+        durable
+            .validate_transaction_journal()
+            .expect("durable journal validates");
+        assert_eq!(durable.transaction_stage, next_stage);
+    }
+}
+
+fn advance_transaction(plan: &mut PlanV1, stage: TransactionStageV1) {
+    match stage {
+        TransactionStageV1::ApprovalPersisted => plan.approve(true, None).expect("approve"),
+        TransactionStageV1::ConsumptionPersisted => plan.mark_consumed().expect("consume"),
+        TransactionStageV1::BoundaryResponsePersisted
+        | TransactionStageV1::SecretSinkPersisted
+        | TransactionStageV1::VerificationResponsePersisted
+        | TransactionStageV1::CompensationResponsePersisted => plan
+            .record_transaction_stage_with_artifact(
+                stage,
+                json!({"stage":stage.as_str(),"receipt_hash":"sha256:fixture"}),
+            )
+            .expect("artifact checkpoint"),
+        _ => plan
+            .record_transaction_stage(stage)
+            .expect("transaction checkpoint"),
+    }
 }

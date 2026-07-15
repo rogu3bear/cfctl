@@ -35,16 +35,22 @@ searchable and explain every missing contract field.
 
 Workspace discovery never scans outside explicitly registered roots. It finds
 configless Git repositories and parses Wrangler TOML/JSONC, Terraform, and
-Pulumi files while excluding generated and vendor directories. Resource links
+Pulumi files while excluding generated and vendor directories. The exact
+supported representations are Wrangler TOML/JSON/JSONC, Terraform HCL/JSON,
+and Pulumi YAML. Resource links
 use canonical absolute repository paths, and every source-config snapshot
 records the current hash, `HEAD` hash, exact worktree-diff hash, and dirty
-status.
+status. The supported-IaC fixture matrix exercises all of those formats plus
+staged, unstaged, and untracked state, duplicate repository basenames, and
+cross-repository resource impact.
 
 `PlanV1` carries a hash-chained transaction journal. Checkpoints distinguish
 the point before a Cloudflare boundary from the persisted response, secret
 sink, and operation-specific verification. A network failure after a boundary
 attempt therefore enters rectification and cannot be mistaken for a safe
-retry.
+retry. The storage crash matrix drops volatile state and reopens the real local
+store between each journal transition, proving recovery at every persisted
+stage; it does not claim account-backed network mutation proof.
 
 ## Trust sequence
 

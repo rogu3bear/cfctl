@@ -126,7 +126,9 @@ approval. A hash-chained transaction journal persists the reviewed plan,
 approval, consumption, adapter boundary, secret sink, verification, and close
 checkpoints. Apply, sink, and verification checkpoints bind non-secret receipt
 hashes, so changing a returned resource ID or evidence hash invalidates the
-journal; a plan durably consumed before a crash cannot be replayed.
+journal; a plan durably consumed before a crash cannot be replayed. The local
+durability suite reopens the state store after an injected crash between every
+journal transition and proves recovery stops at the last persisted checkpoint.
 
 When a token-creation receipt proves the returned resource ID and the catalog
 declares revocation as its rollback, `plans rectify` can derive a separate
@@ -170,10 +172,13 @@ cfctl workspace audit --json
 ```
 
 Discovery inventories Git repositories even when they contain no Cloudflare
-configuration. Wrangler TOML/JSONC, Terraform, and Pulumi configurations are
-linked to catalog targets with current-content, `HEAD`-content, and exact
+configuration. Supported files include Wrangler TOML/JSON/JSONC, Terraform
+HCL/JSON, and Pulumi YAML. Each is linked to catalog targets with
+current-content, `HEAD`-content, and exact
 worktree-diff hashes so dirty or unmanaged dependencies remain visible in a
-plan.
+plan. The fixture matrix includes staged, unstaged, and untracked configuration,
+configless repositories, and duplicate repository basenames without collapsing
+their canonical identities.
 
 Install managed instructions for detected local agents:
 

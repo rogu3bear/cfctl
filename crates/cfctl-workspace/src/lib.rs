@@ -490,6 +490,17 @@ fn resources_from_config(path: &Path, kind: &str, content: &[u8]) -> Vec<Resourc
         "wrangler_json" => serde_json::from_str::<Value>(&strip_jsonc(&text))
             .ok()
             .map_or_else(Vec::new, |value| resources_from_wrangler(path, &value)),
+        "terraform"
+            if path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.to_ascii_lowercase().ends_with(".tf.json")) =>
+        {
+            serde_json::from_slice::<Value>(content).map_or_else(
+                |_| Vec::new(),
+                |document| resources_from_terraform_json(path, &document),
+            )
+        }
         "terraform" => resources_from_terraform(path, &text),
         "pulumi" => serde_yaml::from_str::<serde_yaml::Value>(&text)
             .ok()
@@ -619,6 +630,33 @@ fn resources_from_terraform(path: &Path, content: &str) -> Vec<ResourceNode> {
             category,
             format!("terraform:{}.{}", quoted[0], quoted[1]),
         );
+    }
+    resources
+}
+
+fn resources_from_terraform_json(path: &Path, document: &Value) -> Vec<ResourceNode> {
+    let mut resources = Vec::new();
+    for (block, kind) in [("resource", "terraform"), ("data", "terraform_data")] {
+        let Some(resource_types) = document.get(block).and_then(Value::as_object) else {
+            continue;
+        };
+        for (resource_type, instances) in resource_types {
+            if !resource_type.starts_with("cloudflare_") {
+                continue;
+            }
+            for name in instances
+                .as_object()
+                .into_iter()
+                .flat_map(serde_json::Map::keys)
+            {
+                push_resource(
+                    &mut resources,
+                    path,
+                    kind,
+                    format!("terraform:{resource_type}.{name}"),
+                );
+            }
+        }
     }
     resources
 }
