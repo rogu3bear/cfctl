@@ -3382,10 +3382,8 @@ fn zone_access_service_token_fixture() -> serde_json::Value {
     detail["delete"]["operationId"] =
         json!("zone-level-access-service-tokens-delete-a-service-token");
     detail["delete"]["tags"] = json!(["Zone-Level Access service tokens"]);
-    detail
-        .as_object_mut()
-        .expect("service-token detail operations")
-        .remove("put");
+    detail["put"]["operationId"] = json!("zone-level-access-service-tokens-update-a-service-token");
+    detail["put"]["tags"] = json!(["Zone-Level Access service tokens"]);
 
     paths.clear();
     paths.insert(
@@ -3670,6 +3668,81 @@ fn zone_access_service_token_creation_rejects_authority_and_schema_drift() {
     secret["components"]["schemas"]["ServiceToken"]["properties"]["client_secret"]["type"] =
         json!("integer");
     assert!(blocked(secret));
+}
+
+#[test]
+fn zone_access_service_token_update_excludes_rotation_controls_and_reads_back_metadata() {
+    let snapshot = normalize_openapi(&zone_access_service_token_fixture())
+        .expect("zone Access service-token catalog");
+    let update = snapshot
+        .get("zone-level-access-service-tokens-update-a-service-token")
+        .expect("zone Access service-token update");
+
+    assert_eq!(update.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(update.risk, RiskClass::IdentityOrOwnership);
+    assert_eq!(update.effect, EffectClass::IdentityOrOwnership);
+    assert!(update.cost.known);
+    assert_eq!(update.entitlement.available, Some(true));
+    assert_eq!(
+        update.verification.strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+    let readback = update
+        .same_path_read
+        .as_ref()
+        .expect("zone service-token update readback");
+    assert_eq!(
+        readback.path,
+        "/zones/{zone_id}/access/service_tokens/{service_token_id}"
+    );
+    assert_eq!(
+        readback.read_capability_id,
+        "zone-level-access-service-tokens-get-a-service-token"
+    );
+    assert_eq!(readback.verified_response_fields, ["duration", "name"]);
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .expect("narrow zone update schema"),
+        &json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{
+                "duration":{"type":"string"},
+                "name":{"type":"string"}
+            },
+            "x-cfctl-body-required":true
+        })
+    );
+    assert!(!update.rollback.supported);
+    assert!(update.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("exact prior expiration") && warning.contains("separately reviewed")
+    }));
+    assert!(update.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn zone_access_service_token_update_rejects_authority_and_schema_drift() {
+    let update_is_blocked = |document: serde_json::Value| {
+        normalize_openapi(&document)
+            .expect("drifted zone Access service-token catalog")
+            .get("zone-level-access-service-tokens-update-a-service-token")
+            .expect("zone Access service-token update")
+            .adapter_status
+            == AdapterStatus::Blocked
+    };
+
+    let mut permission = zone_access_service_token_fixture();
+    permission["paths"]["/zones/{zone_id}/access/service_tokens/{service_token_id}"]["put"]["x-api-token-group"] =
+        json!(["Account Settings Write"]);
+    assert!(update_is_blocked(permission));
+
+    let mut request = zone_access_service_token_fixture();
+    request["paths"]["/zones/{zone_id}/access/service_tokens/{service_token_id}"]["put"]["requestBody"]
+        ["content"]["application/json"]["schema"]["properties"]["client_secret_version"]["type"] =
+        json!("string");
+    assert!(update_is_blocked(request));
 }
 
 #[test]

@@ -81,11 +81,13 @@ fields, and writes only `client_id` and `client_secret` as one mode-0600 JSON
 object. The same-scope exact resource readback proves the returned ID, name,
 and duration, but never claims to re-read the one-time secret.
 
-Service-token update accepts only observable `name` and `duration` fields.
-Secret-version and prior-secret-expiration inputs stay outside that generic
-update path because they change credential cutover state. Exact field readback
-proves the requested metadata, while the irreversible expiration-clock reset is
-called out instead of being mislabeled as automatically restorable.
+Account- and zone-scoped service-token updates are distinct exact
+operation/path/product/selector contracts. Both accept only observable `name`
+and `duration` fields. Secret-version and prior-secret-expiration inputs stay
+outside that metadata-update path because they change credential cutover state.
+Exact same-scope field readback proves the requested metadata, while the
+irreversible expiration-clock reset is called out instead of being mislabeled
+as automatically restorable.
 
 Service-token refresh is an operation-specific irreversible verifier, not a
 generic successful-POST check. The apply response and exact detail readback

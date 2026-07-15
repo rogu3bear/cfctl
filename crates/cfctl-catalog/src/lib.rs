@@ -4332,6 +4332,13 @@ struct AccessServiceTokenCreateContract {
     description: &'static str,
 }
 
+struct AccessServiceTokenUpdateContract {
+    id: &'static str,
+    detail_path: &'static str,
+    product: &'static str,
+    scope_selector: &'static str,
+}
+
 const ACCESS_SERVICE_TOKEN_CREATE_CONTRACTS: &[AccessServiceTokenCreateContract] = &[
     AccessServiceTokenCreateContract {
         id: ACCOUNT_ACCESS_SERVICE_TOKEN_CREATE_CAPABILITY_ID,
@@ -4352,6 +4359,21 @@ const ACCESS_SERVICE_TOKEN_CREATE_CONTRACTS: &[AccessServiceTokenCreateContract]
         read_id: "zone-level-access-service-tokens-get-a-service-token",
         delete_id: "zone-level-access-service-tokens-delete-a-service-token",
         description: "Generates a new service token. **Note:** This is the only time you can get the Client Secret. If you lose the Client Secret, you will have to create a new service token.",
+    },
+];
+
+const ACCESS_SERVICE_TOKEN_UPDATE_CONTRACTS: &[AccessServiceTokenUpdateContract] = &[
+    AccessServiceTokenUpdateContract {
+        id: "access-service-tokens-update-a-service-token",
+        detail_path: ACCESS_SERVICE_TOKEN_DETAIL_PATH,
+        product: "Access service tokens",
+        scope_selector: "account_id",
+    },
+    AccessServiceTokenUpdateContract {
+        id: "zone-level-access-service-tokens-update-a-service-token",
+        detail_path: "/zones/{zone_id}/access/service_tokens/{service_token_id}",
+        product: "Zone-Level Access service tokens",
+        scope_selector: "zone_id",
     },
 ];
 
@@ -4412,18 +4434,25 @@ fn apply_access_service_token_commercial_contract(capability: &mut CapabilityV1)
 }
 
 fn access_service_token_update_contract_supported(capability: &CapabilityV1) -> bool {
-    capability.id == "access-service-tokens-update-a-service-token"
-        && capability.method == "PUT"
-        && capability.path == ACCESS_SERVICE_TOKEN_DETAIL_PATH
-        && capability.product == "Access service tokens"
-        && capability.permissions == ["Access: Service Tokens Write"]
-        && capability.description.as_deref() == Some("Updates a configured service token.")
-        && access_service_token_detail_selectors_supported(capability, "account_id")
-        && access_service_token_source_update_request_supported(capability)
-        && access_service_token_response_contract_supported(
-            capability.response_contract.as_ref(),
-            "200",
-        )
+    ACCESS_SERVICE_TOKEN_UPDATE_CONTRACTS
+        .iter()
+        .any(|contract| {
+            capability.id == contract.id
+                && capability.method == "PUT"
+                && capability.path == contract.detail_path
+                && capability.product == contract.product
+                && capability.permissions == ["Access: Service Tokens Write"]
+                && capability.description.as_deref() == Some("Updates a configured service token.")
+                && access_service_token_detail_selectors_supported(
+                    capability,
+                    contract.scope_selector,
+                )
+                && access_service_token_source_update_request_supported(capability)
+                && access_service_token_response_contract_supported(
+                    capability.response_contract.as_ref(),
+                    "200",
+                )
+        })
 }
 
 fn classify_access_service_token_update(capability: &mut CapabilityV1) {

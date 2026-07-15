@@ -188,13 +188,14 @@ plan. The published account-level rotate endpoint remains blocked because
 Cloudflare's current operation schema does not declare its required permission
 lane; cfctl does not borrow authority from either create operation.
 
-Updating an Access service token is similarly narrowed to `name` and
+Account- and zone-scoped Access service-token updates are separate exact
+operation/path/product/selector contracts, each narrowed to `name` and
 `duration`. cfctl excludes `client_secret_version`, which Cloudflare documents
 as a rotation trigger, and `previous_client_secret_expires_at`, which changes
-the old-secret grace period. The exact token is read back after update. Because
-changing duration resets expiration relative to the update, cfctl does not
-claim it can restore the exact prior expiration; any corrective update is a
-separate reviewed plan.
+the old-secret grace period. The exact same-scope token is read back after
+update. Because changing duration resets expiration relative to the update,
+cfctl does not claim it can restore the exact prior expiration; any corrective
+update is a separate reviewed plan.
 
 Refreshing an Access service token is a separate, body-free irreversible lane.
 Cloudflare documents it as a one-year lifetime extension relative to refresh

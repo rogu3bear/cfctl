@@ -178,6 +178,15 @@ printf '%s' '{"name":"deployment automation","duration":"17520h"}' | \
     --selector service_token_id=<service-token-id> --body-stdin --json
 ```
 
+For a zone-scoped token, use the distinct zone operation and selector:
+
+```bash
+printf '%s' '{"name":"zone deployment automation","duration":"17520h"}' | \
+  cfctl call zone-level-access-service-tokens-update-a-service-token \
+    --selector zone_id=<zone-id> \
+    --selector service_token_id=<service-token-id> --body-stdin --json
+```
+
 cfctl reads the exact token back and compares every planned field. It rejects
 `client_secret_version` and `previous_client_secret_expires_at`: Cloudflare
 documents those as secret-rotation and old-secret grace controls. A duration
