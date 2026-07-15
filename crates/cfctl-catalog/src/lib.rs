@@ -3291,6 +3291,7 @@ fn mutation_contract_gap_code(gap: &str) -> &'static str {
             "entitlement_unresolved"
         }
         _ if gap.starts_with("operation-specific cost is not bounded;") => "cost_unbounded",
+        _ if gap.starts_with("known incremental cost has no ") => "cost_invalid",
         _ => "unclassified",
     }
 }

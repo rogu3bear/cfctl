@@ -1316,6 +1316,30 @@ fn coverage_names_every_unresolved_mutation_contract_class() {
 }
 
 #[test]
+fn coverage_classifies_malformed_known_incremental_costs() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    let capability = snapshot
+        .capabilities
+        .get_mut("dns-records-delete")
+        .expect("delete capability");
+    capability.cost.incremental = true;
+    capability.cost.known = true;
+    capability.cost.currency = Some("USD".to_owned());
+    capability.cost.maximum = Some(f64::INFINITY);
+
+    let coverage = snapshot.coverage();
+
+    assert_eq!(
+        coverage.mutation_contract_gap_counts.get("cost_invalid"),
+        Some(&1)
+    );
+    assert_eq!(
+        coverage.mutation_contract_gap_counts.get("unclassified"),
+        None
+    );
+}
+
+#[test]
 fn coverage_names_declared_but_unsupported_runtime_contracts() {
     let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
     let capability = snapshot

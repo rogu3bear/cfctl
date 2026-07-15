@@ -486,6 +486,18 @@ impl CapabilityV1 {
                         .join(", ")
                 ));
             }
+        } else if self.cost.incremental {
+            if !self
+                .cost
+                .currency
+                .as_deref()
+                .is_some_and(valid_currency_code)
+            {
+                gaps.push("known incremental cost has no valid three-letter currency".to_owned());
+            }
+            if !self.cost.maximum.is_some_and(valid_non_negative_amount) {
+                gaps.push("known incremental cost has no finite non-negative maximum".to_owned());
+            }
         }
         if !self.verification_contract_declared() {
             gaps.push("operation-specific verification is not declared".to_owned());
@@ -1734,7 +1746,7 @@ fn validate_money(money: &MoneyV1) -> std::result::Result<(), String> {
 }
 
 fn validate_money_fields(currency: &str, amount: f64) -> std::result::Result<(), String> {
-    if currency.len() != 3 || !currency.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+    if !valid_currency_code(currency) {
         return Err("currency must be a three-letter ASCII code".to_owned());
     }
     if !amount.is_finite() {
@@ -1744,6 +1756,14 @@ fn validate_money_fields(currency: &str, amount: f64) -> std::result::Result<(),
         return Err("amount must not be negative".to_owned());
     }
     Ok(())
+}
+
+fn valid_currency_code(currency: &str) -> bool {
+    currency.len() == 3 && currency.bytes().all(|byte| byte.is_ascii_alphabetic())
+}
+
+fn valid_non_negative_amount(amount: f64) -> bool {
+    amount.is_finite() && amount >= 0.0
 }
 
 pub fn hash_value(value: &Value) -> Result<String> {

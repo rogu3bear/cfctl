@@ -67,6 +67,63 @@ fn mutation_contract_gaps_name_every_missing_execution_guard() {
 }
 
 #[test]
+fn known_incremental_cost_requires_a_valid_executable_ceiling() {
+    let mut capability = CapabilityV1::new(
+        "paid.widgets.create",
+        "Create a paid widget",
+        "POST",
+        "/accounts/{account_id}/widgets",
+    );
+    capability.cost.incremental = true;
+    capability.cost.known = true;
+
+    for (currency, maximum, expected) in [
+        (
+            None,
+            Some(10.0),
+            "known incremental cost has no valid three-letter currency",
+        ),
+        (
+            Some("US".to_owned()),
+            Some(10.0),
+            "known incremental cost has no valid three-letter currency",
+        ),
+        (
+            Some("USD".to_owned()),
+            None,
+            "known incremental cost has no finite non-negative maximum",
+        ),
+        (
+            Some("USD".to_owned()),
+            Some(f64::NAN),
+            "known incremental cost has no finite non-negative maximum",
+        ),
+        (
+            Some("USD".to_owned()),
+            Some(-1.0),
+            "known incremental cost has no finite non-negative maximum",
+        ),
+    ] {
+        capability.cost.currency = currency;
+        capability.cost.maximum = maximum;
+        assert!(
+            capability
+                .mutation_contract_gaps()
+                .contains(&expected.to_owned())
+        );
+    }
+
+    capability.cost.currency = Some("usd".to_owned());
+    capability.cost.maximum = Some(10.0);
+    assert!(
+        capability
+            .mutation_contract_gaps()
+            .iter()
+            .all(|gap| !gap.starts_with("known incremental cost"))
+    );
+}
+
+#[test]
 fn mutation_contracts_reject_declared_but_unimplemented_strategies() {
     let mut capability = CapabilityV1::new(
         "widgets.create",
