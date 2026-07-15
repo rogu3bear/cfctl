@@ -2259,9 +2259,14 @@ fn boundary_response_artifact(
         .capability
         .created_resource
         .as_ref()
-        .map_or("/id", |target| {
-            target.response_result_identity_pointer.as_str()
-        });
+        .map(|target| target.response_result_identity_pointer.as_str())
+        .or_else(|| {
+            plan.capability
+                .created_collection_resource
+                .as_ref()
+                .map(|target| target.response_result_identity_pointer.as_str())
+        })
+        .unwrap_or("/id");
     json!({
         "apply_evidence_hash": apply_evidence.content_hash,
         "http_status": response.status,
@@ -2620,28 +2625,7 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
             {
                 return Ok(None);
             }
-            let Some(target) = plan.capability.created_resource.as_ref() else {
-                return Err(CliError::Input(
-                    "the rollback strategy names created-resource deletion, but the hash-bound resource target is absent"
-                        .to_owned(),
-                ));
-            };
-            let input: CallInput = serde_json::from_value(plan.input.clone())?;
-            let mut selectors = input.selectors.as_object().cloned().ok_or_else(|| {
-                CliError::Input(
-                    "the creation receipt is valid, but its source selectors are not an object; inspect live resource state before compensating"
-                        .to_owned(),
-                )
-            })?;
-            selectors.insert(
-                target.identity_selector.clone(),
-                Value::String(resource_id.to_owned()),
-            );
-            (
-                target.delete_capability_id.clone(),
-                target.detail_path.clone(),
-                Value::Object(selectors),
-            )
+            generic_created_resource_compensation(plan, resource_id)?
         }
     };
     Ok(Some(CompensationRequest {
@@ -2655,6 +2639,52 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
         },
         requested_account: Some(plan.account_id.clone()),
     }))
+}
+
+fn generic_created_resource_compensation(
+    plan: &PlanV1,
+    resource_id: &str,
+) -> Result<(String, String, Value)> {
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let mut selectors = input.selectors.as_object().cloned().ok_or_else(|| {
+        CliError::Input(
+            "the creation receipt is valid, but its source selectors are not an object; inspect live resource state before compensating"
+                .to_owned(),
+        )
+    })?;
+    let (identity_selector, delete_capability_id, expected_path) = if let Some(target) =
+        plan.capability.created_resource.as_ref()
+    {
+        (
+            target.identity_selector.as_str(),
+            target.delete_capability_id.clone(),
+            target.detail_path.clone(),
+        )
+    } else if let Some(target) = plan.capability.created_collection_resource.as_ref() {
+        (
+            target.identity_selector.as_str(),
+            target.delete_capability_id.clone(),
+            format!(
+                "{}/{{{}}}",
+                target.collection_path.trim_end_matches('/'),
+                target.identity_selector
+            ),
+        )
+    } else {
+        return Err(CliError::Input(
+                "the rollback strategy names created-resource deletion, but the hash-bound resource target is absent"
+                    .to_owned(),
+            ));
+    };
+    selectors.insert(
+        identity_selector.to_owned(),
+        Value::String(resource_id.to_owned()),
+    );
+    Ok((
+        delete_capability_id,
+        expected_path,
+        Value::Object(selectors),
+    ))
 }
 
 async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
@@ -4477,8 +4507,9 @@ mod tests {
     use cfctl_catalog::CatalogSnapshot;
     use cfctl_cloudflare::CloudflareResponseV1;
     use cfctl_core::{
-        AdapterStatus, CapabilityV1, CreatedResourceContractV1, EffectClass, PlanStatus, PlanV1,
-        RiskClass, SelectorV1, TransactionStageV1, hash_value,
+        AdapterStatus, CapabilityV1, CreatedCollectionResourceContractV1,
+        CreatedResourceContractV1, EffectClass, PlanStatus, PlanV1, RiskClass, SelectorV1,
+        TransactionStageV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::Utc;
@@ -5276,6 +5307,72 @@ mod tests {
             response_result_identity_pointer: "/id".to_owned(),
             read_capability_id: "widgets-get".to_owned(),
             delete_capability_id: "widgets-delete".to_owned(),
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            query: json!({"mutation_mode":"secret-like-query"}),
+            body: Some(json!({"name":"secret-like-widget"})),
+            if_match: Some("mutation-etag".to_owned()),
+            ..CallInput::default()
+        })
+        .expect("call input");
+        plan.refresh_hash().expect("bind call input");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"resource_id":"widget-id","success":true}),
+        )
+        .expect("response receipt");
+        plan.status = PlanStatus::RectificationRequired;
+
+        let request = compensation_request(&plan)
+            .expect("request resolves")
+            .expect("compensation is supported");
+
+        assert_eq!(request.capability_id, "widgets-delete");
+        assert_eq!(
+            request.expected_path,
+            "/accounts/{account_id}/widgets/{widget_id}"
+        );
+        assert_eq!(request.input.selectors["account_id"], "account-a");
+        assert_eq!(request.input.selectors["widget_id"], "widget-id");
+        assert_eq!(request.input.query, json!({}));
+        assert!(request.input.body.is_none());
+        assert!(request.input.if_match.is_none());
+        assert!(request.input.if_none_match.is_none());
+        assert_eq!(request.requested_account.as_deref(), Some("account-a"));
+    }
+
+    #[test]
+    fn collection_backed_creation_rectification_builds_an_exact_hash_bound_delete() {
+        let mut capability = CapabilityV1::new(
+            "widgets-create",
+            "Create Widget",
+            "POST",
+            "/accounts/{account_id}/widgets",
+        );
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.created_collection_resource = Some(CreatedCollectionResourceContractV1 {
+            collection_path: "/accounts/{account_id}/widgets".to_owned(),
+            identity_selector: "widget_id".to_owned(),
+            response_result_identity_pointer: "/id".to_owned(),
+            response_item_identity_pointer: "/id".to_owned(),
+            read_capability_id: "widgets-list".to_owned(),
+            delete_capability_id: "widgets-delete".to_owned(),
+            verified_response_fields: vec!["name".to_owned()],
+            requires_page_number_completion: true,
         });
         let mut plan = PlanV1::draft(
             "profile-a",

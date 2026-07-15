@@ -203,6 +203,27 @@ pub struct CreatedResourceContractV1 {
     pub delete_capability_id: String,
 }
 
+/// Hash-bound coordinates for proving and compensating a newly created
+/// Cloudflare resource through its complete parent collection when the API has
+/// no exact-resource read endpoint. Every allowlisted field is declared on the
+/// collection item schema and the returned creation identity remains the only
+/// value used to select the item and build an exact delete compensation plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedCollectionResourceContractV1 {
+    pub collection_path: String,
+    pub identity_selector: String,
+    pub response_result_identity_pointer: String,
+    pub response_item_identity_pointer: String,
+    pub read_capability_id: String,
+    pub delete_capability_id: String,
+    pub verified_response_fields: Vec<String>,
+    /// When true, verification succeeds only after the live response proves
+    /// every numbered page was collected through numeric `page` and
+    /// `total_pages` metadata.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_page_number_completion: bool,
+}
+
 /// Hash-bound coordinates for proving an exact resource deletion through a
 /// schema-proven parent collection when the API has no detail read endpoint.
 /// The identity pointer is relative to each item in the collection response's
@@ -266,6 +287,8 @@ pub struct CapabilityV1 {
     pub rollback: RollbackSpecV1,
     #[serde(default)]
     pub created_resource: Option<CreatedResourceContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_collection_resource: Option<CreatedCollectionResourceContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_resource: Option<DeletedResourceContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -339,6 +362,7 @@ impl CapabilityV1 {
                 },
             },
             created_resource: None,
+            created_collection_resource: None,
             deleted_resource: None,
             updated_resource: None,
             adapter_status: AdapterStatus::DynamicApi,
@@ -500,6 +524,9 @@ impl CapabilityV1 {
             "created_resource_contains_planned_fields_by_returned_id" => {
                 self.method == "POST" && self.created_resource_contract_supported()
             }
+            "parent_collection_contains_created_resource_id_and_planned_fields" => {
+                self.method == "POST" && self.created_collection_resource_contract_supported()
+            }
             _ => false,
         }
     }
@@ -537,7 +564,9 @@ impl CapabilityV1 {
                 self.method == "POST" && self.id == "dns-records-for-a-zone-create-dns-record"
             }
             Some("delete_created_resource_by_returned_id") => {
-                self.method == "POST" && self.created_resource_contract_supported()
+                self.method == "POST"
+                    && (self.created_resource_contract_supported()
+                        || self.created_collection_resource_contract_supported())
             }
             _ => false,
         }
@@ -556,6 +585,28 @@ impl CapabilityV1 {
                 && !target.read_capability_id.is_empty()
                 && !target.delete_capability_id.is_empty()
         })
+    }
+
+    fn created_collection_resource_contract_supported(&self) -> bool {
+        self.created_collection_resource
+            .as_ref()
+            .is_some_and(|target| {
+                selector_can_be_response_id(&target.identity_selector)
+                    && self.path == target.collection_path
+                    && target.response_result_identity_pointer == "/id"
+                    && target.response_item_identity_pointer == "/id"
+                    && !target.read_capability_id.is_empty()
+                    && !target.delete_capability_id.is_empty()
+                    && !target.verified_response_fields.is_empty()
+                    && target
+                        .verified_response_fields
+                        .iter()
+                        .all(|field| !field.is_empty() && !field.contains('/'))
+                    && target
+                        .verified_response_fields
+                        .windows(2)
+                        .all(|fields| fields[0] < fields[1])
+            })
     }
 
     fn deleted_resource_contract_supported(&self) -> bool {
@@ -600,6 +651,10 @@ fn path_targets_exact_resource(path: &str) -> bool {
     path.rsplit('/').next().is_some_and(|segment| {
         segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2
     })
+}
+
+fn selector_can_be_response_id(selector: &str) -> bool {
+    selector == "id" || selector.ends_with("_id") || selector.ends_with("_identifier")
 }
 
 fn infer_scope(path: &str) -> &'static str {

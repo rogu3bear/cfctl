@@ -5,8 +5,8 @@ use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, Executor, RequestBuilder,
 };
 use cfctl_core::{
-    CapabilityV1, CreatedResourceContractV1, DeletedResourceContractV1, PlanStatus, PlanV1,
-    UpdatedResourceContractV1,
+    CapabilityV1, CreatedCollectionResourceContractV1, CreatedResourceContractV1,
+    DeletedResourceContractV1, PlanStatus, PlanV1, UpdatedResourceContractV1,
 };
 use serde_json::json;
 use tokio::{
@@ -1139,6 +1139,214 @@ async fn parent_collection_update_rejects_unbound_fields_before_the_mutation_bou
         identity_selector: "widget_id".to_owned(),
         response_item_identity_pointer: "/id".to_owned(),
         read_capability_id: "widgets-list".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+        requires_page_number_completion: false,
+    });
+    plan.status = PlanStatus::Consumed;
+    let input: CallInput = serde_json::from_value(plan.input.clone()).expect("input");
+    let catalog_hash = plan.catalog_hash.clone();
+    let executor =
+        Executor::new(reqwest::Client::new(), "http://127.0.0.1:9/client/v4").expect("executor");
+
+    let error = executor
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            &catalog_hash,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect_err("unbound field must fail before network execution")
+        .to_string();
+
+    assert!(error.contains("outside the hash-bound collection readback fields"));
+    assert_eq!(plan.status, PlanStatus::Consumed);
+}
+
+#[tokio::test]
+async fn created_resource_is_verified_through_a_complete_parent_collection() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for page in 1..=2 {
+            let (mut stream, _) = listener.accept().await.expect("accept verification");
+            let mut buffer = vec![0_u8; 8192];
+            let read = stream.read(&mut buffer).await.expect("read verification");
+            requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+            let body = if page == 1 {
+                r#"{"success":true,"result":[{"id":"widget-other","name":"other","enabled":false}],"result_info":{"page":1,"total_pages":2}}"#
+            } else {
+                r#"{"success":true,"result":[{"id":"secret-created-id","name":"planned-secret-like-name","enabled":true}],"result_info":{"page":2,"total_pages":2}}"#
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write verification");
+        }
+        requests
+    });
+    let mut plan = dns_record_plan(
+        "widgets-create",
+        "POST",
+        "/accounts/{account_id}/widgets",
+        "parent_collection_contains_created_resource_id_and_planned_fields",
+        json!({"account_id":"account-1"}),
+        Some(json!({"name":"planned-secret-like-name", "enabled":true})),
+    );
+    plan.capability.created_collection_resource = Some(CreatedCollectionResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
+        verified_response_fields: vec!["enabled".to_owned(), "name".to_owned()],
+        requires_page_number_completion: true,
+    });
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({"account_id":"account-1"}),
+        query: json!({"mutation_mode":"replace"}),
+        body: Some(json!({"name":"planned-secret-like-name", "enabled":true})),
+        if_match: Some("mutation-etag".to_owned()),
+        ..CallInput::default()
+    })
+    .expect("input");
+    let apply = CloudflareResponseV1 {
+        status: 201,
+        success: true,
+        result: json!({"id":"secret-created-id"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let requests = server.await.expect("server joins");
+    assert!(requests[0].starts_with("GET /client/v4/accounts/account-1/widgets "));
+    assert!(requests[1].starts_with("GET /client/v4/accounts/account-1/widgets?page=2 "));
+    assert!(requests.iter().all(|request| {
+        !request.contains("secret-created-id")
+            && !request.contains("planned-secret-like-name")
+            && !request.contains("mutation_mode")
+            && !request.contains("mutation-etag")
+    }));
+}
+
+#[tokio::test]
+async fn parent_collection_create_rejects_field_drift_without_echoing_values() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let _ = stream.read(&mut buffer).await.expect("read verification");
+        let body = r#"{"success":true,"result":[{"id":"secret-created-id","name":"unexpected-live-value"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+    });
+    let mut plan = dns_record_plan(
+        "widgets-create",
+        "POST",
+        "/accounts/{account_id}/widgets",
+        "parent_collection_contains_created_resource_id_and_planned_fields",
+        json!({"account_id":"account-1"}),
+        Some(json!({"name":"planned-secret-like-name"})),
+    );
+    plan.capability.created_collection_resource = Some(CreatedCollectionResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+        requires_page_number_completion: false,
+    });
+    let apply = CloudflareResponseV1 {
+        status: 201,
+        success: true,
+        result: json!({"id":"secret-created-id"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("planned fields match=false"));
+    assert!(!verification.basis.contains("secret-created-id"));
+    assert!(!verification.basis.contains("planned-secret-like-name"));
+    assert!(!verification.basis.contains("unexpected-live-value"));
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn parent_collection_create_rejects_unbound_fields_before_the_mutation_boundary() {
+    let mut plan = dns_record_plan(
+        "widgets-create",
+        "POST",
+        "/accounts/{account_id}/widgets",
+        "parent_collection_contains_created_resource_id_and_planned_fields",
+        json!({"account_id":"account-1"}),
+        Some(json!({"hidden":true})),
+    );
+    plan.capability.created_collection_resource = Some(CreatedCollectionResourceContractV1 {
+        collection_path: "/accounts/{account_id}/widgets".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-list".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
         verified_response_fields: vec!["name".to_owned()],
         requires_page_number_completion: false,
     });

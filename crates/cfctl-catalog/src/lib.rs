@@ -7,9 +7,10 @@ use std::{
 };
 
 use cfctl_core::{
-    AdapterStatus, BillingModelV1, CapabilityV1, CostExposureV1, CreatedResourceContractV1,
-    DeletedResourceContractV1, EffectClass, KnowledgeReferenceV1, Maturity, RiskClass, SelectorV1,
-    UpdatedResourceContractV1, hash_value,
+    AdapterStatus, BillingModelV1, CapabilityV1, CostExposureV1,
+    CreatedCollectionResourceContractV1, CreatedResourceContractV1, DeletedResourceContractV1,
+    EffectClass, KnowledgeReferenceV1, Maturity, RiskClass, SelectorV1, UpdatedResourceContractV1,
+    hash_value,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -893,6 +894,11 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     classify_parent_collection_update_contracts(document, &mut capabilities);
     classify_same_path_object_update_contracts(document, &mut capabilities);
     classify_created_resource_contracts(&mut capabilities, &creates_with_schema_proven_string_ids);
+    classify_created_collection_resource_contracts(
+        document,
+        &mut capabilities,
+        &creates_with_schema_proven_string_ids,
+    );
 
     let source_hash = hash_value(document)?;
     let mut snapshot = CatalogSnapshot {
@@ -1042,6 +1048,133 @@ fn direct_child_selector(collection_path: &str, detail_path: &str) -> Option<Str
         .and_then(|segment| segment.strip_suffix('}'))
         .filter(|selector| !selector.is_empty())
         .map(str::to_owned)
+}
+
+type CollectionReadTargets = BTreeMap<(String, String), (String, Vec<SelectorV1>)>;
+type ExactDeleteTargets = BTreeMap<(String, String), String>;
+
+fn classify_created_collection_resource_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+    creates_with_schema_proven_string_ids: &BTreeSet<String>,
+) {
+    let list_targets: CollectionReadTargets = capabilities
+        .values()
+        .filter(|capability| capability.method == "GET")
+        .map(|capability| {
+            (
+                (capability.path.clone(), capability.product.clone()),
+                (capability.id.clone(), capability.selectors.clone()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let delete_targets: ExactDeleteTargets = capabilities
+        .values()
+        .filter(|capability| {
+            capability.method == "DELETE"
+                && path_targets_exact_resource(&capability.path)
+                && capability.request_schema.is_none()
+                && capability
+                    .selectors
+                    .iter()
+                    .all(|selector| selector.location == "path")
+        })
+        .map(|capability| {
+            (
+                (capability.path.clone(), capability.product.clone()),
+                capability.id.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for capability in capabilities.values_mut() {
+        if capability.method != "POST"
+            || capability.verification.strategy != "post_change_read_or_operation_specific_verifier"
+            || !creates_with_schema_proven_string_ids.contains(&capability.id)
+        {
+            continue;
+        }
+        let Some(target) = created_collection_resource_contract(
+            document,
+            capability,
+            &list_targets,
+            &delete_targets,
+        ) else {
+            continue;
+        };
+
+        capability.created_collection_resource = Some(target);
+        "parent_collection_contains_created_resource_id_and_planned_fields"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.rollback.warning = Some(
+            "compensation creates a separate exact-resource delete plan that must be reviewed and explicitly approved"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
+
+fn created_collection_resource_contract(
+    document: &Value,
+    capability: &CapabilityV1,
+    list_targets: &CollectionReadTargets,
+    delete_targets: &ExactDeleteTargets,
+) -> Option<CreatedCollectionResourceContractV1> {
+    let mut verified_response_fields = capability
+        .request_schema
+        .as_ref()
+        .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))?
+        .get("properties")?
+        .as_object()?
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    if verified_response_fields.is_empty() {
+        return None;
+    }
+    verified_response_fields.sort();
+    verified_response_fields.dedup();
+
+    let (read_capability_id, read_selectors) =
+        list_targets.get(&(capability.path.clone(), capability.product.clone()))?;
+    let read_operation = document.get("paths")?.get(&capability.path)?.get("get")?;
+    let field_names = verified_response_fields
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let requires_page_number_completion = complete_collection_readback_contract(
+        document,
+        read_operation,
+        read_selectors,
+        &field_names,
+    )?;
+    let delete_candidates = delete_targets
+        .iter()
+        .filter_map(|((delete_path, product), delete_capability_id)| {
+            if product != &capability.product {
+                return None;
+            }
+            let identity_selector = direct_child_selector(&capability.path, delete_path)?;
+            selector_can_be_response_id(&identity_selector)
+                .then(|| (identity_selector, delete_capability_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    let [(identity_selector, delete_capability_id)] = delete_candidates.as_slice() else {
+        return None;
+    };
+
+    Some(CreatedCollectionResourceContractV1 {
+        collection_path: capability.path.clone(),
+        identity_selector: identity_selector.clone(),
+        response_result_identity_pointer: "/id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: read_capability_id.clone(),
+        delete_capability_id: delete_capability_id.clone(),
+        verified_response_fields,
+        requires_page_number_completion,
+    })
 }
 
 fn classify_exact_resource_contracts(capabilities: &mut BTreeMap<String, CapabilityV1>) {

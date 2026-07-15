@@ -1290,6 +1290,201 @@ fn create_contract_rejects_ambiguous_direct_child_resource_paths() {
     assert!(!ambiguous.rollback.supported);
 }
 
+fn create_collection_schemas() -> serde_json::Value {
+    json!({
+        "Widget": {
+            "type": "object",
+            "properties": {
+                "id": {"type":"string"},
+                "name": {"type":"string"},
+                "enabled": {"type":"boolean"}
+            }
+        },
+        "WidgetResponse": {
+            "type": "object",
+            "properties": {
+                "success": {"type":"boolean"},
+                "result": {"$ref":"#/components/schemas/Widget"}
+            }
+        },
+        "WidgetCollectionResponse": {
+            "type": "object",
+            "properties": {
+                "success": {"type":"boolean"},
+                "result": {
+                    "type":"array",
+                    "items":{"$ref":"#/components/schemas/Widget"}
+                },
+                "result_info": {
+                    "type":"object",
+                    "properties": {
+                        "page":{"type":"integer"},
+                        "total_pages":{"type":"integer"}
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn create_collection_lifecycle_fixture() -> serde_json::Value {
+    json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "components": {"schemas": create_collection_schemas()},
+        "paths": {
+            "/accounts/{account_id}/widgets": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}}
+                ],
+                "get": {
+                    "operationId":"widgets-list",
+                    "summary":"List Widgets",
+                    "tags":["Widgets"],
+                    "parameters":[
+                        {"in":"query","name":"page","required":false,"schema":{"type":"integer"}},
+                        {"in":"query","name":"per_page","required":false,"schema":{"type":"integer"}}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description":"Widgets",
+                            "content": {
+                                "application/json": {
+                                    "schema":{"$ref":"#/components/schemas/WidgetCollectionResponse"}
+                                }
+                            }
+                        }
+                    }
+                },
+                "post": {
+                    "operationId":"widgets-create",
+                    "summary":"Create Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"],
+                    "requestBody": {
+                        "required":true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type":"object",
+                                    "properties": {
+                                        "name":{"type":"string"},
+                                        "enabled":{"type":"boolean"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description":"Widget created",
+                            "content": {
+                                "application/json": {
+                                    "schema":{"$ref":"#/components/schemas/WidgetResponse"}
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/accounts/{account_id}/widgets/{widget_id}": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+                    {"in":"path","name":"widget_id","required":true,"schema":{"type":"string"}}
+                ],
+                "delete": {
+                    "operationId":"widgets-delete",
+                    "summary":"Delete Widget",
+                    "tags":["Widgets"],
+                    "x-api-token-group":["Widgets Write"]
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn create_contract_uses_a_complete_parent_collection_when_detail_read_is_absent() {
+    let snapshot = normalize_openapi(&create_collection_lifecycle_fixture())
+        .expect("collection-backed widget catalog");
+    let create = snapshot.get("widgets-create").expect("create widget");
+
+    assert_eq!(
+        create.verification.strategy,
+        "parent_collection_contains_created_resource_id_and_planned_fields"
+    );
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    let target = create
+        .created_collection_resource
+        .as_ref()
+        .expect("created collection resource target");
+    assert_eq!(target.collection_path, "/accounts/{account_id}/widgets");
+    assert_eq!(target.identity_selector, "widget_id");
+    assert_eq!(target.response_result_identity_pointer, "/id");
+    assert_eq!(target.response_item_identity_pointer, "/id");
+    assert_eq!(target.read_capability_id, "widgets-list");
+    assert_eq!(target.delete_capability_id, "widgets-delete");
+    assert_eq!(target.verified_response_fields, ["enabled", "name"]);
+    assert!(target.requires_page_number_completion);
+}
+
+#[test]
+fn create_collection_contract_rejects_unobservable_fields_non_id_children_and_incomplete_pages() {
+    let mut hidden_field = create_collection_lifecycle_fixture();
+    hidden_field["components"]["schemas"]["Widget"]["properties"]
+        .as_object_mut()
+        .expect("widget properties")
+        .remove("enabled");
+    let hidden = normalize_openapi(&hidden_field).expect("hidden-field catalog");
+    assert!(
+        hidden
+            .get("widgets-create")
+            .expect("create widget")
+            .created_collection_resource
+            .is_none()
+    );
+
+    let mut non_id_child = create_collection_lifecycle_fixture();
+    let child = non_id_child["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets/{widget_id}")
+        .expect("widget child");
+    non_id_child["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .insert(
+            "/accounts/{account_id}/widgets/{widget_key}".to_owned(),
+            child,
+        );
+    let non_id = normalize_openapi(&non_id_child).expect("non-id child catalog");
+    assert!(
+        non_id
+            .get("widgets-create")
+            .expect("create widget")
+            .created_collection_resource
+            .is_none()
+    );
+
+    let mut incomplete_pages = create_collection_lifecycle_fixture();
+    incomplete_pages["components"]["schemas"]["WidgetCollectionResponse"]["properties"]
+        ["result_info"]["properties"]
+        .as_object_mut()
+        .expect("pagination properties")
+        .remove("total_pages");
+    let incomplete = normalize_openapi(&incomplete_pages).expect("incomplete page catalog");
+    assert!(
+        incomplete
+            .get("widgets-create")
+            .expect("create widget")
+            .created_collection_resource
+            .is_none()
+    );
+}
+
 fn pricing_feeds_fixture() -> OfficialTextFeedsV1 {
     OfficialTextFeedsV1 {
         fetched_at: Utc::now(),
