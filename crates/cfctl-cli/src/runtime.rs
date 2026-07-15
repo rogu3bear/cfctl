@@ -2797,7 +2797,6 @@ async fn create_plan(
 ) -> Result<ResultEnvelopeV2> {
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
-    reject_implicit_global_key_selection(profile, requested_profile)?;
     let resolved_account = resolve_account_id(store, profile, requested_account, &input)?;
     let account_id = resolved_account
         .as_deref()
@@ -7809,19 +7808,6 @@ fn catalog_show_argv(capability_id: &str) -> Vec<String> {
     ]
 }
 
-fn reject_implicit_global_key_selection(
-    profile: &ProfileMetadata,
-    requested_profile: Option<&str>,
-) -> Result<()> {
-    if profile.kind == ProfileKind::GlobalKey && requested_profile.is_none() {
-        return Err(CliError::Input(
-            "the emergency global-key profile is never selected implicitly; pass `--profile` explicitly"
-                .to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 fn preflight_secret_sink(plan: &PlanV1) -> Result<()> {
     if !is_secret_output_plan(plan) {
         return Ok(());
@@ -8164,12 +8150,12 @@ mod tests {
         apply_global_warp_override_state_response, apply_oauth_client_secret_state_response,
         apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
         apply_zone_account_response, apply_zone_entitlement_response,
-        bind_required_empty_compensation_body, boundary_response_artifact, capability_call_argv,
-        compensation_request, find_secret_value, guide_document, is_live_plan_precondition_hash,
-        is_secret_output_capability, non_readback_verification_basis, persist_prepared_plan,
-        persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
-        query_object_from_pairs, redact_secret_result, reject_implicit_global_key_selection,
-        required_cloudflare_tunnel_configuration_state_precondition,
+        bind_required_empty_compensation_body, boundary_response_artifact, call_command,
+        capability_call_argv, compensation_request, execute_read, find_secret_value,
+        guide_document, is_live_plan_precondition_hash, is_secret_output_capability,
+        non_readback_verification_basis, persist_prepared_plan, persist_secret_lifecycle,
+        preflight_call_input, preserve_previous_catalog, query_object_from_pairs,
+        redact_secret_result, required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
         required_oauth_client_secret_state_precondition,
@@ -8186,6 +8172,8 @@ mod tests {
         validate_selected_permission_groups, validate_zone_account_receipt_precondition,
         workspace_resource_keys, zone_target,
     };
+    use crate::CallArgs;
+    use crate::profiles::ProfilesConfig;
     use cfctl_auth::{AuthError, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
     use cfctl_cloudflare::CloudflareResponseV1;
@@ -11702,21 +11690,117 @@ mod tests {
         );
     }
 
+    fn emergency_global_key_as_current() -> ProfilesConfig {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "emergency".to_owned(),
+            ProfileMetadata::new("emergency", ProfileKind::GlobalKey, None),
+        );
+        profiles.insert(
+            "work".to_owned(),
+            ProfileMetadata::new("work", ProfileKind::OAuth, Some("account-a")),
+        );
+        ProfilesConfig {
+            current_profile: Some("emergency".to_owned()),
+            profiles,
+            ..ProfilesConfig::default()
+        }
+    }
+
     #[test]
     fn emergency_global_key_is_never_selected_without_an_explicit_profile_flag() {
-        let emergency = ProfileMetadata::new("emergency", ProfileKind::GlobalKey, None);
-        let oauth = ProfileMetadata::new("work", ProfileKind::OAuth, Some("account-a"));
+        let mut profiles = emergency_global_key_as_current();
 
-        let blocked = reject_implicit_global_key_selection(&emergency, None)
-            .expect_err("implicit global-key selection must fail closed");
+        let blocked = profiles
+            .selected(None)
+            .expect_err("implicit global-key current profile must fail closed");
         assert!(
             blocked.to_string().contains("never selected implicitly"),
             "{blocked}"
         );
-        reject_implicit_global_key_selection(&emergency, Some("emergency"))
+        profiles
+            .selected(Some("emergency"))
             .expect("explicit --profile may use the emergency lane");
-        reject_implicit_global_key_selection(&oauth, None)
+
+        profiles.current_profile = Some("work".to_owned());
+        profiles
+            .selected(None)
             .expect("non-emergency profiles remain selectable as current");
+    }
+
+    #[tokio::test]
+    async fn execute_read_rejects_implicit_global_key_before_live_credential_use() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        emergency_global_key_as_current()
+            .save(&store)
+            .expect("save emergency as current");
+
+        let capability = CapabilityV1::new("accounts-list", "List accounts", "GET", "/accounts");
+        let catalog = test_catalog();
+        let input = CallInput::default();
+
+        let error = execute_read(&store, &catalog, &capability, &input, None, None)
+            .await
+            .expect_err("live read must not use ambient global-key current profile");
+        assert!(
+            error.to_string().contains("never selected implicitly"),
+            "{error}"
+        );
+
+        // Explicit --profile is allowed past selection; without a real secret store
+        // credential it still fails later — never with an implicit selection path.
+        let explicit = execute_read(
+            &store,
+            &catalog,
+            &capability,
+            &input,
+            Some("emergency"),
+            None,
+        )
+        .await;
+        let explicit_error = explicit.expect_err("no real emergency credential in this fixture");
+        assert!(
+            !explicit_error
+                .to_string()
+                .contains("never selected implicitly"),
+            "explicit --profile must not be blocked by the ambient-selection guard: {explicit_error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_command_live_read_rejects_implicit_global_key_current_profile() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let catalog = test_catalog();
+        store
+            .write_json(&store.paths().catalog_file(), &catalog)
+            .expect("seed non-stale catalog so call does not network-sync");
+        emergency_global_key_as_current()
+            .save(&store)
+            .expect("save emergency as current");
+
+        let error = call_command(
+            &store,
+            CallArgs {
+                capability_id: "accounts-list".to_owned(),
+                selectors: Vec::new(),
+                query: Vec::new(),
+                body_json: None,
+                body_stdin: false,
+                profile: None,
+                account: None,
+                if_match: None,
+                if_none_match: None,
+                value_out: None,
+            },
+        )
+        .await
+        .expect_err("call without --profile must fail closed on ambient global-key");
+        assert!(
+            error.to_string().contains("never selected implicitly"),
+            "{error}"
+        );
     }
 
     #[test]

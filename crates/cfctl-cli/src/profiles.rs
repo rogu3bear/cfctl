@@ -58,6 +58,14 @@ impl ProfilesConfig {
             .get(id)
             .ok_or_else(|| CliError::Input(format!("profile `{id}` does not exist")))?;
         ensure_supported_profile(profile)?;
+        // Every credential-using path goes through selected(); the emergency
+        // global-key lane must never become ambient current-profile authority.
+        if profile.kind == ProfileKind::GlobalKey && requested.is_none() {
+            return Err(CliError::Input(
+                "the emergency global-key profile is never selected implicitly; pass `--profile` explicitly"
+                    .to_owned(),
+            ));
+        }
         Ok(profile)
     }
 }
