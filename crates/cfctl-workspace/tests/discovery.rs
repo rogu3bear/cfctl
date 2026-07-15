@@ -212,6 +212,39 @@ fn terraform_json_resources_and_data_sources_enter_the_dependency_graph() {
 }
 
 #[test]
+fn pulumi_yaml_discovery_preserves_quoted_types_and_interpolated_properties() {
+    let root = tempfile::tempdir().expect("workspace root");
+    let repository = root.path().join("pulumi-yaml");
+    init_repo(
+        &repository,
+        "Pulumi.yaml",
+        r#"name: edge-stack
+runtime: yaml
+resources:
+  worker:
+    type: "cloudflare:WorkersScript" # a colon-bearing scalar
+    properties:
+      scriptName: ${project}-worker
+  unrelated:
+    type: random:RandomString
+"#,
+    );
+
+    let graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
+        .expect("Pulumi YAML discovery");
+
+    assert!(graph.resources.iter().any(|resource| {
+        resource.key == "pulumi:cloudflare:WorkersScript.worker" && resource.kind == "pulumi"
+    }));
+    assert!(
+        !graph
+            .resources
+            .iter()
+            .any(|resource| resource.key.contains("random:RandomString"))
+    );
+}
+
+#[test]
 fn supported_iac_fixture_matrix_preserves_cross_repository_identity_and_untracked_state() {
     let root = tempfile::tempdir().expect("workspace root");
     let service_a = root.path().join("team-a/service");

@@ -502,9 +502,8 @@ fn resources_from_config(path: &Path, kind: &str, content: &[u8]) -> Vec<Resourc
             )
         }
         "terraform" => resources_from_terraform(path, &text),
-        "pulumi" => serde_yaml::from_str::<serde_yaml::Value>(&text)
+        "pulumi" => serde_saphyr::from_str::<Value>(&text)
             .ok()
-            .and_then(|value| serde_json::to_value(value).ok())
             .map_or_else(Vec::new, |value| resources_from_pulumi(path, &value)),
         _ => Vec::new(),
     };
