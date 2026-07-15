@@ -45,6 +45,7 @@ async fn json_response_sequence_server(
 }
 
 async fn single_raw_response_server(
+    status: &'static str,
     content_type: &'static str,
     body: &'static str,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -57,7 +58,7 @@ async fn single_raw_response_server(
         let mut buffer = vec![0_u8; 8192];
         let _ = stream.read(&mut buffer).await.expect("read request");
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream
@@ -1318,6 +1319,7 @@ async fn executor_retries_rate_limits_and_applies_only_the_selected_credential()
 async fn executor_enforces_pinned_json_response_contract_without_echoing_bodies() {
     let mut capability = CapabilityV1::new("zones-list", "List zones", "GET", "/zones");
     capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
         success_media_types: vec!["application/json".to_owned()],
         body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
     });
@@ -1326,6 +1328,7 @@ async fn executor_enforces_pinned_json_response_contract_without_echoing_bodies(
     };
 
     let (address, server) = single_raw_response_server(
+        "200 OK",
         "text/plain",
         r#"{"success":true,"result":{"private":"media-marker"}}"#,
     )
@@ -1346,6 +1349,7 @@ async fn executor_enforces_pinned_json_response_contract_without_echoing_bodies(
     server.await.expect("server joins");
 
     let (address, server) = single_raw_response_server(
+        "200 OK",
         "application/json; charset=utf-8",
         r#"{"result":{"private":"envelope-marker"}}"#,
     )
@@ -1366,6 +1370,7 @@ async fn executor_enforces_pinned_json_response_contract_without_echoing_bodies(
     server.await.expect("server joins");
 
     let (address, server) = single_raw_response_server(
+        "200 OK",
         "application/json; charset=utf-8",
         r#"{"success":true,"result":[{"id":"zone-1"}],"errors":[]}"#,
     )
@@ -1382,10 +1387,91 @@ async fn executor_enforces_pinned_json_response_contract_without_echoing_bodies(
     server.await.expect("server joins");
 }
 
+#[tokio::test]
+async fn executor_enforces_pinned_empty_responses_and_success_statuses() {
+    let mut capability = CapabilityV1::new("empty-read", "Empty read", "GET", "/empty");
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: Vec::new(),
+        body_mode: ResponseBodyModeV1::Empty,
+    });
+    let credential = AuthCredential::Bearer {
+        token: "selected-token".to_owned(),
+    };
+
+    let (address, server) = single_raw_response_server("200 OK", "text/plain", "").await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(&capability, &CallInput::default(), &credential)
+    .await
+    .expect("the pinned empty response should be accepted");
+    assert!(response.success);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.result, Value::Null);
+    server.await.expect("server joins");
+
+    let mut status_class_capability = capability.clone();
+    status_class_capability
+        .response_contract
+        .as_mut()
+        .expect("response contract")
+        .success_statuses = vec!["2XX".to_owned()];
+    let (address, server) = single_raw_response_server("202 Accepted", "text/plain", "").await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(&status_class_capability, &CallInput::default(), &credential)
+    .await
+    .expect("the pinned OpenAPI status class should be accepted");
+    assert_eq!(response.status, 202);
+    server.await.expect("server joins");
+
+    let (address, server) =
+        single_raw_response_server("200 OK", "text/plain", "private-body-marker").await;
+    let error = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(&capability, &CallInput::default(), &credential)
+    .await
+    .expect_err("a body must violate the pinned empty response");
+    assert!(matches!(
+        error,
+        CloudflareError::UnexpectedResponseBody {
+            status: 200,
+            received_bytes: 19
+        }
+    ));
+    assert!(!error.to_string().contains("private-body-marker"));
+    server.await.expect("server joins");
+
+    let (address, server) = single_raw_response_server("201 Created", "text/plain", "").await;
+    let error = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(&capability, &CallInput::default(), &credential)
+    .await
+    .expect_err("an undeclared success status must fail closed");
+    assert!(matches!(
+        error,
+        CloudflareError::UnexpectedSuccessStatus { status: 201, .. }
+    ));
+    server.await.expect("server joins");
+}
+
 #[test]
 fn request_builder_rejects_an_unsupported_pinned_response_contract() {
     let mut capability = CapabilityV1::new("object-read", "Read object", "GET", "/object");
     capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
         success_media_types: vec!["application/octet-stream".to_owned()],
         body_mode: ResponseBodyModeV1::Unsupported,
     });

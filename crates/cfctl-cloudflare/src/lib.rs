@@ -61,6 +61,14 @@ pub enum CloudflareError {
     UnexpectedResponseMediaType { status: u16, received: String },
     #[error("Cloudflare returned HTTP {status} without the pinned JSON success envelope")]
     InvalidResponseEnvelope { status: u16 },
+    #[error(
+        "Cloudflare returned successful HTTP {status}, which is not in the pinned response statuses: {expected}"
+    )]
+    UnexpectedSuccessStatus { status: u16, expected: String },
+    #[error(
+        "Cloudflare returned HTTP {status} with {received_bytes} body bytes despite the pinned empty response contract"
+    )]
+    UnexpectedResponseBody { status: u16, received_bytes: usize },
     #[error("capability `{0}` mutates state and requires a consumable approved plan")]
     ApprovedPlanRequired(String),
     #[error("Cloudflare API base URL cannot accept path segments")]
@@ -1088,24 +1096,50 @@ impl Executor {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
             let content_type = header_text(response.headers(), reqwest::header::CONTENT_TYPE);
-            if request.response_contract.as_ref().is_some_and(|contract| {
-                contract.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
-            }) && !content_type.as_deref().is_some_and(is_application_json)
+            if status.is_success()
+                && let Some(contract) = request.response_contract.as_ref()
             {
-                return Err(CloudflareError::UnexpectedResponseMediaType {
-                    status: status_code,
-                    received: content_type.unwrap_or_else(|| "missing".to_owned()),
-                });
+                if !contract.success_statuses.is_empty()
+                    && !contract
+                        .success_statuses
+                        .iter()
+                        .any(|expected| response_status_matches(expected, status_code))
+                {
+                    return Err(CloudflareError::UnexpectedSuccessStatus {
+                        status: status_code,
+                        expected: contract.success_statuses.join(", "),
+                    });
+                }
+                match contract.body_mode {
+                    ResponseBodyModeV1::CloudflareJsonEnvelope => {
+                        if !content_type.as_deref().is_some_and(is_application_json) {
+                            return Err(CloudflareError::UnexpectedResponseMediaType {
+                                status: status_code,
+                                received: content_type.unwrap_or_else(|| "missing".to_owned()),
+                            });
+                        }
+                        let body = response.json::<Value>().await?;
+                        if body.get("success").and_then(Value::as_bool).is_none() {
+                            return Err(CloudflareError::InvalidResponseEnvelope {
+                                status: status_code,
+                            });
+                        }
+                        return Ok(parse_response(status_code, &body, etag, cf_ray));
+                    }
+                    ResponseBodyModeV1::Empty => {
+                        let body = response.bytes().await?;
+                        if !body.is_empty() {
+                            return Err(CloudflareError::UnexpectedResponseBody {
+                                status: status_code,
+                                received_bytes: body.len(),
+                            });
+                        }
+                        return Ok(parse_response(status_code, &Value::Null, etag, cf_ray));
+                    }
+                    ResponseBodyModeV1::Unsupported => {}
+                }
             }
             let body = response.json::<Value>().await?;
-            if request.response_contract.as_ref().is_some_and(|contract| {
-                contract.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
-            }) && body.get("success").and_then(Value::as_bool).is_none()
-            {
-                return Err(CloudflareError::InvalidResponseEnvelope {
-                    status: status_code,
-                });
-            }
             return Ok(parse_response(status_code, &body, etag, cf_ray));
         }
     }
@@ -1204,6 +1238,21 @@ fn is_application_json(content_type: &str) -> bool {
         .split(';')
         .next()
         .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+}
+
+fn response_status_matches(expected: &str, received: u16) -> bool {
+    if expected.parse::<u16>() == Ok(received) {
+        return true;
+    }
+    let expected = expected.as_bytes();
+    let received = received.to_string();
+    expected.len() == received.len()
+        && expected
+            .iter()
+            .zip(received.as_bytes())
+            .all(|(expected, received)| {
+                expected.eq_ignore_ascii_case(&b'X') || expected == received
+            })
 }
 
 fn apply_credential(

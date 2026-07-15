@@ -901,7 +901,6 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
             capability.maturity = maturity(operation_object);
             classify(&mut capability);
             block_required_reserved_header_selectors(&mut capability);
-            block_unsupported_response_contract(&mut capability);
             block_incomplete_dynamic_mutation(&mut capability);
             capabilities.insert(id, capability);
         }
@@ -913,6 +912,9 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     classify_created_resource_contracts(document, &mut capabilities);
     classify_created_collection_resource_contracts(document, &mut capabilities);
     classify_same_path_object_mutation_contracts(document, &mut capabilities);
+    for capability in capabilities.values_mut() {
+        block_unsupported_response_contract(capability);
+    }
 
     let source_hash = hash_value(document)?;
     let mut snapshot = CatalogSnapshot {
@@ -1820,44 +1822,65 @@ fn success_response_contract(
     document: &Value,
     operation: &Value,
 ) -> Result<Option<ResponseContractV1>> {
-    let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
-        return Ok(None);
-    };
+    let responses = operation.get("responses").and_then(Value::as_object);
+    let mut success_statuses = BTreeSet::new();
     let mut success_media_types = BTreeSet::new();
-    let mut success_response_count = 0_usize;
     let mut every_success_is_cloudflare_json = true;
-    for (status, response) in responses {
-        if !status.starts_with('2') {
-            continue;
+    let mut every_success_is_empty = true;
+    if let Some(responses) = responses {
+        for (status, response) in responses {
+            if !is_success_response_status(status) {
+                continue;
+            }
+            success_statuses.insert(status.to_ascii_uppercase());
+            let response = resolve_local_response(document, response, 0)?;
+            let media = response
+                .get("content")
+                .and_then(Value::as_object)
+                .map(|content| content.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            success_media_types.extend(media.iter().cloned());
+            if media.is_empty() {
+                every_success_is_cloudflare_json = false;
+                continue;
+            }
+            every_success_is_empty = false;
+            if media.as_slice() != ["application/json"] {
+                every_success_is_cloudflare_json = false;
+                continue;
+            }
+            let envelope_proven = response
+                .pointer("/content/application~1json/schema")
+                .is_some_and(|schema| {
+                    schema_declares_boolean_path(document, schema, &["success"], 0)
+                });
+            every_success_is_cloudflare_json &= envelope_proven;
         }
-        success_response_count += 1;
-        let response = resolve_local_response(document, response, 0)?;
-        let media = response
-            .get("content")
-            .and_then(Value::as_object)
-            .map(|content| content.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        success_media_types.extend(media.iter().cloned());
-        if media.as_slice() != ["application/json"] {
-            every_success_is_cloudflare_json = false;
-            continue;
-        }
-        let envelope_proven = response
-            .pointer("/content/application~1json/schema")
-            .is_some_and(|schema| schema_declares_boolean_path(document, schema, &["success"], 0));
-        every_success_is_cloudflare_json &= envelope_proven;
     }
-    if success_response_count == 0 || success_media_types.is_empty() {
-        return Ok(None);
-    }
+    let success_statuses: Vec<String> = success_statuses.into_iter().collect();
     Ok(Some(ResponseContractV1 {
+        success_statuses: success_statuses.clone(),
         success_media_types: success_media_types.into_iter().collect(),
-        body_mode: if every_success_is_cloudflare_json {
+        body_mode: if success_statuses.is_empty() {
+            ResponseBodyModeV1::Unsupported
+        } else if every_success_is_cloudflare_json {
             ResponseBodyModeV1::CloudflareJsonEnvelope
+        } else if every_success_is_empty {
+            ResponseBodyModeV1::Empty
         } else {
             ResponseBodyModeV1::Unsupported
         },
     }))
+}
+
+fn is_success_response_status(status: &str) -> bool {
+    status.len() == 3
+        && status.as_bytes()[0] == b'2'
+        && status
+            .as_bytes()
+            .iter()
+            .skip(1)
+            .all(|byte| byte.is_ascii_digit() || byte.eq_ignore_ascii_case(&b'X'))
 }
 
 fn resolve_local_response<'a>(
@@ -2926,8 +2949,11 @@ fn block_unsupported_response_contract(capability: &mut CapabilityV1) {
         return;
     }
     capability.adapter_status = AdapterStatus::Blocked;
-    capability.blocked_reason = Some(if response.success_media_types == ["application/json"] {
-        "response contract unsupported: the official success JSON schema does not prove a Cloudflare success envelope"
+    capability.blocked_reason = Some(if response.success_statuses.is_empty() {
+        "response contract unsupported: the official schema declares no 2xx success response"
+            .to_owned()
+    } else if response.success_media_types == ["application/json"] {
+        "response contract unsupported: successful response representations do not prove one Cloudflare JSON envelope or empty-body contract"
             .to_owned()
     } else {
         format!(

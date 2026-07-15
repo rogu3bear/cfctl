@@ -126,11 +126,14 @@ pub struct SelectorV1 {
 #[serde(rename_all = "snake_case")]
 pub enum ResponseBodyModeV1 {
     CloudflareJsonEnvelope,
+    Empty,
     Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseContractV1 {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub success_statuses: Vec<String>,
     pub success_media_types: Vec<String>,
     pub body_mode: ResponseBodyModeV1,
 }

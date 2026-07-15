@@ -17,6 +17,23 @@ fn fixture() -> serde_json::Value {
         "openapi": "3.0.3",
         "info": {"title":"Cloudflare API","version":"4.0.0"},
         "servers": [{"url":"https://api.cloudflare.com/client/v4"}],
+        "components": {
+            "schemas": {
+                "ApiEnvelope": {
+                    "type": "object",
+                    "required": ["success"],
+                    "properties": {"success": {"type": "boolean"}}
+                }
+            },
+            "responses": {
+                "ApiEnvelope": {
+                    "description": "Cloudflare API envelope",
+                    "content": {"application/json": {"schema": {
+                        "$ref": "#/components/schemas/ApiEnvelope"
+                    }}}
+                }
+            }
+        },
         "paths": {
             "/zones/{zone_id}/dns_records": {
                 "get": {
@@ -24,6 +41,7 @@ fn fixture() -> serde_json::Value {
                     "summary":"List DNS Records",
                     "tags":["DNS Records"],
                     "parameters":[{"in":"path","name":"zone_id","required":true,"schema":{"type":"string"}}],
+                    "responses": {"200": {"$ref": "#/components/responses/ApiEnvelope"}},
                     "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true}
                 }
             },
@@ -35,9 +53,23 @@ fn fixture() -> serde_json::Value {
                     "parameters":[
                         {"in":"path","name":"zone_id","required":true,"schema":{"type":"string"}},
                         {"in":"path","name":"record_id","required":true,"schema":{"type":"string"}}
-                    ]
+                    ],
+                    "responses": {"200": {"$ref": "#/components/responses/ApiEnvelope"}}
                 }
             }
+        }
+    })
+}
+
+fn cloudflare_envelope_responses() -> Value {
+    json!({
+        "200": {
+            "description": "Cloudflare API envelope",
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["success"],
+                "properties": {"success": {"type": "boolean"}}
+            }}}
         }
     })
 }
@@ -854,7 +886,8 @@ fn credential_returning_get_is_approval_gated_and_sink_only() {
     document["paths"]["/accounts/{account_id}/cfd_tunnel/{tunnel_id}/token"]["get"] = json!({
         "operationId":"cloudflare-tunnel-get-a-cloudflare-tunnel-token",
         "summary":"Get a Cloudflare Tunnel token",
-        "tags":["Cloudflare Tunnel"]
+        "tags":["Cloudflare Tunnel"],
+        "responses": cloudflare_envelope_responses()
     });
     let snapshot = normalize_openapi(&document).expect("credential catalog");
     let capability = snapshot
@@ -955,6 +988,7 @@ fn declared_success_responses_require_one_proven_cloudflare_json_envelope() {
         .as_ref()
         .expect("response contract");
     assert_eq!(response.success_media_types, vec!["application/json"]);
+    assert_eq!(response.success_statuses, vec!["200"]);
     assert_eq!(
         response.body_mode,
         ResponseBodyModeV1::CloudflareJsonEnvelope
@@ -970,6 +1004,115 @@ fn declared_success_responses_require_one_proven_cloudflare_json_envelope() {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("response contract")),
             "{id} must name its response-contract blocker"
+        );
+    }
+}
+
+#[test]
+fn response_contract_distinguishes_empty_and_undocumented_successes() {
+    let mut document = fixture();
+    document["components"]["schemas"]["ApiEnvelope"] = json!({
+        "type": "object",
+        "required": ["success"],
+        "properties": {"success": {"type": "boolean"}}
+    });
+    document["paths"]["/accounts/{account_id}/empty"]["get"] = json!({
+        "operationId": "widgets-empty",
+        "responses": {"204": {"description": "No content"}}
+    });
+    document["paths"]["/accounts/{account_id}/websocket"]["get"] = json!({
+        "operationId": "widgets-websocket",
+        "responses": {"101": {"description": "Switching protocols"}}
+    });
+    document["paths"]["/accounts/{account_id}/undocumented"]["get"] = json!({
+        "operationId": "widgets-undocumented"
+    });
+    document["paths"]["/accounts/{account_id}/mixed-empty"]["get"] = json!({
+        "operationId": "widgets-mixed-empty",
+        "responses": {
+            "200": {
+                "description": "ok",
+                "content": {"application/json": {"schema": {
+                    "$ref": "#/components/schemas/ApiEnvelope"
+                }}}
+            },
+            "204": {"description": "No content"}
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("catalog");
+    let empty = snapshot.get("widgets-empty").expect("empty capability");
+    let response = empty.response_contract.as_ref().expect("empty contract");
+    assert_eq!(response.success_statuses, vec!["204"]);
+    assert!(response.success_media_types.is_empty());
+    assert_eq!(response.body_mode, ResponseBodyModeV1::Empty);
+    assert_eq!(empty.adapter_status, AdapterStatus::DynamicApi);
+
+    for id in [
+        "widgets-websocket",
+        "widgets-undocumented",
+        "widgets-mixed-empty",
+    ] {
+        let capability = snapshot.get(id).expect("unsupported capability");
+        assert_eq!(capability.adapter_status, AdapterStatus::Blocked, "{id}");
+        assert_eq!(
+            capability
+                .response_contract
+                .as_ref()
+                .expect("explicit response contract")
+                .body_mode,
+            ResponseBodyModeV1::Unsupported,
+            "{id}"
+        );
+        assert!(
+            capability
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("response contract")),
+            "{id} must name its response-contract blocker"
+        );
+    }
+}
+
+#[test]
+fn late_catalog_classifiers_cannot_bypass_unsupported_response_contracts() {
+    let mut document = fixture();
+    document["paths"]["/accounts/{account_id}/tokens"]["post"] = json!({
+        "operationId":"account-api-tokens-create-token",
+        "summary":"Create Token",
+        "tags":["Account Owned API Tokens"],
+        "x-api-token-group":["Account API Tokens Write"]
+    });
+    document["paths"]["/zones/{zone_id}/dns_records"]["post"] = json!({
+        "operationId":"dns-records-for-a-zone-create-dns-record",
+        "summary":"Create DNS Record",
+        "tags":["DNS Records for a Zone"],
+        "x-api-token-group":["DNS Write"],
+        "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true}
+    });
+
+    let snapshot = normalize_openapi(&document).expect("catalog");
+    for id in [
+        "account-api-tokens-create-token",
+        "dns-records-for-a-zone-create-dns-record",
+    ] {
+        let capability = snapshot.get(id).expect("classified capability");
+        assert_eq!(
+            capability
+                .response_contract
+                .as_ref()
+                .expect("response contract")
+                .body_mode,
+            ResponseBodyModeV1::Unsupported,
+            "{id}"
+        );
+        assert_eq!(capability.adapter_status, AdapterStatus::Blocked, "{id}");
+        assert!(
+            capability
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("response contract")),
+            "{id}"
         );
     }
 }
@@ -1020,19 +1163,22 @@ fn account_token_mutations_have_complete_native_execution_contracts() {
         "operationId":"account-api-tokens-create-token",
         "summary":"Create Token",
         "tags":["Account Owned API Tokens"],
-        "x-api-token-group":["Account API Tokens Write"]
+        "x-api-token-group":["Account API Tokens Write"],
+        "responses": cloudflare_envelope_responses()
     });
     document["paths"]["/accounts/{account_id}/tokens/{token_id}/value"]["put"] = json!({
         "operationId":"account-api-tokens-roll-token",
         "summary":"Roll Token",
         "tags":["Account Owned API Tokens"],
-        "x-api-token-group":["Account API Tokens Write"]
+        "x-api-token-group":["Account API Tokens Write"],
+        "responses": cloudflare_envelope_responses()
     });
     document["paths"]["/accounts/{account_id}/tokens/{token_id}"]["delete"] = json!({
         "operationId":"account-api-tokens-delete-token",
         "summary":"Delete Token",
         "tags":["Account Owned API Tokens"],
-        "x-api-token-group":["Account API Tokens Write"]
+        "x-api-token-group":["Account API Tokens Write"],
+        "responses": cloudflare_envelope_responses()
     });
 
     let snapshot = normalize_openapi(&document).expect("token catalog");
@@ -1208,7 +1354,8 @@ fn dns_record_crud_has_complete_operation_specific_contracts() {
         "summary":"Create DNS Record",
         "tags":["DNS Records for a Zone"],
         "x-api-token-group":["DNS Write"],
-        "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true}
+        "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true},
+        "responses": cloudflare_envelope_responses()
     });
     for (method, id, summary) in [
         (
@@ -1236,7 +1383,8 @@ fn dns_record_crud_has_complete_operation_specific_contracts() {
             "parameters":[
                 {"in":"path","name":"zone_id","required":true,"schema":{"type":"string"}},
                 {"in":"path","name":"dns_record_id","required":true,"schema":{"type":"string"}}
-            ]
+            ],
+            "responses": cloudflare_envelope_responses()
         });
     }
 
@@ -1307,7 +1455,8 @@ fn exact_resource_deletes_pair_with_same_path_readback_contracts() {
                         {"in":"header","name":"If-None-Match","required":false,"schema":{"type":"string"}},
                         {"in":"header","name":"If-Modified-Since","required":false,"schema":{"type":"string"}}
                     ],
-                    "x-api-token-group":["Widgets Read"]
+                    "x-api-token-group":["Widgets Read"],
+                    "responses": cloudflare_envelope_responses()
                 },
                 "delete": {
                     "operationId":"widgets-delete",
@@ -1316,7 +1465,8 @@ fn exact_resource_deletes_pair_with_same_path_readback_contracts() {
                     "parameters":[
                         {"in":"header","name":"cf-r2-jurisdiction","required":false,"schema":{"type":"string"}}
                     ],
-                    "x-api-token-group":["Widgets Write"]
+                    "x-api-token-group":["Widgets Write"],
+                    "responses": cloudflare_envelope_responses()
                 }
             },
             "/accounts/{account_id}/widgets": {
@@ -1509,13 +1659,15 @@ fn d1_database_readback_omits_only_the_documented_fields_projection() {
                         "type":"object","properties":{"read_replication":{
                             "$ref":"#/components/schemas/D1ReadReplication"
                         }}
-                    }}}}
+                    }}}},
+                    "responses": cloudflare_envelope_responses()
                 },
                 "delete": {
                     "operationId":"d1-delete-database",
                     "summary":"Delete D1 Database",
                     "tags":["D1"],
-                    "x-api-token-group":["D1 Write"]
+                    "x-api-token-group":["D1 Write"],
+                    "responses": cloudflare_envelope_responses()
                 }
             }
         }
@@ -1602,7 +1754,8 @@ fn exact_resource_deletes_use_schema_proven_parent_collection_readback() {
                     "operationId":"widgets-delete",
                     "summary":"Delete Widget",
                     "tags":["Widgets"],
-                    "x-api-token-group":["Widgets Write"]
+                    "x-api-token-group":["Widgets Write"],
+                    "responses": cloudflare_envelope_responses()
                 }
             }
         }
