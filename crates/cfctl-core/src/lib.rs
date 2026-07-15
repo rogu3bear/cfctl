@@ -589,6 +589,9 @@ impl CapabilityV1 {
                 oauth_client_secret_verification_contract_supported(self)
                     && self.same_path_readback_selectors_supported()
             }
+            "access_service_token_reports_refreshed_expiration" => {
+                access_service_token_refresh_verification_contract_supported(self)
+            }
             "dns_record_details_match_created_id_and_planned_fields" => {
                 self.method == "POST" && self.id == "dns-records-for-a-zone-create-dns-record"
             }
@@ -1096,6 +1099,42 @@ fn oauth_client_secret_verification_contract_supported(capability: &CapabilityV1
                 && read.read_capability_id == "oauth-clients-get"
                 && read.verified_response_fields == ["client_id", "has_rotated_secret"]
         })
+}
+
+fn access_service_token_refresh_verification_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "access-service-tokens-refresh-a-service-token"
+        && capability.method == "POST"
+        && capability.product == "Access service tokens"
+        && capability.account_scope == "account"
+        && capability.permissions == ["Access: Service Tokens Write"]
+        && capability.path
+            == "/accounts/{account_id}/access/service_tokens/{service_token_id}/refresh"
+        && capability.request_schema.is_none()
+        && capability.selectors.len() == 2
+        && access_service_token_refresh_selector_supported(capability, "account_id", 32)
+        && access_service_token_refresh_selector_supported(capability, "service_token_id", 36)
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path == "/accounts/{account_id}/access/service_tokens/{service_token_id}"
+                && read.read_capability_id == "access-service-tokens-get-a-service-token"
+                && read.verified_response_fields == ["expires_at", "id"]
+        })
+}
+
+fn access_service_token_refresh_selector_supported(
+    capability: &CapabilityV1,
+    name: &str,
+    max_length: u64,
+) -> bool {
+    capability.selectors.iter().any(|selector| {
+        selector.name == name
+            && selector.location == "path"
+            && selector.required
+            && selector.value_type == "string"
+            && selector.contract.as_ref().is_some_and(|contract| {
+                contract.schema == serde_json::json!({"maxLength":max_length,"type":"string"})
+                    && contract.query.is_none()
+            })
+    })
 }
 
 fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {

@@ -172,6 +172,19 @@ documents those as secret-rotation and old-secret grace controls. A duration
 update resets expiration, so restoring the exact prior expiration is not a
 valid rollback claim; correction requires a separate reviewed update plan.
 
+Extend an existing service token by the one-year interval Cloudflare documents:
+
+```bash
+cfctl call access-service-tokens-refresh-a-service-token \
+  --selector account_id=<account-id> \
+  --selector service_token_id=<service-token-id> --json
+```
+
+The call is body-free and irreversible. After apply, cfctl requires HTTP 200,
+the exact planned token identity, a valid future `expires_at`, and an immediate
+detail readback with the same identity and expiration. It never presents the
+extension as restorable; a lifetime correction is a separate reviewed plan.
+
 Turnstile secret rotation requires an explicit cutover choice. `false` keeps
 the prior secret valid for two hours and prevents another rotation during that
 window; `true` invalidates it immediately. In both cases the new secret is

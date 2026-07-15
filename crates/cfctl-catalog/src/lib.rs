@@ -971,6 +971,7 @@ fn apply_post_normalization_contracts(
     classify_parent_collection_delete_contracts(document, capabilities);
     classify_parent_collection_update_contracts(document, capabilities);
     classify_access_service_token_create_contract(document, capabilities);
+    classify_access_service_token_refresh_contract(document, capabilities);
     classify_created_resource_contracts(document, capabilities);
     classify_created_collection_resource_contracts(document, capabilities);
     classify_global_warp_override_contract(document, capabilities);
@@ -4312,16 +4313,20 @@ const ACCESS_SERVICE_TOKEN_CREATE_CAPABILITY_ID: &str =
 const ACCESS_SERVICE_TOKEN_GET_CAPABILITY_ID: &str = "access-service-tokens-get-a-service-token";
 const ACCESS_SERVICE_TOKEN_DELETE_CAPABILITY_ID: &str =
     "access-service-tokens-delete-a-service-token";
+const ACCESS_SERVICE_TOKEN_REFRESH_CAPABILITY_ID: &str =
+    "access-service-tokens-refresh-a-service-token";
 const ACCESS_SERVICE_TOKEN_COLLECTION_PATH: &str = "/accounts/{account_id}/access/service_tokens";
 const ACCESS_SERVICE_TOKEN_DETAIL_PATH: &str =
     "/accounts/{account_id}/access/service_tokens/{service_token_id}";
+const ACCESS_SERVICE_TOKEN_REFRESH_PATH: &str =
+    "/accounts/{account_id}/access/service_tokens/{service_token_id}/refresh";
 
 fn apply_access_service_token_commercial_contract(capability: &mut CapabilityV1) {
     capability.cost = cfctl_core::CostV1::default();
     capability.cost.billing_model = BillingModelV1::Subscription;
     capability.cost.exposure = CostExposureV1::AccountQuote;
     capability.cost.basis = Some(
-        "creating or updating an Access service token has no direct operation charge; the account's service-token capacity and any separately negotiated increase remain part of its existing Zero Trust subscription"
+        "creating, updating, or refreshing an Access service token has no direct operation charge; the account's service-token capacity and any separately negotiated increase remain part of its existing Zero Trust subscription"
             .to_owned(),
     );
     capability.cost.references = vec![
@@ -4345,6 +4350,12 @@ fn apply_access_service_token_commercial_contract(capability: &mut CapabilityV1)
         KnowledgeReferenceV1 {
             title: "Update an Access service token".to_owned(),
             url: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/methods/update/"
+                .to_owned(),
+            source: "official Cloudflare API".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Refresh an Access service token".to_owned(),
+            url: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/methods/refresh/"
                 .to_owned(),
             source: "official Cloudflare API".to_owned(),
         },
@@ -4433,6 +4444,98 @@ fn classify_access_service_token_create_contract(
     "post_change_read_or_operation_specific_verifier"
         .clone_into(&mut capability.verification.strategy);
     refresh_dynamic_mutation_contract(capability);
+}
+
+fn classify_access_service_token_refresh_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    if !access_service_token_refresh_contract_supported(document, capabilities) {
+        return;
+    }
+    let Some(capability) = capabilities.get_mut(ACCESS_SERVICE_TOKEN_REFRESH_CAPABILITY_ID) else {
+        return;
+    };
+
+    capability.risk = RiskClass::Irreversible;
+    capability.effect = EffectClass::Irreversible;
+    apply_access_service_token_commercial_contract(capability);
+    capability.verification.required = true;
+    "access_service_token_reports_refreshed_expiration"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: ACCESS_SERVICE_TOKEN_DETAIL_PATH.to_owned(),
+        read_capability_id: ACCESS_SERVICE_TOKEN_GET_CAPABILITY_ID.to_owned(),
+        verified_response_fields: vec!["expires_at".to_owned(), "id".to_owned()],
+    });
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "the one-year extension resets expiration relative to refresh time and cannot restore the prior expiration; shortening or otherwise correcting lifetime requires a separately reviewed operation built from trusted evidence"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
+
+fn access_service_token_refresh_contract_supported(
+    document: &Value,
+    capabilities: &BTreeMap<String, CapabilityV1>,
+) -> bool {
+    let Some(refresh) = capabilities.get(ACCESS_SERVICE_TOKEN_REFRESH_CAPABILITY_ID) else {
+        return false;
+    };
+    let Some(read) = capabilities.get(ACCESS_SERVICE_TOKEN_GET_CAPABILITY_ID) else {
+        return false;
+    };
+    if refresh.method != "POST"
+        || refresh.path != ACCESS_SERVICE_TOKEN_REFRESH_PATH
+        || refresh.product != "Access service tokens"
+        || refresh.permissions != ["Access: Service Tokens Write"]
+        || refresh.description.as_deref() != Some("Refreshes the expiration of a service token.")
+        || refresh.request_schema.is_some()
+        || !access_service_token_detail_selectors_supported(refresh)
+        || !access_service_token_response_contract_supported(
+            refresh.response_contract.as_ref(),
+            "200",
+        )
+        || read.method != "GET"
+        || read.path != ACCESS_SERVICE_TOKEN_DETAIL_PATH
+        || read.product != "Access service tokens"
+        || read.permissions.len() != 2
+        || !read
+            .permissions
+            .iter()
+            .any(|permission| permission == "Access: Service Tokens Write")
+        || !read
+            .permissions
+            .iter()
+            .any(|permission| permission == "Access: Service Tokens Read")
+        || !access_service_token_detail_selectors_supported(read)
+        || !access_service_token_response_contract_supported(read.response_contract.as_ref(), "200")
+    {
+        return false;
+    }
+
+    let Some(refresh_operation) = document
+        .get("paths")
+        .and_then(Value::as_object)
+        .and_then(|paths| paths.get(ACCESS_SERVICE_TOKEN_REFRESH_PATH))
+        .and_then(|path| path.get("post"))
+    else {
+        return false;
+    };
+    let Some(read_operation) = document
+        .get("paths")
+        .and_then(Value::as_object)
+        .and_then(|paths| paths.get(ACCESS_SERVICE_TOKEN_DETAIL_PATH))
+        .and_then(|path| path.get("get"))
+    else {
+        return false;
+    };
+    ["id", "expires_at"].iter().all(|field| {
+        success_response_declares_result_string_field(document, refresh_operation, field)
+            && success_response_declares_result_string_field(document, read_operation, field)
+    })
 }
 
 fn access_service_token_create_contract_supported(

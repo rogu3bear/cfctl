@@ -11,7 +11,7 @@ use cfctl_core::{
     CapabilityV1, PlanStatus, PlanV1, ResponseBodyModeV1, ResponseContractV1, SelectorV1,
     request_header_is_reserved,
 };
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -405,6 +405,12 @@ impl Executor {
                 .await;
         }
 
+        if strategy == "access_service_token_reports_refreshed_expiration" {
+            return self
+                .verify_access_service_token_refresh(plan, apply_response, &input, credential)
+                .await;
+        }
+
         if is_delete_verifier(strategy) {
             return self
                 .verify_resource_delete(plan, apply_response, &input, credential)
@@ -562,6 +568,57 @@ impl Executor {
         )?;
         Ok(OperationVerificationV1 {
             strategy: strategy.to_owned(),
+            passed,
+            basis,
+            readback,
+        })
+    }
+
+    async fn verify_access_service_token_refresh(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let target = plan.capability.same_path_read.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the hash-bound Access service-token detail readback contract is absent".to_owned(),
+            )
+        })?;
+        let service_token_id = input
+            .selectors
+            .get("service_token_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the planned Access service-token selector is absent or empty".to_owned(),
+                )
+            })?;
+        let details = same_path_verification_capability(
+            &plan.capability,
+            &target.read_capability_id,
+            "Access service-token refresh verification readback",
+            &target.path,
+        );
+        let request = self.builder.build(
+            &details,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let (passed, basis) = evaluate_access_service_token_refresh_readback(
+            service_token_id,
+            apply_response,
+            &readback,
+        );
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
             passed,
             basis,
             readback,
@@ -1900,6 +1957,54 @@ fn evaluate_oauth_client_secret_readback(
     }
 }
 
+fn evaluate_access_service_token_refresh_readback(
+    service_token_id: &str,
+    apply_response: &CloudflareResponseV1,
+    readback: &CloudflareResponseV1,
+) -> (bool, String) {
+    let apply_identity_matches =
+        apply_response.result.get("id").and_then(Value::as_str) == Some(service_token_id);
+    let readback_identity_matches =
+        readback.result.get("id").and_then(Value::as_str) == Some(service_token_id);
+    let apply_expiration = apply_response
+        .result
+        .get("expires_at")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok());
+    let readback_expiration = readback
+        .result
+        .get("expires_at")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok());
+    let apply_expiration_future = apply_expiration
+        .as_ref()
+        .is_some_and(|expiration| expiration.timestamp() > Utc::now().timestamp());
+    let expiration_matches = apply_expiration
+        .as_ref()
+        .zip(readback_expiration.as_ref())
+        .is_some_and(|(apply, readback)| apply == readback);
+    let passed = apply_response.status == 200
+        && apply_response.success
+        && apply_identity_matches
+        && apply_expiration_future
+        && readback.status == 200
+        && readback.success
+        && readback_identity_matches
+        && expiration_matches;
+    let basis = format!(
+        "Access service-token refresh proof (apply HTTP {}, apply success={}, apply identity matches={}, apply expiration is valid and future={}, readback HTTP {}, readback success={}, readback identity matches={}, expiration matches={})",
+        apply_response.status,
+        apply_response.success,
+        apply_identity_matches,
+        apply_expiration_future,
+        readback.status,
+        readback.success,
+        readback_identity_matches,
+        expiration_matches
+    );
+    (passed, basis)
+}
+
 fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
     let strategy = capability.verification.strategy.as_str();
     if !capability.verification_contract_supported() {
@@ -1913,6 +2018,9 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
             | "oauth_client_reports_no_rotated_secret_after_old_secret_delete"
     ) {
         return validate_oauth_client_secret_target(capability, input);
+    }
+    if strategy == "access_service_token_reports_refreshed_expiration" {
+        return validate_access_service_token_refresh_target(capability, input);
     }
     let body_label = match strategy {
         "created_resource_contains_planned_fields_by_returned_id"
@@ -1995,6 +2103,48 @@ fn validate_oauth_client_secret_target(capability: &CapabilityV1, input: &CallIn
     {
         return Err(CloudflareError::MissingVerificationTarget(
             "the planned OAuth client selectors are missing, empty, or broader than the exact account and client target"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_access_service_token_refresh_target(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let target = capability.same_path_read.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the hash-bound Access service-token detail readback contract is absent".to_owned(),
+        )
+    })?;
+    if target.path != "/accounts/{account_id}/access/service_tokens/{service_token_id}"
+        || target.read_capability_id != "access-service-tokens-get-a-service-token"
+        || target.verified_response_fields != ["expires_at", "id"]
+        || capability.request_schema.is_some()
+        || input.body.is_some()
+        || !clean_verification_query(input)
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the Access service-token refresh does not match its hash-bound body-free detail readback contract"
+                .to_owned(),
+        ));
+    }
+    let selectors = input.selectors.as_object().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the planned Access service-token selectors are not an object".to_owned(),
+        )
+    })?;
+    if selectors.len() != 2
+        || ["account_id", "service_token_id"].iter().any(|name| {
+            selectors
+                .get(*name)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        })
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned Access service-token selectors are missing, empty, or broader than the exact account and token target"
                 .to_owned(),
         ));
     }

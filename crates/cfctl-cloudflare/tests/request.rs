@@ -4109,6 +4109,132 @@ async fn oauth_client_rotation_verifies_two_secret_overlap_without_echoing_secre
 }
 
 #[tokio::test]
+async fn access_service_token_refresh_verifies_exact_identity_and_expiration_readback() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"id":"service-token-1","expires_at":"2099-07-15T22:00:00Z"},"errors":[]}"#,
+    ])
+    .await;
+    let plan = access_service_token_refresh_plan();
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({
+            "id":"service-token-1",
+            "expires_at":"2099-07-15T22:00:00Z"
+        }),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("refresh verification");
+
+    assert!(verification.passed, "{}", verification.basis);
+    assert!(verification.basis.contains("expiration matches=true"));
+    assert!(!verification.basis.contains("2099-07-15"));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].starts_with(
+            "GET /client/v4/accounts/account-1/access/service_tokens/service-token-1 "
+        )
+    );
+}
+
+#[tokio::test]
+async fn access_service_token_refresh_rejects_expiration_readback_drift_without_echoing_values() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"id":"service-token-1","expires_at":"2098-07-15T22:00:00Z"},"errors":[]}"#,
+    ])
+    .await;
+    let plan = access_service_token_refresh_plan();
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({
+            "id":"service-token-1",
+            "expires_at":"2099-07-15T22:00:00Z"
+        }),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("refresh verification");
+
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("expiration matches=false"));
+    assert!(!verification.basis.contains("2099-07-15"));
+    assert!(!verification.basis.contains("2098-07-15"));
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn access_service_token_refresh_rejects_a_grafted_permission_before_network() {
+    let mut plan = access_service_token_refresh_plan();
+    plan.capability.permissions = vec!["Account Settings Write".to_owned()];
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({
+            "id":"service-token-1",
+            "expires_at":"2099-07-15T22:00:00Z"
+        }),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor =
+        Executor::new(reqwest::Client::new(), "http://127.0.0.1:9/client/v4").expect("executor");
+
+    let error = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect_err("a grafted refresh verifier must fail before network")
+        .to_string();
+
+    assert!(error.contains("not implemented"));
+    assert!(!error.contains("2099-07-15"));
+}
+
+#[tokio::test]
 async fn oauth_client_old_secret_delete_verifies_one_secret_state() {
     let (address, server) = json_response_sequence_server(vec![
         r#"{"success":true,"result":{"client_id":"oauth-client-1","has_rotated_secret":false},"errors":[]}"#,
@@ -4427,6 +4553,67 @@ fn oauth_client_secret_plan(id: &str, method: &str, verification_strategy: &str)
         selectors: json!({
             "account_id":"account-1",
             "oauth_client_id":"oauth-client-1"
+        }),
+        query: json!({}),
+        body: None,
+        ..CallInput::default()
+    })
+    .expect("input");
+    plan
+}
+
+fn access_service_token_refresh_plan() -> PlanV1 {
+    let mut capability = CapabilityV1::new(
+        "access-service-tokens-refresh-a-service-token",
+        "Refresh a service token",
+        "POST",
+        "/accounts/{account_id}/access/service_tokens/{service_token_id}/refresh",
+    );
+    "Access service tokens".clone_into(&mut capability.product);
+    capability.permissions = vec!["Access: Service Tokens Write".to_owned()];
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "service_token_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: json!({"maxLength":36,"type":"string"}),
+                query: None,
+            }),
+        },
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: json!({"maxLength":32,"type":"string"}),
+                query: None,
+            }),
+        },
+    ];
+    "access_service_token_reports_refreshed_expiration"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/accounts/{account_id}/access/service_tokens/{service_token_id}".to_owned(),
+        read_capability_id: "access-service-tokens-get-a-service-token".to_owned(),
+        verified_response_fields: vec!["expires_at".to_owned(), "id".to_owned()],
+    });
+    let mut plan = PlanV1::draft(
+        "profile",
+        "account-1",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("plan");
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({
+            "account_id":"account-1",
+            "service_token_id":"service-token-1"
         }),
         query: json!({}),
         body: None,

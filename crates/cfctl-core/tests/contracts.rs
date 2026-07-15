@@ -3,8 +3,8 @@
 use cfctl_core::{
     AdapterStatus, CapabilityV1, CostV1, CreatedCollectionResourceContractV1,
     CreatedResourceContractV1, EffectClass, EvidenceClass, EvidenceV1, GuideStage, PlanStatus,
-    PlanV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1, SelectorV1, TransactionStageV1,
-    UpdatedResourceContractV1, guide_stages, redact_json,
+    PlanV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1,
+    TransactionStageV1, UpdatedResourceContractV1, guide_stages, redact_json,
 };
 use serde_json::{Value, json};
 
@@ -192,6 +192,63 @@ fn mutation_contracts_reject_declared_but_unimplemented_strategies() {
             .iter()
             .any(|gap| { gap == "declared verification strategy is unsupported: not_applicable" })
     );
+}
+
+#[test]
+fn access_service_token_refresh_verifier_is_bound_to_the_exact_expiry_contract() {
+    let mut capability = CapabilityV1::new(
+        "access-service-tokens-refresh-a-service-token",
+        "Refresh a service token",
+        "POST",
+        "/accounts/{account_id}/access/service_tokens/{service_token_id}/refresh",
+    );
+    "Access service tokens".clone_into(&mut capability.product);
+    capability.permissions = vec!["Access: Service Tokens Write".to_owned()];
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "service_token_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: json!({"maxLength":36,"type":"string"}),
+                query: None,
+            }),
+        },
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: json!({"maxLength":32,"type":"string"}),
+                query: None,
+            }),
+        },
+    ];
+    "access_service_token_reports_refreshed_expiration"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/accounts/{account_id}/access/service_tokens/{service_token_id}".to_owned(),
+        read_capability_id: "access-service-tokens-get-a-service-token".to_owned(),
+        verified_response_fields: vec!["expires_at".to_owned(), "id".to_owned()],
+    });
+
+    assert!(capability.verification_contract_supported());
+
+    let mut grafted = capability.clone();
+    grafted.permissions = vec!["Account Settings Write".to_owned()];
+    assert!(!grafted.verification_contract_supported());
+
+    let mut broadened = capability;
+    broadened.selectors[0]
+        .contract
+        .as_mut()
+        .expect("service token selector contract")
+        .schema["maxLength"] = json!(64);
+    assert!(!broadened.verification_contract_supported());
 }
 
 #[test]

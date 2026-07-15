@@ -86,6 +86,12 @@ update path because they change credential cutover state. Exact field readback
 proves the requested metadata, while the irreversible expiration-clock reset is
 called out instead of being mislabeled as automatically restorable.
 
+Service-token refresh is an operation-specific irreversible verifier, not a
+generic successful-POST check. The apply response and exact detail readback
+must agree on both token identity and a valid future expiration. Neither the
+value nor a success flag alone proves the refresh, and the prior expiration is
+not represented as recoverable.
+
 OAuth client rotation combines that sink receipt with a separate state proof:
 the secret value itself remains unreadable, while an exact client-detail read
 must prove the transition from one secret to two. Old-secret deletion is a

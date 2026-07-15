@@ -52,6 +52,8 @@ Docs access patterns worth remembering:
   https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/methods/get/
 - Update an Access service token:
   https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/methods/update/
+- Refresh an Access service token:
+  https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/methods/refresh/
 - Rotate an Access service token:
   https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/service_tokens/methods/rotate/
 - Cloudflare One account limits:

@@ -196,6 +196,13 @@ changing duration resets expiration relative to the update, cfctl does not
 claim it can restore the exact prior expiration; any corrective update is a
 separate reviewed plan.
 
+Refreshing an Access service token is a separate, body-free irreversible lane.
+Cloudflare documents it as a one-year lifetime extension relative to refresh
+time. cfctl requires the exact token ID and returned future `expires_at` to
+match an immediate detail readback, but does not claim the prior expiration can
+be restored. Shortening or otherwise correcting lifetime requires another
+reviewed operation from trusted evidence.
+
 When a token or DNS-record creation receipt proves the returned resource ID
 and the catalog declares a compensating delete, `plans rectify` can derive a
 separate hash-bound revoke/delete plan. It never runs that plan automatically:
