@@ -1392,7 +1392,8 @@ fn classify_created_resource_contracts(
         .filter(|capability| {
             capability.method == "DELETE"
                 && path_targets_exact_resource(&capability.path)
-                && capability.request_schema.is_none()
+                && (capability.request_schema.is_none()
+                    || capability.required_empty_request_body_contract())
                 && capability
                     .selectors
                     .iter()
@@ -1542,7 +1543,8 @@ fn classify_created_collection_resource_contracts(
         .filter(|capability| {
             capability.method == "DELETE"
                 && path_targets_exact_resource(&capability.path)
-                && capability.request_schema.is_none()
+                && (capability.request_schema.is_none()
+                    || capability.required_empty_request_body_contract())
                 && capability
                     .selectors
                     .iter()
@@ -3465,6 +3467,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         classify_load_balancing_configuration(capability, kind);
     } else if is_email_security_settings_configuration(capability) {
         classify_email_security_settings_configuration(capability);
+    } else if let Some(kind) = cloudflare_tunnel_lifecycle_kind(capability) {
+        classify_cloudflare_tunnel_lifecycle(capability, kind);
     } else if let Some(kind) = queue_configuration_kind(capability) {
         classify_queue_configuration(capability, kind);
     } else {
@@ -4120,6 +4124,177 @@ fn classify_email_security_settings_configuration(capability: &mut CapabilityV1)
     capability.entitlement.source =
         Some("https://www.cloudflare.com/plans/zero-trust-services/".to_owned());
     capability.entitlement.requires_live_resolution = false;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloudflareTunnelLifecycleKind {
+    CreateRemoteManaged,
+    UpdateName,
+}
+
+struct CloudflareTunnelLifecycleContract {
+    id: &'static str,
+    method: &'static str,
+    path: &'static str,
+    kind: CloudflareTunnelLifecycleKind,
+}
+
+const CLOUDFLARE_TUNNEL_LIFECYCLE_CONTRACTS: &[CloudflareTunnelLifecycleContract] = &[
+    CloudflareTunnelLifecycleContract {
+        id: "cloudflare-tunnel-create-a-cloudflare-tunnel",
+        method: "POST",
+        path: "/accounts/{account_id}/cfd_tunnel",
+        kind: CloudflareTunnelLifecycleKind::CreateRemoteManaged,
+    },
+    CloudflareTunnelLifecycleContract {
+        id: "cloudflare-tunnel-update-a-cloudflare-tunnel",
+        method: "PATCH",
+        path: "/accounts/{account_id}/cfd_tunnel/{tunnel_id}",
+        kind: CloudflareTunnelLifecycleKind::UpdateName,
+    },
+];
+
+fn cloudflare_tunnel_lifecycle_kind(
+    capability: &CapabilityV1,
+) -> Option<CloudflareTunnelLifecycleKind> {
+    CLOUDFLARE_TUNNEL_LIFECYCLE_CONTRACTS
+        .iter()
+        .find(|contract| {
+            capability.id == contract.id
+                && capability.method == contract.method
+                && capability.path == contract.path
+                && capability.product == "Cloudflare Tunnel"
+                && capability.permissions
+                    == [
+                        "Cloudflare One Connectors Write",
+                        "Cloudflare One Connector: cloudflared Write",
+                        "Cloudflare Tunnel Write",
+                    ]
+                && capability
+                    .response_contract
+                    .as_ref()
+                    .is_some_and(|response| {
+                        response.success_statuses == ["200"]
+                            && response.success_media_types == ["application/json"]
+                            && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                    })
+                && cloudflare_tunnel_request_contract_supported(capability, contract.kind)
+        })
+        .map(|contract| contract.kind)
+}
+
+fn cloudflare_tunnel_request_contract_supported(
+    capability: &CapabilityV1,
+    kind: CloudflareTunnelLifecycleKind,
+) -> bool {
+    let Some(schema) = capability.request_schema.as_ref() else {
+        return false;
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    let string_field = |field: &str| {
+        properties
+            .get(field)
+            .and_then(|field| field.get("type"))
+            .and_then(Value::as_str)
+            == Some("string")
+    };
+    let common_shape = schema.get("type").and_then(Value::as_str) == Some("object")
+        && schema.get("x-cfctl-body-required").and_then(Value::as_bool) == Some(true)
+        && string_field("name")
+        && string_field("tunnel_secret");
+    if !common_shape {
+        return false;
+    }
+    match kind {
+        CloudflareTunnelLifecycleKind::CreateRemoteManaged => {
+            properties.len() == 3
+                && schema.get("required") == Some(&serde_json::json!(["name"]))
+                && string_field("config_src")
+                && properties
+                    .get("config_src")
+                    .and_then(|field| field.get("enum"))
+                    == Some(&serde_json::json!(["local", "cloudflare"]))
+        }
+        CloudflareTunnelLifecycleKind::UpdateName => {
+            properties.len() == 2
+                && schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+        }
+    }
+}
+
+fn classify_cloudflare_tunnel_lifecycle(
+    capability: &mut CapabilityV1,
+    kind: CloudflareTunnelLifecycleKind,
+) {
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "creating or renaming a Cloudflare Tunnel has no direct per-operation charge; traffic, users, logs, and separately enabled Cloudflare One services can retain plan-specific downstream cost and limits"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Cloudflare One plans and pricing".to_owned(),
+            url: "https://www.cloudflare.com/plans/zero-trust-services/".to_owned(),
+            source: "official Cloudflare pricing".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare One overview".to_owned(),
+            url: "https://developers.cloudflare.com/cloudflare-one/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Cloudflare One account limits".to_owned(),
+            url: "https://developers.cloudflare.com/cloudflare-one/account-limits/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Create a Cloudflare Tunnel".to_owned(),
+            url: "https://developers.cloudflare.com/api/resources/zero_trust/subresources/tunnels/subresources/cloudflared/methods/create/"
+                .to_owned(),
+            source: "official Cloudflare API".to_owned(),
+        },
+    ];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans = BTreeMap::from([
+        ("zero_trust_free".to_owned(), true),
+        ("zero_trust_pay_as_you_go".to_owned(), true),
+        ("zero_trust_contract".to_owned(), true),
+    ]);
+    capability.entitlement.blocker = None;
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/cloudflare-one/".to_owned());
+    capability.entitlement.requires_live_resolution = false;
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+
+    capability.request_schema = Some(match kind {
+        CloudflareTunnelLifecycleKind::CreateRemoteManaged => serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["config_src", "name"],
+            "properties": {
+                "config_src": {"type": "string", "enum": ["cloudflare"]},
+                "name": {"type": "string"}
+            },
+            "x-cfctl-body-required": true
+        }),
+        CloudflareTunnelLifecycleKind::UpdateName => serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {"name": {"type": "string"}},
+            "x-cfctl-body-required": true
+        }),
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

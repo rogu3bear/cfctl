@@ -4023,9 +4023,23 @@ fn generic_created_resource_compensation(
     ))
 }
 
+fn bind_required_empty_compensation_body(
+    request: &mut CompensationRequest,
+    capability: &cfctl_core::CapabilityV1,
+) {
+    if request.expected_method == "DELETE"
+        && capability.method == request.expected_method
+        && capability.path == request.expected_path
+        && request.input.body.is_none()
+        && capability.required_empty_request_body_contract()
+    {
+        request.input.body = Some(json!({}));
+    }
+}
+
 async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
     let plan = load_validated_plan(store, &selector.operation_id)?;
-    if let Some(request) = compensation_request(&plan)? {
+    if let Some(mut request) = compensation_request(&plan)? {
         let catalog = ensure_catalog(store).await?;
         let capability = catalog
             .get(&request.capability_id)
@@ -4038,6 +4052,7 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
                 request.capability_id, request.expected_method
             )));
         }
+        bind_required_empty_compensation_body(&mut request, &capability);
         let source_receipt_hash = plan
             .transaction_journal
             .iter()
@@ -5957,10 +5972,11 @@ mod tests {
         CallInput, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions, PlanAuthority,
         apply_d1_read_replication_state_response, apply_dns_record_state_response,
         apply_global_warp_override_state_response, apply_zone_account_response,
-        apply_zone_entitlement_response, boundary_response_artifact, capability_call_argv,
-        compensation_request, find_secret_value, guide_document, is_live_plan_precondition_hash,
-        persist_prepared_plan, persist_secret_lifecycle, preflight_call_input,
-        preserve_previous_catalog, query_object_from_pairs, redact_secret_result,
+        apply_zone_entitlement_response, bind_required_empty_compensation_body,
+        boundary_response_artifact, capability_call_argv, compensation_request, find_secret_value,
+        guide_document, is_live_plan_precondition_hash, persist_prepared_plan,
+        persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
+        query_object_from_pairs, redact_secret_result,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
         required_zone_account_precondition, should_bind_d1_read_replication_state,
@@ -8152,7 +8168,7 @@ mod tests {
         .expect("response receipt");
         plan.status = PlanStatus::RectificationRequired;
 
-        let request = compensation_request(&plan)
+        let mut request = compensation_request(&plan)
             .expect("request resolves")
             .expect("compensation is supported");
 
@@ -8169,6 +8185,21 @@ mod tests {
         assert!(request.input.if_match.is_none());
         assert!(request.input.if_none_match.is_none());
         assert_eq!(request.requested_account.as_deref(), Some("account-a"));
+
+        let mut delete_capability = CapabilityV1::new(
+            "widgets-delete",
+            "Delete Widget",
+            "DELETE",
+            "/accounts/{account_id}/widgets/{slug}",
+        );
+        delete_capability.request_schema = Some(json!({
+            "type":"object",
+            "properties":{},
+            "additionalProperties":false,
+            "x-cfctl-body-required":true
+        }));
+        bind_required_empty_compensation_body(&mut request, &delete_capability);
+        assert_eq!(request.input.body, Some(json!({})));
     }
 
     #[test]

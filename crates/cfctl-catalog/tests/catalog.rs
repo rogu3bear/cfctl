@@ -3976,6 +3976,231 @@ fn queue_configuration_classifier_rejects_permission_and_request_schema_drift() 
     assert_eq!(drifted_update.entitlement.available, None);
 }
 
+fn cloudflare_tunnel_lifecycle_fixture() -> serde_json::Value {
+    let mut document = create_lifecycle_fixture();
+    document["components"]["schemas"]["Widget"]["properties"] = json!({
+        "id": {"type": "string", "format": "uuid"},
+        "name": {"type": "string"},
+        "config_src": {"type": "string", "enum": ["local", "cloudflare"]}
+    });
+
+    let mut collection = document["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets")
+        .expect("widget collection");
+    collection["post"]["operationId"] = json!("cloudflare-tunnel-create-a-cloudflare-tunnel");
+    collection["post"]["summary"] = json!("Create a Cloudflare Tunnel");
+    collection["post"]["tags"] = json!(["Cloudflare Tunnel"]);
+    collection["post"]["x-api-token-group"] = json!([
+        "Cloudflare One Connectors Write",
+        "Cloudflare One Connector: cloudflared Write",
+        "Cloudflare Tunnel Write"
+    ]);
+    collection["post"]["requestBody"]["content"]["application/json"]["schema"] = json!({
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+            "config_src": {"type": "string", "enum": ["local", "cloudflare"]},
+            "name": {"type": "string"},
+            "tunnel_secret": {"type": "string"}
+        }
+    });
+    let create_response = collection["post"]["responses"]
+        .as_object_mut()
+        .expect("create responses")
+        .remove("201")
+        .expect("created response");
+    collection["post"]["responses"] = json!({"200": create_response});
+
+    let mut detail = document["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets/{widget_id}")
+        .expect("widget detail");
+    detail["parameters"][1]["name"] = json!("tunnel_id");
+    detail["parameters"][1]["schema"] = json!({"type": "string", "format": "uuid"});
+    detail["get"]["operationId"] = json!("cloudflare-tunnel-get-a-cloudflare-tunnel");
+    detail["get"]["summary"] = json!("Get a Cloudflare Tunnel");
+    detail["get"]["tags"] = json!(["Cloudflare Tunnel"]);
+    detail["delete"]["operationId"] = json!("cloudflare-tunnel-delete-a-cloudflare-tunnel");
+    detail["delete"]["summary"] = json!("Delete a Cloudflare Tunnel");
+    detail["delete"]["tags"] = json!(["Cloudflare Tunnel"]);
+    detail["delete"]["x-api-token-group"] = json!([
+        "Cloudflare One Connectors Write",
+        "Cloudflare One Connector: cloudflared Write",
+        "Cloudflare Tunnel Write"
+    ]);
+    detail["delete"]["requestBody"] = json!({
+        "required": true,
+        "content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {}
+        }}}
+    });
+    detail["delete"]["responses"] = json!({
+        "200": {
+            "description": "Tunnel deleted",
+            "content": {"application/json": {
+                "schema": {"$ref": "#/components/schemas/WidgetResponse"}
+            }}
+        }
+    });
+    detail["patch"] = json!({
+        "operationId": "cloudflare-tunnel-update-a-cloudflare-tunnel",
+        "summary": "Update a Cloudflare Tunnel",
+        "tags": ["Cloudflare Tunnel"],
+        "x-api-token-group": [
+            "Cloudflare One Connectors Write",
+            "Cloudflare One Connector: cloudflared Write",
+            "Cloudflare Tunnel Write"
+        ],
+        "requestBody": {
+            "required": true,
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "tunnel_secret": {"type": "string"}
+                }
+            }}}
+        },
+        "responses": {
+            "200": {
+                "description": "Tunnel updated",
+                "content": {"application/json": {
+                    "schema": {"$ref": "#/components/schemas/WidgetResponse"}
+                }}
+            }
+        }
+    });
+    document["paths"]["/accounts/{account_id}/cfd_tunnel"] = collection;
+    document["paths"]["/accounts/{account_id}/cfd_tunnel/{tunnel_id}"] = detail;
+    document
+}
+
+#[test]
+fn cloudflare_tunnel_lifecycle_exposes_a_secret_safe_remote_management_lane() {
+    let snapshot =
+        normalize_openapi(&cloudflare_tunnel_lifecycle_fixture()).expect("Tunnel catalog");
+    let create = snapshot
+        .get("cloudflare-tunnel-create-a-cloudflare-tunnel")
+        .expect("Tunnel create");
+    assert_eq!(create.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(create.risk, RiskClass::CrossConfig);
+    assert_eq!(create.effect, EffectClass::ReversibleWrite);
+    assert_eq!(
+        create.request_schema,
+        Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["config_src", "name"],
+            "properties": {
+                "config_src": {"type": "string", "enum": ["cloudflare"]},
+                "name": {"type": "string"}
+            },
+            "x-cfctl-body-required": true
+        }))
+    );
+    assert!(create.cost.known);
+    assert_eq!(create.cost.maximum, Some(0.0));
+    assert_eq!(create.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(create.entitlement.available, Some(true));
+    assert_eq!(create.entitlement.plans.get("zero_trust_free"), Some(&true));
+    assert_eq!(
+        create.entitlement.plans.get("zero_trust_pay_as_you_go"),
+        Some(&true)
+    );
+    assert_eq!(
+        create.entitlement.plans.get("zero_trust_contract"),
+        Some(&true)
+    );
+    let created = create
+        .created_resource
+        .as_ref()
+        .expect("exact created Tunnel contract");
+    assert_eq!(created.identity_selector, "tunnel_id");
+    assert_eq!(created.response_result_identity_pointer, "/id");
+    assert_eq!(
+        created.read_capability_id,
+        "cloudflare-tunnel-get-a-cloudflare-tunnel"
+    );
+    assert_eq!(
+        created.delete_capability_id,
+        "cloudflare-tunnel-delete-a-cloudflare-tunnel"
+    );
+    assert_eq!(created.verified_response_fields, ["config_src", "name"]);
+    assert!(create.rollback.supported);
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    assert!(create.mutation_contract_gaps().is_empty());
+
+    let update = snapshot
+        .get("cloudflare-tunnel-update-a-cloudflare-tunnel")
+        .expect("Tunnel update");
+    assert_eq!(update.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(update.risk, RiskClass::CrossConfig);
+    assert_eq!(update.effect, EffectClass::ReversibleWrite);
+    assert_eq!(
+        update.request_schema,
+        Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {"name": {"type": "string"}},
+            "x-cfctl-body-required": true
+        }))
+    );
+    let readback = update
+        .same_path_read
+        .as_ref()
+        .expect("exact Tunnel update readback");
+    assert_eq!(
+        readback.read_capability_id,
+        "cloudflare-tunnel-get-a-cloudflare-tunnel"
+    );
+    assert_eq!(readback.verified_response_fields, ["name"]);
+    assert!(!update.rollback.supported);
+    assert!(update.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("pre-change snapshot") && warning.contains("separately reviewed")
+    }));
+    assert!(update.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn cloudflare_tunnel_lifecycle_rejects_permission_and_source_schema_drift() {
+    let mut permission_drift = cloudflare_tunnel_lifecycle_fixture();
+    permission_drift["paths"]["/accounts/{account_id}/cfd_tunnel"]["post"]["x-api-token-group"] =
+        json!(["Cloudflare Tunnel Write"]);
+    let permission_snapshot = normalize_openapi(&permission_drift).expect("permission drift");
+    let drifted_create = permission_snapshot
+        .get("cloudflare-tunnel-create-a-cloudflare-tunnel")
+        .expect("permission-drifted Tunnel create");
+    assert_eq!(drifted_create.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(drifted_create.risk, RiskClass::Unknown);
+    assert!(
+        drifted_create
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.pointer("/properties/tunnel_secret"))
+            .is_some()
+    );
+
+    let mut schema_drift = cloudflare_tunnel_lifecycle_fixture();
+    schema_drift["paths"]["/accounts/{account_id}/cfd_tunnel/{tunnel_id}"]["patch"]["requestBody"]
+        ["content"]["application/json"]["schema"]["properties"]["billing_tier"] =
+        json!({"type": "string"});
+    let schema_snapshot = normalize_openapi(&schema_drift).expect("schema drift");
+    let drifted_update = schema_snapshot
+        .get("cloudflare-tunnel-update-a-cloudflare-tunnel")
+        .expect("schema-drifted Tunnel update");
+    assert_eq!(drifted_update.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(drifted_update.risk, RiskClass::Unknown);
+    assert!(!drifted_update.cost.known);
+}
+
 #[test]
 fn create_contract_binds_a_schema_proven_id_and_exact_read_delete_pair() {
     let document = create_lifecycle_fixture();
