@@ -83,7 +83,7 @@ printf '%s' "$CLOUDFLARE_API_KEY" | \
 ## Read and change
 
 ```bash
-cfctl call zones-list-zones --query name=example.com --json
+cfctl call zones-get --query name=example.com --json
 cfctl guide dns-records-for-a-zone-create-dns-record
 cfctl call dns-records-for-a-zone-create-dns-record \
   --selector zone_id=<zone-id> \

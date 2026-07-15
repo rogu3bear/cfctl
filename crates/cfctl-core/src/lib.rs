@@ -416,6 +416,29 @@ pub enum GuideStage {
     CloseWithEvidence,
 }
 
+impl GuideStage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discover => "discover",
+            Self::Authenticate => "authenticate",
+            Self::SelectAccount => "select_account",
+            Self::CheckEntitlement => "check_entitlement",
+            Self::InspectCurrentState => "inspect_current_state",
+            Self::LoadStandards => "load_standards",
+            Self::MapDependencies => "map_dependencies",
+            Self::CalculateCost => "calculate_cost",
+            Self::BuildPlan => "build_plan",
+            Self::RequestApproval => "request_approval",
+            Self::AcquireLocks => "acquire_locks",
+            Self::Execute => "execute",
+            Self::Verify => "verify",
+            Self::Rectify => "rectify",
+            Self::CloseWithEvidence => "close_with_evidence",
+        }
+    }
+}
+
 #[must_use]
 pub fn guide_stages() -> &'static [GuideStage; 15] {
     &[

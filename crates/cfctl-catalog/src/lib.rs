@@ -158,8 +158,11 @@ impl CatalogSnapshot {
                 usize::from(capability.mutating && capability.verification_contract_declared());
             rollback_contracts +=
                 usize::from(capability.mutating && capability.rollback_contract_declared());
-            complete_mutation_contracts +=
-                usize::from(capability.mutating && capability.mutation_contract_gaps().is_empty());
+            complete_mutation_contracts += usize::from(
+                capability.mutating
+                    && capability.adapter_status != AdapterStatus::Blocked
+                    && capability.mutation_contract_gaps().is_empty(),
+            );
         }
         CatalogCoverageV1 {
             schema_hash: self.schema_hash.clone(),
@@ -1501,6 +1504,13 @@ fn classify_api_token_lifecycle(capability: &mut CapabilityV1) {
             "credential values are emitted once and must be delivered to an explicit sink"
                 .to_owned(),
         );
+        if capability.id == "user-api-tokens-create-token" {
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(
+                "user-token minting is blocked until a dedicated live permission inventory and least-privilege policy workflow is implemented"
+                    .to_owned(),
+            );
+        }
     } else if capability.id.ends_with("roll-token") {
         capability.risk = RiskClass::SecretSensitive;
         capability.effect = EffectClass::IdentityOrOwnership;

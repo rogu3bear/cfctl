@@ -9,7 +9,7 @@ with stable JSON for automation.
 ./bootstrap.sh
 cfctl catalog sync
 cfctl catalog search "Worker secret"
-cfctl guide workers-secrets-put-secret-value
+cfctl guide worker-put-script-secret
 cfctl "rotate the production Worker secret"
 ```
 
@@ -95,12 +95,20 @@ printf '%s' "$CLOUDFLARE_API_KEY" | \
 ## Read and change
 
 ```bash
-cfctl call zones-list-zones --query name=example.com --json
+cfctl call zones-get --query name=example.com --json
 cfctl guide dns-records-for-a-zone-create-dns-record
 cfctl call dns-records-for-a-zone-create-dns-record \
   --selector zone_id=<zone-id> \
   --body-json '{"type":"TXT","name":"_example","content":"hello"}'
 ```
+
+`guide --json` returns the exact 15-stage lifecycle with contract states,
+evidence classes, blockers, safe next actions, and argv arrays. A blocked
+capability never receives a runnable `call_argv`; its post-resolution argv is
+clearly separated as a template. Token creation is exposed through the
+inventory-bound `keys mint` workflow rather than a direct create call;
+user-token creation remains blocked without an equivalent workflow and has no
+execution template.
 
 A mutating `call` creates a hash-bound transaction plan. It does not write
 immediately. Review the plan and exact operation ID:

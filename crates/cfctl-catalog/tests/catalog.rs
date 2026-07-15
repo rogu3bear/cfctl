@@ -282,6 +282,31 @@ fn account_token_mutations_have_complete_native_execution_contracts() {
 }
 
 #[test]
+fn user_token_creation_stays_blocked_without_a_permission_inventory_workflow() {
+    let mut document = fixture();
+    document["paths"]["/user/tokens"]["post"] = json!({
+        "operationId":"user-api-tokens-create-token",
+        "summary":"Create Token",
+        "tags":["User API Tokens"],
+        "x-api-token-group":["API Tokens Write"]
+    });
+
+    let snapshot = normalize_openapi(&document).expect("user token catalog");
+    let capability = snapshot
+        .get("user-api-tokens-create-token")
+        .expect("user token create");
+
+    assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+    assert!(
+        capability
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("permission inventory"))
+    );
+    assert_eq!(snapshot.coverage().complete_mutation_contracts, 0);
+}
+
+#[test]
 fn dns_record_crud_has_complete_operation_specific_contracts() {
     let mut document = fixture();
     document["paths"]["/zones/{zone_id}/dns_records"]["post"] = json!({

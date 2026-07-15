@@ -26,12 +26,21 @@ account, check entitlement, inspect current state, load standards, map
 dependencies, calculate cost, build plan, request approval if needed, acquire
 locks, execute, verify, rectify, and close with evidence.
 
+Each stage names its contract state, evidence class, and machine-safe argv
+arrays. `call_argv` is present only when the catalog contract is executable;
+blocked capabilities instead expose exact `blocking_gaps`, a safe next action,
+and, when a safe execution surface exists, a non-runnable
+`post_resolution_call_argv` template. Account API-token creation is routed
+through `keys mint`, which refreshes and binds the live permission-group
+inventory. User-token creation remains blocked and exposes no execution
+template until it has an equivalent inventory-bound workflow.
+
 ## Deterministic execution
 
 Use `cfctl call` with the selectors declared by the capability:
 
 ```bash
-cfctl call zones-list-zones --query name=example.com --json
+cfctl call zones-get --query name=example.com --json
 cfctl call dns-records-for-a-zone-list-dns-records \
   --selector zone_id=<zone-id> --json
 ```

@@ -497,21 +497,9 @@ async fn guide_command(store: &StateStore, arguments: &GuideArgs) -> Result<Resu
     let capability = catalog
         .get(&arguments.capability_id)
         .ok_or_else(|| capability_missing(&arguments.capability_id))?;
-    let stages: Vec<Value> = guide_stages()
-        .iter()
-        .enumerate()
-        .map(|(index, stage)| {
-            json!({
-                "stage": index + 1,
-                "name": format!("{stage:?}").to_ascii_lowercase(),
-                "capability_id": capability.id,
-                "required": stage_required(*stage, capability),
-            })
-        })
-        .collect();
     Ok(ResultEnvelopeV2::success(
         "guide",
-        json!({"capability": capability, "stages": stages}),
+        guide_document(capability),
     ))
 }
 
@@ -3186,6 +3174,413 @@ fn stage_required(stage: cfctl_core::GuideStage, capability: &cfctl_core::Capabi
     }
 }
 
+fn guide_document(capability: &CapabilityV1) -> Value {
+    let blocking_gaps = capability.mutation_contract_gaps();
+    let post_resolution_call_argv = capability_call_argv(capability);
+    let contract_ready = capability.adapter_status != AdapterStatus::Blocked
+        && blocking_gaps.is_empty()
+        && post_resolution_call_argv.is_some();
+    let call_argv = contract_ready
+        .then(|| post_resolution_call_argv.clone())
+        .flatten();
+    let stages = guide_stages()
+        .iter()
+        .enumerate()
+        .map(|(index, stage)| {
+            guide_stage_document(
+                index + 1,
+                *stage,
+                capability,
+                contract_ready,
+                &blocking_gaps,
+                post_resolution_call_argv.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "capability": capability,
+        "contract_state": if contract_ready { "available" } else { "blocked" },
+        "blocking_gaps": blocking_gaps,
+        "blocked_reason": capability.blocked_reason,
+        "call_argv": call_argv,
+        "post_resolution_call_argv": post_resolution_call_argv,
+        "next_action": guide_next_action(
+            capability,
+            contract_ready,
+            post_resolution_call_argv.as_deref(),
+        ),
+        "stages": stages,
+    })
+}
+
+fn capability_call_argv(capability: &CapabilityV1) -> Option<Vec<String>> {
+    if capability.id == "user-api-tokens-create-token" {
+        return None;
+    }
+    if capability.id == "account-api-tokens-create-token" {
+        return Some(
+            [
+                "cfctl",
+                "keys",
+                "mint",
+                "--name",
+                "<token-name>",
+                "--permission",
+                "<permission-group-id>",
+                "--account",
+                "<account_id>",
+                "--value-out",
+                "<new-mode-0600-path>",
+                "--json",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        );
+    }
+
+    let mut argv = vec!["cfctl".to_owned(), "call".to_owned(), capability.id.clone()];
+    for selector in capability
+        .selectors
+        .iter()
+        .filter(|selector| selector.required)
+    {
+        argv.push(
+            if selector.location == "query" {
+                "--query"
+            } else {
+                "--selector"
+            }
+            .to_owned(),
+        );
+        argv.push(format!("{}=<{}>", selector.name, selector.name));
+    }
+    if capability
+        .request_schema
+        .as_ref()
+        .and_then(|schema| schema.get("x-cfctl-body-required"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        argv.push("--body-stdin".to_owned());
+    }
+    if capability.risk == RiskClass::SecretSensitive {
+        argv.extend(["--value-out".to_owned(), "<new-mode-0600-path>".to_owned()]);
+    }
+    argv.push("--json".to_owned());
+    Some(argv)
+}
+
+fn guide_next_action(
+    capability: &CapabilityV1,
+    contract_ready: bool,
+    call_argv: Option<&[String]>,
+) -> Value {
+    if contract_ready {
+        let summary = if capability.mutating {
+            "Create the preview plan with the exact generated argv; no Cloudflare mutation occurs until the resulting operation is run."
+        } else {
+            "Run the exact generated argv to produce a redacted live-read receipt."
+        };
+        return json!({
+            "summary": summary,
+            "argv": call_argv,
+        });
+    }
+
+    let gaps = capability.mutation_contract_gaps();
+    let blocked_text = format!(
+        "{} {}",
+        capability.blocked_reason.as_deref().unwrap_or_default(),
+        gaps.join(" ")
+    )
+    .to_ascii_lowercase();
+    let (summary, argv) = if blocked_text.contains("cost") {
+        (
+            "Resolve and bind the operation's official pricing contract before planning it.",
+            vec![
+                "cfctl".to_owned(),
+                "docs".to_owned(),
+                "search".to_owned(),
+                format!("{} pricing", capability.product),
+                "--json".to_owned(),
+            ],
+        )
+    } else if blocked_text.contains("entitlement") {
+        (
+            "Review the official plan gate, then obtain an account-backed entitlement result before planning. Documentation identifies requirements but does not prove the selected account is entitled.",
+            vec![
+                "cfctl".to_owned(),
+                "docs".to_owned(),
+                "search".to_owned(),
+                format!("{} plans", capability.product),
+                "--json".to_owned(),
+            ],
+        )
+    } else if blocked_text.contains("permission inventory")
+        || blocked_text.contains("permission lane")
+    {
+        (
+            "Inspect the fresh account permission inventory. Inventory alone does not prove that a permission group authorizes this operation; token creation must use the governed keys workflow.",
+            [
+                "cfctl",
+                "keys",
+                "permissions",
+                "--account",
+                "<account_id>",
+                "--json",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        )
+    } else {
+        (
+            "Inspect the exact blocked adapter and contract metadata; do not attempt execution until every named gap is resolved.",
+            vec![
+                "cfctl".to_owned(),
+                "catalog".to_owned(),
+                "show".to_owned(),
+                capability.id.clone(),
+                "--json".to_owned(),
+            ],
+        )
+    };
+    json!({"summary": summary, "argv": argv})
+}
+
+fn guide_stage_document(
+    number: usize,
+    stage: cfctl_core::GuideStage,
+    capability: &CapabilityV1,
+    contract_ready: bool,
+    blocking_gaps: &[String],
+    call_argv: Option<&[String]>,
+) -> Value {
+    use cfctl_core::GuideStage;
+
+    let entitlement_blocked = capability.entitlement.available == Some(false)
+        || blocking_gaps.iter().any(|gap| gap.contains("entitlement"));
+    let entitlement_unresolved = capability.mutating
+        && capability.entitlement.available != Some(true)
+        && capability.entitlement.plans.is_empty();
+    let contract_state = match stage {
+        GuideStage::CheckEntitlement if entitlement_blocked => "blocked",
+        GuideStage::CheckEntitlement if entitlement_unresolved => "manual_review",
+        GuideStage::CalculateCost if capability.mutating && !capability.cost.known => "blocked",
+        GuideStage::CalculateCost
+        | GuideStage::BuildPlan
+        | GuideStage::RequestApproval
+        | GuideStage::AcquireLocks
+        | GuideStage::Rectify
+            if !capability.mutating =>
+        {
+            "not_applicable"
+        }
+        GuideStage::BuildPlan
+        | GuideStage::RequestApproval
+        | GuideStage::AcquireLocks
+        | GuideStage::Execute
+            if !contract_ready =>
+        {
+            "blocked"
+        }
+        GuideStage::Verify if !capability.verification.required => "not_applicable",
+        GuideStage::Verify if !capability.verification_contract_declared() => "blocked",
+        GuideStage::Rectify if !capability.rollback_contract_declared() => "blocked",
+        GuideStage::CloseWithEvidence if capability.mutating && !contract_ready => "blocked",
+        _ => "available",
+    };
+    json!({
+        "stage": number,
+        "name": stage.as_str(),
+        "capability_id": capability.id,
+        "required": stage_required(stage, capability),
+        "contract_state": contract_state,
+        "summary": guide_stage_summary(stage, capability.mutating),
+        "evidence_class": guide_stage_evidence_class(stage, capability.mutating),
+        "commands": guide_stage_commands(stage, capability, contract_state, call_argv),
+    })
+}
+
+fn guide_stage_summary(stage: cfctl_core::GuideStage, mutating: bool) -> &'static str {
+    use cfctl_core::GuideStage;
+
+    match stage {
+        GuideStage::Discover => {
+            "Inspect the catalog contract and adapter classification selected for this capability."
+        }
+        GuideStage::Authenticate => {
+            "Confirm that the selected profile has a usable credential without exposing its value."
+        }
+        GuideStage::SelectAccount => {
+            "Reconcile the explicit account, profile pin, and registered workspace pin; ambiguity fails closed."
+        }
+        GuideStage::CheckEntitlement => {
+            "Inspect the official plan matrix. When live resolution is required, catalog metadata alone does not prove the selected account's entitlement."
+        }
+        GuideStage::InspectCurrentState if mutating => {
+            "Audit registered-workspace state before deriving impact; use an operation-specific Cloudflare read or verifier rather than infer live state from local configuration."
+        }
+        GuideStage::InspectCurrentState => {
+            "Run the capability as a redacted live read to inspect current Cloudflare state."
+        }
+        GuideStage::LoadStandards => {
+            "Load current official product documentation and changelog context."
+        }
+        GuideStage::MapDependencies => {
+            "Map exact local IaC references and affected registered repositories."
+        }
+        GuideStage::CalculateCost => {
+            "Use the bound cost model and official pricing references; unknown or unbounded cost remains blocked."
+        }
+        GuideStage::BuildPlan => {
+            "Create a hash-bound preview plan from the exact selectors, request body, workspace impact, and safety contracts."
+        }
+        GuideStage::RequestApproval => {
+            "Review the plan, then bind approval and any cost ceiling to its exact operation ID."
+        }
+        GuideStage::AcquireLocks => {
+            "Revalidate catalog, account, request, and workspace hashes before acquiring execution locks."
+        }
+        GuideStage::Execute if mutating => {
+            "Cross the Cloudflare write boundary only through the exact durable operation ID."
+        }
+        GuideStage::Execute => {
+            "Perform the redacted live read through the catalog-selected adapter."
+        }
+        GuideStage::Verify => {
+            "Require operation-specific post-change verification before declaring success."
+        }
+        GuideStage::Rectify => {
+            "Use only the declared compensation contract and hash-bound boundary receipts."
+        }
+        GuideStage::CloseWithEvidence => {
+            "Close only with final durable status and content-addressed evidence."
+        }
+    }
+}
+
+fn guide_stage_evidence_class(stage: cfctl_core::GuideStage, mutating: bool) -> &'static str {
+    use cfctl_core::GuideStage;
+
+    match stage {
+        GuideStage::Discover
+        | GuideStage::CheckEntitlement
+        | GuideStage::LoadStandards
+        | GuideStage::MapDependencies
+        | GuideStage::CalculateCost => "source_config",
+        GuideStage::InspectCurrentState | GuideStage::Execute if !mutating => "live_read",
+        GuideStage::Authenticate
+        | GuideStage::SelectAccount
+        | GuideStage::InspectCurrentState
+        | GuideStage::AcquireLocks
+        | GuideStage::CloseWithEvidence => "local_proof",
+        GuideStage::BuildPlan | GuideStage::RequestApproval => "preview",
+        GuideStage::Execute | GuideStage::Rectify => "apply",
+        GuideStage::Verify => "post_change_verification",
+    }
+}
+
+fn guide_stage_commands(
+    stage: cfctl_core::GuideStage,
+    capability: &CapabilityV1,
+    contract_state: &str,
+    call_argv: Option<&[String]>,
+) -> Vec<Vec<String>> {
+    use cfctl_core::GuideStage;
+
+    let available = contract_state == "available";
+    let conditional =
+        |command: Option<Vec<String>>| available.then_some(command).flatten().into_iter().collect();
+    match stage {
+        GuideStage::Discover | GuideStage::CheckEntitlement | GuideStage::CalculateCost => {
+            vec![catalog_show_argv(&capability.id)]
+        }
+        GuideStage::Authenticate => vec![argv(&["cfctl", "auth", "status", "default", "--json"])],
+        GuideStage::SelectAccount => vec![
+            argv(&["cfctl", "auth", "profiles", "--json"]),
+            argv(&["cfctl", "workspace", "graph", "--json"]),
+        ],
+        GuideStage::InspectCurrentState if !capability.mutating => {
+            conditional(call_argv.map(<[String]>::to_vec))
+        }
+        GuideStage::InspectCurrentState => {
+            vec![argv(&["cfctl", "workspace", "audit", "--json"])]
+        }
+        GuideStage::LoadStandards => vec![vec![
+            "cfctl".to_owned(),
+            "docs".to_owned(),
+            "search".to_owned(),
+            capability.product.clone(),
+            "--json".to_owned(),
+        ]],
+        GuideStage::MapDependencies => {
+            vec![argv(&["cfctl", "workspace", "graph", "--json"])]
+        }
+        GuideStage::RequestApproval => conditional(Some(argv(&[
+            "cfctl",
+            "plans",
+            "approve",
+            "<operation-id>",
+            "--yes",
+            "--json",
+        ]))),
+        GuideStage::AcquireLocks => conditional(Some(argv(&[
+            "cfctl",
+            "plans",
+            "show",
+            "<operation-id>",
+            "--json",
+        ]))),
+        GuideStage::Execute if capability.mutating => conditional(Some(argv(&[
+            "cfctl",
+            "plans",
+            "run",
+            "<operation-id>",
+            "--json",
+        ]))),
+        GuideStage::BuildPlan | GuideStage::Execute => {
+            conditional(call_argv.map(<[String]>::to_vec))
+        }
+        GuideStage::Verify => conditional(Some(argv(&[
+            "cfctl",
+            "plans",
+            "status",
+            "<operation-id>",
+            "--json",
+        ]))),
+        GuideStage::Rectify => conditional(Some(argv(&[
+            "cfctl",
+            "plans",
+            "rectify",
+            "<operation-id>",
+            "--json",
+        ]))),
+        GuideStage::CloseWithEvidence if capability.mutating => conditional(Some(argv(&[
+            "cfctl",
+            "plans",
+            "status",
+            "<operation-id>",
+            "--json",
+        ]))),
+        GuideStage::CloseWithEvidence => Vec::new(),
+    }
+}
+
+fn argv(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|part| (*part).to_owned()).collect()
+}
+
+fn catalog_show_argv(capability_id: &str) -> Vec<String> {
+    vec![
+        "cfctl".to_owned(),
+        "catalog".to_owned(),
+        "show".to_owned(),
+        capability_id.to_owned(),
+        "--json".to_owned(),
+    ]
+}
+
 fn preflight_secret_sink(plan: &PlanV1) -> Result<()> {
     if !is_secret_output_plan(plan) {
         return Ok(());
@@ -3446,14 +3841,15 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        CallInput, compensation_request, find_secret_value, persist_secret_lifecycle,
-        redact_secret_result, sink_secret_result, validate_api_token_creation_contract,
-        validate_current_permission_groups, validate_selected_permission_groups,
+        CallInput, compensation_request, find_secret_value, guide_document,
+        persist_secret_lifecycle, redact_secret_result, sink_secret_result,
+        validate_api_token_creation_contract, validate_current_permission_groups,
+        validate_selected_permission_groups,
     };
     use cfctl_auth::{AuthError, SecretStore};
     use cfctl_core::{
-        CapabilityV1, CreatedResourceContractV1, PlanStatus, PlanV1, RiskClass, TransactionStageV1,
-        hash_value,
+        AdapterStatus, CapabilityV1, CreatedResourceContractV1, PlanStatus, PlanV1, RiskClass,
+        SelectorV1, TransactionStageV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use serde_json::json;
@@ -3611,6 +4007,126 @@ mod tests {
                 .expect_err("permission metadata drift is rejected");
             assert!(error.to_string().contains("drifted after planning"));
         }
+    }
+
+    #[test]
+    fn guide_names_exact_blockers_and_never_suggests_executing_a_blocked_call() {
+        let mut capability = CapabilityV1::new(
+            "widgets-update",
+            "Update widget",
+            "PATCH",
+            "/accounts/{account_id}/widgets/{widget_id}",
+        );
+        capability.product = "Widgets".to_owned();
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "operation contract incomplete: operation-specific incremental cost is unknown"
+                .to_owned(),
+        );
+        capability.selectors = vec![
+            SelectorV1 {
+                name: "account_id".to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+            },
+            SelectorV1 {
+                name: "widget_id".to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+            },
+        ];
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "x-cfctl-body-required":true,
+            "properties":{"enabled":{"type":"boolean"}}
+        }));
+
+        let guide = guide_document(&capability);
+
+        assert_eq!(guide["contract_state"], "blocked");
+        assert!(guide["blocking_gaps"].as_array().is_some_and(|gaps| {
+            gaps.iter().any(|gap| {
+                gap.as_str()
+                    .is_some_and(|gap| gap.contains("incremental cost"))
+            })
+        }));
+        assert!(guide["call_argv"].is_null());
+        let stages = guide["stages"].as_array().expect("guide stages");
+        assert_eq!(stages.len(), 15);
+        assert_eq!(stages[3]["name"], "check_entitlement");
+        assert_eq!(stages[7]["name"], "calculate_cost");
+        assert_eq!(stages[7]["contract_state"], "blocked");
+        assert_eq!(stages[8]["name"], "build_plan");
+        assert_eq!(stages[8]["contract_state"], "blocked");
+        assert_eq!(stages[8]["commands"], json!([]));
+        assert_eq!(
+            guide["post_resolution_call_argv"],
+            json!([
+                "cfctl",
+                "call",
+                "widgets-update",
+                "--selector",
+                "account_id=<account_id>",
+                "--selector",
+                "widget_id=<widget_id>",
+                "--body-stdin",
+                "--json"
+            ])
+        );
+    }
+
+    #[test]
+    fn token_creation_guide_routes_through_the_inventory_bound_keys_workflow() {
+        let mut account_token = CapabilityV1::new(
+            "account-api-tokens-create-token",
+            "Create account token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        account_token.risk = RiskClass::SecretSensitive;
+        account_token.effect = cfctl_core::EffectClass::IdentityOrOwnership;
+        account_token.cost.known = true;
+        account_token.verification.strategy = "token_details_report_active".to_owned();
+        account_token.rollback.warning =
+            Some("revoke the new token if installation fails".to_owned());
+        account_token.permissions = vec!["API Tokens Write".to_owned()];
+
+        let account_guide = guide_document(&account_token);
+        assert_eq!(account_guide["contract_state"], "available");
+        assert_eq!(
+            account_guide["call_argv"],
+            json!([
+                "cfctl",
+                "keys",
+                "mint",
+                "--name",
+                "<token-name>",
+                "--permission",
+                "<permission-group-id>",
+                "--account",
+                "<account_id>",
+                "--value-out",
+                "<new-mode-0600-path>",
+                "--json"
+            ])
+        );
+        assert_ne!(account_guide["call_argv"][1], "call");
+
+        account_token.id = "user-api-tokens-create-token".to_owned();
+        account_token.adapter_status = AdapterStatus::Blocked;
+        account_token.blocked_reason = Some(
+            "user-token minting is blocked until a dedicated live permission inventory workflow is implemented"
+                .to_owned(),
+        );
+        let user_guide = guide_document(&account_token);
+        assert_eq!(user_guide["contract_state"], "blocked");
+        assert!(user_guide["call_argv"].is_null());
+        assert_eq!(user_guide["next_action"]["argv"][1], "keys");
+        assert_eq!(user_guide["next_action"]["argv"][2], "permissions");
     }
 
     #[test]

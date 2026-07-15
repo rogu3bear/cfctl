@@ -18,6 +18,13 @@ cfctl catalog show <capability-id> --json
 cfctl guide <capability-id> --json
 ```
 
+Treat the guide as an executable safety contract, not prose. Run `call_argv`
+only when `contract_state` is `available`. When it is `blocked`, resolve every
+named `blocking_gaps` entry through the supplied safe `next_action`; the
+`post_resolution_call_argv` field is a template and is deliberately not an
+execution recommendation. It is `null` when no safe future execution surface
+exists. Commands are argv arrays so agents never have to guess shell quoting.
+
 ## Authentication
 
 Normal OAuth login uses a public client and PKCE:

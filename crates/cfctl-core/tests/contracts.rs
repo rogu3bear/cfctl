@@ -13,6 +13,11 @@ fn every_capability_guide_has_the_exact_fifteen_lifecycle_stages() {
     assert_eq!(stages.len(), 15);
     assert_eq!(stages.first(), Some(&GuideStage::Discover));
     assert_eq!(stages.last(), Some(&GuideStage::CloseWithEvidence));
+    assert_eq!(GuideStage::CheckEntitlement.as_str(), "check_entitlement");
+    assert_eq!(
+        GuideStage::CloseWithEvidence.as_str(),
+        "close_with_evidence"
+    );
 }
 
 #[test]
