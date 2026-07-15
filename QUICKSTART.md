@@ -15,7 +15,9 @@ Or install directly from the checkout:
 cargo install --path crates/cfctl-cli --locked
 ```
 
-The Linux release installer is checksum-verifying and requires an existing release tag:
+The Linux release installer requires Cosign, verifies the release's signed
+checksum manifest against its exact Fulcio identity and issuer, and requires an
+existing release tag:
 
 ```bash
 curl -fsSL https://cfctl.io/install.sh | CFCTL_VERSION=v2.0.0 sh

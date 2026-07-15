@@ -259,7 +259,8 @@ cargo xtask publish \
 ```
 
 `assemble` deliberately stops before identity-bearing Apple or Sigstore
-activity. `release` requires a clean source commit, signs both macOS binaries
+activity, and its rendered Linux installer refuses to run. `release` requires
+a clean source commit, signs both macOS binaries
 with hardened runtime and secure timestamps, notarizes them through the named
 Keychain profile, records hash-bound `Accepted` receipts, refreshes their SBOMs
 and Homebrew hashes, signs checksums and provenance, and verifies every
@@ -271,6 +272,12 @@ checksums, provenance, and Sigstore identities, and uploads one asset at a time
 to an empty draft release without clobbering. If an upload fails, it removes
 only the assets from that failed attempt. Making the draft public remains a
 separate operator action.
+
+The published Linux installer requires Cosign. It verifies the downloaded
+checksum manifest against the exact Fulcio identity and OIDC issuer rendered by
+the release operator, then checks the selected binary against both that signed
+manifest and the installer-embedded architecture hash. It has no checksum-only
+fallback.
 
 GitHub-hosted Rust builds are intentionally absent.
 

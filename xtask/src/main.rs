@@ -85,6 +85,8 @@ enum TaskError {
     },
     #[error("Homebrew formula template still contains an unresolved placeholder")]
     FormulaPlaceholder,
+    #[error("Linux installer template is invalid: {0}")]
+    InstallerTemplate(String),
     #[error("release target `{0}` is not one of the four reviewed platforms")]
     UnsupportedReleaseTarget(String),
     #[error("release target `{0}` was requested more than once")]
@@ -208,7 +210,12 @@ fn release(
     run("cosign", &["version"])?;
     run("xcrun", &["notarytool", "--version"])?;
     assemble(&[])?;
-    sign_and_notarize_macos_artifacts(macos_signing_identity, apple_notary_profile)?;
+    sign_and_notarize_macos_artifacts(
+        macos_signing_identity,
+        apple_notary_profile,
+        certificate_identity,
+        certificate_oidc_issuer,
+    )?;
     sign_release_artifacts()?;
     verify_signed_release(
         certificate_identity,
@@ -260,10 +267,16 @@ fn assemble(requested_targets: &[String]) -> Result<(), TaskError> {
         artifacts.push(artifact.clone());
         artifacts.push(PathBuf::from(format!("{}.spdx.json", artifact.display())));
     }
-    let installer_path = dist.join("install.sh");
-    fs::copy("packaging/install.sh", &installer_path)
-        .map_err(|source| io_error(&installer_path, source))?;
-    artifacts.push(installer_path);
+    if targets
+        .iter()
+        .any(|target| target == "aarch64-unknown-linux-musl")
+        && targets
+            .iter()
+            .any(|target| target == "x86_64-unknown-linux-musl")
+    {
+        let installer_path = render_linux_installer(&dist, None)?;
+        artifacts.push(installer_path);
+    }
     if targets
         .iter()
         .any(|target| target == "aarch64-apple-darwin")
@@ -497,9 +510,92 @@ fn render_homebrew_formula(dist: &Path) -> Result<PathBuf, TaskError> {
     Ok(path)
 }
 
+fn render_linux_installer(
+    dist: &Path,
+    sigstore_identity: Option<(&str, &str)>,
+) -> Result<PathBuf, TaskError> {
+    let template_path = Path::new("packaging/install.sh");
+    let template =
+        fs::read_to_string(template_path).map_err(|source| io_error(template_path, source))?;
+    let rendered = render_linux_installer_text(
+        &template,
+        &sha256_file(&dist.join("cfctl-aarch64-unknown-linux-musl"))?,
+        &sha256_file(&dist.join("cfctl-x86_64-unknown-linux-musl"))?,
+        sigstore_identity,
+    )?;
+    let path = dist.join("install.sh");
+    fs::write(&path, rendered).map_err(|source| io_error(&path, source))?;
+    Ok(path)
+}
+
+fn render_linux_installer_text(
+    template: &str,
+    aarch64_hash: &str,
+    x86_64_hash: &str,
+    sigstore_identity: Option<(&str, &str)>,
+) -> Result<String, TaskError> {
+    for (name, hash) in [
+        ("aarch64 Linux SHA-256", aarch64_hash),
+        ("x86_64 Linux SHA-256", x86_64_hash),
+    ] {
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(TaskError::InstallerTemplate(format!(
+                "{name} must be a 64-character hexadecimal digest"
+            )));
+        }
+    }
+    let (identity, issuer) = match sigstore_identity {
+        Some((identity, issuer)) => {
+            validate_installer_identity_value("Sigstore certificate identity", identity)?;
+            validate_installer_identity_value("Sigstore OIDC issuer", issuer)?;
+            (
+                shell_single_quote_fragment(identity),
+                shell_single_quote_fragment(issuer),
+            )
+        }
+        None => (
+            "UNSIGNED_ASSEMBLY".to_owned(),
+            "UNSIGNED_ASSEMBLY".to_owned(),
+        ),
+    };
+    let rendered = template
+        .replace("@AARCH64_LINUX_SHA256@", aarch64_hash)
+        .replace("@X86_64_LINUX_SHA256@", x86_64_hash)
+        .replace("@SIGSTORE_IDENTITY@", &identity)
+        .replace("@SIGSTORE_OIDC_ISSUER@", &issuer);
+    for placeholder in [
+        "@AARCH64_LINUX_SHA256@",
+        "@X86_64_LINUX_SHA256@",
+        "@SIGSTORE_IDENTITY@",
+        "@SIGSTORE_OIDC_ISSUER@",
+    ] {
+        if rendered.contains(placeholder) {
+            return Err(TaskError::InstallerTemplate(format!(
+                "unresolved placeholder {placeholder}"
+            )));
+        }
+    }
+    Ok(rendered)
+}
+
+fn validate_installer_identity_value(name: &str, value: &str) -> Result<(), TaskError> {
+    if value.trim().is_empty() || value.contains(['\0', '\n', '\r']) {
+        return Err(TaskError::InstallerTemplate(format!(
+            "{name} must be non-empty and single-line"
+        )));
+    }
+    Ok(())
+}
+
+fn shell_single_quote_fragment(value: &str) -> String {
+    value.replace('\'', "'\"'\"'")
+}
+
 fn sign_and_notarize_macos_artifacts(
     signing_identity: &str,
     notary_profile: &str,
+    sigstore_identity: &str,
+    sigstore_issuer: &str,
 ) -> Result<(), TaskError> {
     if !signing_identity.starts_with("Developer ID Application: ") {
         return Err(TaskError::InvalidMacosSignature(
@@ -547,7 +643,12 @@ fn sign_and_notarize_macos_artifacts(
         let artifact = Path::new("dist").join(format!("cfctl-{target}"));
         notarize_macos_artifact(target, &artifact, notary_profile)?;
     }
-    refresh_macos_distribution_metadata(signing_identity, &team_identifier)
+    refresh_macos_distribution_metadata(
+        signing_identity,
+        &team_identifier,
+        sigstore_identity,
+        sigstore_issuer,
+    )
 }
 
 fn notarize_macos_artifact(
@@ -660,6 +761,8 @@ fn write_notary_receipt(
 fn refresh_macos_distribution_metadata(
     signing_identity: &str,
     team_identifier: &str,
+    sigstore_identity: &str,
+    sigstore_issuer: &str,
 ) -> Result<(), TaskError> {
     for target in MACOS_RELEASE_TARGETS {
         let artifact = Path::new("dist").join(format!("cfctl-{target}"));
@@ -673,6 +776,10 @@ fn refresh_macos_distribution_metadata(
         )?;
     }
     let _formula = render_homebrew_formula(Path::new("dist"))?;
+    let _installer = render_linux_installer(
+        Path::new("dist"),
+        Some((sigstore_identity, sigstore_issuer)),
+    )?;
     let provenance_path = Path::new("dist/provenance.json");
     let mut provenance: serde_json::Value = serde_json::from_slice(
         &fs::read(provenance_path).map_err(|source| io_error(provenance_path, source))?,
@@ -1366,10 +1473,16 @@ fn io_error(path: &Path, source: std::io::Error) -> TaskError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::{
+        io::Write as _,
+        process::{Command, Stdio},
+    };
+
     use super::{
         expected_signed_release_file_names, parse_remote_tag_commit, release_build_driver,
-        release_build_subcommand, release_tag_is_exact_version, validate_codesign_details,
-        validate_notary_receipt_value, validate_signed_release_file_set, validated_release_targets,
+        release_build_subcommand, release_tag_is_exact_version, render_linux_installer_text,
+        validate_codesign_details, validate_notary_receipt_value, validate_signed_release_file_set,
+        validated_release_targets,
     };
 
     #[test]
@@ -1516,5 +1629,57 @@ mod tests {
             validate_notary_receipt_value(&wrong_operation, "aarch64-apple-darwin", "abc123")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn linux_installer_requires_identity_bound_manifest_and_embedded_hashes() {
+        let template = include_str!("../../packaging/install.sh");
+        let rendered = render_linux_installer_text(
+            template,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            Some(("release'owner@example.com", "https://issuer.example")),
+        )
+        .expect("rendered installer");
+        assert!(rendered.contains("cosign verify-blob"));
+        assert!(rendered.contains("SHA256SUMS.sigstore.json"));
+        assert!(
+            rendered.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert!(
+            rendered.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert!(rendered.contains("release'\"'\"'owner@example.com"));
+        assert!(!rendered.contains("@SIGSTORE_IDENTITY@"));
+        assert!(!rendered.contains("@X86_64_LINUX_SHA256@"));
+        let mut syntax = Command::new("sh")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn shell syntax check");
+        syntax
+            .stdin
+            .take()
+            .expect("shell stdin")
+            .write_all(rendered.as_bytes())
+            .expect("write installer to shell");
+        assert!(syntax.wait().expect("shell syntax status").success());
+
+        let preview = render_linux_installer_text(
+            template,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            None,
+        )
+        .expect("assembly preview");
+        assert!(preview.contains("UNSIGNED_ASSEMBLY"));
+        let preview_run = Command::new("sh")
+            .arg("-c")
+            .arg(&preview)
+            .output()
+            .expect("run unsigned assembly preview");
+        assert!(!preview_run.status.success());
+        assert!(String::from_utf8_lossy(&preview_run.stderr).contains("unsigned assembly"));
+        assert!(render_linux_installer_text(template, "bad", "bad", Some(("", "issuer"))).is_err());
     }
 }
