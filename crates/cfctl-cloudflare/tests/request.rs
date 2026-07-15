@@ -263,6 +263,156 @@ fn unchecked_request_validates_nested_array_item_enums() {
 }
 
 #[test]
+fn unchecked_request_enforces_scalar_and_collection_bounds() {
+    let mut capability = CapabilityV1::new("bounded-create", "Create", "POST", "/bounded");
+    capability.request_schema = Some(json!({
+        "type": "object",
+        "minProperties": 5,
+        "maxProperties": 5,
+        "required": ["count", "ratio", "name", "items", "labels"],
+        "properties": {
+            "count": {"type": "integer", "minimum": 1, "maximum": 10},
+            "ratio": {
+                "type": "number",
+                "minimum": 0,
+                "exclusiveMinimum": true,
+                "maximum": 1,
+                "exclusiveMaximum": true
+            },
+            "name": {"type": "string", "minLength": 2, "maxLength": 4},
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 2,
+                "uniqueItems": true,
+                "items": {"type": "string"}
+            },
+            "labels": {
+                "type": "object",
+                "minProperties": 1,
+                "maxProperties": 2,
+                "additionalProperties": {"type": "string"}
+            }
+        }
+    }));
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    let valid = CallInput {
+        body: Some(json!({
+            "count": 1,
+            "ratio": 0.5,
+            "name": "éß",
+            "items": ["a", "b"],
+            "labels": {"environment": "test"}
+        })),
+        ..CallInput::default()
+    };
+    assert!(builder.build_unchecked(&capability, &valid).is_ok());
+
+    for body in [
+        json!({"count": 0, "ratio": 0.5, "name": "ok", "items": ["a"], "labels": {"a":"b"}}),
+        json!({"count": 11, "ratio": 0.5, "name": "ok", "items": ["a"], "labels": {"a":"b"}}),
+        json!({"count": 1, "ratio": 0, "name": "ok", "items": ["a"], "labels": {"a":"b"}}),
+        json!({"count": 1, "ratio": 1, "name": "ok", "items": ["a"], "labels": {"a":"b"}}),
+        json!({"count": 1, "ratio": 0.5, "name": "x", "items": ["a"], "labels": {"a":"b"}}),
+        json!({"count": 1, "ratio": 0.5, "name": "abcde", "items": ["a"], "labels": {"a":"b"}}),
+        json!({"count": 1, "ratio": 0.5, "name": "ok", "items": [], "labels": {"a":"b"}}),
+        json!({"count": 1, "ratio": 0.5, "name": "ok", "items": ["a", "b", "c"], "labels": {"a":"b"}}),
+        json!({"count": 1, "ratio": 0.5, "name": "ok", "items": ["a", "a"], "labels": {"a":"b"}}),
+        json!({"count": 1, "ratio": 0.5, "name": "ok", "items": ["a"], "labels": {}}),
+        json!({"count": 1, "ratio": 0.5, "name": "ok", "items": ["a"], "labels": {"a":"b", "c":"d", "e":"f"}}),
+        json!({"count": 1, "ratio": 0.5, "name": "ok", "items": ["a"], "labels": {"a":"b"}, "extra": true}),
+    ] {
+        let error = builder
+            .build_unchecked(
+                &capability,
+                &CallInput {
+                    body: Some(body),
+                    ..CallInput::default()
+                },
+            )
+            .expect_err("out-of-contract bounds must fail before request construction");
+        assert!(matches!(error, CloudflareError::InvalidRequestBody(_)));
+    }
+}
+
+#[test]
+fn unchecked_request_treats_equivalent_json_numbers_as_duplicate_items() {
+    let mut capability = CapabilityV1::new("unique-create", "Create", "POST", "/unique");
+    capability.request_schema = Some(json!({
+        "type": "array",
+        "uniqueItems": true
+    }));
+    let error = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build_unchecked(
+            &capability,
+            &CallInput {
+                body: Some(json!([1, 1.0])),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("mathematically equal JSON numbers are duplicate items");
+    assert!(matches!(error, CloudflareError::InvalidRequestBody(_)));
+}
+
+#[test]
+fn unchecked_request_bounds_unique_item_fingerprint_depth() {
+    let mut capability = CapabilityV1::new("unique-create", "Create", "POST", "/unique");
+    capability.request_schema = Some(json!({
+        "type": "array",
+        "uniqueItems": true
+    }));
+    let mut nested = json!(null);
+    for _ in 0..65 {
+        nested = json!([nested]);
+    }
+    let result = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build_unchecked(
+            &capability,
+            &CallInput {
+                body: Some(json!([nested])),
+                ..CallInput::default()
+            },
+        );
+    let Err(error) = result else {
+        panic!("uniqueItems fingerprinting must honor the schema depth ceiling");
+    };
+    assert!(matches!(
+        error,
+        CloudflareError::InvalidRequestBody(reason)
+            if reason == "pinned schema exceeds the validation depth limit"
+    ));
+}
+
+#[test]
+fn unchecked_request_bounds_unique_item_fingerprint_work() {
+    let mut capability = CapabilityV1::new("unique-create", "Create", "POST", "/unique");
+    capability.request_schema = Some(json!({
+        "type": "array",
+        "uniqueItems": true
+    }));
+    let nested = Value::Array((0..65_535).map(|_| json!("item")).collect());
+    let result = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build_unchecked(
+            &capability,
+            &CallInput {
+                body: Some(json!([nested])),
+                ..CallInput::default()
+            },
+        );
+    let Err(error) = result else {
+        panic!("uniqueItems fingerprinting must honor the validation work limit");
+    };
+    assert!(matches!(
+        error,
+        CloudflareError::InvalidRequestBody(reason)
+            if reason == "request body exceeds the pinned validation work limit"
+    ));
+}
+
+#[test]
 fn unchecked_request_enforces_composed_request_schemas() {
     let capability = composed_request_capability();
     let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");

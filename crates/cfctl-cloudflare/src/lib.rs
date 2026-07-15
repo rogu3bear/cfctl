@@ -1914,6 +1914,7 @@ fn validate_request_schema_value_inner(
             "{location} is not one of the pinned enum values"
         )));
     }
+    validate_request_schema_bounds(schema, value, path, depth, remaining_steps)?;
     if let Some(object) = value.as_object() {
         let mut allowed_properties = inherited_object_properties.clone();
         collect_composed_property_names(schema, &mut allowed_properties, 0);
@@ -1949,6 +1950,224 @@ fn validate_request_schema_value_inner(
         inherited_object_properties,
     )?;
     Ok(())
+}
+
+fn validate_request_schema_bounds(
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    depth: usize,
+    remaining_steps: &mut usize,
+) -> Result<()> {
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64) {
+            let exclusive = schema
+                .get("exclusiveMinimum")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if number < minimum || (exclusive && number <= minimum) {
+                return invalid_request_bound(
+                    path,
+                    if exclusive {
+                        "must be above the pinned minimum"
+                    } else {
+                        "is below the pinned minimum"
+                    },
+                );
+            }
+        }
+        if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
+            let exclusive = schema
+                .get("exclusiveMaximum")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if number > maximum || (exclusive && number >= maximum) {
+                return invalid_request_bound(
+                    path,
+                    if exclusive {
+                        "must be below the pinned maximum"
+                    } else {
+                        "is above the pinned maximum"
+                    },
+                );
+            }
+        }
+    }
+    if let Some(text) = value.as_str() {
+        let length = usize_as_u64(text.chars().count());
+        validate_length_bounds(schema, path, length, "characters", "minLength", "maxLength")?;
+    }
+    if let Some(array) = value.as_array() {
+        validate_length_bounds(
+            schema,
+            path,
+            usize_as_u64(array.len()),
+            "items",
+            "minItems",
+            "maxItems",
+        )?;
+        if schema.get("uniqueItems").and_then(Value::as_bool) == Some(true) {
+            let mut items = BTreeSet::new();
+            for item in array {
+                let encoded = schema_equality_key(item, depth + 1, remaining_steps)?;
+                if !items.insert(encoded) {
+                    return invalid_request_bound(
+                        path,
+                        "contains duplicate items disallowed by the pinned schema",
+                    );
+                }
+            }
+        }
+    }
+    if let Some(object) = value.as_object() {
+        validate_length_bounds(
+            schema,
+            path,
+            usize_as_u64(object.len()),
+            "properties",
+            "minProperties",
+            "maxProperties",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_length_bounds(
+    schema: &Value,
+    path: &str,
+    length: u64,
+    units: &str,
+    minimum_key: &str,
+    maximum_key: &str,
+) -> Result<()> {
+    if schema
+        .get(minimum_key)
+        .and_then(Value::as_u64)
+        .is_some_and(|minimum| length < minimum)
+    {
+        return invalid_request_bound(
+            path,
+            &format!("has fewer {units} than the pinned {minimum_key}"),
+        );
+    }
+    if schema
+        .get(maximum_key)
+        .and_then(Value::as_u64)
+        .is_some_and(|maximum| length > maximum)
+    {
+        return invalid_request_bound(
+            path,
+            &format!("has more {units} than the pinned {maximum_key}"),
+        );
+    }
+    Ok(())
+}
+
+fn usize_as_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn invalid_request_bound(path: &str, reason: &str) -> Result<()> {
+    Err(CloudflareError::InvalidRequestBody(format!(
+        "{} {reason}",
+        request_schema_location(path)
+    )))
+}
+
+fn schema_equality_key(value: &Value, depth: usize, remaining_steps: &mut usize) -> Result<String> {
+    let mut key = String::new();
+    append_schema_equality_key(value, &mut key, depth, remaining_steps)?;
+    Ok(key)
+}
+
+fn append_schema_equality_key(
+    value: &Value,
+    key: &mut String,
+    depth: usize,
+    remaining_steps: &mut usize,
+) -> Result<()> {
+    if depth > MAX_REQUEST_VALIDATION_DEPTH {
+        return Err(CloudflareError::InvalidRequestBody(
+            REQUEST_VALIDATION_DEPTH_LIMIT_REASON.to_owned(),
+        ));
+    }
+    let Some(next_steps) = remaining_steps.checked_sub(1) else {
+        return Err(CloudflareError::InvalidRequestBody(
+            REQUEST_VALIDATION_WORK_LIMIT_REASON.to_owned(),
+        ));
+    };
+    *remaining_steps = next_steps;
+    match value {
+        Value::Null => key.push('z'),
+        Value::Bool(value) => key.push_str(if *value { "b1" } else { "b0" }),
+        Value::Number(value) => {
+            key.push('n');
+            key.push_str(&schema_number_equality_key(value));
+            key.push(';');
+        }
+        Value::String(value) => append_length_prefixed_string('s', value, key),
+        Value::Array(values) => {
+            key.push('[');
+            for value in values {
+                append_schema_equality_key(value, key, depth + 1, remaining_steps)?;
+            }
+            key.push(']');
+        }
+        Value::Object(values) => {
+            key.push('{');
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            for (name, value) in entries {
+                append_length_prefixed_string('k', name, key);
+                append_schema_equality_key(value, key, depth + 1, remaining_steps)?;
+            }
+            key.push('}');
+        }
+    }
+    Ok(())
+}
+
+fn append_length_prefixed_string(prefix: char, value: &str, key: &mut String) {
+    key.push(prefix);
+    key.push_str(&value.len().to_string());
+    key.push(':');
+    key.push_str(value);
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::float_cmp
+)]
+fn schema_number_equality_key(number: &serde_json::Number) -> String {
+    if let Some(value) = number.as_i64() {
+        return value.to_string();
+    }
+    if let Some(value) = number.as_u64() {
+        return value.to_string();
+    }
+    let Some(value) = number.as_f64() else {
+        return number.to_string();
+    };
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    if value.fract() == 0.0 {
+        if (-9_223_372_036_854_775_808.0..0.0).contains(&value) {
+            let integer = value as i64;
+            if integer as f64 == value {
+                return integer.to_string();
+            }
+        }
+        if (0.0..18_446_744_073_709_551_616.0).contains(&value) {
+            let integer = value as u64;
+            if integer as f64 == value {
+                return integer.to_string();
+            }
+        }
+    }
+    format!("f{:016x}", value.to_bits())
 }
 
 fn validate_schema_composition(

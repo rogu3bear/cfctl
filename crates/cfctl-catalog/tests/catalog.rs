@@ -10,7 +10,7 @@ use cfctl_core::{
     EffectClass, KnowledgeReferenceV1, RiskClass, hash_value,
 };
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn fixture() -> serde_json::Value {
     json!({
@@ -81,6 +81,50 @@ fn assert_nested_replication_schema(schema: &serde_json::Value) {
 #[test]
 fn request_contract_resolves_local_schema_without_copying_secret_values() {
     let mut document = fixture();
+    install_request_contract_fixture(&mut document);
+    let snapshot = normalize_openapi(&document).expect("catalog");
+    let schema = snapshot
+        .get("dns-records-create")
+        .and_then(|capability| capability.request_schema.as_ref())
+        .expect("request contract");
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["x-cfctl-body-required"], true);
+    assert_request_schema_bounds(schema);
+    assert_nested_replication_schema(schema);
+    assert!(schema["properties"]["name"].get("description").is_none());
+
+    let capability = snapshot
+        .get("dns-records-create")
+        .expect("create capability");
+    let jurisdiction = capability
+        .selectors
+        .iter()
+        .find(|selector| selector.name == "cf-r2-jurisdiction")
+        .expect("jurisdiction selector");
+    assert_eq!(jurisdiction.value_type, "string");
+    assert_eq!(
+        jurisdiction.description.as_deref(),
+        Some("jurisdiction selector")
+    );
+    assert_eq!(
+        capability
+            .selectors
+            .iter()
+            .find(|selector| selector.name == "deploy")
+            .expect("deploy selector")
+            .value_type,
+        "boolean"
+    );
+    let ambiguous = capability
+        .selectors
+        .iter()
+        .find(|selector| selector.name == "ambiguous")
+        .expect("ambiguous selector");
+    assert_eq!(ambiguous.value_type, "unknown");
+    assert!(ambiguous.description.is_none());
+}
+
+fn install_request_contract_fixture(document: &mut Value) {
     document["components"]["schemas"]["Jurisdiction"] = json!({
         "type": "string",
         "description": "jurisdiction selector"
@@ -101,9 +145,24 @@ fn request_contract_resolves_local_schema_without_copying_secret_values() {
     document["components"]["schemas"]["CreateRecord"] = json!({
         "type": "object",
         "required": ["name"],
+        "minProperties": 1,
+        "maxProperties": 4,
         "properties": {
-            "name": {"type": "string", "description": "record name"},
-            "ttl": {"type": "integer"},
+            "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 253,
+                "pattern": "^[^.]+$",
+                "description": "record name"
+            },
+            "ttl": {"type": "integer", "minimum": 1, "maximum": 86400},
+            "tags": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "uniqueItems": true,
+                "items": {"type": "string"}
+            },
             "replication": {"$ref": "#/components/schemas/Replication"}
         }
     });
@@ -138,46 +197,20 @@ fn request_contract_resolves_local_schema_without_copying_secret_values() {
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateRecord"}}}
         }
     });
-    let snapshot = normalize_openapi(&document).expect("catalog");
-    let schema = snapshot
-        .get("dns-records-create")
-        .and_then(|capability| capability.request_schema.as_ref())
-        .expect("request contract");
-    assert_eq!(schema["type"], "object");
-    assert_eq!(schema["x-cfctl-body-required"], true);
-    assert_eq!(schema["properties"]["ttl"]["type"], "integer");
-    assert_nested_replication_schema(schema);
-    assert!(schema["properties"]["name"].get("description").is_none());
+}
 
-    let capability = snapshot
-        .get("dns-records-create")
-        .expect("create capability");
-    let jurisdiction = capability
-        .selectors
-        .iter()
-        .find(|selector| selector.name == "cf-r2-jurisdiction")
-        .expect("jurisdiction selector");
-    assert_eq!(jurisdiction.value_type, "string");
-    assert_eq!(
-        jurisdiction.description.as_deref(),
-        Some("jurisdiction selector")
-    );
-    assert_eq!(
-        capability
-            .selectors
-            .iter()
-            .find(|selector| selector.name == "deploy")
-            .expect("deploy selector")
-            .value_type,
-        "boolean"
-    );
-    let ambiguous = capability
-        .selectors
-        .iter()
-        .find(|selector| selector.name == "ambiguous")
-        .expect("ambiguous selector");
-    assert_eq!(ambiguous.value_type, "unknown");
-    assert!(ambiguous.description.is_none());
+fn assert_request_schema_bounds(schema: &Value) {
+    assert_eq!(schema["properties"]["ttl"]["type"], "integer");
+    assert_eq!(schema["properties"]["ttl"]["minimum"], 1);
+    assert_eq!(schema["properties"]["ttl"]["maximum"], 86400);
+    assert_eq!(schema["properties"]["name"]["minLength"], 1);
+    assert_eq!(schema["properties"]["name"]["maxLength"], 253);
+    assert!(schema["properties"]["name"].get("pattern").is_none());
+    assert_eq!(schema["properties"]["tags"]["minItems"], 1);
+    assert_eq!(schema["properties"]["tags"]["maxItems"], 3);
+    assert_eq!(schema["properties"]["tags"]["uniqueItems"], true);
+    assert_eq!(schema["minProperties"], 1);
+    assert_eq!(schema["maxProperties"], 4);
 }
 
 #[test]

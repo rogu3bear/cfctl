@@ -1716,7 +1716,24 @@ fn normalize_request_schema_contract(
     }
     let resolved = resolve_local_schema(document, schema);
     let mut contract = Map::new();
-    for key in ["type", "required", "enum", "format", "nullable"] {
+    for key in [
+        "type",
+        "required",
+        "enum",
+        "format",
+        "nullable",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minProperties",
+        "maxProperties",
+    ] {
         if let Some(value) = resolved.get(key) {
             contract.insert(key.to_owned(), value.clone());
         }
