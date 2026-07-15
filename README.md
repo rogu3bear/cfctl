@@ -238,28 +238,39 @@ proof and signs the manifests before they can be uploaded to an existing
 GitHub release:
 
 The local release host needs the four Rust standard-library targets, Zig and
-`cargo-zigbuild`, `cargo-auditable` 0.7.5, Syft, and Cosign. The auditable build
-metadata is what lets each platform SBOM enumerate the actual Rust dependency
-graph instead of treating `cfctl` as one opaque file.
+`cargo-zigbuild`, `cargo-auditable` 0.7.5, Syft, Cosign, Xcode command-line
+tools, an explicit Developer ID Application identity, and a named
+`notarytool` Keychain profile. The auditable build metadata is what lets each
+platform SBOM enumerate the actual Rust dependency graph instead of treating
+`cfctl` as one opaque file.
 
 ```bash
 cargo xtask assemble
 cargo xtask release \
   --certificate-identity '<expected Fulcio identity>' \
-  --certificate-oidc-issuer '<expected OIDC issuer>'
+  --certificate-oidc-issuer '<expected OIDC issuer>' \
+  --macos-signing-identity 'Developer ID Application: Example Corp (TEAMID)' \
+  --apple-notary-profile '<Keychain profile name>'
 cargo xtask publish \
   --tag v2.0.0-alpha.1 \
   --certificate-identity '<expected Fulcio identity>' \
-  --certificate-oidc-issuer '<expected OIDC issuer>'
+  --certificate-oidc-issuer '<expected OIDC issuer>' \
+  --macos-signing-identity 'Developer ID Application: Example Corp (TEAMID)'
 ```
 
-`assemble` deliberately stops before identity-bearing Sigstore activity;
-`release` requires a clean source commit, signs checksums and provenance, and
-verifies both bundles against the exact expected identity and issuer.
-`publish` accepts only the complete four-platform artifact set, rechecks the
-checksums and provenance, and uploads one asset at a time to an empty draft
-release without clobbering. If an upload fails, it removes only the assets from
-that failed attempt. Making the draft public remains a separate operator action.
+`assemble` deliberately stops before identity-bearing Apple or Sigstore
+activity. `release` requires a clean source commit, signs both macOS binaries
+with hardened runtime and secure timestamps, notarizes them through the named
+Keychain profile, records hash-bound `Accepted` receipts, refreshes their SBOMs
+and Homebrew hashes, signs checksums and provenance, and verifies every
+identity again. A notary submission ID is written before waiting, so an
+interrupted external operation leaves a durable receipt under
+`target/release-proof/notary/`. `publish` accepts only the complete
+four-platform artifact set, rechecks Apple signatures, notarization receipts,
+checksums, provenance, and Sigstore identities, and uploads one asset at a time
+to an empty draft release without clobbering. If an upload fails, it removes
+only the assets from that failed attempt. Making the draft public remains a
+separate operator action.
 
 GitHub-hosted Rust builds are intentionally absent.
 
