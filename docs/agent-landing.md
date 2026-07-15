@@ -49,6 +49,10 @@ through `keys mint`, which refreshes and binds the live permission-group
 inventory. User-token creation remains blocked and exposes no execution
 template until it has an equivalent inventory-bound workflow.
 
+Turnstile widget updates use an exact same-resource readback and a zero-direct-
+incremental-cost contract. Widget creation and secret rotation remain blocked
+until their returned secrets can use a sitekey-bound, sink-only lifecycle.
+
 ## Deterministic execution
 
 Use `cfctl call` with the selectors declared by the capability:

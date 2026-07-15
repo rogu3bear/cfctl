@@ -3467,6 +3467,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         classify_dns_record_lifecycle(capability);
     } else if let Some(kind) = access_authorization_configuration_kind(capability) {
         classify_access_authorization_configuration(capability, kind);
+    } else if turnstile_widget_update_contract_supported(capability) {
+        classify_turnstile_widget_update(capability);
     } else if let Some(kind) = load_balancing_configuration_kind(capability) {
         classify_load_balancing_configuration(capability, kind);
     } else if is_email_security_settings_configuration(capability) {
@@ -3485,6 +3487,129 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         return false;
     }
     true
+}
+
+fn turnstile_widget_update_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "accounts-turnstile-widget-update"
+        && capability.method == "PUT"
+        && capability.path == "/accounts/{account_id}/challenges/widgets/{sitekey}"
+        && capability.product == "Turnstile"
+        && capability.permissions.len() == 2
+        && capability
+            .permissions
+            .iter()
+            .any(|permission| permission == "Turnstile Sites Write")
+        && capability
+            .permissions
+            .iter()
+            .any(|permission| permission == "Account Settings Write")
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+                    && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            })
+        && turnstile_widget_update_request_contract_supported(capability)
+}
+
+fn turnstile_widget_update_request_contract_supported(capability: &CapabilityV1) -> bool {
+    let Some(schema) = capability.request_schema.as_ref() else {
+        return false;
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    let boolean_field = |name: &str| {
+        properties
+            .get(name)
+            .and_then(|property| property.get("type"))
+            .and_then(Value::as_str)
+            == Some("boolean")
+    };
+    let enum_field = |name: &str, values: Value| {
+        properties.get(name).is_some_and(|property| {
+            property.get("type").and_then(Value::as_str) == Some("string")
+                && property.get("enum") == Some(&values)
+        })
+    };
+
+    schema.get("type").and_then(Value::as_str) == Some("object")
+        && schema.get("x-cfctl-body-required").and_then(Value::as_bool) == Some(true)
+        && schema.get("required") == Some(&serde_json::json!(["name", "mode", "domains"]))
+        && canonical_request_object_fields(capability)
+            == Some(vec![
+                "bot_fight_mode".to_owned(),
+                "clearance_level".to_owned(),
+                "domains".to_owned(),
+                "ephemeral_id".to_owned(),
+                "mode".to_owned(),
+                "name".to_owned(),
+                "offlabel".to_owned(),
+                "region".to_owned(),
+            ])
+        && boolean_field("bot_fight_mode")
+        && boolean_field("ephemeral_id")
+        && boolean_field("offlabel")
+        && enum_field(
+            "clearance_level",
+            serde_json::json!(["no_clearance", "jschallenge", "managed", "interactive"]),
+        )
+        && enum_field(
+            "mode",
+            serde_json::json!(["non-interactive", "invisible", "managed"]),
+        )
+        && enum_field("region", serde_json::json!(["world", "china"]))
+        && properties.get("domains").is_some_and(|domains| {
+            domains.get("type").and_then(Value::as_str) == Some("array")
+                && domains.get("maxLength").and_then(Value::as_u64) == Some(10)
+                && domains
+                    .get("items")
+                    .and_then(|items| items.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("string")
+        })
+        && properties.get("name").is_some_and(|name| {
+            name.get("type").and_then(Value::as_str) == Some("string")
+                && name.get("minLength").and_then(Value::as_u64) == Some(1)
+                && name.get("maxLength").and_then(Value::as_u64) == Some(254)
+        })
+}
+
+fn classify_turnstile_widget_update(capability: &mut CapabilityV1) {
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.billing_model = BillingModelV1::Subscription;
+    capability.cost.exposure = CostExposureV1::AccountQuote;
+    capability.cost.basis = Some(
+        "updating an existing Turnstile widget does not purchase a plan, add a widget, or add usage charges, so its direct incremental ceiling is zero; Enterprise-only fields remain subject to the account's separately negotiated subscription"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Cloudflare Turnstile plans".to_owned(),
+            url: "https://developers.cloudflare.com/turnstile/plans/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Create and manage Turnstile widgets using the API".to_owned(),
+            url: "https://developers.cloudflare.com/turnstile/get-started/widget-management/api/"
+                .to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+    ];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans =
+        BTreeMap::from([("free".to_owned(), true), ("enterprise".to_owned(), true)]);
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/turnstile/plans/".to_owned());
+    capability.entitlement.blocker = None;
+    capability.entitlement.requires_live_resolution = false;
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
 }
 
 fn is_workers_ai_model_run(capability: &CapabilityV1) -> bool {

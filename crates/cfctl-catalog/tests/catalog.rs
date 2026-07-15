@@ -3786,6 +3786,174 @@ fn email_security_settings_classifier_rejects_retargeting_and_permission_drift()
     assert!(drifted_create.entitlement.blocker.is_none());
 }
 
+fn turnstile_widget_update_fixture() -> serde_json::Value {
+    json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "components": {
+            "schemas": {
+                "Widget": {
+                    "type": "object",
+                    "properties": {
+                        "bot_fight_mode": {"type":"boolean"},
+                        "clearance_level": {
+                            "type":"string",
+                            "enum":["no_clearance","jschallenge","managed","interactive"]
+                        },
+                        "domains": {"type":"array","items":{"type":"string"},"maxLength":10},
+                        "ephemeral_id": {"type":"boolean"},
+                        "mode": {
+                            "type":"string",
+                            "enum":["non-interactive","invisible","managed"]
+                        },
+                        "name": {"type":"string","minLength":1,"maxLength":254},
+                        "offlabel": {"type":"boolean"},
+                        "region": {"type":"string","enum":["world","china"]},
+                        "secret": {"type":"string"},
+                        "sitekey": {"type":"string","maxLength":32}
+                    }
+                },
+                "WidgetResponse": {
+                    "type": "object",
+                    "properties": {
+                        "success": {"type":"boolean"},
+                        "result": {"$ref":"#/components/schemas/Widget"}
+                    }
+                }
+            }
+        },
+        "paths": {
+            "/accounts/{account_id}/challenges/widgets/{sitekey}": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string","maxLength":32}},
+                    {"in":"path","name":"sitekey","required":true,"schema":{"type":"string","maxLength":32}}
+                ],
+                "get": {
+                    "operationId":"accounts-turnstile-widget-get",
+                    "summary":"Turnstile Widget Details",
+                    "tags":["Turnstile"],
+                    "responses": {
+                        "200": {
+                            "description":"Widget",
+                            "content":{"application/json":{"schema":{"$ref":"#/components/schemas/WidgetResponse"}}}
+                        }
+                    }
+                },
+                "put": {
+                    "operationId":"accounts-turnstile-widget-update",
+                    "summary":"Update a Turnstile Widget",
+                    "description":"Update the configuration of a widget.",
+                    "tags":["Turnstile"],
+                    "x-api-token-group":["Turnstile Sites Write","Account Settings Write"],
+                    "requestBody": {
+                        "required": true,
+                        "content":{"application/json":{"schema":{
+                            "type":"object",
+                            "required":["name","mode","domains"],
+                            "properties":{
+                                "bot_fight_mode":{"type":"boolean"},
+                                "clearance_level":{
+                                    "type":"string",
+                                    "enum":["no_clearance","jschallenge","managed","interactive"]
+                                },
+                                "domains":{"type":"array","items":{"type":"string"},"maxLength":10},
+                                "ephemeral_id":{"type":"boolean"},
+                                "mode":{
+                                    "type":"string",
+                                    "enum":["non-interactive","invisible","managed"]
+                                },
+                                "name":{"type":"string","minLength":1,"maxLength":254},
+                                "offlabel":{"type":"boolean"},
+                                "region":{"type":"string","enum":["world","china"]}
+                            }
+                        }}}
+                    },
+                    "responses": {
+                        "200": {
+                            "description":"Widget updated",
+                            "content":{"application/json":{"schema":{"$ref":"#/components/schemas/WidgetResponse"}}}
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn turnstile_widget_update_has_exact_cost_entitlement_and_risk_contracts() {
+    let snapshot =
+        normalize_openapi(&turnstile_widget_update_fixture()).expect("Turnstile catalog");
+    let update = snapshot
+        .get("accounts-turnstile-widget-update")
+        .expect("Turnstile update");
+
+    assert_eq!(update.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(update.risk, RiskClass::CrossConfig);
+    assert_eq!(update.effect, EffectClass::ReversibleWrite);
+    assert!(update.cost.known);
+    assert!(!update.cost.incremental);
+    assert_eq!(update.cost.maximum, Some(0.0));
+    assert_eq!(update.cost.billing_model, BillingModelV1::Subscription);
+    assert_eq!(update.cost.exposure, CostExposureV1::AccountQuote);
+    assert!(update.cost.references.iter().any(|reference| {
+        reference.url == "https://developers.cloudflare.com/turnstile/plans/"
+    }));
+    assert!(update.cost.references.iter().any(|reference| {
+        reference.url
+            == "https://developers.cloudflare.com/turnstile/get-started/widget-management/api/"
+    }));
+    assert_eq!(update.entitlement.available, Some(true));
+    assert_eq!(update.entitlement.plans.get("free"), Some(&true));
+    assert_eq!(update.entitlement.plans.get("enterprise"), Some(&true));
+    assert_eq!(
+        update.entitlement.source.as_deref(),
+        Some("https://developers.cloudflare.com/turnstile/plans/")
+    );
+    assert!(update.same_path_read.is_some());
+    assert!(!update.rollback.supported);
+    assert!(update.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn turnstile_widget_update_classifier_rejects_route_permission_and_schema_drift() {
+    let mut retargeted = turnstile_widget_update_fixture();
+    let operations = retargeted["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/challenges/widgets/{sitekey}")
+        .expect("Turnstile detail");
+    retargeted["paths"]["/accounts/{account_id}/challenges/widget_templates/{sitekey}"] =
+        operations;
+    let retargeted_snapshot = normalize_openapi(&retargeted).expect("retargeted catalog");
+    let retargeted_update = retargeted_snapshot
+        .get("accounts-turnstile-widget-update")
+        .expect("retargeted update");
+    assert_eq!(retargeted_update.risk, RiskClass::Unknown);
+    assert!(!retargeted_update.cost.known);
+
+    let mut permission_drift = turnstile_widget_update_fixture();
+    permission_drift["paths"]["/accounts/{account_id}/challenges/widgets/{sitekey}"]["put"]["x-api-token-group"] =
+        json!(["Account Settings Write"]);
+    let permission_snapshot = normalize_openapi(&permission_drift).expect("permission drift");
+    let drifted_permission = permission_snapshot
+        .get("accounts-turnstile-widget-update")
+        .expect("permission-drifted update");
+    assert_eq!(drifted_permission.risk, RiskClass::Unknown);
+    assert!(!drifted_permission.cost.known);
+
+    let mut schema_drift = turnstile_widget_update_fixture();
+    schema_drift["paths"]["/accounts/{account_id}/challenges/widgets/{sitekey}"]["put"]["requestBody"]
+        ["content"]["application/json"]["schema"]["properties"]["billing_tier"] =
+        json!({"type":"string"});
+    let schema_snapshot = normalize_openapi(&schema_drift).expect("schema drift");
+    let drifted_schema = schema_snapshot
+        .get("accounts-turnstile-widget-update")
+        .expect("schema-drifted update");
+    assert_eq!(drifted_schema.risk, RiskClass::Unknown);
+    assert!(!drifted_schema.cost.known);
+}
+
 fn queue_configuration_fixture() -> serde_json::Value {
     let mut document = create_lifecycle_fixture();
     document["components"]["schemas"]["Widget"]["properties"] = json!({
