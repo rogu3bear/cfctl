@@ -59,6 +59,11 @@ fn official_docs_indexes_expose_product_and_page_links_deterministically() {
 #[test]
 fn request_contract_resolves_local_schema_without_copying_secret_values() {
     let mut document = fixture();
+    document["components"]["schemas"]["Jurisdiction"] = json!({
+        "type": "string",
+        "description": "jurisdiction selector"
+    });
+    document["components"]["schemas"]["DeployFlag"] = json!({"type": "boolean"});
     document["components"]["schemas"]["CreateRecord"] = json!({
         "type": "object",
         "required": ["name"],
@@ -71,6 +76,28 @@ fn request_contract_resolves_local_schema_without_copying_secret_values() {
         "operationId": "dns-records-create",
         "summary": "Create DNS Record",
         "tags": ["DNS Records"],
+        "parameters": [
+            {
+                "in": "header",
+                "name": "cf-r2-jurisdiction",
+                "schema": {"$ref": "#/components/schemas/Jurisdiction"}
+            },
+            {
+                "in": "query",
+                "name": "deploy",
+                "schema": {"allOf": [{"$ref": "#/components/schemas/DeployFlag"}]}
+            },
+            {
+                "in": "query",
+                "name": "ambiguous",
+                "schema": {
+                    "oneOf": [
+                        {"type": "string", "description": "string mode"},
+                        {"type": "integer", "description": "numeric mode"}
+                    ]
+                }
+            }
+        ],
         "requestBody": {
             "required": true,
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateRecord"}}}
@@ -85,6 +112,36 @@ fn request_contract_resolves_local_schema_without_copying_secret_values() {
     assert_eq!(schema["x-cfctl-body-required"], true);
     assert_eq!(schema["properties"]["ttl"]["type"], "integer");
     assert!(schema["properties"]["name"].get("description").is_none());
+
+    let capability = snapshot
+        .get("dns-records-create")
+        .expect("create capability");
+    let jurisdiction = capability
+        .selectors
+        .iter()
+        .find(|selector| selector.name == "cf-r2-jurisdiction")
+        .expect("jurisdiction selector");
+    assert_eq!(jurisdiction.value_type, "string");
+    assert_eq!(
+        jurisdiction.description.as_deref(),
+        Some("jurisdiction selector")
+    );
+    assert_eq!(
+        capability
+            .selectors
+            .iter()
+            .find(|selector| selector.name == "deploy")
+            .expect("deploy selector")
+            .value_type,
+        "boolean"
+    );
+    let ambiguous = capability
+        .selectors
+        .iter()
+        .find(|selector| selector.name == "ambiguous")
+        .expect("ambiguous selector");
+    assert_eq!(ambiguous.value_type, "unknown");
+    assert!(ambiguous.description.is_none());
 }
 
 #[test]

@@ -231,7 +231,7 @@ fn same_path_read_contracts_require_hash_bound_canonical_fields() {
         name: "cf-r2-jurisdiction".to_owned(),
         location: "header".to_owned(),
         required: false,
-        value_type: "unknown".to_owned(),
+        value_type: "string".to_owned(),
         description: None,
     });
     assert!(!update.verification_contract_supported());
@@ -271,7 +271,7 @@ fn same_path_read_contracts_require_hash_bound_canonical_fields() {
         name: "cf-r2-jurisdiction".to_owned(),
         location: "header".to_owned(),
         required: false,
-        value_type: "unknown".to_owned(),
+        value_type: "string".to_owned(),
         description: None,
     });
     assert!(delete.verification_contract_supported());

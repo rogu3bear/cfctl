@@ -763,7 +763,7 @@ async fn exact_resource_deletion_is_verified_by_same_path_not_found_readback() {
         name: "cf-r2-jurisdiction".to_owned(),
         location: "header".to_owned(),
         required: false,
-        value_type: "unknown".to_owned(),
+        value_type: "string".to_owned(),
         description: None,
     });
     plan.input = serde_json::to_value(CallInput {
@@ -1624,7 +1624,7 @@ async fn exact_resource_update_is_verified_by_same_path_planned_fields() {
         name: "cf-r2-jurisdiction".to_owned(),
         location: "header".to_owned(),
         required: false,
-        value_type: "unknown".to_owned(),
+        value_type: "string".to_owned(),
         description: None,
     });
     plan.input = serde_json::to_value(CallInput {

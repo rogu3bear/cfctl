@@ -1516,7 +1516,7 @@ fn same_path_routing_header(capability: &CapabilityV1, selector: &SelectorV1) ->
     selector.location == "header"
         && selector.name == "cf-r2-jurisdiction"
         && !selector.required
-        && matches!(selector.value_type.as_str(), "string" | "unknown")
+        && selector.value_type == "string"
         && matches!(capability.product.as_str(), "R2 Bucket" | "R2 Object")
 }
 

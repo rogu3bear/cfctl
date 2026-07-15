@@ -31,6 +31,11 @@ Generated API writes are executable only when their operation contract is
 complete. Reads remain dynamically executable; incomplete writes remain
 searchable and explain every missing contract field.
 
+OpenAPI parameter selectors resolve local `$ref` chains and compatible value
+types carried through `allOf`, `oneOf`, or `anyOf`. Schema-backed descriptions
+are retained, while unresolved or conflicting shapes stay explicitly
+`unknown`; normalization never guesses a type from a parameter name.
+
 Verification and automatic rollback strategies form a closed runtime set.
 Catalog metadata must select a strategy that is implemented for the exact
 operation identity and resource shape; a plausible but incompatible strategy

@@ -658,7 +658,7 @@ impl CapabilityV1 {
             if selector.location == "header"
                 && selector.name == "cf-r2-jurisdiction"
                 && !selector.required
-                && matches!(selector.value_type.as_str(), "string" | "unknown")
+                && selector.value_type == "string"
                 && matches!(self.product.as_str(), "R2 Bucket" | "R2 Object")
             {
                 routing_headers += 1;

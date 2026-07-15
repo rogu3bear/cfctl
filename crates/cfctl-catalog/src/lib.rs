@@ -856,7 +856,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
                 .clone_into(&mut capability.product);
             capability.selectors = shared_and_operation_parameters(path_item, operation)
                 .into_iter()
-                .filter_map(selector_from_parameter)
+                .filter_map(|parameter| selector_from_parameter(document, parameter))
                 .collect();
             capability.permissions = operation_object
                 .get("x-api-token-group")
@@ -1399,7 +1399,7 @@ fn same_path_routing_headers(
         if selector.location == "header"
             && selector.name == "cf-r2-jurisdiction"
             && !selector.required
-            && matches!(selector.value_type.as_str(), "string" | "unknown")
+            && selector.value_type == "string"
             && matches!(capability.product.as_str(), "R2 Bucket" | "R2 Object")
             && routing_headers.is_empty()
         {
@@ -2135,9 +2135,10 @@ fn shared_and_operation_parameters<'a>(
         .collect()
 }
 
-fn selector_from_parameter(parameter: &Value) -> Option<SelectorV1> {
+fn selector_from_parameter(document: &Value, parameter: &Value) -> Option<SelectorV1> {
     let name = parameter.get("name")?.as_str()?.to_owned();
     let location = parameter.get("in")?.as_str()?.to_owned();
+    let schema = parameter.get("schema");
     Some(SelectorV1 {
         name,
         location,
@@ -2145,17 +2146,89 @@ fn selector_from_parameter(parameter: &Value) -> Option<SelectorV1> {
             .get("required")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        value_type: parameter
-            .pointer("/schema/type")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned(),
+        value_type: schema
+            .and_then(|schema| local_schema_value_type(document, schema, 0))
+            .unwrap_or_else(|| "unknown".to_owned()),
         description: parameter
             .get("description")
-            .or_else(|| parameter.pointer("/schema/description"))
             .and_then(Value::as_str)
-            .map(str::to_owned),
+            .map(str::to_owned)
+            .or_else(|| schema.and_then(|schema| local_schema_description(document, schema, 0))),
     })
+}
+
+fn local_schema_value_type(document: &Value, schema: &Value, depth: u8) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    if let Some(value_type) = schema.get("type").and_then(Value::as_str) {
+        return Some(value_type.to_owned());
+    }
+    if let Some(resolved) = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|reference| reference.strip_prefix('#'))
+        .and_then(|pointer| document.pointer(pointer))
+    {
+        return local_schema_value_type(document, resolved, depth + 1);
+    }
+    if let Some(members) = schema.get("allOf").and_then(Value::as_array) {
+        let mut resolved = members
+            .iter()
+            .filter_map(|member| local_schema_value_type(document, member, depth + 1));
+        let first = resolved.next()?;
+        return resolved
+            .all(|value_type| value_type == first)
+            .then_some(first);
+    }
+    for alternative in ["oneOf", "anyOf"] {
+        let Some(members) = schema.get(alternative).and_then(Value::as_array) else {
+            continue;
+        };
+        let mut resolved = members
+            .iter()
+            .map(|member| local_schema_value_type(document, member, depth + 1));
+        let first = resolved.next()??;
+        return resolved
+            .all(|value_type| value_type.as_deref() == Some(first.as_str()))
+            .then_some(first);
+    }
+    None
+}
+
+fn local_schema_description(document: &Value, schema: &Value, depth: u8) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    if let Some(description) = schema.get("description").and_then(Value::as_str) {
+        return Some(description.to_owned());
+    }
+    if let Some(resolved) = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|reference| reference.strip_prefix('#'))
+        .and_then(|pointer| document.pointer(pointer))
+    {
+        return local_schema_description(document, resolved, depth + 1);
+    }
+    if let Some(members) = schema.get("allOf").and_then(Value::as_array) {
+        return members
+            .iter()
+            .find_map(|member| local_schema_description(document, member, depth + 1));
+    }
+    for alternative in ["oneOf", "anyOf"] {
+        let Some(members) = schema.get(alternative).and_then(Value::as_array) else {
+            continue;
+        };
+        let mut resolved = members
+            .iter()
+            .map(|member| local_schema_description(document, member, depth + 1));
+        let first = resolved.next()??;
+        return resolved
+            .all(|description| description.as_deref() == Some(first.as_str()))
+            .then_some(first);
+    }
+    None
 }
 
 fn maturity(operation: &serde_json::Map<String, Value>) -> Maturity {
