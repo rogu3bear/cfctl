@@ -9,8 +9,8 @@ use std::{
 use cfctl_core::{
     AdapterStatus, BillingModelV1, CapabilityV1, CostExposureV1,
     CreatedCollectionResourceContractV1, CreatedResourceContractV1, DeletedResourceContractV1,
-    EffectClass, KnowledgeReferenceV1, Maturity, RiskClass, SamePathReadContractV1, SelectorV1,
-    UpdatedResourceContractV1, hash_value,
+    EffectClass, KnowledgeReferenceV1, Maturity, QuerySerializationV1, RiskClass,
+    SamePathReadContractV1, SelectorContractV1, SelectorV1, UpdatedResourceContractV1, hash_value,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -794,6 +794,7 @@ pub fn ingest_governed_ui_capabilities(snapshot: &mut CatalogSnapshot) {
             required: true,
             value_type: "string".to_owned(),
             description: Some("Exact Cloudflare account bound to the UI session".to_owned()),
+            contract: None,
         });
         if id.starts_with("cloudflare-ui.oauth-") {
             capability.selectors.push(SelectorV1 {
@@ -802,6 +803,7 @@ pub fn ingest_governed_ui_capabilities(snapshot: &mut CatalogSnapshot) {
                 required: true,
                 value_type: "string".to_owned(),
                 description: Some("Exact OAuth client displayed in the dashboard".to_owned()),
+                contract: None,
             });
         }
         snapshot.capabilities.insert(id.to_owned(), capability);
@@ -2473,6 +2475,36 @@ fn parameter_identity(parameter: &Value) -> Result<(String, String)> {
 fn selector_from_parameter(document: &Value, parameter: &Value) -> Result<SelectorV1> {
     let (location, name) = parameter_identity(parameter)?;
     let schema = parameter.get("schema");
+    let mut active_references = BTreeSet::new();
+    let normalized_schema = schema.map(|schema| {
+        normalize_request_schema_contract(document, schema, 0, &mut active_references)
+    });
+    let query = (location == "query").then(|| {
+        let style = parameter
+            .get("style")
+            .and_then(Value::as_str)
+            .unwrap_or("form")
+            .to_owned();
+        QuerySerializationV1 {
+            explode: parameter
+                .get("explode")
+                .and_then(Value::as_bool)
+                .unwrap_or(style == "form"),
+            style,
+            allow_reserved: parameter
+                .get("allowReserved")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            allow_empty_value: parameter
+                .get("allowEmptyValue")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }
+    });
+    let contract = (normalized_schema.is_some() || query.is_some()).then(|| SelectorContractV1 {
+        schema: normalized_schema.unwrap_or_else(|| Value::Object(Map::new())),
+        query,
+    });
     Ok(SelectorV1 {
         name,
         location,
@@ -2488,6 +2520,7 @@ fn selector_from_parameter(document: &Value, parameter: &Value) -> Result<Select
             .and_then(Value::as_str)
             .map(str::to_owned)
             .or_else(|| schema.and_then(|schema| local_schema_description(document, schema, 0))),
+        contract,
     })
 }
 

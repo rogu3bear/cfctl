@@ -97,12 +97,29 @@ pub enum Maturity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuerySerializationV1 {
+    pub style: String,
+    pub explode: bool,
+    pub allow_reserved: bool,
+    pub allow_empty_value: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelectorContractV1 {
+    pub schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<QuerySerializationV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SelectorV1 {
     pub name: String,
     pub location: String,
     pub required: bool,
     pub value_type: String,
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<SelectorContractV1>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -34,6 +34,10 @@ pub enum CloudflareError {
     MissingQuerySelector(String),
     #[error("catalog query control `{name}` must have type `{expected}`")]
     InvalidQuerySelector { name: String, expected: String },
+    #[error("catalog query control `{name}` does not satisfy its pinned schema: {reason}")]
+    InvalidQuerySelectorSchema { name: String, reason: String },
+    #[error("catalog query control `{name}` uses unsupported serialization: {reason}")]
+    UnsupportedQuerySerialization { name: String, reason: String },
     #[error("required request body is missing for capability `{0}`")]
     MissingRequestBody(String),
     #[error("request body does not satisfy the pinned schema: {0}")]
@@ -135,12 +139,30 @@ impl RequestBuilder {
         if let Some(query) = input.query.as_object().filter(|query| !query.is_empty()) {
             let mut pairs = url.query_pairs_mut();
             for (key, value) in query {
+                let selector = capability
+                    .selectors
+                    .iter()
+                    .find(|selector| selector.location == "query" && selector.name == *key)
+                    .ok_or_else(|| CloudflareError::UndeclaredQuerySelector(key.clone()))?;
+                let (explode, _) = validated_query_serialization(selector)?;
                 match value {
                     Value::Array(values) => {
-                        for item in values {
-                            if let Some(rendered) = scalar(item) {
+                        let rendered = values
+                            .iter()
+                            .map(scalar)
+                            .collect::<Option<Vec<_>>>()
+                            .ok_or_else(|| CloudflareError::InvalidQuerySelector {
+                                name: key.clone(),
+                                expected: selector.value_type.clone(),
+                            })?;
+                        if rendered.is_empty() {
+                            pairs.append_pair(key, "");
+                        } else if explode {
+                            for rendered in rendered {
                                 pairs.append_pair(key, &rendered);
                             }
+                        } else {
+                            pairs.append_pair(key, &rendered.join(","));
                         }
                     }
                     _ => {
@@ -2069,11 +2091,28 @@ fn validate_query_contract(capability: &CapabilityV1, query: &Value) -> Result<(
                 .iter()
                 .find(|selector| selector.location == "query" && selector.name == *name)
                 .ok_or_else(|| CloudflareError::UndeclaredQuerySelector(name.clone()))?;
-            if !query_value_matches_type(value, &selector.value_type) {
+            let (_, allow_empty) = validated_query_serialization(selector)?;
+            if query_value_is_empty(value) && allow_empty {
+                continue;
+            }
+            let Some(canonical) = canonical_query_value(value, &selector.value_type, selector)
+            else {
                 return Err(CloudflareError::InvalidQuerySelector {
                     name: name.clone(),
                     expected: selector.value_type.clone(),
                 });
+            };
+            if let Some(schema) = selector.contract.as_ref().map(|contract| &contract.schema) {
+                validate_request_schema_value(schema, &canonical, "", 0).map_err(|error| {
+                    let reason = match error {
+                        CloudflareError::InvalidRequestBody(reason) => reason,
+                        other => other.to_string(),
+                    };
+                    CloudflareError::InvalidQuerySelectorSchema {
+                        name: name.clone(),
+                        reason,
+                    }
+                })?;
             }
         }
     }
@@ -2089,34 +2128,115 @@ fn validate_query_contract(capability: &CapabilityV1, query: &Value) -> Result<(
     Ok(())
 }
 
-fn query_value_matches_type(value: &Value, expected: &str) -> bool {
+fn validated_query_serialization(selector: &SelectorV1) -> Result<(bool, bool)> {
+    let query = selector
+        .contract
+        .as_ref()
+        .and_then(|contract| contract.query.as_ref());
+    let style = query.map_or("form", |query| query.style.as_str());
+    if style != "form" {
+        return Err(CloudflareError::UnsupportedQuerySerialization {
+            name: selector.name.clone(),
+            reason: format!("style `{style}` is not implemented"),
+        });
+    }
+    if query.is_some_and(|query| query.allow_reserved) {
+        return Err(CloudflareError::UnsupportedQuerySerialization {
+            name: selector.name.clone(),
+            reason: "allowReserved=true cannot be encoded by the governed URL builder".to_owned(),
+        });
+    }
+    Ok((
+        query.is_none_or(|query| query.explode),
+        query.is_some_and(|query| query.allow_empty_value),
+    ))
+}
+
+fn query_value_is_empty(value: &Value) -> bool {
+    value.as_str() == Some("") || value.as_array().is_some_and(Vec::is_empty)
+}
+
+fn canonical_query_value(value: &Value, expected: &str, selector: &SelectorV1) -> Option<Value> {
+    let schema = selector.contract.as_ref().map(|contract| &contract.schema);
+    canonical_query_value_for_schema(value, expected, schema)
+}
+
+fn canonical_query_value_for_schema(
+    value: &Value,
+    expected: &str,
+    schema: Option<&Value>,
+) -> Option<Value> {
     match expected {
-        "string" => value.is_string(),
-        "boolean" => {
-            value.is_boolean()
-                || value
-                    .as_str()
-                    .is_some_and(|value| matches!(value, "true" | "false"))
-        }
-        "integer" => {
-            value.as_i64().is_some()
-                || value.as_u64().is_some()
-                || value.as_str().is_some_and(|value| {
-                    value.parse::<i64>().is_ok() || value.parse::<u64>().is_ok()
+        "string" => value.as_str().map(|value| Value::String(value.to_owned())),
+        "boolean" => value.as_bool().map(Value::Bool).or_else(|| {
+            value.as_str().and_then(|value| match value {
+                "true" => Some(Value::Bool(true)),
+                "false" => Some(Value::Bool(false)),
+                _ => None,
+            })
+        }),
+        "integer" => value
+            .as_i64()
+            .map(serde_json::Number::from)
+            .or_else(|| value.as_u64().map(serde_json::Number::from))
+            .or_else(|| {
+                value.as_str().and_then(|value| {
+                    value
+                        .parse::<i64>()
+                        .map(serde_json::Number::from)
+                        .or_else(|_| value.parse::<u64>().map(serde_json::Number::from))
+                        .ok()
                 })
+            })
+            .map(Value::Number),
+        "number" => value.as_number().cloned().map(Value::Number).or_else(|| {
+            value
+                .as_str()
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .filter(Value::is_number)
+        }),
+        "array" => {
+            let values = value.as_array()?;
+            if values.is_empty() {
+                return None;
+            }
+            let item_schema = schema.and_then(|schema| schema.get("items"));
+            let item_type = item_schema.and_then(schema_value_type).unwrap_or("unknown");
+            if matches!(item_type, "array" | "object") {
+                return None;
+            }
+            values
+                .iter()
+                .map(|value| canonical_query_value_for_schema(value, item_type, item_schema))
+                .collect::<Option<Vec<_>>>()
+                .map(Value::Array)
         }
-        "number" => {
-            value.is_number()
-                || value
-                    .as_str()
-                    .and_then(|value| value.parse::<f64>().ok())
-                    .is_some_and(f64::is_finite)
-        }
-        "array" => value
-            .as_array()
-            .is_some_and(|values| values.iter().all(|value| scalar(value).is_some())),
-        "unknown" => scalar(value).is_some(),
-        _ => false,
+        "unknown" => scalar(value).map(|_| value.clone()),
+        _ => None,
+    }
+}
+
+fn schema_value_type(schema: &Value) -> Option<&str> {
+    schema.get("type").and_then(Value::as_str).or_else(|| {
+        let values = schema.get("enum")?.as_array()?;
+        let first = values.first()?;
+        let value_type = json_value_type(first)?;
+        values
+            .iter()
+            .all(|value| json_value_type(value) == Some(value_type))
+            .then_some(value_type)
+    })
+}
+
+fn json_value_type(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Bool(_) => Some("boolean"),
+        Value::Number(number) if number.is_i64() || number.is_u64() => Some("integer"),
+        Value::Number(_) => Some("number"),
+        Value::String(_) => Some("string"),
+        Value::Array(_) => Some("array"),
+        Value::Object(_) => Some("object"),
+        Value::Null => None,
     }
 }
 

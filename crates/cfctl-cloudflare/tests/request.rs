@@ -6,8 +6,8 @@ use cfctl_cloudflare::{
 };
 use cfctl_core::{
     CapabilityV1, CreatedCollectionResourceContractV1, CreatedResourceContractV1,
-    DeletedResourceContractV1, PlanStatus, PlanV1, SamePathReadContractV1, SelectorV1,
-    UpdatedResourceContractV1,
+    DeletedResourceContractV1, PlanStatus, PlanV1, QuerySerializationV1, SamePathReadContractV1,
+    SelectorContractV1, SelectorV1, UpdatedResourceContractV1,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -58,6 +58,7 @@ fn request_builder_resolves_path_and_query_selectors_without_leaking_auth() {
             required: true,
             value_type: "string".to_owned(),
             description: None,
+            contract: None,
         },
         SelectorV1 {
             name: "name".to_owned(),
@@ -65,6 +66,7 @@ fn request_builder_resolves_path_and_query_selectors_without_leaking_auth() {
             required: false,
             value_type: "string".to_owned(),
             description: None,
+            contract: None,
         },
     ];
     let request = RequestBuilder::new("https://api.cloudflare.com/client/v4")
@@ -110,6 +112,7 @@ fn request_builder_rejects_query_controls_outside_the_catalog_contract() {
             required: true,
             value_type: "string".to_owned(),
             description: None,
+            contract: None,
         },
         SelectorV1 {
             name: "model_name".to_owned(),
@@ -117,6 +120,7 @@ fn request_builder_rejects_query_controls_outside_the_catalog_contract() {
             required: true,
             value_type: "string".to_owned(),
             description: None,
+            contract: None,
         },
         SelectorV1 {
             name: "queueRequest".to_owned(),
@@ -124,6 +128,7 @@ fn request_builder_rejects_query_controls_outside_the_catalog_contract() {
             required: true,
             value_type: "boolean".to_owned(),
             description: None,
+            contract: None,
         },
     ];
     let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
@@ -188,6 +193,202 @@ fn request_builder_rejects_query_controls_outside_the_catalog_contract() {
     assert_eq!(request.url.query(), Some("queueRequest=true"));
 }
 
+fn query_selector(
+    name: &str,
+    value_type: &str,
+    schema: Value,
+    explode: bool,
+    allow_empty_value: bool,
+) -> SelectorV1 {
+    SelectorV1 {
+        name: name.to_owned(),
+        location: "query".to_owned(),
+        required: false,
+        value_type: value_type.to_owned(),
+        description: None,
+        contract: Some(SelectorContractV1 {
+            schema,
+            query: Some(QuerySerializationV1 {
+                style: "form".to_owned(),
+                explode,
+                allow_reserved: false,
+                allow_empty_value,
+            }),
+        }),
+    }
+}
+
+fn query_contract_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "items-list",
+        "List items",
+        "GET",
+        "/accounts/{account_id}/items",
+    );
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        query_selector(
+            "tags",
+            "array",
+            json!({
+                    "type":"array",
+                    "minItems":1,
+                    "maxItems":2,
+                    "uniqueItems":true,
+                    "items":{"type":"string", "enum":["one","two"]}
+            }),
+            false,
+            false,
+        ),
+        query_selector(
+            "limit",
+            "integer",
+            json!({"type":"integer", "minimum":1, "maximum":10}),
+            true,
+            false,
+        ),
+        query_selector(
+            "empty",
+            "integer",
+            json!({"type":"integer", "minimum":1}),
+            true,
+            true,
+        ),
+    ];
+    capability
+}
+
+#[test]
+fn request_builder_enforces_query_schema_and_exact_form_serialization() {
+    let capability = query_contract_capability();
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    let request = builder
+        .build(
+            &capability,
+            &CallInput {
+                selectors: json!({"account_id":"account-1"}),
+                query: json!({"tags":["one","two"], "limit":"5"}),
+                ..CallInput::default()
+            },
+        )
+        .expect("valid pinned query contract");
+    assert_eq!(
+        request.url.query_pairs().collect::<Vec<_>>(),
+        vec![
+            ("limit".into(), "5".into()),
+            ("tags".into(), "one,two".into())
+        ]
+    );
+
+    let invalid_enum = builder
+        .build(
+            &capability,
+            &CallInput {
+                selectors: json!({"account_id":"account-1"}),
+                query: json!({"tags":["one","three"]}),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("array items must satisfy their pinned enum");
+    assert!(matches!(
+        invalid_enum,
+        CloudflareError::InvalidQuerySelectorSchema { name, .. } if name == "tags"
+    ));
+
+    let invalid_bound = builder
+        .build(
+            &capability,
+            &CallInput {
+                selectors: json!({"account_id":"account-1"}),
+                query: json!({"limit":"11"}),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("numeric query bounds must be enforced");
+    assert!(matches!(
+        invalid_bound,
+        CloudflareError::InvalidQuerySelectorSchema { name, .. } if name == "limit"
+    ));
+}
+
+#[test]
+fn request_builder_preserves_allowed_empty_queries_and_rejects_unsupported_styles() {
+    let capability = query_contract_capability();
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    let empty = builder
+        .build(
+            &capability,
+            &CallInput {
+                selectors: json!({"account_id":"account-1"}),
+                query: json!({"empty":""}),
+                ..CallInput::default()
+            },
+        )
+        .expect("allowEmptyValue must preserve an explicit empty query control");
+    assert_eq!(
+        empty.url.query_pairs().collect::<Vec<_>>(),
+        vec![("empty".into(), "".into())]
+    );
+
+    let mut unsupported = capability.clone();
+    unsupported
+        .selectors
+        .iter_mut()
+        .find(|selector| selector.name == "tags")
+        .and_then(|selector| selector.contract.as_mut())
+        .and_then(|contract| contract.query.as_mut())
+        .expect("query contract")
+        .style = "pipeDelimited".to_owned();
+    let error = builder
+        .build(
+            &unsupported,
+            &CallInput {
+                selectors: json!({"account_id":"account-1"}),
+                query: json!({"tags":["one","two"]}),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("unsupported query styles must fail during contract preflight");
+    assert!(matches!(
+        error,
+        CloudflareError::UnsupportedQuerySerialization { name, .. } if name == "tags"
+    ));
+}
+
+#[test]
+fn request_builder_rejects_nested_query_collections_before_rendering() {
+    let mut nested = query_contract_capability();
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    nested.selectors.push(query_selector(
+        "nested",
+        "array",
+        json!({"type":"array", "items":{"type":"array", "items":{"type":"string"}}}),
+        false,
+        false,
+    ));
+    let error = builder
+        .build(
+            &nested,
+            &CallInput {
+                selectors: json!({"account_id":"account-1"}),
+                query: json!({"nested":[["one","two"]]}),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("nested query collections cannot be represented as URL scalar controls");
+    assert!(matches!(
+        error,
+        CloudflareError::InvalidQuerySelector { name, .. } if name == "nested"
+    ));
+}
+
 #[test]
 fn request_builder_sends_only_catalog_declared_header_selectors() {
     let mut capability = CapabilityV1::new(
@@ -202,6 +403,7 @@ fn request_builder_sends_only_catalog_declared_header_selectors() {
         required: false,
         value_type: "unknown".to_owned(),
         description: None,
+        contract: None,
     }];
     let request = RequestBuilder::new("https://api.cloudflare.com/client/v4")
         .expect("valid base URL")
@@ -255,6 +457,7 @@ fn request_builder_rejects_missing_required_or_reserved_header_selectors() {
         required: true,
         value_type: "string".to_owned(),
         description: None,
+        contract: None,
     }];
     let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
     let missing = builder
@@ -1498,6 +1701,7 @@ async fn exact_resource_deletion_is_verified_by_same_path_not_found_readback() {
         required: false,
         value_type: "string".to_owned(),
         description: None,
+        contract: None,
     });
     plan.input = serde_json::to_value(CallInput {
         selectors: json!({
@@ -2435,6 +2639,7 @@ async fn exact_resource_update_is_verified_by_same_path_planned_fields() {
         required: false,
         value_type: "string".to_owned(),
         description: None,
+        contract: None,
     });
     plan.input = serde_json::to_value(CallInput {
         selectors: json!({

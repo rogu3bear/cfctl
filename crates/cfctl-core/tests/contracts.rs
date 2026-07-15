@@ -8,6 +8,17 @@ use cfctl_core::{
 };
 use serde_json::json;
 
+fn uncontracted_selector(name: &str, location: &str, value_type: &str) -> SelectorV1 {
+    SelectorV1 {
+        name: name.to_owned(),
+        location: location.to_owned(),
+        required: false,
+        value_type: value_type.to_owned(),
+        description: None,
+        contract: None,
+    }
+}
+
 #[test]
 fn every_capability_guide_has_the_exact_fifteen_lifecycle_stages() {
     let stages = guide_stages();
@@ -192,13 +203,9 @@ fn updated_resource_contract_rejects_noncanonical_field_allowlists() {
         .verified_response_fields
         .pop();
 
-    capability.selectors.push(SelectorV1 {
-        name: "mode".to_owned(),
-        location: "query".to_owned(),
-        required: false,
-        value_type: "string".to_owned(),
-        description: None,
-    });
+    capability
+        .selectors
+        .push(uncontracted_selector("mode", "query", "string"));
     assert!(!capability.verification_contract_supported());
 
     capability.selectors.clear();
@@ -235,13 +242,9 @@ fn deleted_resource_contract_rejects_body_and_nonpath_controls() {
     assert!(!capability.verification_contract_supported());
 
     capability.request_schema = None;
-    capability.selectors.push(SelectorV1 {
-        name: "cascade".to_owned(),
-        location: "query".to_owned(),
-        required: false,
-        value_type: "boolean".to_owned(),
-        description: None,
-    });
+    capability
+        .selectors
+        .push(uncontracted_selector("cascade", "query", "boolean"));
     assert!(!capability.verification_contract_supported());
 }
 
@@ -357,13 +360,11 @@ fn same_path_read_contracts_require_hash_bound_canonical_fields() {
         .verified_response_fields
         .pop();
 
-    update.selectors.push(SelectorV1 {
-        name: "cf-r2-jurisdiction".to_owned(),
-        location: "header".to_owned(),
-        required: false,
-        value_type: "string".to_owned(),
-        description: None,
-    });
+    update.selectors.push(uncontracted_selector(
+        "cf-r2-jurisdiction",
+        "header",
+        "string",
+    ));
     assert!(!update.verification_contract_supported());
 
     update.product = "R2 Bucket".to_owned();
@@ -397,13 +398,11 @@ fn same_path_read_contracts_require_hash_bound_canonical_fields() {
     assert!(delete.verification_contract_supported());
 
     delete.product = "R2 Object".to_owned();
-    delete.selectors.push(SelectorV1 {
-        name: "cf-r2-jurisdiction".to_owned(),
-        location: "header".to_owned(),
-        required: false,
-        value_type: "string".to_owned(),
-        description: None,
-    });
+    delete.selectors.push(uncontracted_selector(
+        "cf-r2-jurisdiction",
+        "header",
+        "string",
+    ));
     assert!(delete.verification_contract_supported());
 
     delete

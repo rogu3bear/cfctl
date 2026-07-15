@@ -417,6 +417,53 @@ fn selector_types_follow_homogeneous_enums_without_guessing_mixed_values() {
 }
 
 #[test]
+fn selector_contract_preserves_bounded_query_schema_and_serialization() {
+    let mut document = fixture();
+    document["paths"]["/zones/{zone_id}/dns_records"]["get"]["parameters"]
+        .as_array_mut()
+        .expect("parameters")
+        .push(json!({
+            "in": "query",
+            "name": "tags",
+            "style": "form",
+            "explode": false,
+            "allowReserved": false,
+            "allowEmptyValue": false,
+            "schema": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 2,
+                "uniqueItems": true,
+                "items": {"type": "string", "enum": ["one", "two"]}
+            }
+        }));
+
+    let snapshot = normalize_openapi(&document).expect("catalog");
+    let contract = snapshot
+        .get("dns-records-list")
+        .expect("list capability")
+        .selectors
+        .iter()
+        .find(|selector| selector.name == "tags")
+        .and_then(|selector| selector.contract.as_ref())
+        .expect("selector contract");
+    assert_eq!(contract.schema["type"], "array");
+    assert_eq!(contract.schema["minItems"], 1);
+    assert_eq!(contract.schema["maxItems"], 2);
+    assert_eq!(contract.schema["uniqueItems"], true);
+    assert_eq!(contract.schema["items"]["enum"], json!(["one", "two"]));
+    assert!(
+        !contract.schema.to_string().contains("description"),
+        "descriptive source prose must not enter the executable selector schema"
+    );
+    let query = contract.query.as_ref().expect("query serialization");
+    assert_eq!(query.style, "form");
+    assert!(!query.explode);
+    assert!(!query.allow_reserved);
+    assert!(!query.allow_empty_value);
+}
+
+#[test]
 fn selector_contract_resolves_local_parameter_references_and_operation_overrides() {
     let mut document = fixture();
     document["components"]["parameters"] = json!({
@@ -598,6 +645,15 @@ fn legacy_catalog_hash_survives_absent_optional_resource_contracts() {
             .as_object_mut()
             .expect("capability object")
             .remove("same_path_read");
+        for selector in capability["selectors"]
+            .as_array_mut()
+            .expect("selector array")
+        {
+            selector
+                .as_object_mut()
+                .expect("selector object")
+                .remove("contract");
+        }
     }
     stored["schema_hash"] = json!(hash_value(&stored["capabilities"]).expect("legacy hash"));
 

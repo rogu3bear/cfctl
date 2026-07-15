@@ -4633,6 +4633,7 @@ mod tests {
                 required: false,
                 value_type: "array".to_owned(),
                 description: None,
+                contract: None,
             },
             SelectorV1 {
                 name: "cursor".to_owned(),
@@ -4640,6 +4641,7 @@ mod tests {
                 required: false,
                 value_type: "string".to_owned(),
                 description: None,
+                contract: None,
             },
         ];
         let query = query_object_from_pairs(
@@ -5206,6 +5208,7 @@ mod tests {
                 required: true,
                 value_type: "string".to_owned(),
                 description: None,
+                contract: None,
             },
             SelectorV1 {
                 name: "widget_id".to_owned(),
@@ -5213,6 +5216,7 @@ mod tests {
                 required: true,
                 value_type: "string".to_owned(),
                 description: None,
+                contract: None,
             },
         ];
         capability.request_schema = Some(json!({
