@@ -1183,6 +1183,14 @@ fn create_lifecycle_fixture() -> serde_json::Value {
                     "summary":"Create Widget",
                     "tags":["Widgets"],
                     "x-api-token-group":["Widgets Write"],
+                    "requestBody": {
+                        "required": true,
+                        "content": {"application/json": {"schema": {
+                            "type": "object",
+                            "required": ["name"],
+                            "properties": {"name": {"type": "string"}}
+                        }}}
+                    },
                     "responses": {
                         "201": {
                             "description":"Widget created",
@@ -1203,7 +1211,17 @@ fn create_lifecycle_fixture() -> serde_json::Value {
                 "get": {
                     "operationId":"widgets-get",
                     "summary":"Get Widget",
-                    "tags":["Widgets"]
+                    "tags":["Widgets"],
+                    "responses": {
+                        "200": {
+                            "description":"Widget",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref":"#/components/schemas/WidgetResponse"}
+                                }
+                            }
+                        }
+                    }
                 },
                 "delete": {
                     "operationId":"widgets-delete",
@@ -1243,6 +1261,7 @@ fn create_contract_binds_a_schema_proven_id_and_exact_read_delete_pair() {
     assert_eq!(target.response_result_identity_pointer, "/id");
     assert_eq!(target.read_capability_id, "widgets-get");
     assert_eq!(target.delete_capability_id, "widgets-delete");
+    assert_eq!(target.verified_response_fields, vec!["name"]);
 }
 
 #[test]
@@ -1264,21 +1283,34 @@ fn create_contract_rejects_an_undocumented_response_identity() {
 }
 
 #[test]
+fn create_contract_rejects_a_detail_read_without_a_string_identity() {
+    let mut document = create_lifecycle_fixture();
+    document["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"] = json!({
+        "type":"object",
+        "properties":{"result":{"type":"object","properties":{
+            "id":{"type":"integer"},
+            "name":{"type":"string"}
+        }}}
+    });
+
+    let snapshot = normalize_openapi(&document).expect("integer-id detail catalog");
+    let create = snapshot.get("widgets-create").expect("create widget");
+    assert!(create.created_resource.is_none());
+    assert_ne!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+}
+
+#[test]
 fn create_contract_rejects_ambiguous_direct_child_resource_paths() {
     let mut document = create_lifecycle_fixture();
-    document["paths"]["/accounts/{account_id}/widgets/{widget_key}"] = json!({
-        "get": {
-            "operationId":"widgets-get-by-key",
-            "summary":"Get Widget by Key",
-            "tags":["Widgets"]
-        },
-        "delete": {
-            "operationId":"widgets-delete-by-key",
-            "summary":"Delete Widget by Key",
-            "tags":["Widgets"],
-            "x-api-token-group":["Widgets Write"]
-        }
-    });
+    let mut alternative = document["paths"]["/accounts/{account_id}/widgets/{widget_id}"].clone();
+    alternative["parameters"][1]["name"] = json!("widget_identifier");
+    alternative["get"]["operationId"] = json!("widgets-get-by-identifier");
+    alternative["delete"]["operationId"] = json!("widgets-delete-by-identifier");
+    document["paths"]["/accounts/{account_id}/widgets/{widget_identifier}"] = alternative;
 
     let snapshot = normalize_openapi(&document).expect("ambiguous widget catalog");
     let ambiguous = snapshot.get("widgets-create").expect("ambiguous create");
@@ -1288,6 +1320,72 @@ fn create_contract_rejects_ambiguous_direct_child_resource_paths() {
         "created_resource_contains_planned_fields_by_returned_id"
     );
     assert!(!ambiguous.rollback.supported);
+}
+
+#[test]
+fn create_contract_rejects_fields_that_the_exact_read_cannot_prove() {
+    let mut document = create_lifecycle_fixture();
+    document["paths"]["/accounts/{account_id}/widgets"]["post"]["requestBody"]["content"]["application/json"]
+        ["schema"]["properties"]["secret"] = json!({"type":"string"});
+
+    let snapshot = normalize_openapi(&document).expect("hidden-field widget catalog");
+    let create = snapshot.get("widgets-create").expect("create widget");
+
+    assert!(create.created_resource.is_none());
+    assert_ne!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    assert!(!create.rollback.supported);
+}
+
+#[test]
+fn create_contract_rejects_non_id_children_and_broadening_read_or_delete_inputs() {
+    let mut non_id_document = create_lifecycle_fixture();
+    let detail = non_id_document["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/widgets/{widget_id}")
+        .expect("detail path");
+    non_id_document["paths"]["/accounts/{account_id}/widgets/{slug}"] = detail;
+    let non_id = normalize_openapi(&non_id_document).expect("non-id widget catalog");
+    assert!(
+        non_id
+            .get("widgets-create")
+            .expect("create widget")
+            .created_resource
+            .is_none()
+    );
+
+    let mut required_query_document = create_lifecycle_fixture();
+    required_query_document["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["get"]["parameters"] = json!([
+        {"in":"query","name":"expand","required":true,"schema":{"type":"string"}}
+    ]);
+    let required_query =
+        normalize_openapi(&required_query_document).expect("required-query widget catalog");
+    assert!(
+        required_query
+            .get("widgets-create")
+            .expect("create widget")
+            .created_resource
+            .is_none()
+    );
+
+    let mut delete_body_document = create_lifecycle_fixture();
+    delete_body_document["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["delete"]["requestBody"] = json!({
+        "required":true,
+        "content":{"application/json":{"schema":{
+            "type":"object","properties":{"cascade":{"type":"boolean"}}
+        }}}
+    });
+    let delete_body = normalize_openapi(&delete_body_document).expect("delete-body widget catalog");
+    assert!(
+        delete_body
+            .get("widgets-create")
+            .expect("create widget")
+            .created_resource
+            .is_none()
+    );
 }
 
 fn create_collection_schemas() -> serde_json::Value {

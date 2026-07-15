@@ -1486,6 +1486,7 @@ async fn created_resource_is_read_back_by_schema_proven_id_and_planned_fields() 
         response_result_identity_pointer: "/id".to_owned(),
         read_capability_id: "widgets-get".to_owned(),
         delete_capability_id: "widgets-delete".to_owned(),
+        verified_response_fields: vec!["name".to_owned(), "settings".to_owned()],
     });
     plan.input = serde_json::to_value(CallInput {
         selectors: json!({"account_id":"account-1"}),
@@ -1545,6 +1546,7 @@ async fn created_resource_verification_fails_closed_without_returned_identity() 
         response_result_identity_pointer: "/id".to_owned(),
         read_capability_id: "widgets-get".to_owned(),
         delete_capability_id: "widgets-delete".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
     });
     let apply = CloudflareResponseV1 {
         status: 201,
@@ -1591,6 +1593,7 @@ async fn created_resource_without_planned_fields_is_rejected_before_the_mutation
         response_result_identity_pointer: "/id".to_owned(),
         read_capability_id: "widgets-get".to_owned(),
         delete_capability_id: "widgets-delete".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
     });
     plan.status = PlanStatus::Consumed;
     let input: CallInput = serde_json::from_value(plan.input.clone()).expect("input");
@@ -1612,6 +1615,48 @@ async fn created_resource_without_planned_fields_is_rejected_before_the_mutation
         .to_string();
 
     assert!(error.contains("planned create body"));
+    assert_eq!(plan.status, PlanStatus::Consumed);
+}
+
+#[tokio::test]
+async fn created_resource_with_an_unbound_field_is_rejected_before_the_mutation_boundary() {
+    let mut plan = dns_record_plan(
+        "widgets-create",
+        "POST",
+        "/accounts/{account_id}/widgets",
+        "created_resource_contains_planned_fields_by_returned_id",
+        json!({"account_id":"account-1"}),
+        Some(json!({"name":"created", "secret":"must-not-cross-boundary"})),
+    );
+    plan.capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/widgets/{widget_id}".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-get".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+    });
+    plan.status = PlanStatus::Consumed;
+    let input: CallInput = serde_json::from_value(plan.input.clone()).expect("input");
+    let catalog_hash = plan.catalog_hash.clone();
+    let executor =
+        Executor::new(reqwest::Client::new(), "http://127.0.0.1:9/client/v4").expect("executor");
+
+    let error = executor
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            &catalog_hash,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect_err("an unbound field must fail before network execution")
+        .to_string();
+
+    assert!(error.contains("outside the hash-bound exact readback fields"));
+    assert!(!error.contains("must-not-cross-boundary"));
     assert_eq!(plan.status, PlanStatus::Consumed);
 }
 

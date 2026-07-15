@@ -137,6 +137,48 @@ fn updated_resource_contract_rejects_noncanonical_field_allowlists() {
 }
 
 #[test]
+fn created_resource_contract_rejects_noncanonical_field_allowlists() {
+    let mut capability = CapabilityV1::new(
+        "widgets-create",
+        "Create widget",
+        "POST",
+        "/accounts/{account_id}/widgets",
+    );
+    capability.verification.strategy =
+        "created_resource_contains_planned_fields_by_returned_id".to_owned();
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/widgets/{widget_id}".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-get".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
+        verified_response_fields: vec!["name".to_owned(), "enabled".to_owned()],
+    });
+
+    assert!(!capability.verification_contract_supported());
+
+    capability
+        .created_resource
+        .as_mut()
+        .expect("created-resource contract")
+        .verified_response_fields = vec!["enabled".to_owned(), "name".to_owned()];
+    assert!(capability.verification_contract_supported());
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    assert!(capability.rollback_contract_supported());
+
+    let mut legacy_value = serde_json::to_value(&capability).expect("serialize capability");
+    legacy_value["created_resource"]
+        .as_object_mut()
+        .expect("created-resource object")
+        .remove("verified_response_fields");
+    let legacy: CapabilityV1 =
+        serde_json::from_value(legacy_value).expect("deserialize legacy capability");
+    assert!(!legacy.verification_contract_supported());
+    assert!(!legacy.rollback_contract_supported());
+}
+
+#[test]
 fn blocked_dynamic_api_contract_keeps_its_missing_permission_gap() {
     let mut capability = CapabilityV1::new(
         "widgets.delete",
@@ -240,6 +282,7 @@ fn plan_hash_binds_all_reviewed_content_and_is_not_replayable_after_consumption(
         response_result_identity_pointer: "/id".to_owned(),
         read_capability_id: "dns.records.get".to_owned(),
         delete_capability_id: "dns.records.delete".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
     });
     plan.refresh_hash()
         .expect("created-resource contract must rehash");

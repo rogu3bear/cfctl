@@ -1386,7 +1386,7 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
     }
     match strategy {
         "created_resource_contains_planned_fields_by_returned_id" => {
-            validate_created_resource_target(capability)
+            validate_created_resource_target(capability, input)
         }
         "parent_collection_contains_created_resource_id_and_planned_fields" => {
             validate_created_collection_resource_target(capability, input)
@@ -1401,24 +1401,53 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
     }
 }
 
-fn validate_created_resource_target(capability: &CapabilityV1) -> Result<()> {
+fn validate_created_resource_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
     let target = capability.created_resource.as_ref().ok_or_else(|| {
         CloudflareError::MissingVerificationTarget(
             "the hash-bound created-resource contract is absent".to_owned(),
         )
     })?;
     let expected_suffix = format!("/{{{}}}", target.identity_selector);
-    if target.identity_selector.is_empty()
+    if !selector_can_be_response_id(&target.identity_selector)
         || !target.detail_path.ends_with(&expected_suffix)
-        || !target.response_result_identity_pointer.starts_with('/')
+        || target.response_result_identity_pointer != "/id"
         || target.read_capability_id.is_empty()
         || target.delete_capability_id.is_empty()
+        || target.verified_response_fields.is_empty()
+        || target
+            .verified_response_fields
+            .iter()
+            .any(|field| field.is_empty() || field.contains('/'))
+        || target
+            .verified_response_fields
+            .windows(2)
+            .any(|fields| fields[0] >= fields[1])
     {
         return Err(CloudflareError::MissingVerificationTarget(
             "the hash-bound created-resource contract is malformed".to_owned(),
         ));
     }
+    let Some(planned) = input.body.as_ref().and_then(Value::as_object) else {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "planned create body is absent, empty, or not an object".to_owned(),
+        ));
+    };
+    if planned.keys().any(|field| {
+        target
+            .verified_response_fields
+            .binary_search(field)
+            .is_err()
+    }) {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned create contains a field outside the hash-bound exact readback fields"
+                .to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn selector_can_be_response_id(selector: &str) -> bool {
+    selector == "id" || selector.ends_with("_id") || selector.ends_with("_identifier")
 }
 
 fn validate_created_collection_resource_target(

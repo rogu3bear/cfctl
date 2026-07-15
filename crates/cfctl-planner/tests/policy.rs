@@ -36,6 +36,7 @@ fn reversible_write() -> CapabilityV1 {
         response_result_identity_pointer: "/id".to_owned(),
         read_capability_id: "widgets-get".to_owned(),
         delete_capability_id: "widgets-delete".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
     });
     write
 }

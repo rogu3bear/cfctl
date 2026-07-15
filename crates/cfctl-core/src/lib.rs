@@ -201,6 +201,10 @@ pub struct CreatedResourceContractV1 {
     pub response_result_identity_pointer: String,
     pub read_capability_id: String,
     pub delete_capability_id: String,
+    /// Canonical top-level request fields that the exact-resource response
+    /// schema declares and the live verifier is therefore allowed to compare.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_response_fields: Vec<String>,
 }
 
 /// Hash-bound coordinates for proving and compensating a newly created
@@ -579,11 +583,20 @@ impl CapabilityV1 {
                 self.path.trim_end_matches('/'),
                 target.identity_selector
             );
-            !target.identity_selector.is_empty()
+            selector_can_be_response_id(&target.identity_selector)
                 && target.detail_path == expected_path
                 && target.response_result_identity_pointer == "/id"
                 && !target.read_capability_id.is_empty()
                 && !target.delete_capability_id.is_empty()
+                && !target.verified_response_fields.is_empty()
+                && target
+                    .verified_response_fields
+                    .iter()
+                    .all(|field| !field.is_empty() && !field.contains('/'))
+                && target
+                    .verified_response_fields
+                    .windows(2)
+                    .all(|fields| fields[0] < fields[1])
         })
     }
 

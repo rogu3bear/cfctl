@@ -893,7 +893,11 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     classify_parent_collection_delete_contracts(document, &mut capabilities);
     classify_parent_collection_update_contracts(document, &mut capabilities);
     classify_same_path_object_update_contracts(document, &mut capabilities);
-    classify_created_resource_contracts(&mut capabilities, &creates_with_schema_proven_string_ids);
+    classify_created_resource_contracts(
+        document,
+        &mut capabilities,
+        &creates_with_schema_proven_string_ids,
+    );
     classify_created_collection_resource_contracts(
         document,
         &mut capabilities,
@@ -966,13 +970,19 @@ fn classify_same_path_object_update_contracts(
 }
 
 fn classify_created_resource_contracts(
+    document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
     creates_with_schema_proven_string_ids: &BTreeSet<String>,
 ) {
     let read_targets = capabilities
         .values()
         .filter(|capability| {
-            capability.method == "GET" && path_targets_exact_resource(&capability.path)
+            capability.method == "GET"
+                && path_targets_exact_resource(&capability.path)
+                && !capability
+                    .selectors
+                    .iter()
+                    .any(|selector| selector.required && selector.location != "path")
         })
         .map(|capability| {
             (
@@ -984,7 +994,13 @@ fn classify_created_resource_contracts(
     let delete_targets = capabilities
         .values()
         .filter(|capability| {
-            capability.method == "DELETE" && path_targets_exact_resource(&capability.path)
+            capability.method == "DELETE"
+                && path_targets_exact_resource(&capability.path)
+                && capability.request_schema.is_none()
+                && capability
+                    .selectors
+                    .iter()
+                    .all(|selector| selector.location == "path")
         })
         .map(|capability| {
             (
@@ -1001,30 +1017,13 @@ fn classify_created_resource_contracts(
         {
             continue;
         }
-
-        let candidates = read_targets
-            .iter()
-            .filter_map(|((detail_path, product), read_capability_id)| {
-                if product != &capability.product {
-                    return None;
-                }
-                let identity_selector = direct_child_selector(&capability.path, detail_path)?;
-                let delete_capability_id =
-                    delete_targets.get(&(detail_path.clone(), product.clone()))?;
-                Some(CreatedResourceContractV1 {
-                    detail_path: detail_path.clone(),
-                    identity_selector,
-                    response_result_identity_pointer: "/id".to_owned(),
-                    read_capability_id: read_capability_id.clone(),
-                    delete_capability_id: delete_capability_id.clone(),
-                })
-            })
-            .collect::<Vec<_>>();
-        let [target] = candidates.as_slice() else {
+        let Some(target) =
+            created_resource_contract(document, capability, &read_targets, &delete_targets)
+        else {
             continue;
         };
 
-        capability.created_resource = Some(target.clone());
+        capability.created_resource = Some(target);
         "created_resource_contains_planned_fields_by_returned_id"
             .clone_into(&mut capability.verification.strategy);
         capability.rollback.supported = true;
@@ -1035,6 +1034,65 @@ fn classify_created_resource_contracts(
         );
         refresh_dynamic_mutation_contract(capability);
     }
+}
+
+fn created_resource_contract(
+    document: &Value,
+    capability: &CapabilityV1,
+    read_targets: &ExactReadTargets,
+    delete_targets: &ExactDeleteTargets,
+) -> Option<CreatedResourceContractV1> {
+    let mut verified_response_fields = capability
+        .request_schema
+        .as_ref()
+        .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))?
+        .get("properties")?
+        .as_object()?
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    if verified_response_fields.is_empty() {
+        return None;
+    }
+    verified_response_fields.sort();
+    verified_response_fields.dedup();
+    let field_names = verified_response_fields
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    let candidates = read_targets
+        .iter()
+        .filter_map(|((detail_path, product), read_capability_id)| {
+            if product != &capability.product {
+                return None;
+            }
+            let identity_selector = direct_child_selector(&capability.path, detail_path)?;
+            if !selector_can_be_response_id(&identity_selector) {
+                return None;
+            }
+            let delete_capability_id =
+                delete_targets.get(&(detail_path.clone(), product.clone()))?;
+            let read_operation = document.get("paths")?.get(detail_path)?.get("get")?;
+            if !success_response_declares_result_string_id(document, read_operation)
+                || !success_response_declares_result_fields(document, read_operation, &field_names)
+            {
+                return None;
+            }
+            Some(CreatedResourceContractV1 {
+                detail_path: detail_path.clone(),
+                identity_selector,
+                response_result_identity_pointer: "/id".to_owned(),
+                read_capability_id: read_capability_id.clone(),
+                delete_capability_id: delete_capability_id.clone(),
+                verified_response_fields: verified_response_fields.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let [target] = candidates.as_slice() else {
+        return None;
+    };
+    Some(target.clone())
 }
 
 fn direct_child_selector(collection_path: &str, detail_path: &str) -> Option<String> {
@@ -1051,6 +1109,7 @@ fn direct_child_selector(collection_path: &str, detail_path: &str) -> Option<Str
 }
 
 type CollectionReadTargets = BTreeMap<(String, String), (String, Vec<SelectorV1>)>;
+type ExactReadTargets = BTreeMap<(String, String), String>;
 type ExactDeleteTargets = BTreeMap<(String, String), String>;
 
 fn classify_created_collection_resource_contracts(
