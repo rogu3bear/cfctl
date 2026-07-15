@@ -910,6 +910,87 @@ fn exact_resource_deletes_reject_broadening_inputs_and_required_read_controls() 
 }
 
 #[test]
+fn d1_database_readback_omits_only_the_documented_fields_projection() {
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/accounts/{account_id}/d1/database/{database_id}": {
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+                    {"in":"path","name":"database_id","required":true,"schema":{"type":"string"}}
+                ],
+                "get": {
+                    "operationId":"d1-get-database",
+                    "summary":"Get D1 Database",
+                    "tags":["D1"],
+                    "parameters":[{
+                        "description":"Comma-separated list of fields to include in the response. When omitted, all fields are returned.",
+                        "in":"query",
+                        "name":"fields",
+                        "required":false,
+                        "schema":{"type":"array","items":{"type":"string"}}
+                    }],
+                    "responses":{"200":{"description":"ok","content":{"application/json":{"schema":{
+                        "type":"object","properties":{"result":{"type":"object","properties":{
+                            "read_replication":{"type":"object"}
+                        }}}
+                    }}}}}
+                },
+                "patch": {
+                    "operationId":"d1-update-partial-database",
+                    "summary":"Update D1 Database partially",
+                    "tags":["D1"],
+                    "x-api-token-group":["D1 Write"],
+                    "requestBody":{"content":{"application/json":{"schema":{
+                        "type":"object","properties":{"read_replication":{"type":"object"}}
+                    }}}}
+                },
+                "delete": {
+                    "operationId":"d1-delete-database",
+                    "summary":"Delete D1 Database",
+                    "tags":["D1"],
+                    "x-api-token-group":["D1 Write"]
+                }
+            }
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("D1 catalog");
+    assert_eq!(
+        snapshot
+            .get("d1-delete-database")
+            .expect("delete D1 database")
+            .verification
+            .strategy,
+        "same_resource_returns_not_found_after_delete"
+    );
+    assert_eq!(
+        snapshot
+            .get("d1-update-partial-database")
+            .expect("update D1 database")
+            .verification
+            .strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+
+    let mut unrelated = document;
+    unrelated["paths"]["/accounts/{account_id}/d1/database/{database_id}"]["get"]["tags"] =
+        json!(["Widgets"]);
+    unrelated["paths"]["/accounts/{account_id}/d1/database/{database_id}"]["delete"]["tags"] =
+        json!(["Widgets"]);
+    let unrelated_snapshot = normalize_openapi(&unrelated).expect("unrelated catalog");
+    assert_ne!(
+        unrelated_snapshot
+            .get("d1-delete-database")
+            .expect("unrelated delete")
+            .verification
+            .strategy,
+        "same_resource_returns_not_found_after_delete"
+    );
+}
+
+#[test]
 fn exact_resource_deletes_use_schema_proven_parent_collection_readback() {
     let document = json!({
         "openapi": "3.0.3",

@@ -1378,14 +1378,17 @@ fn same_path_readback_routing_headers(capability: &CapabilityV1) -> Option<Vec<S
 
 fn same_path_routing_headers(
     capability: &CapabilityV1,
-    allow_read_conditionals: bool,
+    allow_readback_controls: bool,
 ) -> Option<Vec<String>> {
     let mut routing_headers = Vec::new();
     for selector in &capability.selectors {
         if selector.location == "path" {
             continue;
         }
-        if allow_read_conditionals
+        if allow_readback_controls && safe_omitted_readback_projection(capability, selector) {
+            continue;
+        }
+        if allow_readback_controls
             && selector.location == "header"
             && !selector.required
             && selector.value_type == "string"
@@ -1409,6 +1412,18 @@ fn same_path_routing_headers(
         return None;
     }
     Some(routing_headers)
+}
+
+fn safe_omitted_readback_projection(capability: &CapabilityV1, selector: &SelectorV1) -> bool {
+    capability.product == "D1"
+        && capability.path == "/accounts/{account_id}/d1/database/{database_id}"
+        && selector.location == "query"
+        && selector.name == "fields"
+        && !selector.required
+        && selector.value_type == "array"
+        && selector.description.as_deref().is_some_and(|description| {
+            description.contains("When omitted") && description.contains("all fields are returned.")
+        })
 }
 
 fn canonical_request_object_fields(capability: &CapabilityV1) -> Option<Vec<String>> {
