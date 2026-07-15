@@ -1,6 +1,6 @@
 //! Typed Cloudflare request construction and governed execution.
 
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use cfctl_auth::AuthCredential;
 use cfctl_core::{CapabilityV1, PlanStatus, PlanV1, SelectorV1};
@@ -1845,11 +1845,42 @@ fn validate_request_schema_value(
     path: &str,
     depth: usize,
 ) -> Result<()> {
+    let mut remaining_steps = MAX_REQUEST_VALIDATION_STEPS;
+    validate_request_schema_value_inner(
+        schema,
+        value,
+        path,
+        depth,
+        &mut remaining_steps,
+        &BTreeSet::new(),
+    )
+}
+
+const MAX_REQUEST_VALIDATION_STEPS: usize = 65_536;
+const REQUEST_VALIDATION_DEPTH_LIMIT_REASON: &str =
+    "pinned schema exceeds the validation depth limit";
+const REQUEST_VALIDATION_WORK_LIMIT_REASON: &str =
+    "request body exceeds the pinned validation work limit";
+
+fn validate_request_schema_value_inner(
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    depth: usize,
+    remaining_steps: &mut usize,
+    inherited_object_properties: &BTreeSet<String>,
+) -> Result<()> {
     if depth > MAX_REQUEST_VALIDATION_DEPTH {
         return Err(CloudflareError::InvalidRequestBody(
-            "pinned schema exceeds the validation depth limit".to_owned(),
+            REQUEST_VALIDATION_DEPTH_LIMIT_REASON.to_owned(),
         ));
     }
+    let Some(next_steps) = remaining_steps.checked_sub(1) else {
+        return Err(CloudflareError::InvalidRequestBody(
+            REQUEST_VALIDATION_WORK_LIMIT_REASON.to_owned(),
+        ));
+    };
+    *remaining_steps = next_steps;
     if value.is_null()
         && (schema.get("nullable").and_then(Value::as_bool) == Some(true)
             || schema
@@ -1884,16 +1915,194 @@ fn validate_request_schema_value(
         )));
     }
     if let Some(object) = value.as_object() {
-        validate_request_object(schema, object, path, depth)?;
+        let mut allowed_properties = inherited_object_properties.clone();
+        collect_composed_property_names(schema, &mut allowed_properties, 0);
+        validate_request_object(
+            schema,
+            object,
+            path,
+            depth,
+            remaining_steps,
+            &allowed_properties,
+        )?;
     }
     if let Some(array) = value.as_array()
         && let Some(items) = schema.get("items")
     {
         for item in array {
-            validate_request_schema_value(items, item, path, depth + 1)?;
+            validate_request_schema_value_inner(
+                items,
+                item,
+                path,
+                depth + 1,
+                remaining_steps,
+                &BTreeSet::new(),
+            )?;
+        }
+    }
+    validate_schema_composition(
+        schema,
+        value,
+        path,
+        depth,
+        remaining_steps,
+        inherited_object_properties,
+    )?;
+    Ok(())
+}
+
+fn validate_schema_composition(
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    depth: usize,
+    remaining_steps: &mut usize,
+    inherited_object_properties: &BTreeSet<String>,
+) -> Result<()> {
+    let mut direct_properties = inherited_object_properties.clone();
+    direct_properties.extend(
+        schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .map(|(name, _)| name.clone()),
+    );
+
+    if let Some(members) = schema.get("allOf").and_then(Value::as_array) {
+        if members.is_empty() {
+            return invalid_empty_composition(path, "allOf");
+        }
+        let mut sibling_properties = direct_properties.clone();
+        for member in members {
+            collect_composed_property_names(member, &mut sibling_properties, 0);
+        }
+        for member in members {
+            validate_request_schema_value_inner(
+                member,
+                value,
+                path,
+                depth + 1,
+                remaining_steps,
+                &sibling_properties,
+            )?;
+        }
+    }
+
+    if let Some(members) = schema.get("oneOf").and_then(Value::as_array) {
+        if members.is_empty() {
+            return invalid_empty_composition(path, "oneOf");
+        }
+        let mut matches = 0_usize;
+        for member in members {
+            match validate_request_schema_value_inner(
+                member,
+                value,
+                path,
+                depth + 1,
+                remaining_steps,
+                &direct_properties,
+            ) {
+                Ok(()) => matches += 1,
+                Err(error) if validation_error_aborts_composition(&error) => return Err(error),
+                Err(_) => {}
+            }
+        }
+        if matches != 1 {
+            return Err(CloudflareError::InvalidRequestBody(format!(
+                "{} must match exactly one pinned oneOf alternative",
+                request_schema_location(path)
+            )));
+        }
+    }
+
+    if let Some(members) = schema.get("anyOf").and_then(Value::as_array) {
+        if members.is_empty() {
+            return invalid_empty_composition(path, "anyOf");
+        }
+        let mut sibling_properties = direct_properties.clone();
+        for member in members {
+            collect_composed_property_names(member, &mut sibling_properties, 0);
+        }
+        let mut matches = false;
+        for member in members {
+            match validate_request_schema_value_inner(
+                member,
+                value,
+                path,
+                depth + 1,
+                remaining_steps,
+                &sibling_properties,
+            ) {
+                Ok(()) => {
+                    matches = true;
+                    break;
+                }
+                Err(error) if validation_error_aborts_composition(&error) => return Err(error),
+                Err(_) => {}
+            }
+        }
+        if !matches {
+            return Err(CloudflareError::InvalidRequestBody(format!(
+                "{} must match at least one pinned anyOf alternative",
+                request_schema_location(path)
+            )));
         }
     }
     Ok(())
+}
+
+fn validation_error_aborts_composition(error: &CloudflareError) -> bool {
+    matches!(
+        error,
+        CloudflareError::InvalidRequestBody(reason)
+            if reason == REQUEST_VALIDATION_DEPTH_LIMIT_REASON
+                || reason == REQUEST_VALIDATION_WORK_LIMIT_REASON
+                || reason.contains("declares an empty pinned")
+    )
+}
+
+fn collect_composed_property_names(
+    schema: &Value,
+    properties: &mut BTreeSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_REQUEST_VALIDATION_DEPTH {
+        return;
+    }
+    properties.extend(
+        schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .map(|(name, _)| name.clone()),
+    );
+    for composition in ["allOf", "oneOf", "anyOf"] {
+        for member in schema
+            .get(composition)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            collect_composed_property_names(member, properties, depth + 1);
+        }
+    }
+}
+
+fn invalid_empty_composition(path: &str, composition: &str) -> Result<()> {
+    Err(CloudflareError::InvalidRequestBody(format!(
+        "{} declares an empty pinned {composition} contract",
+        request_schema_location(path)
+    )))
+}
+
+fn request_schema_location(path: &str) -> String {
+    if path.is_empty() {
+        "top-level value".to_owned()
+    } else {
+        format!("property `{path}`")
+    }
 }
 
 fn validate_request_object(
@@ -1901,6 +2110,8 @@ fn validate_request_object(
     object: &serde_json::Map<String, Value>,
     path: &str,
     depth: usize,
+    remaining_steps: &mut usize,
+    allowed_properties: &BTreeSet<String>,
 ) -> Result<()> {
     for required in schema
         .get("required")
@@ -1920,11 +2131,13 @@ fn validate_request_object(
     let additional = schema.get("additionalProperties");
     for (name, value) in object {
         if let Some(property) = properties.and_then(|properties| properties.get(name)) {
-            validate_request_schema_value(
+            validate_request_schema_value_inner(
                 property,
                 value,
                 &request_property_path(path, name),
                 depth + 1,
+                remaining_steps,
+                &BTreeSet::new(),
             )?;
             continue;
         }
@@ -1940,9 +2153,18 @@ fn validate_request_object(
                 )));
             }
             Some(additional_schema) if additional_schema.is_object() => {
-                validate_request_schema_value(additional_schema, value, path, depth + 1)?;
+                validate_request_schema_value_inner(
+                    additional_schema,
+                    value,
+                    path,
+                    depth + 1,
+                    remaining_steps,
+                    &BTreeSet::new(),
+                )?;
             }
-            None if properties.is_some_and(|properties| !properties.is_empty()) => {
+            None if properties.is_some_and(|properties| !properties.is_empty())
+                && !allowed_properties.contains(name) =>
+            {
                 let location = if path.is_empty() {
                     "request body"
                 } else {

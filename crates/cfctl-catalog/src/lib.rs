@@ -1739,6 +1739,26 @@ fn normalize_request_schema_contract(
         contract.insert("additionalProperties".to_owned(), additional);
     }
     if depth < MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
+        for composition in ["allOf", "oneOf", "anyOf"] {
+            if let Some(members) = resolved.get(composition).and_then(Value::as_array) {
+                contract.insert(
+                    composition.to_owned(),
+                    Value::Array(
+                        members
+                            .iter()
+                            .map(|member| {
+                                normalize_request_schema_contract(
+                                    document,
+                                    member,
+                                    depth + 1,
+                                    active_references,
+                                )
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+        }
         if let Some(properties) = resolved.get("properties").and_then(Value::as_object) {
             let properties = properties
                 .iter()

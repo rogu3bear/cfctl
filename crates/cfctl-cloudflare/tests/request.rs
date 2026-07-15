@@ -9,7 +9,7 @@ use cfctl_core::{
     DeletedResourceContractV1, PlanStatus, PlanV1, SamePathReadContractV1, SelectorV1,
     UpdatedResourceContractV1,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -260,6 +260,229 @@ fn unchecked_request_validates_nested_array_item_enums() {
         ..CallInput::default()
     };
     assert!(builder.build_unchecked(&capability, &valid).is_ok());
+}
+
+#[test]
+fn unchecked_request_enforces_composed_request_schemas() {
+    let capability = composed_request_capability();
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+
+    for resources in [
+        json!({"com.cloudflare.api.account.a": "*"}),
+        json!({"com.cloudflare.api.account.a": {"com.cloudflare.api.zone.z": "*"}}),
+    ] {
+        let input = CallInput {
+            selectors: json!({"account_id": "a"}),
+            body: Some(json!({
+                "resources": resources,
+                "settings": {"mode": "on", "enabled": true},
+                "signal": "automatic",
+                "placement": {"scope": "account", "before": "rule-a"}
+            })),
+            ..CallInput::default()
+        };
+        assert!(builder.build_unchecked(&capability, &input).is_ok());
+    }
+
+    assert_invalid_composed_bodies(&builder, &capability);
+}
+
+fn composed_request_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "token-create",
+        "Create token",
+        "POST",
+        "/accounts/{account_id}/tokens",
+    );
+    capability.request_schema = Some(json!({
+        "type": "object",
+        "required": ["resources", "settings"],
+        "properties": {
+            "resources": {
+                "oneOf": [
+                    {"type": "object", "additionalProperties": {"type": "string"}},
+                    {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"}
+                        }
+                    }
+                ]
+            },
+            "settings": {
+                "allOf": [
+                    {
+                        "type": "object",
+                        "required": ["mode"],
+                        "properties": {"mode": {"type": "string", "enum": ["on", "off"]}}
+                    },
+                    {
+                        "type": "object",
+                        "required": ["enabled"],
+                        "properties": {"enabled": {"type": "boolean"}}
+                    }
+                ]
+            },
+            "signal": {
+                "anyOf": [
+                    {"type": "string", "enum": ["automatic"]},
+                    {"type": "integer"}
+                ]
+            },
+            "placement": {
+                "type": "object",
+                "required": ["scope"],
+                "properties": {"scope": {"type": "string"}},
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "required": ["before"],
+                        "properties": {"before": {"type": "string"}}
+                    },
+                    {
+                        "type": "object",
+                        "required": ["after"],
+                        "properties": {"after": {"type": "string"}}
+                    }
+                ]
+            }
+        }
+    }));
+    capability
+}
+
+fn assert_invalid_composed_bodies(builder: &RequestBuilder, capability: &CapabilityV1) {
+    for body in [
+        json!({
+            "resources": {},
+            "settings": {"mode": "on", "enabled": true}
+        }),
+        json!({
+            "resources": {"com.cloudflare.api.account.a": 7},
+            "settings": {"mode": "on", "enabled": true}
+        }),
+        json!({
+            "resources": {"com.cloudflare.api.account.a": "*"},
+            "settings": {"mode": "on"}
+        }),
+        json!({
+            "resources": {"com.cloudflare.api.account.a": "*"},
+            "settings": {"mode": "on", "enabled": true, "surprise": true}
+        }),
+        json!({
+            "resources": {"com.cloudflare.api.account.a": "*"},
+            "settings": {"mode": "on", "enabled": true},
+            "signal": false
+        }),
+        json!({
+            "resources": {"com.cloudflare.api.account.a": "*"},
+            "settings": {"mode": "on", "enabled": true},
+            "placement": {
+                "scope": "account",
+                "before": "rule-a",
+                "after": "rule-b"
+            }
+        }),
+        json!({
+            "resources": {"com.cloudflare.api.account.a": "*"},
+            "settings": {"mode": "on", "enabled": true},
+            "placement": {"scope": "account", "before": "rule-a", "unknown": true}
+        }),
+    ] {
+        let error = builder
+            .build_unchecked(
+                capability,
+                &CallInput {
+                    selectors: json!({"account_id": "a"}),
+                    body: Some(body),
+                    ..CallInput::default()
+                },
+            )
+            .expect_err("invalid composed body must fail before network execution");
+        assert!(matches!(error, CloudflareError::InvalidRequestBody(_)));
+    }
+}
+
+#[test]
+fn unchecked_request_honors_explicit_additional_property_denial_in_all_of() {
+    let mut capability = CapabilityV1::new("strict-create", "Create", "POST", "/strict");
+    capability.request_schema = Some(json!({
+        "allOf": [
+            {
+                "type": "object",
+                "properties": {"known": {"type": "string"}},
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {"sibling": {"type": "string"}}
+            }
+        ]
+    }));
+    let error = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build_unchecked(
+            &capability,
+            &CallInput {
+                body: Some(json!({"known": "yes", "sibling": "still disallowed"})),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("explicit additionalProperties false must override inferred sibling fields");
+    assert!(matches!(error, CloudflareError::InvalidRequestBody(_)));
+}
+
+#[test]
+fn unchecked_request_bounds_schema_validation_work() {
+    let mut capability = CapabilityV1::new("bulk-create", "Create", "POST", "/bulk");
+    capability.request_schema = Some(json!({
+        "type": "array",
+        "items": {"type": "string"}
+    }));
+    let error = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build_unchecked(
+            &capability,
+            &CallInput {
+                body: Some(Value::Array((0..65_536).map(|_| json!("item")).collect())),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("unbounded request validation must fail closed");
+    assert!(matches!(
+        error,
+        CloudflareError::InvalidRequestBody(reason)
+            if reason == "request body exceeds the pinned validation work limit"
+    ));
+}
+
+#[test]
+fn unchecked_request_never_treats_one_of_budget_exhaustion_as_a_mismatch() {
+    let mut capability = CapabilityV1::new("ambiguous-create", "Create", "POST", "/ambiguous");
+    capability.request_schema = Some(json!({
+        "oneOf": [
+            {"type": "array", "items": {"type": "string"}},
+            {"type": "array", "items": {"type": "string"}}
+        ]
+    }));
+    let result = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build_unchecked(
+            &capability,
+            &CallInput {
+                body: Some(Value::Array((0..65_533).map(|_| json!("item")).collect())),
+                ..CallInput::default()
+            },
+        );
+    let Err(error) = result else {
+        panic!("an unevaluated oneOf branch must never authorize a request");
+    };
+    assert!(matches!(
+        error,
+        CloudflareError::InvalidRequestBody(reason)
+            if reason == "request body exceeds the pinned validation work limit"
+    ));
 }
 
 #[tokio::test]

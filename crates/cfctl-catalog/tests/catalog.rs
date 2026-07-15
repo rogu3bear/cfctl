@@ -208,6 +208,102 @@ fn recursive_request_schema_contract_stops_at_the_active_reference() {
 }
 
 #[test]
+fn request_contract_preserves_bounded_schema_composition_without_prose() {
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": {"title":"Cloudflare API","version":"4.0.0"},
+        "components": {"schemas": {
+            "StringResources": {
+                "type": "object",
+                "description": "flat resource map",
+                "additionalProperties": {"type": "string", "description": "resource selector"}
+            },
+            "NestedResources": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
+                }
+            },
+            "Resources": {
+                "oneOf": [
+                    {"$ref": "#/components/schemas/StringResources"},
+                    {"$ref": "#/components/schemas/NestedResources"}
+                ]
+            },
+            "BaseSettings": {
+                "type": "object",
+                "required": ["mode"],
+                "properties": {"mode": {"type": "string", "enum": ["on", "off"]}}
+            },
+            "Settings": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/BaseSettings"},
+                    {
+                        "type": "object",
+                        "required": ["enabled"],
+                        "properties": {"enabled": {"type": "boolean"}}
+                    }
+                ]
+            },
+            "CreateToken": {
+                "type": "object",
+                "required": ["resources", "settings"],
+                "properties": {
+                    "resources": {"$ref": "#/components/schemas/Resources"},
+                    "settings": {"$ref": "#/components/schemas/Settings"},
+                    "signal": {
+                        "anyOf": [
+                            {"type": "string", "enum": ["automatic"]},
+                            {"type": "integer"}
+                        ]
+                    }
+                }
+            }
+        }},
+        "paths": {"/accounts/{account_id}/tokens": {"post": {
+            "operationId": "account-api-tokens-create-token",
+            "summary": "Create token",
+            "tags": ["API Tokens"],
+            "requestBody": {"required": true, "content": {"application/json": {"schema": {
+                "$ref": "#/components/schemas/CreateToken"
+            }}}}
+        }}}
+    });
+    let snapshot = normalize_openapi(&document).expect("composed catalog");
+    let schema = snapshot
+        .get("account-api-tokens-create-token")
+        .and_then(|capability| capability.request_schema.as_ref())
+        .expect("composed request contract");
+
+    assert_eq!(
+        schema["properties"]["resources"]["oneOf"][0],
+        json!({"type": "object", "additionalProperties": {"type": "string"}})
+    );
+    assert_eq!(
+        schema["properties"]["resources"]["oneOf"][1]["additionalProperties"]["additionalProperties"]
+            ["type"],
+        "string"
+    );
+    assert_eq!(
+        schema["properties"]["settings"]["allOf"][0]["required"],
+        json!(["mode"])
+    );
+    assert_eq!(
+        schema["properties"]["settings"]["allOf"][1]["properties"]["enabled"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        schema["properties"]["signal"]["anyOf"][0]["enum"],
+        json!(["automatic"])
+    );
+    assert!(
+        !schema.to_string().contains("description"),
+        "descriptive source prose must not enter the pinned request contract"
+    );
+}
+
+#[test]
 fn selector_types_follow_homogeneous_enums_without_guessing_mixed_values() {
     let mut document = fixture();
     let parameters = document["paths"]["/zones/{zone_id}/dns_records"]["get"]["parameters"]
