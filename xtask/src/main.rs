@@ -341,6 +341,45 @@ fn verify_v1_cutover_contract() -> Result<(), TaskError> {
             "v1 parity audit does not bind the reviewed 147-path archive".to_owned(),
         ));
     }
+    verify_active_guidance_has_no_v1_commands()
+}
+
+fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| {
+            TaskError::InvalidSourceContract("xtask has no repository parent".to_owned())
+        })?;
+    let active_guidance = [
+        "CONTRIBUTING.md",
+        "SECURITY.md",
+        "skills/cfctl-operator/SKILL.md",
+    ];
+    let stale_v1_guidance = [
+        "./scripts/",
+        "--ack-plan",
+        "CF_DEV_TOKEN",
+        "cfctl surfaces",
+        "cfctl ownership",
+        "cfctl skills",
+        "cloudflare-api-mcp",
+        "lib/runtime/",
+        "lib/backends/",
+        "`commands/` owns",
+        "`commands/` contains",
+    ];
+    for path in active_guidance {
+        let absolute_path = repository_root.join(path);
+        let content = fs::read_to_string(&absolute_path)
+            .map_err(|source| io_error(&absolute_path, source))?;
+        for phrase in stale_v1_guidance {
+            if content.contains(phrase) {
+                return Err(TaskError::InvalidSourceContract(format!(
+                    "{path} still teaches archived v1 guidance `{phrase}`"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1646,6 +1685,7 @@ mod tests {
         release_build_subcommand, release_tag_is_exact_version, render_linux_installer_text,
         security_proof_commands, validate_codesign_details, validate_notary_receipt_value,
         validate_signed_release_file_set, validated_release_targets,
+        verify_active_guidance_has_no_v1_commands,
     };
 
     #[test]
@@ -1660,6 +1700,12 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn active_guidance_does_not_reteach_archived_v1_commands() {
+        let result = verify_active_guidance_has_no_v1_commands();
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]

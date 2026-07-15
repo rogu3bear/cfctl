@@ -1,78 +1,79 @@
 ---
 name: cfctl-operator
-description: Operate, extend, or diagnose Cloudflare through this repository's governed cfctl runtime. Use for Cloudflare account reads, API discovery, Workers and Wrangler work, tunnels, dashboard-only tasks, desired state, deployment, incident response, or any task that may need Browser Run or Computer Use as a fallback. Produces a scored SKILL_CHOICE before selecting an execution adapter and records evidence-backed outcome metrics afterward.
+description: Operate, extend, or diagnose Cloudflare through the governed Rust cfctl runtime. Use for capability discovery, live account reads, mutation planning, token lifecycle, workspace and IaC impact, Wrangler or cloudflared delegation, and governed UI handoffs.
 ---
 
-# cfctl Operator
+# cfctl operator
 
-Use `cfctl` as the authority-preserving command bus. Select the best execution adapter from current requirements, execute only within its existing authority, verify the result, and record the outcome.
+Use `cfctl` as the only public Cloudflare control plane. The catalog selects an
+implemented adapter; model output never grants authority or directly mutates
+Cloudflare.
 
 ## Workflow
 
-1. Read the repository `AGENTS.md` and use the local `./cfctl` when `cfctl` on `PATH` is unavailable.
-2. Run `cfctl doctor` when the task depends on live account trust, authentication, previews, locks, or artifact health.
-3. Express the task as a non-secret, bounded intent. Never put credentials, private payloads, or personal data in `--intent` or command arguments.
-4. Classify risk as `read`, `write`, `destructive`, `secret_sensitive`, `external_communication`, or `spend`.
-5. Add concrete capabilities with repeatable `--need` flags. Inspect available names with `cfctl skills list`.
-6. Declare an adapter with `--available <adapter>` only when its tool is actually callable in the active session.
-7. Run `cfctl skills choose` and inspect the emitted `SKILL_CHOICE` receipt:
+1. Read the repository `AGENTS.md`. Use local `./cfctl` if `cfctl` is absent
+   from `PATH`.
+2. Orient and refresh current official capability data:
 
-```bash
-cfctl skills choose \
-  --intent "Inspect a live Worker configuration and verify it" \
-  --risk read \
-  --need live_read \
-  --need verification
-```
+   ```bash
+   cfctl doctor
+   cfctl catalog sync
+   cfctl catalog coverage
+   ```
 
-8. Stop if `decision.status` is `blocked`. Satisfy the stated availability requirement or extend the runtime; do not silently choose an ungoverned path.
-9. Execute through the selected adapter using the rules below.
-10. Record `verified`, `failed`, `fallback`, or `abandoned` against the choice. A `verified` outcome requires an existing evidence path:
+3. Discover and inspect the capability before acting:
 
-```bash
-cfctl skills record \
-  --choice-id <choice-id> \
-  --adapter <adapter-id> \
-  --outcome verified \
-  --duration-ms <milliseconds> \
-  --evidence <artifact-path> \
-  --evidence-class post_change_verification
-```
+   ```bash
+   cfctl catalog search "<bounded non-secret intent>"
+   cfctl catalog show <capability-id>
+   cfctl guide <capability-id>
+   ```
 
-11. Use `cfctl skills metrics` to inspect observed outcomes. Treat null rates as no evidence, not zero performance.
+4. Use `cfctl call` for live reads. Cite the resulting live Cloudflare read;
+   repository configuration is only source evidence.
+5. Register repository boundaries explicitly before workspace analysis. Use
+   `workspace discover`, `graph`, and `audit`; never scan arbitrary roots.
+6. A mutating call creates a plan rather than changing Cloudflare. Review its
+   operation ID, selected account, exact targets, Cloudflare and local diffs,
+   permission lane, entitlement, cost, verification, compensation, and
+   warnings.
+7. If approval is required, translate explicit operator consent only into:
 
-## Adapter Rules
+   ```bash
+   cfctl plans approve <operation-id> --yes
+   ```
 
-### cfctl-native
+   Paid plans also require the reviewed `--max-cost CURRENCY:AMOUNT`. Unknown
+   or unbounded cost stays blocked.
+8. Execute only with `cfctl plans run <operation-id>`, then inspect `plans
+   status`. Use `plans rectify` after uncertain boundary crossing or unsupported
+   verification; never replay a consumed plan.
+9. Report source config, live read, preview, apply, post-change verification,
+   local proof, and agent action as distinct evidence classes.
 
-Use for catalogued control-plane reads and writes, standards, desired state, token lifecycle, incidents, and verification. Read current state first. For writes, run `classify`, `guide`, and `apply ... --plan`; review the receipt; apply only with the matching `--ack-plan`; then run `verify`.
+## Adapter rules
 
-### cloudflare-api-mcp
+- `native`: operation-specific cfctl behavior, including inventory-bound token
+  mint, rotation, revocation, and sink-only credential handling.
+- `dynamic_api`: schema-validated Cloudflare HTTP execution selected from the
+  pinned catalog.
+- `delegated_cli`: governed Wrangler or cloudflared subprocess with a cleared
+  environment, one selected credential, timeout, redaction, and receipt.
+- `governed_ui`: target-bound `AgentActionV1` only after API and CLI
+  insufficiency is established. It is a handoff, not approval or completion.
+- `blocked`: discovery only. Satisfy the named contract gap or extend cfctl;
+  never route around it.
 
-Use official Cloudflare API MCP discovery for uncatalogued endpoints and current schemas. It expands endpoint coverage but does not expand authority. Read-only discovery and live reads may execute directly when allowed. Do not perform a mutation until cfctl has an operation-specific preview, acknowledgement, redaction, and verification contract; extend the public runtime when that contract is absent.
+## Trust invariants
 
-### cfctl-wrangler
-
-Use `cfctl wrangler ...` for Worker and developer-platform operations. Read-only subcommands run in the wrapper envelope. Mutating subcommands require its plan and acknowledgement flow.
-
-### cfctl-cloudflared
-
-Use `cfctl cloudflared ...` for tunnel runtime, connectivity, and local ingress. Do not treat cloudflared output as complete account inventory.
-
-### browser-run
-
-Prefer a purpose-built browser tool for rendered pages, browser sessions, or web UI state. Keep the scope bounded. Cloudflare mutations remain subject to cfctl preview and verification; external communications and spend require the applicable confirmation policy.
-
-### Computer Use
-
-Use Computer Use only when a purpose-built API, connector, CLI, or browser tool is unavailable or insufficient and the active signed-in UI can unblock the task. Confirm the selected window or page and capture before/after state. Computer Use never bypasses cfctl mutation previews, destructive confirmation, external side-effect confirmation, secret handling, or post-change verification. If the UI is the only mutation surface and no cfctl preview contract exists, stop and extend cfctl before changing state.
-
-## Trust Invariants
-
-- A `SKILL_CHOICE` recommends an adapter; it grants no authority.
-- Declared policy metrics rank candidates. They are not success evidence.
-- Observed metrics come only from one persisted `SKILL_OUTCOME` per choice. Verified outcomes require separate, content-hashed evidence; the choice receipt cannot prove itself.
-- Raw intent is not persisted; the receipt stores its SHA-256 digest and length.
-- Agent memory, prose, and screenshots alone do not prove live Cloudflare state.
-- Source-config proof, live read proof, preview proof, apply proof, and post-change verification remain distinct.
-- Never mark a task verified without an evidence path that supports the claim.
+- Profiles and workspaces pin one account; ambiguity fails closed.
+- Secrets enter through stdin or the platform secret store. Secret-producing
+  calls require a new `--value-out` destination.
+- Mutation contracts must know risk, effect, cost, permissions, entitlement,
+  verification, and rollback or irreversibility.
+- Deletes, purges, identity/security/ownership changes, external sends,
+  registrar/billing actions, irreversible data changes, cross-repository
+  changes, unknown-risk work, and paid actions always require explicit
+  approval.
+- A plan, handoff, screenshot, or evidence file is not post-change
+  verification merely because it exists.
