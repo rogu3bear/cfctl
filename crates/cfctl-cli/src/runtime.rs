@@ -19,8 +19,8 @@ use cfctl_auth::{
     revoke_oauth_token,
 };
 use cfctl_catalog::{
-    CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1, fetch_official, fetch_official_text_feeds,
-    ingest_cli_help, ingest_governed_ui_capabilities,
+    CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1, attach_official_product_knowledge,
+    fetch_official, fetch_official_text_feeds, ingest_cli_help, ingest_governed_ui_capabilities,
 };
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, Executor, OperationVerificationV1,
@@ -430,6 +430,7 @@ async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2> {
     let client = http_client()?;
     let (mut catalog, feeds) =
         tokio::try_join!(fetch_official(&client), fetch_official_text_feeds(&client))?;
+    attach_official_product_knowledge(&mut catalog, &feeds)?;
     for (program, version_argument) in [("wrangler", "--version"), ("cloudflared", "version")] {
         if which::which(program).is_ok() {
             let help = std::process::Command::new(program)
@@ -449,6 +450,7 @@ async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2> {
         }
     }
     ingest_governed_ui_capabilities(&mut catalog);
+    catalog.refresh_hash()?;
     let oauth_scope_status = match refresh_oauth_scopes_if_authenticated(store).await {
         Ok(Some(snapshot)) => json!({
             "status": "refreshed",

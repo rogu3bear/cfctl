@@ -7,7 +7,8 @@ use std::{
 };
 
 use cfctl_core::{
-    AdapterStatus, CapabilityV1, EffectClass, Maturity, RiskClass, SelectorV1, hash_value,
+    AdapterStatus, BillingModelV1, CapabilityV1, CostExposureV1, EffectClass, KnowledgeReferenceV1,
+    Maturity, RiskClass, SelectorV1, hash_value,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -49,11 +50,18 @@ pub struct CatalogSnapshot {
     pub schema_version: u8,
     pub generated_at: DateTime<Utc>,
     pub source_url: String,
+    #[serde(default)]
+    pub source_hash: String,
     pub schema_hash: String,
     pub capabilities: BTreeMap<String, CapabilityV1>,
 }
 
 impl CatalogSnapshot {
+    pub fn refresh_hash(&mut self) -> Result<()> {
+        self.schema_hash = hash_value(&serde_json::to_value(&self.capabilities)?)?;
+        Ok(())
+    }
+
     #[must_use]
     pub fn get(&self, id: &str) -> Option<&CapabilityV1> {
         self.capabilities.get(id)
@@ -115,6 +123,10 @@ impl CatalogSnapshot {
         let mut sources = BTreeMap::new();
         let mut mutating = 0;
         let mut blocked = 0;
+        let mut entitlement_metadata = 0;
+        let mut plan_gated = 0;
+        let mut cost_references = 0;
+        let mut complete_mutation_contracts = 0;
         for capability in self.capabilities.values() {
             *adapter_statuses
                 .entry(adapter_status_name(capability.adapter_status).to_owned())
@@ -131,6 +143,17 @@ impl CatalogSnapshot {
             *sources.entry(source.to_owned()).or_insert(0) += 1;
             mutating += usize::from(capability.mutating);
             blocked += usize::from(capability.adapter_status == AdapterStatus::Blocked);
+            entitlement_metadata += usize::from(!capability.entitlement.plans.is_empty());
+            plan_gated += usize::from(
+                capability
+                    .entitlement
+                    .plans
+                    .values()
+                    .any(|available| !available),
+            );
+            cost_references += usize::from(!capability.cost.references.is_empty());
+            complete_mutation_contracts +=
+                usize::from(capability.mutating && capability.mutation_contract_gaps().is_empty());
         }
         CatalogCoverageV1 {
             schema_hash: self.schema_hash.clone(),
@@ -138,6 +161,10 @@ impl CatalogSnapshot {
             reads: self.capabilities.len().saturating_sub(mutating),
             mutating,
             blocked,
+            entitlement_metadata,
+            plan_gated,
+            cost_references,
+            complete_mutation_contracts,
             adapter_statuses,
             sources,
         }
@@ -164,6 +191,10 @@ pub struct CatalogCoverageV1 {
     pub reads: usize,
     pub mutating: usize,
     pub blocked: usize,
+    pub entitlement_metadata: usize,
+    pub plan_gated: usize,
+    pub cost_references: usize,
+    pub complete_mutation_contracts: usize,
     pub adapter_statuses: BTreeMap<String, usize>,
     pub sources: BTreeMap<String, usize>,
 }
@@ -267,6 +298,252 @@ pub struct OfficialTextFeedsV1 {
     pub unread_product_indexes: BTreeMap<String, String>,
     pub changelog_url: String,
     pub changelog: String,
+}
+
+/// Attaches cost and entitlement knowledge from the official Cloudflare
+/// product indexes without converting variable downstream pricing into a
+/// fictitious executable cost ceiling.
+pub fn attach_official_product_knowledge(
+    snapshot: &mut CatalogSnapshot,
+    feeds: &OfficialTextFeedsV1,
+) -> Result<()> {
+    let pricing = official_pricing_references(feeds);
+    for capability in snapshot.capabilities.values_mut() {
+        if !capability.entitlement.plans.is_empty() {
+            capability.entitlement.source =
+                Some("official OpenAPI x-cfPlanAvailability".to_owned());
+            capability.entitlement.requires_live_resolution = capability
+                .entitlement
+                .plans
+                .values()
+                .any(|available| !available);
+        }
+
+        let mut matches: Vec<_> = pricing
+            .iter()
+            .filter(|entry| pricing_product_matches(capability, entry))
+            .collect();
+        let most_specific = matches
+            .iter()
+            .map(|entry| entry.product_terms.len())
+            .max()
+            .unwrap_or_default();
+        matches.retain(|entry| entry.product_terms.len() == most_specific);
+        for entry in matches {
+            if capability
+                .cost
+                .references
+                .iter()
+                .any(|reference| reference.url == entry.reference.url)
+            {
+                continue;
+            }
+            capability.cost.references.push(entry.reference.clone());
+            capability.cost.billing_model =
+                merge_billing_model(capability.cost.billing_model, entry.billing_model);
+        }
+        capability
+            .cost
+            .references
+            .sort_by(|left, right| left.url.cmp(&right.url));
+        if !capability.cost.references.is_empty() {
+            capability.cost.exposure = if capability.cost.billing_model == BillingModelV1::Contract
+            {
+                CostExposureV1::AccountQuote
+            } else {
+                CostExposureV1::DownstreamUsage
+            };
+            if capability.mutating && !capability.cost.known {
+                capability.cost.basis = Some(
+                    "official product pricing is linked, but the mutation does not declare a hard ceiling for downstream resource or usage charges"
+                        .to_owned(),
+                );
+            }
+        }
+        refresh_incomplete_contract_reason(capability);
+    }
+    snapshot.refresh_hash()
+}
+
+#[derive(Debug)]
+struct ProductPricingReference {
+    product_slug: String,
+    product_terms: BTreeSet<String>,
+    billing_model: BillingModelV1,
+    reference: KnowledgeReferenceV1,
+}
+
+fn official_pricing_references(feeds: &OfficialTextFeedsV1) -> Vec<ProductPricingReference> {
+    let mut references = Vec::new();
+    for (index_url, index) in &feeds.product_indexes {
+        let Some(product_slug) = index_url
+            .strip_prefix("https://developers.cloudflare.com/")
+            .and_then(|path| path.strip_suffix("/llms.txt"))
+        else {
+            continue;
+        };
+        let product_terms = product_terms(product_slug);
+        if product_terms.is_empty() {
+            continue;
+        }
+        for line in index.lines().filter(|line| {
+            line.to_ascii_lowercase().contains("pricing") && markdown_link(line).is_some()
+        }) {
+            let Some(url) = markdown_link(line) else {
+                continue;
+            };
+            references.push(ProductPricingReference {
+                product_slug: product_slug.to_owned(),
+                product_terms: product_terms.clone(),
+                billing_model: billing_model_from_pricing_line(line),
+                reference: KnowledgeReferenceV1 {
+                    title: markdown_title(line).unwrap_or("Pricing").to_owned(),
+                    url: url.to_owned(),
+                    source: index_url.clone(),
+                },
+            });
+        }
+    }
+    references
+}
+
+fn product_terms(product_slug: &str) -> BTreeSet<String> {
+    match product_slug {
+        "analytics" => ["analytics", "engine"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        "cloudflare-for-platforms" => ["workers", "platforms"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        _ => normalized_tokens(product_slug)
+            .into_iter()
+            .filter(|term| !matches!(term.as_str(), "cloudflare" | "for" | "the" | "api"))
+            .collect(),
+    }
+}
+
+fn pricing_product_matches(capability: &CapabilityV1, entry: &ProductPricingReference) -> bool {
+    let product = capability.product.to_ascii_lowercase();
+    let path_root = first_resource_segment(&capability.path);
+    match entry.product_slug.as_str() {
+        "ai-search" => return product.starts_with("ai search") || product.starts_with("autorag"),
+        "workers-ai" => return product.starts_with("workers ai"),
+        "ai-gateway" => return product.starts_with("ai gateway"),
+        "cloudflare-for-platforms" => return product.starts_with("workers for platforms"),
+        "workers-vpc" => return product == "connectivity services",
+        "durable-objects" => return product.starts_with("durable objects"),
+        "log-explorer" => return product.starts_with("log explorer"),
+        "images" => return product.starts_with("cloudflare images"),
+        "kv" => return normalized_tokens(&product).contains("kv"),
+        "pipelines" => return product.contains("pipeline"),
+        "pages" => {
+            return product.starts_with("pages ") || path_root.is_some_and(|root| root == "pages");
+        }
+        _ => {}
+    }
+
+    let mut product_root_tokens = normalized_tokens(&product);
+    if let Some(root) = path_root {
+        product_root_tokens.extend(normalized_tokens(root));
+    }
+    if entry.product_terms.len() > 1 {
+        return entry
+            .product_terms
+            .iter()
+            .all(|term| product_root_tokens.contains(term));
+    }
+    let Some(term) = entry.product_terms.first() else {
+        return false;
+    };
+    let product_tokens = normalized_token_sequence(&capability.product);
+    product_tokens
+        .first()
+        .is_some_and(|first| token_stem_matches(first, term))
+        || path_root.is_some_and(|root| {
+            normalized_token_sequence(root)
+                .first()
+                .is_some_and(|first| token_stem_matches(first, term))
+        })
+}
+
+fn normalized_token_sequence(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn first_resource_segment(path: &str) -> Option<&str> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .find(|segment| {
+            !matches!(*segment, "accounts" | "zones" | "user") && !segment.starts_with('{')
+        })
+}
+
+fn token_stem_matches(left: &str, right: &str) -> bool {
+    left == right || left.trim_end_matches('s') == right.trim_end_matches('s')
+}
+
+fn normalized_tokens(value: &str) -> BTreeSet<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn markdown_title(line: &str) -> Option<&str> {
+    let start = line.find('[')? + 1;
+    let remainder = line.get(start..)?;
+    remainder.get(..remainder.find(']')?)
+}
+
+fn billing_model_from_pricing_line(line: &str) -> BillingModelV1 {
+    let line = line.to_ascii_lowercase();
+    if line.contains("pass through") || line.contains("pass-through") {
+        BillingModelV1::PassThrough
+    } else if [
+        "usage",
+        "request",
+        "storage",
+        "cpu",
+        "operation",
+        "token",
+        "minute",
+        "data",
+        "dimension",
+        "overage",
+        "inference",
+        "vCPU",
+    ]
+    .iter()
+    .any(|term| line.contains(&term.to_ascii_lowercase()))
+    {
+        BillingModelV1::UsageBased
+    } else if line.contains("contract") || line.contains("account team") {
+        BillingModelV1::Contract
+    } else if line.contains("plan") || line.contains("subscription") {
+        BillingModelV1::Subscription
+    } else {
+        BillingModelV1::Unknown
+    }
+}
+
+fn merge_billing_model(left: BillingModelV1, right: BillingModelV1) -> BillingModelV1 {
+    use BillingModelV1::{Contract, Fixed, None, PassThrough, Subscription, Unknown, UsageBased};
+    match (left, right) {
+        (Contract, _) | (_, Contract) => Contract,
+        (PassThrough, _) | (_, PassThrough) => PassThrough,
+        (UsageBased, _) | (_, UsageBased) => UsageBased,
+        (Subscription, _) | (_, Subscription) => Subscription,
+        (Fixed, _) | (_, Fixed) => Fixed,
+        (None, None) => None,
+        _ => Unknown,
+    }
 }
 
 pub async fn fetch_official_text_feeds(client: &reqwest::Client) -> Result<OfficialTextFeedsV1> {
@@ -556,13 +833,17 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
         }
     }
 
-    Ok(CatalogSnapshot {
+    let source_hash = hash_value(document)?;
+    let mut snapshot = CatalogSnapshot {
         schema_version: 1,
         generated_at: Utc::now(),
         source_url: OFFICIAL_OPENAPI_URL.to_owned(),
-        schema_hash: hash_value(document)?,
+        source_hash,
+        schema_hash: String::new(),
         capabilities,
-    })
+    };
+    snapshot.refresh_hash()?;
+    Ok(snapshot)
 }
 
 pub async fn fetch_official(client: &reqwest::Client) -> Result<CatalogSnapshot> {
@@ -836,8 +1117,23 @@ fn block_incomplete_dynamic_mutation(capability: &mut CapabilityV1) {
     if capability.adapter_status != AdapterStatus::DynamicApi || !capability.mutating {
         return;
     }
+    refresh_incomplete_contract_reason(capability);
+}
+
+fn refresh_incomplete_contract_reason(capability: &mut CapabilityV1) {
+    let is_incomplete_dynamic = capability.adapter_status == AdapterStatus::DynamicApi
+        || (capability.adapter_status == AdapterStatus::Blocked
+            && capability
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("operation contract incomplete:")));
+    if !is_incomplete_dynamic || !capability.mutating {
+        return;
+    }
     let gaps = capability.mutation_contract_gaps();
     if gaps.is_empty() {
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
         return;
     }
     capability.adapter_status = AdapterStatus::Blocked;

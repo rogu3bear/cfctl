@@ -49,9 +49,9 @@ retry.
 ## Trust sequence
 
 1. Pin profile and account.
-2. Pin the exact catalog schema hash.
+2. Pin the derived executable-catalog hash while retaining the upstream OpenAPI source hash separately.
 3. Read registered workspace impact.
-4. Bind the request, permission lane, workspace graph, source-config hashes, cost metadata, and exact plan content hash.
+4. Bind the request, permission lane, workspace graph, source-config hashes, official pricing references, cost metadata, and exact plan content hash.
 5. Apply policy and, when required, approve that operation ID.
 6. Acquire the local operation lock.
 7. Recheck drift, append the consumption checkpoint, and durably consume the plan.

@@ -1,10 +1,12 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use cfctl_catalog::{
-    CatalogChangeKind, CatalogIndex, CatalogSnapshot, ingest_cli_help, markdown_link,
-    markdown_links, normalize_openapi,
+    CatalogChangeKind, CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1,
+    attach_official_product_knowledge, ingest_cli_help, markdown_link, markdown_links,
+    normalize_openapi,
 };
-use cfctl_core::{AdapterStatus, EffectClass, RiskClass};
+use cfctl_core::{AdapterStatus, BillingModelV1, CostExposureV1, EffectClass, RiskClass};
+use chrono::Utc;
 use serde_json::json;
 
 fn fixture() -> serde_json::Value {
@@ -277,4 +279,138 @@ fn account_token_mutations_have_complete_native_execution_contracts() {
             .as_deref()
             .is_some_and(|warning| warning.contains("old token value"))
     );
+}
+
+fn pricing_feeds_fixture() -> OfficialTextFeedsV1 {
+    OfficialTextFeedsV1 {
+        fetched_at: Utc::now(),
+        docs_index_url: "https://developers.cloudflare.com/llms.txt".to_owned(),
+        docs_index: String::new(),
+        product_indexes: [
+            (
+                "https://developers.cloudflare.com/d1/llms.txt".to_owned(),
+                "- [Pricing](https://developers.cloudflare.com/d1/platform/pricing/index.md): D1 pricing based on rows read, rows written, and storage with scale-to-zero billing."
+                    .to_owned(),
+            ),
+            (
+                "https://developers.cloudflare.com/pages/llms.txt".to_owned(),
+                "- [Pricing](https://developers.cloudflare.com/pages/functions/pricing/index.md): Pages Functions requests are billed as Workers requests."
+                    .to_owned(),
+            ),
+            (
+                "https://developers.cloudflare.com/realtime/llms.txt".to_owned(),
+                "- [Pricing](https://developers.cloudflare.com/realtime/sfu/pricing/index.md): Realtime SFU pricing."
+                    .to_owned(),
+            ),
+            (
+                "https://developers.cloudflare.com/workers-ai/llms.txt".to_owned(),
+                "- [Pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/index.md): Workers AI pricing is based on Neurons."
+                    .to_owned(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        unread_product_indexes: std::collections::BTreeMap::default(),
+        changelog_url: "https://developers.cloudflare.com/changelog/".to_owned(),
+        changelog: String::new(),
+    }
+}
+
+#[test]
+fn official_product_indexes_attach_pricing_without_claiming_a_bounded_cost() {
+    let mut document = fixture();
+    document["paths"]["/accounts/{account_id}/d1/database"]["post"] = json!({
+        "operationId":"d1-database-create",
+        "summary":"Create D1 database",
+        "tags":["D1 Database"],
+        "x-api-token-group":["D1 Write"],
+        "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true}
+    });
+    document["paths"]["/accounts/{account_id}/access/custom_pages"]["post"] = json!({
+        "operationId":"access-custom-pages-create-a-custom-page",
+        "summary":"Create a custom page",
+        "tags":["Access custom pages"],
+        "x-api-token-group":["Access Apps and Policies Write"]
+    });
+    document["paths"]["/radar/bgp/routes/realtime"]["get"] = json!({
+        "operationId":"radar-get-bgp-routes-realtime",
+        "summary":"Get real-time BGP routes for a prefix",
+        "tags":["Radar BGP"]
+    });
+    document["paths"]["/radar/ai/inference/summary/model"]["get"] = json!({
+        "operationId":"radar-get-ai-inference-summary-by-model",
+        "summary":"Get Workers AI models summary",
+        "tags":["Radar AI Inference"]
+    });
+    let mut snapshot = normalize_openapi(&document).expect("catalog");
+
+    attach_official_product_knowledge(&mut snapshot, &pricing_feeds_fixture())
+        .expect("knowledge attaches");
+
+    let capability = snapshot.get("d1-database-create").expect("D1 create");
+    assert_eq!(capability.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(capability.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert!(!capability.cost.known);
+    assert_eq!(capability.cost.references.len(), 1);
+    assert_eq!(
+        capability.cost.references[0].url,
+        "https://developers.cloudflare.com/d1/platform/pricing/index.md"
+    );
+    assert_eq!(
+        capability.entitlement.source.as_deref(),
+        Some("official OpenAPI x-cfPlanAvailability")
+    );
+    assert!(
+        snapshot
+            .get("access-custom-pages-create-a-custom-page")
+            .expect("Access custom page")
+            .cost
+            .references
+            .is_empty()
+    );
+    assert!(
+        snapshot
+            .get("radar-get-bgp-routes-realtime")
+            .expect("Radar realtime")
+            .cost
+            .references
+            .is_empty()
+    );
+    assert!(
+        snapshot
+            .get("radar-get-ai-inference-summary-by-model")
+            .expect("Radar AI inference")
+            .cost
+            .references
+            .is_empty()
+    );
+    assert!(
+        capability
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("official pricing reference"))
+    );
+    let coverage = snapshot.coverage();
+    assert_eq!(coverage.entitlement_metadata, 2);
+    assert_eq!(coverage.plan_gated, 0);
+    assert_eq!(coverage.cost_references, 1);
+    assert_eq!(coverage.complete_mutation_contracts, 0);
+}
+
+#[test]
+fn executable_catalog_hash_changes_when_a_local_contract_changes() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    let source_hash = snapshot.source_hash.clone();
+    let original_catalog_hash = snapshot.schema_hash.clone();
+    snapshot
+        .capabilities
+        .get_mut("dns-records-delete")
+        .expect("delete")
+        .rollback
+        .warning = Some("deletion is irreversible".to_owned());
+
+    snapshot.refresh_hash().expect("hash refreshes");
+
+    assert_eq!(snapshot.source_hash, source_hash);
+    assert_ne!(snapshot.schema_hash, original_catalog_hash);
 }

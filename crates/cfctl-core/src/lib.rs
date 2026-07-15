@@ -105,6 +105,35 @@ pub struct SelectorV1 {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingModelV1 {
+    None,
+    Fixed,
+    UsageBased,
+    Subscription,
+    PassThrough,
+    Contract,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostExposureV1 {
+    #[default]
+    None,
+    DownstreamUsage,
+    AccountQuote,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeReferenceV1 {
+    pub title: String,
+    pub url: String,
+    pub source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CostV1 {
     pub incremental: bool,
@@ -112,6 +141,12 @@ pub struct CostV1 {
     pub maximum: Option<f64>,
     pub basis: Option<String>,
     pub known: bool,
+    #[serde(default)]
+    pub billing_model: BillingModelV1,
+    #[serde(default)]
+    pub exposure: CostExposureV1,
+    #[serde(default)]
+    pub references: Vec<KnowledgeReferenceV1>,
 }
 
 impl Default for CostV1 {
@@ -122,6 +157,9 @@ impl Default for CostV1 {
             maximum: Some(0.0),
             basis: Some("no incremental cost metadata declared".to_owned()),
             known: true,
+            billing_model: BillingModelV1::None,
+            exposure: CostExposureV1::None,
+            references: Vec::new(),
         }
     }
 }
@@ -131,6 +169,12 @@ pub struct EntitlementV1 {
     pub available: Option<bool>,
     pub plans: BTreeMap<String, bool>,
     pub blocker: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub requires_live_resolution: bool,
+    #[serde(default)]
+    pub observed_plan: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +230,9 @@ impl CapabilityV1 {
                 maximum: None,
                 basis: Some("official API schema does not declare operation pricing".to_owned()),
                 known: false,
+                billing_model: BillingModelV1::Unknown,
+                exposure: CostExposureV1::None,
+                references: Vec::new(),
             }
         };
         Self {
@@ -254,7 +301,19 @@ impl CapabilityV1 {
             gaps.push("operation-specific effect classification is missing".to_owned());
         }
         if !self.cost.known {
-            gaps.push("operation-specific incremental cost is unknown".to_owned());
+            if self.cost.references.is_empty() {
+                gaps.push("operation-specific incremental cost is unknown".to_owned());
+            } else {
+                gaps.push(format!(
+                    "operation-specific cost is not bounded; review official pricing reference(s): {}",
+                    self.cost
+                        .references
+                        .iter()
+                        .map(|reference| reference.url.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
         }
         if self.verification.required
             && matches!(

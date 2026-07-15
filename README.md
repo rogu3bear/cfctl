@@ -31,6 +31,12 @@ data, AI, Browser Run, email, media, networking, security, registrar, billing,
 analytics, and paid/enterprise features. “Universal” means honest discovery
 and classification; entitlement, missing permission, unavailable adapters,
 unknown cost, and unsupported verification remain visible blockers.
+Catalog sync also joins official product pricing indexes to matching
+capabilities. Those references identify usage, subscription, pass-through, or
+contract exposure without pretending a variable downstream bill is a hard
+execution ceiling. `catalog coverage` reports entitlement metadata, plan-gated
+operations, pricing-reference coverage, and complete mutation contracts
+separately.
 
 ## Public commands
 
@@ -110,9 +116,10 @@ Known, scoped, reversible, isolated operations may be policy-authorized to run
 without a separate approval. Deletes, purges, identity/security/ownership
 changes, external sends, registrar/billing actions, irreversible data changes,
 unknown semantics, cross-repository impact, and paid actions require approval.
-Paid plans also require `--max-cost CURRENCY:AMOUNT`; unknown cost is blocked.
+Paid plans also require `--max-cost CURRENCY:AMOUNT`; unknown or unbounded
+downstream cost is blocked even when an official pricing page is available.
 
-Plans bind the catalog schema, account, permission lane, exact request,
+Plans bind the derived executable-catalog hash, account, permission lane, exact request,
 workspace graph, source configuration, impact, costs, verification,
 compensation, and warnings. They expire within 24 hours. Drift invalidates
 approval. A hash-chained transaction journal persists the reviewed plan,
@@ -123,7 +130,10 @@ Generated write capabilities stay blocked until risk and effect are classified,
 incremental cost and plan entitlement are known, permissions are declared, and
 operation-specific verification plus rollback or irreversibility behavior are
 implemented. This makes catalog coverage broader than executable write
-coverage by design.
+coverage by design. The catalog preserves the upstream OpenAPI `source_hash`
+separately; approvals use the derived `schema_hash`, so local adapter or safety
+contract changes invalidate an older approval even when the upstream schema is
+unchanged.
 
 ## Secrets
 

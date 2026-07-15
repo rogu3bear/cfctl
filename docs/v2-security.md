@@ -8,6 +8,8 @@
 - Evidence is redacted before it is content-addressed and written atomically. Presence of evidence is not proof that an operation was performed or verified.
 - Plans are one-use transactions. Their content, schema, account, targets, impact, policy, and approval are hash-bound.
 - Mutation capabilities fail closed unless risk, effect, incremental cost, permissions, entitlement, operation-specific verification, and rollback or explicit irreversibility are known.
+- Official product pricing indexes enrich catalog cost knowledge, but variable resource or usage pricing remains unbounded and therefore non-executable. An official pricing link is evidence, not a cost ceiling.
+- Plans pin a hash of the executable capability catalog, including locally maintained adapter and safety contracts. The upstream OpenAPI hash is retained separately as source evidence.
 - Each transaction stage is appended to a hash-chained journal before or after its corresponding boundary: plan, approval, consumption, adapter attempt/response, secret sink, verification attempt/response, compensation, and close. Journal drift or a missing predecessor blocks execution.
 - A crash after durable consumption or an adapter-boundary attempt requires rectification; cfctl does not replay the mutation. Verification failure also enters rectification instead of being reported as success.
 - Native token mint, value-roll, and revoke operations use live token-detail readbacks. Creation and rotation require the planned token to be active; revocation requires a not-found readback.

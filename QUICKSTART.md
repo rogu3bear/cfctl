@@ -36,7 +36,11 @@ The catalog refreshes from Cloudflare's official OpenAPI schema, docs text feed,
 Reads with complete schemas can execute through the dynamic API adapter.
 Generated writes remain discoverable but are blocked until their exact risk,
 cost, entitlement, permission, verifier, and rollback/irreversibility contract
-is implemented. `catalog show` explains every missing field.
+is implemented. Official product pricing references and OpenAPI plan
+availability are attached when they match, but unbounded downstream usage
+remains blocked. `catalog show` explains every missing field, and `catalog
+coverage` separates pricing-reference and entitlement coverage from complete
+executable mutation contracts.
 
 For disposable tests, isolate all non-credential state explicitly:
 
