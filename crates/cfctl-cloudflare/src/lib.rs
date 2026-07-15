@@ -2534,9 +2534,7 @@ fn validate_request_object(
                     &BTreeSet::new(),
                 )?;
             }
-            None if properties.is_some_and(|properties| !properties.is_empty())
-                && !allowed_properties.contains(name) =>
-            {
+            None if properties.is_some() && !allowed_properties.contains(name) => {
                 let location = if path.is_empty() {
                     "request body"
                 } else {

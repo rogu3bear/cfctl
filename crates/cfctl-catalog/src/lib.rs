@@ -1717,6 +1717,7 @@ fn normalize_request_schema_contract(
     let resolved = resolve_local_schema(document, schema);
     let mut contract = Map::new();
     copy_request_schema_value_constraints(resolved, &mut contract);
+    copy_request_schema_required(document, resolved, &mut contract);
     if let Some(additional) = resolved.get("additionalProperties") {
         let additional = if additional.is_object() {
             if depth < MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
@@ -1758,6 +1759,7 @@ fn normalize_request_schema_contract(
         if let Some(properties) = resolved.get("properties").and_then(Value::as_object) {
             let properties = properties
                 .iter()
+                .filter(|(_, property)| !request_property_is_read_only(document, property))
                 .map(|(name, property)| {
                     (
                         name.clone(),
@@ -1788,7 +1790,6 @@ fn normalize_request_schema_contract(
 fn copy_request_schema_value_constraints(resolved: &Value, contract: &mut Map<String, Value>) {
     for key in [
         "type",
-        "required",
         "enum",
         "format",
         "nullable",
@@ -1814,6 +1815,36 @@ fn copy_request_schema_value_constraints(resolved: &Value, contract: &mut Map<St
     {
         contract.insert("multipleOf".to_owned(), multiple.clone());
     }
+}
+
+fn copy_request_schema_required(
+    document: &Value,
+    resolved: &Value,
+    contract: &mut Map<String, Value>,
+) {
+    let Some(required) = resolved.get("required").and_then(Value::as_array) else {
+        return;
+    };
+    let properties = resolved.get("properties").and_then(Value::as_object);
+    let writable_required = required
+        .iter()
+        .filter(|entry| {
+            entry.as_str().is_none_or(|name| {
+                properties
+                    .and_then(|properties| properties.get(name))
+                    .is_none_or(|property| !request_property_is_read_only(document, property))
+            })
+        })
+        .cloned()
+        .collect();
+    contract.insert("required".to_owned(), Value::Array(writable_required));
+}
+
+fn request_property_is_read_only(document: &Value, property: &Value) -> bool {
+    resolve_local_schema(document, property)
+        .get("readOnly")
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 fn success_response_declares_result_string_id(document: &Value, operation: &Value) -> bool {

@@ -124,6 +124,48 @@ fn request_contract_resolves_local_schema_without_copying_secret_values() {
     assert!(ambiguous.description.is_none());
 }
 
+#[test]
+fn request_contract_omits_read_only_properties_and_their_required_entries() {
+    let mut document = fixture();
+    document["components"]["schemas"]["ServerIdentifier"] = json!({
+        "type": "string",
+        "readOnly": true
+    });
+    document["components"]["schemas"]["CreateWidget"] = json!({
+        "type": "object",
+        "required": ["name", "server_id", "created_at", "secret"],
+        "properties": {
+            "name": {"type": "string"},
+            "server_id": {"$ref": "#/components/schemas/ServerIdentifier"},
+            "created_at": {"type": "string", "readOnly": true},
+            "secret": {"type": "string", "writeOnly": true}
+        }
+    });
+    document["paths"]["/accounts/{account_id}/widgets"]["post"] = json!({
+        "operationId": "widgets-create",
+        "summary": "Create widget",
+        "tags": ["Widgets"],
+        "requestBody": {
+            "required": true,
+            "content": {"application/json": {"schema": {
+                "$ref": "#/components/schemas/CreateWidget"
+            }}}
+        }
+    });
+
+    let snapshot = normalize_openapi(&document).expect("catalog");
+    let schema = snapshot
+        .get("widgets-create")
+        .and_then(|capability| capability.request_schema.as_ref())
+        .expect("request contract");
+
+    assert_eq!(schema["required"], json!(["name", "secret"]));
+    assert_eq!(schema["properties"]["name"]["type"], "string");
+    assert_eq!(schema["properties"]["secret"]["type"], "string");
+    assert!(schema["properties"].get("server_id").is_none());
+    assert!(schema["properties"].get("created_at").is_none());
+}
+
 fn install_request_contract_fixture(document: &mut Value) {
     document["components"]["schemas"]["Jurisdiction"] = json!({
         "type": "string",

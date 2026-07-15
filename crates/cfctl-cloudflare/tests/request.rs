@@ -193,6 +193,31 @@ fn unchecked_request_validates_required_body_shape_from_pinned_schema() {
 }
 
 #[test]
+fn unchecked_request_closes_an_explicitly_empty_property_contract() {
+    let mut capability = CapabilityV1::new("server-state", "Server state", "POST", "/state");
+    capability.request_schema = Some(json!({
+        "type": "object",
+        "properties": {}
+    }));
+    let error = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build_unchecked(
+            &capability,
+            &CallInput {
+                body: Some(json!({"server_id": "must-not-be-writable"})),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("an empty pinned property set must not become an open object");
+
+    assert!(matches!(
+        error,
+        CloudflareError::InvalidRequestBody(reason)
+            if reason.contains("outside the pinned contract")
+    ));
+}
+
+#[test]
 fn unchecked_request_validates_nested_required_fields_and_enums() {
     let mut capability =
         CapabilityV1::new("d1-update", "Update D1 database", "PATCH", "/database/id");
