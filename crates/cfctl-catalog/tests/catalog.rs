@@ -1734,6 +1734,93 @@ fn update_contract_accepts_properties_without_an_explicit_object_type() {
 }
 
 #[test]
+fn update_contract_unions_all_of_fields_and_excludes_write_only_inputs() {
+    let mut document = exact_resource_update_fixture();
+    document["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["patch"]["requestBody"]["content"]
+        ["application/json"]["schema"] = json!({
+        "allOf": [
+            {
+                "type":"object",
+                "properties": {
+                    "name":{"type":"string"},
+                    "secret":{"type":"string", "writeOnly":true}
+                }
+            },
+            {
+                "properties": {
+                    "enabled":{"type":"boolean"}
+                }
+            }
+        ]
+    });
+
+    let snapshot = normalize_openapi(&document).expect("allOf update catalog");
+    let patch = snapshot.get("widgets-patch").expect("allOf patch");
+    assert_eq!(
+        patch.verification.strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+    assert_eq!(
+        patch
+            .same_path_read
+            .as_ref()
+            .expect("same-path readback")
+            .verified_response_fields,
+        ["enabled", "name"]
+    );
+    assert!(patch.request_object_field_is_write_only("secret"));
+
+    document["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["patch"]["requestBody"]["content"]
+        ["application/json"]["schema"]["allOf"][1]["type"] = json!("string");
+    let conflicting = normalize_openapi(&document).expect("conflicting allOf catalog");
+    assert_ne!(
+        conflicting
+            .get("widgets-patch")
+            .expect("conflicting patch")
+            .verification
+            .strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+
+    document["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["patch"]["requestBody"]["content"]
+        ["application/json"]["schema"] = json!({
+        "oneOf": [
+            {"type":"object", "properties":{"name":{"type":"string"}}},
+            {"type":"object", "properties":{"enabled":{"type":"boolean"}}}
+        ]
+    });
+    let alternatives = normalize_openapi(&document).expect("oneOf update catalog");
+    assert_ne!(
+        alternatives
+            .get("widgets-patch")
+            .expect("oneOf patch")
+            .verification
+            .strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+
+    document["paths"]["/accounts/{account_id}/widgets/{widget_id}"]["patch"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"] = json!({"name":{"type":"string"}});
+    let direct_with_alternatives =
+        normalize_openapi(&document).expect("direct fields with oneOf catalog");
+    let patch = direct_with_alternatives
+        .get("widgets-patch")
+        .expect("direct-field oneOf patch");
+    assert_eq!(
+        patch.verification.strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+    assert_eq!(
+        patch
+            .same_path_read
+            .as_ref()
+            .expect("direct-field readback")
+            .verified_response_fields,
+        ["name"]
+    );
+}
+
+#[test]
 fn same_path_object_updates_require_schema_proven_readback_fields() {
     let document = json!({
         "openapi":"3.0.3",

@@ -2241,15 +2241,16 @@ async fn exact_resource_update_is_verified_by_same_path_planned_fields() {
         json!({"account_id":"account-1", "widget_id":"widget-1"}),
         Some(json!({
             "name":"after",
-            "settings":{"enabled":true,"mode":"strict"}
+            "settings":{"enabled":true,"mode":"strict"},
+            "secret":"must-not-be-returned"
         })),
     );
+    plan.capability.request_schema = Some(all_of_update_request_schema());
     plan.capability
-        .request_schema
+        .same_path_read
         .as_mut()
-        .and_then(Value::as_object_mut)
-        .expect("request schema")
-        .remove("type");
+        .expect("same-path readback")
+        .verified_response_fields = vec!["name".to_owned(), "settings".to_owned()];
     plan.capability.product = "R2 Object".to_owned();
     plan.capability.selectors.push(SelectorV1 {
         name: "cf-r2-jurisdiction".to_owned(),
@@ -2267,7 +2268,8 @@ async fn exact_resource_update_is_verified_by_same_path_planned_fields() {
         query: json!({}),
         body: Some(json!({
             "name":"after",
-            "settings":{"enabled":true,"mode":"strict"}
+            "settings":{"enabled":true,"mode":"strict"},
+            "secret":"must-not-be-returned"
         })),
         if_match: Some("mutation-etag".to_owned()),
         ..CallInput::default()
@@ -2304,7 +2306,33 @@ async fn exact_resource_update_is_verified_by_same_path_planned_fields() {
     assert!(request.starts_with("GET /client/v4/accounts/account-1/widgets/widget-1 "));
     assert!(!request.contains("mutation_mode"));
     assert!(!request.contains("mutation-etag"));
+    assert!(!verification.basis.contains("must-not-be-returned"));
     assert!(request.contains("cf-r2-jurisdiction: fedramp\r\n"));
+}
+
+fn all_of_update_request_schema() -> Value {
+    json!({
+        "allOf": [
+            {
+                "type":"object",
+                "properties": {
+                    "name":{"type":"string"},
+                    "secret":{"type":"string", "writeOnly":true}
+                }
+            },
+            {
+                "properties": {
+                    "settings":{
+                        "type":"object",
+                        "properties": {
+                            "enabled":{"type":"boolean"},
+                            "mode":{"type":"string"}
+                        }
+                    }
+                }
+            }
+        ]
+    })
 }
 
 #[tokio::test]

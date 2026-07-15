@@ -326,6 +326,95 @@ fn same_path_read_contracts_require_hash_bound_canonical_fields() {
 }
 
 #[test]
+fn same_path_read_contracts_union_all_of_object_fields_without_exposing_secrets() {
+    let mut update = CapabilityV1::new(
+        "widgets-update",
+        "Update widget",
+        "PATCH",
+        "/accounts/{account_id}/widgets/{widget_id}",
+    );
+    update.verification.strategy = "same_resource_contains_planned_fields_after_update".to_owned();
+    update.request_schema = Some(json!({
+        "allOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type":"string"},
+                    "secret": {"type":"string", "writeOnly":true},
+                    "shared": {"type":"string", "writeOnly":true}
+                }
+            },
+            {
+                "properties": {
+                    "enabled": {"type":"boolean"},
+                    "shared": {"type":"string"}
+                }
+            }
+        ]
+    }));
+    update.same_path_read = Some(SamePathReadContractV1 {
+        path: update.path.clone(),
+        read_capability_id: "widgets-get".to_owned(),
+        verified_response_fields: vec![
+            "enabled".to_owned(),
+            "name".to_owned(),
+            "shared".to_owned(),
+        ],
+    });
+
+    assert_eq!(
+        update.verifiable_request_object_fields(),
+        Some(vec![
+            "enabled".to_owned(),
+            "name".to_owned(),
+            "shared".to_owned(),
+        ])
+    );
+    assert!(update.request_object_field_is_write_only("secret"));
+    assert!(!update.request_object_field_is_write_only("shared"));
+    assert!(update.verification_contract_supported());
+
+    update
+        .same_path_read
+        .as_mut()
+        .expect("same-path contract")
+        .verified_response_fields
+        .push("secret".to_owned());
+    assert!(!update.verification_contract_supported());
+    update
+        .same_path_read
+        .as_mut()
+        .expect("same-path contract")
+        .verified_response_fields
+        .pop();
+
+    update.request_schema.as_mut().expect("request schema")["allOf"][1]["type"] = json!("string");
+    assert_eq!(update.verifiable_request_object_fields(), None);
+    assert!(!update.verification_contract_supported());
+
+    update.request_schema = Some(json!({
+        "oneOf": [
+            {"type":"object", "properties":{"name":{"type":"string"}}},
+            {"type":"object", "properties":{"enabled":{"type":"boolean"}}}
+        ]
+    }));
+    assert_eq!(update.verifiable_request_object_fields(), None);
+    assert!(!update.verification_contract_supported());
+
+    update.request_schema = Some(json!({
+        "properties": {"kind":{"type":"string"}},
+        "oneOf": [
+            {"type":"object", "properties":{"kind":{"enum":["ip"]},"name":{"type":"string"}}},
+            {"type":"object", "properties":{"kind":{"enum":["identity"]},"email":{"type":"string"}}}
+        ]
+    }));
+    assert_eq!(
+        update.verifiable_request_object_fields(),
+        Some(vec!["kind".to_owned()])
+    );
+}
+
+#[test]
 fn created_resource_contract_rejects_noncanonical_field_allowlists() {
     let mut capability = CapabilityV1::new(
         "widgets-create",
