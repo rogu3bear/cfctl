@@ -13,6 +13,10 @@ cfctl catalog coverage --json
 cfctl agents doctor --json
 ```
 
+Coverage includes stable `mutation_contract_gap_counts`. The counts overlap by
+design because one capability can lack risk, cost, permissions, verification,
+rollback, and entitlement knowledge simultaneously.
+
 Search before acting:
 
 ```bash

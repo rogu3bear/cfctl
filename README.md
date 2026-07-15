@@ -36,7 +36,10 @@ capabilities. Those references identify usage, subscription, pass-through, or
 contract exposure without pretending a variable downstream bill is a hard
 execution ceiling. `catalog coverage` reports entitlement metadata, plan-gated
 operations, pricing-reference coverage, declared verification and rollback
-contracts, and fully complete mutation contracts separately.
+contracts, and fully complete mutation contracts separately. It also reports
+overlapping, stable mutation-gap classes (`risk_unknown`, `cost_unbounded`,
+`verification_missing`, and the other execution guards) plus adapters that are
+blocked for a reason outside the generic mutation contract.
 
 ## Public commands
 

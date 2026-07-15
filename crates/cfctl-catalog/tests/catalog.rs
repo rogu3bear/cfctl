@@ -5,7 +5,9 @@ use cfctl_catalog::{
     attach_official_product_knowledge, ingest_cli_help, markdown_link, markdown_links,
     normalize_openapi,
 };
-use cfctl_core::{AdapterStatus, BillingModelV1, CostExposureV1, EffectClass, RiskClass};
+use cfctl_core::{
+    AdapterStatus, BillingModelV1, CostExposureV1, EffectClass, KnowledgeReferenceV1, RiskClass,
+};
 use chrono::Utc;
 use serde_json::json;
 
@@ -303,7 +305,80 @@ fn user_token_creation_stays_blocked_without_a_permission_inventory_workflow() {
             .as_deref()
             .is_some_and(|reason| reason.contains("permission inventory"))
     );
-    assert_eq!(snapshot.coverage().complete_mutation_contracts, 0);
+    let coverage = snapshot.coverage();
+    assert_eq!(coverage.complete_mutation_contracts, 0);
+    assert_eq!(coverage.blocked_adapters_without_contract_gaps, 1);
+}
+
+#[test]
+fn coverage_names_every_unresolved_mutation_contract_class() {
+    let document = json!({
+        "openapi":"3.0.3",
+        "info":{"title":"Cloudflare API","version":"4.0.0"},
+        "paths": {
+            "/accounts/{account_id}/widgets": {
+                "post": {
+                    "operationId":"widgets-create",
+                    "summary":"Create Widget",
+                    "tags":["Widgets"],
+                    "x-cfPlanAvailability":{"free":false,"pro":false,"business":false,"enterprise":true},
+                    "parameters":[
+                        {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}}
+                    ]
+                }
+            }
+        }
+    });
+
+    let mut snapshot = normalize_openapi(&document).expect("catalog");
+    let coverage = snapshot.coverage();
+
+    assert_eq!(coverage.capabilities_with_mutation_contract_gaps, 1);
+    assert_eq!(coverage.blocked_adapters_without_contract_gaps, 0);
+    for gap in [
+        "risk_unknown",
+        "effect_unknown",
+        "cost_unknown",
+        "verification_missing",
+        "rollback_or_irreversibility_missing",
+        "permission_lane_missing",
+        "entitlement_unresolved",
+    ] {
+        assert_eq!(
+            coverage.mutation_contract_gap_counts.get(gap),
+            Some(&1),
+            "missing coverage for {gap}"
+        );
+    }
+    assert_eq!(
+        coverage.mutation_contract_gap_counts.get("unclassified"),
+        None
+    );
+
+    snapshot
+        .capabilities
+        .get_mut("widgets-create")
+        .expect("widget capability")
+        .cost
+        .references
+        .push(KnowledgeReferenceV1 {
+            title: "Widget pricing".to_owned(),
+            url: "https://developers.cloudflare.com/widgets/pricing/".to_owned(),
+            source: "official fixture".to_owned(),
+        });
+    let priced_coverage = snapshot.coverage();
+    assert_eq!(
+        priced_coverage
+            .mutation_contract_gap_counts
+            .get("cost_unbounded"),
+        Some(&1)
+    );
+    assert_eq!(
+        priced_coverage
+            .mutation_contract_gap_counts
+            .get("cost_unknown"),
+        None
+    );
 }
 
 #[test]

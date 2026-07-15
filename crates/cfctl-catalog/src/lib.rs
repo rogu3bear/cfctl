@@ -129,6 +129,9 @@ impl CatalogSnapshot {
         let mut verification_contracts = 0;
         let mut rollback_contracts = 0;
         let mut complete_mutation_contracts = 0;
+        let mut capabilities_with_mutation_contract_gaps = 0;
+        let mut blocked_adapters_without_contract_gaps = 0;
+        let mut mutation_contract_gap_counts = BTreeMap::new();
         for capability in self.capabilities.values() {
             *adapter_statuses
                 .entry(adapter_status_name(capability.adapter_status).to_owned())
@@ -158,10 +161,21 @@ impl CatalogSnapshot {
                 usize::from(capability.mutating && capability.verification_contract_declared());
             rollback_contracts +=
                 usize::from(capability.mutating && capability.rollback_contract_declared());
+            let contract_gaps = capability.mutation_contract_gaps();
+            capabilities_with_mutation_contract_gaps +=
+                usize::from(capability.mutating && !contract_gaps.is_empty());
+            blocked_adapters_without_contract_gaps += usize::from(
+                capability.adapter_status == AdapterStatus::Blocked && contract_gaps.is_empty(),
+            );
+            for gap in &contract_gaps {
+                *mutation_contract_gap_counts
+                    .entry(mutation_contract_gap_code(gap).to_owned())
+                    .or_insert(0) += 1;
+            }
             complete_mutation_contracts += usize::from(
                 capability.mutating
                     && capability.adapter_status != AdapterStatus::Blocked
-                    && capability.mutation_contract_gaps().is_empty(),
+                    && contract_gaps.is_empty(),
             );
         }
         CatalogCoverageV1 {
@@ -176,6 +190,9 @@ impl CatalogSnapshot {
             verification_contracts,
             rollback_contracts,
             complete_mutation_contracts,
+            capabilities_with_mutation_contract_gaps,
+            blocked_adapters_without_contract_gaps,
+            mutation_contract_gap_counts,
             adapter_statuses,
             sources,
         }
@@ -208,6 +225,9 @@ pub struct CatalogCoverageV1 {
     pub verification_contracts: usize,
     pub rollback_contracts: usize,
     pub complete_mutation_contracts: usize,
+    pub capabilities_with_mutation_contract_gaps: usize,
+    pub blocked_adapters_without_contract_gaps: usize,
+    pub mutation_contract_gap_counts: BTreeMap<String, usize>,
     pub adapter_statuses: BTreeMap<String, usize>,
     pub sources: BTreeMap<String, usize>,
 }
@@ -1621,6 +1641,24 @@ fn catalog_io(path: &Path, source: std::io::Error) -> CatalogError {
     CatalogError::Io {
         path: path.display().to_string(),
         source,
+    }
+}
+
+fn mutation_contract_gap_code(gap: &str) -> &'static str {
+    match gap {
+        "operation-specific risk classification is missing" => "risk_unknown",
+        "operation-specific effect classification is missing" => "effect_unknown",
+        "operation-specific incremental cost is unknown" => "cost_unknown",
+        "operation-specific verification is not declared" => "verification_missing",
+        "operation-specific rollback or irreversibility behavior is not declared" => {
+            "rollback_or_irreversibility_missing"
+        }
+        "required Cloudflare permission lane is not declared" => "permission_lane_missing",
+        "account entitlement has not been resolved for this plan-gated operation" => {
+            "entitlement_unresolved"
+        }
+        _ if gap.starts_with("operation-specific cost is not bounded;") => "cost_unbounded",
+        _ => "unclassified",
     }
 }
 

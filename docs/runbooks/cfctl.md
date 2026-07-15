@@ -10,6 +10,12 @@ cfctl docs changes --json
 cfctl agents doctor --json
 ```
 
+Use `mutation_contract_gap_counts` to distinguish unknown risk, effect, cost,
+verification, rollback, permissions, and entitlement debt. Counts overlap;
+`capabilities_with_mutation_contract_gaps` counts affected operations once,
+while `blocked_adapters_without_contract_gaps` identifies separate adapter or
+workflow blockers.
+
 Find and inspect an operation:
 
 ```bash
