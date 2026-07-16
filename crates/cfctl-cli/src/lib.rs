@@ -147,6 +147,59 @@ pub enum KeysCommand {
     Mint(KeyMutationArgs),
     Rotate(KeyRotateArgs),
     Revoke(KeyRevokeArgs),
+    Policy(KeyPolicyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct KeyPolicyArgs {
+    #[command(subcommand)]
+    pub command: KeyPolicyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KeyPolicyCommand {
+    Create(KeyPolicyCreateArgs),
+    List,
+    Approve(KeyPolicyApproveArgs),
+    Revoke(KeyPolicySelector),
+}
+
+#[derive(Debug, Args)]
+pub struct KeyPolicyCreateArgs {
+    #[arg(long, help = "Pin the single account this authority may operate on")]
+    pub account: String,
+    #[arg(
+        long,
+        help = "Name prefix every child token minted under this authority must carry"
+    )]
+    pub name_prefix: String,
+    #[arg(
+        long = "permission",
+        help = "Permission group (id or exact name) children may request; repeatable"
+    )]
+    pub permissions: Vec<String>,
+    #[arg(long, help = "Maximum child-token TTL in hours")]
+    pub max_child_ttl_hours: u32,
+    #[arg(long, help = "Maximum standing runs per rolling 24h window")]
+    pub max_runs_per_day: u32,
+    #[arg(
+        long,
+        default_value_t = 90,
+        help = "Days until the authority itself expires"
+    )]
+    pub expires_days: u32,
+}
+
+#[derive(Debug, Args)]
+pub struct KeyPolicyApproveArgs {
+    pub authority_id: String,
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct KeyPolicySelector {
+    pub authority_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -177,6 +230,12 @@ pub struct KeyMutationArgs {
     pub ttl_hours: Option<u32>,
     #[arg(long)]
     pub value_out: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "AUTHORITY_ID",
+        help = "Plan AND run unattended under an active standing authority whose bounds cover this mint"
+    )]
+    pub under_policy: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -190,6 +249,12 @@ pub struct KeyRevokeArgs {
     pub id: String,
     #[arg(long)]
     pub account: Option<String>,
+    #[arg(
+        long,
+        value_name = "AUTHORITY_ID",
+        help = "Plan AND run unattended under an active standing authority; only tokens the authority minted may be revoked"
+    )]
+    pub under_policy: Option<String>,
 }
 
 #[derive(Debug, Args)]

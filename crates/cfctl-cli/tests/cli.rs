@@ -150,6 +150,114 @@ fn user_owned_key_lifecycle_requires_an_explicit_owner_flag_and_account_context(
 }
 
 #[test]
+fn standing_policy_verbs_parse_and_under_policy_rides_mint_and_revoke() {
+    let parsed = Cli::try_parse_from([
+        "cfctl",
+        "keys",
+        "policy",
+        "create",
+        "--account",
+        "account-id",
+        "--name-prefix",
+        "cf-rotation-",
+        "--permission",
+        "Workers Scripts Write",
+        "--max-child-ttl-hours",
+        "24",
+        "--max-runs-per-day",
+        "4",
+    ])
+    .expect("policy create parses");
+    let Some(Command::Keys(arguments)) = parsed.command else {
+        panic!("keys command");
+    };
+    let cfctl_cli::KeysCommand::Policy(policy) = arguments.command else {
+        panic!("policy command");
+    };
+    let cfctl_cli::KeyPolicyCommand::Create(create) = policy.command else {
+        panic!("create command");
+    };
+    assert_eq!(create.account, "account-id");
+    assert_eq!(create.name_prefix, "cf-rotation-");
+    assert_eq!(create.max_child_ttl_hours, 24);
+    assert_eq!(create.max_runs_per_day, 4);
+    assert_eq!(create.expires_days, 90, "authority TTL defaults to 90 days");
+
+    let approve = Cli::try_parse_from(["cfctl", "keys", "policy", "approve", "authority-1"])
+        .expect("approve without --yes still parses as a draft gate request");
+    let Some(Command::Keys(arguments)) = approve.command else {
+        panic!("keys command");
+    };
+    let cfctl_cli::KeysCommand::Policy(policy) = arguments.command else {
+        panic!("policy command");
+    };
+    let cfctl_cli::KeyPolicyCommand::Approve(approve) = policy.command else {
+        panic!("approve command");
+    };
+    assert!(
+        !approve.yes,
+        "chat/intent alone must not set the approval flag; only --yes grants authority"
+    );
+
+    let minted = Cli::try_parse_from([
+        "cfctl",
+        "keys",
+        "mint",
+        "--name",
+        "cf-rotation-web",
+        "--permission",
+        "group-id",
+        "--account",
+        "account-id",
+        "--value-out",
+        "/tmp/child.tok",
+        "--under-policy",
+        "authority-1",
+    ])
+    .expect("under-policy mint parses");
+    let Some(Command::Keys(arguments)) = minted.command else {
+        panic!("keys command");
+    };
+    let cfctl_cli::KeysCommand::Mint(mint) = arguments.command else {
+        panic!("mint command");
+    };
+    assert_eq!(mint.under_policy.as_deref(), Some("authority-1"));
+}
+
+#[test]
+fn standing_runs_fail_closed_before_any_network_when_the_authority_is_missing() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args([
+            "keys",
+            "mint",
+            "--name",
+            "cf-rotation-x",
+            "--permission",
+            "group",
+            "--account",
+            "account-a",
+            "--value-out",
+            "/tmp/never-written.tok",
+            "--under-policy",
+            "ghost",
+            "--json",
+        ])
+        .output()
+        .expect("cfctl binary runs");
+    assert!(
+        !output.status.success(),
+        "a standing run against a missing authority must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("standing authority `ghost` does not exist"),
+        "missing authority must be the failure, got: {stderr}"
+    );
+}
+
+#[test]
 fn help_and_version_are_successful_public_commands() {
     for argument in ["--help", "--version"] {
         let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))

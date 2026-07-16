@@ -68,6 +68,29 @@ older process from deleting a newer lock.
 - paid actions
 - unknown write semantics or risk
 
+## Standing authority — the one bounded exception
+
+Recurring token-lifecycle operations may consume an unapproved plan under a
+`StandingAuthorityV1`: a hash-bound grant that is itself created from a fresh
+live permission inventory and activated only by an explicit
+`cfctl keys policy approve <authority-id> --yes`. Approval moves from
+per-operation to per-policy; it never disappears.
+
+The grant is defensible because its bounds are strict and enforced against
+the exact execution input at run time: children must carry the pinned name
+prefix, request only allowlisted permission groups, and expire within the
+maximum child TTL; revocations are lineage-bound to tokens the authority
+itself minted; runs are rate-limited per rolling 24h window; the authority
+expires on its own TTL and is revocable immediately and unconditionally with
+`cfctl keys policy revoke`. Every standing consumption records the authority
+id and content hash in the plan's transaction journal and leaves
+`standing_apply` evidence, so each unattended run is attributable to the
+exact approved grant. Post-approval drift of any bound fails closed.
+
+External sends, spend, and everything else in the list above remain
+per-operation approval forever; standing authority covers only the
+token-lifecycle capabilities named in the approved grant.
+
 ## Secrets
 
 Credential material lives only in Keychain on macOS or Secret Service on

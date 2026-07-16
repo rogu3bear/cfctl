@@ -29,8 +29,8 @@ use cfctl_cloudflare::{
 };
 use cfctl_core::{
     AdapterStatus, CapabilityV1, ErrorV1, EvidenceClass, EvidenceV1, MoneyV1, PlanStatus, PlanV1,
-    PolicyDisposition, ResultEnvelopeV2, RiskClass, TransactionStageV1, VerificationState,
-    guide_stages, hash_value, redact_json,
+    PolicyDisposition, ResultEnvelopeV2, RiskClass, StandingAuthorityV1, TransactionStageV1,
+    VerificationState, guide_stages, hash_value, redact_json,
 };
 use cfctl_planner::{ImpactContext, PolicyEngine};
 use cfctl_storage::{RuntimePaths, StateStore};
@@ -44,8 +44,9 @@ use tokio::process::Command as ProcessCommand;
 use crate::{
     AgentsCommand, AuthCommand, AuthLoginArgs, CallArgs, CatalogCommand, Cli, Command, DocsCommand,
     GuideArgs, ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs,
-    KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector,
-    PlansCommand, ProfileSelector, SearchArgs, WorkspaceCommand,
+    KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs, KeyPolicySelector, KeyRevokeArgs,
+    KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector, PlansCommand,
+    ProfileSelector, SearchArgs, WorkspaceCommand,
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
 
@@ -200,6 +201,28 @@ fn platform_secret_store_health(store: &StateStore) -> Result<Value> {
         "fallback_dir": secrets.fallback_root(),
         "fallback_secret_count": secrets.fallback_secret_count()?,
     }))
+}
+
+fn standing_authorities_health(store: &StateStore) -> Result<Value> {
+    let now = Utc::now();
+    let authorities: Vec<Value> = store
+        .list_authorities()?
+        .iter()
+        .map(|authority| {
+            json!({
+                "authority_id": authority.authority_id,
+                "status": authority.status.as_str(),
+                "account_id": authority.account_id,
+                "name_prefix": authority.name_prefix,
+                "capability_ids": authority.capability_ids,
+                "expires_at": authority.expires_at,
+                "max_runs_per_day": authority.max_runs_per_day,
+                "runs_last_24h": authority.runs_in_last_day(now),
+                "minted_tokens": authority.minted_token_ids.len(),
+            })
+        })
+        .collect();
+    Ok(Value::Array(authorities))
 }
 
 async fn auth_command(store: &StateStore, command: AuthCommand) -> Result<ResultEnvelopeV2> {
@@ -3949,6 +3972,172 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     .await
 }
 
+/// The standing-authority execution lane. Identical to `run_plan` in every
+/// pre-consumption re-verification (catalog hash, workspace and live
+/// precondition hashes, token contract, secret sink); it differs only at the
+/// consumption gate, where the authority's blast-radius bounds are validated
+/// against the exact resolved execution input and consumption is recorded
+/// against the authority instead of a per-operation approval.
+async fn run_plan_under_standing_authority(
+    store: &StateStore,
+    operation_id: &str,
+    authority_id: &str,
+) -> Result<ResultEnvelopeV2> {
+    let mut authority = store.load_authority(authority_id)?;
+    let _lock = store.lock_plan(operation_id)?;
+    let catalog = ensure_catalog(store).await?;
+    let mut plan = load_validated_plan(store, operation_id)?;
+    if plan.catalog_hash != catalog.schema_hash {
+        return Err(CliError::Input(format!(
+            "catalog drift invalidated the plan: planned {}, current {}",
+            plan.catalog_hash, catalog.schema_hash
+        )));
+    }
+    validate_plan_preconditions(store, &plan)?;
+    if plan.capability.adapter_status == AdapterStatus::Blocked {
+        return Err(CliError::Input(
+            plan.capability.blocked_reason.clone().unwrap_or_else(|| {
+                "the approved capability no longer has an executable adapter".to_owned()
+            }),
+        ));
+    }
+    preflight_secret_sink(&plan)?;
+    let profiles = ProfilesConfig::load(store)?;
+    let profile = profiles.selected(Some(&plan.profile_id))?;
+    let secrets = platform_secrets(store);
+    let credential = fresh_credential(profile, &secrets).await?;
+    let execution_input = resolved_plan_input(&plan, &secrets)?;
+    let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    validate_api_token_creation_contract(
+        &plan.capability,
+        &execution_input,
+        adapter_targets,
+        &plan.account_id,
+    )?;
+    let live_precondition_evidence = validate_live_plan_precondition_evidence(
+        store,
+        &catalog,
+        &plan,
+        &execution_input,
+        &credential,
+    )
+    .await?;
+    authorize_standing_execution(&authority, &plan, &execution_input)?;
+    plan.mark_consumed_via_standing_authority(&authority)?;
+    // Run accounting is recorded before the boundary is crossed so failed
+    // executions still consume budget — the rate bound limits attempts, not
+    // successes.
+    authority.record_run(&plan.operation_id, &plan.capability.id);
+    store.save_authority(&authority)?;
+    store.save_plan(&plan)?;
+    let standing_evidence = store.write_evidence(
+        EvidenceClass::StandingApply,
+        &json!({
+            "standing_authority_id": authority.authority_id,
+            "standing_authority_content_hash": authority.content_hash,
+            "operation_id": plan.operation_id,
+            "capability_id": plan.capability.id,
+            "account_id": plan.account_id,
+        }),
+    )?;
+    persist_transaction_stage(
+        store,
+        &mut plan,
+        TransactionStageV1::BoundaryAttemptPersisted,
+    )?;
+    let mut envelope = execute_consumed_plan(
+        store,
+        &catalog.schema_hash,
+        &mut plan,
+        &execution_input,
+        &credential,
+        &secrets,
+        live_precondition_evidence,
+    )
+    .await?;
+    if envelope.ok
+        && plan.capability.id.ends_with("create-token")
+        && let Some(minted_id) = envelope
+            .result
+            .get("result")
+            .and_then(|result| result.get("id"))
+            .and_then(Value::as_str)
+    {
+        authority.record_minted_token(minted_id);
+        store.save_authority(&authority)?;
+    }
+    envelope.evidence.push(standing_evidence);
+    if let Some(result) = envelope.result.as_object_mut() {
+        result.insert(
+            "standing_authority_id".to_owned(),
+            json!(authority.authority_id),
+        );
+    }
+    Ok(envelope)
+}
+
+/// Validates the authority's bounds against the exact execution input the
+/// boundary call will use — never a re-derivation.
+fn authorize_standing_execution(
+    authority: &StandingAuthorityV1,
+    plan: &PlanV1,
+    input: &CallInput,
+) -> Result<()> {
+    let now = Utc::now();
+    if plan.capability.id.ends_with("create-token") {
+        let body = input.body.as_ref().ok_or_else(|| {
+            CliError::Input("a standing mint requires the plan's request body".to_owned())
+        })?;
+        let child_name = body.get("name").and_then(Value::as_str).ok_or_else(|| {
+            CliError::Input("a standing mint requires a child token name".to_owned())
+        })?;
+        let requested_group_ids: Vec<String> = body
+            .get("policies")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|policy| policy.get("permission_groups").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|group| group.get("id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        let child_expires_at = body
+            .get("expires_on")
+            .and_then(Value::as_str)
+            .map(|raw| {
+                chrono::DateTime::parse_from_rfc3339(raw)
+                    .map(|parsed| parsed.with_timezone(&Utc))
+                    .map_err(|error| {
+                        CliError::Input(format!(
+                            "the standing mint carries an unparseable expires_on: {error}"
+                        ))
+                    })
+            })
+            .transpose()?;
+        authority.authorize_token_create(
+            now,
+            child_name,
+            &requested_group_ids,
+            child_expires_at,
+        )?;
+    } else if plan.capability.id.ends_with("delete-token") {
+        let token_id = input
+            .selectors
+            .get("token_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("a standing revoke requires a token_id selector".to_owned())
+            })?;
+        authority.authorize_token_delete(now, token_id)?;
+    } else {
+        return Err(CliError::Input(format!(
+            "standing authorities do not cover capability `{}`",
+            plan.capability.id
+        )));
+    }
+    Ok(())
+}
+
 struct LivePreconditionEvidence {
     zone_account: Option<EvidenceV1>,
     entitlement: Option<EvidenceV1>,
@@ -6071,10 +6260,206 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
 async fn keys_command(store: &StateStore, command: KeysCommand) -> Result<ResultEnvelopeV2> {
     match command {
         KeysCommand::Permissions(arguments) => key_permissions(store, &arguments).await,
-        KeysCommand::Mint(arguments) => key_mint(store, &arguments).await,
+        KeysCommand::Mint(arguments) => {
+            preflight_standing_authority(store, arguments.under_policy.as_deref())?;
+            let plan = key_mint(store, &arguments).await?;
+            finish_standing_run(store, plan, arguments.under_policy.as_deref()).await
+        }
         KeysCommand::Rotate(arguments) => key_rotate(store, &arguments).await,
-        KeysCommand::Revoke(arguments) => key_revoke(store, &arguments).await,
+        KeysCommand::Revoke(arguments) => {
+            preflight_standing_authority(store, arguments.under_policy.as_deref())?;
+            let plan = key_revoke(store, &arguments).await?;
+            finish_standing_run(store, plan, arguments.under_policy.as_deref()).await
+        }
+        KeysCommand::Policy(arguments) => key_policy(store, arguments.command).await,
     }
+}
+
+/// Fails a standing run closed before any live read or plan creation when
+/// the named authority is missing, unapproved, revoked, or expired.
+fn preflight_standing_authority(store: &StateStore, under_policy: Option<&str>) -> Result<()> {
+    if let Some(authority_id) = under_policy {
+        store.load_authority(authority_id)?.ensure_operational()?;
+    }
+    Ok(())
+}
+
+/// When `--under-policy` names a standing authority, the freshly created plan
+/// is immediately validated against the authority's bounds and executed in
+/// the same invocation; otherwise the plan envelope is returned for the
+/// ordinary per-operation approval ceremony.
+async fn finish_standing_run(
+    store: &StateStore,
+    plan_envelope: ResultEnvelopeV2,
+    under_policy: Option<&str>,
+) -> Result<ResultEnvelopeV2> {
+    let Some(authority_id) = under_policy else {
+        return Ok(plan_envelope);
+    };
+    let Some(operation_id) = plan_envelope.operation_id.clone() else {
+        return Err(CliError::Input(
+            "a standing run requires the plan envelope to carry an operation id".to_owned(),
+        ));
+    };
+    run_plan_under_standing_authority(store, &operation_id, authority_id).await
+}
+
+async fn key_policy(store: &StateStore, command: KeyPolicyCommand) -> Result<ResultEnvelopeV2> {
+    match command {
+        KeyPolicyCommand::Create(arguments) => key_policy_create(store, &arguments).await,
+        KeyPolicyCommand::List => key_policy_list(store),
+        KeyPolicyCommand::Approve(arguments) => key_policy_approve(store, &arguments),
+        KeyPolicyCommand::Revoke(selector) => key_policy_revoke(store, &selector),
+    }
+}
+
+async fn key_policy_create(
+    store: &StateStore,
+    arguments: &KeyPolicyCreateArgs,
+) -> Result<ResultEnvelopeV2> {
+    if arguments.permissions.is_empty() {
+        return Err(CliError::Input(
+            "a standing authority requires at least one allowlisted permission group; use `cfctl keys permissions --account <id>`"
+                .to_owned(),
+        ));
+    }
+    if arguments.name_prefix.trim().is_empty() {
+        return Err(CliError::Input(
+            "a standing authority requires a non-empty `--name-prefix` lineage bound".to_owned(),
+        ));
+    }
+    if arguments.max_child_ttl_hours == 0 || arguments.max_runs_per_day == 0 {
+        return Err(CliError::Input(
+            "`--max-child-ttl-hours` and `--max-runs-per-day` must both be at least 1".to_owned(),
+        ));
+    }
+    let inventory = key_permissions(
+        store,
+        &KeyPermissionArgs {
+            account: Some(arguments.account.clone()),
+            user: false,
+        },
+    )
+    .await?;
+    if !inventory.ok
+        || !inventory.performed
+        || inventory.account_id.as_deref() != Some(arguments.account.as_str())
+    {
+        return Err(CliError::Input(
+            "fresh account-bound permission inventory did not produce a live-read receipt"
+                .to_owned(),
+        ));
+    }
+    let selected_groups = validate_selected_permission_groups(
+        &arguments.permissions,
+        inventory.result.get("result").unwrap_or(&Value::Null),
+    )?;
+    validate_permission_group_resource_scope(&selected_groups, "com.cloudflare.api.account")?;
+    let selected_group_ids = selected_groups
+        .iter()
+        .filter_map(|group| group.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let selected_groups_hash = hash_value(&serde_json::to_value(&selected_groups)?)?;
+    let expires_at = Utc::now() + ChronoDuration::days(i64::from(arguments.expires_days));
+    let authority = StandingAuthorityV1::draft(
+        &arguments.account,
+        vec![
+            "account-api-tokens-create-token".to_owned(),
+            "account-api-tokens-delete-token".to_owned(),
+        ],
+        selected_group_ids,
+        &selected_groups_hash,
+        arguments.max_child_ttl_hours,
+        &arguments.name_prefix,
+        arguments.max_runs_per_day,
+        expires_at,
+    )?;
+    store.save_authority(&authority)?;
+    let mut envelope = ResultEnvelopeV2::success(
+        "keys policy create",
+        json!({
+            "authority_id": authority.authority_id,
+            "status": authority.status.as_str(),
+            "account_id": authority.account_id,
+            "capability_ids": authority.capability_ids,
+            "name_prefix": authority.name_prefix,
+            "max_child_ttl_hours": authority.max_child_ttl_hours,
+            "max_runs_per_day": authority.max_runs_per_day,
+            "expires_at": authority.expires_at,
+            "resolved_permission_groups": selected_groups,
+            "permission_inventory_hash": authority.permission_inventory_hash,
+            "approval_command": format!(
+                "cfctl keys policy approve {} --yes",
+                authority.authority_id
+            ),
+            "message": "Standing authority drafted from a fresh live permission inventory. Review the resolved groups and bounds, then approve the exact authority ID."
+        }),
+    );
+    envelope.account_id = Some(arguments.account.clone());
+    envelope.evidence = inventory.evidence;
+    Ok(envelope)
+}
+
+fn key_policy_list(store: &StateStore) -> Result<ResultEnvelopeV2> {
+    let now = Utc::now();
+    let authorities: Vec<Value> = store
+        .list_authorities()?
+        .iter()
+        .map(|authority| {
+            json!({
+                "authority_id": authority.authority_id,
+                "status": authority.status.as_str(),
+                "account_id": authority.account_id,
+                "capability_ids": authority.capability_ids,
+                "name_prefix": authority.name_prefix,
+                "permission_group_count": authority.permission_group_ids.len(),
+                "max_child_ttl_hours": authority.max_child_ttl_hours,
+                "max_runs_per_day": authority.max_runs_per_day,
+                "runs_last_24h": authority.runs_in_last_day(now),
+                "minted_tokens": authority.minted_token_ids.len(),
+                "created_at": authority.created_at,
+                "expires_at": authority.expires_at,
+            })
+        })
+        .collect();
+    Ok(ResultEnvelopeV2::success(
+        "keys policy list",
+        json!({"authorities": authorities}),
+    ))
+}
+
+fn key_policy_approve(
+    store: &StateStore,
+    arguments: &KeyPolicyApproveArgs,
+) -> Result<ResultEnvelopeV2> {
+    let mut authority = store.load_authority(&arguments.authority_id)?;
+    authority.approve(arguments.yes)?;
+    store.save_authority(&authority)?;
+    Ok(ResultEnvelopeV2::success(
+        "keys policy approve",
+        json!({
+            "authority_id": authority.authority_id,
+            "status": authority.status.as_str(),
+            "approved_content_hash": authority.approval.as_ref().map(|approval| approval.approved_content_hash.clone()),
+            "expires_at": authority.expires_at,
+            "message": "Standing authority is active. Unattended runs under it are bounded, rate-limited, attributable, and revocable with `cfctl keys policy revoke`."
+        }),
+    ))
+}
+
+fn key_policy_revoke(store: &StateStore, selector: &KeyPolicySelector) -> Result<ResultEnvelopeV2> {
+    let mut authority = store.load_authority(&selector.authority_id)?;
+    authority.revoke();
+    store.save_authority(&authority)?;
+    Ok(ResultEnvelopeV2::success(
+        "keys policy revoke",
+        json!({
+            "authority_id": authority.authority_id,
+            "status": authority.status.as_str(),
+            "message": "Standing authority revoked. Future runs under it fail closed immediately; already-minted child tokens are unaffected and can be revoked individually."
+        }),
+    ))
 }
 
 async fn key_permissions(
@@ -6691,6 +7076,7 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "oauth_scope_inventory_hash": inventory_hash,
             "oauth_profiles": oauth_reconsent,
             "platform_secret_store": platform_secret_store_health(store)?,
+            "standing_authorities": standing_authorities_health(store)?,
             "agents": agents,
             "public_oauth": "unconfigured until cfctl.io ownership, site publication, domain verification, and permanent promotion are explicitly completed; use `cfctl auth import-api-token --account <id> --stdin` for the scoped day-to-day lane",
         }),
@@ -8336,8 +8722,9 @@ mod tests {
         bind_required_empty_compensation_body, boundary_response_artifact, call_command,
         capability_call_argv, compensation_request, execute_read, find_secret_value,
         force_ipv4_from, guide_document, http_client, is_live_plan_precondition_hash,
-        is_secret_output_capability, non_readback_verification_basis, persist_prepared_plan,
-        persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
+        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
+        non_readback_verification_basis, persist_prepared_plan, persist_secret_lifecycle,
+        preflight_call_input, preflight_standing_authority, preserve_previous_catalog,
         query_object_from_pairs, read_import_secret, read_secret_file, redact_secret_result,
         required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
@@ -8357,7 +8744,7 @@ mod tests {
         workspace_resource_keys, zone_target,
     };
     use crate::profiles::ProfilesConfig;
-    use crate::{CallArgs, PlanApproveArgs};
+    use crate::{CallArgs, KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs};
     use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
     use cfctl_cloudflare::CloudflareResponseV1;
@@ -8365,10 +8752,10 @@ mod tests {
         AdapterStatus, CapabilityV1, CostV1, CreatedCollectionResourceContractV1,
         CreatedResourceContractV1, EffectClass, EvidenceClass, EvidenceV1, PlanStatus, PlanV1,
         QuerySerializationV1, RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1,
-        TransactionStageV1, hash_value,
+        StandingAuthorityV1, TransactionStageV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
-    use chrono::Utc;
+    use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::{Value, json};
     use std::{collections::BTreeMap, fs};
 
@@ -12053,6 +12440,73 @@ mod tests {
         )
         .expect_err("empty account rejected");
         assert!(unpinned.to_string().contains("--account"));
+    }
+
+    #[test]
+    fn standing_authority_lifecycle_approves_lists_and_revokes_offline() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let authority = StandingAuthorityV1::draft(
+            "account-a",
+            vec!["account-api-tokens-create-token".to_owned()],
+            vec!["group-a".to_owned()],
+            "sha256:inventory-binding",
+            24,
+            "cf-rotation-",
+            2,
+            Utc::now() + ChronoDuration::days(30),
+        )
+        .expect("authority draft");
+        let authority_id = authority.authority_id.clone();
+        store.save_authority(&authority).expect("persist draft");
+
+        let denied = key_policy_approve(
+            &store,
+            &KeyPolicyApproveArgs {
+                authority_id: authority_id.clone(),
+                yes: false,
+            },
+        )
+        .expect_err("approval requires an explicit yes");
+        assert!(denied.to_string().contains("explicit yes"), "{denied}");
+
+        let approved = key_policy_approve(
+            &store,
+            &KeyPolicyApproveArgs {
+                authority_id: authority_id.clone(),
+                yes: true,
+            },
+        )
+        .expect("explicit approval activates");
+        assert_eq!(approved.result["status"], "active");
+
+        let listed = key_policy_list(&store).expect("list authorities");
+        assert_eq!(
+            listed.result["authorities"][0]["authority_id"],
+            serde_json::json!(authority_id)
+        );
+        assert_eq!(listed.result["authorities"][0]["status"], "active");
+        assert_eq!(listed.result["authorities"][0]["runs_last_24h"], 0);
+
+        preflight_standing_authority(&store, Some(&authority_id))
+            .expect("active authority passes preflight");
+        assert!(
+            preflight_standing_authority(&store, Some("ghost")).is_err(),
+            "unknown authorities fail closed before any network"
+        );
+
+        let revoked = key_policy_revoke(
+            &store,
+            &KeyPolicySelector {
+                authority_id: authority_id.clone(),
+            },
+        )
+        .expect("revocation is unconditional");
+        assert_eq!(revoked.result["status"], "revoked");
+        assert!(
+            preflight_standing_authority(&store, Some(&authority_id)).is_err(),
+            "revoked authorities fail preflight immediately"
+        );
     }
 
     #[test]
