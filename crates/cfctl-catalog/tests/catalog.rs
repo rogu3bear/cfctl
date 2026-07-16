@@ -1218,13 +1218,14 @@ fn account_token_mutations_have_complete_native_execution_contracts() {
 }
 
 #[test]
-fn user_token_creation_stays_blocked_without_a_permission_inventory_workflow() {
+fn user_token_creation_uses_the_inventory_bound_native_lifecycle() {
     let mut document = fixture();
     document["paths"]["/user/tokens"]["post"] = json!({
         "operationId":"user-api-tokens-create-token",
         "summary":"Create Token",
         "tags":["User API Tokens"],
-        "x-api-token-group":["API Tokens Write"]
+        "x-api-token-group":["API Tokens Write"],
+        "responses": cloudflare_envelope_responses()
     });
 
     let snapshot = normalize_openapi(&document).expect("user token catalog");
@@ -1232,16 +1233,19 @@ fn user_token_creation_stays_blocked_without_a_permission_inventory_workflow() {
         .get("user-api-tokens-create-token")
         .expect("user token create");
 
-    assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
-    assert!(
-        capability
-            .blocked_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("permission inventory"))
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert!(capability.blocked_reason.is_none());
+    assert_eq!(
+        capability.verification.strategy,
+        "api_token_details_match_created_id_and_active_status"
+    );
+    assert_eq!(
+        capability.rollback.strategy.as_deref(),
+        Some("revoke_created_api_token_by_returned_id_if_downstream_installation_fails")
     );
     let coverage = snapshot.coverage();
-    assert_eq!(coverage.complete_mutation_contracts, 0);
-    assert_eq!(coverage.blocked_adapters_without_contract_gaps, 1);
+    assert_eq!(coverage.complete_mutation_contracts, 1);
+    assert_eq!(coverage.blocked_adapters_without_contract_gaps, 0);
 }
 
 #[test]

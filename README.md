@@ -54,7 +54,7 @@ check before sending a mutation.
 
 ```text
 cfctl "<natural-language request>"
-cfctl auth login|status|profiles|use|logout|import-global-key
+cfctl auth login|status|profiles|use|logout|import-api-token|import-global-key
 cfctl keys permissions|mint|rotate|revoke
 cfctl catalog sync|search|show|changes|coverage
 cfctl call <capability-id> [selectors/body]
@@ -74,27 +74,34 @@ contracts are `CapabilityV1`, `PlanV1`, `PolicyDecisionV1`, `AgentActionV1`,
 
 ## Authentication
 
-OAuth Authorization Code with PKCE is the normal lane. Tokens live in Keychain
-on macOS or Secret Service on Linux. Each profile/workspace pins an account and
-ambiguous selection fails closed.
-
-Until the public cfctl OAuth application is promoted, bring your own Cloudflare
-OAuth client:
+Day-to-day auth is a scoped API token, imported only through stdin (never
+argv). The token lives in Keychain on macOS or Secret Service on Linux, and
+the account pin is required:
 
 ```bash
-cfctl auth login \
-  --profile default \
-  --client-id "$CFCTL_OAUTH_CLIENT_ID" \
-  --scope <scope-id> \
-  --account <account-id>
+printf '%s' "$CLOUDFLARE_API_TOKEN" | \
+  cfctl auth import-api-token --account <account-id> --stdin
 ```
 
-The login emits an authorization URL. The static callback displays a one-time
-`STATE CODE` value for the CLI completion step. Public clients never embed a
-client secret. Refresh and logout/revocation are supported.
+If you drive cfctl through a wrapper that routes stdin through `cargo` (the
+in-repo `./cfctl` shim does), pass a mode-0600 file instead so the secret never
+touches stdin:
 
-An emergency global key can be imported from stdin. It is never selected
-silently:
+```bash
+( umask 077; printf '%s' "$CLOUDFLARE_API_TOKEN" > token.tok )
+cfctl auth import-api-token --account <account-id> --value-in token.tok
+rm -f token.tok
+```
+
+OAuth Authorization Code with PKCE remains available when you have a
+Cloudflare OAuth client (`--client-id` / `CFCTL_OAUTH_CLIENT_ID`). Public cfctl
+OAuth is not the default until cfctl.io ownership and permanent promotion
+complete. The login emits an authorization URL; complete with the callback's
+one-time `STATE CODE` on stdin. Public clients never embed a client secret.
+
+An emergency global key can be imported from stdin, or from a mode-0600 file
+with `--value-in` when a wrapper such as `./cfctl` would route stdin through
+`cargo`. It is never selected silently:
 
 ```bash
 printf '%s' "$CLOUDFLARE_API_KEY" | \
@@ -102,6 +109,11 @@ printf '%s' "$CLOUDFLARE_API_KEY" | \
   --profile emergency-global \
   --email you@example.com \
   --stdin
+
+# or stdin-free:
+( umask 077; printf '%s' "$CLOUDFLARE_API_KEY" > key.tok )
+cfctl auth import-global-key --profile emergency-global --email you@example.com --value-in key.tok
+rm -f key.tok
 ```
 
 ## Read and change
@@ -118,9 +130,11 @@ cfctl call dns-records-for-a-zone-create-dns-record \
 evidence classes, blockers, safe next actions, and argv arrays. A blocked
 capability never receives a runnable `call_argv`; its post-resolution argv is
 clearly separated as a template. Token creation is exposed through the
-inventory-bound `keys mint` workflow rather than a direct create call;
-user-token creation remains blocked without an equivalent workflow and has no
-execution template.
+inventory-bound `keys mint` workflow rather than a direct create call.
+Account-owned tokens use the account permission inventory. User-owned tokens
+require `--user`, use the user permission inventory, and are constrained to one
+explicit `--account` resource; wildcard and arbitrary-resource policies are
+not accepted.
 
 A mutating `call` creates a hash-bound transaction plan. It does not write
 immediately. Review the plan and exact operation ID:
@@ -170,13 +184,15 @@ ownership receipt is hash-bound to the plan; missing access, cross-account
 targets, substituted responses, and ownership drift fail before mutation.
 
 `cfctl keys mint` validates every selected permission-group ID against a fresh,
-account-bound live inventory before it creates a plan. The plan binds only the
+owner-specific live inventory before it creates a plan. The plan binds only the
 normalized ID, name, category, and scopes for the selected groups plus the
-live-read evidence hash; it never copies arbitrary inventory fields. Execution
-repeats that read before durable consumption and rejects renamed, rescoped,
-missing, duplicate, cross-account, or widened policy input. Direct token-create
-calls and user-token minting remain blocked until they can carry the same
-least-privilege contract.
+live-read evidence hash; it never copies arbitrary inventory fields. Each
+selected group must explicitly support `com.cloudflare.api.account`, and the
+policy must target exactly the requested account. Execution repeats the same
+owner-specific inventory read before durable consumption and rejects renamed,
+rescoped, missing, duplicate, cross-account, wrong-owner, or widened policy
+input. Direct token-create calls cannot bypass this workflow. Use `--user` for
+a user-owned token; omission selects the account-owned endpoint.
 
 Access service tokens use separate, exactly allowlisted account- and zone-scoped
 creation lifecycles. Each accepts only `name` and optional `duration`, requires

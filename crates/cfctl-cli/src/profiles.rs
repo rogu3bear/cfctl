@@ -51,13 +51,24 @@ impl ProfilesConfig {
         let id = requested
             .or(self.current_profile.as_deref())
             .ok_or_else(|| {
-                CliError::Input("no active profile; run `cfctl auth login`".to_owned())
+                CliError::Input(
+                    "no active profile; run `cfctl auth import-api-token --account <id> --stdin` or `cfctl auth login --client-id <id>`"
+                        .to_owned(),
+                )
             })?;
         let profile = self
             .profiles
             .get(id)
             .ok_or_else(|| CliError::Input(format!("profile `{id}` does not exist")))?;
         ensure_supported_profile(profile)?;
+        // Every credential-using path goes through selected(); the emergency
+        // global-key lane must never become ambient current-profile authority.
+        if profile.kind == ProfileKind::GlobalKey && requested.is_none() {
+            return Err(CliError::Input(
+                "the emergency global-key profile is never selected implicitly; pass `--profile` explicitly"
+                    .to_owned(),
+            ));
+        }
         Ok(profile)
     }
 }

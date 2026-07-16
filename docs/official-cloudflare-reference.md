@@ -30,6 +30,12 @@ Docs access patterns worth remembering:
   https://developers.cloudflare.com/api/resources/accounts/subresources/tokens/methods/create/
 - Account token permission groups API:
   https://developers.cloudflare.com/api/resources/accounts/subresources/tokens/subresources/permission_groups/methods/list/
+- User token create API:
+  https://developers.cloudflare.com/api/resources/user/subresources/tokens/methods/create/
+- User token permission groups API:
+  https://developers.cloudflare.com/api/resources/user/subresources/tokens/subresources/permission_groups/methods/list/
+- API token permission scopes:
+  https://developers.cloudflare.com/fundamentals/api/reference/permissions/
 - Wrangler commands:
   https://developers.cloudflare.com/workers/wrangler/commands/
 - Wrangler configuration:

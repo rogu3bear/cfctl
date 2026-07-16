@@ -60,11 +60,27 @@ ownership from a profile label, workspace pin, or local IaC.
 
 ## Authentication
 
-Normal OAuth login uses a public client and PKCE:
+Day-to-day auth is a scoped API token imported out-of-band. Pipe it through
+stdin, or hand cfctl a mode-0600 file with `--value-in` when a build wrapper
+(such as the in-repo `./cfctl` shim, which routes stdin through `cargo`) would
+otherwise swallow stdin:
+
+```bash
+printf '%s' "$CLOUDFLARE_API_TOKEN" | \
+  cfctl auth import-api-token --account <account-id> --stdin --json
+
+# or, stdin-free (survives ./cfctl):
+( umask 077; printf '%s' "$CLOUDFLARE_API_TOKEN" > token.tok )
+cfctl auth import-api-token --account <account-id> --value-in token.tok --json
+rm -f token.tok
+```
+
+OAuth login (optional) uses PKCE and an explicit client id until public cfctl
+OAuth is promoted:
 
 ```bash
 cfctl auth login --profile default --client-id <client-id> \
-  --scope <scope-id> --account <account-id> --json
+  --account <account-id> --json
 ```
 
 Open the returned authorization URL, then pipe the callback's one-time
@@ -136,6 +152,22 @@ Mint planning repeats the live permission inventory and binds the exact group
 metadata and account-only resource policy. Running the approved plan repeats
 that inventory read before consumption; drift requires a new plan. Do not use
 generic `call` for account API-token creation.
+
+Mint a user-owned token for one explicit account with the parallel governed
+workflow:
+
+```bash
+cfctl keys permissions --user --account <account-id> --json
+cfctl keys mint --user --name <name> --permission <reviewed-group-id> \
+  --account <account-id> --ttl-hours <hours> \
+  --value-out /new/secure/path --json
+```
+
+The `--user` flag changes token ownership and the permission-inventory
+endpoint, not the policy scope: every selected group must declare account scope
+and the policy remains pinned to the one `--account` value. Use the same flag
+for `keys rotate` and `keys revoke`; those plans select the user token endpoint
+while preserving the explicit account authority context.
 
 Create an Access service token through its separate exact account or zone
 lifecycle. The input is intentionally limited to `name` and optional

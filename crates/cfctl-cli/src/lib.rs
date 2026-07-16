@@ -50,6 +50,7 @@ pub enum AuthCommand {
     Profiles,
     Use(ProfileSelector),
     Logout(ProfileSelector),
+    ImportApiToken(ImportApiTokenArgs),
     ImportGlobalKey(ImportGlobalKeyArgs),
 }
 
@@ -57,8 +58,12 @@ pub enum AuthCommand {
 pub struct AuthLoginArgs {
     #[arg(long, default_value = "default")]
     pub profile: String,
-    #[arg(long, env = "CFCTL_OAUTH_CLIENT_ID")]
-    pub client_id: String,
+    #[arg(
+        long,
+        env = "CFCTL_OAUTH_CLIENT_ID",
+        help = "Cloudflare OAuth client id (required for OAuth; until public cfctl OAuth is promoted, prefer `auth import-api-token`)"
+    )]
+    pub client_id: Option<String>,
     #[arg(long = "scope", value_delimiter = ',')]
     pub scopes: Vec<String>,
     #[arg(long)]
@@ -74,6 +79,28 @@ pub struct ProfileSelector {
 }
 
 #[derive(Debug, Args)]
+pub struct ImportApiTokenArgs {
+    #[arg(long, default_value = "default")]
+    pub profile: String,
+    #[arg(
+        long,
+        help = "Pin the account this token is allowed to operate on; ambiguous multi-account selection fails closed"
+    )]
+    pub account: String,
+    #[arg(
+        long,
+        help = "Read the API token from stdin; values in command arguments are forbidden"
+    )]
+    pub stdin: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Read the API token from a mode-0600 file instead of stdin; avoids piping secrets through a build wrapper such as `./cfctl`"
+    )]
+    pub value_in: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 pub struct ImportGlobalKeyArgs {
     #[arg(long, default_value = "emergency-global")]
     pub profile: String,
@@ -84,6 +111,12 @@ pub struct ImportGlobalKeyArgs {
         help = "Read the key from stdin; values in command arguments are forbidden"
     )]
     pub stdin: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Read the global key from a mode-0600 file instead of stdin; avoids piping secrets through a build wrapper such as `./cfctl`"
+    )]
+    pub value_in: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -102,12 +135,22 @@ pub enum KeysCommand {
 
 #[derive(Debug, Args)]
 pub struct KeyPermissionArgs {
+    #[arg(
+        long,
+        help = "Read the user-owned token permission inventory; --account remains the explicit resource and authority context"
+    )]
+    pub user: bool,
     #[arg(long)]
     pub account: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct KeyMutationArgs {
+    #[arg(
+        long,
+        help = "Create a user-owned token scoped to the explicit --account resource"
+    )]
+    pub user: bool,
     #[arg(long)]
     pub name: String,
     #[arg(long = "permission")]
@@ -122,6 +165,11 @@ pub struct KeyMutationArgs {
 
 #[derive(Debug, Args)]
 pub struct KeyRevokeArgs {
+    #[arg(
+        long,
+        help = "Revoke a user-owned token instead of an account-owned token"
+    )]
+    pub user: bool,
     #[arg(long)]
     pub id: String,
     #[arg(long)]
@@ -130,6 +178,11 @@ pub struct KeyRevokeArgs {
 
 #[derive(Debug, Args)]
 pub struct KeyRotateArgs {
+    #[arg(
+        long,
+        help = "Rotate a user-owned token instead of an account-owned token"
+    )]
+    pub user: bool,
     #[arg(long)]
     pub id: String,
     #[arg(long)]
