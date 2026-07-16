@@ -8114,11 +8114,30 @@ fn catalog_is_stale(store: &StateStore) -> bool {
 }
 
 fn http_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(120))
-        .user_agent(concat!("cfctl/", env!("CARGO_PKG_VERSION")))
-        .build()?)
+        .user_agent(concat!("cfctl/", env!("CARGO_PKG_VERSION")));
+    // IP-allowlisted API tokens (e.g. a laptop-pinned minter) are usually
+    // scoped to the machine's IPv4. When the host default-routes over IPv6,
+    // Cloudflare rejects the call with error 9109 ("Cannot use the access
+    // token from location: <IPv6>"). `CFCTL_FORCE_IPV4=1` binds egress to an
+    // IPv4 source so those tokens work — including unattended (launchd) runs
+    // that can't fall back to an interactive `curl -4`.
+    if force_ipv4_egress() {
+        builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    }
+    Ok(builder.build()?)
+}
+
+/// True when `CFCTL_FORCE_IPV4` is set to an affirmative value. Off by default
+/// so IPv6-only hosts and non-allowlisted tokens are unaffected.
+fn force_ipv4_egress() -> bool {
+    force_ipv4_from(std::env::var("CFCTL_FORCE_IPV4").ok().as_deref())
+}
+
+fn force_ipv4_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "yes" | "on"))
 }
 
 fn configured_agent() -> Result<AgentKind> {
@@ -8270,10 +8289,10 @@ mod tests {
         apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
         bind_required_empty_compensation_body, boundary_response_artifact, call_command,
         capability_call_argv, compensation_request, execute_read, find_secret_value,
-        guide_document, is_live_plan_precondition_hash, is_secret_output_capability,
-        non_readback_verification_basis, persist_prepared_plan, persist_secret_lifecycle,
-        preflight_call_input, preserve_previous_catalog, query_object_from_pairs,
-        read_import_secret, read_secret_file, redact_secret_result,
+        force_ipv4_from, guide_document, http_client, is_live_plan_precondition_hash,
+        is_secret_output_capability, non_readback_verification_basis, persist_prepared_plan,
+        persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
+        query_object_from_pairs, read_import_secret, read_secret_file, redact_secret_result,
         required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -11998,6 +12017,27 @@ mod tests {
         let both =
             read_import_secret(true, Some(&path), "API token").expect_err("two sources rejected");
         assert!(both.to_string().contains("not both"), "{both}");
+    }
+
+    #[test]
+    fn force_ipv4_flag_parses_affirmative_values_only() {
+        for on in ["1", "true", "yes", "on"] {
+            assert!(force_ipv4_from(Some(on)), "{on} should enable IPv4");
+        }
+        for off in [Some("0"), Some("false"), Some(""), None] {
+            assert!(!force_ipv4_from(off), "{off:?} should not enable IPv4");
+        }
+    }
+
+    #[test]
+    fn http_client_builds_in_both_egress_modes() {
+        // Default builder is valid.
+        http_client().expect("default client builds");
+        // The IPv4-bound builder is also valid (binds a v4 source address).
+        reqwest::Client::builder()
+            .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+            .build()
+            .expect("ipv4-bound client builds");
     }
 
     #[cfg(unix)]
