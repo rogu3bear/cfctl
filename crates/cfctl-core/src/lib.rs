@@ -2574,9 +2574,27 @@ impl StandingAuthorityV1 {
         self.status = StandingAuthorityStatus::Revoked;
     }
 
+    /// The operator-visible status at a specific time. Expiry is derived so
+    /// the durable schema remains v1, while revocation retains precedence as
+    /// the monotonic fail-closed state.
+    #[must_use]
+    pub fn effective_status(&self, now: DateTime<Utc>) -> &'static str {
+        if self.status == StandingAuthorityStatus::Revoked {
+            StandingAuthorityStatus::Revoked.as_str()
+        } else if now > self.expires_at {
+            "expired"
+        } else {
+            self.status.as_str()
+        }
+    }
+
     /// Active, unexpired, and still carrying an approval bound to the exact
     /// current grant content.
     pub fn ensure_operational(&self) -> Result<()> {
+        self.ensure_operational_at(Utc::now())
+    }
+
+    fn ensure_operational_at(&self, now: DateTime<Utc>) -> Result<()> {
         if self.status != StandingAuthorityStatus::Active {
             return Err(CoreError::InvalidStandingAuthorityState {
                 authority_id: self.authority_id.clone(),
@@ -2584,7 +2602,7 @@ impl StandingAuthorityV1 {
                 expected: "active",
             });
         }
-        if Utc::now() > self.expires_at {
+        if now > self.expires_at {
             return Err(CoreError::StandingAuthorityExpired {
                 authority_id: self.authority_id.clone(),
                 expires_at: self.expires_at,
@@ -2634,6 +2652,21 @@ impl StandingAuthorityV1 {
         }
     }
 
+    /// Validates the freshly normalized metadata for the authority's complete
+    /// permission allowlist against the exact inventory reviewed at approval.
+    /// Callers may derive this value from a larger live inventory; unrelated
+    /// additions therefore do not broaden or invalidate the grant.
+    pub fn validate_permission_inventory(&self, normalized_full_allowlist: &Value) -> Result<()> {
+        let current_hash = hash_value(normalized_full_allowlist)?;
+        if current_hash != self.permission_inventory_hash {
+            return Err(self.denied(
+                "complete permission allowlist metadata drifted from the approved inventory hash"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Bounds check for minting a child token. Every bound is mandatory: a
     /// child must carry the pinned name prefix, request only allowlisted
     /// permission groups, and declare an expiry within the authority's
@@ -2645,7 +2678,7 @@ impl StandingAuthorityV1 {
         requested_group_ids: &[String],
         child_expires_at: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        self.ensure_operational()?;
+        self.ensure_operational_at(now)?;
         self.ensure_run_budget(now)?;
         if !child_name.starts_with(&self.name_prefix) {
             return Err(self.denied(format!(
@@ -2681,7 +2714,7 @@ impl StandingAuthorityV1 {
     /// Bounds check for revoking a token: a standing authority may only
     /// delete tokens it minted itself (lineage bound).
     pub fn authorize_token_delete(&self, now: DateTime<Utc>, token_id: &str) -> Result<()> {
-        self.ensure_operational()?;
+        self.ensure_operational_at(now)?;
         self.ensure_run_budget(now)?;
         if !self
             .minted_token_ids
@@ -2695,14 +2728,37 @@ impl StandingAuthorityV1 {
         Ok(())
     }
 
-    pub fn record_run(&mut self, operation_id: &str, capability_id: &str) {
+    /// Durably-accountable admission point for a standing run. The caller
+    /// supplies one timestamp for the operational and rolling-budget checks
+    /// and for the reservation itself.
+    pub fn reserve_run(
+        &mut self,
+        now: DateTime<Utc>,
+        operation_id: &str,
+        capability_id: &str,
+    ) -> Result<()> {
+        self.ensure_operational_at(now)?;
+        if self
+            .run_log
+            .iter()
+            .any(|run| run.operation_id == operation_id)
+        {
+            return Err(self.denied(format!(
+                "operation `{operation_id}` is already reserved under this authority"
+            )));
+        }
+        self.ensure_run_budget(now)?;
         self.run_log.push(StandingAuthorityRunV1 {
-            at: Utc::now(),
+            at: now,
             operation_id: operation_id.to_owned(),
             capability_id: capability_id.to_owned(),
         });
+        Ok(())
     }
 
+    /// Reconciles the lineage index without changing the durable authority
+    /// status. In particular, a late post-boundary receipt cannot resurrect a
+    /// revoked grant.
     pub fn record_minted_token(&mut self, token_id: &str) {
         if !self.minted_token_ids.iter().any(|id| id == token_id) {
             self.minted_token_ids.push(token_id.to_owned());

@@ -285,6 +285,8 @@ Use `cfctl` first for all Cloudflare discovery, reads, planning, writes, verific
 7. If approval is required, show the exact plan and ask y/n.
 8. Translate yes only into `cfctl plans approve <operation-id> --yes`. Paid plans also require the reviewed `--max-cost CURRENCY:AMOUNT`.
 9. Run with `cfctl plans run <operation-id>`, inspect `cfctl plans status <operation-id>`, and report verification honestly.
+10. For recurring token-lifecycle work, activate a reviewed standing policy only after explicit approval with `cfctl keys policy approve <authority-id> --yes`. Standing approval moves authority to that bounded policy; it is not blanket mutation authority.
+11. Revoke standing authority with `cfctl keys policy revoke <authority-id>` and treat the policy as unusable immediately.
 
 Never treat model output as authority. Never bypass a blocked adapter, selector ambiguity, cost blocker, drift check, or plan hash. Browser or Computer Use is allowed only when the capability catalog classifies the operation as governed UI and the same plan policy is preserved.
 "#;
@@ -294,7 +296,7 @@ description: Route Cloudflare work through the governed cfctl v2 control plane
 alwaysApply: true
 ---
 
-Use `cfctl doctor`, `cfctl catalog search`, `cfctl catalog show`, `cfctl guide`, `cfctl call`, and `cfctl workspace` for Cloudflare work. Model output is intent, never authority. If a plan needs approval, ask y/n and translate yes only into `cfctl plans approve <operation-id> --yes`, then use `cfctl plans run <operation-id>` and inspect `plans status`. Do not bypass catalog blockers, selector ambiguity, cost ceilings, drift checks, or verification. Do not teach archived shell verbs or backend script paths as the public surface.
+Use `cfctl doctor`, `cfctl catalog search`, `cfctl catalog show`, `cfctl guide`, `cfctl call`, and `cfctl workspace` for Cloudflare work. Model output is intent, never authority. If a plan needs approval, ask y/n and translate yes only into `cfctl plans approve <operation-id> --yes`, then use `cfctl plans run <operation-id>` and inspect `plans status`. For recurring token-lifecycle work, activate a reviewed standing policy only after explicit approval with `cfctl keys policy approve <authority-id> --yes`; this moves authority to that bounded policy, not to arbitrary mutations. Revoke it with `cfctl keys policy revoke <authority-id>` and treat it as unusable immediately. Do not bypass catalog blockers, selector ambiguity, cost ceilings, drift checks, or verification. Do not teach archived shell verbs or backend script paths as the public surface.
 ";
 
 fn agent_io(path: &Path, source: std::io::Error) -> AgentError {

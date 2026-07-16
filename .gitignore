@@ -40,6 +40,7 @@ LAYERS.md
 NUANCE.md
 .agent-context-stack
 .agents/
+.agent/
 .claude/
 *.local.md
 target/

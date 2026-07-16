@@ -227,6 +227,7 @@ fn standing_policy_verbs_parse_and_under_policy_rides_mint_and_revoke() {
 #[test]
 fn standing_runs_fail_closed_before_any_network_when_the_authority_is_missing() {
     let runtime = tempfile::tempdir().expect("runtime root");
+    let missing_authority_id = "00000000-0000-4000-8000-000000000001";
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
         .env("CFCTL_HOME", runtime.path())
         .args([
@@ -241,7 +242,7 @@ fn standing_runs_fail_closed_before_any_network_when_the_authority_is_missing() 
             "--value-out",
             "/tmp/never-written.tok",
             "--under-policy",
-            "ghost",
+            missing_authority_id,
             "--json",
         ])
         .output()
@@ -252,7 +253,9 @@ fn standing_runs_fail_closed_before_any_network_when_the_authority_is_missing() 
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("standing authority `ghost` does not exist"),
+        stderr.contains(&format!(
+            "standing authority `{missing_authority_id}` does not exist"
+        )),
         "missing authority must be the failure, got: {stderr}"
     );
 }
