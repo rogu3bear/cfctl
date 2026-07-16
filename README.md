@@ -311,10 +311,12 @@ cfctl agents install --all-detected
 cfctl agents doctor
 ```
 
-Natural language launches the configured agent once. The
-`CFCTL_AGENT_SESSION` marker prevents recursion. Agents translate intent into
-catalog searches and deterministic commands; model output never grants
-authority or directly mutates Cloudflare.
+Natural language launches the configured agent once. Quote it: a bare single
+token that is not a known command fails closed with a usage error and a
+did-you-mean — a typo is never an agent launch. The `CFCTL_AGENT_SESSION`
+marker prevents recursion. Agents translate intent into catalog searches and
+deterministic commands; model output never grants authority or directly
+mutates Cloudflare.
 
 Browser or Computer Use is available only for cataloged `governed_ui`
 capabilities after API/CLI coverage cannot finish the task. UI actions bind the

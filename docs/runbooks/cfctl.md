@@ -285,6 +285,8 @@ cfctl "<natural-language Cloudflare request>"
 
 Natural language launches one configured local agent. The agent must translate
 intent to deterministic commands; it cannot approve or directly mutate state.
+Quote natural language: a bare single token that is not a known command fails
+closed with a usage error instead of launching an agent.
 
 ## Local proof
 
