@@ -814,6 +814,7 @@ fn preflight_call_input(
     validate_cloudflare_tunnel_configuration_ingress(capability, &resolved)?;
     validate_warp_connector_configuration_semantics(capability, &resolved)?;
     validate_d1_database_create_semantics(capability, &resolved)?;
+    validate_worker_script_secret_semantics(capability, &resolved)?;
     Ok(())
 }
 
@@ -945,6 +946,80 @@ fn validate_warp_connector_configuration_semantics(
             return Err(CliError::Input(format!(
                 "unsupported WARP Connector HA mode `{mode}`"
             )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_worker_script_secret_semantics(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    if !is_worker_script_secret_input_only_capability(capability) {
+        return Ok(());
+    }
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input("Worker script secret input requires a JSON object body".to_owned())
+        })?;
+    let secret_type = body.get("type").and_then(Value::as_str).ok_or_else(|| {
+        CliError::Input("Worker script secret input requires string field `type`".to_owned())
+    })?;
+    let has_base64 = body.contains_key("key_base64");
+    let has_jwk = body.contains_key("key_jwk");
+    if has_base64 && has_jwk {
+        return Err(CliError::Input(
+            "Worker script secret_key input accepts exactly one key material field: `key_base64` or `key_jwk`"
+                .to_owned(),
+        ));
+    }
+    match secret_type {
+        "secret_text" => {
+            if body.get("text").and_then(Value::as_str).is_none() {
+                return Err(CliError::Input(
+                    "Worker script secret_text input requires string field `text`".to_owned(),
+                ));
+            }
+            if has_base64 || has_jwk {
+                return Err(CliError::Input(
+                    "Worker script secret_text accepts only `text`, never key material fields"
+                        .to_owned(),
+                ));
+            }
+        }
+        "secret_key" => {
+            let format = body.get("format").and_then(Value::as_str).ok_or_else(|| {
+                CliError::Input(
+                    "Worker script secret_key input requires string field `format`".to_owned(),
+                )
+            })?;
+            if format == "jwk" {
+                if !has_jwk || has_base64 {
+                    return Err(CliError::Input(
+                        "Worker script secret_key format `jwk` requires `key_jwk` and forbids `key_base64`"
+                            .to_owned(),
+                    ));
+                }
+            } else if matches!(format, "raw" | "pkcs8" | "spki") {
+                if !has_base64 || has_jwk {
+                    return Err(CliError::Input(format!(
+                        "Worker script secret_key format `{format}` requires `key_base64` and forbids `key_jwk`"
+                    )));
+                }
+            } else {
+                return Err(CliError::Input(
+                    "Worker script secret_key format must be one of `raw`, `pkcs8`, `spki`, or `jwk`"
+                        .to_owned(),
+                ));
+            }
+        }
+        _ => {
+            return Err(CliError::Input(
+                "Worker script secret type must be `secret_text` or `secret_key`".to_owned(),
+            ));
         }
     }
     Ok(())
@@ -6205,7 +6280,16 @@ async fn execute_api_plan(
             ApiBoundaryResponseOutcome::Recovery(envelope) => return Ok(envelope),
         };
     let performed = response.success;
-    let verification = match verify_api_plan(store, &executor, plan, &response, credential).await {
+    let verification = match verify_api_plan(
+        store,
+        &executor,
+        plan,
+        &response,
+        execution_input,
+        credential,
+    )
+    .await
+    {
         Ok(verification) => verification,
         Err(error) => {
             return Ok(post_boundary_failure_envelope(
@@ -6258,7 +6342,7 @@ fn process_api_boundary_response(
     secrets: &dyn SecretStore,
 ) -> Result<ApiBoundaryResponseOutcome> {
     let mut response_value = serde_json::to_value(response)?;
-    if is_secret_output_plan(plan) {
+    if should_redact_secret_response(&plan.capability) {
         response_value = redact_secret_result(&response_value);
     }
     let mut failures = Vec::new();
@@ -6683,6 +6767,7 @@ async fn verify_api_plan(
     executor: &Executor,
     plan: &mut PlanV1,
     response: &CloudflareResponseV1,
+    execution_input: &CallInput,
     credential: &AuthCredential,
 ) -> Result<ApiVerificationOutcome> {
     if !response.success {
@@ -6715,7 +6800,10 @@ async fn verify_api_plan(
         )?;
         return Ok(outcome);
     }
-    let outcome = match executor.verify_plan(plan, response, credential).await {
+    let outcome = match executor
+        .verify_plan_with_input(plan, response, execution_input, credential)
+        .await
+    {
         Ok(verification) => verification_outcome(store, plan, verification)?,
         Err(error) => verification_error_outcome(store, plan, &error)?,
     };
@@ -8668,7 +8756,7 @@ fn call_input(capability: &CapabilityV1, arguments: &CallArgs) -> Result<Prepare
     };
     let contains_secret = body
         .as_ref()
-        .is_some_and(|value| redact_json(value) != *value);
+        .is_some_and(|value| request_body_contains_secret(capability, value));
     if contains_secret && !arguments.body_stdin {
         return Err(CliError::Input(
             "secret-shaped request fields are accepted only through `--body-stdin`, never command arguments"
@@ -8685,6 +8773,15 @@ fn call_input(capability: &CapabilityV1, arguments: &CallArgs) -> Result<Prepare
         },
         secret_body: contains_secret.then_some(body).flatten(),
     })
+}
+
+fn request_body_contains_secret(capability: &CapabilityV1, body: &Value) -> bool {
+    redact_json(body) != *body
+        || body.as_object().is_some_and(|fields| {
+            fields
+                .keys()
+                .any(|field| capability.request_object_field_is_write_only(field))
+        })
 }
 
 fn query_object_from_pairs(capability: &CapabilityV1, pairs: &[(String, String)]) -> Result<Value> {
@@ -9697,8 +9794,27 @@ fn is_secret_output_plan(plan: &PlanV1) -> bool {
 }
 
 fn is_secret_output_capability(capability: &CapabilityV1) -> bool {
+    (capability.risk == RiskClass::SecretSensitive
+        && !is_worker_script_secret_input_only_capability(capability))
+        || is_access_service_token_create_capability(capability)
+}
+
+fn should_redact_secret_response(capability: &CapabilityV1) -> bool {
     capability.risk == RiskClass::SecretSensitive
         || is_access_service_token_create_capability(capability)
+}
+
+fn is_worker_script_secret_input_only_capability(capability: &CapabilityV1) -> bool {
+    capability.id == "worker-put-script-secret"
+        && capability.method == "PUT"
+        && capability.path == "/accounts/{account_id}/workers/scripts/{script_name}/secrets"
+        && capability.product == "Worker Script"
+        && capability.permissions == ["Workers Scripts Write"]
+        && capability.verification.strategy
+            == "worker_script_secret_reports_planned_name_and_type_after_put"
+        && capability.request_object_field_is_write_only("text")
+        && capability.request_object_field_is_write_only("key_base64")
+        && capability.request_object_field_is_write_only("key_jwk")
 }
 
 fn find_secret_value(value: &Value) -> Option<&str> {
@@ -9745,7 +9861,14 @@ fn redact_secret_payload(value: &Value, root: bool) -> Value {
                 .map(|(key, item)| {
                     if matches!(
                         key.as_str(),
-                        "value" | "token" | "secret" | "access_token" | "client_secret"
+                        "value"
+                            | "token"
+                            | "secret"
+                            | "access_token"
+                            | "client_secret"
+                            | "text"
+                            | "key_base64"
+                            | "key_jwk"
                     ) {
                         (key.clone(), Value::String("[SUNK]".to_owned()))
                     } else {
@@ -9958,7 +10081,7 @@ mod tests {
         preflight_call_input, preflight_standing_authority, preserve_previous_catalog,
         query_object_from_pairs, read_import_secret, read_secret_file,
         reconcile_standing_lineage_from_plan, rectify_plan, redact_secret_result,
-        required_cloudflare_tunnel_configuration_state_precondition,
+        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -9969,13 +10092,13 @@ mod tests {
         should_bind_d1_read_replication_state, should_bind_dns_record_state,
         should_bind_global_warp_override_state, should_bind_oauth_client_secret_state,
         should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
-        should_bind_zone_account, should_resolve_zone_entitlement, sink_secret_result,
-        store_imported_api_token, validate_api_token_creation_contract,
+        should_bind_zone_account, should_redact_secret_response, should_resolve_zone_entitlement,
+        sink_secret_result, store_imported_api_token, validate_api_token_creation_contract,
         validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
         validate_selected_permission_groups, validate_standing_authority_permission_inventory,
-        validate_zone_account_receipt_precondition, validated_standing_lineage_token_id,
-        workspace_resource_keys, zone_target,
+        validate_worker_script_secret_semantics, validate_zone_account_receipt_precondition,
+        validated_standing_lineage_token_id, workspace_resource_keys, zone_target,
     };
     use crate::profiles::ProfilesConfig;
     use crate::{
@@ -10107,6 +10230,154 @@ mod tests {
         };
         catalog.refresh_hash().expect("catalog hash");
         catalog
+    }
+
+    fn workers_secret_input_capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            "worker-put-script-secret",
+            "Add script secret",
+            "PUT",
+            "/accounts/{account_id}/workers/scripts/{script_name}/secrets",
+        );
+        "Worker Script".clone_into(&mut capability.product);
+        capability.permissions = vec!["Workers Scripts Write".to_owned()];
+        capability.risk = RiskClass::SecretSensitive;
+        "worker_script_secret_reports_planned_name_and_type_after_put"
+            .clone_into(&mut capability.verification.strategy);
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "oneOf":[
+                {
+                    "type":"object",
+                    "required":["name","type","text"],
+                    "properties":{
+                        "name":{"type":"string"},
+                        "type":{"type":"string","enum":["secret_text"]},
+                        "text":{"type":"string","writeOnly":true}
+                    }
+                },
+                {
+                    "type":"object",
+                    "required":["name","type","format","algorithm","usages"],
+                    "properties":{
+                        "name":{"type":"string"},
+                        "type":{"type":"string","enum":["secret_key"]},
+                        "format":{"type":"string","enum":["raw","pkcs8","spki","jwk"]},
+                        "algorithm":{"type":"object"},
+                        "usages":{"type":"array","items":{"type":"string"}},
+                        "key_base64":{"type":"string","writeOnly":true},
+                        "key_jwk":{"type":"object","writeOnly":true}
+                    }
+                }
+            ],
+            "x-cfctl-body-required":true
+        }));
+        capability
+    }
+
+    #[test]
+    fn workers_secret_inputs_are_schema_detected_without_becoming_secret_outputs() {
+        let capability = workers_secret_input_capability();
+        let body = json!({
+            "name":"DATABASE_TOKEN",
+            "type":"secret_text",
+            "text":"not-detected-by-generic-key-redaction"
+        });
+
+        assert!(request_body_contains_secret(&capability, &body));
+        assert!(!is_secret_output_capability(&capability));
+        assert!(should_redact_secret_response(&capability));
+        assert_eq!(secret_sink_format(&capability), None);
+        let argv = capability_call_argv(&capability);
+        assert!(argv.iter().any(|argument| argument == "--body-stdin"));
+        assert!(!argv.iter().any(|argument| argument == "--value-out"));
+
+        let mut ordinary = CapabilityV1::new(
+            "workers-update-description",
+            "Update description",
+            "PUT",
+            "/accounts/{account_id}/workers/scripts/{script_name}",
+        );
+        ordinary.request_schema = Some(json!({
+            "type":"object",
+            "properties":{"text":{"type":"string"}}
+        }));
+        assert!(!request_body_contains_secret(
+            &ordinary,
+            &json!({"text":"ordinary public text"})
+        ));
+    }
+
+    #[test]
+    fn workers_secret_key_material_matches_the_declared_format() {
+        let capability = workers_secret_input_capability();
+        for body in [
+            json!({"name":"TOKEN","type":"secret_text","text":"value"}),
+            json!({"name":"KEY","type":"secret_key","format":"raw","algorithm":{},"usages":["sign"],"key_base64":"dmFsdWU="}),
+            json!({"name":"KEY","type":"secret_key","format":"jwk","algorithm":{},"usages":["sign"],"key_jwk":{"kty":"oct","k":"dmFsdWU"}}),
+        ] {
+            validate_worker_script_secret_semantics(
+                &capability,
+                &CallInput {
+                    body: Some(body),
+                    ..CallInput::default()
+                },
+            )
+            .expect("valid secret input");
+        }
+
+        for (body, expected) in [
+            (
+                json!({"name":"TOKEN","type":"secret_text","text":"value","key_base64":"dmFsdWU="}),
+                "secret_text accepts only `text`",
+            ),
+            (
+                json!({"name":"KEY","type":"secret_key","format":"jwk","algorithm":{},"usages":["sign"],"key_base64":"dmFsdWU="}),
+                "format `jwk` requires `key_jwk`",
+            ),
+            (
+                json!({"name":"KEY","type":"secret_key","format":"raw","algorithm":{},"usages":["sign"],"key_jwk":{"kty":"oct"}}),
+                "format `raw` requires `key_base64`",
+            ),
+            (
+                json!({"name":"KEY","type":"secret_key","format":"raw","algorithm":{},"usages":["sign"],"key_base64":"dmFsdWU=","key_jwk":{"kty":"oct"}}),
+                "exactly one key material field",
+            ),
+        ] {
+            let error = validate_worker_script_secret_semantics(
+                &capability,
+                &CallInput {
+                    body: Some(body),
+                    ..CallInput::default()
+                },
+            )
+            .expect_err("invalid key material must fail before planning")
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("dmFsdWU"));
+        }
+    }
+
+    #[test]
+    fn workers_secret_response_redaction_defensively_covers_input_field_names() {
+        let response = json!({
+            "success":true,
+            "result":{
+                "name":"DATABASE_TOKEN",
+                "type":"secret_text",
+                "text":"unexpected-text-echo",
+                "key_base64":"unexpected-key-echo",
+                "key_jwk":{"k":"unexpected-jwk-echo"}
+            }
+        });
+
+        let redacted = redact_secret_result(&response);
+        assert_eq!(redacted["result"]["name"], "DATABASE_TOKEN");
+        assert_eq!(redacted["result"]["type"], "secret_text");
+        assert_eq!(redacted["result"]["text"], "[SUNK]");
+        assert_eq!(redacted["result"]["key_base64"], "[SUNK]");
+        assert_eq!(redacted["result"]["key_jwk"], "[SUNK]");
+        assert!(!redacted.to_string().contains("unexpected"));
     }
 
     fn global_warp_override_capability() -> CapabilityV1 {

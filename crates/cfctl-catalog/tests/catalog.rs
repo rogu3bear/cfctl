@@ -528,6 +528,315 @@ fn r2_bucket_create_classifier_rejects_permission_request_response_and_readback_
     );
 }
 
+fn workers_script_secret_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "oneOf": [
+            {
+                "type": "object",
+                "required": ["name", "type", "text"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "type": {"type": "string", "enum": ["secret_text"]},
+                    "text": {"type": "string", "writeOnly": true}
+                }
+            },
+            {
+                "type": "object",
+                "required": ["name", "type", "format", "algorithm", "usages"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "type": {"type": "string", "enum": ["secret_key"]},
+                    "format": {"type": "string", "enum": ["raw", "pkcs8", "spki", "jwk"]},
+                    "algorithm": {"type": "object"},
+                    "usages": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["encrypt", "decrypt", "sign", "verify", "deriveKey", "deriveBits", "wrapKey", "unwrapKey"]}
+                    },
+                    "key_base64": {"type": "string", "writeOnly": true},
+                    "key_jwk": {"type": "object", "writeOnly": true}
+                }
+            }
+        ]
+    })
+}
+
+fn workers_script_secret_result_schema(secret_schema: Value) -> Value {
+    json!({
+        "type": "object",
+        "required": ["success"],
+        "properties": {
+            "success": {"type": "boolean"},
+            "result": secret_schema
+        }
+    })
+}
+
+fn workers_script_secret_fixture() -> Value {
+    let account = json!({
+        "in": "path",
+        "name": "account_id",
+        "required": true,
+        "description": "Identifier.",
+        "schema": {"type": "string", "maxLength": 32}
+    });
+    let script = json!({
+        "in": "path",
+        "name": "script_name",
+        "required": true,
+        "description": "Name of the script, used in URLs and route configuration.",
+        "schema": {"type": "string"}
+    });
+    let secret_name = json!({
+        "in": "path",
+        "name": "secret_name",
+        "required": true,
+        "description": "A JavaScript variable name for the secret binding.",
+        "schema": {"type": "string"}
+    });
+    let url_encoded = json!({
+        "in": "query",
+        "name": "url_encoded",
+        "required": false,
+        "description": "Flag that indicates whether the secret name is URL encoded.",
+        "schema": {"type": "boolean"}
+    });
+    let secret_schema = workers_script_secret_request_schema();
+    let secret_result = workers_script_secret_result_schema(secret_schema.clone());
+    let empty_result = json!({
+        "type": "object",
+        "required": ["success"],
+        "properties": {
+            "success": {"type": "boolean"},
+            "result": {"type": "object"}
+        }
+    });
+    json!({
+        "openapi": "3.0.3",
+        "info": {"title": "Cloudflare API", "version": "4.0.0"},
+        "servers": [{"url": "https://api.cloudflare.com/client/v4"}],
+        "paths": {
+            "/accounts/{account_id}/workers/scripts/{script_name}/secrets": {
+                "put": {
+                    "operationId": "worker-put-script-secret",
+                    "summary": "Add script secret",
+                    "description": "Add a secret to a script.",
+                    "tags": ["Worker Script"],
+                    "x-api-token-group": ["Workers Scripts Write"],
+                    "parameters": [account.clone(), script.clone()],
+                    "requestBody": {"required": true, "content": {"application/json": {"schema": secret_schema}}},
+                    "responses": {"200": {"description": "Secret metadata", "content": {"application/json": {"schema": secret_result.clone()}}}}
+                }
+            },
+            "/accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}": {
+                "get": {
+                    "operationId": "worker-get-script-secret",
+                    "summary": "Get secret binding",
+                    "description": "Get a given secret binding (value omitted) on a script.",
+                    "tags": ["Worker Script"],
+                    "parameters": [account.clone(), script.clone(), secret_name.clone(), url_encoded.clone()],
+                    "responses": {"200": {"description": "Secret metadata", "content": {"application/json": {"schema": secret_result}}}}
+                },
+                "delete": {
+                    "operationId": "worker-delete-script-secret",
+                    "summary": "Delete script secret",
+                    "description": "Remove a secret from a script.",
+                    "tags": ["Worker Script"],
+                    "x-api-token-group": ["Workers Scripts Write"],
+                    "parameters": [account, script, secret_name, url_encoded],
+                    "responses": {"200": {"description": "Deleted", "content": {"application/json": {"schema": empty_result}}}}
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn workers_script_secret_put_and_delete_are_secret_safe_exact_lifecycles() {
+    let snapshot =
+        normalize_openapi(&workers_script_secret_fixture()).expect("Workers secret catalog");
+
+    let put = snapshot
+        .get("worker-put-script-secret")
+        .expect("secret put capability");
+    assert_eq!(
+        put.adapter_status,
+        AdapterStatus::DynamicApi,
+        "{:?}",
+        put.blocked_reason
+    );
+    assert_eq!(put.risk, RiskClass::SecretSensitive);
+    assert_eq!(put.effect, EffectClass::IdentityOrOwnership);
+    assert!(put.cost.known);
+    assert_eq!(put.cost.maximum, Some(0.0));
+    assert_eq!(put.cost.billing_model, BillingModelV1::Subscription);
+    assert_eq!(put.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(
+        put.verification.strategy,
+        "worker_script_secret_reports_planned_name_and_type_after_put"
+    );
+    assert!(!put.rollback.supported);
+    assert!(
+        put.rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("prior value") && warning.contains("cannot"))
+    );
+    assert!(put.request_object_field_is_write_only("text"));
+    assert!(put.request_object_field_is_write_only("key_base64"));
+    assert!(put.request_object_field_is_write_only("key_jwk"));
+    let put_read = put.same_path_read.as_ref().expect("exact secret readback");
+    assert_eq!(
+        put_read.path,
+        "/accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}"
+    );
+    assert_eq!(put_read.read_capability_id, "worker-get-script-secret");
+    assert_eq!(put_read.verified_response_fields, ["name", "type"]);
+    assert!(put.verification_contract_supported());
+    assert!(put.mutation_contract_gaps().is_empty());
+
+    let delete = snapshot
+        .get("worker-delete-script-secret")
+        .expect("secret delete capability");
+    assert_eq!(
+        delete.adapter_status,
+        AdapterStatus::DynamicApi,
+        "{:?}",
+        delete.blocked_reason
+    );
+    assert_eq!(delete.risk, RiskClass::Destructive);
+    assert_eq!(delete.effect, EffectClass::Irreversible);
+    assert!(delete.cost.known);
+    assert_eq!(delete.cost.maximum, Some(0.0));
+    assert_eq!(
+        delete.verification.strategy,
+        "same_resource_returns_not_found_after_delete"
+    );
+    assert!(
+        delete
+            .selectors
+            .iter()
+            .all(|selector| selector.location == "path")
+    );
+    let delete_read = delete
+        .same_path_read
+        .as_ref()
+        .expect("exact delete readback");
+    assert_eq!(delete_read.path, delete.path);
+    assert!(delete_read.verified_response_fields.is_empty());
+    assert!(!delete.rollback.supported);
+    assert!(
+        delete
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("secret value") && warning.contains("cannot"))
+    );
+    assert!(delete.verification_contract_supported());
+    assert!(delete.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn workers_script_secret_accepts_official_referenced_response_shape() {
+    let mut document = workers_script_secret_fixture();
+    let secret = document["paths"]
+        ["/accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}"]["get"]
+        ["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["result"]
+        .take();
+    document["components"] = json!({
+        "schemas": {
+            "ApiEnvelope": {
+                "type": "object",
+                "required": ["success"],
+                "properties": {"success": {"type": "boolean"}}
+            },
+            "WorkerSecret": secret
+        }
+    });
+    let response = json!({
+        "allOf": [
+            {"$ref": "#/components/schemas/ApiEnvelope"},
+            {
+                "type": "object",
+                "properties": {
+                    "result": {"$ref": "#/components/schemas/WorkerSecret"}
+                }
+            }
+        ]
+    });
+    document["paths"]["/accounts/{account_id}/workers/scripts/{script_name}/secrets"]["put"]["responses"]
+        ["200"]["content"]["application/json"]["schema"] = response.clone();
+    document["paths"]["/accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}"]
+        ["get"]["responses"]["200"]["content"]["application/json"]["schema"] = response;
+
+    let snapshot = normalize_openapi(&document).expect("official-shaped Workers secret catalog");
+    for capability_id in ["worker-put-script-secret", "worker-delete-script-secret"] {
+        let capability = snapshot.get(capability_id).expect("secret capability");
+        assert_eq!(
+            capability.adapter_status,
+            AdapterStatus::DynamicApi,
+            "{capability_id}: {:?}",
+            capability.blocked_reason
+        );
+        assert!(capability.verification_contract_supported());
+    }
+}
+
+#[test]
+fn workers_script_secret_classifier_rejects_permission_schema_and_readback_drift() {
+    let mut permission = workers_script_secret_fixture();
+    permission["paths"]["/accounts/{account_id}/workers/scripts/{script_name}/secrets"]["put"]["x-api-token-group"] =
+        json!(["Workers Scripts Read"]);
+    let snapshot = normalize_openapi(&permission).expect("permission-drifted catalog");
+    assert_eq!(
+        snapshot
+            .get("worker-put-script-secret")
+            .expect("put")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+
+    let mut secret_marker = workers_script_secret_fixture();
+    secret_marker["paths"]["/accounts/{account_id}/workers/scripts/{script_name}/secrets"]["put"]
+        ["requestBody"]["content"]["application/json"]["schema"]["oneOf"][0]
+        ["properties"]["text"]
+        .as_object_mut()
+        .expect("text schema")
+        .remove("writeOnly");
+    let snapshot = normalize_openapi(&secret_marker).expect("writeOnly-drifted catalog");
+    assert_eq!(
+        snapshot
+            .get("worker-put-script-secret")
+            .expect("put")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+
+    let mut readback = workers_script_secret_fixture();
+    readback["paths"]["/accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}"]
+        ["get"]["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["result"]
+        ["oneOf"][0]["properties"]
+        .as_object_mut()
+        .expect("readback properties")
+        .remove("type");
+    let snapshot = normalize_openapi(&readback).expect("readback-drifted catalog");
+    let put = snapshot.get("worker-put-script-secret").expect("put");
+    assert_eq!(put.adapter_status, AdapterStatus::Blocked);
+    assert!(put.same_path_read.is_none());
+
+    let mut response_leak = workers_script_secret_fixture();
+    response_leak["paths"]["/accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}"]
+        ["get"]["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["result"]
+        ["oneOf"][0]["properties"]["text"]
+        .as_object_mut()
+        .expect("response secret text schema")
+        .remove("writeOnly");
+    let snapshot = normalize_openapi(&response_leak).expect("response-leak catalog");
+    let put = snapshot.get("worker-put-script-secret").expect("put");
+    assert_eq!(put.adapter_status, AdapterStatus::Blocked);
+    assert!(put.same_path_read.is_none());
+}
+
 fn assert_nested_replication_schema(schema: &serde_json::Value) {
     assert_eq!(schema["properties"]["replication"]["type"], "object");
     assert_eq!(

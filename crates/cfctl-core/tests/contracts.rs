@@ -23,6 +23,98 @@ fn uncontracted_selector(name: &str, location: &str, value_type: &str) -> Select
     }
 }
 
+fn workers_secret_put_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "worker-put-script-secret",
+        "Add script secret",
+        "PUT",
+        "/accounts/{account_id}/workers/scripts/{script_name}/secrets",
+    );
+    "Worker Script".clone_into(&mut capability.product);
+    capability.permissions = vec!["Workers Scripts Write".to_owned()];
+    capability.selectors = [
+        ("account_id", json!({"maxLength":32,"type":"string"})),
+        ("script_name", json!({"type":"string"})),
+    ]
+    .into_iter()
+    .map(|(name, schema)| SelectorV1 {
+        name: name.to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: Some(SelectorContractV1 {
+            schema,
+            query: None,
+        }),
+    })
+    .collect();
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "oneOf":[
+            {
+                "type":"object",
+                "required":["name","type","text"],
+                "properties":{
+                    "name":{"type":"string"},
+                    "type":{"type":"string","enum":["secret_text"]},
+                    "text":{"type":"string","writeOnly":true}
+                }
+            },
+            {
+                "type":"object",
+                "required":["name","type","format","algorithm","usages"],
+                "properties":{
+                    "name":{"type":"string"},
+                    "type":{"type":"string","enum":["secret_key"]},
+                    "format":{"type":"string","enum":["raw","pkcs8","spki","jwk"]},
+                    "algorithm":{"type":"object"},
+                    "usages":{"type":"array","items":{"type":"string","enum":["encrypt","decrypt","sign","verify","deriveKey","deriveBits","wrapKey","unwrapKey"]}},
+                    "key_base64":{"type":"string","writeOnly":true},
+                    "key_jwk":{"type":"object","writeOnly":true}
+                }
+            }
+        ],
+        "x-cfctl-body-required":true
+    }));
+    "worker_script_secret_reports_planned_name_and_type_after_put"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}"
+            .to_owned(),
+        read_capability_id: "worker-get-script-secret".to_owned(),
+        verified_response_fields: vec!["name".to_owned(), "type".to_owned()],
+    });
+    capability
+}
+
+#[test]
+fn workers_secret_put_verifier_is_bound_to_exact_secret_safe_contract() {
+    let capability = workers_secret_put_capability();
+    assert!(capability.verification_contract_supported());
+
+    let mut wrong_read = capability.clone();
+    wrong_read
+        .same_path_read
+        .as_mut()
+        .expect("read contract")
+        .read_capability_id = "worker-list-script-secrets".to_owned();
+    assert!(!wrong_read.verification_contract_supported());
+
+    let mut leaked_text = capability.clone();
+    leaked_text.request_schema.as_mut().expect("request schema")["oneOf"][0]["properties"]["text"]
+        .as_object_mut()
+        .expect("text schema")
+        .remove("writeOnly");
+    assert!(!leaked_text.verification_contract_supported());
+
+    let mut extra_selector = capability;
+    extra_selector
+        .selectors
+        .push(uncontracted_selector("url_encoded", "query", "boolean"));
+    assert!(!extra_selector.verification_contract_supported());
+}
+
 #[test]
 fn every_capability_guide_has_the_exact_fifteen_lifecycle_stages() {
     let stages = guide_stages();

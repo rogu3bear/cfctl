@@ -718,9 +718,9 @@ impl CapabilityV1 {
                     )
             }
             "oauth_client_reports_rotated_secret_after_value_roll"
-            | "oauth_client_reports_no_rotated_secret_after_old_secret_delete" => {
-                oauth_client_secret_verification_contract_supported(self)
-                    && self.same_path_readback_selectors_supported()
+            | "oauth_client_reports_no_rotated_secret_after_old_secret_delete"
+            | "worker_script_secret_reports_planned_name_and_type_after_put" => {
+                secret_lifecycle_verification_contract_supported(self)
             }
             "access_service_token_reports_refreshed_expiration" => {
                 access_service_token_refresh_verification_contract_supported(self)
@@ -1222,6 +1222,20 @@ impl CapabilityV1 {
     }
 }
 
+fn secret_lifecycle_verification_contract_supported(capability: &CapabilityV1) -> bool {
+    match capability.verification.strategy.as_str() {
+        "oauth_client_reports_rotated_secret_after_value_roll"
+        | "oauth_client_reports_no_rotated_secret_after_old_secret_delete" => {
+            oauth_client_secret_verification_contract_supported(capability)
+                && capability.same_path_readback_selectors_supported()
+        }
+        "worker_script_secret_reports_planned_name_and_type_after_put" => {
+            worker_script_secret_put_verification_contract_supported(capability)
+        }
+        _ => false,
+    }
+}
+
 fn oauth_client_secret_verification_contract_supported(capability: &CapabilityV1) -> bool {
     let operation_supported = matches!(
         (
@@ -1258,6 +1272,70 @@ fn oauth_client_secret_verification_contract_supported(capability: &CapabilityV1
             read.path == "/accounts/{account_id}/oauth_clients/{oauth_client_id}"
                 && read.read_capability_id == "oauth-clients-get"
                 && read.verified_response_fields == ["client_id", "has_rotated_secret"]
+        })
+}
+
+fn worker_script_secret_put_verification_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "worker-put-script-secret"
+        && capability.method == "PUT"
+        && capability.product == "Worker Script"
+        && capability.account_scope == "account"
+        && capability.permissions == ["Workers Scripts Write"]
+        && capability.path == "/accounts/{account_id}/workers/scripts/{script_name}/secrets"
+        && capability.selectors.len() == 2
+        && [
+            (
+                "account_id",
+                serde_json::json!({"maxLength":32,"type":"string"}),
+            ),
+            ("script_name", serde_json::json!({"type":"string"})),
+        ]
+        .iter()
+        .all(|(name, schema)| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+                    && selector.contract.as_ref().is_some_and(|contract| {
+                        contract.schema == *schema && contract.query.is_none()
+                    })
+            })
+        })
+        && capability.request_schema.as_ref()
+            == Some(&serde_json::json!({
+                "type":"object",
+                "oneOf":[
+                    {
+                        "type":"object",
+                        "required":["name","type","text"],
+                        "properties":{
+                            "name":{"type":"string"},
+                            "type":{"type":"string","enum":["secret_text"]},
+                            "text":{"type":"string","writeOnly":true}
+                        }
+                    },
+                    {
+                        "type":"object",
+                        "required":["name","type","format","algorithm","usages"],
+                        "properties":{
+                            "name":{"type":"string"},
+                            "type":{"type":"string","enum":["secret_key"]},
+                            "format":{"type":"string","enum":["raw","pkcs8","spki","jwk"]},
+                            "algorithm":{"type":"object"},
+                            "usages":{"type":"array","items":{"type":"string","enum":["encrypt","decrypt","sign","verify","deriveKey","deriveBits","wrapKey","unwrapKey"]}},
+                            "key_base64":{"type":"string","writeOnly":true},
+                            "key_jwk":{"type":"object","writeOnly":true}
+                        }
+                    }
+                ],
+                "x-cfctl-body-required":true
+            }))
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path
+                == "/accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}"
+                && read.read_capability_id == "worker-get-script-secret"
+                && read.verified_response_fields == ["name", "type"]
         })
 }
 

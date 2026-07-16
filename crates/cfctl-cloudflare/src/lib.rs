@@ -383,47 +383,68 @@ impl Executor {
         apply_response: &CloudflareResponseV1,
         credential: &AuthCredential,
     ) -> Result<OperationVerificationV1> {
-        let strategy = plan.capability.verification.strategy.as_str();
         let input: CallInput = serde_json::from_value(plan.input.clone())
             .map_err(cfctl_core::CoreError::Serialization)?;
-        validate_verification_preconditions(&plan.capability, &input)?;
+        self.verify_plan_with_input(plan, apply_response, &input, credential)
+            .await
+    }
+
+    /// Runs the operation-specific verifier with the exact execution input
+    /// already validated by the caller. This lane is required for secret
+    /// request bodies because the durable plan contains only a hash-bound
+    /// credential-store reference, never the value-bearing body.
+    pub async fn verify_plan_with_input(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let strategy = plan.capability.verification.strategy.as_str();
+        validate_verification_preconditions(&plan.capability, input)?;
         if strategy.starts_with("api_token_details_") {
             return self
-                .verify_api_token(plan, apply_response, &input, credential)
+                .verify_api_token(plan, apply_response, input, credential)
                 .await;
         }
 
         if strategy.starts_with("dns_record_details_") {
             return self
-                .verify_dns_record(plan, apply_response, &input, credential)
+                .verify_dns_record(plan, apply_response, input, credential)
                 .await;
         }
 
         if strategy.starts_with("oauth_client_") {
             return self
-                .verify_oauth_client_secret_rotation(plan, apply_response, &input, credential)
+                .verify_oauth_client_secret_rotation(plan, apply_response, input, credential)
+                .await;
+        }
+
+        if strategy == "worker_script_secret_reports_planned_name_and_type_after_put" {
+            return self
+                .verify_worker_script_secret_put(plan, apply_response, input, credential)
                 .await;
         }
 
         if strategy == "access_service_token_reports_refreshed_expiration" {
             return self
-                .verify_access_service_token_refresh(plan, apply_response, &input, credential)
+                .verify_access_service_token_refresh(plan, apply_response, input, credential)
                 .await;
         }
 
         if is_delete_verifier(strategy) {
             return self
-                .verify_resource_delete(plan, apply_response, &input, credential)
+                .verify_resource_delete(plan, apply_response, input, credential)
                 .await;
         }
         if is_update_verifier(strategy) {
             return self
-                .verify_resource_update(plan, apply_response, &input, credential)
+                .verify_resource_update(plan, apply_response, input, credential)
                 .await;
         }
         if is_create_verifier(strategy) {
             return self
-                .verify_resource_create(plan, apply_response, &input, credential)
+                .verify_resource_create(plan, apply_response, input, credential)
                 .await;
         }
 
@@ -471,6 +492,76 @@ impl Executor {
         let (passed, basis) = evaluate_token_readback(expectation, &token_id, &readback);
         Ok(OperationVerificationV1 {
             strategy: strategy.to_owned(),
+            passed,
+            basis,
+            readback,
+        })
+    }
+
+    async fn verify_worker_script_secret_put(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let target = plan.capability.same_path_read.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the hash-bound Worker script secret readback contract is absent".to_owned(),
+            )
+        })?;
+        let body = input
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the planned Worker script secret body is absent or not an object".to_owned(),
+                )
+            })?;
+        let secret_name = body.get("name").and_then(Value::as_str).ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the planned Worker script secret name is absent".to_owned(),
+            )
+        })?;
+        let secret_type = body.get("type").and_then(Value::as_str).ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the planned Worker script secret type is absent".to_owned(),
+            )
+        })?;
+        let mut selectors = input.selectors.as_object().cloned().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the planned Worker script selectors are not an object".to_owned(),
+            )
+        })?;
+        selectors.insert(
+            "secret_name".to_owned(),
+            Value::String(secret_name.to_owned()),
+        );
+        let details = same_path_verification_capability(
+            &plan.capability,
+            &target.read_capability_id,
+            "Worker script secret verification readback",
+            &target.path,
+        );
+        let request = self.builder.build(
+            &details,
+            &CallInput {
+                selectors: Value::Object(selectors),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let (passed, basis) = evaluate_worker_script_secret_put_readback(
+            secret_name,
+            secret_type,
+            apply_response,
+            &readback,
+        );
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
             passed,
             basis,
             readback,
@@ -2000,6 +2091,42 @@ fn evaluate_oauth_client_secret_readback(
     }
 }
 
+fn evaluate_worker_script_secret_put_readback(
+    planned_name: &str,
+    planned_type: &str,
+    apply_response: &CloudflareResponseV1,
+    readback: &CloudflareResponseV1,
+) -> (bool, String) {
+    let apply_name_matches =
+        apply_response.result.get("name").and_then(Value::as_str) == Some(planned_name);
+    let apply_type_matches =
+        apply_response.result.get("type").and_then(Value::as_str) == Some(planned_type);
+    let readback_name_matches =
+        readback.result.get("name").and_then(Value::as_str) == Some(planned_name);
+    let readback_type_matches =
+        readback.result.get("type").and_then(Value::as_str) == Some(planned_type);
+    let passed = apply_response.status == 200
+        && apply_response.success
+        && apply_name_matches
+        && apply_type_matches
+        && readback.status == 200
+        && readback.success
+        && readback_name_matches
+        && readback_type_matches;
+    let basis = format!(
+        "Worker script secret proof (apply HTTP {}, apply success={}, apply name matches={}, apply type matches={}, readback HTTP {}, readback success={}, readback name matches={}, readback type matches={})",
+        apply_response.status,
+        apply_response.success,
+        apply_name_matches,
+        apply_type_matches,
+        readback.status,
+        readback.success,
+        readback_name_matches,
+        readback_type_matches
+    );
+    (passed, basis)
+}
+
 fn evaluate_access_service_token_refresh_readback(
     service_token_id: &str,
     apply_response: &CloudflareResponseV1,
@@ -2062,6 +2189,9 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
     ) {
         return validate_oauth_client_secret_target(capability, input);
     }
+    if strategy == "worker_script_secret_reports_planned_name_and_type_after_put" {
+        return validate_worker_script_secret_put_target(capability, input);
+    }
     if strategy == "access_service_token_reports_refreshed_expiration" {
         return validate_access_service_token_refresh_target(capability, input);
     }
@@ -2111,6 +2241,69 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
         }
         _ => Ok(()),
     }
+}
+
+fn validate_worker_script_secret_put_target(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let target = capability.same_path_read.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the hash-bound Worker script secret readback contract is absent".to_owned(),
+        )
+    })?;
+    if target.path != "/accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}"
+        || target.read_capability_id != "worker-get-script-secret"
+        || target.verified_response_fields != ["name", "type"]
+        || !clean_verification_query(input)
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the Worker script secret operation does not match its hash-bound exact readback contract"
+                .to_owned(),
+        ));
+    }
+    let selectors = input.selectors.as_object().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the planned Worker script selectors are not an object".to_owned(),
+        )
+    })?;
+    if selectors.len() != 2
+        || ["account_id", "script_name"].iter().any(|name| {
+            selectors
+                .get(*name)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        })
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned Worker script selectors are missing, empty, or broader than the exact account and script target"
+                .to_owned(),
+        ));
+    }
+    validate_request_contract(capability, input)?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the planned Worker script secret body is absent or not an object".to_owned(),
+            )
+        })?;
+    if body
+        .get("name")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+        || !matches!(
+            body.get("type").and_then(Value::as_str),
+            Some("secret_text" | "secret_key")
+        )
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned Worker script secret name or type is absent or invalid".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_oauth_client_secret_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {

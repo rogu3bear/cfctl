@@ -967,6 +967,7 @@ fn apply_post_normalization_contracts(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
 ) {
+    finalize_worker_script_secret_contracts(document, capabilities);
     classify_exact_resource_contracts(document, capabilities);
     classify_parent_collection_delete_contracts(document, capabilities);
     classify_parent_collection_update_contracts(document, capabilities);
@@ -2830,6 +2831,72 @@ fn success_response_declares_result_fields(
         })
 }
 
+fn success_response_omits_or_marks_write_only_result_fields(
+    document: &Value,
+    operation: &Value,
+    fields: &[&str],
+) -> bool {
+    operation
+        .get("responses")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(status, _)| status.starts_with('2'))
+        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
+        .any(|schema| {
+            fields.iter().all(|field| {
+                schema_path_write_only_state(document, schema, &["result", *field], 0)
+                    .is_none_or(|write_only| write_only)
+            })
+        })
+}
+
+fn schema_path_write_only_state(
+    document: &Value,
+    schema: &Value,
+    path: &[&str],
+    depth: usize,
+) -> Option<bool> {
+    if depth > 32 {
+        return Some(false);
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let Some(resolved) = reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+        else {
+            return Some(false);
+        };
+        return schema_path_write_only_state(document, resolved, path, depth + 1);
+    }
+    if path.is_empty() {
+        return Some(schema.get("writeOnly").and_then(Value::as_bool) == Some(true));
+    }
+
+    let mut found = None;
+    if let Some(property) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(path[0]))
+        && let Some(write_only) =
+            schema_path_write_only_state(document, property, &path[1..], depth + 1)
+    {
+        found = Some(write_only);
+    }
+    for composition in ["allOf", "oneOf", "anyOf"] {
+        if let Some(members) = schema.get(composition).and_then(Value::as_array) {
+            for member in members {
+                if let Some(write_only) =
+                    schema_path_write_only_state(document, member, path, depth + 1)
+                {
+                    found = Some(found.unwrap_or(true) && write_only);
+                }
+            }
+        }
+    }
+    found
+}
+
 fn success_response_declares_result_field_union(
     document: &Value,
     operation: &Value,
@@ -3475,6 +3542,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         classify_r2_bucket_create(capability);
     } else if d1_database_create_operation_supported(capability) {
         classify_d1_database_create(capability);
+    } else if let Some(kind) = worker_script_secret_operation_kind(capability) {
+        classify_worker_script_secret_operation(capability, kind);
     } else if let Some(kind) = oauth_client_secret_operation_kind(capability) {
         classify_oauth_client_secret_operation(capability, kind);
     } else if is_workers_ai_model_run(capability) {
@@ -3511,6 +3580,307 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         return false;
     }
     true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerScriptSecretOperationKind {
+    Put,
+    Delete,
+}
+
+const WORKER_SCRIPT_SECRET_COLLECTION_PATH: &str =
+    "/accounts/{account_id}/workers/scripts/{script_name}/secrets";
+const WORKER_SCRIPT_SECRET_DETAIL_PATH: &str =
+    "/accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}";
+const WORKER_SCRIPT_SECRET_READ_CAPABILITY_ID: &str = "worker-get-script-secret";
+
+fn worker_script_secret_operation_kind(
+    capability: &CapabilityV1,
+) -> Option<WorkerScriptSecretOperationKind> {
+    if capability.product != "Worker Script"
+        || capability.permissions != ["Workers Scripts Write"]
+        || !worker_script_secret_response_contract_supported(capability)
+    {
+        return None;
+    }
+    match (
+        capability.id.as_str(),
+        capability.method.as_str(),
+        capability.path.as_str(),
+    ) {
+        ("worker-put-script-secret", "PUT", WORKER_SCRIPT_SECRET_COLLECTION_PATH)
+            if capability.title == "Add script secret"
+                && capability.description.as_deref() == Some("Add a secret to a script.")
+                && worker_script_secret_put_selectors_supported(capability)
+                && worker_script_secret_put_request_contract_supported(capability) =>
+        {
+            Some(WorkerScriptSecretOperationKind::Put)
+        }
+        ("worker-delete-script-secret", "DELETE", WORKER_SCRIPT_SECRET_DETAIL_PATH)
+            if capability.title == "Delete script secret"
+                && capability.description.as_deref() == Some("Remove a secret from a script.")
+                && capability.request_schema.is_none()
+                && worker_script_secret_detail_selectors_supported(capability) =>
+        {
+            Some(WorkerScriptSecretOperationKind::Delete)
+        }
+        _ => None,
+    }
+}
+
+fn worker_script_secret_response_contract_supported(capability: &CapabilityV1) -> bool {
+    capability
+        .response_contract
+        .as_ref()
+        .is_some_and(|response| {
+            response.success_statuses == ["200"]
+                && response.success_media_types == ["application/json"]
+                && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+        })
+}
+
+fn worker_script_secret_put_selectors_supported(capability: &CapabilityV1) -> bool {
+    worker_script_secret_path_selectors_supported(capability, false)
+}
+
+fn worker_script_secret_detail_selectors_supported(capability: &CapabilityV1) -> bool {
+    worker_script_secret_path_selectors_supported(capability, true)
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "url_encoded"
+                && selector.location == "query"
+                && !selector.required
+                && selector.value_type == "boolean"
+                && selector.description.as_deref()
+                    == Some("Flag that indicates whether the secret name is URL encoded.")
+                && selector.contract.as_ref().is_some_and(|contract| {
+                    contract.schema == serde_json::json!({"type":"boolean"})
+                        && contract.query.as_ref().is_some_and(|query| {
+                            query.style == "form"
+                                && query.explode
+                                && !query.allow_reserved
+                                && !query.allow_empty_value
+                        })
+                })
+        })
+}
+
+fn worker_script_secret_path_selectors_supported(
+    capability: &CapabilityV1,
+    includes_secret_name: bool,
+) -> bool {
+    let expected_len = if includes_secret_name { 4 } else { 2 };
+    if capability.selectors.len() != expected_len {
+        return false;
+    }
+    let expected = [
+        (
+            "account_id",
+            "Identifier.",
+            serde_json::json!({"maxLength":32,"type":"string"}),
+        ),
+        (
+            "script_name",
+            "Name of the script, used in URLs and route configuration.",
+            serde_json::json!({"type":"string"}),
+        ),
+        (
+            "secret_name",
+            "A JavaScript variable name for the secret binding.",
+            serde_json::json!({"type":"string"}),
+        ),
+    ];
+    expected[..if includes_secret_name { 3 } else { 2 }]
+        .iter()
+        .all(|(name, description, schema)| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+                    && selector.description.as_deref() == Some(*description)
+                    && selector.contract.as_ref().is_some_and(|contract| {
+                        contract.schema == *schema && contract.query.is_none()
+                    })
+            })
+        })
+}
+
+fn worker_script_secret_put_request_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.request_schema.as_ref()
+        == Some(&serde_json::json!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "required": ["name", "type", "text"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "type": {"type": "string", "enum": ["secret_text"]},
+                        "text": {"type": "string", "writeOnly": true}
+                    }
+                },
+                {
+                    "type": "object",
+                    "required": ["name", "type", "format", "algorithm", "usages"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "type": {"type": "string", "enum": ["secret_key"]},
+                        "format": {"type": "string", "enum": ["raw", "pkcs8", "spki", "jwk"]},
+                        "algorithm": {"type": "object"},
+                        "usages": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["encrypt", "decrypt", "sign", "verify", "deriveKey", "deriveBits", "wrapKey", "unwrapKey"]}
+                        },
+                        "key_base64": {"type": "string", "writeOnly": true},
+                        "key_jwk": {"type": "object", "writeOnly": true}
+                    }
+                }
+            ],
+            "x-cfctl-body-required": true
+        }))
+}
+
+fn classify_worker_script_secret_operation(
+    capability: &mut CapabilityV1,
+    kind: WorkerScriptSecretOperationKind,
+) {
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.billing_model = BillingModelV1::Subscription;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "adding, replacing, or deleting one Worker secret binding does not purchase a plan or add a direct operation charge, so the direct incremental ceiling is zero; the deployed Worker remains subject to its existing plan and downstream usage charges"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Workers script secrets API".to_owned(),
+            url: "https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/secrets/"
+                .to_owned(),
+            source: "official Cloudflare API reference".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Workers secrets".to_owned(),
+            url: "https://developers.cloudflare.com/workers/configuration/secrets/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Workers pricing".to_owned(),
+            url: "https://developers.cloudflare.com/workers/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+    ];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans =
+        BTreeMap::from([("free".to_owned(), true), ("paid".to_owned(), true)]);
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/workers/platform/pricing/".to_owned());
+    capability.entitlement.blocker = None;
+    capability.entitlement.requires_live_resolution = false;
+    capability.verification.required = true;
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    match kind {
+        WorkerScriptSecretOperationKind::Put => {
+            capability.risk = RiskClass::SecretSensitive;
+            capability.effect = EffectClass::IdentityOrOwnership;
+            "worker_script_secret_reports_planned_name_and_type_after_put"
+                .clone_into(&mut capability.verification.strategy);
+            capability.rollback.warning = Some(
+                "the API is an upsert and never returns the prior value, so cfctl cannot restore a replaced secret automatically; preserve the prior value in its trusted source and use a separately reviewed plan if restoration is required"
+                    .to_owned(),
+            );
+        }
+        WorkerScriptSecretOperationKind::Delete => {
+            capability
+                .selectors
+                .retain(|selector| selector.location == "path");
+            capability.risk = RiskClass::Destructive;
+            capability.effect = EffectClass::Irreversible;
+            "same_resource_returns_not_found_after_delete"
+                .clone_into(&mut capability.verification.strategy);
+            capability.rollback.warning = Some(
+                "deletion is irreversible because Cloudflare never returns the secret value and cfctl cannot restore it; recreate it only from a trusted source through a separately reviewed plan"
+                    .to_owned(),
+            );
+        }
+    }
+}
+
+fn finalize_worker_script_secret_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let read_supported = capabilities
+        .get(WORKER_SCRIPT_SECRET_READ_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.id == WORKER_SCRIPT_SECRET_READ_CAPABILITY_ID
+                && capability.title == "Get secret binding"
+                && capability.description.as_deref()
+                    == Some("Get a given secret binding (value omitted) on a script.")
+                && capability.method == "GET"
+                && capability.path == WORKER_SCRIPT_SECRET_DETAIL_PATH
+                && capability.product == "Worker Script"
+                && capability.permissions.is_empty()
+                && capability.request_schema.is_none()
+                && worker_script_secret_detail_selectors_supported(capability)
+                && worker_script_secret_response_contract_supported(capability)
+        })
+        && document
+            .pointer("/paths/~1accounts~1{account_id}~1workers~1scripts~1{script_name}~1secrets~1{secret_name}/get")
+            .is_some_and(|operation| {
+                success_response_declares_result_fields(document, operation, &["name", "type"])
+                    && success_response_omits_or_marks_write_only_result_fields(
+                        document,
+                        operation,
+                        &["text", "key_base64", "key_jwk"],
+                    )
+            });
+    if !read_supported {
+        return;
+    }
+
+    let put_response_supported = document
+        .pointer("/paths/~1accounts~1{account_id}~1workers~1scripts~1{script_name}~1secrets/put")
+        .is_some_and(|operation| {
+            success_response_declares_result_fields(document, operation, &["name", "type"])
+                && success_response_omits_or_marks_write_only_result_fields(
+                    document,
+                    operation,
+                    &["text", "key_base64", "key_jwk"],
+                )
+        });
+    if put_response_supported
+        && let Some(capability) = capabilities.get_mut("worker-put-script-secret")
+        && worker_script_secret_operation_kind(capability)
+            == Some(WorkerScriptSecretOperationKind::Put)
+    {
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: WORKER_SCRIPT_SECRET_DETAIL_PATH.to_owned(),
+            read_capability_id: WORKER_SCRIPT_SECRET_READ_CAPABILITY_ID.to_owned(),
+            verified_response_fields: vec!["name".to_owned(), "type".to_owned()],
+        });
+        refresh_dynamic_mutation_contract(capability);
+    }
+
+    if let Some(capability) = capabilities.get_mut("worker-delete-script-secret")
+        && capability.method == "DELETE"
+        && capability.path == WORKER_SCRIPT_SECRET_DETAIL_PATH
+        && capability.product == "Worker Script"
+        && capability.permissions == ["Workers Scripts Write"]
+        && capability.request_schema.is_none()
+        && capability.selectors.len() == 3
+        && capability
+            .selectors
+            .iter()
+            .all(|selector| selector.location == "path")
+    {
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: WORKER_SCRIPT_SECRET_DETAIL_PATH.to_owned(),
+            read_capability_id: WORKER_SCRIPT_SECRET_READ_CAPABILITY_ID.to_owned(),
+            verified_response_fields: Vec::new(),
+        });
+        refresh_dynamic_mutation_contract(capability);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
