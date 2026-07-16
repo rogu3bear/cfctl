@@ -119,4 +119,4 @@ cfctl agents doctor
 cfctl "inspect the current Worker routes for example.com"
 ```
 
-Agents use deterministic commands underneath. A recursion marker prevents an agent from launching another agent through the bare-intent path. Model output never approves or directly mutates Cloudflare.
+Agents use deterministic commands underneath. A recursion marker prevents an agent from launching another agent through the bare-intent path. Model output never approves or directly mutates Cloudflare. Quote natural language — a bare single token that is not a known command fails closed with a usage error instead of launching an agent.
