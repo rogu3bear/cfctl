@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use cfctl_core::{EvidenceClass, EvidenceV1, PlanV1, redact_json};
+use cfctl_core::{EvidenceClass, EvidenceV1, PlanV1, StandingAuthorityV1, redact_json};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -36,6 +36,8 @@ pub enum StorageError {
     UnsafeImportPath(String),
     #[error("plan `{0}` does not exist")]
     PlanNotFound(String),
+    #[error("standing authority `{0}` does not exist")]
+    AuthorityNotFound(String),
     #[error("plan `{0}` is already locked")]
     PlanLocked(String),
     #[error("system clock is before the Unix epoch")]
@@ -111,6 +113,7 @@ impl StateStore {
             &paths.data_dir.join("plans"),
             &paths.data_dir.join("locks"),
             &paths.data_dir.join("catalog"),
+            &paths.data_dir.join("authorities"),
         ] {
             create_dir_all(path)?;
         }
@@ -174,6 +177,42 @@ impl StateStore {
         }
         plans.sort_by_key(|plan: &PlanV1| plan.created_at);
         Ok(plans)
+    }
+
+    fn authority_path(&self, authority_id: &str) -> PathBuf {
+        self.paths
+            .data_dir
+            .join("authorities")
+            .join(format!("{authority_id}.json"))
+    }
+
+    pub fn save_authority(&self, authority: &StandingAuthorityV1) -> Result<()> {
+        let value = serde_json::to_value(authority)?;
+        if redact_json(&value) != value {
+            return Err(StorageError::SensitiveData);
+        }
+        self.write_json(&self.authority_path(&authority.authority_id), authority)
+    }
+
+    pub fn load_authority(&self, authority_id: &str) -> Result<StandingAuthorityV1> {
+        let path = self.authority_path(authority_id);
+        if !path.is_file() {
+            return Err(StorageError::AuthorityNotFound(authority_id.to_owned()));
+        }
+        self.read_json(&path)
+    }
+
+    pub fn list_authorities(&self) -> Result<Vec<StandingAuthorityV1>> {
+        let directory = self.paths.data_dir.join("authorities");
+        let mut authorities = Vec::new();
+        for entry in fs::read_dir(&directory).map_err(|source| io_error(&directory, source))? {
+            let entry = entry.map_err(|source| io_error(&directory, source))?;
+            if entry.path().extension().and_then(std::ffi::OsStr::to_str) == Some("json") {
+                authorities.push(self.read_json::<StandingAuthorityV1>(&entry.path())?);
+            }
+        }
+        authorities.sort_by_key(|authority: &StandingAuthorityV1| authority.created_at);
+        Ok(authorities)
     }
 
     pub fn lock_plan(&self, operation_id: &str) -> Result<PlanLock> {
