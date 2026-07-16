@@ -87,10 +87,15 @@ pub enum CliError {
 pub type Result<T> = std::result::Result<T, CliError>;
 
 pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
-    let store = StateStore::open(RuntimePaths::discover()?)?;
     let command = cli.command.ok_or_else(|| {
         CliError::Input("run `cfctl --help` or pass a natural-language intent".to_owned())
     })?;
+    if let Command::Guide(arguments) = &command
+        && let Some(topic) = arguments.topic
+    {
+        return guide_topic_envelope(topic);
+    }
+    let store = StateStore::open(RuntimePaths::discover()?)?;
     match command {
         Command::Auth(arguments) => auth_command(&store, arguments.command).await,
         Command::Keys(arguments) => keys_command(&store, arguments.command).await,
@@ -676,14 +681,7 @@ fn preserve_previous_catalog(store: &StateStore) -> Result<Value> {
 
 async fn guide_command(store: &StateStore, arguments: &GuideArgs) -> Result<ResultEnvelopeV2> {
     if let Some(topic) = arguments.topic {
-        let topic = match topic {
-            GuideTopicArg::System => GuideTopicV1::System,
-            GuideTopicArg::StandingAuthority => GuideTopicV1::StandingAuthority,
-        };
-        return Ok(ResultEnvelopeV2::success(
-            "guide",
-            serde_json::to_value(guide_topic_document(topic))?,
-        ));
+        return guide_topic_envelope(topic);
     }
     let capability_id = arguments.capability_id.as_deref().ok_or_else(|| {
         CliError::Input("guide requires one capability ID or `--topic`".to_owned())
@@ -695,6 +693,17 @@ async fn guide_command(store: &StateStore, arguments: &GuideArgs) -> Result<Resu
     Ok(ResultEnvelopeV2::success(
         "guide",
         serde_json::to_value(guide_document(capability))?,
+    ))
+}
+
+fn guide_topic_envelope(topic: GuideTopicArg) -> Result<ResultEnvelopeV2> {
+    let topic = match topic {
+        GuideTopicArg::System => GuideTopicV1::System,
+        GuideTopicArg::StandingAuthority => GuideTopicV1::StandingAuthority,
+    };
+    Ok(ResultEnvelopeV2::success(
+        "guide",
+        serde_json::to_value(guide_topic_document(topic))?,
     ))
 }
 

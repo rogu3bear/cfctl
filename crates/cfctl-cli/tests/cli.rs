@@ -93,7 +93,7 @@ fn guide_help_explains_capability_and_system_targets() {
 }
 
 #[test]
-fn system_topics_run_offline_without_a_catalog() {
+fn system_topics_run_without_opening_mutable_runtime_state() {
     let runtime = tempfile::tempdir().expect("runtime root");
     for topic in ["system", "standing-authority"] {
         let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
@@ -117,8 +117,11 @@ fn system_topics_run_offline_without_a_catalog() {
             Some(5)
         );
         assert!(
-            !runtime.path().join("data/catalog/current.json").exists(),
-            "a static topic must not create or refresh the catalog"
+            fs::read_dir(runtime.path())
+                .expect("inspect untouched runtime root")
+                .next()
+                .is_none(),
+            "a static topic must not create the runtime tree, load a catalog, or touch account state"
         );
     }
 }
