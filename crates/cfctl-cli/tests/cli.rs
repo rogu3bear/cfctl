@@ -81,6 +81,72 @@ fn approval_requires_the_exact_plan_id_and_explicit_yes_flag() {
     assert_eq!(approval.operation_id, "op-123");
     assert!(approval.yes);
     assert_eq!(approval.max_cost.as_deref(), Some("USD:10.00"));
+
+    let without_yes = Cli::try_parse_from(["cfctl", "plans", "approve", "op-123"])
+        .expect("approve without --yes still parses as a draft gate request");
+    let Some(Command::Plans(arguments)) = without_yes.command else {
+        panic!("plans command");
+    };
+    let cfctl_cli::PlansCommand::Approve(approval) = arguments.command else {
+        panic!("approve command");
+    };
+    assert_eq!(approval.operation_id, "op-123");
+    assert!(
+        !approval.yes,
+        "chat/intent alone must not set the approval flag; only --yes grants authority"
+    );
+}
+
+#[test]
+fn user_owned_key_lifecycle_requires_an_explicit_owner_flag_and_account_context() {
+    let parsed = Cli::try_parse_from([
+        "cfctl",
+        "keys",
+        "mint",
+        "--user",
+        "--name",
+        "deployment",
+        "--permission",
+        "group-id",
+        "--account",
+        "account-id",
+        "--value-out",
+        "/tmp/new-token",
+    ])
+    .expect("user-owned mint parses");
+    let Some(Command::Keys(arguments)) = parsed.command else {
+        panic!("keys command");
+    };
+    let cfctl_cli::KeysCommand::Mint(mint) = arguments.command else {
+        panic!("mint command");
+    };
+    assert!(mint.user);
+    assert_eq!(mint.account.as_deref(), Some("account-id"));
+
+    for action in ["rotate", "revoke"] {
+        let mut arguments = vec![
+            "cfctl",
+            "keys",
+            action,
+            "--user",
+            "--id",
+            "token-id",
+            "--account",
+            "account-id",
+        ];
+        if action == "rotate" {
+            arguments.extend(["--value-out", "/tmp/rotated-token"]);
+        }
+        let parsed = Cli::try_parse_from(arguments).expect("user-owned lifecycle parses");
+        let Some(Command::Keys(arguments)) = parsed.command else {
+            panic!("keys command");
+        };
+        match arguments.command {
+            cfctl_cli::KeysCommand::Rotate(rotate) => assert!(rotate.user),
+            cfctl_cli::KeysCommand::Revoke(revoke) => assert!(revoke.user),
+            _ => panic!("unexpected key command"),
+        }
+    }
 }
 
 #[test]
@@ -351,4 +417,155 @@ fn write_legacy_wrangler_profile(runtime: &std::path::Path) {
         }"#,
     )
     .expect("legacy profile fixture");
+}
+
+fn write_emergency_global_key_current(runtime: &std::path::Path) {
+    fs::create_dir_all(runtime.join("config")).expect("runtime config directory");
+    fs::write(
+        runtime.join("config/profiles.json"),
+        r#"{
+            "schema_version": 1,
+            "current_profile": "emergency",
+            "profiles": {
+                "emergency": {
+                    "schema_version": 1,
+                    "id": "emergency",
+                    "kind": "global_key",
+                    "account_id": null,
+                    "oauth_client_id": null,
+                    "oauth_scopes": [],
+                    "oauth_scope_inventory_hash": null,
+                    "emergency_only": true
+                }
+            },
+            "pending_logins": {}
+        }"#,
+    )
+    .expect("emergency global-key current profile fixture");
+}
+
+fn write_fresh_accounts_list_catalog(runtime: &std::path::Path) {
+    use cfctl_catalog::CatalogSnapshot;
+    use cfctl_core::CapabilityV1;
+    use chrono::Utc;
+    use std::collections::BTreeMap;
+
+    let capability = CapabilityV1::new("accounts-list", "List accounts", "GET", "/accounts");
+    let mut catalog = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "https://example.invalid/openapi.json".to_owned(),
+        source_hash: "source-sha".to_owned(),
+        schema_hash: String::new(),
+        capabilities: BTreeMap::from([(capability.id.clone(), capability)]),
+    };
+    catalog.refresh_hash().expect("catalog hash");
+    let path = runtime.join("data/catalog/catalog-v1.json");
+    fs::create_dir_all(path.parent().expect("catalog parent")).expect("catalog directory");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&catalog).expect("catalog JSON"),
+    )
+    .expect("write catalog fixture");
+}
+
+#[test]
+fn binary_import_api_token_requires_stdin_flag() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args([
+            "auth",
+            "import-api-token",
+            "--account",
+            "account-a",
+            "--json",
+        ])
+        .output()
+        .expect("import-api-token without --stdin");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("--stdin"),
+        "must require stdin sink: {combined}"
+    );
+}
+
+#[test]
+fn binary_import_global_key_requires_a_secret_source() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args([
+            "auth",
+            "import-global-key",
+            "--email",
+            "ops@example.com",
+            "--json",
+        ])
+        .output()
+        .expect("import-global-key without a source");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("--stdin") && combined.contains("--value-in"),
+        "must offer both out-of-band sources: {combined}"
+    );
+}
+
+#[test]
+fn binary_auth_login_without_client_id_points_at_import_api_token() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .env_remove("CFCTL_OAUTH_CLIENT_ID")
+        .args(["auth", "login", "--json"])
+        .output()
+        .expect("auth login without client id");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("import-api-token"),
+        "login without client-id must point operators at the simple token lane: {combined}"
+    );
+}
+
+#[test]
+fn binary_call_rejects_ambient_emergency_global_key_without_profile_flag() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    write_emergency_global_key_current(runtime.path());
+    write_fresh_accounts_list_catalog(runtime.path());
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args(["call", "accounts-list", "--json"])
+        .output()
+        .expect("run cfctl call with ambient global-key current profile");
+    assert!(
+        !output.status.success(),
+        "ambient global-key must fail closed; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("never selected implicitly"),
+        "expected ambient global-key denial, got: {combined}"
+    );
 }

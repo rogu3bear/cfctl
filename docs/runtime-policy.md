@@ -30,10 +30,13 @@ selectors, request body hash, workspace graph, source-config hashes, local and
 Cloudflare diffs, cost, verification, compensation, and non-reversible
 warnings. It expires within 24 hours and any relevant drift invalidates it.
 
-Account-token mint plans additionally bind a fresh live permission-group
-inventory receipt and the normalized metadata for only the selected groups.
-cfctl re-reads those groups before durable consumption; permission or account
-scope drift invalidates the plan without crossing the token-create boundary.
+API-token mint plans additionally bind a fresh owner-specific live
+permission-group inventory receipt and the normalized metadata for only the
+selected groups. Account-owned tokens use the account inventory; user-owned
+tokens use the user inventory and require an explicit account resource. cfctl
+requires every group to declare account scope and re-reads the same inventory
+before durable consumption. Permission, owner, or account-scope drift
+invalidates the plan without crossing the token-create boundary.
 
 Zone-scoped writes whose only remaining gap is official plan entitlement use a
 fresh `GET /zones/{zone_id}/subscription` read during planning. cfctl binds the

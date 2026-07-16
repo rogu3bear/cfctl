@@ -15,7 +15,7 @@ use cfctl_agent::{
 };
 use cfctl_auth::{
     AuthCredential, OAuthClientConfig, PkceSession, PlatformSecretStore, ProfileKind,
-    ProfileMetadata, SecretStore, exchange_authorization_code, refresh_oauth_tokens,
+    ProfileMetadata, SecretBackend, SecretStore, exchange_authorization_code, refresh_oauth_tokens,
     revoke_oauth_token,
 };
 use cfctl_catalog::{
@@ -43,9 +43,9 @@ use tokio::process::Command as ProcessCommand;
 
 use crate::{
     AgentsCommand, AuthCommand, AuthLoginArgs, CallArgs, CatalogCommand, Cli, Command, DocsCommand,
-    GuideArgs, ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs, KeyRevokeArgs,
-    KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector, PlansCommand,
-    ProfileSelector, SearchArgs, WorkspaceCommand,
+    GuideArgs, ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs,
+    KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector,
+    PlansCommand, ProfileSelector, SearchArgs, WorkspaceCommand,
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
 
@@ -162,8 +162,48 @@ pub fn render(envelope: &ResultEnvelopeV2, json_output: bool) -> Result<String> 
     ))
 }
 
+fn platform_secrets(store: &StateStore) -> PlatformSecretStore {
+    PlatformSecretStore::new(store.paths().data_dir.join("auth").join("secrets"))
+}
+
+fn describe_secret_backend(backend: Option<SecretBackend>) -> (&'static str, &'static str) {
+    match backend {
+        Some(SecretBackend::PlatformKeyring) => {
+            ("platform_keyring", "in the platform credential store")
+        }
+        Some(SecretBackend::FallbackFile) => (
+            "fallback_file",
+            "in cfctl's mode-0600 file secret store because the platform keyring is unavailable (see `cfctl doctor`)",
+        ),
+        Some(SecretBackend::Memory) => ("memory", "in the in-process secret store"),
+        None => ("unknown", "in an undetermined backend"),
+    }
+}
+
+fn platform_secret_store_health(store: &StateStore) -> Result<Value> {
+    let secrets = platform_secrets(store);
+    let preferred = if cfg!(target_os = "macos") {
+        "keychain"
+    } else if cfg!(target_os = "linux") {
+        "secret_service"
+    } else {
+        "unsupported"
+    };
+    let (keyring, active_backend) = match secrets.keyring_probe() {
+        Ok(()) => ("ok".to_owned(), "platform_keyring"),
+        Err(error) => (format!("unavailable: {error}"), "fallback_file"),
+    };
+    Ok(json!({
+        "preferred": preferred,
+        "keyring": keyring,
+        "active_backend": active_backend,
+        "fallback_dir": secrets.fallback_root(),
+        "fallback_secret_count": secrets.fallback_secret_count()?,
+    }))
+}
+
 async fn auth_command(store: &StateStore, command: AuthCommand) -> Result<ResultEnvelopeV2> {
-    let secrets = PlatformSecretStore;
+    let secrets = platform_secrets(store);
     let mut profiles = ProfilesConfig::load(store)?;
     match command {
         AuthCommand::Login(arguments) if !arguments.complete => {
@@ -181,10 +221,25 @@ async fn auth_command(store: &StateStore, command: AuthCommand) -> Result<Result
         AuthCommand::Logout(selector) => {
             logout_profile(store, &mut profiles, &secrets, &selector).await
         }
+        AuthCommand::ImportApiToken(arguments) => {
+            import_api_token(store, &mut profiles, &secrets, &arguments)
+        }
         AuthCommand::ImportGlobalKey(arguments) => {
             import_global_key(store, &mut profiles, &secrets, &arguments)
         }
     }
+}
+
+fn require_oauth_client_id(client_id: Option<&str>) -> Result<&str> {
+    client_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth login needs --client-id (or CFCTL_OAUTH_CLIENT_ID). Until public cfctl OAuth is promoted, use the simple scoped lane: printf '%s' \"$CLOUDFLARE_API_TOKEN\" | cfctl auth import-api-token --account <account-id> --stdin"
+                    .to_owned(),
+            )
+        })
 }
 
 async fn begin_oauth_login(
@@ -193,9 +248,10 @@ async fn begin_oauth_login(
     secrets: &dyn SecretStore,
     arguments: AuthLoginArgs,
 ) -> Result<ResultEnvelopeV2> {
+    let client_id = require_oauth_client_id(arguments.client_id.as_deref())?;
     let requested_scopes =
         resolve_login_scopes(store, profiles, secrets, &arguments.scopes).await?;
-    let client = OAuthClientConfig::cfctl_public(&arguments.client_id);
+    let client = OAuthClientConfig::cfctl_public(client_id);
     let scopes: Vec<&str> = requested_scopes.iter().map(String::as_str).collect();
     let session = PkceSession::begin(&client, &scopes)?;
     secrets.put(
@@ -229,12 +285,13 @@ async fn complete_oauth_login(
     secrets: &dyn SecretStore,
     arguments: AuthLoginArgs,
 ) -> Result<ResultEnvelopeV2> {
+    let client_id = require_oauth_client_id(arguments.client_id.as_deref())?;
     let pending = profiles
         .pending_logins
         .get(&arguments.profile)
         .cloned()
         .ok_or_else(|| CliError::Input(format!("no pending login for `{}`", arguments.profile)))?;
-    if pending.client.client_id != arguments.client_id {
+    if pending.client.client_id != client_id {
         return Err(CliError::Input(
             "OAuth client ID differs from the pending login".to_owned(),
         ));
@@ -363,24 +420,86 @@ async fn logout_profile(
     ))
 }
 
+fn import_api_token(
+    store: &StateStore,
+    profiles: &mut ProfilesConfig,
+    secrets: &dyn SecretStore,
+    arguments: &ImportApiTokenArgs,
+) -> Result<ResultEnvelopeV2> {
+    let token = read_import_secret(arguments.stdin, arguments.value_in.as_deref(), "API token")?;
+    store_imported_api_token(
+        store,
+        profiles,
+        secrets,
+        &arguments.profile,
+        &arguments.account,
+        &token,
+    )
+}
+
+fn store_imported_api_token(
+    store: &StateStore,
+    profiles: &mut ProfilesConfig,
+    secrets: &dyn SecretStore,
+    profile_id: &str,
+    account: &str,
+    token: &str,
+) -> Result<ResultEnvelopeV2> {
+    let account = account.trim();
+    let token = token.trim();
+    if account.is_empty() {
+        return Err(CliError::Input(
+            "API-token import requires a non-empty `--account` pin".to_owned(),
+        ));
+    }
+    if token.is_empty() {
+        return Err(CliError::Input(
+            "the supplied API token was empty".to_owned(),
+        ));
+    }
+    if token.chars().any(char::is_whitespace) {
+        return Err(CliError::Input(
+            "the supplied API token must be a single value without whitespace".to_owned(),
+        ));
+    }
+    secrets.store_api_token(profile_id, token)?;
+    let (secret_backend, storage_note) =
+        describe_secret_backend(secrets.locate_api_token(profile_id)?);
+    let profile = ProfileMetadata::new(profile_id, ProfileKind::ApiToken, Some(account));
+    profiles.profiles.insert(profile_id.to_owned(), profile);
+    profiles.current_profile = Some(profile_id.to_owned());
+    profiles.save(store)?;
+    Ok(ResultEnvelopeV2::success(
+        "auth import-api-token",
+        json!({
+            "profile": profile_id,
+            "kind": "api_token",
+            "account_id": account,
+            "selected": true,
+            "emergency_only": false,
+            "secret_backend": secret_backend,
+            "message": format!("API token stored {storage_note} and selected as the active profile. The token value was not written to stdout, plans, or repository files.")
+        }),
+    ))
+}
+
 fn import_global_key(
     store: &StateStore,
     profiles: &mut ProfilesConfig,
     secrets: &dyn SecretStore,
     arguments: &ImportGlobalKeyArgs,
 ) -> Result<ResultEnvelopeV2> {
-    if !arguments.stdin {
-        return Err(CliError::Input(
-            "global keys are accepted only through stdin; add `--stdin`".to_owned(),
-        ));
-    }
-    let key = read_stdin()?.trim().to_owned();
+    let key = read_import_secret(arguments.stdin, arguments.value_in.as_deref(), "global key")?
+        .trim()
+        .to_owned();
     if key.is_empty() {
         return Err(CliError::Input(
-            "stdin did not contain a global key".to_owned(),
+            "the supplied global key was empty".to_owned(),
         ));
     }
     secrets.store_global_key(&arguments.profile, &arguments.email, &key)?;
+    let (secret_backend, storage_note) =
+        describe_secret_backend(secrets.locate_global_key(&arguments.profile)?);
     let profile = ProfileMetadata::new(&arguments.profile, ProfileKind::GlobalKey, None);
     profiles.profiles.insert(arguments.profile.clone(), profile);
     profiles.save(store)?;
@@ -390,7 +509,8 @@ fn import_global_key(
             "profile": arguments.profile,
             "emergency_only": true,
             "selected": false,
-            "message": "Emergency global key stored. It was not selected."
+            "secret_backend": secret_backend,
+            "message": format!("Emergency global key stored {storage_note}. It was not selected.")
         }),
     ))
 }
@@ -571,7 +691,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         )
         .await;
     }
-    let secrets = PlatformSecretStore;
+    let secrets = platform_secrets(store);
     let mut secret_ref = None;
     let mut adapter_targets = Map::new();
     if let Some(secret_body) = &prepared.secret_body {
@@ -827,7 +947,7 @@ async fn execute_read(
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
-    let credential = fresh_credential(profile, &PlatformSecretStore).await?;
+    let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
     let response = executor
         .execute_read(capability, input, &credential)
@@ -859,7 +979,7 @@ async fn execute_delegated_read(
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
-    let credential = fresh_credential(profile, &PlatformSecretStore).await?;
+    let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let receipt = run_delegated_cli(capability, input, &credential).await?;
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
     let success = receipt
@@ -2797,12 +2917,6 @@ async fn create_plan(
 ) -> Result<ResultEnvelopeV2> {
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
-    if profile.kind == ProfileKind::GlobalKey && requested_profile.is_none() {
-        return Err(CliError::Input(
-            "the emergency global-key profile is never selected implicitly; pass `--profile` explicitly"
-                .to_owned(),
-        ));
-    }
     let resolved_account = resolve_account_id(store, profile, requested_account, &input)?;
     let account_id = resolved_account
         .as_deref()
@@ -2815,7 +2929,7 @@ async fn create_plan(
     })?;
     let resolve_entitlement = should_resolve_zone_entitlement(&capability);
     let credential = if plan_requires_live_credential(&capability) {
-        Some(fresh_credential(profile, &PlatformSecretStore).await?)
+        Some(fresh_credential(profile, &platform_secrets(store)).await?)
     } else {
         None
     };
@@ -3367,18 +3481,9 @@ fn validate_api_token_creation_contract(
     adapter_targets: &Value,
     account_id: &str,
 ) -> Result<()> {
-    if !matches!(
-        capability.id.as_str(),
-        "account-api-tokens-create-token" | "user-api-tokens-create-token"
-    ) {
+    let Some(inventory_contract) = token_permission_inventory_contract(&capability.id) else {
         return Ok(());
-    }
-    if capability.id != "account-api-tokens-create-token" {
-        return Err(CliError::Input(
-            "user-token minting is blocked until a dedicated least-privilege inventory workflow is implemented; use account-scoped `cfctl keys mint`"
-                .to_owned(),
-        ));
-    }
+    };
     let inventory = adapter_targets
         .get("permission_inventory")
         .ok_or_else(|| {
@@ -3390,12 +3495,12 @@ fn validate_api_token_creation_contract(
     if inventory
         .get("source_capability_id")
         .and_then(Value::as_str)
-        != Some("account-api-tokens-list-permission-groups")
+        != Some(inventory_contract.capability_id)
     {
-        return Err(CliError::Input(
-            "token mint permission metadata is not bound to the account permission-group inventory capability"
-                .to_owned(),
-        ));
+        return Err(CliError::Input(format!(
+            "token mint permission metadata is not bound to the required `{}` inventory capability",
+            inventory_contract.capability_id
+        )));
     }
     let selected_groups = inventory
         .get("selected_groups")
@@ -3422,6 +3527,7 @@ fn validate_api_token_creation_contract(
         .collect::<Result<Vec<_>>>()?;
     let normalized_groups =
         validate_selected_permission_groups(&selected_ids, &Value::Array(selected_groups.clone()))?;
+    validate_permission_group_resource_scope(&normalized_groups, "com.cloudflare.api.account")?;
     let expected_hash = inventory
         .get("selected_groups_hash")
         .and_then(Value::as_str)
@@ -3455,6 +3561,54 @@ fn validate_api_token_creation_contract(
         ));
     }
     validate_token_policy_body(input.body.as_ref(), &selected_ids, account_id)
+}
+
+#[derive(Clone, Copy)]
+struct TokenPermissionInventoryContract {
+    capability_id: &'static str,
+    path: &'static str,
+    account_selector: bool,
+}
+
+fn token_permission_inventory_contract(
+    token_create_capability_id: &str,
+) -> Option<TokenPermissionInventoryContract> {
+    match token_create_capability_id {
+        "account-api-tokens-create-token" => Some(TokenPermissionInventoryContract {
+            capability_id: "account-api-tokens-list-permission-groups",
+            path: "/accounts/{account_id}/tokens/permission_groups",
+            account_selector: true,
+        }),
+        "user-api-tokens-create-token" => Some(TokenPermissionInventoryContract {
+            capability_id: "permission-groups-list-permission-groups",
+            path: "/user/tokens/permission_groups",
+            account_selector: false,
+        }),
+        _ => None,
+    }
+}
+
+fn validate_permission_group_resource_scope(groups: &[Value], required_scope: &str) -> Result<()> {
+    for group in groups {
+        let id = group
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        let supports_scope = group
+            .get("scopes")
+            .and_then(Value::as_array)
+            .is_some_and(|scopes| {
+                scopes
+                    .iter()
+                    .any(|scope| scope.as_str() == Some(required_scope))
+            });
+        if !supports_scope {
+            return Err(CliError::Input(format!(
+                "permission group `{id}` does not support the required account resource scope `{required_scope}`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_token_policy_body(
@@ -3758,8 +3912,8 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     preflight_secret_sink(&plan)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(Some(&plan.profile_id))?;
-    let credential = fresh_credential(profile, &PlatformSecretStore).await?;
-    let secrets = PlatformSecretStore;
+    let secrets = platform_secrets(store);
+    let credential = fresh_credential(profile, &secrets).await?;
     let execution_input = resolved_plan_input(&plan, &secrets)?;
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
     validate_api_token_creation_contract(
@@ -4992,9 +5146,9 @@ async fn validate_live_permission_inventory_precondition(
     plan: &PlanV1,
     credential: &AuthCredential,
 ) -> Result<Option<EvidenceV1>> {
-    if plan.capability.id != "account-api-tokens-create-token" {
+    let Some(expected_inventory) = token_permission_inventory_contract(&plan.capability.id) else {
         return Ok(None);
-    }
+    };
     let inventory_contract = plan
         .targets
         .pointer("/adapter/permission_inventory")
@@ -5015,12 +5169,12 @@ async fn validate_live_permission_inventory_precondition(
             "token mint permission-inventory capability `{source_capability_id}` no longer exists"
         ))
     })?;
-    if source_capability.id != "account-api-tokens-list-permission-groups"
+    if source_capability.id != expected_inventory.capability_id
         || source_capability.method != "GET"
-        || source_capability.path != "/accounts/{account_id}/tokens/permission_groups"
+        || source_capability.path != expected_inventory.path
     {
         return Err(CliError::Input(
-            "token mint permission-inventory capability drifted from the governed account read"
+            "token mint permission-inventory capability drifted from its governed owner-specific read"
                 .to_owned(),
         ));
     }
@@ -5029,7 +5183,11 @@ async fn validate_live_permission_inventory_precondition(
         .execute_read(
             source_capability,
             &CallInput {
-                selectors: json!({"account_id": plan.account_id}),
+                selectors: if expected_inventory.account_selector {
+                    json!({"account_id": plan.account_id})
+                } else {
+                    json!({})
+                },
                 query: json!({}),
                 body: None,
                 ..CallInput::default()
@@ -5923,13 +6081,15 @@ async fn key_permissions(
     store: &StateStore,
     arguments: &KeyPermissionArgs,
 ) -> Result<ResultEnvelopeV2> {
-    let capability_id = if arguments.account.is_some() {
-        "account-api-tokens-list-permission-groups"
-    } else {
+    let capability_id = if arguments.user || arguments.account.is_none() {
         "permission-groups-list-permission-groups"
+    } else {
+        "account-api-tokens-list-permission-groups"
     };
     let mut selectors = Vec::new();
-    if let Some(account) = &arguments.account {
+    if !arguments.user
+        && let Some(account) = &arguments.account
+    {
         selectors.push(("account_id".to_owned(), account.clone()));
     }
     call_command(
@@ -5958,21 +6118,25 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
         CliError::Input("token minting requires the sink-only `--value-out <path>`".to_owned())
     })?;
     if arguments.permissions.is_empty() {
-        return Err(CliError::Input(
+        return Err(CliError::Input(if arguments.user {
+            "at least one permission group ID is required; use `cfctl keys permissions --user --account <id>`"
+                    .to_owned()
+        } else {
             "at least one permission group ID is required; use `cfctl keys permissions --account <id>`"
-                .to_owned(),
-        ));
+                    .to_owned()
+        }));
     }
     let inventory = key_permissions(
         store,
         &KeyPermissionArgs {
             account: Some(account.to_owned()),
+            user: arguments.user,
         },
     )
     .await?;
     if !inventory.ok || !inventory.performed || inventory.account_id.as_deref() != Some(account) {
         return Err(CliError::Input(
-            "fresh account permission inventory did not produce an account-bound live-read receipt"
+            "fresh owner-specific permission inventory did not produce an account-bound live-read receipt"
                 .to_owned(),
         ));
     }
@@ -5980,6 +6144,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
         &arguments.permissions,
         inventory.result.get("result").unwrap_or(&Value::Null),
     )?;
+    validate_permission_group_resource_scope(&selected_groups, "com.cloudflare.api.account")?;
     let selected_group_ids = selected_groups
         .iter()
         .filter_map(|group| group.get("id").and_then(Value::as_str))
@@ -6004,16 +6169,27 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
             json!((Utc::now() + ChronoDuration::hours(i64::from(hours))).to_rfc3339());
     }
     let catalog = ensure_catalog(store).await?;
+    let capability_id = if arguments.user {
+        "user-api-tokens-create-token"
+    } else {
+        "account-api-tokens-create-token"
+    };
+    let inventory_contract = token_permission_inventory_contract(capability_id)
+        .ok_or_else(|| capability_missing(capability_id))?;
     let capability = catalog
-        .get("account-api-tokens-create-token")
+        .get(capability_id)
         .cloned()
-        .ok_or_else(|| capability_missing("account-api-tokens-create-token"))?;
+        .ok_or_else(|| capability_missing(capability_id))?;
     let mut plan = create_plan(
         store,
         &catalog,
         capability,
         CallInput {
-            selectors: json!({"account_id": account}),
+            selectors: if arguments.user {
+                json!({})
+            } else {
+                json!({"account_id": account})
+            },
             query: json!({}),
             body: Some(body),
             ..CallInput::default()
@@ -6023,7 +6199,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
         json!({
             "value_out": value_out,
             "permission_inventory": {
-                "source_capability_id": "account-api-tokens-list-permission-groups",
+                "source_capability_id": inventory_contract.capability_id,
                 "selected_groups": selected_groups,
                 "selected_groups_hash": selected_groups_hash,
                 "evidence_hashes": inventory_evidence_hashes,
@@ -6111,16 +6287,25 @@ fn validate_selected_permission_groups(
 
 async fn key_rotate(store: &StateStore, arguments: &KeyRotateArgs) -> Result<ResultEnvelopeV2> {
     let catalog = ensure_catalog(store).await?;
+    let capability_id = if arguments.user {
+        "user-api-tokens-roll-token"
+    } else {
+        "account-api-tokens-roll-token"
+    };
     let capability = catalog
-        .get("account-api-tokens-roll-token")
+        .get(capability_id)
         .cloned()
-        .ok_or_else(|| capability_missing("account-api-tokens-roll-token"))?;
+        .ok_or_else(|| capability_missing(capability_id))?;
     create_plan(
         store,
         &catalog,
         capability,
         CallInput {
-            selectors: json!({"account_id": arguments.account, "token_id": arguments.id}),
+            selectors: if arguments.user {
+                json!({"token_id": arguments.id})
+            } else {
+                json!({"account_id": arguments.account, "token_id": arguments.id})
+            },
             query: json!({}),
             body: Some(json!({})),
             ..CallInput::default()
@@ -6137,16 +6322,25 @@ async fn key_revoke(store: &StateStore, arguments: &KeyRevokeArgs) -> Result<Res
         CliError::Input("token revocation requires `--account` for explicit ownership".to_owned())
     })?;
     let catalog = ensure_catalog(store).await?;
+    let capability_id = if arguments.user {
+        "user-api-tokens-delete-token"
+    } else {
+        "account-api-tokens-delete-token"
+    };
     let capability = catalog
-        .get("account-api-tokens-delete-token")
+        .get(capability_id)
         .cloned()
-        .ok_or_else(|| capability_missing("account-api-tokens-delete-token"))?;
+        .ok_or_else(|| capability_missing(capability_id))?;
     create_plan(
         store,
         &catalog,
         capability,
         CallInput {
-            selectors: json!({"account_id": account, "token_id": arguments.id}),
+            selectors: if arguments.user {
+                json!({"token_id": arguments.id})
+            } else {
+                json!({"account_id": account, "token_id": arguments.id})
+            },
             query: json!({}),
             body: None,
             ..CallInput::default()
@@ -6277,7 +6471,7 @@ fn agents_command(store: &StateStore, command: AgentsCommand) -> Result<ResultEn
                     "binary_on_path": which::which("cfctl").ok(),
                     "configured_default_agent": configured,
                     "platform": env::consts::OS,
-                    "platform_secret_store": if cfg!(target_os = "macos") { "keychain" } else if cfg!(target_os = "linux") { "secret_service" } else { "unsupported" },
+                    "platform_secret_store": platform_secret_store_health(store)?,
                     "instruction_drift": status.iter().filter(|agent| agent.skill_present && !agent.skill_current).count(),
                     "agents": status,
                 }),
@@ -6496,9 +6690,9 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "unsupported_legacy_profiles": unsupported_legacy_profiles,
             "oauth_scope_inventory_hash": inventory_hash,
             "oauth_profiles": oauth_reconsent,
-            "platform_secret_store": if cfg!(target_os = "macos") { "keychain" } else if cfg!(target_os = "linux") { "secret_service" } else { "unsupported" },
+            "platform_secret_store": platform_secret_store_health(store)?,
             "agents": agents,
-            "public_oauth": "unconfigured until cfctl.io ownership, site publication, domain verification, and permanent promotion are explicitly completed",
+            "public_oauth": "unconfigured until cfctl.io ownership, site publication, domain verification, and permanent promotion are explicitly completed; use `cfctl auth import-api-token --account <id> --stdin` for the scoped day-to-day lane",
         }),
     ))
 }
@@ -6688,7 +6882,7 @@ async fn refresh_oauth_scopes_if_authenticated(store: &StateStore) -> Result<Opt
     let Ok(profile) = profiles.selected(None) else {
         return Ok(None);
     };
-    let credential = fresh_credential(profile, &PlatformSecretStore).await?;
+    let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let snapshot = fetch_oauth_scope_snapshot(&credential).await?;
     store.write_json(&oauth_scope_inventory_file(store), &snapshot)?;
     Ok(Some(snapshot))
@@ -7011,12 +7205,9 @@ fn stage_required(stage: cfctl_core::GuideStage, capability: &cfctl_core::Capabi
 fn guide_document(capability: &CapabilityV1) -> Value {
     let blocking_gaps = capability.mutation_contract_gaps();
     let post_resolution_call_argv = capability_call_argv(capability);
-    let contract_ready = capability.adapter_status != AdapterStatus::Blocked
-        && blocking_gaps.is_empty()
-        && post_resolution_call_argv.is_some();
-    let call_argv = contract_ready
-        .then(|| post_resolution_call_argv.clone())
-        .flatten();
+    let contract_ready =
+        capability.adapter_status != AdapterStatus::Blocked && blocking_gaps.is_empty();
+    let call_argv = contract_ready.then(|| post_resolution_call_argv.clone());
     let stages = guide_stages()
         .iter()
         .enumerate()
@@ -7027,7 +7218,7 @@ fn guide_document(capability: &CapabilityV1) -> Value {
                 capability,
                 contract_ready,
                 &blocking_gaps,
-                post_resolution_call_argv.as_deref(),
+                Some(&post_resolution_call_argv),
             )
         })
         .collect::<Vec<_>>();
@@ -7042,35 +7233,33 @@ fn guide_document(capability: &CapabilityV1) -> Value {
         "next_action": guide_next_action(
             capability,
             contract_ready,
-            post_resolution_call_argv.as_deref(),
+            Some(&post_resolution_call_argv),
         ),
         "stages": stages,
     })
 }
 
-fn capability_call_argv(capability: &CapabilityV1) -> Option<Vec<String>> {
-    if capability.id == "user-api-tokens-create-token" {
-        return None;
-    }
-    if capability.id == "account-api-tokens-create-token" {
-        return Some(
-            [
-                "cfctl",
-                "keys",
-                "mint",
-                "--name",
-                "<token-name>",
-                "--permission",
-                "<permission-group-id>",
-                "--account",
-                "<account_id>",
-                "--value-out",
-                "<new-mode-0600-path>",
-                "--json",
-            ]
-            .map(str::to_owned)
-            .to_vec(),
-        );
+fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
+    if matches!(
+        capability.id.as_str(),
+        "account-api-tokens-create-token" | "user-api-tokens-create-token"
+    ) {
+        let mut argv = vec!["cfctl", "keys", "mint"];
+        if capability.id == "user-api-tokens-create-token" {
+            argv.push("--user");
+        }
+        argv.extend([
+            "--name",
+            "<token-name>",
+            "--permission",
+            "<permission-group-id>",
+            "--account",
+            "<account_id>",
+            "--value-out",
+            "<new-mode-0600-path>",
+            "--json",
+        ]);
+        return argv.into_iter().map(str::to_owned).collect();
     }
 
     let mut argv = vec!["cfctl".to_owned(), "call".to_owned(), capability.id.clone()];
@@ -7101,7 +7290,7 @@ fn capability_call_argv(capability: &CapabilityV1) -> Option<Vec<String>> {
         argv.extend(["--value-out".to_owned(), sink.to_owned()]);
     }
     argv.push("--json".to_owned());
-    Some(argv)
+    argv
 }
 
 fn capability_has_meaningful_request_body(capability: &CapabilityV1) -> bool {
@@ -7971,11 +8160,30 @@ fn catalog_is_stale(store: &StateStore) -> bool {
 }
 
 fn http_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(120))
-        .user_agent(concat!("cfctl/", env!("CARGO_PKG_VERSION")))
-        .build()?)
+        .user_agent(concat!("cfctl/", env!("CARGO_PKG_VERSION")));
+    // IP-allowlisted API tokens (e.g. a laptop-pinned minter) are usually
+    // scoped to the machine's IPv4. When the host default-routes over IPv6,
+    // Cloudflare rejects the call with error 9109 ("Cannot use the access
+    // token from location: <IPv6>"). `CFCTL_FORCE_IPV4=1` binds egress to an
+    // IPv4 source so those tokens work — including unattended (launchd) runs
+    // that can't fall back to an interactive `curl -4`.
+    if force_ipv4_egress() {
+        builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    }
+    Ok(builder.build()?)
+}
+
+/// True when `CFCTL_FORCE_IPV4` is set to an affirmative value. Off by default
+/// so IPv6-only hosts and non-allowlisted tokens are unaffected.
+fn force_ipv4_egress() -> bool {
+    force_ipv4_from(std::env::var("CFCTL_FORCE_IPV4").ok().as_deref())
+}
+
+fn force_ipv4_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "yes" | "on"))
 }
 
 fn configured_agent() -> Result<AgentKind> {
@@ -8006,6 +8214,50 @@ fn read_stdin() -> Result<String> {
         .read_to_string(&mut value)
         .map_err(|source| cli_io(Path::new("stdin"), source))?;
     Ok(value)
+}
+
+/// Read an out-of-band secret from exactly one source. `--value-in <path>`
+/// exists so callers can hand cfctl a secret without piping it through a build
+/// wrapper such as `./cfctl`, which routes stdin through `cargo` and can consume
+/// it before the binary reads it. Exactly one of stdin or a file is required.
+fn read_import_secret(from_stdin: bool, value_in: Option<&Path>, label: &str) -> Result<String> {
+    match (from_stdin, value_in) {
+        (true, Some(_)) => Err(CliError::Input(format!(
+            "choose one {label} source: either `--stdin` or `--value-in <path>`, not both"
+        ))),
+        (false, None) => Err(CliError::Input(format!(
+            "the {label} must be supplied out-of-band: add `--stdin` or `--value-in <mode-0600 path>`; values in command arguments are forbidden"
+        ))),
+        (true, None) => read_stdin(),
+        (false, Some(path)) => read_secret_file(path),
+    }
+}
+
+/// Read a secret from a file that no other user can read. On Unix any group or
+/// other permission bit fails closed, mirroring the mode-0600 sink that
+/// `--value-out` writes.
+fn read_secret_file(path: &Path) -> Result<String> {
+    let metadata = fs::metadata(path).map_err(|source| cli_io(path, source))?;
+    if !metadata.is_file() {
+        return Err(CliError::Input(format!(
+            "`--value-in` path is not a regular file: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(CliError::Input(format!(
+                "`--value-in` file {} must not be readable by group or others; run `chmod 600 {}` (current mode {:04o})",
+                path.display(),
+                path.display(),
+                mode & 0o7777
+            )));
+        }
+    }
+    fs::read_to_string(path).map_err(|source| cli_io(path, source))
 }
 
 fn docs_file(store: &StateStore) -> PathBuf {
@@ -8080,12 +8332,13 @@ mod tests {
         apply_d1_read_replication_state_response, apply_dns_record_state_response,
         apply_global_warp_override_state_response, apply_oauth_client_secret_state_response,
         apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
-        apply_zone_account_response, apply_zone_entitlement_response,
-        bind_required_empty_compensation_body, boundary_response_artifact, capability_call_argv,
-        compensation_request, find_secret_value, guide_document, is_live_plan_precondition_hash,
+        apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
+        bind_required_empty_compensation_body, boundary_response_artifact, call_command,
+        capability_call_argv, compensation_request, execute_read, find_secret_value,
+        force_ipv4_from, guide_document, http_client, is_live_plan_precondition_hash,
         is_secret_output_capability, non_readback_verification_basis, persist_prepared_plan,
         persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
-        query_object_from_pairs, redact_secret_result,
+        query_object_from_pairs, read_import_secret, read_secret_file, redact_secret_result,
         required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -8097,13 +8350,15 @@ mod tests {
         should_bind_global_warp_override_state, should_bind_oauth_client_secret_state,
         should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
         should_bind_zone_account, should_resolve_zone_entitlement, sink_secret_result,
-        validate_api_token_creation_contract, validate_current_permission_groups,
-        validate_entitlement_receipt_precondition,
+        store_imported_api_token, validate_api_token_creation_contract,
+        validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
         validate_selected_permission_groups, validate_zone_account_receipt_precondition,
         workspace_resource_keys, zone_target,
     };
-    use cfctl_auth::{AuthError, ProfileKind, ProfileMetadata, SecretStore};
+    use crate::profiles::ProfilesConfig;
+    use crate::{CallArgs, PlanApproveArgs};
+    use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
     use cfctl_cloudflare::CloudflareResponseV1;
     use cfctl_core::{
@@ -11176,6 +11431,10 @@ mod tests {
         fn delete(&self, _key: &str) -> cfctl_auth::Result<()> {
             Err(AuthError::SecretStore("injected delete failure".to_owned()))
         }
+
+        fn locate(&self, _key: &str) -> cfctl_auth::Result<Option<cfctl_auth::SecretBackend>> {
+            Ok(None)
+        }
     }
 
     #[test]
@@ -11276,6 +11535,83 @@ mod tests {
             validate_api_token_creation_contract(&capability, &widened, &adapter, "account-a")
                 .expect_err("cross-account scope is rejected");
         assert!(widened.to_string().contains("account-a"));
+    }
+
+    #[test]
+    fn user_token_creation_requires_its_own_inventory_and_account_compatible_groups() {
+        let user_capability = CapabilityV1::new(
+            "user-api-tokens-create-token",
+            "Create user-owned token",
+            "POST",
+            "/user/tokens",
+        );
+        let groups = json!([{
+            "id": "group-a",
+            "name": "Workers Scripts Write",
+            "scopes": ["com.cloudflare.api.account"]
+        }]);
+        let groups_hash = hash_value(&groups).expect("group hash");
+        let user_adapter = json!({
+            "permission_inventory": {
+                "source_capability_id": "permission-groups-list-permission-groups",
+                "selected_groups": groups,
+                "selected_groups_hash": groups_hash,
+                "evidence_hashes": [format!("sha256:{}", "b".repeat(64))]
+            }
+        });
+        let input = CallInput {
+            selectors: json!({}),
+            query: json!({}),
+            body: Some(json!({
+                "name":"least-privilege user token",
+                "policies":[{
+                    "effect":"allow",
+                    "permission_groups":[{"id":"group-a"}],
+                    "resources":{"com.cloudflare.api.account.account-a":"*"}
+                }]
+            })),
+            ..CallInput::default()
+        };
+        validate_api_token_creation_contract(&user_capability, &input, &user_adapter, "account-a")
+            .expect("user-owned account-scoped token uses the user inventory");
+
+        let mut wrong_owner_inventory = user_adapter.clone();
+        wrong_owner_inventory["permission_inventory"]["source_capability_id"] =
+            json!("account-api-tokens-list-permission-groups");
+        let wrong_owner = validate_api_token_creation_contract(
+            &user_capability,
+            &input,
+            &wrong_owner_inventory,
+            "account-a",
+        )
+        .expect_err("user-owned token cannot borrow an account-owned permission inventory");
+        assert!(
+            wrong_owner
+                .to_string()
+                .contains("permission-groups-list-permission-groups")
+        );
+
+        let zone_only_groups = json!([{
+            "id": "group-a",
+            "name": "DNS Write",
+            "scopes": ["com.cloudflare.api.account.zone"]
+        }]);
+        let zone_only_adapter = json!({
+            "permission_inventory": {
+                "source_capability_id": "permission-groups-list-permission-groups",
+                "selected_groups": zone_only_groups,
+                "selected_groups_hash": hash_value(&zone_only_groups).expect("zone group hash"),
+                "evidence_hashes": [format!("sha256:{}", "c".repeat(64))]
+            }
+        });
+        let incompatible = validate_api_token_creation_contract(
+            &user_capability,
+            &input,
+            &zone_only_adapter,
+            "account-a",
+        )
+        .expect_err("zone-only permission cannot be attached to an account resource");
+        assert!(incompatible.to_string().contains("account resource scope"));
     }
 
     #[test]
@@ -11408,7 +11744,7 @@ mod tests {
             }
         }));
 
-        let queue_argv = capability_call_argv(&queue_update).expect("Queue call argv");
+        let queue_argv = capability_call_argv(&queue_update);
         assert!(queue_argv.iter().any(|argument| argument == "--body-stdin"));
 
         let mut empty_object = CapabilityV1::new(
@@ -11422,7 +11758,7 @@ mod tests {
             "x-cfctl-body-required":false,
             "properties":{}
         }));
-        let empty_argv = capability_call_argv(&empty_object).expect("empty object call argv");
+        let empty_argv = capability_call_argv(&empty_object);
         assert!(!empty_argv.iter().any(|argument| argument == "--body-stdin"));
 
         for request_schema in [
@@ -11436,7 +11772,7 @@ mod tests {
                 "/accounts/{account_id}/widgets/import",
             );
             capability.request_schema = Some(request_schema);
-            let argv = capability_call_argv(&capability).expect("non-object call argv");
+            let argv = capability_call_argv(&capability);
             assert!(argv.iter().any(|argument| argument == "--body-stdin"));
         }
     }
@@ -11520,16 +11856,370 @@ mod tests {
         assert_ne!(account_guide["call_argv"][1], "call");
 
         account_token.id = "user-api-tokens-create-token".to_owned();
-        account_token.adapter_status = AdapterStatus::Blocked;
-        account_token.blocked_reason = Some(
-            "user-token minting is blocked until a dedicated live permission inventory workflow is implemented"
-                .to_owned(),
-        );
         let user_guide = guide_document(&account_token);
-        assert_eq!(user_guide["contract_state"], "blocked");
-        assert!(user_guide["call_argv"].is_null());
-        assert_eq!(user_guide["next_action"]["argv"][1], "keys");
-        assert_eq!(user_guide["next_action"]["argv"][2], "permissions");
+        assert_eq!(user_guide["contract_state"], "available");
+        assert_eq!(
+            user_guide["call_argv"],
+            json!([
+                "cfctl",
+                "keys",
+                "mint",
+                "--user",
+                "--name",
+                "<token-name>",
+                "--permission",
+                "<permission-group-id>",
+                "--account",
+                "<account_id>",
+                "--value-out",
+                "<new-mode-0600-path>",
+                "--json"
+            ])
+        );
+    }
+
+    fn emergency_global_key_as_current() -> ProfilesConfig {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "emergency".to_owned(),
+            ProfileMetadata::new("emergency", ProfileKind::GlobalKey, None),
+        );
+        profiles.insert(
+            "work".to_owned(),
+            ProfileMetadata::new("work", ProfileKind::OAuth, Some("account-a")),
+        );
+        ProfilesConfig {
+            current_profile: Some("emergency".to_owned()),
+            profiles,
+            ..ProfilesConfig::default()
+        }
+    }
+
+    #[test]
+    fn emergency_global_key_is_never_selected_without_an_explicit_profile_flag() {
+        let mut profiles = emergency_global_key_as_current();
+
+        let blocked = profiles
+            .selected(None)
+            .expect_err("implicit global-key current profile must fail closed");
+        assert!(
+            blocked.to_string().contains("never selected implicitly"),
+            "{blocked}"
+        );
+        profiles
+            .selected(Some("emergency"))
+            .expect("explicit --profile may use the emergency lane");
+
+        profiles.current_profile = Some("work".to_owned());
+        profiles
+            .selected(None)
+            .expect("non-emergency profiles remain selectable as current");
+    }
+
+    #[tokio::test]
+    async fn execute_read_rejects_implicit_global_key_before_live_credential_use() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        emergency_global_key_as_current()
+            .save(&store)
+            .expect("save emergency as current");
+
+        let capability = CapabilityV1::new("accounts-list", "List accounts", "GET", "/accounts");
+        let catalog = test_catalog();
+        let input = CallInput::default();
+
+        let error = execute_read(&store, &catalog, &capability, &input, None, None)
+            .await
+            .expect_err("live read must not use ambient global-key current profile");
+        assert!(
+            error.to_string().contains("never selected implicitly"),
+            "{error}"
+        );
+
+        // Explicit --profile is allowed past selection; without a real secret store
+        // credential it still fails later — never with an implicit selection path.
+        let explicit = execute_read(
+            &store,
+            &catalog,
+            &capability,
+            &input,
+            Some("emergency"),
+            None,
+        )
+        .await;
+        let explicit_error = explicit.expect_err("no real emergency credential in this fixture");
+        assert!(
+            !explicit_error
+                .to_string()
+                .contains("never selected implicitly"),
+            "explicit --profile must not be blocked by the ambient-selection guard: {explicit_error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_command_live_read_rejects_implicit_global_key_current_profile() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let catalog = test_catalog();
+        store
+            .write_json(&store.paths().catalog_file(), &catalog)
+            .expect("seed non-stale catalog so call does not network-sync");
+        emergency_global_key_as_current()
+            .save(&store)
+            .expect("save emergency as current");
+
+        let error = call_command(
+            &store,
+            CallArgs {
+                capability_id: "accounts-list".to_owned(),
+                selectors: Vec::new(),
+                query: Vec::new(),
+                body_json: None,
+                body_stdin: false,
+                profile: None,
+                account: None,
+                if_match: None,
+                if_none_match: None,
+                value_out: None,
+            },
+        )
+        .await
+        .expect_err("call without --profile must fail closed on ambient global-key");
+        assert!(
+            error.to_string().contains("never selected implicitly"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn store_imported_api_token_selects_scoped_profile_and_keeps_secret_out_of_envelope() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let secrets = MemorySecretStore::default();
+        let mut profiles = ProfilesConfig::default();
+        let token = "cfat_test_token_must_not_echo";
+
+        let envelope = store_imported_api_token(
+            &store,
+            &mut profiles,
+            &secrets,
+            "default",
+            "account-a",
+            token,
+        )
+        .expect("import api token");
+        assert_eq!(envelope.command, "auth import-api-token");
+        assert!(envelope.ok);
+        assert_eq!(envelope.result["selected"], true);
+        assert_eq!(envelope.result["kind"], "api_token");
+        assert_eq!(envelope.result["account_id"], "account-a");
+        assert_eq!(envelope.result["secret_backend"], "memory");
+        let encoded = serde_json::to_string(&envelope).expect("envelope serializes");
+        assert!(
+            !encoded.contains(token),
+            "token must not appear in the result envelope: {encoded}"
+        );
+        assert_eq!(profiles.current_profile.as_deref(), Some("default"));
+        let profile = profiles.profiles.get("default").expect("profile saved");
+        assert_eq!(profile.kind, ProfileKind::ApiToken);
+        assert_eq!(profile.account_id.as_deref(), Some("account-a"));
+        assert!(!profile.emergency_only);
+        assert_eq!(
+            secrets
+                .load_credential("default", ProfileKind::ApiToken)
+                .expect("credential")
+                .bearer_token(),
+            Some(token)
+        );
+
+        let empty = store_imported_api_token(
+            &store,
+            &mut ProfilesConfig::default(),
+            &secrets,
+            "default",
+            "account-a",
+            "",
+        )
+        .expect_err("empty token rejected");
+        assert!(empty.to_string().contains("API token was empty"));
+
+        let unpinned = store_imported_api_token(
+            &store,
+            &mut ProfilesConfig::default(),
+            &secrets,
+            "default",
+            "  ",
+            token,
+        )
+        .expect_err("empty account rejected");
+        assert!(unpinned.to_string().contains("--account"));
+    }
+
+    #[test]
+    fn read_import_secret_requires_exactly_one_out_of_band_source() {
+        let neither = read_import_secret(false, None, "API token").expect_err("no source rejected");
+        let neither = neither.to_string();
+        assert!(neither.contains("--stdin"), "{neither}");
+        assert!(neither.contains("--value-in"), "{neither}");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("token");
+        std::fs::write(&path, "cfat_from_file").expect("write token file");
+        let both =
+            read_import_secret(true, Some(&path), "API token").expect_err("two sources rejected");
+        assert!(both.to_string().contains("not both"), "{both}");
+    }
+
+    #[test]
+    fn force_ipv4_flag_parses_affirmative_values_only() {
+        for on in ["1", "true", "yes", "on"] {
+            assert!(force_ipv4_from(Some(on)), "{on} should enable IPv4");
+        }
+        for off in [Some("0"), Some("false"), Some(""), None] {
+            assert!(!force_ipv4_from(off), "{off:?} should not enable IPv4");
+        }
+    }
+
+    #[test]
+    fn http_client_builds_in_both_egress_modes() {
+        // Default builder is valid.
+        http_client().expect("default client builds");
+        // The IPv4-bound builder is also valid (binds a v4 source address).
+        reqwest::Client::builder()
+            .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+            .build()
+            .expect("ipv4-bound client builds");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_secret_file_reads_mode_0600_and_rejects_group_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("token");
+        std::fs::write(&path, "cfat_from_file\n").expect("write token file");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+        let value = read_secret_file(&path).expect("read 0600 file");
+        assert_eq!(value.trim(), "cfat_from_file");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod 640");
+        let leaky = read_secret_file(&path).expect_err("group-readable rejected");
+        let leaky = leaky.to_string();
+        assert!(leaky.contains("group or others"), "{leaky}");
+        assert!(leaky.contains("chmod 600"), "{leaky}");
+    }
+
+    #[test]
+    fn approve_plan_requires_explicit_yes_on_the_store_path() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = CapabilityV1::new(
+            "dns.records.update",
+            "Update DNS record",
+            "PUT",
+            "/zones/{zone_id}/dns_records/{record_id}",
+        );
+        let plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"zone_id":"zone-a","record_id":"record-a"}),
+        )
+        .expect("draft plan");
+        let operation_id = plan.operation_id.clone();
+        store.save_plan(&plan).expect("persist draft");
+
+        let error = approve_plan(
+            &store,
+            &PlanApproveArgs {
+                operation_id: operation_id.clone(),
+                yes: false,
+                max_cost: None,
+            },
+        )
+        .expect_err("store path must refuse chat/intent without --yes");
+        assert!(
+            error
+                .to_string()
+                .contains("approval must be an explicit yes bound to the operation id"),
+            "{error}"
+        );
+        let reloaded = store.load_plan(&operation_id).expect("plan remains draft");
+        assert_eq!(reloaded.status, PlanStatus::Draft);
+        assert!(reloaded.approval.is_none());
+    }
+
+    #[test]
+    fn approve_plan_rejects_hash_drifted_store_draft_before_authority() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = CapabilityV1::new(
+            "dns.records.update",
+            "Update DNS record",
+            "PUT",
+            "/zones/{zone_id}/dns_records/{record_id}",
+        );
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"zone_id":"zone-a","record_id":"record-a"}),
+        )
+        .expect("draft plan");
+        let operation_id = plan.operation_id.clone();
+        let bound_hash = plan.content_hash.clone();
+        store.save_plan(&plan).expect("persist hash-bound draft");
+
+        plan.targets = json!({"zone_id":"zone-b","record_id":"record-a"});
+        assert_eq!(plan.content_hash, bound_hash);
+        store
+            .save_plan(&plan)
+            .expect("persist drifted targets without rehash");
+
+        let error = approve_plan(
+            &store,
+            &PlanApproveArgs {
+                operation_id: operation_id.clone(),
+                yes: true,
+                max_cost: None,
+            },
+        )
+        .expect_err("store path must refuse hash-drifted draft");
+        assert!(
+            error.to_string().contains("unchanged hash-bound draft"),
+            "{error}"
+        );
+        let reloaded = store.load_plan(&operation_id).expect("still draft");
+        assert_eq!(reloaded.status, PlanStatus::Draft);
+        assert!(reloaded.approval.is_none());
+
+        plan.refresh_hash()
+            .expect("operator rebinds reviewed content");
+        store.save_plan(&plan).expect("persist rehashed draft");
+        let approved = approve_plan(
+            &store,
+            &PlanApproveArgs {
+                operation_id: operation_id.clone(),
+                yes: true,
+                max_cost: None,
+            },
+        )
+        .expect("rehashed draft may approve with explicit yes");
+        assert_eq!(approved.command, "plans approve");
+        assert!(approved.ok);
+        let reloaded = store.load_plan(&operation_id).expect("approved plan");
+        assert_eq!(reloaded.status, PlanStatus::Approved);
+        assert_eq!(
+            reloaded
+                .approval
+                .as_ref()
+                .map(|approval| approval.approved_content_hash.as_str()),
+            Some(reloaded.content_hash.as_str())
+        );
     }
 
     #[test]
@@ -11669,7 +12359,6 @@ mod tests {
         assert!(!payload.to_string().contains("deployment automation"));
         assert_eq!(
             capability_call_argv(&plan.capability)
-                .expect("service-token call")
                 .iter()
                 .find(|argument| argument.contains("0600"))
                 .map(String::as_str),
@@ -11684,7 +12373,6 @@ mod tests {
         );
         assert_eq!(
             capability_call_argv(&risk_metadata_drift)
-                .expect("service-token call despite risk metadata drift")
                 .iter()
                 .find(|argument| argument.contains("0600"))
                 .map(String::as_str),
@@ -11755,7 +12443,6 @@ mod tests {
         );
         assert_eq!(
             capability_call_argv(&plan.capability)
-                .expect("zone service-token call")
                 .iter()
                 .find(|argument| argument.contains("0600"))
                 .map(String::as_str),
