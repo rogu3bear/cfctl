@@ -60,3 +60,6 @@ print_stdout = "deny"
 print_stderr = "deny"
 missing_errors_doc = "allow"
 needless_pass_by_value = "allow"
+
+[profile.dev]
+debug = "line-tables-only"
