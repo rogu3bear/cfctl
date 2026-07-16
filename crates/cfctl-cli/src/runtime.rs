@@ -8149,7 +8149,7 @@ mod tests {
         apply_d1_read_replication_state_response, apply_dns_record_state_response,
         apply_global_warp_override_state_response, apply_oauth_client_secret_state_response,
         apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
-        apply_zone_account_response, apply_zone_entitlement_response,
+        apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
         bind_required_empty_compensation_body, boundary_response_artifact, call_command,
         capability_call_argv, compensation_request, execute_read, find_secret_value,
         guide_document, is_live_plan_precondition_hash, is_secret_output_capability,
@@ -8172,8 +8172,8 @@ mod tests {
         validate_selected_permission_groups, validate_zone_account_receipt_precondition,
         workspace_resource_keys, zone_target,
     };
-    use crate::CallArgs;
     use crate::profiles::ProfilesConfig;
+    use crate::{CallArgs, PlanApproveArgs};
     use cfctl_auth::{AuthError, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
     use cfctl_cloudflare::CloudflareResponseV1;
@@ -11800,6 +11800,117 @@ mod tests {
         assert!(
             error.to_string().contains("never selected implicitly"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn approve_plan_requires_explicit_yes_on_the_store_path() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = CapabilityV1::new(
+            "dns.records.update",
+            "Update DNS record",
+            "PUT",
+            "/zones/{zone_id}/dns_records/{record_id}",
+        );
+        let plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"zone_id":"zone-a","record_id":"record-a"}),
+        )
+        .expect("draft plan");
+        let operation_id = plan.operation_id.clone();
+        store.save_plan(&plan).expect("persist draft");
+
+        let error = approve_plan(
+            &store,
+            &PlanApproveArgs {
+                operation_id: operation_id.clone(),
+                yes: false,
+                max_cost: None,
+            },
+        )
+        .expect_err("store path must refuse chat/intent without --yes");
+        assert!(
+            error
+                .to_string()
+                .contains("approval must be an explicit yes bound to the operation id"),
+            "{error}"
+        );
+        let reloaded = store.load_plan(&operation_id).expect("plan remains draft");
+        assert_eq!(reloaded.status, PlanStatus::Draft);
+        assert!(reloaded.approval.is_none());
+    }
+
+    #[test]
+    fn approve_plan_rejects_hash_drifted_store_draft_before_authority() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = CapabilityV1::new(
+            "dns.records.update",
+            "Update DNS record",
+            "PUT",
+            "/zones/{zone_id}/dns_records/{record_id}",
+        );
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"zone_id":"zone-a","record_id":"record-a"}),
+        )
+        .expect("draft plan");
+        let operation_id = plan.operation_id.clone();
+        let bound_hash = plan.content_hash.clone();
+        store.save_plan(&plan).expect("persist hash-bound draft");
+
+        plan.targets = json!({"zone_id":"zone-b","record_id":"record-a"});
+        assert_eq!(plan.content_hash, bound_hash);
+        store
+            .save_plan(&plan)
+            .expect("persist drifted targets without rehash");
+
+        let error = approve_plan(
+            &store,
+            &PlanApproveArgs {
+                operation_id: operation_id.clone(),
+                yes: true,
+                max_cost: None,
+            },
+        )
+        .expect_err("store path must refuse hash-drifted draft");
+        assert!(
+            error.to_string().contains("unchanged hash-bound draft"),
+            "{error}"
+        );
+        let reloaded = store.load_plan(&operation_id).expect("still draft");
+        assert_eq!(reloaded.status, PlanStatus::Draft);
+        assert!(reloaded.approval.is_none());
+
+        plan.refresh_hash()
+            .expect("operator rebinds reviewed content");
+        store.save_plan(&plan).expect("persist rehashed draft");
+        let approved = approve_plan(
+            &store,
+            &PlanApproveArgs {
+                operation_id: operation_id.clone(),
+                yes: true,
+                max_cost: None,
+            },
+        )
+        .expect("rehashed draft may approve with explicit yes");
+        assert_eq!(approved.command, "plans approve");
+        assert!(approved.ok);
+        let reloaded = store.load_plan(&operation_id).expect("approved plan");
+        assert_eq!(reloaded.status, PlanStatus::Approved);
+        assert_eq!(
+            reloaded
+                .approval
+                .as_ref()
+                .map(|approval| approval.approved_content_hash.as_str()),
+            Some(reloaded.content_hash.as_str())
         );
     }
 

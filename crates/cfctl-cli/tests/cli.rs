@@ -418,3 +418,81 @@ fn write_legacy_wrangler_profile(runtime: &std::path::Path) {
     )
     .expect("legacy profile fixture");
 }
+
+fn write_emergency_global_key_current(runtime: &std::path::Path) {
+    fs::create_dir_all(runtime.join("config")).expect("runtime config directory");
+    fs::write(
+        runtime.join("config/profiles.json"),
+        r#"{
+            "schema_version": 1,
+            "current_profile": "emergency",
+            "profiles": {
+                "emergency": {
+                    "schema_version": 1,
+                    "id": "emergency",
+                    "kind": "global_key",
+                    "account_id": null,
+                    "oauth_client_id": null,
+                    "oauth_scopes": [],
+                    "oauth_scope_inventory_hash": null,
+                    "emergency_only": true
+                }
+            },
+            "pending_logins": {}
+        }"#,
+    )
+    .expect("emergency global-key current profile fixture");
+}
+
+fn write_fresh_accounts_list_catalog(runtime: &std::path::Path) {
+    use cfctl_catalog::CatalogSnapshot;
+    use cfctl_core::CapabilityV1;
+    use chrono::Utc;
+    use std::collections::BTreeMap;
+
+    let capability = CapabilityV1::new("accounts-list", "List accounts", "GET", "/accounts");
+    let mut catalog = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "https://example.invalid/openapi.json".to_owned(),
+        source_hash: "source-sha".to_owned(),
+        schema_hash: String::new(),
+        capabilities: BTreeMap::from([(capability.id.clone(), capability)]),
+    };
+    catalog.refresh_hash().expect("catalog hash");
+    let path = runtime.join("data/catalog/catalog-v1.json");
+    fs::create_dir_all(path.parent().expect("catalog parent")).expect("catalog directory");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&catalog).expect("catalog JSON"),
+    )
+    .expect("write catalog fixture");
+}
+
+#[test]
+fn binary_call_rejects_ambient_emergency_global_key_without_profile_flag() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    write_emergency_global_key_current(runtime.path());
+    write_fresh_accounts_list_catalog(runtime.path());
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args(["call", "accounts-list", "--json"])
+        .output()
+        .expect("run cfctl call with ambient global-key current profile");
+    assert!(
+        !output.status.success(),
+        "ambient global-key must fail closed; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("never selected implicitly"),
+        "expected ambient global-key denial, got: {combined}"
+    );
+}
