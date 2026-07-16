@@ -44,6 +44,22 @@ pub enum CoreError {
     },
     #[error("operation {0} no longer matches its approved content hash")]
     PlanDrifted(String),
+    #[error("standing authority {authority_id} denied the operation: {reason}")]
+    StandingAuthorityDenied {
+        authority_id: String,
+        reason: String,
+    },
+    #[error("standing authority {authority_id} is {actual}; expected {expected}")]
+    InvalidStandingAuthorityState {
+        authority_id: String,
+        actual: String,
+        expected: &'static str,
+    },
+    #[error("standing authority {authority_id} expired at {expires_at}")]
+    StandingAuthorityExpired {
+        authority_id: String,
+        expires_at: DateTime<Utc>,
+    },
     #[error("operation {operation_id} has an invalid transaction journal: {reason}")]
     InvalidTransactionJournal {
         operation_id: String,
@@ -2021,6 +2037,75 @@ impl PlanV1 {
         Ok(())
     }
 
+    /// Consumes an unapproved, approval-required draft under a hash-bound
+    /// standing authority instead of a per-operation approval. The caller
+    /// must have validated the authority's blast-radius bounds against the
+    /// exact execution input first; this method re-checks plan integrity and
+    /// the authority's operational state, then records the authority binding
+    /// in the transaction journal so every unattended consumption is
+    /// attributable to the exact approved grant.
+    pub fn mark_consumed_via_standing_authority(
+        &mut self,
+        authority: &StandingAuthorityV1,
+    ) -> Result<()> {
+        if Utc::now() > self.expires_at {
+            self.status = PlanStatus::Expired;
+            return Err(CoreError::PlanExpired {
+                operation_id: self.operation_id.clone(),
+                expires_at: self.expires_at,
+            });
+        }
+        let current_hash = hash_value(&self.hashable_content())?;
+        if current_hash != self.content_hash {
+            return Err(CoreError::PlanDrifted(self.operation_id.clone()));
+        }
+        if self.status != PlanStatus::Draft
+            || self.approval.is_some()
+            || self.policy.disposition != PolicyDisposition::ApprovalRequired
+        {
+            return Err(CoreError::InvalidPlanState {
+                operation_id: self.operation_id.clone(),
+                actual: self.status,
+                expected: "unapproved approval-required draft for standing-authority consumption",
+            });
+        }
+        authority.ensure_operational()?;
+        if authority.account_id != self.account_id {
+            return Err(CoreError::StandingAuthorityDenied {
+                authority_id: authority.authority_id.clone(),
+                reason: format!(
+                    "plan account `{}` is outside the authority's pinned account",
+                    self.account_id
+                ),
+            });
+        }
+        if !authority
+            .capability_ids
+            .iter()
+            .any(|capability_id| capability_id == &self.capability.id)
+        {
+            return Err(CoreError::StandingAuthorityDenied {
+                authority_id: authority.authority_id.clone(),
+                reason: format!(
+                    "capability `{}` is outside the authority's allowlist",
+                    self.capability.id
+                ),
+            });
+        }
+        self.status = PlanStatus::Consumed;
+        if let Err(error) = self.record_transaction_stage_with_artifact(
+            TransactionStageV1::ConsumptionPersisted,
+            serde_json::json!({
+                "standing_authority_id": authority.authority_id,
+                "standing_authority_content_hash": authority.content_hash,
+            }),
+        ) {
+            self.status = PlanStatus::Draft;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Appends a forward-only, hash-chained transaction checkpoint. Runtime
     /// persistence is performed by the caller immediately after this method.
     pub fn record_transaction_stage(&mut self, stage: TransactionStageV1) -> Result<()> {
@@ -2335,6 +2420,296 @@ fn valid_non_negative_amount(amount: f64) -> bool {
     amount.is_finite() && amount >= 0.0
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StandingAuthorityStatus {
+    PendingApproval,
+    Active,
+    Revoked,
+}
+
+impl StandingAuthorityStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingApproval => "pending_approval",
+            Self::Active => "active",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StandingAuthorityRunV1 {
+    pub at: DateTime<Utc>,
+    pub operation_id: String,
+    pub capability_id: String,
+}
+
+/// A one-time-approved, hash-bound, TTL- and scope-bounded authorization
+/// under which recurring token-lifecycle plans may be consumed unattended.
+/// The bounds are the defensibility core: an authority can only produce
+/// strictly-weaker, name-scoped, expiring child tokens, and can only revoke
+/// tokens it minted itself. Granting one is itself an explicit approval
+/// ceremony; revocation is immediate and unconditional.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StandingAuthorityV1 {
+    pub schema_version: u8,
+    pub authority_id: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub account_id: String,
+    pub capability_ids: Vec<String>,
+    pub permission_group_ids: Vec<String>,
+    pub permission_inventory_hash: String,
+    pub max_child_ttl_hours: u32,
+    pub name_prefix: String,
+    pub max_runs_per_day: u32,
+    pub status: StandingAuthorityStatus,
+    pub approval: Option<ApprovalV1>,
+    #[serde(default)]
+    pub minted_token_ids: Vec<String>,
+    #[serde(default)]
+    pub run_log: Vec<StandingAuthorityRunV1>,
+    pub content_hash: String,
+}
+
+impl StandingAuthorityV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn draft(
+        account_id: &str,
+        capability_ids: Vec<String>,
+        mut permission_group_ids: Vec<String>,
+        permission_inventory_hash: &str,
+        max_child_ttl_hours: u32,
+        name_prefix: &str,
+        max_runs_per_day: u32,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Self> {
+        permission_group_ids.sort();
+        permission_group_ids.dedup();
+        let mut authority = Self {
+            schema_version: 1,
+            authority_id: Uuid::new_v4().to_string(),
+            created_at: Utc::now(),
+            expires_at,
+            account_id: account_id.to_owned(),
+            capability_ids,
+            permission_group_ids,
+            permission_inventory_hash: permission_inventory_hash.to_owned(),
+            max_child_ttl_hours,
+            name_prefix: name_prefix.to_owned(),
+            max_runs_per_day,
+            status: StandingAuthorityStatus::PendingApproval,
+            approval: None,
+            minted_token_ids: Vec::new(),
+            run_log: Vec::new(),
+            content_hash: String::new(),
+        };
+        authority.refresh_hash()?;
+        Ok(authority)
+    }
+
+    /// The reviewed grant content. Excludes status, approval, and the
+    /// mutable run accounting so post-approval bookkeeping cannot drift the
+    /// approved hash.
+    fn hashable_content(&self) -> Value {
+        serde_json::json!({
+            "schema_version": self.schema_version,
+            "authority_id": self.authority_id,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "account_id": self.account_id,
+            "capability_ids": self.capability_ids,
+            "permission_group_ids": self.permission_group_ids,
+            "permission_inventory_hash": self.permission_inventory_hash,
+            "max_child_ttl_hours": self.max_child_ttl_hours,
+            "name_prefix": self.name_prefix,
+            "max_runs_per_day": self.max_runs_per_day,
+        })
+    }
+
+    pub fn refresh_hash(&mut self) -> Result<()> {
+        self.content_hash = hash_value(&self.hashable_content())?;
+        Ok(())
+    }
+
+    pub fn approve(&mut self, explicit_yes: bool) -> Result<()> {
+        if !explicit_yes {
+            return Err(CoreError::ExplicitApprovalRequired);
+        }
+        if self.status != StandingAuthorityStatus::PendingApproval {
+            return Err(CoreError::InvalidStandingAuthorityState {
+                authority_id: self.authority_id.clone(),
+                actual: self.status.as_str().to_owned(),
+                expected: "pending_approval",
+            });
+        }
+        if Utc::now() > self.expires_at {
+            return Err(CoreError::StandingAuthorityExpired {
+                authority_id: self.authority_id.clone(),
+                expires_at: self.expires_at,
+            });
+        }
+        let current_hash = hash_value(&self.hashable_content())?;
+        if current_hash != self.content_hash {
+            return Err(CoreError::InvalidStandingAuthorityState {
+                authority_id: self.authority_id.clone(),
+                actual: "hash-drifted".to_owned(),
+                expected: "unchanged hash-bound grant",
+            });
+        }
+        self.approval = Some(ApprovalV1 {
+            approved_at: Utc::now(),
+            approved_content_hash: self.content_hash.clone(),
+            max_cost: None,
+        });
+        self.status = StandingAuthorityStatus::Active;
+        Ok(())
+    }
+
+    /// Revocation is the fail-closed direction: always permitted, from any
+    /// state, effective immediately.
+    pub fn revoke(&mut self) {
+        self.status = StandingAuthorityStatus::Revoked;
+    }
+
+    /// Active, unexpired, and still carrying an approval bound to the exact
+    /// current grant content.
+    pub fn ensure_operational(&self) -> Result<()> {
+        if self.status != StandingAuthorityStatus::Active {
+            return Err(CoreError::InvalidStandingAuthorityState {
+                authority_id: self.authority_id.clone(),
+                actual: self.status.as_str().to_owned(),
+                expected: "active",
+            });
+        }
+        if Utc::now() > self.expires_at {
+            return Err(CoreError::StandingAuthorityExpired {
+                authority_id: self.authority_id.clone(),
+                expires_at: self.expires_at,
+            });
+        }
+        let current_hash = hash_value(&self.hashable_content())?;
+        let approval_matches = self
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.approved_content_hash == current_hash);
+        if current_hash != self.content_hash || !approval_matches {
+            return Err(CoreError::InvalidStandingAuthorityState {
+                authority_id: self.authority_id.clone(),
+                actual: "hash-drifted".to_owned(),
+                expected: "approval bound to the current grant content",
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn runs_in_last_day(&self, now: DateTime<Utc>) -> usize {
+        self.run_log
+            .iter()
+            .filter(|run| now - run.at <= Duration::hours(24))
+            .count()
+    }
+
+    fn ensure_run_budget(&self, now: DateTime<Utc>) -> Result<()> {
+        if self.runs_in_last_day(now) >= self.max_runs_per_day as usize {
+            return Err(CoreError::StandingAuthorityDenied {
+                authority_id: self.authority_id.clone(),
+                reason: format!(
+                    "run budget exhausted: {} runs in the last 24h against a limit of {}",
+                    self.runs_in_last_day(now),
+                    self.max_runs_per_day
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn denied(&self, reason: String) -> CoreError {
+        CoreError::StandingAuthorityDenied {
+            authority_id: self.authority_id.clone(),
+            reason,
+        }
+    }
+
+    /// Bounds check for minting a child token. Every bound is mandatory: a
+    /// child must carry the pinned name prefix, request only allowlisted
+    /// permission groups, and declare an expiry within the authority's
+    /// maximum child TTL.
+    pub fn authorize_token_create(
+        &self,
+        now: DateTime<Utc>,
+        child_name: &str,
+        requested_group_ids: &[String],
+        child_expires_at: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        self.ensure_operational()?;
+        self.ensure_run_budget(now)?;
+        if !child_name.starts_with(&self.name_prefix) {
+            return Err(self.denied(format!(
+                "child token name `{child_name}` does not carry the pinned prefix `{}`",
+                self.name_prefix
+            )));
+        }
+        if requested_group_ids.is_empty() {
+            return Err(self.denied("child token requests no permission groups".to_owned()));
+        }
+        for group_id in requested_group_ids {
+            if !self.permission_group_ids.contains(group_id) {
+                return Err(self.denied(format!(
+                    "permission group `{group_id}` is outside the approved allowlist"
+                )));
+            }
+        }
+        let Some(child_expires_at) = child_expires_at else {
+            return Err(self.denied(
+                "child token declares no expiry; standing mints must be short-lived".to_owned(),
+            ));
+        };
+        let max_ttl = Duration::hours(i64::from(self.max_child_ttl_hours));
+        if child_expires_at - now > max_ttl {
+            return Err(self.denied(format!(
+                "child token expiry exceeds the {}h maximum child TTL",
+                self.max_child_ttl_hours
+            )));
+        }
+        Ok(())
+    }
+
+    /// Bounds check for revoking a token: a standing authority may only
+    /// delete tokens it minted itself (lineage bound).
+    pub fn authorize_token_delete(&self, now: DateTime<Utc>, token_id: &str) -> Result<()> {
+        self.ensure_operational()?;
+        self.ensure_run_budget(now)?;
+        if !self
+            .minted_token_ids
+            .iter()
+            .any(|minted| minted == token_id)
+        {
+            return Err(self.denied(format!(
+                "token `{token_id}` was not minted under this authority; lineage bound refuses the revoke"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn record_run(&mut self, operation_id: &str, capability_id: &str) {
+        self.run_log.push(StandingAuthorityRunV1 {
+            at: Utc::now(),
+            operation_id: operation_id.to_owned(),
+            capability_id: capability_id.to_owned(),
+        });
+    }
+
+    pub fn record_minted_token(&mut self, token_id: &str) {
+        if !self.minted_token_ids.iter().any(|id| id == token_id) {
+            self.minted_token_ids.push(token_id.to_owned());
+        }
+    }
+}
+
 pub fn hash_value(value: &Value) -> Result<String> {
     let encoded = serde_json::to_vec(value)?;
     let digest = Sha256::digest(encoded);
@@ -2367,6 +2742,7 @@ pub enum EvidenceClass {
     LiveRead,
     Preview,
     Apply,
+    StandingApply,
     PostChangeVerification,
     AgentAction,
     LocalProof,
