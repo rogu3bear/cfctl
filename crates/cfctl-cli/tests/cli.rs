@@ -61,6 +61,57 @@ fn bare_text_is_agent_intent_but_deterministic_commands_are_not() {
 }
 
 #[test]
+fn bare_single_unknown_tokens_fail_closed_to_the_deterministic_parser() {
+    for typo in ["not-a-real-verb", "verify", "catallog", "env"] {
+        assert_eq!(
+            classify_invocation(["cfctl", typo]),
+            InvocationMode::Deterministic,
+            "single token `{typo}` must fail closed, not launch an agent"
+        );
+        assert!(
+            Cli::try_parse_from(["cfctl", typo]).is_err(),
+            "clap must reject the unknown verb `{typo}`"
+        );
+    }
+    assert_eq!(
+        classify_invocation(["cfctl", "--json", "verify"]),
+        InvocationMode::Deterministic
+    );
+    // The documented quoted natural-language form keeps the agent lane, as
+    // does unquoted multi-argument intent.
+    assert_eq!(
+        classify_invocation(["cfctl", "list dns records for the active zone"]),
+        InvocationMode::NaturalLanguage("list dns records for the active zone".to_owned())
+    );
+    assert_eq!(
+        classify_invocation(["cfctl", "list", "dns", "records"]),
+        InvocationMode::NaturalLanguage("list dns records".to_owned())
+    );
+    // `help` is injected by clap at parse time and must stay deterministic.
+    assert_eq!(
+        classify_invocation(["cfctl", "help"]),
+        InvocationMode::Deterministic
+    );
+}
+
+#[test]
+fn unknown_single_verb_exits_nonzero_without_launching_an_agent() {
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .arg("not-a-real-verb")
+        .output()
+        .expect("cfctl binary runs");
+    assert!(
+        !output.status.success(),
+        "an unknown verb must not exit 0 (the old behavior launched an agent)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unrecognized subcommand"),
+        "clap must reject the verb with a usage error, got: {stderr}"
+    );
+}
+
+#[test]
 fn approval_requires_the_exact_plan_id_and_explicit_yes_flag() {
     let parsed = Cli::try_parse_from([
         "cfctl",

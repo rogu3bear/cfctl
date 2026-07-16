@@ -2,23 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
-
-const DETERMINISTIC_COMMANDS: &[&str] = &[
-    "auth",
-    "keys",
-    "catalog",
-    "call",
-    "guide",
-    "plans",
-    "workspace",
-    "agents",
-    "docs",
-    "doctor",
-    "update",
-    "migrate",
-    "help",
-];
+use clap::{Args, CommandFactory as _, Parser, Subcommand};
 
 mod profiles;
 pub mod runtime;
@@ -385,11 +369,26 @@ where
     let Some(first) = remaining.first() else {
         return InvocationMode::Deterministic;
     };
-    if first.starts_with('-') || DETERMINISTIC_COMMANDS.contains(&first.as_str()) {
-        InvocationMode::Deterministic
-    } else {
-        InvocationMode::NaturalLanguage(remaining.join(" "))
+    if first.starts_with('-') || is_known_subcommand(first) {
+        return InvocationMode::Deterministic;
     }
+    // A bare single token is far more likely a mistyped subcommand than a
+    // one-word natural-language request: route it to the deterministic parser
+    // so clap fails closed with an unrecognized-subcommand error (and its
+    // did-you-mean suggestion) instead of silently launching an agent.
+    if remaining.len() == 1 && !first.contains(char::is_whitespace) {
+        return InvocationMode::Deterministic;
+    }
+    InvocationMode::NaturalLanguage(remaining.join(" "))
+}
+
+fn is_known_subcommand(name: &str) -> bool {
+    // clap injects the `help` subcommand at parse time, so it is not visible
+    // through `get_subcommands` here.
+    name == "help"
+        || Cli::command().get_subcommands().any(|command| {
+            command.get_name() == name || command.get_all_aliases().any(|alias| alias == name)
+        })
 }
 
 fn parse_key_value(value: &str) -> Result<(String, String), String> {

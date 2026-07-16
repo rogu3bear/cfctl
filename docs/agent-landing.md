@@ -143,7 +143,9 @@ cfctl "rotate the production Worker secret"
 
 This launches the configured local agent. Agents must use deterministic cfctl
 commands underneath. `CFCTL_AGENT_SESSION` prevents recursive agent launch.
-Model output never approves or directly mutates Cloudflare.
+Model output never approves or directly mutates Cloudflare. A bare single
+token that is not a known command fails closed with a usage error — mistyped
+verbs never become agent sessions.
 
 ## Completion evidence
 
