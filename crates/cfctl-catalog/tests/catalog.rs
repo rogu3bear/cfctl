@@ -837,6 +837,362 @@ fn workers_script_secret_classifier_rejects_permission_schema_and_readback_drift
     assert!(put.same_path_read.is_none());
 }
 
+fn workers_kv_namespace_response() -> Value {
+    json!({
+        "200": {
+            "description": "Workers KV namespace response.",
+            "content": {"application/json": {"schema": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/workers-kv_api-response-common"},
+                    {"type": "object", "properties": {
+                        "result": {"$ref": "#/components/schemas/workers-kv_namespace"}
+                    }}
+                ]
+            }}}
+        }
+    })
+}
+
+fn workers_kv_namespace_delete_response() -> Value {
+    json!({
+        "200": {
+            "description": "Remove a Namespace response.",
+            "content": {"application/json": {"schema": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/workers-kv_api-response-common"},
+                    {"type": "object", "properties": {
+                        "result": {"type": "object", "nullable": true}
+                    }}
+                ]
+            }}}
+        }
+    })
+}
+
+fn workers_kv_namespace_components() -> Value {
+    json!({
+        "schemas": {
+            "workers-kv_identifier": {
+                "description": "Identifier.",
+                "maxLength": 32,
+                "readOnly": true,
+                "type": "string"
+            },
+            "workers-kv_namespace_identifier": {
+                "description": "Namespace identifier tag.",
+                "maxLength": 32,
+                "readOnly": true,
+                "type": "string"
+            },
+            "workers-kv_namespace_title": {
+                "description": "A human-readable string name for a Namespace.",
+                "maxLength": 512,
+                "type": "string"
+            },
+            "workers-kv_create_rename_namespace_body": {
+                "type": "object",
+                "required": ["title"],
+                "properties": {
+                    "title": {"$ref": "#/components/schemas/workers-kv_namespace_title"}
+                }
+            },
+            "workers-kv_namespace": {
+                "type": "object",
+                "required": ["id", "title"],
+                "properties": {
+                    "id": {"$ref": "#/components/schemas/workers-kv_namespace_identifier"},
+                    "title": {"$ref": "#/components/schemas/workers-kv_namespace_title"},
+                    "supports_url_encoding": {"type": "boolean", "readOnly": true}
+                }
+            },
+            "workers-kv_api-response-common": {
+                "type": "object",
+                "required": ["success"],
+                "properties": {"success": {"type": "boolean", "enum": [true]}}
+            }
+        }
+    })
+}
+
+fn workers_kv_namespace_fixture() -> Value {
+    let account = json!({
+        "in": "path",
+        "name": "account_id",
+        "required": true,
+        "schema": {"$ref": "#/components/schemas/workers-kv_identifier"}
+    });
+    let namespace = json!({
+        "in": "path",
+        "name": "namespace_id",
+        "required": true,
+        "schema": {"$ref": "#/components/schemas/workers-kv_namespace_identifier"}
+    });
+    let namespace_response = workers_kv_namespace_response();
+    json!({
+        "openapi": "3.0.3",
+        "info": {"title": "Cloudflare API", "version": "4.0.0"},
+        "servers": [{"url": "https://api.cloudflare.com/client/v4"}],
+        "components": workers_kv_namespace_components(),
+        "paths": {
+            "/accounts/{account_id}/storage/kv/namespaces": {
+                "post": {
+                    "operationId": "workers-kv-namespace-create-a-namespace",
+                    "summary": "Create a Namespace",
+                    "description": "Creates a namespace under the given title. A `400` is returned if the account already owns a namespace with this title. A namespace must be explicitly deleted to be replaced.",
+                    "tags": ["Workers KV Namespace"],
+                    "x-api-token-group": ["Workers KV Storage Write"],
+                    "parameters": [account.clone()],
+                    "requestBody": {"required": true, "content": {"application/json": {
+                        "schema": {"$ref": "#/components/schemas/workers-kv_create_rename_namespace_body"}
+                    }}},
+                    "responses": namespace_response.clone()
+                }
+            },
+            "/accounts/{account_id}/storage/kv/namespaces/{namespace_id}": {
+                "get": {
+                    "operationId": "workers-kv-namespace-get-a-namespace",
+                    "summary": "Get a Namespace",
+                    "description": "Get the namespace corresponding to the given ID.",
+                    "tags": ["Workers KV Namespace"],
+                    "x-api-token-group": ["Workers KV Storage Write", "Workers KV Storage Read"],
+                    "parameters": [namespace.clone(), account.clone()],
+                    "responses": namespace_response.clone()
+                },
+                "put": {
+                    "operationId": "workers-kv-namespace-rename-a-namespace",
+                    "summary": "Rename a Namespace",
+                    "description": "Modifies a namespace's title.",
+                    "tags": ["Workers KV Namespace"],
+                    "x-api-token-group": ["Workers KV Storage Write"],
+                    "parameters": [namespace.clone(), account.clone()],
+                    "requestBody": {"required": true, "content": {"application/json": {
+                        "schema": {"$ref": "#/components/schemas/workers-kv_create_rename_namespace_body"}
+                    }}},
+                    "responses": namespace_response
+                },
+                "delete": {
+                    "operationId": "workers-kv-namespace-remove-a-namespace",
+                    "summary": "Remove a Namespace",
+                    "description": "Deletes the namespace corresponding to the given ID.",
+                    "tags": ["Workers KV Namespace"],
+                    "x-api-token-group": ["Workers KV Storage Write"],
+                    "parameters": [namespace, account],
+                    "requestBody": {"required": true, "content": {"application/json": {}}},
+                    "responses": workers_kv_namespace_delete_response()
+                }
+            }
+        }
+    })
+}
+
+fn assert_workers_kv_namespace_create(create: &CapabilityV1) {
+    assert_eq!(
+        create.adapter_status,
+        AdapterStatus::DynamicApi,
+        "{:?}",
+        create.blocked_reason
+    );
+    assert_eq!(create.risk, RiskClass::ScopedWrite);
+    assert_eq!(create.effect, EffectClass::ReversibleWrite);
+    assert!(create.cost.known);
+    assert_eq!(create.cost.maximum, Some(0.0));
+    assert_eq!(create.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(create.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(create.entitlement.available, Some(true));
+    assert_eq!(create.entitlement.plans.get("free"), Some(&true));
+    assert_eq!(create.entitlement.plans.get("paid"), Some(&true));
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    let created = create
+        .created_resource
+        .as_ref()
+        .expect("created namespace contract");
+    assert_eq!(
+        created.detail_path,
+        "/accounts/{account_id}/storage/kv/namespaces/{namespace_id}"
+    );
+    assert_eq!(created.identity_selector, "namespace_id");
+    assert_eq!(created.response_result_identity_pointer, "/id");
+    assert_eq!(
+        created.read_capability_id,
+        "workers-kv-namespace-get-a-namespace"
+    );
+    assert_eq!(
+        created.delete_capability_id,
+        "workers-kv-namespace-remove-a-namespace"
+    );
+    assert_eq!(created.verified_response_fields, ["title"]);
+    assert!(create.rollback.supported);
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    assert!(create.mutation_contract_gaps().is_empty());
+}
+
+fn assert_workers_kv_namespace_rename(rename: &CapabilityV1) {
+    assert_eq!(
+        rename.adapter_status,
+        AdapterStatus::DynamicApi,
+        "{:?}",
+        rename.blocked_reason
+    );
+    assert_eq!(rename.risk, RiskClass::ScopedWrite);
+    assert_eq!(rename.effect, EffectClass::ReversibleWrite);
+    assert!(rename.cost.known);
+    assert_eq!(rename.cost.maximum, Some(0.0));
+    assert_eq!(rename.entitlement.available, Some(true));
+    assert_eq!(
+        rename.verification.strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+    let read = rename.same_path_read.as_ref().expect("rename readback");
+    assert_eq!(
+        read.read_capability_id,
+        "workers-kv-namespace-get-a-namespace"
+    );
+    assert_eq!(read.verified_response_fields, ["title"]);
+    assert!(!rename.rollback.supported);
+    assert!(
+        rename
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("pre-change snapshot"))
+    );
+    assert!(rename.mutation_contract_gaps().is_empty());
+}
+
+fn assert_workers_kv_namespace_delete_is_cost_blocked(delete: &CapabilityV1) {
+    assert_eq!(delete.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(delete.risk, RiskClass::Destructive);
+    assert_eq!(delete.effect, EffectClass::Irreversible);
+    assert!(!delete.cost.known);
+    assert_eq!(delete.cost.maximum, None);
+    assert_eq!(delete.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(delete.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert!(delete.cost.basis.as_deref().is_some_and(
+        |basis| basis.contains("populated namespace") && basis.contains("not documented")
+    ));
+    assert_eq!(delete.entitlement.available, Some(true));
+    assert_eq!(
+        delete.verification.strategy,
+        "same_resource_returns_not_found_after_delete"
+    );
+    let read = delete.same_path_read.as_ref().expect("delete readback");
+    assert_eq!(
+        read.read_capability_id,
+        "workers-kv-namespace-get-a-namespace"
+    );
+    assert!(read.verified_response_fields.is_empty());
+    assert!(!delete.rollback.supported);
+    assert!(delete.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("all contained values") && warning.contains("irreversible")
+    }));
+    assert!(delete.verification_contract_supported());
+    assert_eq!(delete.mutation_contract_gaps().len(), 1);
+    assert!(delete.mutation_contract_gaps()[0].contains("cost is not bounded"));
+}
+
+#[test]
+fn workers_kv_namespace_lifecycle_has_exact_routes_costs_and_recovery_contracts() {
+    let snapshot = normalize_openapi(&workers_kv_namespace_fixture()).expect("Workers KV catalog");
+    assert_workers_kv_namespace_create(
+        snapshot
+            .get("workers-kv-namespace-create-a-namespace")
+            .expect("create namespace"),
+    );
+    assert_workers_kv_namespace_rename(
+        snapshot
+            .get("workers-kv-namespace-rename-a-namespace")
+            .expect("rename namespace"),
+    );
+    assert_workers_kv_namespace_delete_is_cost_blocked(
+        snapshot
+            .get("workers-kv-namespace-remove-a-namespace")
+            .expect("remove namespace"),
+    );
+}
+
+#[test]
+fn workers_kv_namespace_classifier_rejects_legacy_route_and_contract_drift() {
+    let mut legacy = workers_kv_namespace_fixture();
+    let collection = legacy["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/storage/kv/namespaces")
+        .expect("collection path");
+    let detail = legacy["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/storage/kv/namespaces/{namespace_id}")
+        .expect("detail path");
+    legacy["paths"]["/accounts/{account_id}/workers/namespaces"] = collection;
+    legacy["paths"]["/accounts/{account_id}/workers/namespaces/{namespace_id}"] = detail;
+    let snapshot = normalize_openapi(&legacy).expect("legacy Workers KV catalog");
+    for capability_id in [
+        "workers-kv-namespace-create-a-namespace",
+        "workers-kv-namespace-rename-a-namespace",
+        "workers-kv-namespace-remove-a-namespace",
+    ] {
+        assert_eq!(
+            snapshot
+                .get(capability_id)
+                .expect("namespace mutation")
+                .adapter_status,
+            AdapterStatus::Blocked
+        );
+    }
+
+    let mut permission = workers_kv_namespace_fixture();
+    permission["paths"]["/accounts/{account_id}/storage/kv/namespaces"]["post"]["x-api-token-group"] =
+        json!(["Workers KV Storage Read"]);
+    let snapshot = normalize_openapi(&permission).expect("permission-drifted catalog");
+    assert_eq!(
+        snapshot
+            .get("workers-kv-namespace-create-a-namespace")
+            .expect("create")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+
+    let mut request = workers_kv_namespace_fixture();
+    request["components"]["schemas"]["workers-kv_namespace_title"]["maxLength"] = json!(1024);
+    let snapshot = normalize_openapi(&request).expect("request-drifted catalog");
+    for capability_id in [
+        "workers-kv-namespace-create-a-namespace",
+        "workers-kv-namespace-rename-a-namespace",
+    ] {
+        assert_eq!(
+            snapshot
+                .get(capability_id)
+                .expect("namespace write")
+                .adapter_status,
+            AdapterStatus::Blocked
+        );
+    }
+
+    let mut readback = workers_kv_namespace_fixture();
+    readback["paths"]["/accounts/{account_id}/storage/kv/namespaces/{namespace_id}"]["get"]["operationId"] =
+        json!("workers-kv-namespace-untrusted-readback");
+    let snapshot = normalize_openapi(&readback).expect("readback-drifted catalog");
+    for capability_id in [
+        "workers-kv-namespace-create-a-namespace",
+        "workers-kv-namespace-rename-a-namespace",
+        "workers-kv-namespace-remove-a-namespace",
+    ] {
+        assert_eq!(
+            snapshot
+                .get(capability_id)
+                .expect("namespace mutation")
+                .adapter_status,
+            AdapterStatus::Blocked
+        );
+    }
+}
+
 fn assert_nested_replication_schema(schema: &serde_json::Value) {
     assert_eq!(schema["properties"]["replication"]["type"], "object");
     assert_eq!(

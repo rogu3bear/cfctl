@@ -979,6 +979,7 @@ fn apply_post_normalization_contracts(
     classify_same_path_object_mutation_contracts(document, capabilities);
     finalize_r2_bucket_create_contract(document, capabilities);
     finalize_d1_database_create_contract(document, capabilities);
+    finalize_workers_kv_namespace_contracts(document, capabilities);
     finalize_oauth_client_secret_rotation_contract(document, capabilities);
     finalize_global_warp_override_rollback_contract(capabilities);
     finalize_d1_read_replication_rollback_contract(capabilities);
@@ -3544,6 +3545,10 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         classify_d1_database_create(capability);
     } else if let Some(kind) = worker_script_secret_operation_kind(capability) {
         classify_worker_script_secret_operation(capability, kind);
+    } else if WORKERS_KV_NAMESPACE_MUTATION_IDS.contains(&capability.id.as_str()) {
+        if let Some(kind) = workers_kv_namespace_operation_kind(capability) {
+            classify_workers_kv_namespace_operation(capability, kind);
+        }
     } else if let Some(kind) = oauth_client_secret_operation_kind(capability) {
         classify_oauth_client_secret_operation(capability, kind);
     } else if is_workers_ai_model_run(capability) {
@@ -3879,6 +3884,310 @@ fn finalize_worker_script_secret_contracts(
             read_capability_id: WORKER_SCRIPT_SECRET_READ_CAPABILITY_ID.to_owned(),
             verified_response_fields: Vec::new(),
         });
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkersKvNamespaceOperationKind {
+    Create,
+    Rename,
+    Delete,
+}
+
+const WORKERS_KV_NAMESPACE_COLLECTION_PATH: &str = "/accounts/{account_id}/storage/kv/namespaces";
+const WORKERS_KV_NAMESPACE_DETAIL_PATH: &str =
+    "/accounts/{account_id}/storage/kv/namespaces/{namespace_id}";
+const WORKERS_KV_NAMESPACE_READ_CAPABILITY_ID: &str = "workers-kv-namespace-get-a-namespace";
+const WORKERS_KV_NAMESPACE_MUTATION_IDS: [&str; 3] = [
+    "workers-kv-namespace-create-a-namespace",
+    "workers-kv-namespace-rename-a-namespace",
+    "workers-kv-namespace-remove-a-namespace",
+];
+
+fn workers_kv_namespace_operation_kind(
+    capability: &CapabilityV1,
+) -> Option<WorkersKvNamespaceOperationKind> {
+    if capability.product != "Workers KV Namespace"
+        || capability.account_scope != "account"
+        || capability.permissions != ["Workers KV Storage Write"]
+        || !workers_kv_namespace_response_contract_supported(capability)
+    {
+        return None;
+    }
+    match (
+        capability.id.as_str(),
+        capability.method.as_str(),
+        capability.path.as_str(),
+    ) {
+        (
+            "workers-kv-namespace-create-a-namespace",
+            "POST",
+            WORKERS_KV_NAMESPACE_COLLECTION_PATH,
+        ) if capability.title == "Create a Namespace"
+            && capability.description.as_deref()
+                == Some(
+                    "Creates a namespace under the given title. A `400` is returned if the account already owns a namespace with this title. A namespace must be explicitly deleted to be replaced.",
+                )
+            && workers_kv_namespace_selectors_supported(capability, false)
+            && workers_kv_namespace_title_request_supported(capability) =>
+        {
+            Some(WorkersKvNamespaceOperationKind::Create)
+        }
+        ("workers-kv-namespace-rename-a-namespace", "PUT", WORKERS_KV_NAMESPACE_DETAIL_PATH)
+            if capability.title == "Rename a Namespace"
+                && capability.description.as_deref() == Some("Modifies a namespace's title.")
+                && workers_kv_namespace_selectors_supported(capability, true)
+                && workers_kv_namespace_title_request_supported(capability) =>
+        {
+            Some(WorkersKvNamespaceOperationKind::Rename)
+        }
+        ("workers-kv-namespace-remove-a-namespace", "DELETE", WORKERS_KV_NAMESPACE_DETAIL_PATH)
+            if capability.title == "Remove a Namespace"
+                && capability.description.as_deref()
+                    == Some("Deletes the namespace corresponding to the given ID.")
+                && workers_kv_namespace_selectors_supported(capability, true)
+                && capability.request_schema.is_none() =>
+        {
+            Some(WorkersKvNamespaceOperationKind::Delete)
+        }
+        _ => None,
+    }
+}
+
+fn workers_kv_namespace_response_contract_supported(capability: &CapabilityV1) -> bool {
+    capability
+        .response_contract
+        .as_ref()
+        .is_some_and(|response| {
+            response.success_statuses == ["200"]
+                && response.success_media_types == ["application/json"]
+                && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+        })
+}
+
+fn workers_kv_namespace_selectors_supported(
+    capability: &CapabilityV1,
+    includes_namespace_id: bool,
+) -> bool {
+    let expected = if includes_namespace_id {
+        [
+            ("account_id", "Identifier."),
+            ("namespace_id", "Namespace identifier tag."),
+        ]
+        .as_slice()
+    } else {
+        [("account_id", "Identifier.")].as_slice()
+    };
+    capability.selectors.len() == expected.len()
+        && expected.iter().all(|(name, description)| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+                    && selector.description.as_deref() == Some(*description)
+                    && selector.contract.as_ref().is_some_and(|contract| {
+                        contract.schema == serde_json::json!({"maxLength":32,"type":"string"})
+                            && contract.query.is_none()
+                    })
+            })
+        })
+}
+
+fn workers_kv_namespace_title_request_supported(capability: &CapabilityV1) -> bool {
+    capability.request_schema.as_ref()
+        == Some(&serde_json::json!({
+            "type": "object",
+            "required": ["title"],
+            "properties": {
+                "title": {"maxLength": 512, "type": "string"}
+            },
+            "x-cfctl-body-required": true
+        }))
+}
+
+fn workers_kv_namespace_references() -> Vec<KnowledgeReferenceV1> {
+    vec![
+        KnowledgeReferenceV1 {
+            title: "Workers KV namespace API".to_owned(),
+            url: "https://developers.cloudflare.com/api/resources/kv/".to_owned(),
+            source: "official Cloudflare API reference".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Workers KV pricing".to_owned(),
+            url: "https://developers.cloudflare.com/kv/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Workers KV changelog".to_owned(),
+            url: "https://developers.cloudflare.com/changelog/product/kv/".to_owned(),
+            source: "official Cloudflare changelog".to_owned(),
+        },
+    ]
+}
+
+fn classify_workers_kv_namespace_operation(
+    capability: &mut CapabilityV1,
+    kind: WorkersKvNamespaceOperationKind,
+) {
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans =
+        BTreeMap::from([("free".to_owned(), true), ("paid".to_owned(), true)]);
+    capability.entitlement.blocker = None;
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/kv/platform/pricing/".to_owned());
+    capability.entitlement.requires_live_resolution = false;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.references = workers_kv_namespace_references();
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    match kind {
+        WorkersKvNamespaceOperationKind::Create => {
+            capability.risk = RiskClass::ScopedWrite;
+            capability.effect = EffectClass::ReversibleWrite;
+            capability.cost.basis = Some(
+                "the namespace-management request does not read, write, delete, or list a KV key and has no direct incremental operation charge; later KV key operations and stored data remain usage-billed"
+                    .to_owned(),
+            );
+            capability.rollback.warning = Some(
+                "compensation requires an exact returned namespace identifier and a separately reviewed delete plan"
+                    .to_owned(),
+            );
+        }
+        WorkersKvNamespaceOperationKind::Rename => {
+            capability.risk = RiskClass::ScopedWrite;
+            capability.effect = EffectClass::ReversibleWrite;
+            capability.cost.basis = Some(
+                "renaming a namespace does not read, write, delete, or list a KV key and has no direct incremental operation charge; later KV key operations and stored data remain usage-billed"
+                    .to_owned(),
+            );
+            capability.rollback.warning = Some(
+                "automatic restoration is unsupported because the plan does not bind a pre-change snapshot; restoration requires a separately reviewed rename plan built from trusted evidence"
+                    .to_owned(),
+            );
+        }
+        WorkersKvNamespaceOperationKind::Delete => {
+            capability.risk = RiskClass::Destructive;
+            capability.effect = EffectClass::Irreversible;
+            capability.cost.incremental = true;
+            capability.cost.currency = None;
+            capability.cost.maximum = None;
+            capability.cost.known = false;
+            capability.cost.basis = Some(
+                "Cloudflare prices KV key deletions, but whether removing a populated namespace bills deletion of its contained keys is not documented; cfctl therefore cannot declare a finite operation ceiling"
+                    .to_owned(),
+            );
+            capability.rollback.warning = Some(
+                "namespace deletion and loss of all contained values are irreversible without a prior export or trusted snapshot; recreation requires separately reviewed namespace and key-write plans"
+                    .to_owned(),
+            );
+        }
+    }
+}
+
+fn finalize_workers_kv_namespace_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let read_supported = capabilities
+        .get(WORKERS_KV_NAMESPACE_READ_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.id == WORKERS_KV_NAMESPACE_READ_CAPABILITY_ID
+                && capability.title == "Get a Namespace"
+                && capability.description.as_deref()
+                    == Some("Get the namespace corresponding to the given ID.")
+                && capability.method == "GET"
+                && capability.path == WORKERS_KV_NAMESPACE_DETAIL_PATH
+                && capability.product == "Workers KV Namespace"
+                && capability.account_scope == "account"
+                && capability.permissions == ["Workers KV Storage Write", "Workers KV Storage Read"]
+                && capability.request_schema.is_none()
+                && workers_kv_namespace_selectors_supported(capability, true)
+                && workers_kv_namespace_response_contract_supported(capability)
+        })
+        && document
+            .pointer("/paths/~1accounts~1{account_id}~1storage~1kv~1namespaces~1{namespace_id}/get")
+            .is_some_and(|operation| {
+                success_response_declares_result_fields(document, operation, &["id", "title"])
+            });
+
+    for capability_id in WORKERS_KV_NAMESPACE_MUTATION_IDS {
+        let Some(capability) = capabilities.get_mut(capability_id) else {
+            continue;
+        };
+        let Some(kind) = workers_kv_namespace_operation_kind(capability) else {
+            continue;
+        };
+        let operation_response_supported = match kind {
+            WorkersKvNamespaceOperationKind::Create => document
+                .pointer("/paths/~1accounts~1{account_id}~1storage~1kv~1namespaces/post")
+                .is_some_and(|operation| {
+                    success_response_declares_result_fields(document, operation, &["id", "title"])
+                }),
+            WorkersKvNamespaceOperationKind::Rename => document
+                .pointer(
+                    "/paths/~1accounts~1{account_id}~1storage~1kv~1namespaces~1{namespace_id}/put",
+                )
+                .is_some_and(|operation| {
+                    success_response_declares_result_fields(document, operation, &["id", "title"])
+                }),
+            WorkersKvNamespaceOperationKind::Delete => true,
+        };
+        if !read_supported || !operation_response_supported {
+            capability.created_resource = None;
+            capability.same_path_read = None;
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason =
+                Some("Workers KV namespace source or exact readback contract drifted".to_owned());
+            continue;
+        }
+
+        classify_workers_kv_namespace_operation(capability, kind);
+        match kind {
+            WorkersKvNamespaceOperationKind::Create => {
+                capability.created_resource = Some(CreatedResourceContractV1 {
+                    detail_path: WORKERS_KV_NAMESPACE_DETAIL_PATH.to_owned(),
+                    identity_selector: "namespace_id".to_owned(),
+                    response_result_identity_pointer: "/id".to_owned(),
+                    read_capability_id: WORKERS_KV_NAMESPACE_READ_CAPABILITY_ID.to_owned(),
+                    delete_capability_id: "workers-kv-namespace-remove-a-namespace".to_owned(),
+                    verified_response_fields: vec!["title".to_owned()],
+                });
+                "created_resource_contains_planned_fields_by_returned_id"
+                    .clone_into(&mut capability.verification.strategy);
+                capability.rollback.supported = true;
+                capability.rollback.strategy =
+                    Some("delete_created_resource_by_returned_id".to_owned());
+                capability.rollback.warning = Some(
+                    "compensation creates a separate exact namespace delete plan that must be reviewed and explicitly approved; populated namespaces remain blocked from deletion until their cost and data-loss boundary is resolved"
+                        .to_owned(),
+                );
+            }
+            WorkersKvNamespaceOperationKind::Rename => {
+                capability.same_path_read = Some(SamePathReadContractV1 {
+                    path: WORKERS_KV_NAMESPACE_DETAIL_PATH.to_owned(),
+                    read_capability_id: WORKERS_KV_NAMESPACE_READ_CAPABILITY_ID.to_owned(),
+                    verified_response_fields: vec!["title".to_owned()],
+                });
+                "same_resource_contains_planned_fields_after_update"
+                    .clone_into(&mut capability.verification.strategy);
+            }
+            WorkersKvNamespaceOperationKind::Delete => {
+                capability.same_path_read = Some(SamePathReadContractV1 {
+                    path: WORKERS_KV_NAMESPACE_DETAIL_PATH.to_owned(),
+                    read_capability_id: WORKERS_KV_NAMESPACE_READ_CAPABILITY_ID.to_owned(),
+                    verified_response_fields: Vec::new(),
+                });
+                "same_resource_returns_not_found_after_delete"
+                    .clone_into(&mut capability.verification.strategy);
+            }
+        }
         refresh_dynamic_mutation_contract(capability);
     }
 }
