@@ -496,6 +496,32 @@ fn binary_import_api_token_requires_stdin_flag() {
 }
 
 #[test]
+fn binary_import_global_key_requires_a_secret_source() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args([
+            "auth",
+            "import-global-key",
+            "--email",
+            "ops@example.com",
+            "--json",
+        ])
+        .output()
+        .expect("import-global-key without a source");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("--stdin") && combined.contains("--value-in"),
+        "must offer both out-of-band sources: {combined}"
+    );
+}
+
+#[test]
 fn binary_auth_login_without_client_id_points_at_import_api_token() {
     let runtime = tempfile::tempdir().expect("runtime root");
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))

@@ -62,6 +62,16 @@ printf '%s' "$CLOUDFLARE_API_TOKEN" | \
 cfctl auth status --json
 ```
 
+Piping through a build wrapper such as the in-repo `./cfctl` shim can lose
+stdin to `cargo`. When you invoke cfctl that way, hand it a mode-0600 file
+instead — the token never rides stdin:
+
+```bash
+( umask 077; printf '%s' "$CLOUDFLARE_API_TOKEN" > token.tok )
+cfctl auth import-api-token --account <account-id> --value-in token.tok
+rm -f token.tok
+```
+
 OAuth is optional when you have a Cloudflare OAuth client (public cfctl OAuth
 is not default until promoted):
 
@@ -76,11 +86,18 @@ printf '%s\n' '<STATE CODE>' | cfctl auth login \
   --client-id "$CFCTL_OAUTH_CLIENT_ID"
 ```
 
-An emergency global key can be imported through stdin. It is never selected automatically:
+An emergency global key can be imported through stdin, or from a mode-0600 file
+with `--value-in` (use the file form under `./cfctl`, whose cargo wrapper eats
+stdin). It is never selected automatically:
 
 ```bash
 printf '%s' "$CLOUDFLARE_API_KEY" | \
   cfctl auth import-global-key --profile emergency-global --email you@example.com --stdin
+
+# or stdin-free:
+( umask 077; printf '%s' "$CLOUDFLARE_API_KEY" > key.tok )
+cfctl auth import-global-key --profile emergency-global --email you@example.com --value-in key.tok
+rm -f key.tok
 ```
 
 ## Read and change

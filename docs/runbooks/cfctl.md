@@ -60,11 +60,19 @@ ownership from a profile label, workspace pin, or local IaC.
 
 ## Authentication
 
-Day-to-day auth is a scoped API token imported only through stdin:
+Day-to-day auth is a scoped API token imported out-of-band. Pipe it through
+stdin, or hand cfctl a mode-0600 file with `--value-in` when a build wrapper
+(such as the in-repo `./cfctl` shim, which routes stdin through `cargo`) would
+otherwise swallow stdin:
 
 ```bash
 printf '%s' "$CLOUDFLARE_API_TOKEN" | \
   cfctl auth import-api-token --account <account-id> --stdin --json
+
+# or, stdin-free (survives ./cfctl):
+( umask 077; printf '%s' "$CLOUDFLARE_API_TOKEN" > token.tok )
+cfctl auth import-api-token --account <account-id> --value-in token.tok --json
+rm -f token.tok
 ```
 
 OAuth login (optional) uses PKCE and an explicit client id until public cfctl

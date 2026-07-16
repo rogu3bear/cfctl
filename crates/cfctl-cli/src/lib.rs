@@ -108,6 +108,12 @@ pub struct ImportApiTokenArgs {
         help = "Read the API token from stdin; values in command arguments are forbidden"
     )]
     pub stdin: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Read the API token from a mode-0600 file instead of stdin; avoids piping secrets through a build wrapper such as `./cfctl`"
+    )]
+    pub value_in: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -121,6 +127,12 @@ pub struct ImportGlobalKeyArgs {
         help = "Read the key from stdin; values in command arguments are forbidden"
     )]
     pub stdin: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Read the global key from a mode-0600 file instead of stdin; avoids piping secrets through a build wrapper such as `./cfctl`"
+    )]
+    pub value_in: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

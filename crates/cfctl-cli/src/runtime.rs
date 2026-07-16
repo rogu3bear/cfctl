@@ -386,12 +386,7 @@ fn import_api_token(
     secrets: &dyn SecretStore,
     arguments: &ImportApiTokenArgs,
 ) -> Result<ResultEnvelopeV2> {
-    if !arguments.stdin {
-        return Err(CliError::Input(
-            "API tokens are accepted only through stdin; add `--stdin`".to_owned(),
-        ));
-    }
-    let token = read_stdin()?;
+    let token = read_import_secret(arguments.stdin, arguments.value_in.as_deref(), "API token")?;
     store_imported_api_token(
         store,
         profiles,
@@ -419,12 +414,12 @@ fn store_imported_api_token(
     }
     if token.is_empty() {
         return Err(CliError::Input(
-            "stdin did not contain an API token".to_owned(),
+            "the supplied API token was empty".to_owned(),
         ));
     }
     if token.chars().any(char::is_whitespace) {
         return Err(CliError::Input(
-            "API token from stdin must be a single value without whitespace".to_owned(),
+            "the supplied API token must be a single value without whitespace".to_owned(),
         ));
     }
     secrets.store_api_token(profile_id, token)?;
@@ -451,15 +446,12 @@ fn import_global_key(
     secrets: &dyn SecretStore,
     arguments: &ImportGlobalKeyArgs,
 ) -> Result<ResultEnvelopeV2> {
-    if !arguments.stdin {
-        return Err(CliError::Input(
-            "global keys are accepted only through stdin; add `--stdin`".to_owned(),
-        ));
-    }
-    let key = read_stdin()?.trim().to_owned();
+    let key = read_import_secret(arguments.stdin, arguments.value_in.as_deref(), "global key")?
+        .trim()
+        .to_owned();
     if key.is_empty() {
         return Err(CliError::Input(
-            "stdin did not contain a global key".to_owned(),
+            "the supplied global key was empty".to_owned(),
         ));
     }
     secrets.store_global_key(&arguments.profile, &arguments.email, &key)?;
@@ -8159,6 +8151,50 @@ fn read_stdin() -> Result<String> {
     Ok(value)
 }
 
+/// Read an out-of-band secret from exactly one source. `--value-in <path>`
+/// exists so callers can hand cfctl a secret without piping it through a build
+/// wrapper such as `./cfctl`, which routes stdin through `cargo` and can consume
+/// it before the binary reads it. Exactly one of stdin or a file is required.
+fn read_import_secret(from_stdin: bool, value_in: Option<&Path>, label: &str) -> Result<String> {
+    match (from_stdin, value_in) {
+        (true, Some(_)) => Err(CliError::Input(format!(
+            "choose one {label} source: either `--stdin` or `--value-in <path>`, not both"
+        ))),
+        (false, None) => Err(CliError::Input(format!(
+            "the {label} must be supplied out-of-band: add `--stdin` or `--value-in <mode-0600 path>`; values in command arguments are forbidden"
+        ))),
+        (true, None) => read_stdin(),
+        (false, Some(path)) => read_secret_file(path),
+    }
+}
+
+/// Read a secret from a file that no other user can read. On Unix any group or
+/// other permission bit fails closed, mirroring the mode-0600 sink that
+/// `--value-out` writes.
+fn read_secret_file(path: &Path) -> Result<String> {
+    let metadata = fs::metadata(path).map_err(|source| cli_io(path, source))?;
+    if !metadata.is_file() {
+        return Err(CliError::Input(format!(
+            "`--value-in` path is not a regular file: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(CliError::Input(format!(
+                "`--value-in` file {} must not be readable by group or others; run `chmod 600 {}` (current mode {:04o})",
+                path.display(),
+                path.display(),
+                mode & 0o7777
+            )));
+        }
+    }
+    fs::read_to_string(path).map_err(|source| cli_io(path, source))
+}
+
 fn docs_file(store: &StateStore) -> PathBuf {
     store
         .paths()
@@ -8237,7 +8273,8 @@ mod tests {
         guide_document, is_live_plan_precondition_hash, is_secret_output_capability,
         non_readback_verification_basis, persist_prepared_plan, persist_secret_lifecycle,
         preflight_call_input, preserve_previous_catalog, query_object_from_pairs,
-        redact_secret_result, required_cloudflare_tunnel_configuration_state_precondition,
+        read_import_secret, read_secret_file, redact_secret_result,
+        required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
         required_oauth_client_secret_state_precondition,
@@ -11934,11 +11971,7 @@ mod tests {
             "",
         )
         .expect_err("empty token rejected");
-        assert!(
-            empty
-                .to_string()
-                .contains("stdin did not contain an API token")
-        );
+        assert!(empty.to_string().contains("API token was empty"));
 
         let unpinned = store_imported_api_token(
             &store,
@@ -11950,6 +11983,41 @@ mod tests {
         )
         .expect_err("empty account rejected");
         assert!(unpinned.to_string().contains("--account"));
+    }
+
+    #[test]
+    fn read_import_secret_requires_exactly_one_out_of_band_source() {
+        let neither = read_import_secret(false, None, "API token").expect_err("no source rejected");
+        let neither = neither.to_string();
+        assert!(neither.contains("--stdin"), "{neither}");
+        assert!(neither.contains("--value-in"), "{neither}");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("token");
+        std::fs::write(&path, "cfat_from_file").expect("write token file");
+        let both =
+            read_import_secret(true, Some(&path), "API token").expect_err("two sources rejected");
+        assert!(both.to_string().contains("not both"), "{both}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_secret_file_reads_mode_0600_and_rejects_group_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("token");
+        std::fs::write(&path, "cfat_from_file\n").expect("write token file");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+        let value = read_secret_file(&path).expect("read 0600 file");
+        assert_eq!(value.trim(), "cfat_from_file");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod 640");
+        let leaky = read_secret_file(&path).expect_err("group-readable rejected");
+        let leaky = leaky.to_string();
+        assert!(leaky.contains("group or others"), "{leaky}");
+        assert!(leaky.contains("chmod 600"), "{leaky}");
     }
 
     #[test]

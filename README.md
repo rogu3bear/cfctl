@@ -83,14 +83,25 @@ printf '%s' "$CLOUDFLARE_API_TOKEN" | \
   cfctl auth import-api-token --account <account-id> --stdin
 ```
 
+If you drive cfctl through a wrapper that routes stdin through `cargo` (the
+in-repo `./cfctl` shim does), pass a mode-0600 file instead so the secret never
+touches stdin:
+
+```bash
+( umask 077; printf '%s' "$CLOUDFLARE_API_TOKEN" > token.tok )
+cfctl auth import-api-token --account <account-id> --value-in token.tok
+rm -f token.tok
+```
+
 OAuth Authorization Code with PKCE remains available when you have a
 Cloudflare OAuth client (`--client-id` / `CFCTL_OAUTH_CLIENT_ID`). Public cfctl
 OAuth is not the default until cfctl.io ownership and permanent promotion
 complete. The login emits an authorization URL; complete with the callback's
 one-time `STATE CODE` on stdin. Public clients never embed a client secret.
 
-An emergency global key can be imported from stdin. It is never selected
-silently:
+An emergency global key can be imported from stdin, or from a mode-0600 file
+with `--value-in` when a wrapper such as `./cfctl` would route stdin through
+`cargo`. It is never selected silently:
 
 ```bash
 printf '%s' "$CLOUDFLARE_API_KEY" | \
@@ -98,6 +109,11 @@ printf '%s' "$CLOUDFLARE_API_KEY" | \
   --profile emergency-global \
   --email you@example.com \
   --stdin
+
+# or stdin-free:
+( umask 077; printf '%s' "$CLOUDFLARE_API_KEY" > key.tok )
+cfctl auth import-global-key --profile emergency-global --email you@example.com --value-in key.tok
+rm -f key.tok
 ```
 
 ## Read and change
