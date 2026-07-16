@@ -131,6 +131,45 @@ cfctl call cloudflare-tunnel-get-a-cloudflare-tunnel-token \
   --value-out /tmp/tunnel-token
 ```
 
+<!-- BEGIN CFCTL GENERATED: standing-authority-guide -->
+## Standing authority lifecycle
+
+Standing authority is the bounded token-lifecycle exception: one explicitly approved local policy may admit matching token mints and lineage-bound revocations without per-operation approval.
+
+**Will this mutate Cloudflare now?** Permission reads and policy create, list, approve, and revoke are local or read-only. A matching `keys mint --under-policy` or lineage-bound token revoke may cross the Cloudflare boundary after durable admission.
+
+**What grants authority?** Only `cfctl keys policy approve <authority-id> --yes` activates the exact reviewed policy. Its account, capabilities, permission allowlist, token-name prefix, child TTL, rate budget, expiry, and content hash remain binding.
+
+**What is persisted?** cfctl persists the schema-v1 authority document, approval, run reservations, plan journals, reconciled minted-token lineage, and redacted evidence. The one-time token value goes only to the requested mode-0600 sink.
+
+**What happens after a failure or crash?** Revocation blocks runs not yet durably admitted; an already durably admitted run may finish. A validated boundary receipt is reconciled into lineage even after sink or verification failure, and later recovery never replays the Cloudflare mutation.
+
+**What should I do next?** Read the fresh account permission inventory, then create a narrow policy using exact permission IDs or unambiguous exact names.
+
+### Lifecycle
+
+1. **Read permissions** (`read`) — Fetch one fresh account-owned permission inventory. Durable state: live permission receipt
+2. **Create policy** (`none`) — Resolve the allowlist and bind every standing-authority limit. Durable state: pending StandingAuthorityV1
+3. **Approve policy** (`none`) — Review the exact authority ID and activate it with explicit `--yes`. Durable state: approved authority content hash
+4. **Admit child** (`none`) — Recheck the child subset and complete allowlist, reserve the run under lock, and consume the child plan. Durable state: run reservation and plan consumption
+5. **Execute child** (`write`) — Release the authority lock, then mint or revoke exactly within the approved bounds. Durable state: boundary attempt and response
+6. **Sink and reconcile** (`none`) — Write the one-time secret sink and reconcile any created token ID from the validated response. Durable state: secret-sink receipt and minted-token lineage
+7. **Verify** (`read`) — Verify the remote token identity and status or require rectification without replay. Durable state: verification receipt and final plan status
+8. **Revoke policy** (`none`) — Close future admission immediately; already minted child tokens remain separate resources. Durable state: monotonic revoked authority status
+
+### Commands
+
+```bash
+cfctl keys permissions --account <account-id> --json
+cfctl keys policy create --account <account-id> --name-prefix <token-prefix> --permission <permission-group-id> --max-child-ttl-hours 24 --max-runs-per-day 4 --expires-days 30 --json
+cfctl keys policy list --json
+cfctl keys policy approve <authority-id> --yes --json
+cfctl keys mint --name <token-name> --permission <permission-group-id> --account <account-id> --ttl-hours 12 --value-out <new-mode-0600-path> --under-policy <authority-id> --json
+cfctl keys policy list --json
+cfctl keys policy revoke <authority-id> --json
+```
+<!-- END CFCTL GENERATED: standing-authority-guide -->
+
 ## Install agent discovery
 
 ```bash

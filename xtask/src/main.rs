@@ -11,6 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use cfctl_core::{GuideTopicV1, render_guide_topic_markdown};
 use clap::{Parser, Subcommand};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -390,6 +391,8 @@ fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
         "verify_public_contract.sh",
         "cfctl standards audit",
         "cfctl admin authorize-backend",
+        // Branch or PR lifecycle text must not survive into active guidance.
+        "pending merge",
     ];
     for path in required_guidance {
         verify_guidance_file_has_no_stale_v1(repository_root, path, &stale_v1_guidance)?;
@@ -422,6 +425,11 @@ fn verify_guidance_file_has_no_stale_v1(
 }
 
 fn verify_documented_contracts() -> Result<(), TaskError> {
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| {
+            TaskError::InvalidSourceContract("xtask has no repository parent".to_owned())
+        })?;
     for (path, phrase) in [
         ("README.md", "hash-chained transaction journal"),
         ("SECURITY.md", "full-history Gitleaks scan"),
@@ -429,13 +437,71 @@ fn verify_documented_contracts() -> Result<(), TaskError> {
         ("docs/v2-security.md", "operation-specific verification"),
         ("docs/v2-architecture.md", "Wrangler TOML/JSONC, Terraform"),
     ] {
-        let content =
-            fs::read_to_string(path).map_err(|source| io_error(Path::new(path), source))?;
+        let absolute_path = repository_root.join(path);
+        let content = fs::read_to_string(&absolute_path)
+            .map_err(|source| io_error(&absolute_path, source))?;
         if !content.contains(phrase) {
             return Err(TaskError::InvalidSourceContract(format!(
                 "{path} omits required contract text `{phrase}`"
             )));
         }
+    }
+    verify_generated_guidance_section(
+        &repository_root.join("README.md"),
+        "system-guide",
+        &render_guide_topic_markdown(GuideTopicV1::System),
+    )?;
+    verify_generated_guidance_section(
+        &repository_root.join("QUICKSTART.md"),
+        "standing-authority-guide",
+        &render_guide_topic_markdown(GuideTopicV1::StandingAuthority),
+    )?;
+    Ok(())
+}
+
+fn verify_generated_guidance_section(
+    path: &Path,
+    key: &str,
+    expected: &str,
+) -> Result<(), TaskError> {
+    let content = fs::read_to_string(path).map_err(|source| io_error(path, source))?;
+    verify_generated_guidance_section_text(&content, key, expected)
+        .map_err(|error| TaskError::InvalidSourceContract(format!("{}: {error}", path.display())))
+}
+
+fn verify_generated_guidance_section_text(
+    content: &str,
+    key: &str,
+    expected: &str,
+) -> Result<(), TaskError> {
+    let start = format!("<!-- BEGIN CFCTL GENERATED: {key} -->");
+    let end = format!("<!-- END CFCTL GENERATED: {key} -->");
+    if content.matches(&start).count() != 1 || content.matches(&end).count() != 1 {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "generated guidance section `{key}` must have exactly one start and end marker"
+        )));
+    }
+    let (_, after_start) = content.split_once(&start).ok_or_else(|| {
+        TaskError::InvalidSourceContract(format!(
+            "generated guidance section `{key}` has no start marker"
+        ))
+    })?;
+    let after_start = after_start.strip_prefix('\n').ok_or_else(|| {
+        TaskError::InvalidSourceContract(format!(
+            "generated guidance section `{key}` must start on the line after its marker"
+        ))
+    })?;
+    let (actual, _) = after_start.split_once(&end).ok_or_else(|| {
+        TaskError::InvalidSourceContract(format!(
+            "generated guidance section `{key}` has no end marker"
+        ))
+    })?;
+    let actual = actual.strip_suffix('\n').unwrap_or(actual);
+    let expected = expected.strip_suffix('\n').unwrap_or(expected);
+    if actual != expected {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "generated guidance section `{key}` drifted from the executable projection"
+        )));
     }
     Ok(())
 }
@@ -1723,7 +1789,8 @@ mod tests {
         release_build_subcommand, release_tag_is_exact_version, render_linux_installer_text,
         security_proof_commands, validate_codesign_details, validate_notary_receipt_value,
         validate_signed_release_file_set, validated_release_targets,
-        verify_active_guidance_has_no_v1_commands,
+        verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
+        verify_generated_guidance_section_text,
     };
 
     #[test]
@@ -1743,6 +1810,39 @@ mod tests {
     #[test]
     fn active_guidance_does_not_reteach_archived_v1_commands() {
         let result = verify_active_guidance_has_no_v1_commands();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn generated_guidance_sections_require_an_exact_projection_match() {
+        let content = concat!(
+            "before\n",
+            "<!-- BEGIN CFCTL GENERATED: system-guide -->\n",
+            "canonical body\n",
+            "<!-- END CFCTL GENERATED: system-guide -->\n",
+            "after\n",
+        );
+        assert!(
+            verify_generated_guidance_section_text(content, "system-guide", "canonical body")
+                .is_ok()
+        );
+        assert!(
+            verify_generated_guidance_section_text(content, "system-guide", "drifted body")
+                .is_err()
+        );
+        assert!(
+            verify_generated_guidance_section_text(
+                "<!-- BEGIN CFCTL GENERATED: system-guide -->\ncanonical body\n",
+                "system-guide",
+                "canonical body",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn checked_in_guidance_matches_the_executable_projection() {
+        let result = verify_documented_contracts();
         assert!(result.is_ok(), "{result:?}");
     }
 
