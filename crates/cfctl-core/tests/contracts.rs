@@ -1,11 +1,13 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use cfctl_core::{
-    AdapterStatus, CapabilityV1, CostV1, CreatedCollectionResourceContractV1,
-    CreatedResourceContractV1, EffectClass, EvidenceClass, EvidenceV1, GuideStage, PlanStatus,
-    PlanV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1,
-    StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, UpdatedResourceContractV1,
-    guide_stages, hash_value, redact_json,
+    AdapterStatus, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1, CostV1,
+    CreatedCollectionResourceContractV1, CreatedResourceContractV1, EffectClass, EvidenceClass,
+    EvidenceV1, GuideActionV1, GuideCloudflareEffectV1, GuideContractStateV1, GuideStage,
+    GuideTopicV1, PlanStatus, PlanV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1,
+    SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
+    TransactionStageV1, UpdatedResourceContractV1, guide_stages, guide_topic_document, hash_value,
+    redact_json, render_guide_topic_markdown,
 };
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
@@ -32,6 +34,102 @@ fn every_capability_guide_has_the_exact_fifteen_lifecycle_stages() {
         GuideStage::CloseWithEvidence.as_str(),
         "close_with_evidence"
     );
+}
+
+#[test]
+fn typed_capability_guide_preserves_the_existing_json_shape() {
+    let capability = CapabilityV1::new(
+        "dns.records.list",
+        "List DNS records",
+        "GET",
+        "/zones/{zone_id}/dns_records",
+    );
+    let guide = CapabilityGuideV1 {
+        capability: capability.clone(),
+        contract_state: GuideContractStateV1::Available,
+        blocking_gaps: Vec::new(),
+        blocked_reason: None,
+        call_argv: Some(vec![
+            "cfctl".to_owned(),
+            "call".to_owned(),
+            capability.id.clone(),
+        ]),
+        post_resolution_call_argv: vec![
+            "cfctl".to_owned(),
+            "call".to_owned(),
+            capability.id.clone(),
+        ],
+        next_action: GuideActionV1 {
+            summary: "Read live state.".to_owned(),
+            argv: vec!["cfctl".to_owned(), "call".to_owned(), capability.id.clone()],
+        },
+        stages: vec![CapabilityGuideStageV1 {
+            stage: 1,
+            name: GuideStage::Discover,
+            capability_id: capability.id.clone(),
+            required: true,
+            contract_state: GuideContractStateV1::Available,
+            summary: "Inspect the catalog contract.".to_owned(),
+            evidence_class: EvidenceClass::SourceConfig,
+            commands: vec![vec![
+                "cfctl".to_owned(),
+                "catalog".to_owned(),
+                "show".to_owned(),
+                capability.id,
+            ]],
+        }],
+    };
+
+    let value = serde_json::to_value(guide).expect("typed guide JSON");
+    assert_eq!(value["contract_state"], "available");
+    assert_eq!(value["stages"][0]["name"], "discover");
+    assert_eq!(value["stages"][0]["evidence_class"], "source_config");
+    assert!(value.get("schema_version").is_none());
+}
+
+#[test]
+fn system_and_standing_topics_answer_the_operator_questions_from_one_contract() {
+    let system = guide_topic_document(GuideTopicV1::System);
+    assert_eq!(system.schema_version, 1);
+    assert_eq!(system.answers.len(), 5);
+    assert!(
+        system
+            .flow
+            .iter()
+            .any(|step| step.cloudflare_effect == GuideCloudflareEffectV1::Write)
+    );
+    assert!(
+        system
+            .commands
+            .iter()
+            .any(|command| command == &["cfctl", "plans", "run", "<operation-id>", "--json"])
+    );
+
+    let standing = guide_topic_document(GuideTopicV1::StandingAuthority);
+    assert_eq!(standing.schema_version, 1);
+    assert!(standing.summary.contains("token-lifecycle"));
+    assert!(standing.answers.iter().any(|answer| {
+        answer.answer.contains("durably admitted") && answer.answer.contains("never replay")
+    }));
+    assert!(standing.commands.iter().any(|command| {
+        command
+            .windows(2)
+            .any(|pair| pair == ["--under-policy", "<authority-id>"])
+    }));
+}
+
+#[test]
+fn canonical_topic_markdown_is_complete_and_status_free() {
+    let system = render_guide_topic_markdown(GuideTopicV1::System);
+    assert!(system.starts_with("## How cfctl works\n"));
+    assert!(system.contains("**Will this mutate Cloudflare now?**"));
+    assert!(system.contains("cfctl guide <capability-id> --json"));
+
+    let standing = render_guide_topic_markdown(GuideTopicV1::StandingAuthority);
+    assert!(standing.starts_with("## Standing authority lifecycle\n"));
+    assert!(standing.contains("cfctl keys policy approve <authority-id> --yes --json"));
+    assert!(standing.contains("cfctl keys policy revoke <authority-id> --json"));
+    assert!(!standing.contains("pending merge"));
 }
 
 #[test]
