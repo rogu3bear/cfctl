@@ -3,7 +3,7 @@
 use std::{fs, process::Command as ProcessCommand};
 
 use cfctl_cli::{Cli, Command, InvocationMode, classify_invocation};
-use clap::Parser;
+use clap::{CommandFactory as _, Parser};
 
 #[test]
 fn every_public_command_group_is_parseable() {
@@ -40,6 +40,85 @@ fn every_public_command_group_is_parseable() {
         assert!(
             matches!(parsed.command, Some(Command::Auth(_))) == (command == "auth")
                 || command != "auth"
+        );
+    }
+}
+
+#[test]
+fn guide_topics_are_additive_and_capability_guides_remain_compatible() {
+    let capability = Cli::try_parse_from(["cfctl", "guide", "dns-records-list"])
+        .expect("existing capability guide parses");
+    let Some(Command::Guide(capability)) = capability.command else {
+        panic!("guide command");
+    };
+    assert_eq!(
+        capability.capability_id.as_deref(),
+        Some("dns-records-list")
+    );
+    assert!(capability.topic.is_none());
+
+    for (value, expected) in [
+        ("system", cfctl_cli::GuideTopicArg::System),
+        (
+            "standing-authority",
+            cfctl_cli::GuideTopicArg::StandingAuthority,
+        ),
+    ] {
+        let parsed =
+            Cli::try_parse_from(["cfctl", "guide", "--topic", value]).expect("guide topic parses");
+        let Some(Command::Guide(arguments)) = parsed.command else {
+            panic!("guide command");
+        };
+        assert!(arguments.capability_id.is_none());
+        assert_eq!(arguments.topic, Some(expected));
+    }
+
+    assert!(Cli::try_parse_from(["cfctl", "guide"]).is_err());
+    assert!(
+        Cli::try_parse_from(["cfctl", "guide", "dns-records-list", "--topic", "system"]).is_err()
+    );
+}
+
+#[test]
+fn guide_help_explains_capability_and_system_targets() {
+    let mut guide = Cli::command()
+        .find_subcommand("guide")
+        .expect("guide subcommand")
+        .clone();
+    let help = guide.render_long_help().to_string();
+    assert!(help.contains("CAPABILITY_ID"));
+    assert!(help.contains("--topic <TOPIC>"));
+    assert!(help.contains("system"));
+    assert!(help.contains("standing-authority"));
+}
+
+#[test]
+fn system_topics_run_offline_without_a_catalog() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    for topic in ["system", "standing-authority"] {
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+            .env("CFCTL_HOME", runtime.path())
+            .args(["guide", "--topic", topic, "--json"])
+            .output()
+            .expect("run system topic");
+        assert!(
+            output.status.success(),
+            "{topic}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("guide topic envelope");
+        assert_eq!(envelope["schema_version"], 2);
+        assert_eq!(envelope["performed"], false);
+        assert_eq!(envelope["result"]["schema_version"], 1);
+        assert_eq!(envelope["result"]["topic"], topic);
+        assert_eq!(
+            envelope["result"]["answers"].as_array().map(Vec::len),
+            Some(5)
+        );
+        assert!(
+            !runtime.path().join("data/catalog/current.json").exists(),
+            "a static topic must not create or refresh the catalog"
         );
     }
 }

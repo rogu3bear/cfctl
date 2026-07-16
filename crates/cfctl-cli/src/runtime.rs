@@ -28,9 +28,10 @@ use cfctl_cloudflare::{
     validate_request_contract,
 };
 use cfctl_core::{
-    AdapterStatus, CapabilityV1, ErrorV1, EvidenceClass, EvidenceV1, MoneyV1, PlanStatus, PlanV1,
+    AdapterStatus, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1, ErrorV1, EvidenceClass,
+    EvidenceV1, GuideActionV1, GuideContractStateV1, GuideTopicV1, MoneyV1, PlanStatus, PlanV1,
     PolicyDisposition, ResultEnvelopeV2, RiskClass, StandingAuthorityV1, TransactionStageV1,
-    VerificationState, guide_stages, hash_value, redact_json,
+    VerificationState, guide_stages, guide_topic_document, hash_value, redact_json,
 };
 use cfctl_planner::{ImpactContext, PolicyEngine};
 use cfctl_storage::{RuntimePaths, StateStore};
@@ -43,10 +44,10 @@ use tokio::process::Command as ProcessCommand;
 
 use crate::{
     AgentsCommand, AuthCommand, AuthLoginArgs, CallArgs, CatalogCommand, Cli, Command, DocsCommand,
-    GuideArgs, ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs,
-    KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs, KeyPolicySelector, KeyRevokeArgs,
-    KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector, PlansCommand,
-    ProfileSelector, SearchArgs, WorkspaceCommand,
+    GuideArgs, GuideTopicArg, ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs,
+    KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs,
+    KeyPolicySelector, KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs,
+    PlanSelector, PlansCommand, ProfileSelector, SearchArgs, WorkspaceCommand,
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
 
@@ -674,13 +675,26 @@ fn preserve_previous_catalog(store: &StateStore) -> Result<Value> {
 }
 
 async fn guide_command(store: &StateStore, arguments: &GuideArgs) -> Result<ResultEnvelopeV2> {
+    if let Some(topic) = arguments.topic {
+        let topic = match topic {
+            GuideTopicArg::System => GuideTopicV1::System,
+            GuideTopicArg::StandingAuthority => GuideTopicV1::StandingAuthority,
+        };
+        return Ok(ResultEnvelopeV2::success(
+            "guide",
+            serde_json::to_value(guide_topic_document(topic))?,
+        ));
+    }
+    let capability_id = arguments.capability_id.as_deref().ok_or_else(|| {
+        CliError::Input("guide requires one capability ID or `--topic`".to_owned())
+    })?;
     let catalog = ensure_catalog(store).await?;
     let capability = catalog
-        .get(&arguments.capability_id)
-        .ok_or_else(|| capability_missing(&arguments.capability_id))?;
+        .get(capability_id)
+        .ok_or_else(|| capability_missing(capability_id))?;
     Ok(ResultEnvelopeV2::success(
         "guide",
-        guide_document(capability),
+        serde_json::to_value(guide_document(capability))?,
     ))
 }
 
@@ -6920,19 +6934,50 @@ fn key_policy_list(store: &StateStore) -> Result<ResultEnvelopeV2> {
         .list_authorities()?
         .iter()
         .map(|authority| {
+            let effective_status = authority.effective_status(now);
+            let runs_last_24h = authority.runs_in_last_day(now);
+            let runs_remaining_24h = usize::try_from(authority.max_runs_per_day)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(runs_last_24h);
+            let next_action = match effective_status {
+                "pending_approval" => format!(
+                    "Review the bounds, then run `cfctl keys policy approve {} --yes`.",
+                    authority.authority_id
+                ),
+                "active" if runs_remaining_24h == 0 => format!(
+                    "The rolling run budget is exhausted; wait for budget to age out or revoke with `cfctl keys policy revoke {}`.",
+                    authority.authority_id
+                ),
+                "active" => format!(
+                    "Use `--under-policy {}` only for a matching mint or lineage-bound revoke; list again to inspect the resulting budget and lineage.",
+                    authority.authority_id
+                ),
+                "expired" => {
+                    "This authority is effectively expired; create and explicitly approve a new policy if recurring work must continue."
+                        .to_owned()
+                }
+                "revoked" => {
+                    "This authority is revoked and cannot admit new runs; individually revoke any surviving child tokens when needed."
+                        .to_owned()
+                }
+                _ => "Inspect the authority document before taking another action.".to_owned(),
+            };
             json!({
                 "authority_id": authority.authority_id,
-                "status": authority.effective_status(now),
+                "status": effective_status,
                 "account_id": authority.account_id,
                 "capability_ids": authority.capability_ids,
                 "name_prefix": authority.name_prefix,
                 "permission_group_count": authority.permission_group_ids.len(),
                 "max_child_ttl_hours": authority.max_child_ttl_hours,
                 "max_runs_per_day": authority.max_runs_per_day,
-                "runs_last_24h": authority.runs_in_last_day(now),
+                "runs_last_24h": runs_last_24h,
+                "runs_remaining_24h": runs_remaining_24h,
                 "minted_tokens": authority.minted_token_ids.len(),
+                "minted_token_ids": authority.minted_token_ids,
                 "created_at": authority.created_at,
                 "expires_at": authority.expires_at,
+                "next_action": next_action,
             })
         })
         .collect();
@@ -8128,7 +8173,7 @@ fn stage_required(stage: cfctl_core::GuideStage, capability: &cfctl_core::Capabi
     }
 }
 
-fn guide_document(capability: &CapabilityV1) -> Value {
+fn guide_document(capability: &CapabilityV1) -> CapabilityGuideV1 {
     let blocking_gaps = capability.mutation_contract_gaps();
     let post_resolution_call_argv = capability_call_argv(capability);
     let contract_ready =
@@ -8149,20 +8194,24 @@ fn guide_document(capability: &CapabilityV1) -> Value {
         })
         .collect::<Vec<_>>();
 
-    json!({
-        "capability": capability,
-        "contract_state": if contract_ready { "available" } else { "blocked" },
-        "blocking_gaps": blocking_gaps,
-        "blocked_reason": capability.blocked_reason,
-        "call_argv": call_argv,
-        "post_resolution_call_argv": post_resolution_call_argv,
-        "next_action": guide_next_action(
+    CapabilityGuideV1 {
+        capability: capability.clone(),
+        contract_state: if contract_ready {
+            GuideContractStateV1::Available
+        } else {
+            GuideContractStateV1::Blocked
+        },
+        blocking_gaps,
+        blocked_reason: capability.blocked_reason.clone(),
+        call_argv,
+        post_resolution_call_argv: post_resolution_call_argv.clone(),
+        next_action: guide_next_action(
             capability,
             contract_ready,
             Some(&post_resolution_call_argv),
         ),
-        "stages": stages,
-    })
+        stages,
+    }
 }
 
 fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
@@ -8242,17 +8291,17 @@ fn guide_next_action(
     capability: &CapabilityV1,
     contract_ready: bool,
     call_argv: Option<&[String]>,
-) -> Value {
+) -> GuideActionV1 {
     if contract_ready {
         let summary = if capability.mutating {
             "Create the preview plan with the exact generated argv; no Cloudflare mutation occurs until the resulting operation is run."
         } else {
             "Run the exact generated argv to produce a redacted live-read receipt."
         };
-        return json!({
-            "summary": summary,
-            "argv": call_argv,
-        });
+        return GuideActionV1 {
+            summary: summary.to_owned(),
+            argv: call_argv.unwrap_or_default().to_vec(),
+        };
     }
 
     let gaps = capability.mutation_contract_gaps();
@@ -8328,7 +8377,10 @@ fn guide_next_action(
             ],
         )
     };
-    json!({"summary": summary, "argv": argv})
+    GuideActionV1 {
+        summary: summary.to_owned(),
+        argv,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -8394,7 +8446,7 @@ fn guide_stage_contract_state(
     contract_ready: bool,
     blocking_gaps: &[String],
     live_reads: &[GuideLiveRead],
-) -> &'static str {
+) -> GuideContractStateV1 {
     use cfctl_core::GuideStage;
 
     let entitlement_blocked = capability.entitlement.available == Some(false)
@@ -8404,10 +8456,10 @@ fn guide_stage_contract_state(
         && capability.entitlement.plans.is_empty();
     match stage {
         GuideStage::SelectAccount if live_reads.contains(&GuideLiveRead::ZoneAccount) => {
-            "live_read_required"
+            GuideContractStateV1::LiveReadRequired
         }
         GuideStage::CheckEntitlement if live_reads.contains(&GuideLiveRead::ZoneEntitlement) => {
-            "live_read_required"
+            GuideContractStateV1::LiveReadRequired
         }
         GuideStage::InspectCurrentState
             if live_reads.iter().any(|read| {
@@ -8423,11 +8475,15 @@ fn guide_stage_contract_state(
                 )
             }) =>
         {
-            "live_read_required"
+            GuideContractStateV1::LiveReadRequired
         }
-        GuideStage::CheckEntitlement if entitlement_blocked => "blocked",
-        GuideStage::CheckEntitlement if entitlement_unresolved => "manual_review",
-        GuideStage::CalculateCost if capability.mutating && !capability.cost.known => "blocked",
+        GuideStage::CheckEntitlement if entitlement_blocked => GuideContractStateV1::Blocked,
+        GuideStage::CheckEntitlement if entitlement_unresolved => {
+            GuideContractStateV1::ManualReview
+        }
+        GuideStage::CalculateCost if capability.mutating && !capability.cost.known => {
+            GuideContractStateV1::Blocked
+        }
         GuideStage::CalculateCost
         | GuideStage::BuildPlan
         | GuideStage::RequestApproval
@@ -8435,7 +8491,7 @@ fn guide_stage_contract_state(
         | GuideStage::Rectify
             if !capability.mutating =>
         {
-            "not_applicable"
+            GuideContractStateV1::NotApplicable
         }
         GuideStage::BuildPlan
         | GuideStage::RequestApproval
@@ -8443,23 +8499,27 @@ fn guide_stage_contract_state(
         | GuideStage::Execute
             if !contract_ready =>
         {
-            "blocked"
+            GuideContractStateV1::Blocked
         }
         GuideStage::Verify
             if !capability.verification_contract_declared()
                 || !capability.verification_contract_supported() =>
         {
-            "blocked"
+            GuideContractStateV1::Blocked
         }
-        GuideStage::Verify if !capability.verification.required => "not_applicable",
+        GuideStage::Verify if !capability.verification.required => {
+            GuideContractStateV1::NotApplicable
+        }
         GuideStage::Rectify
             if !capability.rollback_contract_declared()
                 || !capability.rollback_contract_supported() =>
         {
-            "blocked"
+            GuideContractStateV1::Blocked
         }
-        GuideStage::CloseWithEvidence if capability.mutating && !contract_ready => "blocked",
-        _ => "available",
+        GuideStage::CloseWithEvidence if capability.mutating && !contract_ready => {
+            GuideContractStateV1::Blocked
+        }
+        _ => GuideContractStateV1::Available,
     }
 }
 
@@ -8550,7 +8610,7 @@ fn guide_stage_document(
     contract_ready: bool,
     blocking_gaps: &[String],
     call_argv: Option<&[String]>,
-) -> Value {
+) -> CapabilityGuideStageV1 {
     let live_reads = guide_live_reads(capability);
     let contract_state = guide_stage_contract_state(
         stage,
@@ -8562,20 +8622,20 @@ fn guide_stage_document(
     let summary = guide_live_read_summary(stage, &live_reads)
         .unwrap_or_else(|| guide_stage_summary(stage, capability));
     let evidence_class = if guide_stage_uses_live_read(stage, &live_reads) {
-        "live_read"
+        EvidenceClass::LiveRead
     } else {
         guide_stage_evidence_class(stage, capability.mutating)
     };
-    json!({
-        "stage": number,
-        "name": stage.as_str(),
-        "capability_id": capability.id,
-        "required": stage_required(stage, capability),
-        "contract_state": contract_state,
-        "summary": summary,
-        "evidence_class": evidence_class,
-        "commands": guide_stage_commands(stage, capability, contract_state, call_argv),
-    })
+    CapabilityGuideStageV1 {
+        stage: number,
+        name: stage,
+        capability_id: capability.id.clone(),
+        required: stage_required(stage, capability),
+        contract_state,
+        summary: summary.to_owned(),
+        evidence_class,
+        commands: guide_stage_commands(stage, capability, contract_state, call_argv),
+    }
 }
 
 fn guide_stage_summary(stage: cfctl_core::GuideStage, capability: &CapabilityV1) -> &'static str {
@@ -8643,7 +8703,7 @@ fn guide_stage_summary(stage: cfctl_core::GuideStage, capability: &CapabilityV1)
     }
 }
 
-fn guide_stage_evidence_class(stage: cfctl_core::GuideStage, mutating: bool) -> &'static str {
+fn guide_stage_evidence_class(stage: cfctl_core::GuideStage, mutating: bool) -> EvidenceClass {
     use cfctl_core::GuideStage;
 
     match stage {
@@ -8651,16 +8711,18 @@ fn guide_stage_evidence_class(stage: cfctl_core::GuideStage, mutating: bool) -> 
         | GuideStage::CheckEntitlement
         | GuideStage::LoadStandards
         | GuideStage::MapDependencies
-        | GuideStage::CalculateCost => "source_config",
-        GuideStage::InspectCurrentState | GuideStage::Execute if !mutating => "live_read",
+        | GuideStage::CalculateCost => EvidenceClass::SourceConfig,
+        GuideStage::InspectCurrentState | GuideStage::Execute if !mutating => {
+            EvidenceClass::LiveRead
+        }
         GuideStage::Authenticate
         | GuideStage::SelectAccount
         | GuideStage::InspectCurrentState
         | GuideStage::AcquireLocks
-        | GuideStage::CloseWithEvidence => "local_proof",
-        GuideStage::BuildPlan | GuideStage::RequestApproval => "preview",
-        GuideStage::Execute | GuideStage::Rectify => "apply",
-        GuideStage::Verify => "post_change_verification",
+        | GuideStage::CloseWithEvidence => EvidenceClass::LocalProof,
+        GuideStage::BuildPlan | GuideStage::RequestApproval => EvidenceClass::Preview,
+        GuideStage::Execute | GuideStage::Rectify => EvidenceClass::Apply,
+        GuideStage::Verify => EvidenceClass::PostChangeVerification,
     }
 }
 
@@ -8750,17 +8812,17 @@ fn operation_specific_current_state_command(capability: &CapabilityV1) -> Option
 fn guide_stage_commands(
     stage: cfctl_core::GuideStage,
     capability: &CapabilityV1,
-    contract_state: &str,
+    contract_state: GuideContractStateV1,
     call_argv: Option<&[String]>,
 ) -> Vec<Vec<String>> {
     use cfctl_core::GuideStage;
 
-    let available = contract_state == "available";
+    let available = contract_state == GuideContractStateV1::Available;
     let conditional =
         |command: Option<Vec<String>>| available.then_some(command).flatten().into_iter().collect();
     match stage {
         GuideStage::SelectAccount | GuideStage::CheckEntitlement
-            if contract_state == "live_read_required" =>
+            if contract_state == GuideContractStateV1::LiveReadRequired =>
         {
             call_argv.map(<[String]>::to_vec).into_iter().collect()
         }
@@ -9306,6 +9368,10 @@ mod tests {
         sync::{Arc, Barrier},
         thread,
     };
+
+    fn guide_json(capability: &CapabilityV1) -> Value {
+        serde_json::to_value(guide_document(capability)).expect("typed capability guide JSON")
+    }
 
     struct DeleteFailingSecretStore;
 
@@ -9899,7 +9965,7 @@ mod tests {
         );
         assert!(should_bind_oauth_client_secret_state(&rotate));
         assert!(should_bind_oauth_client_secret_state(&delete_old));
-        let guide = guide_document(&rotate);
+        let guide = guide_json(&rotate);
         assert_eq!(guide["stages"][4]["contract_state"], "live_read_required");
         assert_eq!(
             guide["stages"][4]["commands"][0],
@@ -11760,7 +11826,7 @@ mod tests {
     #[test]
     fn global_warp_override_guide_requires_the_exact_live_state_read() {
         let capability = global_warp_override_capability();
-        let guide = guide_document(&capability);
+        let guide = guide_json(&capability);
         let current_state = &guide["stages"][4];
         assert_eq!(current_state["name"], "inspect_current_state");
         assert_eq!(current_state["contract_state"], "live_read_required");
@@ -11788,7 +11854,7 @@ mod tests {
     #[test]
     fn d1_guide_requires_the_exact_live_database_state_read() {
         let capability = d1_read_replication_update_capability();
-        let guide = guide_document(&capability);
+        let guide = guide_json(&capability);
         let current_state = &guide["stages"][4];
         assert_eq!(current_state["name"], "inspect_current_state");
         assert_eq!(current_state["contract_state"], "live_read_required");
@@ -11812,7 +11878,7 @@ mod tests {
     #[test]
     fn cloudflare_tunnel_configuration_guide_requires_the_exact_live_routing_read() {
         let capability = cloudflare_tunnel_configuration_capability();
-        let guide = guide_document(&capability);
+        let guide = guide_json(&capability);
         let current_state = &guide["stages"][4];
         assert_eq!(current_state["name"], "inspect_current_state");
         assert_eq!(current_state["contract_state"], "live_read_required");
@@ -11836,7 +11902,7 @@ mod tests {
     #[test]
     fn warp_connector_configuration_guide_requires_the_exact_live_ha_read() {
         let capability = warp_connector_configuration_capability();
-        let guide = guide_document(&capability);
+        let guide = guide_json(&capability);
         let current_state = &guide["stages"][4];
         assert_eq!(current_state["name"], "inspect_current_state");
         assert_eq!(current_state["contract_state"], "live_read_required");
@@ -11860,7 +11926,7 @@ mod tests {
     #[test]
     fn web_analytics_rum_guide_requires_the_exact_live_setting_read() {
         let capability = web_analytics_rum_capability();
-        let guide = guide_document(&capability);
+        let guide = guide_json(&capability);
         let current_state = &guide["stages"][4];
         assert_eq!(current_state["name"], "inspect_current_state");
         assert_eq!(current_state["contract_state"], "live_read_required");
@@ -11882,7 +11948,7 @@ mod tests {
     #[test]
     fn dns_record_guide_requires_the_exact_live_record_state_read() {
         let capability = dns_record_update_capability("PATCH");
-        let guide = guide_document(&capability);
+        let guide = guide_json(&capability);
         let current_state = &guide["stages"][4];
         assert_eq!(current_state["name"], "inspect_current_state");
         assert_eq!(current_state["contract_state"], "live_read_required");
@@ -12193,7 +12259,7 @@ mod tests {
             "gaps: {:?}",
             capability.mutation_contract_gaps()
         );
-        let guide = guide_document(&capability);
+        let guide = guide_json(&capability);
         assert_eq!(guide["contract_state"], "blocked");
         assert_eq!(guide["next_action"]["argv"][0], "cfctl");
         assert_eq!(guide["next_action"]["argv"][1], "call");
@@ -12326,7 +12392,7 @@ mod tests {
         capability.account_scope = "zone".to_owned();
         capability.adapter_status = AdapterStatus::DynamicApi;
         assert!(should_bind_zone_account(&capability));
-        let guide = guide_document(&capability);
+        let guide = guide_json(&capability);
         assert_eq!(guide["stages"][2]["contract_state"], "live_read_required");
         assert_eq!(guide["stages"][2]["evidence_class"], "live_read");
 
@@ -12760,7 +12826,7 @@ mod tests {
             "properties":{"enabled":{"type":"boolean"}}
         }));
 
-        let guide = guide_document(&capability);
+        let guide = guide_json(&capability);
 
         assert_eq!(guide["contract_state"], "blocked");
         assert!(guide["blocking_gaps"].as_array().is_some_and(|gaps| {
@@ -12871,7 +12937,7 @@ mod tests {
             capability.entitlement.blocker.as_deref().expect("blocker")
         ));
 
-        let guide = guide_document(&capability);
+        let guide = guide_json(&capability);
 
         assert_eq!(guide["contract_state"], "blocked");
         assert!(
@@ -12903,7 +12969,7 @@ mod tests {
             Some("revoke the new token if installation fails".to_owned());
         account_token.permissions = vec!["API Tokens Write".to_owned()];
 
-        let account_guide = guide_document(&account_token);
+        let account_guide = guide_json(&account_token);
         assert_eq!(account_guide["contract_state"], "available");
         assert_eq!(
             account_guide["call_argv"],
@@ -12925,7 +12991,7 @@ mod tests {
         assert_ne!(account_guide["call_argv"][1], "call");
 
         account_token.id = "user-api-tokens-create-token".to_owned();
-        let user_guide = guide_document(&account_token);
+        let user_guide = guide_json(&account_token);
         assert_eq!(user_guide["contract_state"], "available");
         assert_eq!(
             user_guide["call_argv"],
@@ -13169,6 +13235,16 @@ mod tests {
         );
         assert_eq!(listed.result["authorities"][0]["status"], "active");
         assert_eq!(listed.result["authorities"][0]["runs_last_24h"], 0);
+        assert_eq!(listed.result["authorities"][0]["runs_remaining_24h"], 2);
+        assert_eq!(
+            listed.result["authorities"][0]["minted_token_ids"],
+            json!([])
+        );
+        assert!(
+            listed.result["authorities"][0]["next_action"]
+                .as_str()
+                .is_some_and(|action| action.contains("--under-policy"))
+        );
 
         preflight_standing_authority(&store, Some(&authority_id))
             .expect("active authority passes preflight");
@@ -14493,7 +14569,7 @@ mod tests {
             non_readback_verification_basis(&capability),
             "Cloudflare returned success and the required sink-only secret output was durably persisted"
         );
-        let guide = guide_document(&capability);
+        let guide = guide_json(&capability);
         let verify = guide["stages"]
             .as_array()
             .expect("guide stages")
