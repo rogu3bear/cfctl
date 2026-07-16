@@ -55,7 +55,7 @@ check before sending a mutation.
 ```text
 cfctl "<natural-language request>"
 cfctl auth login|status|profiles|use|logout|import-api-token|import-global-key
-cfctl keys permissions|mint|rotate|revoke
+cfctl keys permissions|mint|rotate|revoke|policy
 cfctl catalog sync|search|show|changes|coverage
 cfctl call <capability-id> [selectors/body]
 cfctl guide <capability-id>

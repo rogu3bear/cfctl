@@ -29,8 +29,8 @@ use cfctl_cloudflare::{
 };
 use cfctl_core::{
     AdapterStatus, CapabilityV1, ErrorV1, EvidenceClass, EvidenceV1, MoneyV1, PlanStatus, PlanV1,
-    PolicyDisposition, ResultEnvelopeV2, RiskClass, TransactionStageV1, VerificationState,
-    guide_stages, hash_value, redact_json,
+    PolicyDisposition, ResultEnvelopeV2, RiskClass, StandingAuthorityV1, TransactionStageV1,
+    VerificationState, guide_stages, hash_value, redact_json,
 };
 use cfctl_planner::{ImpactContext, PolicyEngine};
 use cfctl_storage::{RuntimePaths, StateStore};
@@ -44,8 +44,9 @@ use tokio::process::Command as ProcessCommand;
 use crate::{
     AgentsCommand, AuthCommand, AuthLoginArgs, CallArgs, CatalogCommand, Cli, Command, DocsCommand,
     GuideArgs, ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs,
-    KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector,
-    PlansCommand, ProfileSelector, SearchArgs, WorkspaceCommand,
+    KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs, KeyPolicySelector, KeyRevokeArgs,
+    KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector, PlansCommand,
+    ProfileSelector, SearchArgs, WorkspaceCommand,
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
 
@@ -200,6 +201,28 @@ fn platform_secret_store_health(store: &StateStore) -> Result<Value> {
         "fallback_dir": secrets.fallback_root(),
         "fallback_secret_count": secrets.fallback_secret_count()?,
     }))
+}
+
+fn standing_authorities_health(store: &StateStore) -> Result<Value> {
+    let now = Utc::now();
+    let authorities: Vec<Value> = store
+        .list_authorities()?
+        .iter()
+        .map(|authority| {
+            json!({
+                "authority_id": authority.authority_id,
+                "status": authority.status.as_str(),
+                "account_id": authority.account_id,
+                "name_prefix": authority.name_prefix,
+                "capability_ids": authority.capability_ids,
+                "expires_at": authority.expires_at,
+                "max_runs_per_day": authority.max_runs_per_day,
+                "runs_last_24h": authority.runs_in_last_day(now),
+                "minted_tokens": authority.minted_token_ids.len(),
+            })
+        })
+        .collect();
+    Ok(Value::Array(authorities))
 }
 
 async fn auth_command(store: &StateStore, command: AuthCommand) -> Result<ResultEnvelopeV2> {
@@ -3928,6 +3951,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         &plan,
         &execution_input,
         &credential,
+        None,
     )
     .await?;
     plan.mark_consumed()?;
@@ -3949,6 +3973,391 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     .await
 }
 
+/// The standing-authority execution lane. Identical to `run_plan` in every
+/// pre-consumption re-verification (catalog hash, workspace and live
+/// precondition hashes, token contract, secret sink); it differs only at the
+/// consumption gate, where the authority's blast-radius bounds are validated
+/// against the exact resolved execution input and consumption is recorded
+/// against the authority instead of a per-operation approval.
+async fn run_plan_under_standing_authority(
+    store: &StateStore,
+    operation_id: &str,
+    authority_id: &str,
+) -> Result<ResultEnvelopeV2> {
+    // Lock order is always plan -> authority. The plan lock may span async
+    // preflight; the authority lock is acquired only for the synchronous
+    // admission critical section below and is released before network I/O.
+    let _plan_lock = store.lock_plan(operation_id)?;
+    let authority_snapshot = store.load_authority(authority_id)?;
+    let catalog = ensure_catalog(store).await?;
+    let mut plan = load_validated_plan(store, operation_id)?;
+    if plan.catalog_hash != catalog.schema_hash {
+        return Err(CliError::Input(format!(
+            "catalog drift invalidated the plan: planned {}, current {}",
+            plan.catalog_hash, catalog.schema_hash
+        )));
+    }
+    validate_plan_preconditions(store, &plan)?;
+    if plan.capability.adapter_status == AdapterStatus::Blocked {
+        return Err(CliError::Input(
+            plan.capability.blocked_reason.clone().unwrap_or_else(|| {
+                "the approved capability no longer has an executable adapter".to_owned()
+            }),
+        ));
+    }
+    preflight_secret_sink(&plan)?;
+    let profiles = ProfilesConfig::load(store)?;
+    let profile = profiles.selected(Some(&plan.profile_id))?;
+    let secrets = platform_secrets(store);
+    let credential = fresh_credential(profile, &secrets).await?;
+    let execution_input = resolved_plan_input(&plan, &secrets)?;
+    let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    validate_api_token_creation_contract(
+        &plan.capability,
+        &execution_input,
+        adapter_targets,
+        &plan.account_id,
+    )?;
+    let live_precondition_evidence = validate_live_plan_precondition_evidence(
+        store,
+        &catalog,
+        &plan,
+        &execution_input,
+        &credential,
+        Some(&authority_snapshot),
+    )
+    .await?;
+    authorize_standing_execution(&authority_snapshot, &plan, &execution_input)?;
+    let standing_evidence =
+        admit_standing_plan(store, &mut plan, &authority_snapshot, &execution_input)?;
+    let admitted_authority_id = authority_snapshot.authority_id.clone();
+    let mut envelope = execute_consumed_plan(
+        store,
+        &catalog.schema_hash,
+        &mut plan,
+        &execution_input,
+        &credential,
+        &secrets,
+        live_precondition_evidence,
+    )
+    .await?;
+    envelope.evidence.push(standing_evidence);
+    if let Some(result) = envelope.result.as_object_mut() {
+        result.insert(
+            "standing_authority_id".to_owned(),
+            json!(admitted_authority_id),
+        );
+    }
+    Ok(envelope)
+}
+
+/// Performs the synchronous standing-authority admission transaction while
+/// the caller holds the plan lock. No network or async work is permitted in
+/// this critical section.
+fn admit_standing_plan(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    authority_snapshot: &StandingAuthorityV1,
+    execution_input: &CallInput,
+) -> Result<EvidenceV1> {
+    let authority_guard = store.lock_authority(&authority_snapshot.authority_id)?;
+    let mut authority = store.load_authority(&authority_snapshot.authority_id)?;
+    if authority.content_hash != authority_snapshot.content_hash {
+        return Err(CliError::Input(
+            "standing authority changed during live preflight; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    // The live inventory was validated against the snapshot. Exact
+    // content-hash equality plus the operational/hash check below proves
+    // that the locked authority carries the same immutable allowlist.
+    let admission_time = Utc::now();
+    authorize_standing_execution_at(&authority, plan, execution_input, admission_time)?;
+    plan.mark_consumed_via_standing_authority(&authority)?;
+    // Durable reservation is the admission linearization point. It is saved
+    // before plan consumption so a persistence failure may spend a budget
+    // slot but can never permit an unaccounted boundary attempt.
+    authority.reserve_run(admission_time, &plan.operation_id, &plan.capability.id)?;
+    store.save_authority_guarded(&authority, &authority_guard)?;
+    store.save_plan(plan)?;
+    let evidence = store.write_evidence(
+        EvidenceClass::StandingApply,
+        &json!({
+            "standing_authority_id": authority.authority_id,
+            "standing_authority_content_hash": authority.content_hash,
+            "operation_id": plan.operation_id,
+            "capability_id": plan.capability.id,
+            "account_id": plan.account_id,
+            "admission": "durable_run_reservation",
+        }),
+    )?;
+    persist_transaction_stage(store, plan, TransactionStageV1::BoundaryAttemptPersisted)?;
+    Ok(evidence)
+}
+
+/// Validates the authority's bounds against the exact execution input the
+/// boundary call will use — never a re-derivation.
+fn authorize_standing_execution(
+    authority: &StandingAuthorityV1,
+    plan: &PlanV1,
+    input: &CallInput,
+) -> Result<()> {
+    authorize_standing_execution_at(authority, plan, input, Utc::now())
+}
+
+fn authorize_standing_execution_at(
+    authority: &StandingAuthorityV1,
+    plan: &PlanV1,
+    input: &CallInput,
+    now: chrono::DateTime<Utc>,
+) -> Result<()> {
+    if plan.capability.id.ends_with("create-token") {
+        let body = input.body.as_ref().ok_or_else(|| {
+            CliError::Input("a standing mint requires the plan's request body".to_owned())
+        })?;
+        let child_name = body.get("name").and_then(Value::as_str).ok_or_else(|| {
+            CliError::Input("a standing mint requires a child token name".to_owned())
+        })?;
+        let requested_group_ids: Vec<String> = body
+            .get("policies")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|policy| policy.get("permission_groups").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|group| group.get("id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        let child_expires_at = body
+            .get("expires_on")
+            .and_then(Value::as_str)
+            .map(|raw| {
+                chrono::DateTime::parse_from_rfc3339(raw)
+                    .map(|parsed| parsed.with_timezone(&Utc))
+                    .map_err(|error| {
+                        CliError::Input(format!(
+                            "the standing mint carries an unparseable expires_on: {error}"
+                        ))
+                    })
+            })
+            .transpose()?;
+        authority.authorize_token_create(
+            now,
+            child_name,
+            &requested_group_ids,
+            child_expires_at,
+        )?;
+    } else if plan.capability.id.ends_with("delete-token") {
+        let token_id = input
+            .selectors
+            .get("token_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("a standing revoke requires a token_id selector".to_owned())
+            })?;
+        authority.authorize_token_delete(now, token_id)?;
+    } else {
+        return Err(CliError::Input(format!(
+            "standing authorities do not cover capability `{}`",
+            plan.capability.id
+        )));
+    }
+    Ok(())
+}
+
+/// Returns the created token ID only when the validated transaction journal
+/// proves that this exact authority admitted the plan and Cloudflare returned
+/// a successful creation receipt. Revocation is intentionally not consulted:
+/// lineage reconciliation records an already-crossed boundary; it grants no
+/// new authority.
+fn validated_standing_lineage_token_id<'a>(
+    plan: &'a PlanV1,
+    authority: &StandingAuthorityV1,
+) -> Result<Option<&'a str>> {
+    plan.validate_transaction_journal()?;
+    let Some(binding) = plan.transaction_artifact(TransactionStageV1::ConsumptionPersisted) else {
+        return Ok(None);
+    };
+    let bound_authority_id = binding
+        .get("standing_authority_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "standing consumption receipt has no authority ID; do not replay the mutation"
+                    .to_owned(),
+            )
+        })?;
+    let bound_authority_hash = binding
+        .get("standing_authority_content_hash")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "standing consumption receipt has no authority content hash; do not replay the mutation"
+                    .to_owned(),
+            )
+        })?;
+    if bound_authority_id != authority.authority_id
+        || bound_authority_hash != authority.content_hash
+    {
+        return Err(CliError::Input(
+            "standing consumption receipt does not bind the exact authority; do not replay the mutation"
+                .to_owned(),
+        ));
+    }
+    let approval_matches = authority
+        .approval
+        .as_ref()
+        .is_some_and(|approval| approval.approved_content_hash == authority.content_hash);
+    if !approval_matches {
+        return Err(CliError::Input(
+            "standing authority no longer carries the approval bound by the consumption receipt; do not replay the mutation"
+                .to_owned(),
+        ));
+    }
+    let matching_reservations = authority
+        .run_log
+        .iter()
+        .filter(|run| run.operation_id == plan.operation_id)
+        .collect::<Vec<_>>();
+    if matching_reservations.len() != 1
+        || matching_reservations[0].capability_id != plan.capability.id
+    {
+        return Err(CliError::Input(
+            "standing boundary receipt was not durably reserved exactly once under the same authority capability; do not replay the mutation"
+                .to_owned(),
+        ));
+    }
+    if plan.account_id != authority.account_id
+        || plan.capability.id != "account-api-tokens-create-token"
+        || !authority
+            .capability_ids
+            .iter()
+            .any(|capability_id| capability_id == &plan.capability.id)
+    {
+        return Err(CliError::Input(
+            "standing token receipt account or capability does not match its authority; do not replay the mutation"
+                .to_owned(),
+        ));
+    }
+    let Some(response) = plan.transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+    else {
+        return Ok(None);
+    };
+    let success = response
+        .get("success")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            CliError::Input(
+                "standing boundary receipt has no success result; do not replay the mutation"
+                    .to_owned(),
+            )
+        })?;
+    if !success {
+        return Ok(None);
+    }
+    response
+        .get("resource_id")
+        .and_then(Value::as_str)
+        .filter(|resource_id| !resource_id.trim().is_empty())
+        .map(Some)
+        .ok_or_else(|| {
+            CliError::Input(
+                "successful standing token receipt has no resource ID; do not replay the mutation and run `cfctl plans rectify`"
+                    .to_owned(),
+            )
+        })
+}
+
+fn standing_consumption_authority_id(plan: &PlanV1) -> Result<Option<&str>> {
+    let Some(binding) = plan.transaction_artifact(TransactionStageV1::ConsumptionPersisted) else {
+        return Ok(None);
+    };
+    if binding.get("standing_authority_id").is_none()
+        && binding.get("standing_authority_content_hash").is_none()
+    {
+        return Ok(None);
+    }
+    binding
+        .get("standing_authority_id")
+        .and_then(Value::as_str)
+        .filter(|authority_id| !authority_id.is_empty())
+        .map(Some)
+        .ok_or_else(|| {
+            CliError::Input(
+                "standing consumption receipt has no authority ID; do not replay the mutation"
+                    .to_owned(),
+            )
+        })
+}
+
+fn reconcile_standing_lineage_from_plan(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<Option<EvidenceV1>> {
+    let Some(authority_id) = standing_consumption_authority_id(plan)? else {
+        return Ok(None);
+    };
+    if plan.capability.id != "account-api-tokens-create-token" {
+        return Ok(None);
+    }
+    let guard = store.lock_authority(authority_id)?;
+    let mut authority = store.load_authority(authority_id)?;
+    let Some(token_id) = validated_standing_lineage_token_id(plan, &authority)? else {
+        return Ok(None);
+    };
+    let already_recorded = authority
+        .minted_token_ids
+        .iter()
+        .any(|recorded| recorded == token_id);
+    authority.record_minted_token(token_id);
+    if !already_recorded {
+        store.save_authority_guarded(&authority, &guard)?;
+    }
+    let boundary_receipt_hash = plan
+        .transaction_journal
+        .iter()
+        .find(|checkpoint| checkpoint.stage == TransactionStageV1::BoundaryResponsePersisted)
+        .and_then(|checkpoint| checkpoint.artifact_hash.as_deref())
+        .ok_or_else(|| {
+            CliError::Input(
+                "standing boundary response has no validated artifact hash; do not replay the mutation"
+                    .to_owned(),
+            )
+        })?;
+    let evidence = store.write_evidence(
+        EvidenceClass::StandingApply,
+        &json!({
+            "standing_authority_id": authority.authority_id,
+            "standing_authority_content_hash": authority.content_hash,
+            "operation_id": plan.operation_id,
+            "token_id": token_id,
+            "source_boundary_receipt_hash": boundary_receipt_hash,
+            "reconciled": true,
+        }),
+    )?;
+    Ok(Some(evidence))
+}
+
+fn recover_standing_lineage(store: &StateStore, authority_id: &str) -> Result<Vec<EvidenceV1>> {
+    let mut evidence = Vec::new();
+    for snapshot in store.list_plans()? {
+        if standing_consumption_authority_id(&snapshot)? != Some(authority_id) {
+            continue;
+        }
+        let _plan_lock = store.lock_plan(&snapshot.operation_id)?;
+        let plan = load_validated_plan(store, &snapshot.operation_id)?;
+        if standing_consumption_authority_id(&plan)? != Some(authority_id) {
+            continue;
+        }
+        if let Some(item) = reconcile_standing_lineage_from_plan(store, &plan)? {
+            evidence.push(item);
+        }
+    }
+    Ok(evidence)
+}
+
 struct LivePreconditionEvidence {
     zone_account: Option<EvidenceV1>,
     entitlement: Option<EvidenceV1>,
@@ -3968,6 +4377,7 @@ async fn validate_live_plan_precondition_evidence(
     plan: &PlanV1,
     input: &CallInput,
     credential: &AuthCredential,
+    standing_authority: Option<&StandingAuthorityV1>,
 ) -> Result<LivePreconditionEvidence> {
     Ok(LivePreconditionEvidence {
         zone_account: validate_live_zone_account_precondition(
@@ -3979,7 +4389,11 @@ async fn validate_live_plan_precondition_evidence(
         )
         .await?,
         permission_inventory: validate_live_permission_inventory_precondition(
-            store, catalog, plan, credential,
+            store,
+            catalog,
+            plan,
+            credential,
+            standing_authority,
         )
         .await?,
         global_warp_override_state: validate_live_global_warp_override_state_precondition(
@@ -5145,6 +5559,7 @@ async fn validate_live_permission_inventory_precondition(
     catalog: &CatalogSnapshot,
     plan: &PlanV1,
     credential: &AuthCredential,
+    standing_authority: Option<&StandingAuthorityV1>,
 ) -> Result<Option<EvidenceV1>> {
     let Some(expected_inventory) = token_permission_inventory_contract(&plan.capability.id) else {
         return Ok(None);
@@ -5202,6 +5617,9 @@ async fn validate_live_permission_inventory_precondition(
         ));
     }
     validate_current_permission_groups(inventory_contract, &response.result)?;
+    if let Some(authority) = standing_authority {
+        validate_standing_authority_permission_inventory(authority, &response.result)?;
+    }
     let evidence =
         store.write_evidence(EvidenceClass::LiveRead, &serde_json::to_value(&response)?)?;
     Ok(Some(evidence))
@@ -5245,6 +5663,16 @@ fn validate_current_permission_groups(inventory_contract: &Value, current: &Valu
     Ok(())
 }
 
+fn validate_standing_authority_permission_inventory(
+    authority: &StandingAuthorityV1,
+    current: &Value,
+) -> Result<()> {
+    let current_allowlist =
+        validate_selected_permission_groups(&authority.permission_group_ids, current)?;
+    authority.validate_permission_inventory(&Value::Array(current_allowlist))?;
+    Ok(())
+}
+
 async fn execute_api_plan(
     store: &StateStore,
     catalog_hash: &str,
@@ -5260,48 +5688,222 @@ async fn execute_api_plan(
     let response = match response_result {
         Ok(response) => response,
         Err(error) => {
-            plan.status = PlanStatus::RectificationRequired;
-            persist_transaction_stage_with_artifact(
-                store,
-                plan,
-                TransactionStageV1::BoundaryResponsePersisted,
-                boundary_failure_artifact("dynamic_api", "transport_error"),
-            )?;
-            persist_secret_lifecycle(store, plan, false, None, secrets)?;
-            return Err(error.into());
+            let error = CliError::from(error);
+            return Ok(process_api_transport_failure(store, plan, &error, secrets));
         }
     };
-    let mut response_value = serde_json::to_value(&response)?;
+    let (response_value, apply_evidence, lineage_evidence) =
+        match process_api_boundary_response(store, plan, &response, secrets)? {
+            ApiBoundaryResponseOutcome::Ready {
+                response_value,
+                apply_evidence,
+                lineage_evidence,
+            } => (response_value, apply_evidence, lineage_evidence),
+            ApiBoundaryResponseOutcome::Recovery(envelope) => return Ok(envelope),
+        };
+    let performed = response.success;
+    let verification = match verify_api_plan(store, &executor, plan, &response, credential).await {
+        Ok(verification) => verification,
+        Err(error) => {
+            return Ok(post_boundary_failure_envelope(
+                plan,
+                response_value,
+                Some(apply_evidence),
+                lineage_evidence,
+                &error,
+                performed,
+                "the Cloudflare boundary response and secret lifecycle are durable, but verification could not complete",
+            ));
+        }
+    };
+    let finalization: Result<()> =
+        if matches!(plan.status, PlanStatus::Verified | PlanStatus::Failed) {
+            persist_transaction_stage(store, plan, TransactionStageV1::Closed)
+        } else {
+            store.save_plan(plan).map_err(CliError::from)
+        };
+    let finalization_error = finalization.err();
+    Ok(api_plan_result_envelope(
+        plan,
+        response_value,
+        apply_evidence,
+        lineage_evidence,
+        verification,
+        performed,
+        finalization_error.as_ref(),
+    ))
+}
+
+enum ApiBoundaryResponseOutcome {
+    Ready {
+        response_value: Value,
+        apply_evidence: EvidenceV1,
+        lineage_evidence: Option<EvidenceV1>,
+    },
+    Recovery(ResultEnvelopeV2),
+}
+
+/// Persists the non-secret response receipt, always attempts the one-time
+/// secret sink, and reconciles lineage only when the boundary receipt was
+/// durably saved. Any local failure after a successful response returns a
+/// no-replay recovery envelope instead of losing boundary truth through the
+/// generic top-level error path.
+fn process_api_boundary_response(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    response: &CloudflareResponseV1,
+    secrets: &dyn SecretStore,
+) -> Result<ApiBoundaryResponseOutcome> {
+    let mut response_value = serde_json::to_value(response)?;
     if is_secret_output_plan(plan) {
         response_value = redact_secret_result(&response_value);
     }
-    let apply_evidence = store.write_evidence(EvidenceClass::Apply, &response_value)?;
-    persist_transaction_stage_with_artifact(
+    let mut failures = Vec::new();
+    let apply_evidence = match store.write_evidence(EvidenceClass::Apply, &response_value) {
+        Ok(evidence) => Some(evidence),
+        Err(error) => {
+            plan.status = PlanStatus::RectificationRequired;
+            failures.push(format!("apply evidence persistence failed: {error}"));
+            None
+        }
+    };
+    let boundary_response_persisted = match persist_transaction_stage_with_artifact(
         store,
         plan,
         TransactionStageV1::BoundaryResponsePersisted,
-        boundary_response_artifact(plan, &response, &apply_evidence),
-    )?;
-    persist_secret_lifecycle(
+        boundary_response_artifact(plan, response, apply_evidence.as_ref()),
+    ) {
+        Ok(()) => true,
+        Err(error) => {
+            plan.status = PlanStatus::RectificationRequired;
+            failures.push(format!("boundary response persistence failed: {error}"));
+            false
+        }
+    };
+    let lifecycle = persist_secret_lifecycle_and_reconcile_lineage(
         store,
         plan,
         response.success,
         Some(&response.result),
         secrets,
-    )?;
-    let performed = response.success;
-    let verification = verify_api_plan(store, &executor, plan, &response, credential).await?;
-    if matches!(plan.status, PlanStatus::Verified | PlanStatus::Failed) {
-        persist_transaction_stage(store, plan, TransactionStageV1::Closed)?;
-    } else {
-        store.save_plan(plan)?;
+        boundary_response_persisted,
+    );
+    if let Some(error) = lifecycle.error {
+        failures.push(error.to_string());
     }
-    let mut envelope =
-        ResultEnvelopeV2::success("plans run", response_value).with_evidence(apply_evidence);
+    if !failures.is_empty() {
+        let error = CliError::Input(failures.join("; "));
+        let verification_basis = if boundary_response_persisted {
+            "the Cloudflare boundary response is durable, but local post-boundary recovery is required before verification can be trusted"
+        } else {
+            "Cloudflare returned a mutation response, but the boundary receipt is not durably validated; the one-time secret sink was still attempted and the mutation must not be replayed"
+        };
+        return Ok(ApiBoundaryResponseOutcome::Recovery(
+            post_boundary_failure_envelope(
+                plan,
+                response_value,
+                apply_evidence,
+                lifecycle.lineage_evidence,
+                &error,
+                response.success,
+                verification_basis,
+            ),
+        ));
+    }
+    let Some(apply_evidence) = apply_evidence else {
+        return Err(CliError::Input(
+            "post-boundary response handling lost its apply evidence without recording a recovery failure"
+                .to_owned(),
+        ));
+    };
+    Ok(ApiBoundaryResponseOutcome::Ready {
+        response_value,
+        apply_evidence,
+        lineage_evidence: lifecycle.lineage_evidence,
+    })
+}
+
+/// A transport error after `BoundaryAttemptPersisted` cannot prove that the
+/// remote mutation did not happen. Persist as much local recovery state as
+/// possible and return an operation-bound unknown-outcome envelope.
+fn process_api_transport_failure(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    transport_error: &CliError,
+    secrets: &dyn SecretStore,
+) -> ResultEnvelopeV2 {
+    plan.status = PlanStatus::RectificationRequired;
+    let mut failures = vec![format!(
+        "Cloudflare mutation outcome is unknown after the request crossed the boundary: {transport_error}"
+    )];
+    if let Err(error) = persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::BoundaryResponsePersisted,
+        boundary_failure_artifact("dynamic_api", "transport_error"),
+    ) {
+        failures.push(format!(
+            "unknown-outcome boundary receipt persistence failed: {error}"
+        ));
+    }
+    if let Err(error) = persist_secret_lifecycle(store, plan, false, None, secrets) {
+        failures.push(format!(
+            "unknown-outcome secret lifecycle persistence failed: {error}"
+        ));
+    }
+    let error = CliError::Input(failures.join("; "));
+    post_boundary_failure_envelope(
+        plan,
+        json!({
+            "success": false,
+            "outcome": "unknown",
+            "receipt_available": false,
+        }),
+        None,
+        None,
+        &error,
+        false,
+        "the mutation request was sent, but no Cloudflare response was received; the remote outcome is unknown and must be rectified without replay",
+    )
+}
+
+fn api_plan_result_envelope(
+    plan: &PlanV1,
+    result: Value,
+    apply_evidence: EvidenceV1,
+    lineage_evidence: Option<EvidenceV1>,
+    verification: ApiVerificationOutcome,
+    performed: bool,
+    finalization_error: Option<&CliError>,
+) -> ResultEnvelopeV2 {
+    if let Some(error) = finalization_error {
+        let mut envelope = post_boundary_failure_envelope(
+            plan,
+            result,
+            Some(apply_evidence),
+            lineage_evidence,
+            error,
+            performed,
+            "the Cloudflare boundary response is durable, but the final local checkpoint requires recovery",
+        );
+        envelope.verification.state = verification.state;
+        envelope.verification.basis = Some(format!(
+            "{}; the final plan checkpoint could not be persisted",
+            verification.basis
+        ));
+        if let Some(evidence) = verification.evidence {
+            envelope.evidence.push(evidence);
+        }
+        return envelope;
+    }
+    let mut envelope = ResultEnvelopeV2::success("plans run", result).with_evidence(apply_evidence);
+    if let Some(evidence) = lineage_evidence {
+        envelope.evidence.push(evidence);
+    }
     if let Some(evidence) = verification.evidence {
         envelope.evidence.push(evidence);
     }
-    envelope.ok = response.success && plan.status == PlanStatus::Verified;
+    envelope.ok = performed && plan.status == PlanStatus::Verified;
     envelope.performed = performed;
     envelope.operation_id = Some(plan.operation_id.clone());
     envelope.capability_id = Some(plan.capability.id.clone());
@@ -5311,7 +5913,7 @@ async fn execute_api_plan(
     envelope.verification.state = verification.state;
     envelope.verification.basis = Some(verification.basis);
     envelope.error = verification.error;
-    Ok(envelope)
+    envelope
 }
 
 struct ApiVerificationOutcome {
@@ -5321,10 +5923,47 @@ struct ApiVerificationOutcome {
     error: Option<ErrorV1>,
 }
 
+fn post_boundary_failure_envelope(
+    plan: &PlanV1,
+    result: Value,
+    apply_evidence: Option<EvidenceV1>,
+    lineage_evidence: Option<EvidenceV1>,
+    error: &CliError,
+    performed: bool,
+    verification_basis: &str,
+) -> ResultEnvelopeV2 {
+    let next_step = format!(
+        "Do not replay the mutation; run `cfctl plans rectify {}`.",
+        plan.operation_id
+    );
+    let mut envelope = ResultEnvelopeV2::failure(
+        "plans run",
+        "CFCTL_POST_BOUNDARY_RECOVERY_REQUIRED",
+        &error.to_string(),
+        Some(&next_step),
+    );
+    envelope.result = redact_json(&result);
+    envelope.performed = performed;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.policy_decision = Some(plan.policy.clone());
+    envelope.verification.state = VerificationState::Pending;
+    envelope.verification.basis = Some(verification_basis.to_owned());
+    if let Some(evidence) = apply_evidence {
+        envelope.evidence.push(evidence);
+    }
+    if let Some(evidence) = lineage_evidence {
+        envelope.evidence.push(evidence);
+    }
+    envelope
+}
+
 fn boundary_response_artifact(
     plan: &PlanV1,
     response: &CloudflareResponseV1,
-    apply_evidence: &EvidenceV1,
+    apply_evidence: Option<&EvidenceV1>,
 ) -> Value {
     let identity_pointer = plan
         .capability
@@ -5339,7 +5978,7 @@ fn boundary_response_artifact(
         })
         .unwrap_or("/id");
     json!({
-        "apply_evidence_hash": apply_evidence.content_hash,
+        "apply_evidence_hash": apply_evidence.map(|evidence| evidence.content_hash.as_str()),
         "http_status": response.status,
         "success": response.success,
         "resource_id": response.result.pointer(identity_pointer).and_then(Value::as_str),
@@ -5384,6 +6023,59 @@ fn secret_sink_artifact(
         },
         "path": path.map(|path| path.display().to_string()),
     })
+}
+
+/// Persists the secret-sink outcome and then reconciles token lineage from the
+/// already-durable boundary receipt regardless of whether the sink succeeded.
+/// A post-boundary error always directs the operator to rectification; replay
+/// is never an acceptable recovery path.
+struct PostBoundaryLifecycleOutcome {
+    lineage_evidence: Option<EvidenceV1>,
+    error: Option<CliError>,
+}
+
+fn persist_secret_lifecycle_and_reconcile_lineage(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    response_success: bool,
+    response_result: Option<&Value>,
+    secrets: &dyn SecretStore,
+    boundary_response_durable: bool,
+) -> PostBoundaryLifecycleOutcome {
+    let secret_sink_result =
+        persist_secret_lifecycle(store, plan, response_success, response_result, secrets);
+    let lineage_result = if boundary_response_durable {
+        reconcile_standing_lineage_from_plan(store, plan)
+    } else {
+        Ok(None)
+    };
+    match (secret_sink_result, lineage_result) {
+        (Ok(_sink_path), Ok(lineage_evidence)) => PostBoundaryLifecycleOutcome {
+            lineage_evidence,
+            error: None,
+        },
+        (Err(sink_error), Ok(lineage_evidence)) => PostBoundaryLifecycleOutcome {
+            lineage_evidence,
+            error: Some(CliError::Input(format!(
+                "the Cloudflare boundary response was persisted, but the secret sink failed: {sink_error}. Do not replay the mutation; run `cfctl plans rectify {}`",
+                plan.operation_id
+            ))),
+        },
+        (Ok(_), Err(lineage_error)) => PostBoundaryLifecycleOutcome {
+            lineage_evidence: None,
+            error: Some(CliError::Input(format!(
+                "the Cloudflare boundary response was persisted, but standing token lineage reconciliation failed: {lineage_error}. Do not replay the mutation; run `cfctl plans rectify {}`",
+                plan.operation_id
+            ))),
+        },
+        (Err(sink_error), Err(lineage_error)) => PostBoundaryLifecycleOutcome {
+            lineage_evidence: None,
+            error: Some(CliError::Input(format!(
+                "the Cloudflare boundary response was persisted, but both the secret sink and standing token lineage reconciliation failed (sink: {sink_error}; lineage: {lineage_error}). Do not replay the mutation; run `cfctl plans rectify {}`",
+                plan.operation_id
+            ))),
+        },
+    }
 }
 
 fn persist_secret_lifecycle(
@@ -6000,7 +6692,9 @@ fn bind_required_empty_compensation_body(
 }
 
 async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
+    let _plan_lock = store.lock_plan(&selector.operation_id)?;
     let plan = load_validated_plan(store, &selector.operation_id)?;
+    let lineage_evidence = reconcile_standing_lineage_from_plan(store, &plan)?;
     if let Some(mut request) = compensation_request(&plan)? {
         let catalog = ensure_catalog(store).await?;
         let capability = catalog
@@ -6053,9 +6747,12 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
                 ),
             );
         }
+        if let Some(evidence) = lineage_evidence {
+            envelope.evidence.push(evidence);
+        }
         return Ok(envelope);
     }
-    Ok(ResultEnvelopeV2::success(
+    let mut envelope = ResultEnvelopeV2::success(
         "plans rectify",
         json!({
             "operation_id": plan.operation_id,
@@ -6065,16 +6762,219 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
             "non_reversible_warnings": plan.non_reversible_warnings,
             "message": "No safe automatic compensation plan can be derived from the hash-bound receipts for this capability. Inspect live state with the catalog, then create a new hash-bound plan."
         }),
-    ))
+    );
+    if let Some(evidence) = lineage_evidence {
+        envelope.evidence.push(evidence);
+    }
+    Ok(envelope)
 }
 
 async fn keys_command(store: &StateStore, command: KeysCommand) -> Result<ResultEnvelopeV2> {
     match command {
         KeysCommand::Permissions(arguments) => key_permissions(store, &arguments).await,
-        KeysCommand::Mint(arguments) => key_mint(store, &arguments).await,
+        KeysCommand::Mint(arguments) => {
+            preflight_standing_authority(store, arguments.under_policy.as_deref())?;
+            let plan = key_mint(store, &arguments).await?;
+            finish_standing_run(store, plan, arguments.under_policy.as_deref()).await
+        }
         KeysCommand::Rotate(arguments) => key_rotate(store, &arguments).await,
-        KeysCommand::Revoke(arguments) => key_revoke(store, &arguments).await,
+        KeysCommand::Revoke(arguments) => {
+            preflight_standing_authority(store, arguments.under_policy.as_deref())?;
+            let plan = key_revoke(store, &arguments).await?;
+            finish_standing_run(store, plan, arguments.under_policy.as_deref()).await
+        }
+        KeysCommand::Policy(arguments) => key_policy(store, arguments.command).await,
     }
+}
+
+/// Fails a standing run closed before any live read or plan creation when
+/// the named authority is missing, unapproved, revoked, or expired.
+fn preflight_standing_authority(store: &StateStore, under_policy: Option<&str>) -> Result<()> {
+    if let Some(authority_id) = under_policy {
+        recover_standing_lineage(store, authority_id)?;
+        store.load_authority(authority_id)?.ensure_operational()?;
+    }
+    Ok(())
+}
+
+/// When `--under-policy` names a standing authority, the freshly created plan
+/// is immediately validated against the authority's bounds and executed in
+/// the same invocation; otherwise the plan envelope is returned for the
+/// ordinary per-operation approval ceremony.
+async fn finish_standing_run(
+    store: &StateStore,
+    plan_envelope: ResultEnvelopeV2,
+    under_policy: Option<&str>,
+) -> Result<ResultEnvelopeV2> {
+    let Some(authority_id) = under_policy else {
+        return Ok(plan_envelope);
+    };
+    let Some(operation_id) = plan_envelope.operation_id.clone() else {
+        return Err(CliError::Input(
+            "a standing run requires the plan envelope to carry an operation id".to_owned(),
+        ));
+    };
+    run_plan_under_standing_authority(store, &operation_id, authority_id).await
+}
+
+async fn key_policy(store: &StateStore, command: KeyPolicyCommand) -> Result<ResultEnvelopeV2> {
+    match command {
+        KeyPolicyCommand::Create(arguments) => key_policy_create(store, &arguments).await,
+        KeyPolicyCommand::List => key_policy_list(store),
+        KeyPolicyCommand::Approve(arguments) => key_policy_approve(store, &arguments),
+        KeyPolicyCommand::Revoke(selector) => key_policy_revoke(store, &selector),
+    }
+}
+
+async fn key_policy_create(
+    store: &StateStore,
+    arguments: &KeyPolicyCreateArgs,
+) -> Result<ResultEnvelopeV2> {
+    if arguments.permissions.is_empty() {
+        return Err(CliError::Input(
+            "a standing authority requires at least one allowlisted permission group; use `cfctl keys permissions --account <id>`"
+                .to_owned(),
+        ));
+    }
+    if arguments.name_prefix.trim().is_empty() {
+        return Err(CliError::Input(
+            "a standing authority requires a non-empty `--name-prefix` lineage bound".to_owned(),
+        ));
+    }
+    if arguments.max_child_ttl_hours == 0 || arguments.max_runs_per_day == 0 {
+        return Err(CliError::Input(
+            "`--max-child-ttl-hours` and `--max-runs-per-day` must both be at least 1".to_owned(),
+        ));
+    }
+    let inventory = key_permissions(
+        store,
+        &KeyPermissionArgs {
+            account: Some(arguments.account.clone()),
+            user: false,
+        },
+    )
+    .await?;
+    if !inventory.ok
+        || !inventory.performed
+        || inventory.account_id.as_deref() != Some(arguments.account.as_str())
+    {
+        return Err(CliError::Input(
+            "fresh account-bound permission inventory did not produce a live-read receipt"
+                .to_owned(),
+        ));
+    }
+    let selected_groups = validate_selected_permission_groups(
+        &arguments.permissions,
+        inventory.result.get("result").unwrap_or(&Value::Null),
+    )?;
+    validate_permission_group_resource_scope(&selected_groups, "com.cloudflare.api.account")?;
+    let selected_group_ids = selected_groups
+        .iter()
+        .filter_map(|group| group.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let selected_groups_hash = hash_value(&serde_json::to_value(&selected_groups)?)?;
+    let expires_at = Utc::now() + ChronoDuration::days(i64::from(arguments.expires_days));
+    let authority = StandingAuthorityV1::draft(
+        &arguments.account,
+        vec![
+            "account-api-tokens-create-token".to_owned(),
+            "account-api-tokens-delete-token".to_owned(),
+        ],
+        selected_group_ids,
+        &selected_groups_hash,
+        arguments.max_child_ttl_hours,
+        &arguments.name_prefix,
+        arguments.max_runs_per_day,
+        expires_at,
+    )?;
+    store.create_authority(&authority)?;
+    let mut envelope = ResultEnvelopeV2::success(
+        "keys policy create",
+        json!({
+            "authority_id": authority.authority_id,
+            "status": authority.status.as_str(),
+            "account_id": authority.account_id,
+            "capability_ids": authority.capability_ids,
+            "name_prefix": authority.name_prefix,
+            "max_child_ttl_hours": authority.max_child_ttl_hours,
+            "max_runs_per_day": authority.max_runs_per_day,
+            "expires_at": authority.expires_at,
+            "resolved_permission_groups": selected_groups,
+            "permission_inventory_hash": authority.permission_inventory_hash,
+            "approval_command": format!(
+                "cfctl keys policy approve {} --yes",
+                authority.authority_id
+            ),
+            "message": "Standing authority drafted from a fresh live permission inventory. Review the resolved groups and bounds, then approve the exact authority ID."
+        }),
+    );
+    envelope.account_id = Some(arguments.account.clone());
+    envelope.evidence = inventory.evidence;
+    Ok(envelope)
+}
+
+fn key_policy_list(store: &StateStore) -> Result<ResultEnvelopeV2> {
+    let now = Utc::now();
+    let authorities: Vec<Value> = store
+        .list_authorities()?
+        .iter()
+        .map(|authority| {
+            json!({
+                "authority_id": authority.authority_id,
+                "status": authority.effective_status(now),
+                "account_id": authority.account_id,
+                "capability_ids": authority.capability_ids,
+                "name_prefix": authority.name_prefix,
+                "permission_group_count": authority.permission_group_ids.len(),
+                "max_child_ttl_hours": authority.max_child_ttl_hours,
+                "max_runs_per_day": authority.max_runs_per_day,
+                "runs_last_24h": authority.runs_in_last_day(now),
+                "minted_tokens": authority.minted_token_ids.len(),
+                "created_at": authority.created_at,
+                "expires_at": authority.expires_at,
+            })
+        })
+        .collect();
+    Ok(ResultEnvelopeV2::success(
+        "keys policy list",
+        json!({"authorities": authorities}),
+    ))
+}
+
+fn key_policy_approve(
+    store: &StateStore,
+    arguments: &KeyPolicyApproveArgs,
+) -> Result<ResultEnvelopeV2> {
+    let guard = store.lock_authority(&arguments.authority_id)?;
+    let mut authority = store.load_authority(&arguments.authority_id)?;
+    authority.approve(arguments.yes)?;
+    store.save_authority_guarded(&authority, &guard)?;
+    Ok(ResultEnvelopeV2::success(
+        "keys policy approve",
+        json!({
+            "authority_id": authority.authority_id,
+            "status": authority.status.as_str(),
+            "approved_content_hash": authority.approval.as_ref().map(|approval| approval.approved_content_hash.clone()),
+            "expires_at": authority.expires_at,
+            "message": "Standing authority is active. Unattended runs under it are bounded, rate-limited, attributable, and revocable with `cfctl keys policy revoke`."
+        }),
+    ))
+}
+
+fn key_policy_revoke(store: &StateStore, selector: &KeyPolicySelector) -> Result<ResultEnvelopeV2> {
+    let guard = store.lock_authority(&selector.authority_id)?;
+    let mut authority = store.load_authority(&selector.authority_id)?;
+    authority.revoke();
+    store.save_authority_guarded(&authority, &guard)?;
+    Ok(ResultEnvelopeV2::success(
+        "keys policy revoke",
+        json!({
+            "authority_id": authority.authority_id,
+            "status": authority.status.as_str(),
+            "message": "Standing authority revoked. Runs not yet durably admitted fail closed; an already-admitted boundary attempt may finish, and later lineage reconciliation cannot reactivate the grant. Already-minted child tokens are unaffected and can be revoked individually."
+        }),
+    ))
 }
 
 async fn key_permissions(
@@ -6119,10 +7019,10 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
     })?;
     if arguments.permissions.is_empty() {
         return Err(CliError::Input(if arguments.user {
-            "at least one permission group ID is required; use `cfctl keys permissions --user --account <id>`"
+            "at least one permission group ID or exact name is required; use `cfctl keys permissions --user --account <id>`"
                     .to_owned()
         } else {
-            "at least one permission group ID is required; use `cfctl keys permissions --account <id>`"
+            "at least one permission group ID or exact name is required; use `cfctl keys permissions --account <id>`"
                     .to_owned()
         }));
     }
@@ -6212,40 +7112,65 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
 }
 
 fn validate_selected_permission_groups(
-    requested_ids: &[String],
+    requested_selectors: &[String],
     inventory: &Value,
 ) -> Result<Vec<Value>> {
-    if requested_ids.is_empty() {
+    if requested_selectors.is_empty() {
         return Err(CliError::Input(
-            "at least one permission group ID must be selected".to_owned(),
+            "at least one permission group ID or exact name must be selected".to_owned(),
         ));
     }
     let groups = inventory.as_array().ok_or_else(|| {
         CliError::Input("live permission inventory result is not an array".to_owned())
     })?;
-    let mut requested_ids = requested_ids.to_vec();
-    requested_ids.sort();
-    requested_ids.dedup();
-    let mut selected = Vec::with_capacity(requested_ids.len());
-    for requested_id in requested_ids {
+    let mut requested_selectors = requested_selectors.to_vec();
+    requested_selectors.sort();
+    requested_selectors.dedup();
+    let mut resolved = BTreeMap::<String, &Value>::new();
+    for requested_selector in requested_selectors {
         let matches = groups
             .iter()
-            .filter(|group| group.get("id").and_then(Value::as_str) == Some(&requested_id))
+            .filter(|group| {
+                group.get("id").and_then(Value::as_str) == Some(&requested_selector)
+                    || group.get("name").and_then(Value::as_str) == Some(&requested_selector)
+            })
             .collect::<Vec<_>>();
         if matches.len() != 1 {
             return Err(CliError::Input(format!(
-                "permission group `{requested_id}` is not unique in the fresh account inventory (matched {})",
+                "permission group selector `{requested_selector}` is not unique in the fresh account inventory (matched {})",
                 matches.len()
             )));
         }
         let group = matches[0];
+        let resolved_id = group
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                CliError::Input(format!(
+                    "permission group `{requested_selector}` has no auditable ID in the fresh account inventory"
+                ))
+            })?;
+        let id_matches = groups
+            .iter()
+            .filter(|candidate| candidate.get("id").and_then(Value::as_str) == Some(resolved_id))
+            .count();
+        if id_matches != 1 {
+            return Err(CliError::Input(format!(
+                "permission group `{resolved_id}` is not unique in the fresh account inventory (matched {id_matches})"
+            )));
+        }
+        resolved.insert(resolved_id.to_owned(), group);
+    }
+    let mut selected = Vec::with_capacity(resolved.len());
+    for (resolved_id, group) in resolved {
         let name = group
             .get("name")
             .and_then(Value::as_str)
             .filter(|name| !name.trim().is_empty())
             .ok_or_else(|| {
                 CliError::Input(format!(
-                    "permission group `{requested_id}` has no auditable name in the fresh account inventory"
+                    "permission group `{resolved_id}` has no auditable name in the fresh account inventory"
                 ))
             })?;
         let mut scopes = group
@@ -6253,14 +7178,14 @@ fn validate_selected_permission_groups(
             .and_then(Value::as_array)
             .ok_or_else(|| {
                 CliError::Input(format!(
-                    "permission group `{requested_id}` has no auditable scope list in the fresh account inventory"
+                    "permission group `{resolved_id}` has no auditable scope list in the fresh account inventory"
                 ))
             })?
             .iter()
             .map(|scope| {
                 scope.as_str().map(str::to_owned).ok_or_else(|| {
                     CliError::Input(format!(
-                        "permission group `{requested_id}` contains a non-string scope"
+                        "permission group `{resolved_id}` contains a non-string scope"
                     ))
                 })
             })
@@ -6269,11 +7194,11 @@ fn validate_selected_permission_groups(
         scopes.dedup();
         if scopes.is_empty() {
             return Err(CliError::Input(format!(
-                "permission group `{requested_id}` has an empty scope list"
+                "permission group `{resolved_id}` has an empty scope list"
             )));
         }
         let mut normalized = Map::from_iter([
-            ("id".to_owned(), Value::String(requested_id)),
+            ("id".to_owned(), Value::String(resolved_id)),
             ("name".to_owned(), Value::String(name.to_owned())),
             ("scopes".to_owned(), serde_json::to_value(scopes)?),
         ]);
@@ -6691,6 +7616,7 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "oauth_scope_inventory_hash": inventory_hash,
             "oauth_profiles": oauth_reconsent,
             "platform_secret_store": platform_secret_store_health(store)?,
+            "standing_authorities": standing_authorities_health(store)?,
             "agents": agents,
             "public_oauth": "unconfigured until cfctl.io ownership, site publication, domain verification, and permanent promotion are explicitly completed; use `cfctl auth import-api-token --account <id> --stdin` for the scoped day-to-day lane",
         }),
@@ -8327,7 +9253,7 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 mod tests {
     use super::{
         CallInput, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
-        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority,
+        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, admit_standing_plan,
         apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_read_replication_state_response, apply_dns_record_state_response,
         apply_global_warp_override_state_response, apply_oauth_client_secret_state_response,
@@ -8336,10 +9262,12 @@ mod tests {
         bind_required_empty_compensation_body, boundary_response_artifact, call_command,
         capability_call_argv, compensation_request, execute_read, find_secret_value,
         force_ipv4_from, guide_document, http_client, is_live_plan_precondition_hash,
-        is_secret_output_capability, non_readback_verification_basis, persist_prepared_plan,
-        persist_secret_lifecycle, preflight_call_input, preserve_previous_catalog,
-        query_object_from_pairs, read_import_secret, read_secret_file, redact_secret_result,
-        required_cloudflare_tunnel_configuration_state_precondition,
+        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
+        non_readback_verification_basis, persist_prepared_plan, persist_secret_lifecycle,
+        persist_secret_lifecycle_and_reconcile_lineage, preflight_call_input,
+        preflight_standing_authority, preserve_previous_catalog, query_object_from_pairs,
+        read_import_secret, read_secret_file, reconcile_standing_lineage_from_plan, rectify_plan,
+        redact_secret_result, required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
         required_oauth_client_secret_state_precondition,
@@ -8353,24 +9281,31 @@ mod tests {
         store_imported_api_token, validate_api_token_creation_contract,
         validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
-        validate_selected_permission_groups, validate_zone_account_receipt_precondition,
+        validate_selected_permission_groups, validate_standing_authority_permission_inventory,
+        validate_zone_account_receipt_precondition, validated_standing_lineage_token_id,
         workspace_resource_keys, zone_target,
     };
     use crate::profiles::ProfilesConfig;
-    use crate::{CallArgs, PlanApproveArgs};
+    use crate::{CallArgs, KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs, PlanSelector};
     use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
-    use cfctl_cloudflare::CloudflareResponseV1;
+    use cfctl_cloudflare::{CloudflareResponseV1, OperationVerificationV1};
     use cfctl_core::{
         AdapterStatus, CapabilityV1, CostV1, CreatedCollectionResourceContractV1,
         CreatedResourceContractV1, EffectClass, EvidenceClass, EvidenceV1, PlanStatus, PlanV1,
         QuerySerializationV1, RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1,
-        TransactionStageV1, hash_value,
+        StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, VerificationState,
+        hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
-    use chrono::Utc;
+    use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::{Value, json};
-    use std::{collections::BTreeMap, fs};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     struct DeleteFailingSecretStore;
 
@@ -11479,6 +12414,53 @@ mod tests {
     }
 
     #[test]
+    fn selected_permission_groups_accept_exact_names_and_reject_ambiguous_names() {
+        let inventory = json!([
+            {
+                "id": "group-a",
+                "name": "Workers Scripts Write",
+                "scopes": ["com.cloudflare.api.account"]
+            },
+            {
+                "id": "group-b",
+                "name": "Account Settings Read",
+                "scopes": ["com.cloudflare.api.account"]
+            }
+        ]);
+
+        let selected = validate_selected_permission_groups(
+            &[
+                "Workers Scripts Write".to_owned(),
+                "group-a".to_owned(),
+                "Account Settings Read".to_owned(),
+            ],
+            &inventory,
+        )
+        .expect("exact ID and exact name selectors resolve deterministically");
+
+        assert_eq!(selected.len(), 2, "ID/name aliases deduplicate by group ID");
+        assert_eq!(selected[0]["id"], "group-a");
+        assert_eq!(selected[1]["id"], "group-b");
+
+        let ambiguous_inventory = json!([
+            {
+                "id": "group-a",
+                "name": "Shared Name",
+                "scopes": ["com.cloudflare.api.account"]
+            },
+            {
+                "id": "group-b",
+                "name": "Shared Name",
+                "scopes": ["com.cloudflare.api.account"]
+            }
+        ]);
+        let error =
+            validate_selected_permission_groups(&["Shared Name".to_owned()], &ambiguous_inventory)
+                .expect_err("ambiguous exact names fail closed");
+        assert!(error.to_string().contains("matched 2"), "{error}");
+    }
+
+    #[test]
     fn token_creation_requires_inventory_bound_permissions_and_exact_account_scope() {
         let capability = CapabilityV1::new(
             "account-api-tokens-create-token",
@@ -11650,6 +12632,93 @@ mod tests {
             let error = validate_current_permission_groups(&contract, &drifted)
                 .expect_err("permission metadata drift is rejected");
             assert!(error.to_string().contains("drifted after planning"));
+        }
+    }
+
+    #[test]
+    fn standing_authority_inventory_validation_binds_complete_allowlist_metadata() {
+        let approved_inventory = json!([
+            {
+                "id":"group-b",
+                "name":"Account Settings Read",
+                "scopes":["com.cloudflare.api.account"]
+            },
+            {
+                "id":"group-a",
+                "name":"Workers Scripts Write",
+                "scopes":["com.cloudflare.api.zone", "com.cloudflare.api.account"],
+                "category":"workers"
+            }
+        ]);
+        let approved_groups = validate_selected_permission_groups(
+            &["group-a".to_owned(), "group-b".to_owned()],
+            &approved_inventory,
+        )
+        .expect("approved groups normalize");
+        let authority = StandingAuthorityV1::draft(
+            "account-a",
+            vec!["account-api-tokens-create-token".to_owned()],
+            vec!["group-a".to_owned(), "group-b".to_owned()],
+            &hash_value(&serde_json::to_value(&approved_groups).expect("approved groups JSON"))
+                .expect("approved inventory hash"),
+            24,
+            "cf-rotation-",
+            2,
+            Utc::now() + ChronoDuration::days(30),
+        )
+        .expect("authority draft");
+
+        validate_standing_authority_permission_inventory(
+            &authority,
+            &json!([
+                {
+                    "id":"unrelated",
+                    "name":"Unrelated Addition",
+                    "scopes":["com.cloudflare.api.account"]
+                },
+                {
+                    "id":"group-a",
+                    "name":"Workers Scripts Write",
+                    "scopes":["com.cloudflare.api.account", "com.cloudflare.api.zone"],
+                    "category":"workers"
+                },
+                {
+                    "id":"group-b",
+                    "name":"Account Settings Read",
+                    "scopes":["com.cloudflare.api.account"]
+                }
+            ]),
+        )
+        .expect("reordering and unrelated additions preserve the approved allowlist");
+
+        for drifted in [
+            json!([
+                {"id":"group-a","name":"Workers Scripts Admin","scopes":["com.cloudflare.api.account","com.cloudflare.api.zone"],"category":"workers"},
+                {"id":"group-b","name":"Account Settings Read","scopes":["com.cloudflare.api.account"]}
+            ]),
+            json!([
+                {"id":"group-a","name":"Workers Scripts Write","scopes":["com.cloudflare.api.account"],"category":"workers"},
+                {"id":"group-b","name":"Account Settings Read","scopes":["com.cloudflare.api.account"]}
+            ]),
+            json!([
+                {"id":"group-a","name":"Workers Scripts Write","scopes":["com.cloudflare.api.account","com.cloudflare.api.zone"],"category":"different"},
+                {"id":"group-b","name":"Account Settings Read","scopes":["com.cloudflare.api.account"]}
+            ]),
+            json!([
+                {"id":"group-a","name":"Workers Scripts Write","scopes":["com.cloudflare.api.account","com.cloudflare.api.zone"],"category":"workers"}
+            ]),
+            json!([
+                {"id":"group-a","name":"Workers Scripts Write","scopes":["com.cloudflare.api.account","com.cloudflare.api.zone"],"category":"workers"},
+                {"id":"group-a","name":"Duplicate","scopes":["com.cloudflare.api.account"]},
+                {"id":"group-b","name":"Account Settings Read","scopes":["com.cloudflare.api.account"]}
+            ]),
+        ] {
+            let error = validate_standing_authority_permission_inventory(&authority, &drifted)
+                .expect_err("approved allowlist drift fails closed");
+            assert!(
+                error.to_string().contains("permission") || error.to_string().contains("inventory"),
+                "{error}"
+            );
         }
     }
 
@@ -12053,6 +13122,1171 @@ mod tests {
         )
         .expect_err("empty account rejected");
         assert!(unpinned.to_string().contains("--account"));
+    }
+
+    #[test]
+    fn standing_authority_lifecycle_approves_lists_and_revokes_offline() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let authority = StandingAuthorityV1::draft(
+            "account-a",
+            vec!["account-api-tokens-create-token".to_owned()],
+            vec!["group-a".to_owned()],
+            "sha256:inventory-binding",
+            24,
+            "cf-rotation-",
+            2,
+            Utc::now() + ChronoDuration::days(30),
+        )
+        .expect("authority draft");
+        let authority_id = authority.authority_id.clone();
+        store.save_authority(&authority).expect("persist draft");
+
+        let denied = key_policy_approve(
+            &store,
+            &KeyPolicyApproveArgs {
+                authority_id: authority_id.clone(),
+                yes: false,
+            },
+        )
+        .expect_err("approval requires an explicit yes");
+        assert!(denied.to_string().contains("explicit yes"), "{denied}");
+
+        let approved = key_policy_approve(
+            &store,
+            &KeyPolicyApproveArgs {
+                authority_id: authority_id.clone(),
+                yes: true,
+            },
+        )
+        .expect("explicit approval activates");
+        assert_eq!(approved.result["status"], "active");
+
+        let listed = key_policy_list(&store).expect("list authorities");
+        assert_eq!(
+            listed.result["authorities"][0]["authority_id"],
+            serde_json::json!(authority_id)
+        );
+        assert_eq!(listed.result["authorities"][0]["status"], "active");
+        assert_eq!(listed.result["authorities"][0]["runs_last_24h"], 0);
+
+        preflight_standing_authority(&store, Some(&authority_id))
+            .expect("active authority passes preflight");
+        assert!(
+            preflight_standing_authority(&store, Some("ghost")).is_err(),
+            "unknown authorities fail closed before any network"
+        );
+
+        let revoked = key_policy_revoke(
+            &store,
+            &KeyPolicySelector {
+                authority_id: authority_id.clone(),
+            },
+        )
+        .expect("revocation is unconditional");
+        assert_eq!(revoked.result["status"], "revoked");
+        assert!(
+            preflight_standing_authority(&store, Some(&authority_id)).is_err(),
+            "revoked authorities fail preflight immediately"
+        );
+    }
+
+    #[test]
+    fn standing_authority_list_reports_effective_expiry() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let expired = StandingAuthorityV1::draft(
+            "account-a",
+            vec!["account-api-tokens-create-token".to_owned()],
+            vec!["group-a".to_owned()],
+            "sha256:inventory-binding",
+            24,
+            "cf-rotation-",
+            2,
+            Utc::now() - ChronoDuration::seconds(1),
+        )
+        .expect("expired authority draft remains inspectable");
+        store
+            .create_authority(&expired)
+            .expect("persist expired authority");
+
+        let listed = key_policy_list(&store).expect("list authorities");
+
+        assert_eq!(listed.result["authorities"][0]["status"], "expired");
+    }
+
+    #[test]
+    fn approval_and_revocation_race_cannot_resurrect_an_authority() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let paths = RuntimePaths::from_root(root.path());
+        let store = StateStore::open(paths.clone()).expect("state store");
+        let authority = StandingAuthorityV1::draft(
+            "account-a",
+            vec!["account-api-tokens-create-token".to_owned()],
+            vec!["group-a".to_owned()],
+            "sha256:inventory-binding",
+            24,
+            "cf-rotation-",
+            2,
+            Utc::now() + ChronoDuration::days(30),
+        )
+        .expect("authority draft");
+        let authority_id = authority.authority_id.clone();
+        store
+            .create_authority(&authority)
+            .expect("persist pending authority");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let approve = {
+            let paths = paths.clone();
+            let barrier = Arc::clone(&barrier);
+            let authority_id = authority_id.clone();
+            thread::spawn(move || {
+                let store = StateStore::open(paths).expect("approval store");
+                barrier.wait();
+                key_policy_approve(
+                    &store,
+                    &KeyPolicyApproveArgs {
+                        authority_id,
+                        yes: true,
+                    },
+                )
+            })
+        };
+        let revoke = {
+            let paths = paths.clone();
+            let barrier = Arc::clone(&barrier);
+            let authority_id = authority_id.clone();
+            thread::spawn(move || {
+                let store = StateStore::open(paths).expect("revocation store");
+                barrier.wait();
+                key_policy_revoke(&store, &KeyPolicySelector { authority_id })
+            })
+        };
+
+        let _approval_result = approve.join().expect("approval thread joins");
+        revoke
+            .join()
+            .expect("revocation thread joins")
+            .expect("revocation always commits");
+        let durable = store
+            .load_authority(&authority_id)
+            .expect("durable authority reloads");
+        assert_eq!(durable.status, StandingAuthorityStatus::Revoked);
+    }
+
+    fn active_standing_authority(max_runs_per_day: u32) -> StandingAuthorityV1 {
+        let mut authority = StandingAuthorityV1::draft(
+            "account-a",
+            vec![
+                "account-api-tokens-create-token".to_owned(),
+                "account-api-tokens-delete-token".to_owned(),
+            ],
+            vec!["group-a".to_owned()],
+            "sha256:inventory-binding",
+            24,
+            "cf-rotation-",
+            max_runs_per_day,
+            Utc::now() + ChronoDuration::days(30),
+        )
+        .expect("authority draft");
+        authority.approve(true).expect("authority approval");
+        authority
+    }
+
+    fn standing_mint_plan() -> (PlanV1, CallInput) {
+        let mut capability = CapabilityV1::new(
+            "account-api-tokens-create-token",
+            "Create account token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        capability.risk = RiskClass::SecretSensitive;
+        let plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("standing mint plan");
+        let input = CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            query: json!({}),
+            body: Some(json!({
+                "name":"cf-rotation-child",
+                "expires_on":(Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),
+                "policies":[{
+                    "effect":"allow",
+                    "permission_groups":[{"id":"group-a"}],
+                    "resources":{"com.cloudflare.api.account.account-a":"*"}
+                }]
+            })),
+            ..CallInput::default()
+        };
+        (plan, input)
+    }
+
+    #[test]
+    fn standing_admission_serializes_one_run_budget_across_two_stores() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let paths = RuntimePaths::from_root(root.path());
+        let store = StateStore::open(paths.clone()).expect("state store");
+        let mut authority = StandingAuthorityV1::draft(
+            "account-a",
+            vec!["account-api-tokens-create-token".to_owned()],
+            vec!["group-a".to_owned()],
+            "sha256:inventory-binding",
+            24,
+            "cf-rotation-",
+            1,
+            Utc::now() + ChronoDuration::days(30),
+        )
+        .expect("authority draft");
+        authority.approve(true).expect("authority approval");
+        store
+            .create_authority(&authority)
+            .expect("persist authority");
+        let (plan_a, input_a) = standing_mint_plan();
+        let (plan_b, input_b) = standing_mint_plan();
+        let operation_ids = [plan_a.operation_id.clone(), plan_b.operation_id.clone()];
+        store.save_plan(&plan_a).expect("persist plan A");
+        store.save_plan(&plan_b).expect("persist plan B");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = [(plan_a, input_a), (plan_b, input_b)]
+            .into_iter()
+            .map(|(mut plan, input)| {
+                let paths = paths.clone();
+                let barrier = Arc::clone(&barrier);
+                let snapshot = authority.clone();
+                thread::spawn(move || {
+                    let store = StateStore::open(paths).expect("second store");
+                    barrier.wait();
+                    admit_standing_plan(&store, &mut plan, &snapshot, &input)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("admission thread"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let stored = store
+            .load_authority(&authority.authority_id)
+            .expect("stored authority");
+        assert_eq!(stored.run_log.len(), 1);
+        assert_eq!(stored.runs_in_last_day(Utc::now()), 1);
+        let consumed = operation_ids
+            .iter()
+            .map(|operation_id| store.load_plan(operation_id).expect("stored plan"))
+            .filter(|plan| plan.status == PlanStatus::Consumed)
+            .count();
+        assert_eq!(consumed, 1, "only the durably reserved plan is consumed");
+    }
+
+    #[test]
+    fn revocation_before_admission_blocks_the_run_without_spending_budget() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let authority = active_standing_authority(2);
+        let authority_id = authority.authority_id.clone();
+        store
+            .create_authority(&authority)
+            .expect("persist active authority");
+        let (mut plan, input) = standing_mint_plan();
+        store.save_plan(&plan).expect("persist draft plan");
+        key_policy_revoke(
+            &store,
+            &KeyPolicySelector {
+                authority_id: authority_id.clone(),
+            },
+        )
+        .expect("revocation commits before admission");
+
+        let error = admit_standing_plan(&store, &mut plan, &authority, &input)
+            .expect_err("revoked authority cannot admit a run");
+
+        assert!(error.to_string().contains("revoked"), "{error}");
+        let durable = store
+            .load_authority(&authority_id)
+            .expect("authority reloads");
+        assert_eq!(durable.status, StandingAuthorityStatus::Revoked);
+        assert!(durable.run_log.is_empty());
+        assert_eq!(
+            store
+                .load_plan(&plan.operation_id)
+                .expect("draft plan reloads")
+                .status,
+            PlanStatus::Draft
+        );
+    }
+
+    #[test]
+    fn standing_admission_reserves_budget_before_plan_persistence() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let paths = RuntimePaths::from_root(root.path());
+        let store = StateStore::open(paths.clone()).expect("state store");
+        let authority = active_standing_authority(1);
+        store
+            .create_authority(&authority)
+            .expect("persist active authority");
+        let (mut plan, input) = standing_mint_plan();
+        store.save_plan(&plan).expect("persist draft plan");
+        let plan_path = paths
+            .data_dir
+            .join("plans")
+            .join(format!("{}.json", plan.operation_id));
+        fs::remove_file(&plan_path).expect("remove plan for injected persistence failure");
+        fs::create_dir(&plan_path).expect("replace plan with non-regular fixture");
+
+        admit_standing_plan(&store, &mut plan, &authority, &input)
+            .expect_err("plan persistence fails after authority reservation");
+
+        let durable = store
+            .load_authority(&authority.authority_id)
+            .expect("authority reservation reloads");
+        assert_eq!(durable.run_log.len(), 1);
+        assert_eq!(durable.run_log[0].operation_id, plan.operation_id);
+        assert_eq!(
+            plan.transaction_stage,
+            TransactionStageV1::ConsumptionPersisted,
+            "the boundary attempt is not recorded until after the plan save"
+        );
+    }
+
+    fn standing_token_plan_with_receipt(
+        authority: &StandingAuthorityV1,
+        response: Value,
+    ) -> PlanV1 {
+        standing_token_plan_with_receipt_and_targets(authority, response, json!({}))
+    }
+
+    fn standing_token_plan_with_receipt_and_targets(
+        authority: &StandingAuthorityV1,
+        response: Value,
+        targets: Value,
+    ) -> PlanV1 {
+        let mut plan = standing_token_plan_at_boundary_attempt(authority, targets);
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            response,
+        )
+        .expect("boundary response");
+        plan
+    }
+
+    fn standing_token_plan_at_boundary_attempt(
+        authority: &StandingAuthorityV1,
+        targets: Value,
+    ) -> PlanV1 {
+        let mut capability = CapabilityV1::new(
+            "account-api-tokens-create-token",
+            "Create account token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        capability.risk = RiskClass::SecretSensitive;
+        let mut plan = PlanV1::draft("profile-a", "account-a", "catalog-sha", capability, targets)
+            .expect("standing plan");
+        plan.mark_consumed_via_standing_authority(authority)
+            .expect("standing consumption");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("boundary attempt");
+        plan
+    }
+
+    fn reserve_standing_plan(authority: &mut StandingAuthorityV1, plan: &PlanV1) {
+        authority
+            .reserve_run(Utc::now(), &plan.operation_id, &plan.capability.id)
+            .expect("standing run reservation");
+    }
+
+    #[test]
+    fn standing_lineage_uses_only_validated_success_receipts_and_survives_revocation() {
+        let mut authority = StandingAuthorityV1::draft(
+            "account-a",
+            vec!["account-api-tokens-create-token".to_owned()],
+            vec!["group-a".to_owned()],
+            "sha256:inventory-binding",
+            24,
+            "cf-rotation-",
+            8,
+            Utc::now() + ChronoDuration::days(30),
+        )
+        .expect("authority draft");
+        authority.approve(true).expect("authority approval");
+        let plan = standing_token_plan_with_receipt(
+            &authority,
+            json!({"success":true,"resource_id":"token-child"}),
+        );
+        let malformed = [
+            json!({"success":true}),
+            json!({"success":true,"resource_id":""}),
+        ]
+        .map(|receipt| standing_token_plan_with_receipt(&authority, receipt));
+        let unsuccessful = standing_token_plan_with_receipt(
+            &authority,
+            json!({"success":false,"resource_id":"token-never-created"}),
+        );
+        reserve_standing_plan(&mut authority, &plan);
+        for candidate in &malformed {
+            reserve_standing_plan(&mut authority, candidate);
+        }
+        reserve_standing_plan(&mut authority, &unsuccessful);
+
+        assert_eq!(
+            validated_standing_lineage_token_id(&plan, &authority).expect("valid standing receipt"),
+            Some("token-child")
+        );
+        authority.revoke();
+        assert_eq!(
+            validated_standing_lineage_token_id(&plan, &authority)
+                .expect("revocation cannot erase a completed boundary fact"),
+            Some("token-child")
+        );
+
+        let mut wrong_authority = authority.clone();
+        wrong_authority.authority_id = "00000000-0000-4000-8000-000000000001".to_owned();
+        assert!(
+            validated_standing_lineage_token_id(&plan, &wrong_authority).is_err(),
+            "the consumption receipt binds the exact authority"
+        );
+
+        for malformed in &malformed {
+            assert!(
+                validated_standing_lineage_token_id(malformed, &authority).is_err(),
+                "successful receipts require a nonempty resource id"
+            );
+        }
+
+        assert_eq!(
+            validated_standing_lineage_token_id(&unsuccessful, &authority)
+                .expect("an unsuccessful receipt is validated but creates no lineage"),
+            None
+        );
+    }
+
+    #[test]
+    fn standing_lineage_requires_the_authoritys_durable_run_reservation() {
+        let authority = active_standing_authority(2);
+        let plan = standing_token_plan_with_receipt(
+            &authority,
+            json!({"success":true,"resource_id":"token-unreserved"}),
+        );
+
+        let error = validated_standing_lineage_token_id(&plan, &authority)
+            .expect_err("a plan-side receipt cannot manufacture authority lineage");
+
+        assert!(error.to_string().contains("reserved"), "{error}");
+    }
+
+    #[test]
+    fn standing_lineage_reservation_must_bind_the_same_capability() {
+        let mut authority = active_standing_authority(2);
+        let plan = standing_token_plan_with_receipt(
+            &authority,
+            json!({"success":true,"resource_id":"token-wrong-capability"}),
+        );
+        authority
+            .reserve_run(
+                Utc::now(),
+                &plan.operation_id,
+                "account-api-tokens-delete-token",
+            )
+            .expect("persist mismatched reservation fixture");
+
+        let error = validated_standing_lineage_token_id(&plan, &authority)
+            .expect_err("the reservation must bind the exact creation capability");
+
+        assert!(error.to_string().contains("reserved"), "{error}");
+        assert!(error.to_string().contains("capability"), "{error}");
+    }
+
+    #[test]
+    fn standing_lineage_is_reconciled_even_when_the_secret_sink_fails() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut authority = active_standing_authority(2);
+        let mut plan = standing_token_plan_with_receipt(
+            &authority,
+            json!({"success":true,"resource_id":"token-sink-failed"}),
+        );
+        reserve_standing_plan(&mut authority, &plan);
+        store
+            .create_authority(&authority)
+            .expect("persist active authority and run reservation");
+        store
+            .save_plan(&plan)
+            .expect("persist successful boundary receipt");
+
+        let outcome = persist_secret_lifecycle_and_reconcile_lineage(
+            &store,
+            &mut plan,
+            true,
+            None,
+            &MemorySecretStore::default(),
+            true,
+        );
+        let error = outcome
+            .error
+            .expect("missing one-time secret fails the sink");
+
+        assert!(
+            error.to_string().contains("required sink-only value"),
+            "{error}"
+        );
+        assert!(
+            outcome.lineage_evidence.is_some(),
+            "lineage evidence survives a sink failure"
+        );
+        let durable_authority = store
+            .load_authority(&authority.authority_id)
+            .expect("authority lineage reloads");
+        assert_eq!(
+            durable_authority.minted_token_ids,
+            vec!["token-sink-failed"]
+        );
+        let durable_plan = store
+            .load_plan(&plan.operation_id)
+            .expect("sink failure checkpoint reloads");
+        assert_eq!(durable_plan.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            durable_plan.transaction_stage,
+            TransactionStageV1::SecretSinkPersisted
+        );
+    }
+
+    #[test]
+    fn post_boundary_failure_envelope_retains_performed_truth_and_receipts() {
+        let (plan, _) = standing_mint_plan();
+        let apply = EvidenceV1::new(
+            EvidenceClass::Apply,
+            "sha256:apply",
+            "/managed/evidence/apply.json",
+        );
+        let lineage = EvidenceV1::new(
+            EvidenceClass::StandingApply,
+            "sha256:lineage",
+            "/managed/evidence/lineage.json",
+        );
+        let error = super::CliError::Input("injected sink failure".to_owned());
+
+        let envelope = super::post_boundary_failure_envelope(
+            &plan,
+            json!({"success":true,"resource_id":"token-created"}),
+            Some(apply),
+            Some(lineage),
+            &error,
+            true,
+            "the Cloudflare boundary response is durable, but recovery is required",
+        );
+
+        assert!(!envelope.ok);
+        assert!(envelope.performed);
+        assert_eq!(envelope.command, "plans run");
+        assert_eq!(
+            envelope.operation_id.as_deref(),
+            Some(plan.operation_id.as_str())
+        );
+        assert_eq!(
+            envelope.capability_id.as_deref(),
+            Some(plan.capability.id.as_str())
+        );
+        assert_eq!(envelope.evidence.len(), 2);
+        assert!(envelope.error.as_ref().is_some_and(|error| {
+            error.message.contains("injected sink failure")
+                && error.next_step.as_deref().is_some_and(|next| {
+                    next.contains("Do not replay") && next.contains(&plan.operation_id)
+                })
+        }));
+    }
+
+    #[test]
+    fn final_checkpoint_failure_preserves_boundary_and_verification_truth() {
+        let (mut plan, _) = standing_mint_plan();
+        plan.status = PlanStatus::Verified;
+        let apply = EvidenceV1::new(
+            EvidenceClass::Apply,
+            "sha256:apply",
+            "/managed/evidence/apply.json",
+        );
+        let lineage = EvidenceV1::new(
+            EvidenceClass::StandingApply,
+            "sha256:lineage",
+            "/managed/evidence/lineage.json",
+        );
+        let verification_evidence = EvidenceV1::new(
+            EvidenceClass::PostChangeVerification,
+            "sha256:verification",
+            "/managed/evidence/verification.json",
+        );
+        let finalization_error =
+            super::CliError::Input("injected closed-checkpoint failure".to_owned());
+
+        let envelope = super::api_plan_result_envelope(
+            &plan,
+            json!({"success":true,"resource_id":"token-created"}),
+            apply,
+            Some(lineage),
+            super::ApiVerificationOutcome {
+                state: VerificationState::Passed,
+                basis: "live readback matched".to_owned(),
+                evidence: Some(verification_evidence),
+                error: None,
+            },
+            true,
+            Some(&finalization_error),
+        );
+
+        assert!(!envelope.ok);
+        assert!(envelope.performed);
+        assert_eq!(envelope.verification.state, VerificationState::Passed);
+        assert!(
+            envelope
+                .verification
+                .basis
+                .as_deref()
+                .is_some_and(|basis| basis.contains("live readback matched")
+                    && basis.contains("final plan checkpoint"))
+        );
+        assert_eq!(envelope.evidence.len(), 3);
+        assert!(
+            envelope
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("injected closed-checkpoint failure"))
+        );
+    }
+
+    #[test]
+    fn successful_response_still_sinks_the_secret_when_apply_evidence_persistence_fails() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut authority = active_standing_authority(2);
+        let sink_path = root.path().join("created-token.txt");
+        let mut plan = standing_token_plan_at_boundary_attempt(
+            &authority,
+            json!({"adapter":{"value_out":sink_path}}),
+        );
+        reserve_standing_plan(&mut authority, &plan);
+        store
+            .create_authority(&authority)
+            .expect("persist active authority and run reservation");
+        store
+            .save_plan(&plan)
+            .expect("persist boundary attempt before the remote call");
+        let evidence_dir = store.paths().data_dir.join("evidence");
+        fs::remove_dir(&evidence_dir).expect("remove empty evidence directory");
+        fs::write(&evidence_dir, "not-a-directory").expect("block evidence persistence");
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({"id":"token-apply-evidence-failed","value":"one-time-secret"}),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+
+        let envelope = match super::process_api_boundary_response(
+            &store,
+            &mut plan,
+            &response,
+            &MemorySecretStore::default(),
+        )
+        .expect("a local evidence failure returns a recovery envelope")
+        {
+            super::ApiBoundaryResponseOutcome::Recovery(envelope) => envelope,
+            super::ApiBoundaryResponseOutcome::Ready { .. } => {
+                panic!("missing apply evidence cannot proceed to verification")
+            }
+        };
+
+        assert!(!envelope.ok);
+        assert!(envelope.performed);
+        assert_eq!(
+            envelope.operation_id.as_deref(),
+            Some(plan.operation_id.as_str())
+        );
+        assert_eq!(envelope.verification.state, VerificationState::Pending);
+        assert!(envelope.error.as_ref().is_some_and(|error| {
+            error.message.contains("apply evidence")
+                && error
+                    .next_step
+                    .as_deref()
+                    .is_some_and(|next| next.contains("Do not replay") && next.contains("rectify"))
+        }));
+        assert_eq!(
+            fs::read_to_string(&sink_path).expect("one-time secret was sunk"),
+            "one-time-secret"
+        );
+        assert_eq!(
+            store
+                .load_authority(&authority.authority_id)
+                .expect("authority lineage reloads")
+                .minted_token_ids,
+            vec!["token-apply-evidence-failed"]
+        );
+        let durable_plan = store
+            .load_plan(&plan.operation_id)
+            .expect("boundary receipt and sink checkpoint reload");
+        assert_eq!(durable_plan.status, PlanStatus::RectificationRequired);
+        assert!(
+            durable_plan
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .is_some(),
+            "the receipt remains durable even when the separate apply evidence write fails"
+        );
+    }
+
+    #[test]
+    fn successful_response_still_sinks_the_secret_when_boundary_receipt_persistence_fails() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let paths = RuntimePaths::from_root(root.path());
+        let store = StateStore::open(paths.clone()).expect("state store");
+        let mut authority = active_standing_authority(2);
+        let sink_path = root.path().join("created-token.txt");
+        let mut plan = standing_token_plan_at_boundary_attempt(
+            &authority,
+            json!({"adapter":{"value_out":sink_path}}),
+        );
+        reserve_standing_plan(&mut authority, &plan);
+        store
+            .create_authority(&authority)
+            .expect("persist active authority and run reservation");
+        store
+            .save_plan(&plan)
+            .expect("persist boundary attempt before the remote call");
+        let plan_path = paths
+            .data_dir
+            .join("plans")
+            .join(format!("{}.json", plan.operation_id));
+        fs::remove_file(&plan_path).expect("remove plan before injected persistence failure");
+        fs::create_dir(&plan_path).expect("replace plan with a non-regular fixture");
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({"id":"token-receipt-persistence-failed","value":"one-time-secret"}),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+
+        let envelope = match super::process_api_boundary_response(
+            &store,
+            &mut plan,
+            &response,
+            &MemorySecretStore::default(),
+        )
+        .expect("a receipt persistence failure returns a recovery envelope")
+        {
+            super::ApiBoundaryResponseOutcome::Recovery(envelope) => envelope,
+            super::ApiBoundaryResponseOutcome::Ready { .. } => {
+                panic!("an undurable boundary receipt cannot proceed to verification")
+            }
+        };
+
+        assert!(!envelope.ok);
+        assert!(envelope.performed);
+        assert_eq!(
+            envelope.operation_id.as_deref(),
+            Some(plan.operation_id.as_str())
+        );
+        assert_eq!(envelope.verification.state, VerificationState::Pending);
+        assert!(envelope.error.as_ref().is_some_and(|error| {
+            error.message.contains("boundary response")
+                && error
+                    .next_step
+                    .as_deref()
+                    .is_some_and(|next| next.contains("Do not replay") && next.contains("rectify"))
+        }));
+        assert_eq!(
+            fs::read_to_string(&sink_path).expect("one-time secret was sunk"),
+            "one-time-secret"
+        );
+        assert!(
+            store
+                .load_authority(&authority.authority_id)
+                .expect("authority reloads")
+                .minted_token_ids
+                .is_empty(),
+            "an undurable boundary receipt cannot authorize lineage reconciliation"
+        );
+    }
+
+    #[test]
+    fn transport_error_after_boundary_attempt_returns_unknown_no_replay_envelope() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let authority = active_standing_authority(2);
+        let mut plan = standing_token_plan_at_boundary_attempt(&authority, json!({}));
+        store
+            .save_plan(&plan)
+            .expect("persist boundary attempt before the remote call");
+        let transport_error = super::CliError::Input("injected response timeout".to_owned());
+
+        let envelope = super::process_api_transport_failure(
+            &store,
+            &mut plan,
+            &transport_error,
+            &MemorySecretStore::default(),
+        );
+
+        assert!(!envelope.ok);
+        assert!(!envelope.performed);
+        assert_eq!(
+            envelope.operation_id.as_deref(),
+            Some(plan.operation_id.as_str())
+        );
+        assert_eq!(envelope.verification.state, VerificationState::Pending);
+        assert!(envelope.error.as_ref().is_some_and(|error| {
+            error.message.contains("outcome is unknown")
+                && error.message.contains("injected response timeout")
+                && error
+                    .next_step
+                    .as_deref()
+                    .is_some_and(|next| next.contains("Do not replay") && next.contains("rectify"))
+        }));
+        let durable_plan = store
+            .load_plan(&plan.operation_id)
+            .expect("unknown outcome checkpoints reload");
+        assert_eq!(durable_plan.status, PlanStatus::RectificationRequired);
+        assert_eq!(
+            durable_plan.transaction_stage,
+            TransactionStageV1::SecretSinkPersisted
+        );
+        assert_eq!(
+            durable_plan
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .and_then(|artifact| artifact.get("receipt_available"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn standing_lineage_is_durable_before_a_failing_verification_checkpoint() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut authority = active_standing_authority(2);
+        let sink_path = root.path().join("created-token.txt");
+        let mut plan = standing_token_plan_with_receipt_and_targets(
+            &authority,
+            json!({"success":true,"resource_id":"token-verification-failed"}),
+            json!({"adapter":{"value_out":sink_path}}),
+        );
+        reserve_standing_plan(&mut authority, &plan);
+        store
+            .create_authority(&authority)
+            .expect("persist active authority and run reservation");
+        store
+            .save_plan(&plan)
+            .expect("persist successful boundary receipt");
+
+        let outcome = persist_secret_lifecycle_and_reconcile_lineage(
+            &store,
+            &mut plan,
+            true,
+            Some(&json!({"id":"token-verification-failed","value":"one-time-secret"})),
+            &MemorySecretStore::default(),
+            true,
+        );
+        assert!(
+            outcome.error.is_none(),
+            "sink and lineage reconciliation complete: {:?}",
+            outcome.error
+        );
+        assert!(outcome.lineage_evidence.is_some());
+        assert_eq!(
+            store
+                .load_authority(&authority.authority_id)
+                .expect("authority lineage reloads")
+                .minted_token_ids,
+            vec!["token-verification-failed"]
+        );
+
+        super::persist_transaction_stage(
+            &store,
+            &mut plan,
+            TransactionStageV1::VerificationAttemptPersisted,
+        )
+        .expect("verification attempt checkpoint persists");
+        let outcome = super::verification_outcome(
+            &store,
+            &mut plan,
+            OperationVerificationV1 {
+                strategy: "test_readback".to_owned(),
+                passed: false,
+                basis: "injected post-change mismatch".to_owned(),
+                readback: CloudflareResponseV1 {
+                    status: 200,
+                    success: true,
+                    result: json!({"id":"token-verification-failed","status":"unexpected"}),
+                    errors: Vec::new(),
+                    result_info: None,
+                    etag: None,
+                    cf_ray: None,
+                },
+            },
+        )
+        .expect("verification outcome records evidence");
+        let artifact =
+            super::verification_response_artifact(&outcome).expect("verification receipt builds");
+        super::persist_transaction_stage_with_artifact(
+            &store,
+            &mut plan,
+            TransactionStageV1::VerificationResponsePersisted,
+            artifact,
+        )
+        .expect("failing verification checkpoint persists");
+
+        let durable_authority = store
+            .load_authority(&authority.authority_id)
+            .expect("authority reloads after verification failure");
+        assert_eq!(durable_authority.status, StandingAuthorityStatus::Active);
+        assert_eq!(
+            durable_authority.minted_token_ids,
+            vec!["token-verification-failed"]
+        );
+        assert_eq!(plan.status, PlanStatus::RectificationRequired);
+    }
+
+    #[test]
+    fn later_standing_preflight_recovers_missing_lineage_after_reopen() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let paths = RuntimePaths::from_root(root.path());
+        let store = StateStore::open(paths.clone()).expect("state store");
+        let mut authority = active_standing_authority(2);
+        let authority_id = authority.authority_id.clone();
+        let plan = standing_token_plan_with_receipt(
+            &authority,
+            json!({"success":true,"resource_id":"token-crash-recovery"}),
+        );
+        reserve_standing_plan(&mut authority, &plan);
+        store
+            .create_authority(&authority)
+            .expect("persist active authority and run reservation");
+        store
+            .save_plan(&plan)
+            .expect("persist only the boundary receipt before simulated crash");
+        drop(store);
+
+        let reopened = StateStore::open(paths).expect("state store reopens");
+        preflight_standing_authority(&reopened, Some(&authority_id))
+            .expect("later standing preflight recovers lineage");
+        preflight_standing_authority(&reopened, Some(&authority_id))
+            .expect("repeated recovery is idempotent");
+
+        let durable = reopened
+            .load_authority(&authority_id)
+            .expect("reconciled authority reloads");
+        assert_eq!(durable.minted_token_ids, vec!["token-crash-recovery"]);
+    }
+
+    #[test]
+    fn standing_lineage_recovery_cannot_observe_an_in_flight_plan() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let paths = RuntimePaths::from_root(root.path());
+        let running_store = StateStore::open(paths.clone()).expect("running store");
+        let recovery_store = StateStore::open(paths).expect("recovery store");
+        let mut authority = active_standing_authority(2);
+        let authority_id = authority.authority_id.clone();
+        let plan = standing_token_plan_with_receipt(
+            &authority,
+            json!({"success":true,"resource_id":"token-in-flight"}),
+        );
+        reserve_standing_plan(&mut authority, &plan);
+        running_store
+            .create_authority(&authority)
+            .expect("persist active authority and run reservation");
+        let operation_id = plan.operation_id.clone();
+        running_store
+            .save_plan(&plan)
+            .expect("persist boundary response before the sink attempt");
+        let plan_guard = running_store
+            .lock_plan(&operation_id)
+            .expect("running invocation owns the plan");
+
+        let error = super::recover_standing_lineage(&recovery_store, &authority_id)
+            .expect_err("recovery cannot inspect an in-flight plan");
+
+        assert!(error.to_string().contains("locked"), "{error}");
+        assert!(
+            recovery_store
+                .load_authority(&authority_id)
+                .expect("authority reloads")
+                .minted_token_ids
+                .is_empty(),
+            "recovery must not publish lineage before the running invocation attempts its sink"
+        );
+        drop(plan_guard);
+        super::recover_standing_lineage(&recovery_store, &authority_id)
+            .expect("recovery proceeds after the running invocation releases its plan");
+        assert_eq!(
+            recovery_store
+                .load_authority(&authority_id)
+                .expect("reconciled authority reloads")
+                .minted_token_ids,
+            vec!["token-in-flight"]
+        );
+    }
+
+    #[tokio::test]
+    async fn plans_rectify_recovers_missing_lineage_idempotently() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut authority = active_standing_authority(2);
+        let plan = standing_token_plan_with_receipt(
+            &authority,
+            json!({"success":true,"resource_id":"token-rectify-recovery"}),
+        );
+        reserve_standing_plan(&mut authority, &plan);
+        store
+            .create_authority(&authority)
+            .expect("persist active authority and run reservation");
+        let operation_id = plan.operation_id.clone();
+        store
+            .save_plan(&plan)
+            .expect("persist successful boundary receipt");
+
+        let first = rectify_plan(
+            &store,
+            &PlanSelector {
+                operation_id: operation_id.clone(),
+            },
+        )
+        .await
+        .expect("rectify reconciles without replaying the source mutation");
+        assert!(
+            first
+                .evidence
+                .iter()
+                .any(|evidence| evidence.class == EvidenceClass::StandingApply),
+            "rectify must return the receipt for its authority-lineage mutation"
+        );
+        rectify_plan(
+            &store,
+            &PlanSelector {
+                operation_id: operation_id.clone(),
+            },
+        )
+        .await
+        .expect("repeated rectification is idempotent");
+
+        let durable = store
+            .load_authority(&authority.authority_id)
+            .expect("authority lineage reloads");
+        assert_eq!(durable.minted_token_ids, vec!["token-rectify-recovery"]);
+    }
+
+    #[tokio::test]
+    async fn plans_rectify_cannot_race_an_in_flight_plan() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let paths = RuntimePaths::from_root(root.path());
+        let running_store = StateStore::open(paths.clone()).expect("running store");
+        let rectify_store = StateStore::open(paths).expect("rectify store");
+        let mut authority = active_standing_authority(2);
+        let authority_id = authority.authority_id.clone();
+        let plan = standing_token_plan_with_receipt(
+            &authority,
+            json!({"success":true,"resource_id":"token-rectify-in-flight"}),
+        );
+        reserve_standing_plan(&mut authority, &plan);
+        running_store
+            .create_authority(&authority)
+            .expect("persist active authority and run reservation");
+        let operation_id = plan.operation_id.clone();
+        running_store
+            .save_plan(&plan)
+            .expect("persist boundary response before the sink attempt");
+        let plan_guard = running_store
+            .lock_plan(&operation_id)
+            .expect("running invocation owns the plan");
+
+        let error = rectify_plan(
+            &rectify_store,
+            &PlanSelector {
+                operation_id: operation_id.clone(),
+            },
+        )
+        .await
+        .expect_err("rectification cannot race an in-flight run");
+
+        assert!(error.to_string().contains("locked"), "{error}");
+        assert!(
+            rectify_store
+                .load_authority(&authority_id)
+                .expect("authority reloads")
+                .minted_token_ids
+                .is_empty(),
+            "rectification must not publish lineage while the source run owns the plan"
+        );
+        drop(plan_guard);
+        rectify_plan(&rectify_store, &PlanSelector { operation_id })
+            .await
+            .expect("rectification proceeds after the source plan lock is released");
+        assert_eq!(
+            rectify_store
+                .load_authority(&authority_id)
+                .expect("reconciled authority reloads")
+                .minted_token_ids,
+            vec!["token-rectify-in-flight"]
+        );
+    }
+
+    #[test]
+    fn concurrent_lineage_reconciliation_is_idempotent_and_preserves_revocation() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let paths = RuntimePaths::from_root(root.path());
+        let store = StateStore::open(paths.clone()).expect("state store");
+        let mut authority = active_standing_authority(2);
+        let authority_id = authority.authority_id.clone();
+        let plan = standing_token_plan_with_receipt(
+            &authority,
+            json!({"success":true,"resource_id":"token-concurrent-recovery"}),
+        );
+        reserve_standing_plan(&mut authority, &plan);
+        store
+            .create_authority(&authority)
+            .expect("persist active authority and run reservation");
+        store
+            .save_plan(&plan)
+            .expect("persist successful boundary receipt");
+        key_policy_revoke(
+            &store,
+            &KeyPolicySelector {
+                authority_id: authority_id.clone(),
+            },
+        )
+        .expect("revocation commits before late reconciliation");
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let paths = paths.clone();
+                let barrier = Arc::clone(&barrier);
+                let plan = plan.clone();
+                thread::spawn(move || {
+                    let store = StateStore::open(paths).expect("reconciliation store");
+                    barrier.wait();
+                    reconcile_standing_lineage_from_plan(&store, &plan)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("reconciliation thread joins")
+                .expect("receipt reconciliation succeeds");
+        }
+        let durable = store
+            .load_authority(&authority_id)
+            .expect("authority reloads");
+        assert_eq!(durable.status, StandingAuthorityStatus::Revoked);
+        assert_eq!(durable.minted_token_ids, vec!["token-concurrent-recovery"]);
     }
 
     #[test]
@@ -12654,7 +14888,7 @@ mod tests {
         );
         plan.record_transaction_stage_with_artifact(
             TransactionStageV1::BoundaryResponsePersisted,
-            boundary_response_artifact(&plan, &response, &apply_evidence),
+            boundary_response_artifact(&plan, &response, Some(&apply_evidence)),
         )
         .expect("response receipt");
         plan.status = PlanStatus::RectificationRequired;

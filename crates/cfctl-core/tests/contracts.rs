@@ -4,8 +4,10 @@ use cfctl_core::{
     AdapterStatus, CapabilityV1, CostV1, CreatedCollectionResourceContractV1,
     CreatedResourceContractV1, EffectClass, EvidenceClass, EvidenceV1, GuideStage, PlanStatus,
     PlanV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1,
-    TransactionStageV1, UpdatedResourceContractV1, guide_stages, redact_json,
+    StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, UpdatedResourceContractV1,
+    guide_stages, hash_value, redact_json,
 };
+use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 
 fn uncontracted_selector(name: &str, location: &str, value_type: &str) -> SelectorV1 {
@@ -1777,4 +1779,463 @@ fn redaction_recurses_through_objects_and_arrays() {
     assert_eq!(redacted["access_token"], "[REDACTED]");
     assert_eq!(redacted["nested"][0]["client_secret"], "[REDACTED]");
     assert_eq!(redacted["safe"], "visible");
+}
+
+fn standing_authority_fixture() -> StandingAuthorityV1 {
+    StandingAuthorityV1::draft(
+        "account-a",
+        vec![
+            "account-api-tokens-create-token".to_owned(),
+            "account-api-tokens-delete-token".to_owned(),
+        ],
+        vec!["group-a".to_owned(), "group-b".to_owned()],
+        "sha256:inventory-binding",
+        24,
+        "cf-rotation-",
+        4,
+        Utc::now() + Duration::days(30),
+    )
+    .expect("authority fixture must be valid")
+}
+
+fn standing_authority_with_permission_inventory(
+    permission_inventory: &Value,
+    max_runs_per_day: u32,
+) -> StandingAuthorityV1 {
+    StandingAuthorityV1::draft(
+        "account-a",
+        vec![
+            "account-api-tokens-create-token".to_owned(),
+            "account-api-tokens-delete-token".to_owned(),
+        ],
+        vec!["group-a".to_owned(), "group-b".to_owned()],
+        &hash_value(permission_inventory).expect("permission inventory hash"),
+        24,
+        "cf-rotation-",
+        max_runs_per_day,
+        Utc::now() + Duration::days(30),
+    )
+    .expect("authority fixture must be valid")
+}
+
+#[test]
+fn standing_authority_grants_require_explicit_yes_and_bind_the_content_hash() {
+    let mut authority = standing_authority_fixture();
+    assert_eq!(authority.status, StandingAuthorityStatus::PendingApproval);
+    assert!(
+        authority.approve(false).is_err(),
+        "chat/intent alone must never activate a standing grant"
+    );
+    assert!(
+        authority.ensure_operational().is_err(),
+        "a pending grant authorizes nothing"
+    );
+
+    authority.approve(true).expect("explicit grant activates");
+    assert_eq!(authority.status, StandingAuthorityStatus::Active);
+    authority
+        .ensure_operational()
+        .expect("active grant is operational");
+    assert_eq!(
+        authority
+            .approval
+            .as_ref()
+            .expect("approval recorded")
+            .approved_content_hash,
+        authority.content_hash
+    );
+
+    authority.max_runs_per_day = 10_000;
+    assert!(
+        authority.ensure_operational().is_err(),
+        "post-approval bound drift must fail closed"
+    );
+}
+
+#[test]
+fn standing_authority_run_accounting_never_drifts_the_approved_hash() {
+    let mut authority = standing_authority_fixture();
+    authority.approve(true).expect("grant");
+    authority
+        .reserve_run(Utc::now(), "op-1", "account-api-tokens-create-token")
+        .expect("run reservation");
+    authority.record_minted_token("token-child-1");
+    authority
+        .ensure_operational()
+        .expect("bookkeeping is outside the reviewed grant content");
+    assert_eq!(authority.runs_in_last_day(Utc::now()), 1);
+    assert_eq!(authority.minted_token_ids, vec!["token-child-1".to_owned()]);
+}
+
+#[test]
+fn standing_authority_permission_inventory_must_match_the_approved_hash() {
+    let approved_inventory = json!([
+        {
+            "id": "group-a",
+            "name": "Account API Tokens Write",
+            "scopes": ["com.cloudflare.api.account"],
+            "category": "Account API Tokens"
+        },
+        {
+            "id": "group-b",
+            "name": "Account Settings Read",
+            "scopes": ["com.cloudflare.api.account"]
+        }
+    ]);
+    let mut authority = standing_authority_with_permission_inventory(&approved_inventory, 4);
+    authority.approve(true).expect("grant");
+
+    authority
+        .validate_permission_inventory(&approved_inventory)
+        .expect("the exact normalized approved allowlist remains valid");
+
+    for drifted_inventory in [
+        json!([
+            {
+                "id": "group-a",
+                "name": "Renamed permission",
+                "scopes": ["com.cloudflare.api.account"],
+                "category": "Account API Tokens"
+            },
+            {
+                "id": "group-b",
+                "name": "Account Settings Read",
+                "scopes": ["com.cloudflare.api.account"]
+            }
+        ]),
+        json!([
+            {
+                "id": "group-a",
+                "name": "Account API Tokens Write",
+                "scopes": ["com.cloudflare.api.user"],
+                "category": "Account API Tokens"
+            },
+            {
+                "id": "group-b",
+                "name": "Account Settings Read",
+                "scopes": ["com.cloudflare.api.account"]
+            }
+        ]),
+        json!([
+            {
+                "id": "group-a",
+                "name": "Account API Tokens Write",
+                "scopes": ["com.cloudflare.api.account"],
+                "category": "Different category"
+            },
+            {
+                "id": "group-b",
+                "name": "Account Settings Read",
+                "scopes": ["com.cloudflare.api.account"]
+            }
+        ]),
+        json!([
+            {
+                "id": "group-a",
+                "name": "Account API Tokens Write",
+                "scopes": ["com.cloudflare.api.account"],
+                "category": "Account API Tokens"
+            }
+        ]),
+    ] {
+        let error = authority
+            .validate_permission_inventory(&drifted_inventory)
+            .expect_err("metadata drift must invalidate the standing mint");
+        assert!(
+            error
+                .to_string()
+                .contains("complete permission allowlist metadata drifted"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn standing_run_reservation_rechecks_state_budget_and_operation_identity() {
+    let now = Utc::now();
+    let mut authority = standing_authority_with_permission_inventory(&json!([]), 1);
+    authority.approve(true).expect("grant");
+
+    authority
+        .reserve_run(now, "op-1", "account-api-tokens-create-token")
+        .expect("first run reserves the only budget slot");
+    assert_eq!(authority.run_log.len(), 1);
+    assert_eq!(authority.run_log[0].at, now);
+
+    let duplicate = authority
+        .reserve_run(
+            now + Duration::minutes(1),
+            "op-1",
+            "account-api-tokens-create-token",
+        )
+        .expect_err("an operation id can only be reserved once");
+    assert!(
+        duplicate.to_string().contains("already reserved"),
+        "{duplicate}"
+    );
+    assert_eq!(authority.run_log.len(), 1);
+
+    let exhausted = authority
+        .reserve_run(
+            now + Duration::minutes(1),
+            "op-2",
+            "account-api-tokens-create-token",
+        )
+        .expect_err("the run budget is checked before append");
+    assert!(
+        exhausted.to_string().contains("run budget exhausted"),
+        "{exhausted}"
+    );
+    assert_eq!(authority.run_log.len(), 1);
+
+    authority.revoke();
+    let revoked = authority
+        .reserve_run(
+            now + Duration::hours(25),
+            "op-3",
+            "account-api-tokens-create-token",
+        )
+        .expect_err("revocation is rechecked before append");
+    assert!(revoked.to_string().contains("is revoked"), "{revoked}");
+    assert_eq!(authority.run_log.len(), 1);
+}
+
+#[test]
+fn standing_run_reservation_uses_the_supplied_time_for_expiry() {
+    let mut authority = standing_authority_fixture();
+    authority.approve(true).expect("grant");
+    let after_expiry = authority.expires_at + Duration::seconds(1);
+
+    let expired = authority
+        .reserve_run(
+            after_expiry,
+            "op-after-expiry",
+            "account-api-tokens-create-token",
+        )
+        .expect_err("an expired authority cannot reserve a run");
+    assert!(expired.to_string().contains("expired at"), "{expired}");
+    assert!(authority.run_log.is_empty());
+}
+
+#[test]
+fn standing_lineage_reconciliation_is_idempotent_and_preserves_revocation() {
+    let mut authority = standing_authority_fixture();
+    authority.approve(true).expect("grant");
+    authority.revoke();
+
+    authority.record_minted_token("token-child");
+    authority.record_minted_token("token-child");
+
+    assert_eq!(authority.status, StandingAuthorityStatus::Revoked);
+    assert_eq!(authority.minted_token_ids, vec!["token-child".to_owned()]);
+}
+
+#[test]
+fn standing_authority_reports_expiry_without_changing_schema_v1_status() {
+    let mut authority = standing_authority_fixture();
+    authority.approve(true).expect("grant");
+
+    assert_eq!(
+        authority.effective_status(authority.expires_at - Duration::seconds(1)),
+        "active"
+    );
+    assert_eq!(
+        authority.effective_status(authority.expires_at + Duration::seconds(1)),
+        "expired"
+    );
+    assert_eq!(authority.status, StandingAuthorityStatus::Active);
+    assert_eq!(
+        serde_json::to_value(&authority).expect("authority JSON")["status"],
+        json!("active")
+    );
+
+    authority.revoke();
+    assert_eq!(
+        authority.effective_status(authority.expires_at + Duration::seconds(1)),
+        "revoked",
+        "revocation remains the monotonic durable status"
+    );
+}
+
+#[test]
+fn standing_mints_fail_closed_on_prefix_groups_expiry_ttl_and_rate() {
+    let mut authority = standing_authority_fixture();
+    authority.approve(true).expect("grant");
+    let now = Utc::now();
+    let in_bounds_expiry = Some(now + Duration::hours(12));
+    let group = vec!["group-a".to_owned()];
+
+    authority
+        .authorize_token_create(now, "cf-rotation-web-deploy", &group, in_bounds_expiry)
+        .expect("in-bounds mint authorized");
+
+    assert!(
+        authority
+            .authorize_token_create(now, "unprefixed-name", &group, in_bounds_expiry)
+            .is_err(),
+        "name prefix is mandatory"
+    );
+    assert!(
+        authority
+            .authorize_token_create(
+                now,
+                "cf-rotation-x",
+                &["group-outside".to_owned()],
+                in_bounds_expiry
+            )
+            .is_err(),
+        "permission groups outside the allowlist are refused"
+    );
+    assert!(
+        authority
+            .authorize_token_create(now, "cf-rotation-x", &[], in_bounds_expiry)
+            .is_err(),
+        "a child with no permission groups is refused"
+    );
+    assert!(
+        authority
+            .authorize_token_create(now, "cf-rotation-x", &group, None)
+            .is_err(),
+        "children must declare an expiry"
+    );
+    assert!(
+        authority
+            .authorize_token_create(
+                now,
+                "cf-rotation-x",
+                &group,
+                Some(now + Duration::hours(48))
+            )
+            .is_err(),
+        "children must stay within the maximum child TTL"
+    );
+
+    for run in 0..4 {
+        authority
+            .reserve_run(now, &format!("op-{run}"), "account-api-tokens-create-token")
+            .expect("run reservation within budget");
+    }
+    assert!(
+        authority
+            .authorize_token_create(now, "cf-rotation-x", &group, in_bounds_expiry)
+            .is_err(),
+        "the daily run budget limits attempts"
+    );
+}
+
+#[test]
+fn standing_revocation_is_immediate_and_deletion_is_lineage_bound() {
+    let mut authority = standing_authority_fixture();
+    authority.approve(true).expect("grant");
+    let now = Utc::now();
+
+    assert!(
+        authority
+            .authorize_token_delete(now, "token-foreign")
+            .is_err(),
+        "an authority may only revoke tokens it minted"
+    );
+    authority.record_minted_token("token-child");
+    authority
+        .authorize_token_delete(now, "token-child")
+        .expect("own child may be revoked");
+
+    authority.revoke();
+    assert!(
+        authority
+            .authorize_token_delete(now, "token-child")
+            .is_err(),
+        "revocation takes effect immediately"
+    );
+    assert!(
+        authority.approve(true).is_err(),
+        "a revoked grant cannot be re-approved"
+    );
+}
+
+#[test]
+fn standing_consumption_accepts_only_in_scope_unapproved_drafts_and_records_the_binding() {
+    let mut authority = standing_authority_fixture();
+    authority.approve(true).expect("grant");
+    let capability = CapabilityV1::new(
+        "account-api-tokens-create-token",
+        "Create token",
+        "POST",
+        "/accounts/{account_id}/tokens",
+    );
+    let plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "schema-sha",
+        capability.clone(),
+        json!({"account_id": "account-a"}),
+    )
+    .expect("plan fixture");
+
+    let pending = standing_authority_fixture();
+    assert!(
+        plan.clone()
+            .mark_consumed_via_standing_authority(&pending)
+            .is_err(),
+        "a pending grant consumes nothing"
+    );
+
+    let mut foreign_account = plan.clone();
+    foreign_account.account_id = "account-b".to_owned();
+    foreign_account.refresh_hash().expect("rehash");
+    assert!(
+        foreign_account
+            .mark_consumed_via_standing_authority(&authority)
+            .is_err(),
+        "the account pin is enforced at consumption"
+    );
+
+    let out_of_scope = CapabilityV1::new("zones-get", "Read zone", "GET", "/zones/{zone_id}");
+    let unlisted = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "schema-sha",
+        out_of_scope,
+        json!({}),
+    )
+    .expect("plan fixture");
+    assert!(
+        unlisted
+            .clone()
+            .mark_consumed_via_standing_authority(&authority)
+            .is_err(),
+        "capabilities outside the allowlist are refused"
+    );
+
+    let mut approved = plan.clone();
+    approved.approve(true, None).expect("ordinary approval");
+    assert!(
+        approved
+            .mark_consumed_via_standing_authority(&authority)
+            .is_err(),
+        "approved plans must use the ordinary consumption lane"
+    );
+
+    let mut consumed = plan;
+    consumed
+        .mark_consumed_via_standing_authority(&authority)
+        .expect("in-scope unapproved draft consumes under the grant");
+    assert_eq!(consumed.status, PlanStatus::Consumed);
+    let binding = consumed
+        .transaction_artifact(TransactionStageV1::ConsumptionPersisted)
+        .expect("consumption records the authority binding");
+    assert_eq!(
+        binding["standing_authority_id"],
+        json!(authority.authority_id)
+    );
+    assert_eq!(
+        binding["standing_authority_content_hash"],
+        json!(authority.content_hash)
+    );
+    assert!(
+        consumed
+            .mark_consumed_via_standing_authority(&authority)
+            .is_err(),
+        "standing consumption is not replayable"
+    );
 }

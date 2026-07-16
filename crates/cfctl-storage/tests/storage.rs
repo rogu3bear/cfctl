@@ -1,8 +1,42 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use cfctl_core::{CapabilityV1, EvidenceClass, PlanStatus, PlanV1, TransactionStageV1};
+use cfctl_core::{
+    CapabilityV1, EvidenceClass, PlanStatus, PlanV1, StandingAuthorityStatus, StandingAuthorityV1,
+    TransactionStageV1,
+};
 use cfctl_storage::{RuntimePaths, StateStore, StorageError};
+use chrono::{Duration, Utc};
 use serde_json::json;
+
+fn draft_plan() -> PlanV1 {
+    PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "sha256:catalog",
+        CapabilityV1::new(
+            "account-api-tokens-create-token",
+            "Create account token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        ),
+        json!({"account_id":"account-a"}),
+    )
+    .expect("draft plan")
+}
+
+fn draft_authority() -> StandingAuthorityV1 {
+    StandingAuthorityV1::draft(
+        "account-a",
+        vec!["account-api-tokens-create-token".to_owned()],
+        vec!["permission-a".to_owned()],
+        "sha256:permission-inventory",
+        24,
+        "agent-",
+        1,
+        Utc::now() + Duration::hours(24),
+    )
+    .expect("draft authority")
+}
 
 #[test]
 fn evidence_is_redacted_content_addressed_and_deduplicated() {
@@ -169,28 +203,443 @@ fn imports_are_bounded_to_the_managed_data_directory() {
 fn plan_locks_are_exclusive_and_expired_crash_locks_are_reclaimed() {
     let root = tempfile::tempdir().expect("temporary storage root");
     let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
-    let first = store.lock_plan("operation-a").expect("first lock");
+    let operation_a = "00000000-0000-4000-8000-000000000001";
+    let operation_b = "00000000-0000-4000-8000-000000000002";
+    let first = store.lock_plan(operation_a).expect("first lock");
     assert!(matches!(
-        store.lock_plan("operation-a"),
+        store.lock_plan(operation_a),
         Err(StorageError::PlanLocked(_))
     ));
     drop(first);
-    drop(store.lock_plan("operation-a").expect("released lock"));
+    drop(store.lock_plan(operation_a).expect("released lock"));
 
-    let crashed = store.lock_plan("operation-b").expect("crash fixture lock");
+    let crashed = store.lock_plan(operation_b).expect("crash fixture lock");
     std::mem::forget(crashed);
-    let lock_path = root.path().join("data/locks/operation-b.lock");
+    let lock_path = root
+        .path()
+        .join("data/locks")
+        .join(format!("{operation_b}.lock"));
     std::fs::write(
         &lock_path,
         br#"{"pid":999999,"created_at_unix":0,"nonce":"crashed"}"#,
     )
     .expect("age crash lock");
-    drop(
-        store
-            .lock_plan("operation-b")
-            .expect("stale lock reclaimed"),
-    );
+    drop(store.lock_plan(operation_b).expect("stale lock reclaimed"));
     assert!(!lock_path.exists());
+}
+
+#[test]
+fn managed_ids_cannot_escape_or_alias_their_storage_directories() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+
+    let escaped_lock = root.path().join("data/escaped-plan.lock");
+    assert!(matches!(
+        store.lock_plan("../escaped-plan"),
+        Err(StorageError::InvalidPlanId(_))
+    ));
+    assert!(!escaped_lock.exists());
+
+    let mut traversal = draft_authority();
+    traversal.authority_id = "../../escaped-authority".to_owned();
+    assert!(matches!(
+        store.save_authority(&traversal),
+        Err(StorageError::InvalidAuthorityId(_))
+    ));
+    assert!(!root.path().join("escaped-authority.json").exists());
+
+    let mut absolute = draft_authority();
+    let escaped_absolute = root.path().join("absolute-authority.json");
+    absolute.authority_id = root.path().join("absolute-authority").display().to_string();
+    assert!(matches!(
+        store.save_authority(&absolute),
+        Err(StorageError::InvalidAuthorityId(_))
+    ));
+    assert!(!escaped_absolute.exists());
+
+    let plan = draft_plan();
+    assert!(matches!(
+        store.load_plan(&plan.operation_id.to_uppercase()),
+        Err(StorageError::InvalidPlanId(_))
+    ));
+    assert!(matches!(
+        store.load_plan(&plan.operation_id.replace('-', "")),
+        Err(StorageError::InvalidPlanId(_))
+    ));
+
+    let authority = draft_authority();
+    assert!(matches!(
+        store.load_authority(&authority.authority_id.to_uppercase()),
+        Err(StorageError::InvalidAuthorityId(_))
+    ));
+    assert!(matches!(
+        store.load_authority(&authority.authority_id.replace('-', "")),
+        Err(StorageError::InvalidAuthorityId(_))
+    ));
+}
+
+#[test]
+fn authority_creation_is_create_only_and_cannot_clobber_existing_state() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let authority = draft_authority();
+    store
+        .save_authority(&authority)
+        .expect("first authority creation succeeds");
+
+    let mut replacement = authority.clone();
+    replacement.revoke();
+    assert!(matches!(
+        store.save_authority(&replacement),
+        Err(StorageError::AuthorityAlreadyExists(_))
+    ));
+
+    let reloaded = store
+        .load_authority(&authority.authority_id)
+        .expect("original authority remains readable");
+    assert_eq!(reloaded.status, StandingAuthorityStatus::PendingApproval);
+}
+
+#[test]
+fn managed_document_identity_must_match_its_filename() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("storage opens");
+
+    let plan = draft_plan();
+    store.save_plan(&plan).expect("plan stores");
+    let forged_plan_id = "00000000-0000-4000-8000-000000000047";
+    std::fs::copy(
+        paths
+            .data_dir
+            .join("plans")
+            .join(format!("{}.json", plan.operation_id)),
+        paths
+            .data_dir
+            .join("plans")
+            .join(format!("{forged_plan_id}.json")),
+    )
+    .expect("forged plan document writes");
+    assert!(matches!(
+        store.load_plan(forged_plan_id),
+        Err(StorageError::ManagedDocumentIdentityMismatch { .. })
+    ));
+    assert!(matches!(
+        store.list_plans(),
+        Err(StorageError::ManagedDocumentIdentityMismatch { .. })
+    ));
+
+    let authority = draft_authority();
+    store.save_authority(&authority).expect("authority stores");
+    let forged_authority_id = "00000000-0000-4000-8000-000000000048";
+    std::fs::copy(
+        paths
+            .data_dir
+            .join("authorities")
+            .join(format!("{}.json", authority.authority_id)),
+        paths
+            .data_dir
+            .join("authorities")
+            .join(format!("{forged_authority_id}.json")),
+    )
+    .expect("forged authority document writes");
+    assert!(matches!(
+        store.load_authority(forged_authority_id),
+        Err(StorageError::ManagedDocumentIdentityMismatch { .. })
+    ));
+    assert!(matches!(
+        store.list_authorities(),
+        Err(StorageError::ManagedDocumentIdentityMismatch { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_documents_reject_symlinks_instead_of_following_them() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("storage opens");
+
+    let plan = draft_plan();
+    store.save_plan(&plan).expect("plan stores");
+    let plan_path = paths
+        .data_dir
+        .join("plans")
+        .join(format!("{}.json", plan.operation_id));
+    let external_plan = root.path().join("external-plan.json");
+    std::fs::rename(&plan_path, &external_plan).expect("move plan outside managed directory");
+    symlink(&external_plan, &plan_path).expect("forge plan symlink");
+    assert!(matches!(
+        store.load_plan(&plan.operation_id),
+        Err(StorageError::UnsafeManagedDocument { .. })
+    ));
+    assert!(matches!(
+        store.save_plan(&plan),
+        Err(StorageError::UnsafeManagedDocument { .. })
+    ));
+    assert!(matches!(
+        store.list_plans(),
+        Err(StorageError::UnsafeManagedDocument { .. })
+    ));
+
+    let authority = draft_authority();
+    store.save_authority(&authority).expect("authority stores");
+    let authority_path = paths
+        .data_dir
+        .join("authorities")
+        .join(format!("{}.json", authority.authority_id));
+    let external_authority = root.path().join("external-authority.json");
+    std::fs::rename(&authority_path, &external_authority)
+        .expect("move authority outside managed directory");
+    symlink(&external_authority, &authority_path).expect("forge authority symlink");
+    assert!(matches!(
+        store.load_authority(&authority.authority_id),
+        Err(StorageError::UnsafeManagedDocument { .. })
+    ));
+    assert!(matches!(
+        store.save_authority(&authority),
+        Err(StorageError::UnsafeManagedDocument { .. })
+    ));
+    assert!(matches!(
+        store.list_authorities(),
+        Err(StorageError::UnsafeManagedDocument { .. })
+    ));
+}
+
+#[test]
+fn managed_document_listing_rejects_malformed_names_and_non_regular_files() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("storage opens");
+    let plan = draft_plan();
+    store.save_plan(&plan).expect("plan stores");
+    std::fs::copy(
+        paths
+            .data_dir
+            .join("plans")
+            .join(format!("{}.json", plan.operation_id)),
+        paths.data_dir.join("plans/not-a-uuid.json"),
+    )
+    .expect("malformed plan filename fixture writes");
+    assert!(matches!(
+        store.list_plans(),
+        Err(StorageError::InvalidPlanId(_))
+    ));
+
+    std::fs::remove_file(paths.data_dir.join("plans/not-a-uuid.json"))
+        .expect("remove malformed fixture");
+    let non_regular_id = "00000000-0000-4000-8000-000000000049";
+    std::fs::create_dir(paths.data_dir.join(format!("plans/{non_regular_id}.json")))
+        .expect("non-regular plan fixture writes");
+    assert!(matches!(
+        store.load_plan(non_regular_id),
+        Err(StorageError::UnsafeManagedDocument { .. })
+    ));
+    assert!(matches!(
+        store.list_plans(),
+        Err(StorageError::UnsafeManagedDocument { .. })
+    ));
+
+    let authority = draft_authority();
+    store
+        .create_authority(&authority)
+        .expect("authority stores");
+    std::fs::copy(
+        paths
+            .data_dir
+            .join("authorities")
+            .join(format!("{}.json", authority.authority_id)),
+        paths.data_dir.join("authorities/NOT-A-UUID.json"),
+    )
+    .expect("malformed authority filename fixture writes");
+    assert!(matches!(
+        store.list_authorities(),
+        Err(StorageError::InvalidAuthorityId(_))
+    ));
+}
+
+#[test]
+fn authority_lock_guards_are_bound_to_the_store_root_and_authority_id() {
+    let first_root = tempfile::tempdir().expect("first temporary storage root");
+    let first_store =
+        StateStore::open(RuntimePaths::from_root(first_root.path())).expect("first storage opens");
+    let first = draft_authority();
+    let second = draft_authority();
+    first_store
+        .create_authority(&first)
+        .expect("first authority stores");
+    first_store
+        .create_authority(&second)
+        .expect("second authority stores");
+
+    let first_guard = first_store
+        .lock_authority(&first.authority_id)
+        .expect("first authority locks");
+    let mut second_update = second.clone();
+    second_update.revoke();
+    assert!(matches!(
+        first_store.save_authority_guarded(&second_update, &first_guard),
+        Err(StorageError::AuthorityLockMismatch(_))
+    ));
+    drop(first_guard);
+
+    let other_root = tempfile::tempdir().expect("other temporary storage root");
+    let other_store =
+        StateStore::open(RuntimePaths::from_root(other_root.path())).expect("other storage opens");
+    other_store
+        .create_authority(&first)
+        .expect("same identifier stores under other root");
+    let other_guard = other_store
+        .lock_authority(&first.authority_id)
+        .expect("other-root authority locks");
+    assert!(matches!(
+        first_store.save_authority_guarded(&first, &other_guard),
+        Err(StorageError::AuthorityLockMismatch(_))
+    ));
+}
+
+#[test]
+fn authority_locks_are_os_backed_and_exclusive_across_stores() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let first_store = StateStore::open(paths.clone()).expect("first storage opens");
+    let second_store = StateStore::open(paths).expect("second storage opens");
+    let authority = draft_authority();
+    first_store
+        .create_authority(&authority)
+        .expect("authority stores");
+    let first_guard = first_store
+        .lock_authority(&authority.authority_id)
+        .expect("first store acquires lock");
+
+    let authority_id = authority.authority_id.clone();
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let contender = std::thread::spawn(move || {
+        let guard = second_store
+            .lock_authority(&authority_id)
+            .expect("second store eventually acquires lock");
+        acquired_tx.send(()).expect("report lock acquisition");
+        guard
+    });
+    assert!(matches!(
+        acquired_rx.recv_timeout(std::time::Duration::from_millis(150)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    drop(first_guard);
+    acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("second store acquires released lock");
+    drop(contender.join().expect("lock contender joins"));
+}
+
+#[test]
+fn guarded_authority_saves_preserve_durable_revocation_and_lineage() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let authority = draft_authority();
+    store
+        .create_authority(&authority)
+        .expect("authority stores");
+
+    let approval_guard = store
+        .lock_authority(&authority.authority_id)
+        .expect("authority locks for approval");
+    let mut active = store
+        .load_authority(&authority.authority_id)
+        .expect("authority reloads under lock");
+    active.approve(true).expect("authority approves");
+    store
+        .save_authority_guarded(&active, &approval_guard)
+        .expect("approval saves under guard");
+    drop(approval_guard);
+
+    let revocation_guard = store
+        .lock_authority(&authority.authority_id)
+        .expect("authority locks for revocation");
+    let mut revoked = store
+        .load_authority(&authority.authority_id)
+        .expect("active authority reloads under lock");
+    revoked.revoke();
+    store
+        .save_authority_guarded(&revoked, &revocation_guard)
+        .expect("revocation saves under guard");
+    drop(revocation_guard);
+
+    let lineage_guard = store
+        .lock_authority(&authority.authority_id)
+        .expect("authority locks for lineage");
+    let mut stale_active = active;
+    stale_active.record_minted_token("token-stale");
+    assert!(matches!(
+        store.save_authority_guarded(&stale_active, &lineage_guard),
+        Err(StorageError::AuthorityRevocationRollback(_))
+    ));
+    let mut lineage = store
+        .load_authority(&authority.authority_id)
+        .expect("revoked authority reloads under lock");
+    lineage.record_minted_token("token-reconciled");
+    store
+        .save_authority_guarded(&lineage, &lineage_guard)
+        .expect("lineage saves without reversing revocation");
+    drop(lineage_guard);
+
+    let reloaded = store
+        .load_authority(&authority.authority_id)
+        .expect("authority reloads");
+    assert_eq!(reloaded.status, StandingAuthorityStatus::Revoked);
+    assert_eq!(reloaded.minted_token_ids, vec!["token-reconciled"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_documents_and_lock_files_use_private_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("storage opens");
+    let plan = draft_plan();
+    let authority = draft_authority();
+    store.save_plan(&plan).expect("plan stores");
+    store
+        .create_authority(&authority)
+        .expect("authority stores");
+    let plan_guard = store.lock_plan(&plan.operation_id).expect("plan locks");
+    let authority_guard = store
+        .lock_authority(&authority.authority_id)
+        .expect("authority locks");
+
+    for path in [
+        paths
+            .data_dir
+            .join("plans")
+            .join(format!("{}.json", plan.operation_id)),
+        paths
+            .data_dir
+            .join("authorities")
+            .join(format!("{}.json", authority.authority_id)),
+        paths
+            .data_dir
+            .join("locks")
+            .join(format!("{}.lock", plan.operation_id)),
+        paths
+            .data_dir
+            .join("locks/authorities")
+            .join(format!("{}.lock", authority.authority_id)),
+    ] {
+        let mode = std::fs::metadata(&path)
+            .expect("managed file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "{} must be private", path.display());
+    }
+
+    drop(authority_guard);
+    drop(plan_guard);
 }
 
 #[test]

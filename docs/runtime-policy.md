@@ -68,6 +68,62 @@ older process from deleting a newer lock.
 - paid actions
 - unknown write semantics or risk
 
+## Standing authority — the one bounded exception
+
+Recurring token-lifecycle operations may consume an unapproved plan under a
+`StandingAuthorityV1`: a hash-bound grant that is itself created from a fresh
+live permission inventory and activated only by an explicit
+`cfctl keys policy approve <authority-id> --yes`. Approval moves from
+per-operation to per-policy; it never disappears.
+
+The grant is defensible because its bounds are strict and enforced against
+the exact execution input at run time: children must carry the pinned name
+prefix, request only allowlisted permission groups, and expire within the
+maximum child TTL; revocations are lineage-bound to tokens the authority
+itself minted; runs are rate-limited per rolling 24h window; the authority
+expires on its own TTL. `cfctl keys policy revoke <authority-id>` closes
+admission immediately and unconditionally; it does not cancel work that was
+already durably admitted.
+
+Standing mint admission applies two independent validations to one fresh,
+owner-specific permission-inventory response. The child plan's normalized
+selected subset must still match its plan hash, and normalized metadata for
+the authority's complete approved allowlist must still match the authority's
+permission-inventory hash. Inventory reordering and additions unrelated to the
+approved allowlist remain valid. A missing or duplicated allowlisted group, or
+allowlisted name, scope, or category drift, blocks the mint. Standing deletes
+remain available without mint-inventory validation because they create no new
+token; their authority, lineage, TTL, and rate bounds still apply.
+
+Standing admission uses the fixed lock order `plan -> authority`. Under the
+authority lock, cfctl reloads the grant, rechecks its status and budget,
+durably reserves the run, and saves the authority before consuming the plan.
+That durable run reservation is the revocation linearization point: a revoke
+committed before reservation blocks admission, while a run whose reservation
+already committed may finish. Plan consumption and the boundary-attempt
+checkpoint become durable before the authority lock is released for network
+activity. Later lineage updates reload the authority and preserve `Revoked`;
+recording lineage never reactivates a grant.
+
+For a standing mint, each validated `BoundaryResponsePersisted` journal
+receipt bound to the same authority is token-lineage truth. After the secret
+sink attempt, including when the sink fails, cfctl reconciles any successfully
+created token ID into `minted_token_ids` under the authority lock before
+verification. The field remains an idempotent reconciled index: later standing
+runs and `plans rectify` recover a missing entry from the receipt, repeated or
+concurrent recovery does not duplicate it, and recovery preserves revocation.
+Recovery never replays the Cloudflare mutation. Malformed, unsuccessful, or
+authority-mismatched receipts cannot add lineage.
+
+Every standing consumption records the authority id and content hash in the
+plan's transaction journal and leaves `standing_apply` evidence, so each
+unattended run is attributable to the exact approved grant. Post-approval
+drift of any bound fails closed.
+
+External sends, spend, and everything else in the list above remain
+per-operation approval forever; standing authority covers only the
+token-lifecycle capabilities named in the approved grant.
+
 ## Secrets
 
 Credential material lives only in Keychain on macOS or Secret Service on
