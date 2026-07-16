@@ -15,7 +15,7 @@ use cfctl_agent::{
 };
 use cfctl_auth::{
     AuthCredential, OAuthClientConfig, PkceSession, PlatformSecretStore, ProfileKind,
-    ProfileMetadata, SecretStore, exchange_authorization_code, refresh_oauth_tokens,
+    ProfileMetadata, SecretBackend, SecretStore, exchange_authorization_code, refresh_oauth_tokens,
     revoke_oauth_token,
 };
 use cfctl_catalog::{
@@ -162,8 +162,48 @@ pub fn render(envelope: &ResultEnvelopeV2, json_output: bool) -> Result<String> 
     ))
 }
 
+fn platform_secrets(store: &StateStore) -> PlatformSecretStore {
+    PlatformSecretStore::new(store.paths().data_dir.join("auth").join("secrets"))
+}
+
+fn describe_secret_backend(backend: Option<SecretBackend>) -> (&'static str, &'static str) {
+    match backend {
+        Some(SecretBackend::PlatformKeyring) => {
+            ("platform_keyring", "in the platform credential store")
+        }
+        Some(SecretBackend::FallbackFile) => (
+            "fallback_file",
+            "in cfctl's mode-0600 file secret store because the platform keyring is unavailable (see `cfctl doctor`)",
+        ),
+        Some(SecretBackend::Memory) => ("memory", "in the in-process secret store"),
+        None => ("unknown", "in an undetermined backend"),
+    }
+}
+
+fn platform_secret_store_health(store: &StateStore) -> Result<Value> {
+    let secrets = platform_secrets(store);
+    let preferred = if cfg!(target_os = "macos") {
+        "keychain"
+    } else if cfg!(target_os = "linux") {
+        "secret_service"
+    } else {
+        "unsupported"
+    };
+    let (keyring, active_backend) = match secrets.keyring_probe() {
+        Ok(()) => ("ok".to_owned(), "platform_keyring"),
+        Err(error) => (format!("unavailable: {error}"), "fallback_file"),
+    };
+    Ok(json!({
+        "preferred": preferred,
+        "keyring": keyring,
+        "active_backend": active_backend,
+        "fallback_dir": secrets.fallback_root(),
+        "fallback_secret_count": secrets.fallback_secret_count()?,
+    }))
+}
+
 async fn auth_command(store: &StateStore, command: AuthCommand) -> Result<ResultEnvelopeV2> {
-    let secrets = PlatformSecretStore;
+    let secrets = platform_secrets(store);
     let mut profiles = ProfilesConfig::load(store)?;
     match command {
         AuthCommand::Login(arguments) if !arguments.complete => {
@@ -423,6 +463,8 @@ fn store_imported_api_token(
         ));
     }
     secrets.store_api_token(profile_id, token)?;
+    let (secret_backend, storage_note) =
+        describe_secret_backend(secrets.locate_api_token(profile_id)?);
     let profile = ProfileMetadata::new(profile_id, ProfileKind::ApiToken, Some(account));
     profiles.profiles.insert(profile_id.to_owned(), profile);
     profiles.current_profile = Some(profile_id.to_owned());
@@ -435,7 +477,8 @@ fn store_imported_api_token(
             "account_id": account,
             "selected": true,
             "emergency_only": false,
-            "message": "API token stored in the platform credential store and selected as the active profile. The token value was not written to stdout, plans, or repository files."
+            "secret_backend": secret_backend,
+            "message": format!("API token stored {storage_note} and selected as the active profile. The token value was not written to stdout, plans, or repository files.")
         }),
     ))
 }
@@ -455,6 +498,8 @@ fn import_global_key(
         ));
     }
     secrets.store_global_key(&arguments.profile, &arguments.email, &key)?;
+    let (secret_backend, storage_note) =
+        describe_secret_backend(secrets.locate_global_key(&arguments.profile)?);
     let profile = ProfileMetadata::new(&arguments.profile, ProfileKind::GlobalKey, None);
     profiles.profiles.insert(arguments.profile.clone(), profile);
     profiles.save(store)?;
@@ -464,7 +509,8 @@ fn import_global_key(
             "profile": arguments.profile,
             "emergency_only": true,
             "selected": false,
-            "message": "Emergency global key stored. It was not selected."
+            "secret_backend": secret_backend,
+            "message": format!("Emergency global key stored {storage_note}. It was not selected.")
         }),
     ))
 }
@@ -645,7 +691,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         )
         .await;
     }
-    let secrets = PlatformSecretStore;
+    let secrets = platform_secrets(store);
     let mut secret_ref = None;
     let mut adapter_targets = Map::new();
     if let Some(secret_body) = &prepared.secret_body {
@@ -901,7 +947,7 @@ async fn execute_read(
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
-    let credential = fresh_credential(profile, &PlatformSecretStore).await?;
+    let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
     let response = executor
         .execute_read(capability, input, &credential)
@@ -933,7 +979,7 @@ async fn execute_delegated_read(
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
-    let credential = fresh_credential(profile, &PlatformSecretStore).await?;
+    let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let receipt = run_delegated_cli(capability, input, &credential).await?;
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
     let success = receipt
@@ -2883,7 +2929,7 @@ async fn create_plan(
     })?;
     let resolve_entitlement = should_resolve_zone_entitlement(&capability);
     let credential = if plan_requires_live_credential(&capability) {
-        Some(fresh_credential(profile, &PlatformSecretStore).await?)
+        Some(fresh_credential(profile, &platform_secrets(store)).await?)
     } else {
         None
     };
@@ -3866,8 +3912,8 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     preflight_secret_sink(&plan)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(Some(&plan.profile_id))?;
-    let credential = fresh_credential(profile, &PlatformSecretStore).await?;
-    let secrets = PlatformSecretStore;
+    let secrets = platform_secrets(store);
+    let credential = fresh_credential(profile, &secrets).await?;
     let execution_input = resolved_plan_input(&plan, &secrets)?;
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
     validate_api_token_creation_contract(
@@ -6425,7 +6471,7 @@ fn agents_command(store: &StateStore, command: AgentsCommand) -> Result<ResultEn
                     "binary_on_path": which::which("cfctl").ok(),
                     "configured_default_agent": configured,
                     "platform": env::consts::OS,
-                    "platform_secret_store": if cfg!(target_os = "macos") { "keychain" } else if cfg!(target_os = "linux") { "secret_service" } else { "unsupported" },
+                    "platform_secret_store": platform_secret_store_health(store)?,
                     "instruction_drift": status.iter().filter(|agent| agent.skill_present && !agent.skill_current).count(),
                     "agents": status,
                 }),
@@ -6644,7 +6690,7 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "unsupported_legacy_profiles": unsupported_legacy_profiles,
             "oauth_scope_inventory_hash": inventory_hash,
             "oauth_profiles": oauth_reconsent,
-            "platform_secret_store": if cfg!(target_os = "macos") { "keychain" } else if cfg!(target_os = "linux") { "secret_service" } else { "unsupported" },
+            "platform_secret_store": platform_secret_store_health(store)?,
             "agents": agents,
             "public_oauth": "unconfigured until cfctl.io ownership, site publication, domain verification, and permanent promotion are explicitly completed; use `cfctl auth import-api-token --account <id> --stdin` for the scoped day-to-day lane",
         }),
@@ -6836,7 +6882,7 @@ async fn refresh_oauth_scopes_if_authenticated(store: &StateStore) -> Result<Opt
     let Ok(profile) = profiles.selected(None) else {
         return Ok(None);
     };
-    let credential = fresh_credential(profile, &PlatformSecretStore).await?;
+    let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let snapshot = fetch_oauth_scope_snapshot(&credential).await?;
     store.write_json(&oauth_scope_inventory_file(store), &snapshot)?;
     Ok(Some(snapshot))
@@ -11385,6 +11431,10 @@ mod tests {
         fn delete(&self, _key: &str) -> cfctl_auth::Result<()> {
             Err(AuthError::SecretStore("injected delete failure".to_owned()))
         }
+
+        fn locate(&self, _key: &str) -> cfctl_auth::Result<Option<cfctl_auth::SecretBackend>> {
+            Ok(None)
+        }
     }
 
     #[test]
@@ -11963,6 +12013,7 @@ mod tests {
         assert_eq!(envelope.result["selected"], true);
         assert_eq!(envelope.result["kind"], "api_token");
         assert_eq!(envelope.result["account_id"], "account-a");
+        assert_eq!(envelope.result["secret_backend"], "memory");
         let encoded = serde_json::to_string(&envelope).expect("envelope serializes");
         assert!(
             !encoded.contains(token),

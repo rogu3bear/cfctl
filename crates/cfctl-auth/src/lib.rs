@@ -2,7 +2,15 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{Rng as _, distr::Alphanumeric};
-use std::{collections::BTreeMap, fmt, sync::Mutex};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::{
+    collections::BTreeMap,
+    fmt, fs,
+    io::Write as _,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -306,10 +314,30 @@ impl fmt::Debug for AuthCredential {
     }
 }
 
+/// Backend that physically holds a stored secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretBackend {
+    PlatformKeyring,
+    FallbackFile,
+    Memory,
+}
+
 pub trait SecretStore: Send + Sync {
     fn put(&self, key: &str, value: &str) -> Result<()>;
     fn get(&self, key: &str) -> Result<Option<String>>;
     fn delete(&self, key: &str) -> Result<()>;
+
+    /// Report which backend currently holds `key`, if any.
+    fn locate(&self, key: &str) -> Result<Option<SecretBackend>>;
+
+    fn locate_api_token(&self, profile_id: &str) -> Result<Option<SecretBackend>> {
+        self.locate(&api_token_key(profile_id))
+    }
+
+    fn locate_global_key(&self, profile_id: &str) -> Result<Option<SecretBackend>> {
+        self.locate(&global_key(profile_id))
+    }
 
     fn store_oauth_tokens(&self, profile_id: &str, tokens: &OAuthTokenSet) -> Result<()> {
         let encoded = serde_json::to_string(tokens)?;
@@ -403,14 +431,21 @@ impl SecretStore for MemorySecretStore {
             .remove(key);
         Ok(())
     }
+
+    fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
+        Ok(self.get(key)?.map(|_| SecretBackend::Memory))
+    }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PlatformSecretStore;
+const KEYRING_SERVICE: &str = "io.cfctl.cfctl";
 
-impl SecretStore for PlatformSecretStore {
+/// Direct platform keyring access (macOS Keychain, Linux Secret Service).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeyringSecretStore;
+
+impl SecretStore for KeyringSecretStore {
     fn put(&self, key: &str, value: &str) -> Result<()> {
-        let entry = keyring::Entry::new("io.cfctl.cfctl", key)
+        let entry = keyring::Entry::new(KEYRING_SERVICE, key)
             .map_err(|error| AuthError::SecretStore(error.to_string()))?;
         entry
             .set_password(value)
@@ -418,7 +453,7 @@ impl SecretStore for PlatformSecretStore {
     }
 
     fn get(&self, key: &str) -> Result<Option<String>> {
-        let entry = keyring::Entry::new("io.cfctl.cfctl", key)
+        let entry = keyring::Entry::new(KEYRING_SERVICE, key)
             .map_err(|error| AuthError::SecretStore(error.to_string()))?;
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
@@ -428,13 +463,282 @@ impl SecretStore for PlatformSecretStore {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        let entry = keyring::Entry::new("io.cfctl.cfctl", key)
+        let entry = keyring::Entry::new(KEYRING_SERVICE, key)
             .map_err(|error| AuthError::SecretStore(error.to_string()))?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(AuthError::SecretStore(error.to_string())),
         }
     }
+
+    fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
+        Ok(self.get(key)?.map(|_| SecretBackend::PlatformKeyring))
+    }
+}
+
+/// Durable mode-0600 per-secret files for hosts whose platform keyring
+/// rejects writes (for example a login keychain whose passphrase is out of
+/// sync with the login password). Secret values never relax past 0600 and
+/// group- or world-accessible files are refused on read.
+#[derive(Debug, Clone)]
+pub struct FileSecretStore {
+    root: PathBuf,
+}
+
+impl FileSecretStore {
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Number of secrets currently held on disk.
+    pub fn stored_secret_count(&self) -> Result<usize> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(file_store_error("list", &self.root, &error)),
+        };
+        let mut count = 0;
+        for entry in entries {
+            let entry = entry.map_err(|error| file_store_error("list", &self.root, &error))?;
+            if entry.file_name().to_string_lossy().contains(".tmp-") {
+                continue;
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|error| file_store_error("list", &self.root, &error))?;
+            if file_type.is_file() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    fn secret_path(&self, key: &str) -> Result<PathBuf> {
+        if key.is_empty() {
+            return Err(AuthError::SecretStore(
+                "secret keys must not be empty".to_owned(),
+            ));
+        }
+        Ok(self.root.join(secret_file_name(key)))
+    }
+
+    fn ensure_root(&self) -> Result<()> {
+        fs::create_dir_all(&self.root)
+            .map_err(|error| file_store_error("create", &self.root, &error))?;
+        #[cfg(unix)]
+        fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))
+            .map_err(|error| file_store_error("restrict", &self.root, &error))?;
+        Ok(())
+    }
+}
+
+impl SecretStore for FileSecretStore {
+    fn put(&self, key: &str, value: &str) -> Result<()> {
+        let path = self.secret_path(key)?;
+        self.ensure_root()?;
+        let staging = self
+            .root
+            .join(format!("{}.tmp-{}", secret_file_name(key), Uuid::new_v4()));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let written = options
+            .open(&staging)
+            .map_err(|error| file_store_error("stage", &staging, &error))
+            .and_then(|mut file| {
+                file.write_all(value.as_bytes())
+                    .and_then(|()| file.sync_all())
+                    .map_err(|error| file_store_error("write", &staging, &error))
+            })
+            .and_then(|()| {
+                fs::rename(&staging, &path)
+                    .map_err(|error| file_store_error("commit", &path, &error))
+            });
+        if written.is_err() {
+            let _ = fs::remove_file(&staging);
+        }
+        written
+    }
+
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        let path = self.secret_path(key)?;
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(file_store_error("inspect", &path, &error)),
+        };
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(AuthError::SecretStore(format!(
+                "refusing to read group- or world-accessible secret file {}; run `chmod 600` on it first",
+                path.display()
+            )));
+        }
+        #[cfg(not(unix))]
+        let _ = metadata;
+        match fs::read_to_string(&path) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(file_store_error("read", &path, &error)),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let path = self.secret_path(key)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(file_store_error("delete", &path, &error)),
+        }
+    }
+
+    fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
+        Ok(self.get(key)?.map(|_| SecretBackend::FallbackFile))
+    }
+}
+
+/// Platform keyring first, with a durable file fallback so a broken keyring
+/// (for example `errSecAuthFailed` from a desynchronized login keychain)
+/// degrades to governed mode-0600 files instead of blocking credential
+/// import. `cfctl doctor` reports which backend is active.
+#[derive(Debug, Clone)]
+pub struct PlatformSecretStore {
+    keyring: KeyringSecretStore,
+    fallback: FileSecretStore,
+}
+
+impl PlatformSecretStore {
+    #[must_use]
+    pub fn new(fallback_root: PathBuf) -> Self {
+        Self {
+            keyring: KeyringSecretStore,
+            fallback: FileSecretStore::new(fallback_root),
+        }
+    }
+
+    #[must_use]
+    pub fn fallback_root(&self) -> &Path {
+        self.fallback.root()
+    }
+
+    pub fn fallback_secret_count(&self) -> Result<usize> {
+        self.fallback.stored_secret_count()
+    }
+
+    /// Prove the platform keyring accepts writes by round-tripping a
+    /// non-secret probe value. Returns the platform failure text when the
+    /// keyring is unusable.
+    pub fn keyring_probe(&self) -> std::result::Result<(), String> {
+        const PROBE_KEY: &str = "doctor/keyring-probe";
+        const PROBE_VALUE: &str = "cfctl-keyring-probe";
+        let _ = self.keyring.delete(PROBE_KEY);
+        self.keyring
+            .put(PROBE_KEY, PROBE_VALUE)
+            .map_err(|error| error.to_string())?;
+        let read = self
+            .keyring
+            .get(PROBE_KEY)
+            .map_err(|error| error.to_string());
+        let _ = self.keyring.delete(PROBE_KEY);
+        match read? {
+            Some(value) if value == PROBE_VALUE => Ok(()),
+            _ => Err("keyring probe read back an unexpected value".to_owned()),
+        }
+    }
+}
+
+impl SecretStore for PlatformSecretStore {
+    fn put(&self, key: &str, value: &str) -> Result<()> {
+        chained_put(&self.keyring, &self.fallback, key, value)
+    }
+
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        chained_get(&self.keyring, &self.fallback, key)
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        chained_delete(&self.keyring, &self.fallback, key)
+    }
+
+    fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
+        if matches!(self.keyring.get(key), Ok(Some(_))) {
+            return Ok(Some(SecretBackend::PlatformKeyring));
+        }
+        self.fallback.locate(key)
+    }
+}
+
+fn chained_put(
+    primary: &dyn SecretStore,
+    fallback: &dyn SecretStore,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    match primary.put(key, value) {
+        // Drop any stale fallback copy so a later fallback read can never
+        // resurrect an old secret.
+        Ok(()) => fallback.delete(key),
+        Err(primary_error) => fallback.put(key, value).map_err(|fallback_error| {
+            AuthError::SecretStore(format!(
+                "primary secret store write failed ({primary_error}); fallback write also failed ({fallback_error})"
+            ))
+        }),
+    }
+}
+
+fn chained_get(
+    primary: &dyn SecretStore,
+    fallback: &dyn SecretStore,
+    key: &str,
+) -> Result<Option<String>> {
+    match primary.get(key) {
+        Ok(Some(value)) => Ok(Some(value)),
+        Ok(None) => fallback.get(key),
+        Err(primary_error) => match fallback.get(key) {
+            Ok(Some(value)) => Ok(Some(value)),
+            Ok(None) => Err(primary_error),
+            Err(fallback_error) => Err(AuthError::SecretStore(format!(
+                "primary secret store read failed ({primary_error}); fallback read also failed ({fallback_error})"
+            ))),
+        },
+    }
+}
+
+fn chained_delete(primary: &dyn SecretStore, fallback: &dyn SecretStore, key: &str) -> Result<()> {
+    let primary_result = primary.delete(key);
+    let fallback_result = fallback.delete(key);
+    primary_result?;
+    fallback_result
+}
+
+fn secret_file_name(key: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut name = String::with_capacity(key.len());
+    for byte in key.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' => name.push(char::from(byte)),
+            other => {
+                name.push('%');
+                name.push(char::from(HEX[usize::from(other >> 4)]));
+                name.push(char::from(HEX[usize::from(other & 0x0F)]));
+            }
+        }
+    }
+    name
+}
+
+fn file_store_error(action: &str, path: &Path, error: &std::io::Error) -> AuthError {
+    AuthError::SecretStore(format!(
+        "file secret store failed to {action} {}: {error}",
+        path.display()
+    ))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -514,4 +818,179 @@ pub async fn revoke_oauth_token(
         .await?
         .error_for_status()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    struct RejectingSecretStore;
+
+    impl SecretStore for RejectingSecretStore {
+        fn put(&self, _key: &str, _value: &str) -> Result<()> {
+            Err(AuthError::SecretStore(
+                "primary store rejected the write".to_owned(),
+            ))
+        }
+
+        fn get(&self, _key: &str) -> Result<Option<String>> {
+            Err(AuthError::SecretStore(
+                "primary store rejected the read".to_owned(),
+            ))
+        }
+
+        fn delete(&self, _key: &str) -> Result<()> {
+            Err(AuthError::SecretStore(
+                "primary store rejected the delete".to_owned(),
+            ))
+        }
+
+        fn locate(&self, _key: &str) -> Result<Option<SecretBackend>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn chained_put_prefers_primary_and_clears_stale_fallback_copies() {
+        let primary = MemorySecretStore::default();
+        let fallback = MemorySecretStore::default();
+        fallback.put("k", "stale").expect("seed fallback");
+
+        chained_put(&primary, &fallback, "k", "fresh").expect("chained put");
+
+        assert_eq!(primary.get("k").expect("primary"), Some("fresh".to_owned()));
+        assert_eq!(fallback.get("k").expect("fallback"), None);
+    }
+
+    #[test]
+    fn chained_put_falls_back_when_primary_rejects_the_write() {
+        let fallback = MemorySecretStore::default();
+
+        chained_put(&RejectingSecretStore, &fallback, "k", "v").expect("fallback put");
+
+        assert_eq!(fallback.get("k").expect("fallback"), Some("v".to_owned()));
+        assert_eq!(
+            chained_get(&RejectingSecretStore, &fallback, "k").expect("fallback read"),
+            Some("v".to_owned())
+        );
+    }
+
+    #[test]
+    fn chained_put_reports_both_failures_when_no_store_accepts_the_secret() {
+        let error = chained_put(&RejectingSecretStore, &RejectingSecretStore, "k", "v")
+            .expect_err("double failure");
+        let message = error.to_string();
+        assert!(message.contains("rejected the write"), "{message}");
+        assert!(message.contains("fallback write also failed"), "{message}");
+    }
+
+    #[test]
+    fn chained_get_prefers_primary_and_surfaces_primary_error_on_double_miss() {
+        let primary = MemorySecretStore::default();
+        let fallback = MemorySecretStore::default();
+        primary.put("k", "primary-value").expect("seed primary");
+        fallback.put("k", "fallback-value").expect("seed fallback");
+
+        assert_eq!(
+            chained_get(&primary, &fallback, "k").expect("primary wins"),
+            Some("primary-value".to_owned())
+        );
+        let miss = chained_get(&RejectingSecretStore, &MemorySecretStore::default(), "k")
+            .expect_err("primary error surfaces when fallback misses");
+        assert!(miss.to_string().contains("rejected the read"));
+    }
+
+    #[test]
+    fn chained_delete_still_clears_the_fallback_when_primary_fails() {
+        let fallback = MemorySecretStore::default();
+        fallback.put("k", "v").expect("seed fallback");
+
+        let error = chained_delete(&RejectingSecretStore, &fallback, "k")
+            .expect_err("primary delete failure surfaces");
+        assert!(error.to_string().contains("rejected the delete"));
+        assert_eq!(fallback.get("k").expect("fallback"), None);
+    }
+
+    #[test]
+    fn secret_file_names_stay_flat_and_injective() {
+        assert_eq!(
+            secret_file_name("profile/default/api-token"),
+            "profile%2Fdefault%2Fapi-token"
+        );
+        assert_eq!(secret_file_name("a%b"), "a%25b");
+        assert_eq!(secret_file_name(".."), "%2E%2E");
+        assert_ne!(
+            secret_file_name("profile/x"),
+            secret_file_name("profile%2Fx")
+        );
+    }
+
+    #[test]
+    fn file_secret_store_round_trips_and_counts_secrets() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = FileSecretStore::new(root.path().join("secrets"));
+
+        assert_eq!(store.stored_secret_count().expect("empty count"), 0);
+        store.put("profile/default/api-token", "one").expect("put");
+        store
+            .put("profile/default/api-token", "two")
+            .expect("overwrite");
+        assert_eq!(
+            store.get("profile/default/api-token").expect("get"),
+            Some("two".to_owned())
+        );
+        assert_eq!(store.stored_secret_count().expect("count"), 1);
+        assert_eq!(
+            store.locate("profile/default/api-token").expect("locate"),
+            Some(SecretBackend::FallbackFile)
+        );
+
+        store.delete("profile/default/api-token").expect("delete");
+        assert_eq!(store.get("profile/default/api-token").expect("miss"), None);
+        store
+            .delete("profile/default/api-token")
+            .expect("deleting a missing secret is not an error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_secret_store_enforces_0600_files_and_0700_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = FileSecretStore::new(root.path().join("secrets"));
+        store
+            .put("profile/default/api-token", "value")
+            .expect("put");
+
+        let dir_mode = fs::metadata(store.root())
+            .expect("root metadata")
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o777, 0o700, "root must be 0700");
+
+        let path = store
+            .root()
+            .join(secret_file_name("profile/default/api-token"));
+        let file_mode = fs::metadata(&path)
+            .expect("secret metadata")
+            .permissions()
+            .mode();
+        assert_eq!(file_mode & 0o777, 0o600, "secret files must be 0600");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("loosen");
+        let error = store
+            .get("profile/default/api-token")
+            .expect_err("group- or world-accessible secrets are refused");
+        assert!(error.to_string().contains("chmod 600"), "{error}");
+    }
+
+    #[test]
+    fn empty_secret_keys_are_rejected() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = FileSecretStore::new(root.path().join("secrets"));
+        assert!(store.put("", "value").is_err());
+        assert!(store.get("").is_err());
+        assert!(store.delete("").is_err());
+    }
 }
