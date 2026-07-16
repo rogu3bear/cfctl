@@ -54,19 +54,22 @@ CFCTL_HOME=/tmp/cfctl-proof cfctl doctor --json
 
 ## Authenticate
 
-The public cfctl OAuth application is not active until cfctl.io ownership is verified and the permanent Cloudflare promotion is approved. Until then, use your own Cloudflare OAuth client:
+Simplest day-to-day lane — scoped API token from stdin, account pin required:
+
+```bash
+printf '%s' "$CLOUDFLARE_API_TOKEN" | \
+  cfctl auth import-api-token --account <account-id> --stdin
+cfctl auth status --json
+```
+
+OAuth is optional when you have a Cloudflare OAuth client (public cfctl OAuth
+is not default until promoted):
 
 ```bash
 cfctl auth login \
   --profile default \
   --client-id "$CFCTL_OAUTH_CLIENT_ID" \
-  --scope <scope-id> \
   --account <account-id>
-```
-
-Open the returned URL. Pipe the callback's `STATE CODE` value into:
-
-```bash
 printf '%s\n' '<STATE CODE>' | cfctl auth login \
   --complete \
   --profile default \

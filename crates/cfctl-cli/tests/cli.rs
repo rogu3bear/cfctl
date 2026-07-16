@@ -470,6 +470,53 @@ fn write_fresh_accounts_list_catalog(runtime: &std::path::Path) {
 }
 
 #[test]
+fn binary_import_api_token_requires_stdin_flag() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args([
+            "auth",
+            "import-api-token",
+            "--account",
+            "account-a",
+            "--json",
+        ])
+        .output()
+        .expect("import-api-token without --stdin");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("--stdin"),
+        "must require stdin sink: {combined}"
+    );
+}
+
+#[test]
+fn binary_auth_login_without_client_id_points_at_import_api_token() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .env_remove("CFCTL_OAUTH_CLIENT_ID")
+        .args(["auth", "login", "--json"])
+        .output()
+        .expect("auth login without client id");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("import-api-token"),
+        "login without client-id must point operators at the simple token lane: {combined}"
+    );
+}
+
+#[test]
 fn binary_call_rejects_ambient_emergency_global_key_without_profile_flag() {
     let runtime = tempfile::tempdir().expect("runtime root");
     write_emergency_global_key_current(runtime.path());

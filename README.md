@@ -54,7 +54,7 @@ check before sending a mutation.
 
 ```text
 cfctl "<natural-language request>"
-cfctl auth login|status|profiles|use|logout|import-global-key
+cfctl auth login|status|profiles|use|logout|import-api-token|import-global-key
 cfctl keys permissions|mint|rotate|revoke
 cfctl catalog sync|search|show|changes|coverage
 cfctl call <capability-id> [selectors/body]
@@ -74,24 +74,20 @@ contracts are `CapabilityV1`, `PlanV1`, `PolicyDecisionV1`, `AgentActionV1`,
 
 ## Authentication
 
-OAuth Authorization Code with PKCE is the normal lane. Tokens live in Keychain
-on macOS or Secret Service on Linux. Each profile/workspace pins an account and
-ambiguous selection fails closed.
-
-Until the public cfctl OAuth application is promoted, bring your own Cloudflare
-OAuth client:
+Day-to-day auth is a scoped API token, imported only through stdin (never
+argv). The token lives in Keychain on macOS or Secret Service on Linux, and
+the account pin is required:
 
 ```bash
-cfctl auth login \
-  --profile default \
-  --client-id "$CFCTL_OAUTH_CLIENT_ID" \
-  --scope <scope-id> \
-  --account <account-id>
+printf '%s' "$CLOUDFLARE_API_TOKEN" | \
+  cfctl auth import-api-token --account <account-id> --stdin
 ```
 
-The login emits an authorization URL. The static callback displays a one-time
-`STATE CODE` value for the CLI completion step. Public clients never embed a
-client secret. Refresh and logout/revocation are supported.
+OAuth Authorization Code with PKCE remains available when you have a
+Cloudflare OAuth client (`--client-id` / `CFCTL_OAUTH_CLIENT_ID`). Public cfctl
+OAuth is not the default until cfctl.io ownership and permanent promotion
+complete. The login emits an authorization URL; complete with the callback's
+one-time `STATE CODE` on stdin. Public clients never embed a client secret.
 
 An emergency global key can be imported from stdin. It is never selected
 silently:

@@ -51,7 +51,10 @@ impl ProfilesConfig {
         let id = requested
             .or(self.current_profile.as_deref())
             .ok_or_else(|| {
-                CliError::Input("no active profile; run `cfctl auth login`".to_owned())
+                CliError::Input(
+                    "no active profile; run `cfctl auth import-api-token --account <id> --stdin` or `cfctl auth login --client-id <id>`"
+                        .to_owned(),
+                )
             })?;
         let profile = self
             .profiles

@@ -43,9 +43,9 @@ use tokio::process::Command as ProcessCommand;
 
 use crate::{
     AgentsCommand, AuthCommand, AuthLoginArgs, CallArgs, CatalogCommand, Cli, Command, DocsCommand,
-    GuideArgs, ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs, KeyRevokeArgs,
-    KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector, PlansCommand,
-    ProfileSelector, SearchArgs, WorkspaceCommand,
+    GuideArgs, ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs,
+    KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector,
+    PlansCommand, ProfileSelector, SearchArgs, WorkspaceCommand,
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
 
@@ -181,10 +181,25 @@ async fn auth_command(store: &StateStore, command: AuthCommand) -> Result<Result
         AuthCommand::Logout(selector) => {
             logout_profile(store, &mut profiles, &secrets, &selector).await
         }
+        AuthCommand::ImportApiToken(arguments) => {
+            import_api_token(store, &mut profiles, &secrets, &arguments)
+        }
         AuthCommand::ImportGlobalKey(arguments) => {
             import_global_key(store, &mut profiles, &secrets, &arguments)
         }
     }
+}
+
+fn require_oauth_client_id(client_id: Option<&str>) -> Result<&str> {
+    client_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth login needs --client-id (or CFCTL_OAUTH_CLIENT_ID). Until public cfctl OAuth is promoted, use the simple scoped lane: printf '%s' \"$CLOUDFLARE_API_TOKEN\" | cfctl auth import-api-token --account <account-id> --stdin"
+                    .to_owned(),
+            )
+        })
 }
 
 async fn begin_oauth_login(
@@ -193,9 +208,10 @@ async fn begin_oauth_login(
     secrets: &dyn SecretStore,
     arguments: AuthLoginArgs,
 ) -> Result<ResultEnvelopeV2> {
+    let client_id = require_oauth_client_id(arguments.client_id.as_deref())?;
     let requested_scopes =
         resolve_login_scopes(store, profiles, secrets, &arguments.scopes).await?;
-    let client = OAuthClientConfig::cfctl_public(&arguments.client_id);
+    let client = OAuthClientConfig::cfctl_public(client_id);
     let scopes: Vec<&str> = requested_scopes.iter().map(String::as_str).collect();
     let session = PkceSession::begin(&client, &scopes)?;
     secrets.put(
@@ -229,12 +245,13 @@ async fn complete_oauth_login(
     secrets: &dyn SecretStore,
     arguments: AuthLoginArgs,
 ) -> Result<ResultEnvelopeV2> {
+    let client_id = require_oauth_client_id(arguments.client_id.as_deref())?;
     let pending = profiles
         .pending_logins
         .get(&arguments.profile)
         .cloned()
         .ok_or_else(|| CliError::Input(format!("no pending login for `{}`", arguments.profile)))?;
-    if pending.client.client_id != arguments.client_id {
+    if pending.client.client_id != client_id {
         return Err(CliError::Input(
             "OAuth client ID differs from the pending login".to_owned(),
         ));
@@ -359,6 +376,71 @@ async fn logout_profile(
             } else {
                 "Profile credentials and metadata were removed."
             }
+        }),
+    ))
+}
+
+fn import_api_token(
+    store: &StateStore,
+    profiles: &mut ProfilesConfig,
+    secrets: &dyn SecretStore,
+    arguments: &ImportApiTokenArgs,
+) -> Result<ResultEnvelopeV2> {
+    if !arguments.stdin {
+        return Err(CliError::Input(
+            "API tokens are accepted only through stdin; add `--stdin`".to_owned(),
+        ));
+    }
+    let token = read_stdin()?;
+    store_imported_api_token(
+        store,
+        profiles,
+        secrets,
+        &arguments.profile,
+        &arguments.account,
+        &token,
+    )
+}
+
+fn store_imported_api_token(
+    store: &StateStore,
+    profiles: &mut ProfilesConfig,
+    secrets: &dyn SecretStore,
+    profile_id: &str,
+    account: &str,
+    token: &str,
+) -> Result<ResultEnvelopeV2> {
+    let account = account.trim();
+    let token = token.trim();
+    if account.is_empty() {
+        return Err(CliError::Input(
+            "API-token import requires a non-empty `--account` pin".to_owned(),
+        ));
+    }
+    if token.is_empty() {
+        return Err(CliError::Input(
+            "stdin did not contain an API token".to_owned(),
+        ));
+    }
+    if token.chars().any(char::is_whitespace) {
+        return Err(CliError::Input(
+            "API token from stdin must be a single value without whitespace".to_owned(),
+        ));
+    }
+    secrets.store_api_token(profile_id, token)?;
+    let profile = ProfileMetadata::new(profile_id, ProfileKind::ApiToken, Some(account));
+    profiles.profiles.insert(profile_id.to_owned(), profile);
+    profiles.current_profile = Some(profile_id.to_owned());
+    profiles.save(store)?;
+    Ok(ResultEnvelopeV2::success(
+        "auth import-api-token",
+        json!({
+            "profile": profile_id,
+            "kind": "api_token",
+            "account_id": account,
+            "selected": true,
+            "emergency_only": false,
+            "message": "API token stored in the platform credential store and selected as the active profile. The token value was not written to stdout, plans, or repository files."
         }),
     ))
 }
@@ -6572,7 +6654,7 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "oauth_profiles": oauth_reconsent,
             "platform_secret_store": if cfg!(target_os = "macos") { "keychain" } else if cfg!(target_os = "linux") { "secret_service" } else { "unsupported" },
             "agents": agents,
-            "public_oauth": "unconfigured until cfctl.io ownership, site publication, domain verification, and permanent promotion are explicitly completed",
+            "public_oauth": "unconfigured until cfctl.io ownership, site publication, domain verification, and permanent promotion are explicitly completed; use `cfctl auth import-api-token --account <id> --stdin` for the scoped day-to-day lane",
         }),
     ))
 }
@@ -8166,15 +8248,15 @@ mod tests {
         should_bind_global_warp_override_state, should_bind_oauth_client_secret_state,
         should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
         should_bind_zone_account, should_resolve_zone_entitlement, sink_secret_result,
-        validate_api_token_creation_contract, validate_current_permission_groups,
-        validate_entitlement_receipt_precondition,
+        store_imported_api_token, validate_api_token_creation_contract,
+        validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
         validate_selected_permission_groups, validate_zone_account_receipt_precondition,
         workspace_resource_keys, zone_target,
     };
     use crate::profiles::ProfilesConfig;
     use crate::{CallArgs, PlanApproveArgs};
-    use cfctl_auth::{AuthError, ProfileKind, ProfileMetadata, SecretStore};
+    use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
     use cfctl_cloudflare::CloudflareResponseV1;
     use cfctl_core::{
@@ -11801,6 +11883,73 @@ mod tests {
             error.to_string().contains("never selected implicitly"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn store_imported_api_token_selects_scoped_profile_and_keeps_secret_out_of_envelope() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let secrets = MemorySecretStore::default();
+        let mut profiles = ProfilesConfig::default();
+        let token = "cfat_test_token_must_not_echo";
+
+        let envelope = store_imported_api_token(
+            &store,
+            &mut profiles,
+            &secrets,
+            "default",
+            "account-a",
+            token,
+        )
+        .expect("import api token");
+        assert_eq!(envelope.command, "auth import-api-token");
+        assert!(envelope.ok);
+        assert_eq!(envelope.result["selected"], true);
+        assert_eq!(envelope.result["kind"], "api_token");
+        assert_eq!(envelope.result["account_id"], "account-a");
+        let encoded = serde_json::to_string(&envelope).expect("envelope serializes");
+        assert!(
+            !encoded.contains(token),
+            "token must not appear in the result envelope: {encoded}"
+        );
+        assert_eq!(profiles.current_profile.as_deref(), Some("default"));
+        let profile = profiles.profiles.get("default").expect("profile saved");
+        assert_eq!(profile.kind, ProfileKind::ApiToken);
+        assert_eq!(profile.account_id.as_deref(), Some("account-a"));
+        assert!(!profile.emergency_only);
+        assert_eq!(
+            secrets
+                .load_credential("default", ProfileKind::ApiToken)
+                .expect("credential")
+                .bearer_token(),
+            Some(token)
+        );
+
+        let empty = store_imported_api_token(
+            &store,
+            &mut ProfilesConfig::default(),
+            &secrets,
+            "default",
+            "account-a",
+            "",
+        )
+        .expect_err("empty token rejected");
+        assert!(
+            empty
+                .to_string()
+                .contains("stdin did not contain an API token")
+        );
+
+        let unpinned = store_imported_api_token(
+            &store,
+            &mut ProfilesConfig::default(),
+            &secrets,
+            "default",
+            "  ",
+            token,
+        )
+        .expect_err("empty account rejected");
+        assert!(unpinned.to_string().contains("--account"));
     }
 
     #[test]

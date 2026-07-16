@@ -60,11 +60,19 @@ ownership from a profile label, workspace pin, or local IaC.
 
 ## Authentication
 
-Normal OAuth login uses a public client and PKCE:
+Day-to-day auth is a scoped API token imported only through stdin:
+
+```bash
+printf '%s' "$CLOUDFLARE_API_TOKEN" | \
+  cfctl auth import-api-token --account <account-id> --stdin --json
+```
+
+OAuth login (optional) uses PKCE and an explicit client id until public cfctl
+OAuth is promoted:
 
 ```bash
 cfctl auth login --profile default --client-id <client-id> \
-  --scope <scope-id> --account <account-id> --json
+  --account <account-id> --json
 ```
 
 Open the returned authorization URL, then pipe the callback's one-time

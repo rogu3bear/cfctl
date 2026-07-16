@@ -66,6 +66,7 @@ pub enum AuthCommand {
     Profiles,
     Use(ProfileSelector),
     Logout(ProfileSelector),
+    ImportApiToken(ImportApiTokenArgs),
     ImportGlobalKey(ImportGlobalKeyArgs),
 }
 
@@ -73,8 +74,12 @@ pub enum AuthCommand {
 pub struct AuthLoginArgs {
     #[arg(long, default_value = "default")]
     pub profile: String,
-    #[arg(long, env = "CFCTL_OAUTH_CLIENT_ID")]
-    pub client_id: String,
+    #[arg(
+        long,
+        env = "CFCTL_OAUTH_CLIENT_ID",
+        help = "Cloudflare OAuth client id (required for OAuth; until public cfctl OAuth is promoted, prefer `auth import-api-token`)"
+    )]
+    pub client_id: Option<String>,
     #[arg(long = "scope", value_delimiter = ',')]
     pub scopes: Vec<String>,
     #[arg(long)]
@@ -87,6 +92,22 @@ pub struct AuthLoginArgs {
 pub struct ProfileSelector {
     #[arg(default_value = "default")]
     pub profile: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ImportApiTokenArgs {
+    #[arg(long, default_value = "default")]
+    pub profile: String,
+    #[arg(
+        long,
+        help = "Pin the account this token is allowed to operate on; ambiguous multi-account selection fails closed"
+    )]
+    pub account: String,
+    #[arg(
+        long,
+        help = "Read the API token from stdin; values in command arguments are forbidden"
+    )]
+    pub stdin: bool,
 }
 
 #[derive(Debug, Args)]

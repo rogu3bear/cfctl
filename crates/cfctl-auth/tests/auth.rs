@@ -43,6 +43,27 @@ fn secret_store_keeps_oauth_tokens_out_of_profile_metadata() {
 }
 
 #[test]
+fn api_token_profiles_store_bearer_credentials_outside_profile_metadata() {
+    let store = MemorySecretStore::default();
+    store
+        .store_api_token("default", "cf-api-token-value")
+        .expect("store api token");
+    let credential = store
+        .load_credential("default", ProfileKind::ApiToken)
+        .expect("load api token");
+    assert_eq!(credential.bearer_token(), Some("cf-api-token-value"));
+    assert!(!format!("{credential:?}").contains("cf-api-token-value"));
+    let profile = ProfileMetadata::new("default", ProfileKind::ApiToken, Some("account-a"));
+    assert!(!profile.emergency_only);
+    let json = serde_json::to_string(&profile).expect("profile serializes");
+    assert!(!json.contains("cf-api-token-value"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).expect("profile json")["kind"],
+        "api_token"
+    );
+}
+
+#[test]
 fn global_key_profiles_require_an_email_and_are_explicitly_emergency_only() {
     let store = MemorySecretStore::default();
     store
