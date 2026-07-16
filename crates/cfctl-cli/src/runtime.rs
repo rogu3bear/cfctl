@@ -28,11 +28,11 @@ use cfctl_cloudflare::{
     validate_request_contract,
 };
 use cfctl_core::{
-    AdapterStatus, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1, ErrorV1, EvidenceClass,
-    EvidenceV1, GuideActionV1, GuideContractStateV1, GuideTopicDocumentV1, GuideTopicV1, MoneyV1,
-    PlanStatus, PlanV1, PolicyDisposition, ResultEnvelopeV2, RiskClass, StandingAuthorityV1,
-    TransactionStageV1, VerificationState, guide_stages, guide_topic_document, hash_value,
-    redact_json, render_guide_topic_document_markdown,
+    AdapterStatus, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1, EffectClass, ErrorV1,
+    EvidenceClass, EvidenceV1, GuideActionV1, GuideContractStateV1, GuideTopicDocumentV1,
+    GuideTopicV1, MoneyV1, PlanStatus, PlanV1, PolicyDisposition, ResultEnvelopeV2, RiskClass,
+    StandingAuthorityV1, TransactionStageV1, VerificationState, guide_stages, guide_topic_document,
+    hash_value, redact_json, render_guide_topic_document_markdown,
 };
 use cfctl_planner::{ImpactContext, PolicyEngine};
 use cfctl_storage::{RuntimePaths, StateStore};
@@ -745,6 +745,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         ));
     }
     let mut prepared = call_input(&capability, &arguments)?;
+    prepare_r2_temporary_credentials_input(&capability, &mut prepared.input)?;
     preflight_call_input(&capability, &prepared.input, prepared.secret_body.as_ref())?;
     if !capability.mutating {
         if prepared.secret_body.is_some() {
@@ -815,6 +816,357 @@ fn preflight_call_input(
     validate_warp_connector_configuration_semantics(capability, &resolved)?;
     validate_d1_database_create_semantics(capability, &resolved)?;
     validate_worker_script_secret_semantics(capability, &resolved)?;
+    validate_r2_temporary_credentials_semantics(capability, &resolved)?;
+    Ok(())
+}
+
+const R2_TEMPORARY_CREDENTIALS_CAPABILITY_ID: &str = "r2-create-temp-access-credentials";
+const R2_TEMPORARY_CREDENTIALS_PATH: &str = "/accounts/{account_id}/r2/temp-access-credentials";
+const R2_PARENT_TOKEN_VERIFY_CAPABILITY_ID: &str = "user-api-tokens-verify-token";
+const R2_PARENT_TOKEN_VERIFY_PATH: &str = "/user/tokens/verify";
+const R2_PARENT_TOKEN_PRECONDITION: &str = "r2_parent_token";
+const R2_ACTIVE_PROFILE_TOKEN_ID: &str = "$cfctl_active_profile_token_id";
+const R2_TEMPORARY_CREDENTIAL_PERMISSIONS: [&str; 6] = [
+    "Workers R2 Storage Write",
+    "Workers R2 Storage Read",
+    "Workers R2 Storage Bucket Item Write",
+    "Workers R2 Storage Bucket Item Read",
+    "Workers R2 Data Catalog Write",
+    "Workers R2 Data Catalog Read",
+];
+
+fn is_r2_temporary_credentials_operation_identity(capability: &CapabilityV1) -> bool {
+    capability.id == R2_TEMPORARY_CREDENTIALS_CAPABILITY_ID
+        && capability.title == "Create Temporary Access Credentials"
+        && capability.method == "POST"
+        && capability.path == R2_TEMPORARY_CREDENTIALS_PATH
+        && capability.product == "R2 Bucket"
+        && capability.account_scope == "account"
+}
+
+fn is_r2_temporary_credentials_capability(capability: &CapabilityV1) -> bool {
+    is_r2_temporary_credentials_operation_identity(capability)
+        && capability.permissions
+            == R2_TEMPORARY_CREDENTIAL_PERMISSIONS
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        && capability.risk == RiskClass::SecretSensitive
+        && capability.effect == EffectClass::IdentityOrOwnership
+        && !capability.verification.required
+        && capability.verification.strategy == "sink_write_and_source_response_status"
+        && capability.request_schema.as_ref().is_some_and(|schema| {
+            schema
+                .pointer("/properties/parentAccessKeyId/x-cfctl-derived-from-active-profile")
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+}
+
+fn prepare_r2_temporary_credentials_input(
+    capability: &CapabilityV1,
+    input: &mut CallInput,
+) -> Result<()> {
+    if !is_r2_temporary_credentials_capability(capability) {
+        return Ok(());
+    }
+    let body = input
+        .body
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            CliError::Input("R2 temporary credentials require a JSON object body".to_owned())
+        })?;
+    if body.contains_key("parentAccessKeyId") {
+        return Err(CliError::Input(
+            "omit `parentAccessKeyId`; cfctl derives and hash-binds it from the active API-token profile so callers cannot redirect signing to another parent"
+                .to_owned(),
+        ));
+    }
+    body.insert(
+        "parentAccessKeyId".to_owned(),
+        Value::String(R2_ACTIVE_PROFILE_TOKEN_ID.to_owned()),
+    );
+    Ok(())
+}
+
+fn should_bind_r2_parent_token(capability: &CapabilityV1) -> bool {
+    is_r2_temporary_credentials_capability(capability)
+        && capability.mutating
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+}
+
+fn r2_parent_token_verify_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == R2_PARENT_TOKEN_VERIFY_CAPABILITY_ID
+        && capability.title == "Verify Token"
+        && capability.method == "GET"
+        && capability.path == R2_PARENT_TOKEN_VERIFY_PATH
+        && capability.product == "User API Tokens"
+        && capability.account_scope == "user"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && capability.permissions.is_empty()
+        && capability.selectors.is_empty()
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|contract| {
+                matches!(
+                    contract.body_mode,
+                    cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                ) && contract.success_statuses == ["200"]
+                    && contract.success_media_types == ["application/json"]
+            })
+}
+
+fn r2_parent_permission_contract(permission: &str) -> Result<Value> {
+    let allowed_capabilities: &[&str] = match permission {
+        "admin-read-write" => &[
+            "object_read",
+            "object_write",
+            "object_list",
+            "bucket_configuration_read",
+            "bucket_configuration_write",
+            "data_catalog_read",
+            "data_catalog_write",
+        ],
+        "admin-read-only" => &[
+            "object_read",
+            "object_list",
+            "bucket_configuration_read",
+            "data_catalog_read",
+        ],
+        "object-read-write" => &["object_read", "object_write", "object_list"],
+        "object-read-only" => &["object_read", "object_list"],
+        _ => {
+            return Err(CliError::Input(format!(
+                "unsupported R2 temporary credential permission `{permission}`"
+            )));
+        }
+    };
+    Ok(json!({
+        "rule": "temporary_scope_must_not_exceed_parent",
+        "enforced_by": "cloudflare",
+        "requested_scope": permission,
+        "allowed_capabilities": allowed_capabilities,
+    }))
+}
+
+fn r2_delegated_scope(input: &CallInput) -> Result<Value> {
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input("R2 temporary credentials require a JSON object body".to_owned())
+        })?;
+    let mut scope = Map::new();
+    for field in ["bucket", "permission", "ttlSeconds", "prefixes", "objects"] {
+        if let Some(value) = body.get(field) {
+            scope.insert(field.to_owned(), value.clone());
+        }
+    }
+    Ok(Value::Object(scope))
+}
+
+fn apply_r2_parent_token_response(
+    capability: &CapabilityV1,
+    account_id: &str,
+    input: &mut CallInput,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !should_bind_r2_parent_token(capability) {
+        return Err(CliError::Input(
+            "R2 temporary credential operation drifted from its governed parent-token contract"
+                .to_owned(),
+        ));
+    }
+    if !response.success || response.status != 200 {
+        return Err(CliError::Input(format!(
+            "active API-token verification did not return the exact successful HTTP 200 contract (received {}); the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    let parent_access_key_id = response
+        .result
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .ok_or_else(|| {
+            CliError::Input(
+                "active API-token verification omitted a bounded token id; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+    let token_status = response
+        .result
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "active API-token verification omitted token status; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+    if token_status != "active" {
+        return Err(CliError::Input(format!(
+            "selected API-token profile is not active (status `{token_status}`); the mutation boundary was not crossed"
+        )));
+    }
+    let body = input
+        .body
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            CliError::Input("R2 temporary credentials require a JSON object body".to_owned())
+        })?;
+    let planned_parent = body
+        .get("parentAccessKeyId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "R2 temporary credential request omitted its cfctl-derived parent token marker"
+                    .to_owned(),
+            )
+        })?;
+    if planned_parent != R2_ACTIVE_PROFILE_TOKEN_ID && planned_parent != parent_access_key_id {
+        return Err(CliError::Input(
+            "R2 temporary credential parent token differs from the selected API-token profile; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    body.insert(
+        "parentAccessKeyId".to_owned(),
+        Value::String(parent_access_key_id.to_owned()),
+    );
+    let delegated_scope = r2_delegated_scope(input)?;
+    let permission = delegated_scope
+        .get("permission")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("R2 temporary credential permission is missing".to_owned())
+        })?;
+    Ok(json!({
+        "schema_version": 1,
+        "source_capability_id": R2_PARENT_TOKEN_VERIFY_CAPABILITY_ID,
+        "source_path": R2_PARENT_TOKEN_VERIFY_PATH,
+        "target_capability_id": capability.id,
+        "target_method": capability.method,
+        "target_path": capability.path,
+        "target_scope": "account",
+        "account_id": account_id,
+        "parent_access_key_id": parent_access_key_id,
+        "token_status": token_status,
+        "delegated_scope": delegated_scope,
+        "parent_permission_contract": r2_parent_permission_contract(permission)?,
+    }))
+}
+
+async fn read_live_r2_parent_token(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &mut CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    let source_capability = catalog
+        .get(R2_PARENT_TOKEN_VERIFY_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(R2_PARENT_TOKEN_VERIFY_CAPABILITY_ID))?;
+    if !r2_parent_token_verify_contract_supported(source_capability) {
+        return Err(CliError::Input(
+            "R2 parent-token source capability drifted from the governed user-token verification read"
+                .to_owned(),
+        ));
+    }
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(source_capability, &CallInput::default(), credential)
+        .await?;
+    let receipt = apply_r2_parent_token_response(capability, account_id, input, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
+
+fn validate_r2_temporary_credentials_semantics(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    if !is_r2_temporary_credentials_capability(capability) {
+        return Ok(());
+    }
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input("R2 temporary credentials require a JSON object body".to_owned())
+        })?;
+    let allowed = [
+        "bucket",
+        "objects",
+        "parentAccessKeyId",
+        "permission",
+        "prefixes",
+        "ttlSeconds",
+    ];
+    if let Some(field) = body.keys().find(|field| !allowed.contains(&field.as_str())) {
+        return Err(CliError::Input(format!(
+            "R2 temporary credentials reject undeclared body field `{field}`"
+        )));
+    }
+    let bucket = body
+        .get("bucket")
+        .and_then(Value::as_str)
+        .filter(|bucket| !bucket.trim().is_empty())
+        .ok_or_else(|| {
+            CliError::Input("R2 temporary credentials require a non-empty `bucket`".to_owned())
+        })?;
+    let _ = bucket;
+    let ttl = body
+        .get("ttlSeconds")
+        .and_then(Value::as_u64)
+        .filter(|ttl| (1..=604_800).contains(ttl))
+        .ok_or_else(|| {
+            CliError::Input(
+                "R2 temporary credential `ttlSeconds` must be a whole number from 1 through 604800; use the shortest practical TTL"
+                    .to_owned(),
+            )
+        })?;
+    let _ = ttl;
+    for field in ["prefixes", "objects"] {
+        let Some(values) = body.get(field) else {
+            continue;
+        };
+        let values = values.as_array().ok_or_else(|| {
+            CliError::Input(format!(
+                "R2 temporary credential `{field}` must be an array of non-empty strings"
+            ))
+        })?;
+        let mut unique = BTreeSet::new();
+        for value in values {
+            let value = value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    CliError::Input(format!(
+                        "R2 temporary credential `{field}` must contain only non-empty strings"
+                    ))
+                })?;
+            if !unique.insert(value) {
+                return Err(CliError::Input(format!(
+                    "R2 temporary credential `{field}` contains duplicate path `{value}`"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3311,13 +3663,14 @@ fn plan_requires_live_credential(capability: &CapabilityV1, adapter_targets: &Va
         || should_bind_web_analytics_rum_state(capability)
         || should_bind_dns_record_state(capability)
         || should_bind_oauth_client_secret_state(capability)
+        || should_bind_r2_parent_token(capability)
 }
 
 async fn create_plan(
     store: &StateStore,
     catalog: &CatalogSnapshot,
     mut capability: cfctl_core::CapabilityV1,
-    input: CallInput,
+    mut input: CallInput,
     requested_profile: Option<&str>,
     requested_account: Option<&str>,
     adapter_targets: Value,
@@ -3337,6 +3690,30 @@ async fn create_plan(
     let resolve_entitlement = should_resolve_zone_entitlement(&capability);
     let credential = if plan_requires_live_credential(&capability, &adapter_targets) {
         Some(fresh_credential(profile, &platform_secrets(store)).await?)
+    } else {
+        None
+    };
+    let r2_parent_token_precondition = if should_bind_r2_parent_token(&capability) {
+        if profile.kind != ProfileKind::ApiToken {
+            return Err(CliError::Input(
+                "R2 temporary credentials require an active scoped API-token profile; OAuth and emergency global-key profiles cannot serve as the parent access key"
+                    .to_owned(),
+            ));
+        }
+        let credential = credential.as_ref().ok_or_else(|| {
+            CliError::Input("R2 parent-token precondition credential was not resolved".to_owned())
+        })?;
+        Some(
+            read_live_r2_parent_token(
+                store,
+                catalog,
+                &capability,
+                &mut input,
+                account_id,
+                credential,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -3378,6 +3755,7 @@ async fn create_plan(
     .await?;
     live_preconditions.entitlement = entitlement_precondition;
     live_preconditions.zone_account = zone_account_precondition;
+    live_preconditions.r2_parent_token = r2_parent_token_precondition;
     persist_prepared_plan(
         store,
         catalog,
@@ -3580,6 +3958,7 @@ async fn prepare_live_plan_preconditions(
     Ok(LivePlanPreconditions {
         entitlement: None,
         zone_account: None,
+        r2_parent_token: None,
         global_warp_override_state: prepare_global_warp_override_state_precondition(
             store, catalog, capability, input, account_id, credential,
         )
@@ -3631,6 +4010,7 @@ struct PlanAuthority<'a> {
 struct LivePlanPreconditions {
     entitlement: Option<(Value, EvidenceV1)>,
     zone_account: Option<(Value, EvidenceV1)>,
+    r2_parent_token: Option<(Value, EvidenceV1)>,
     global_warp_override_state: Option<(Value, EvidenceV1)>,
     d1_read_replication_state: Option<(Value, EvidenceV1)>,
     d1_empty_database_state: Option<(Value, EvidenceV1)>,
@@ -3678,6 +4058,9 @@ fn plan_targets(
     if let Some((receipt, _)) = &live_preconditions.oauth_client_secret_state {
         targets["live_preconditions"][OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION] = receipt.clone();
     }
+    if let Some((receipt, _)) = &live_preconditions.r2_parent_token {
+        targets["live_preconditions"][R2_PARENT_TOKEN_PRECONDITION] = receipt.clone();
+    }
     targets
 }
 
@@ -3719,6 +4102,10 @@ fn bind_live_plan_preconditions(
         (
             OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION,
             &live_preconditions.oauth_client_secret_state,
+        ),
+        (
+            R2_PARENT_TOKEN_PRECONDITION,
+            &live_preconditions.r2_parent_token,
         ),
     ] {
         if let Some((receipt, _)) = precondition {
@@ -3835,6 +4222,13 @@ fn persist_prepared_plan(
         account_id,
     } = authority;
     validate_api_token_creation_contract(&capability, &input, &adapter_targets, account_id)?;
+    validate_prepared_r2_parent_token_contract(
+        &capability,
+        &input,
+        profile,
+        account_id,
+        &live_preconditions,
+    )?;
     let impact = plan_impact(store, &capability, &input, account_id)?;
     let policy = PolicyEngine.evaluate(&capability, &impact.policy);
     if policy.disposition == PolicyDisposition::Blocked {
@@ -3903,31 +4297,67 @@ fn persist_prepared_plan(
     envelope.account_id = Some(account_id.to_owned());
     envelope.policy_decision = Some(policy);
     envelope.verification.state = VerificationState::Pending;
-    if let Some((_, evidence)) = live_preconditions.entitlement {
-        envelope.evidence.insert(0, evidence);
-    }
-    if let Some((_, evidence)) = live_preconditions.zone_account {
-        envelope.evidence.insert(0, evidence);
-    }
-    if let Some((_, evidence)) = live_preconditions.global_warp_override_state {
-        envelope.evidence.insert(0, evidence);
-    }
-    if let Some((_, evidence)) = live_preconditions.d1_read_replication_state {
-        envelope.evidence.insert(0, evidence);
-    }
-    if let Some((_, evidence)) = live_preconditions.cloudflare_tunnel_configuration_state {
-        envelope.evidence.insert(0, evidence);
-    }
-    if let Some((_, evidence)) = live_preconditions.warp_connector_configuration_state {
-        envelope.evidence.insert(0, evidence);
-    }
-    if let Some((_, evidence)) = live_preconditions.web_analytics_rum_state {
-        envelope.evidence.insert(0, evidence);
-    }
-    if let Some((_, evidence)) = live_preconditions.dns_record_state {
-        envelope.evidence.insert(0, evidence);
-    }
+    prepend_prepared_plan_evidence(&mut envelope, live_preconditions);
     Ok(envelope)
+}
+
+fn prepend_prepared_plan_evidence(
+    envelope: &mut ResultEnvelopeV2,
+    live_preconditions: LivePlanPreconditions,
+) {
+    for (_, evidence) in [
+        live_preconditions.entitlement,
+        live_preconditions.zone_account,
+        live_preconditions.global_warp_override_state,
+        live_preconditions.d1_read_replication_state,
+        live_preconditions.cloudflare_tunnel_configuration_state,
+        live_preconditions.warp_connector_configuration_state,
+        live_preconditions.web_analytics_rum_state,
+        live_preconditions.dns_record_state,
+        live_preconditions.r2_parent_token,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        envelope.evidence.insert(0, evidence);
+    }
+}
+
+fn validate_prepared_r2_parent_token_contract(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    profile: &ProfileMetadata,
+    account_id: &str,
+    live_preconditions: &LivePlanPreconditions,
+) -> Result<()> {
+    if !is_r2_temporary_credentials_operation_identity(capability) {
+        return Ok(());
+    }
+    if !should_bind_r2_parent_token(capability) || profile.kind != ProfileKind::ApiToken {
+        return Err(CliError::Input(
+            "R2 temporary credential plan is inconsistent with its governed active API-token parent contract"
+                .to_owned(),
+        ));
+    }
+    let (receipt, _) = live_preconditions.r2_parent_token.as_ref().ok_or_else(|| {
+        CliError::Input(
+            "R2 temporary credential plan is missing its live parent-token receipt".to_owned(),
+        )
+    })?;
+    let parent = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("parentAccessKeyId"))
+        .and_then(Value::as_str);
+    if receipt.get("account_id").and_then(Value::as_str) != Some(account_id)
+        || receipt.get("parent_access_key_id").and_then(Value::as_str) != parent
+    {
+        return Err(CliError::Input(
+            "R2 temporary credential parent-token receipt does not match the planned account and request"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_api_token_creation_contract(
@@ -4367,6 +4797,14 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     preflight_secret_sink(&plan)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(Some(&plan.profile_id))?;
+    if is_r2_temporary_credentials_operation_identity(&plan.capability)
+        && profile.kind != ProfileKind::ApiToken
+    {
+        return Err(CliError::Input(
+            "R2 temporary credential plan no longer selects its required scoped API-token profile; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
     let secrets = platform_secrets(store);
     let credential = fresh_credential(profile, &secrets).await?;
     let execution_input = resolved_plan_input(&plan, &secrets)?;
@@ -4802,6 +5240,7 @@ struct LivePreconditionEvidence {
     web_analytics_rum_state: Option<EvidenceV1>,
     dns_record_state: Option<EvidenceV1>,
     oauth_client_secret_state: Option<EvidenceV1>,
+    r2_parent_token: Option<EvidenceV1>,
 }
 
 async fn validate_live_plan_precondition_evidence(
@@ -4860,6 +5299,10 @@ async fn validate_live_plan_precondition_evidence(
         )
         .await?,
         oauth_client_secret_state: validate_live_oauth_client_secret_state_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        r2_parent_token: validate_live_r2_parent_token_precondition(
             store, catalog, plan, input, credential,
         )
         .await?,
@@ -4930,6 +5373,7 @@ fn prepend_live_precondition_evidence(
     evidence: LivePreconditionEvidence,
 ) {
     for item in [
+        evidence.r2_parent_token,
         evidence.oauth_client_secret_state,
         evidence.dns_record_state,
         evidence.web_analytics_rum_state,
@@ -4947,6 +5391,125 @@ fn prepend_live_precondition_evidence(
     {
         envelope.evidence.insert(0, item);
     }
+}
+
+async fn validate_live_r2_parent_token_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_r2_parent_token_precondition(plan)? else {
+        return Ok(None);
+    };
+    let mut current_input = input.clone();
+    let (receipt, evidence) = read_live_r2_parent_token(
+        store,
+        catalog,
+        &plan.capability,
+        &mut current_input,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "active R2 parent-token identity or status drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
+}
+
+fn validate_r2_parent_token_receipt(plan: &PlanV1, receipt: &Value) -> Result<()> {
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let parent_access_key_id = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("parentAccessKeyId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "R2 temporary credential plan omitted its derived parent access-key id; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let delegated_scope = r2_delegated_scope(&input)?;
+    let permission = delegated_scope
+        .get("permission")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "R2 temporary credential plan omitted its delegated permission; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let expected_permission_contract = r2_parent_permission_contract(permission)?;
+    let exact = receipt.as_object().is_some_and(|object| object.len() == 12)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("source_capability_id").and_then(Value::as_str)
+            == Some(R2_PARENT_TOKEN_VERIFY_CAPABILITY_ID)
+        && receipt.get("source_path").and_then(Value::as_str) == Some(R2_PARENT_TOKEN_VERIFY_PATH)
+        && receipt.get("target_capability_id").and_then(Value::as_str)
+            == Some(plan.capability.id.as_str())
+        && receipt.get("target_method").and_then(Value::as_str)
+            == Some(plan.capability.method.as_str())
+        && receipt.get("target_path").and_then(Value::as_str)
+            == Some(plan.capability.path.as_str())
+        && receipt.get("target_scope").and_then(Value::as_str) == Some("account")
+        && receipt.get("account_id").and_then(Value::as_str) == Some(plan.account_id.as_str())
+        && receipt.get("parent_access_key_id").and_then(Value::as_str)
+            == Some(parent_access_key_id)
+        && receipt.get("token_status").and_then(Value::as_str) == Some("active")
+        && receipt.get("delegated_scope") == Some(&delegated_scope)
+        && receipt.get("parent_permission_contract") == Some(&expected_permission_contract);
+    if !exact {
+        return Err(CliError::Input(
+            "R2 temporary credential parent-token receipt has an invalid source, account, scope, permission, or active-token shape; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn required_r2_parent_token_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    if !is_r2_temporary_credentials_operation_identity(&plan.capability) {
+        return Ok(None);
+    }
+    if !should_bind_r2_parent_token(&plan.capability) || plan.permission_lane != "api_token" {
+        return Err(CliError::Input(
+            "R2 temporary credential plan is inconsistent with its hash-bound scoped API-token parent contract; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(R2_PARENT_TOKEN_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the live R2 parent-token contract; create a new plan".to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/r2_parent_token")
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the hash-bound R2 parent-token receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    validate_r2_parent_token_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "plan R2 parent-token receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
 }
 
 async fn validate_live_global_warp_override_state_precondition(
@@ -8693,6 +9256,7 @@ fn is_live_plan_precondition_hash(name: &str) -> bool {
             | WARP_CONNECTOR_CONFIGURATION_STATE_PRECONDITION
             | WEB_ANALYTICS_RUM_STATE_PRECONDITION
             | DNS_RECORD_STATE_PRECONDITION
+            | R2_PARENT_TOKEN_PRECONDITION
     )
 }
 
@@ -8968,7 +9532,9 @@ fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
         argv.push("--body-stdin".to_owned());
     }
     if is_secret_output_capability(capability) {
-        let sink = if is_access_service_token_create_capability(capability) {
+        let sink = if is_access_service_token_create_capability(capability)
+            || is_r2_temporary_credentials_operation_identity(capability)
+        {
             "<new-mode-0600-json-path>"
         } else {
             "<new-mode-0600-path>"
@@ -9710,6 +10276,27 @@ fn sink_secret_result(plan: &PlanV1, result: &Value) -> Result<PathBuf> {
 }
 
 fn secret_sink_payload(capability: &CapabilityV1, result: &Value) -> Result<Vec<u8>> {
+    if is_r2_temporary_credentials_operation_identity(capability) {
+        let required = |field: &'static str| {
+            result
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    CliError::Input(format!(
+                        "Cloudflare reported R2 temporary-credential success without non-empty `{field}`; no credential sink was created and the operation requires rectification"
+                    ))
+                })
+        };
+        let access_key_id = required("accessKeyId")?;
+        let secret_access_key = required("secretAccessKey")?;
+        let session_token = required("sessionToken")?;
+        return Ok(serde_json::to_vec(&json!({
+            "accessKeyId": access_key_id,
+            "secretAccessKey": secret_access_key,
+            "sessionToken": session_token,
+        }))?);
+    }
     if is_access_service_token_create_capability(capability) {
         let client_id = result
             .get("client_id")
@@ -9774,6 +10361,8 @@ fn is_access_service_token_create_capability(capability: &CapabilityV1) -> bool 
 fn secret_sink_format(capability: &CapabilityV1) -> Option<&'static str> {
     if !is_secret_output_capability(capability) {
         None
+    } else if is_r2_temporary_credentials_operation_identity(capability) {
+        Some("r2_temporary_credentials_json")
     } else if is_access_service_token_create_capability(capability) {
         Some("access_service_token_json")
     } else {
@@ -9797,11 +10386,13 @@ fn is_secret_output_capability(capability: &CapabilityV1) -> bool {
     (capability.risk == RiskClass::SecretSensitive
         && !is_worker_script_secret_input_only_capability(capability))
         || is_access_service_token_create_capability(capability)
+        || is_r2_temporary_credentials_operation_identity(capability)
 }
 
 fn should_redact_secret_response(capability: &CapabilityV1) -> bool {
     capability.risk == RiskClass::SecretSensitive
         || is_access_service_token_create_capability(capability)
+        || is_r2_temporary_credentials_operation_identity(capability)
 }
 
 fn is_worker_script_secret_input_only_capability(capability: &CapabilityV1) -> bool {
@@ -9869,6 +10460,9 @@ fn redact_secret_payload(value: &Value, root: bool) -> Value {
                             | "text"
                             | "key_base64"
                             | "key_jwk"
+                            | "accessKeyId"
+                            | "secretAccessKey"
+                            | "sessionToken"
                     ) {
                         (key.clone(), Value::String("[SUNK]".to_owned()))
                     } else {
@@ -10068,7 +10662,7 @@ mod tests {
         apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
         apply_dns_record_state_response, apply_global_warp_override_state_response,
-        apply_oauth_client_secret_state_response,
+        apply_oauth_client_secret_state_response, apply_r2_parent_token_response,
         apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
         apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
         bind_required_empty_compensation_body, boundary_response_artifact, call_command,
@@ -10078,14 +10672,14 @@ mod tests {
         key_policy_list, key_policy_revoke, non_readback_verification_basis,
         permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
         persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
-        preflight_call_input, preflight_standing_authority, preserve_previous_catalog,
-        query_object_from_pairs, read_import_secret, read_secret_file,
+        preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
+        preserve_previous_catalog, query_object_from_pairs, read_import_secret, read_secret_file,
         reconcile_standing_lineage_from_plan, rectify_plan, redact_secret_result,
         request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
-        required_oauth_client_secret_state_precondition,
+        required_oauth_client_secret_state_precondition, required_r2_parent_token_precondition,
         required_warp_connector_configuration_state_precondition,
         required_web_analytics_rum_state_precondition, required_zone_account_precondition,
         secret_sink_format, should_bind_cloudflare_tunnel_configuration_state,
@@ -10215,6 +10809,7 @@ mod tests {
             "warp_connector_configuration_state"
         ));
         assert!(is_live_plan_precondition_hash("web_analytics_rum_state"));
+        assert!(is_live_plan_precondition_hash("r2_parent_token"));
         assert!(!is_live_plan_precondition_hash("workspace_graph"));
     }
 
@@ -11163,6 +11758,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
                 d1_empty_database_state: None,
@@ -12119,6 +12715,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                r2_parent_token: None,
                 global_warp_override_state: Some((receipt.clone(), receipt_evidence)),
                 d1_read_replication_state: None,
                 d1_empty_database_state: None,
@@ -12204,6 +12801,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: Some((receipt.clone(), receipt_evidence)),
                 d1_empty_database_state: None,
@@ -12294,6 +12892,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
                 d1_empty_database_state: None,
@@ -12380,6 +12979,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
                 cloudflare_tunnel_configuration_state: None,
@@ -12460,6 +13060,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
                 cloudflare_tunnel_configuration_state: None,
@@ -12556,6 +13157,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
                 cloudflare_tunnel_configuration_state: None,
@@ -15789,6 +16391,249 @@ mod tests {
         assert_eq!(redacted["result"]["status"], "active");
         assert_eq!(redacted["result"]["value"], "[SUNK]");
         assert!(!redacted.to_string().contains("must-not-survive"));
+    }
+
+    fn r2_temporary_credentials_capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            "r2-create-temp-access-credentials",
+            "Create Temporary Access Credentials",
+            "POST",
+            "/accounts/{account_id}/r2/temp-access-credentials",
+        );
+        capability.product = "R2 Bucket".to_owned();
+        capability.account_scope = "account".to_owned();
+        capability.permissions = vec![
+            "Workers R2 Storage Write".to_owned(),
+            "Workers R2 Storage Read".to_owned(),
+            "Workers R2 Storage Bucket Item Write".to_owned(),
+            "Workers R2 Storage Bucket Item Read".to_owned(),
+            "Workers R2 Data Catalog Write".to_owned(),
+            "Workers R2 Data Catalog Read".to_owned(),
+        ];
+        capability.risk = RiskClass::SecretSensitive;
+        capability.effect = EffectClass::IdentityOrOwnership;
+        capability.verification.required = false;
+        capability.verification.strategy = "sink_write_and_source_response_status".to_owned();
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "required":["bucket","permission","ttlSeconds","parentAccessKeyId"],
+            "properties":{
+                "bucket":{"type":"string"},
+                "objects":{"type":"array","items":{"type":"string"}},
+                "parentAccessKeyId":{"type":"string","x-cfctl-derived-from-active-profile":true},
+                "permission":{"type":"string","enum":["admin-read-write","admin-read-only","object-read-write","object-read-only"]},
+                "prefixes":{"type":"array","items":{"type":"string"}},
+                "ttlSeconds":{"type":"number","maximum":604_800}
+            },
+            "x-cfctl-body-required":true
+        }));
+        capability
+    }
+
+    #[test]
+    fn r2_parent_identity_is_derived_from_the_active_profile_and_hash_bound() {
+        let capability = r2_temporary_credentials_capability();
+        let mut input = CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            body: Some(json!({
+                "bucket":"uploads",
+                "permission":"object-read-write",
+                "ttlSeconds":900,
+                "prefixes":["user-7/"]
+            })),
+            ..CallInput::default()
+        };
+        prepare_r2_temporary_credentials_input(&capability, &mut input)
+            .expect("cfctl parent placeholder");
+        assert_eq!(
+            input.body.as_ref().expect("body")["parentAccessKeyId"],
+            "$cfctl_active_profile_token_id"
+        );
+
+        let receipt = apply_r2_parent_token_response(
+            &capability,
+            "account-a",
+            &mut input,
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: json!({"id":"0123456789abcdef0123456789abcdef","status":"active"}),
+                errors: vec![],
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect("active parent token receipt");
+        assert_eq!(
+            input.body.as_ref().expect("body")["parentAccessKeyId"],
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(receipt["token_status"], "active");
+        assert_eq!(receipt["account_id"], "account-a");
+        assert_eq!(
+            receipt["parent_permission_contract"]["rule"],
+            "temporary_scope_must_not_exceed_parent"
+        );
+        assert_eq!(
+            receipt["parent_permission_contract"]["requested_scope"],
+            "object-read-write"
+        );
+        assert_eq!(
+            receipt["parent_permission_contract"]["allowed_capabilities"],
+            json!(["object_read", "object_write", "object_list"])
+        );
+
+        let plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"live_preconditions":{"r2_parent_token":receipt.clone()}}),
+        )
+        .expect("plan");
+        let mut plan = plan;
+        plan.permission_lane = "api_token".to_owned();
+        plan.input = serde_json::to_value(&input).expect("plan input");
+        plan.precondition_hashes.insert(
+            "r2_parent_token".to_owned(),
+            hash_value(&receipt).expect("receipt hash"),
+        );
+        assert_eq!(
+            required_r2_parent_token_precondition(&plan).expect("precondition"),
+            plan.precondition_hashes
+                .get("r2_parent_token")
+                .map(String::as_str)
+        );
+    }
+
+    #[test]
+    fn r2_parent_identity_rejects_caller_control_and_inactive_tokens() {
+        let capability = r2_temporary_credentials_capability();
+        let mut controlled = CallInput {
+            body: Some(json!({
+                "bucket":"uploads",
+                "permission":"object-read-only",
+                "ttlSeconds":900,
+                "parentAccessKeyId":"attacker-selected-token"
+            })),
+            ..CallInput::default()
+        };
+        let error = prepare_r2_temporary_credentials_input(&capability, &mut controlled)
+            .expect_err("caller-selected parent must fail")
+            .to_string();
+        assert!(error.contains("omit `parentAccessKeyId`"), "{error}");
+
+        let mut derived = CallInput {
+            body: Some(json!({
+                "bucket":"uploads",
+                "permission":"object-read-only",
+                "ttlSeconds":900
+            })),
+            ..CallInput::default()
+        };
+        prepare_r2_temporary_credentials_input(&capability, &mut derived)
+            .expect("cfctl parent placeholder");
+        let error = apply_r2_parent_token_response(
+            &capability,
+            "account-a",
+            &mut derived,
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: json!({"id":"0123456789abcdef0123456789abcdef","status":"disabled"}),
+                errors: vec![],
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect_err("inactive token must fail")
+        .to_string();
+        assert!(error.contains("not active"), "{error}");
+    }
+
+    #[test]
+    fn r2_temporary_credentials_use_a_complete_mode_0600_json_sink() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("r2-temporary-credentials.json");
+        let capability = r2_temporary_credentials_capability();
+        let plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"adapter":{"value_out":path}}),
+        )
+        .expect("plan");
+        let result = json!({
+            "accessKeyId":"temporary-access-key",
+            "secretAccessKey":"temporary-secret-key-must-not-leak",
+            "sessionToken":"temporary-session-token-must-not-leak"
+        });
+
+        sink_secret_result(&plan, &result).expect("complete credential sink");
+        let payload: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("credential bundle contents"))
+                .expect("credential bundle JSON");
+        assert_eq!(payload, result);
+        assert_eq!(
+            secret_sink_format(&plan.capability),
+            Some("r2_temporary_credentials_json")
+        );
+        assert_eq!(
+            capability_call_argv(&plan.capability)
+                .iter()
+                .find(|argument| argument.contains("0600"))
+                .map(String::as_str),
+            Some("<new-mode-0600-json-path>")
+        );
+        let mut risk_metadata_drift = plan.capability.clone();
+        risk_metadata_drift.risk = RiskClass::Unknown;
+        assert!(is_secret_output_capability(&risk_metadata_drift));
+        assert_eq!(
+            secret_sink_format(&risk_metadata_drift),
+            Some("r2_temporary_credentials_json")
+        );
+        let redacted = redact_secret_result(&json!({"success":true,"result":result}));
+        assert_eq!(redacted["result"]["accessKeyId"], "[SUNK]");
+        assert_eq!(redacted["result"]["secretAccessKey"], "[SUNK]");
+        assert_eq!(redacted["result"]["sessionToken"], "[SUNK]");
+        assert!(!redacted.to_string().contains("must-not-leak"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("sink metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn r2_temporary_credentials_reject_incomplete_bundle_before_file_creation() {
+        for result in [
+            json!({"accessKeyId":"key","secretAccessKey":"secret"}),
+            json!({"accessKeyId":"key","sessionToken":"session"}),
+            json!({"secretAccessKey":"secret","sessionToken":"session"}),
+        ] {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = directory.path().join("r2-temporary-credentials.json");
+            let plan = PlanV1::draft(
+                "profile-a",
+                "account-a",
+                "catalog-sha",
+                r2_temporary_credentials_capability(),
+                json!({"adapter":{"value_out":path}}),
+            )
+            .expect("plan");
+            assert!(sink_secret_result(&plan, &result).is_err());
+            assert!(!path.exists());
+        }
     }
 
     #[test]

@@ -1193,6 +1193,212 @@ fn workers_kv_namespace_classifier_rejects_legacy_route_and_contract_drift() {
     }
 }
 
+fn r2_temporary_credentials_fixture() -> Value {
+    json!({
+        "openapi": "3.0.3",
+        "info": {"title": "Cloudflare API", "version": "4.0.0"},
+        "servers": [{"url": "https://api.cloudflare.com/client/v4"}],
+        "components": {
+            "schemas": {
+                "identifier": {"type": "string", "maxLength": 32},
+                "api-response-common": {
+                    "type": "object",
+                    "required": ["success"],
+                    "properties": {"success": {"type": "boolean"}}
+                },
+                "token-verify-result": {
+                    "type": "object",
+                    "required": ["id", "status"],
+                    "properties": {
+                        "id": {"type": "string", "maxLength": 32},
+                        "status": {"type": "string", "enum": ["active", "disabled", "expired"]},
+                        "expires_on": {"type": "string", "format": "date-time"},
+                        "not_before": {"type": "string", "format": "date-time"}
+                    }
+                },
+                "temporary-credentials-request": {
+                    "type": "object",
+                    "required": ["bucket", "permission", "ttlSeconds", "parentAccessKeyId"],
+                    "properties": {
+                        "bucket": {"type": "string"},
+                        "objects": {"type": "array", "items": {"type": "string"}},
+                        "parentAccessKeyId": {"type": "string"},
+                        "permission": {
+                            "type": "string",
+                            "enum": [
+                                "admin-read-write",
+                                "admin-read-only",
+                                "object-read-write",
+                                "object-read-only"
+                            ]
+                        },
+                        "prefixes": {"type": "array", "items": {"type": "string"}},
+                        "ttlSeconds": {"type": "number", "maximum": 604_800}
+                    }
+                },
+                "temporary-credentials-result": {
+                    "type": "object",
+                    "properties": {
+                        "accessKeyId": {"type": "string"},
+                        "secretAccessKey": {"type": "string", "x-sensitive": true},
+                        "sessionToken": {"type": "string", "x-sensitive": true}
+                    }
+                }
+            }
+        },
+        "paths": {
+            "/user/tokens/verify": {
+                "get": {
+                    "operationId": "user-api-tokens-verify-token",
+                    "summary": "Verify Token",
+                    "tags": ["User API Tokens"],
+                    "responses": {"200": {"description": "Verify token response", "content": {
+                        "application/json": {"schema": {"allOf": [
+                            {"$ref": "#/components/schemas/api-response-common"},
+                            {"type": "object", "properties": {
+                                "result": {"$ref": "#/components/schemas/token-verify-result"}
+                            }}
+                        ]}}
+                    }}}
+                }
+            },
+            "/accounts/{account_id}/r2/temp-access-credentials": {
+                "post": {
+                    "operationId": "r2-create-temp-access-credentials",
+                    "summary": "Create Temporary Access Credentials",
+                    "description": "Creates temporary access credentials on a bucket that can be optionally scoped to prefixes or objects.",
+                    "tags": ["R2 Bucket"],
+                    "parameters": [{
+                        "in": "path",
+                        "name": "account_id",
+                        "required": true,
+                        "schema": {"$ref": "#/components/schemas/identifier"},
+                        "description": "Account ID."
+                    }],
+                    "requestBody": {"required": true, "content": {"application/json": {
+                        "schema": {"$ref": "#/components/schemas/temporary-credentials-request"}
+                    }}},
+                    "responses": {"200": {"description": "Temporary credentials response", "content": {
+                        "application/json": {"schema": {"allOf": [
+                            {"$ref": "#/components/schemas/api-response-common"},
+                            {"type": "object", "properties": {
+                                "result": {"$ref": "#/components/schemas/temporary-credentials-result"}
+                            }}
+                        ]}}
+                    }}}
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn r2_temporary_credentials_are_parent_bound_sink_only_and_zero_direct_cost() {
+    let snapshot = normalize_openapi(&r2_temporary_credentials_fixture())
+        .expect("R2 temporary credentials catalog");
+    let capability = snapshot
+        .get("r2-create-temp-access-credentials")
+        .expect("R2 temporary credentials");
+
+    assert_eq!(
+        capability.adapter_status,
+        AdapterStatus::DynamicApi,
+        "{:?}",
+        capability.blocked_reason
+    );
+    assert_eq!(capability.risk, RiskClass::SecretSensitive);
+    assert_eq!(capability.effect, EffectClass::IdentityOrOwnership);
+    assert_eq!(
+        capability.permissions,
+        [
+            "Workers R2 Storage Write",
+            "Workers R2 Storage Read",
+            "Workers R2 Storage Bucket Item Write",
+            "Workers R2 Storage Bucket Item Read",
+            "Workers R2 Data Catalog Write",
+            "Workers R2 Data Catalog Read",
+        ]
+    );
+    assert!(capability.cost.known);
+    assert!(!capability.cost.incremental);
+    assert_eq!(capability.cost.maximum, Some(0.0));
+    assert_eq!(capability.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(capability.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(capability.entitlement.available, Some(true));
+    assert_eq!(
+        capability.entitlement.plans.get("r2_active_subscription"),
+        Some(&true)
+    );
+    assert!(!capability.entitlement.requires_live_resolution);
+    assert_eq!(
+        capability.verification.strategy,
+        "sink_write_and_source_response_status"
+    );
+    assert!(!capability.verification.required);
+    assert!(!capability.rollback.supported);
+    assert!(
+        capability
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| {
+                warning.contains("expires automatically")
+                    && warning.contains("parent API token")
+                    && warning.contains("cannot be revoked individually")
+            })
+    );
+    assert_eq!(
+        capability
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema
+                .pointer("/properties/parentAccessKeyId/x-cfctl-derived-from-active-profile"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(capability.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn r2_temporary_credentials_classifier_rejects_request_response_and_verify_drift() {
+    let mut ttl = r2_temporary_credentials_fixture();
+    ttl["components"]["schemas"]["temporary-credentials-request"]["properties"]["ttlSeconds"]["maximum"] =
+        json!(1_209_600);
+    assert_eq!(
+        normalize_openapi(&ttl)
+            .expect("TTL-drifted catalog")
+            .get("r2-create-temp-access-credentials")
+            .expect("R2 temporary credentials")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+
+    let mut response = r2_temporary_credentials_fixture();
+    response["components"]["schemas"]["temporary-credentials-result"]["properties"]
+        .as_object_mut()
+        .expect("result properties")
+        .remove("sessionToken");
+    assert_eq!(
+        normalize_openapi(&response)
+            .expect("response-drifted catalog")
+            .get("r2-create-temp-access-credentials")
+            .expect("R2 temporary credentials")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+
+    let mut verify = r2_temporary_credentials_fixture();
+    verify["paths"]["/user/tokens/verify"]["get"]["operationId"] = json!("untrusted-token-verify");
+    assert_eq!(
+        normalize_openapi(&verify)
+            .expect("verify-drifted catalog")
+            .get("r2-create-temp-access-credentials")
+            .expect("R2 temporary credentials")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+}
+
 fn assert_nested_replication_schema(schema: &serde_json::Value) {
     assert_eq!(schema["properties"]["replication"]["type"], "object");
     assert_eq!(
