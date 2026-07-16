@@ -22,7 +22,7 @@ cfctl is a local-first, catalog-driven control plane: it separates intent, live 
 
 **What grants authority?** The deterministic policy engine grants automatic admission only to the narrow safe class. Otherwise authority is either explicit approval of one reviewed operation ID or explicit approval of one bounded standing token policy. A model never grants authority.
 
-**What is persisted?** cfctl persists plans, approval and admission checkpoints, transaction journals, standing-authority records, locks, and redacted evidence under its managed state root. Credential values remain in the platform secret store or an explicit mode-0600 sink.
+**What is persisted?** Under its managed state root, cfctl persists profile metadata, the live CapabilityV1 catalog and official-doc caches, workspace registrations and imports, plans, approval and admission checkpoints, transaction journals, standing-authority records, locks, and redacted evidence. Credential values remain in the platform secret store or an explicit mode-0600 sink. The source checkout's compat/v1 tree is inert migration evidence, not runtime state or a live catalog.
 
 **What happens after a failure or crash?** Once consumption or a boundary attempt is durable, cfctl never guesses that replay is safe. Inspect `plans status`; use `plans rectify` to reconcile durable receipts and verification without replaying the original Cloudflare mutation.
 
@@ -378,7 +378,9 @@ not verification.
 content-addressed imports. It skips secret-shaped paths/content and never
 imports credentials implicitly. The original dirty shell runtime was frozen
 before cutover in the gitignored private v1 archive for the one-release
-compatibility window.
+compatibility window. This checkout's retained v1 data is quarantined under
+[`compat/v1/`](compat/v1/README.md); the live v2 catalog is managed under
+`CFCTL_HOME`, not loaded from that retained tree.
 
 ## Development and release
 

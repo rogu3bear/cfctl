@@ -32,6 +32,7 @@ all other static proof moved into Rust tests and `xtask`.
 
 The exact behavioral disposition is recorded in
 [`compat/v1-parity-audit.json`](../../../compat/v1-parity-audit.json). Checked-in
-v1 desired state remains inert migration input during the one-release window;
-the static v1 catalog remains non-executable reference data. Neither is a
-public command contract.
+v1 desired state and the static v1 catalog are quarantined under `compat/v1/`
+during the one-release window. The former remains inert migration input and
+the latter remains non-executable reference data. Neither is a public command
+contract.

@@ -46,7 +46,9 @@ The account-backed disposable token lifecycle remains
 an existing selected profile plus an explicit acknowledgement and performs its
 own revoke compensation.
 
-The checked-in `state/` tree is inert desired-state input for the compatibility
-window. `cfctl migrate v1` copies only safe desired state and evidence into
-content-addressed imports and never imports credentials. The checked-in static
-v1 `catalog/` is non-executable reference data and is not loaded by Rust v2.
+The checked-in `compat/v1/state/` tree is inert desired-state input for the
+compatibility window. `cfctl migrate v1` copies only safe desired state and
+evidence into content-addressed imports and never imports credentials. The
+checked-in static v1 `compat/v1/catalog/` tree is non-executable reference data
+and is not loaded by Rust v2. External v1 workspaces may still migrate their
+top-level `state/` tree when the quarantined repo-local root is absent.

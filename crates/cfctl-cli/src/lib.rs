@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use cfctl_core::{RETIRED_V1_PUBLIC_VERBS, RETIRED_V1_SURFACES};
 use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum};
 
 mod profiles;
@@ -471,7 +472,10 @@ where
     let Some(first) = remaining.first() else {
         return InvocationMode::Deterministic;
     };
-    if first.starts_with('-') || is_known_subcommand(first) {
+    if first.starts_with('-')
+        || is_known_subcommand(first)
+        || is_retired_v1_command_shape(&remaining)
+    {
         return InvocationMode::Deterministic;
     }
     // A bare single token is far more likely a mistyped subcommand than a
@@ -482,6 +486,23 @@ where
         return InvocationMode::Deterministic;
     }
     InvocationMode::NaturalLanguage(remaining.join(" "))
+}
+
+fn is_retired_v1_command_shape(arguments: &[String]) -> bool {
+    let Some(first) = arguments.first().map(String::as_str) else {
+        return false;
+    };
+    if !RETIRED_V1_PUBLIC_VERBS.contains(&first) {
+        return false;
+    }
+    let second = arguments.get(1).map(String::as_str);
+    match first {
+        "apply" | "can" | "classify" | "diff" | "explain" | "get" | "list" | "snapshot"
+        | "verify" => second.is_some_and(|surface| RETIRED_V1_SURFACES.contains(&surface)),
+        "audit" => false,
+        "token" => second.is_some_and(|action| matches!(action, "mint" | "revoke")),
+        _ => true,
+    }
 }
 
 fn is_known_subcommand(name: &str) -> bool {

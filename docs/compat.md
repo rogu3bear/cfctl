@@ -8,6 +8,11 @@ See the [human audit](v1-parity.md) and
 run `cfctl migrate v1` from a v1 checkout to import safe desired state and
 evidence. Credentials and secret-shaped content are never migrated.
 
+This repository's own retained v1 state and static catalog are quarantined
+under [`compat/v1/`](../compat/v1/README.md). They are evidence, not a second
+public command surface. The live v2 catalog is the managed `CapabilityV1`
+catalog under `CFCTL_HOME`.
+
 The pre-release `wrangler_session` profile kind is accepted only as inert
 metadata so affected profile stores remain inspectable. It cannot be selected
 or used as a credential. `cfctl doctor --json` reports the exact metadata-only

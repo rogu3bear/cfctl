@@ -29,9 +29,10 @@ use cfctl_cloudflare::{
 };
 use cfctl_core::{
     AdapterStatus, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1, ErrorV1, EvidenceClass,
-    EvidenceV1, GuideActionV1, GuideContractStateV1, GuideTopicV1, MoneyV1, PlanStatus, PlanV1,
-    PolicyDisposition, ResultEnvelopeV2, RiskClass, StandingAuthorityV1, TransactionStageV1,
-    VerificationState, guide_stages, guide_topic_document, hash_value, redact_json,
+    EvidenceV1, GuideActionV1, GuideContractStateV1, GuideTopicDocumentV1, GuideTopicV1, MoneyV1,
+    PlanStatus, PlanV1, PolicyDisposition, ResultEnvelopeV2, RiskClass, StandingAuthorityV1,
+    TransactionStageV1, VerificationState, guide_stages, guide_topic_document, hash_value,
+    redact_json, render_guide_topic_document_markdown,
 };
 use cfctl_planner::{ImpactContext, PolicyEngine};
 use cfctl_storage::{RuntimePaths, StateStore};
@@ -159,6 +160,13 @@ pub fn render(envelope: &ResultEnvelopeV2, json_output: bool) -> Result<String> 
             .map(|step| format!("\nNext: {step}"))
             .unwrap_or_default();
         return Ok(format!("Error: {}{next}\n", error.message));
+    }
+    if envelope.command == "guide"
+        && envelope.result.get("topic").is_some()
+        && let Ok(document) =
+            serde_json::from_value::<GuideTopicDocumentV1>(envelope.result.clone())
+    {
+        return Ok(render_guide_topic_document_markdown(&document));
     }
     if let Some(message) = envelope.result.get("message").and_then(Value::as_str) {
         return Ok(format!("{message}\n"));
@@ -7708,7 +7716,15 @@ fn migrate_command(store: &StateStore, command: MigrateCommand) -> Result<Result
             let cwd = env::current_dir().map_err(|source| cli_io(Path::new("."), source))?;
             let mut imported = Vec::new();
             let mut skipped = Vec::new();
-            for source_root in ["state", "var/inventory"] {
+            let retained_repo_state = "compat/v1/state";
+            let state_source = if cwd.join(retained_repo_state).is_dir() {
+                retained_repo_state
+            } else {
+                "state"
+            };
+            for (source_root, import_label) in
+                [(state_source, "state"), ("var/inventory", "var/inventory")]
+            {
                 let root = cwd.join(source_root);
                 if !root.is_dir() {
                     continue;
@@ -7744,7 +7760,7 @@ fn migrate_command(store: &StateStore, command: MigrateCommand) -> Result<Result
                     let destination = store.write_import(
                         &Path::new("v1")
                             .join(digest)
-                            .join(source_root)
+                            .join(import_label)
                             .join(source_relative),
                         content.as_bytes(),
                     )?;
