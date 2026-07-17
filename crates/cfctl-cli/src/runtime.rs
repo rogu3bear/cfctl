@@ -13455,7 +13455,10 @@ mod tests {
         let envelope = blocked_capability_envelope(
             "call",
             &capability,
-            capability.blocked_reason.as_deref().unwrap(),
+            capability
+                .blocked_reason
+                .as_deref()
+                .expect("blocked reason fixture"),
         );
         assert!(!envelope.ok);
         assert_eq!(envelope.capability_id.as_deref(), Some("cache-purge"));
