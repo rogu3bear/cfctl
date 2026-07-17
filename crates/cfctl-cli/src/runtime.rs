@@ -1025,13 +1025,14 @@ async fn execute_read(
             );
         }
         AdapterStatus::Blocked => {
-            return Err(CliError::Input(format!(
-                "capability is blocked: {}",
+            return Ok(blocked_capability_envelope(
+                "call",
+                capability,
                 capability
                     .blocked_reason
                     .as_deref()
-                    .unwrap_or("no executable adapter is available")
-            )));
+                    .unwrap_or("no executable adapter is available"),
+            ));
         }
         AdapterStatus::Native | AdapterStatus::DynamicApi => {}
     }
@@ -3763,10 +3764,11 @@ fn persist_prepared_plan(
     let impact = plan_impact(store, &capability, &input, account_id)?;
     let policy = PolicyEngine.evaluate(&capability, &impact.policy);
     if policy.disposition == PolicyDisposition::Blocked {
-        return Err(CliError::Input(format!(
-            "capability is blocked: {}",
-            policy.reasons.join("; ")
-        )));
+        return Ok(blocked_capability_envelope(
+            "call",
+            &capability,
+            &policy.reasons.join("; "),
+        ));
     }
     let targets = plan_targets(&input, account_id, &adapter_targets, &live_preconditions);
     let mut plan = PlanV1::draft(
@@ -4283,11 +4285,18 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     }
     validate_plan_preconditions(store, &plan)?;
     if plan.capability.adapter_status == AdapterStatus::Blocked {
-        return Err(CliError::Input(
-            plan.capability.blocked_reason.clone().unwrap_or_else(|| {
-                "the approved capability no longer has an executable adapter".to_owned()
-            }),
-        ));
+        let mut envelope = blocked_capability_envelope(
+            "plans run",
+            &plan.capability,
+            plan.capability
+                .blocked_reason
+                .as_deref()
+                .unwrap_or("the approved capability no longer has an executable adapter"),
+        );
+        envelope.operation_id = Some(plan.operation_id.clone());
+        envelope.profile_id = Some(plan.profile_id.clone());
+        envelope.account_id = Some(plan.account_id.clone());
+        return Ok(envelope);
     }
     preflight_secret_sink(&plan)?;
     let profiles = ProfilesConfig::load(store)?;
@@ -4356,11 +4365,18 @@ async fn run_plan_under_standing_authority(
     }
     validate_plan_preconditions(store, &plan)?;
     if plan.capability.adapter_status == AdapterStatus::Blocked {
-        return Err(CliError::Input(
-            plan.capability.blocked_reason.clone().unwrap_or_else(|| {
-                "the approved capability no longer has an executable adapter".to_owned()
-            }),
-        ));
+        let mut envelope = blocked_capability_envelope(
+            "plans run",
+            &plan.capability,
+            plan.capability
+                .blocked_reason
+                .as_deref()
+                .unwrap_or("the approved capability no longer has an executable adapter"),
+        );
+        envelope.operation_id = Some(plan.operation_id.clone());
+        envelope.profile_id = Some(plan.profile_id.clone());
+        envelope.account_id = Some(plan.account_id.clone());
+        return Ok(envelope);
     }
     preflight_secret_sink(&plan)?;
     let profiles = ProfilesConfig::load(store)?;
@@ -6424,6 +6440,26 @@ struct ApiVerificationOutcome {
     basis: String,
     evidence: Option<EvidenceV1>,
     error: Option<ErrorV1>,
+}
+
+fn blocked_capability_envelope(
+    command: &str,
+    capability: &cfctl_core::CapabilityV1,
+    reason: &str,
+) -> ResultEnvelopeV2 {
+    let next_step = format!(
+        "Run `cfctl guide {} --json` and follow next_action; never bypass the blocker.",
+        capability.id
+    );
+    let mut envelope = ResultEnvelopeV2::failure(
+        command,
+        "CFCTL_CAPABILITY_BLOCKED",
+        &format!("capability is blocked: {reason}"),
+        Some(&next_step),
+    );
+    envelope.capability_id = Some(capability.id.clone());
+    envelope.result = json!({ "blocking_gaps": capability.mutation_contract_gaps() });
+    envelope
 }
 
 fn post_boundary_failure_envelope(
@@ -9948,11 +9984,11 @@ mod tests {
         apply_oauth_client_secret_state_response,
         apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
         apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
-        bind_required_empty_compensation_body, boundary_response_artifact, call_command,
-        capability_call_argv, compensation_request, execute_read, find_secret_value,
-        force_ipv4_from, guide_document, guide_stage_commands, http_client,
-        is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
-        key_policy_list, key_policy_revoke, non_readback_verification_basis,
+        bind_required_empty_compensation_body, blocked_capability_envelope,
+        boundary_response_artifact, call_command, capability_call_argv, compensation_request,
+        execute_read, find_secret_value, force_ipv4_from, guide_document, guide_stage_commands,
+        http_client, is_live_plan_precondition_hash, is_secret_output_capability,
+        key_policy_approve, key_policy_list, key_policy_revoke, non_readback_verification_basis,
         permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
         persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
         preflight_call_input, preflight_standing_authority, preserve_previous_catalog,
@@ -13130,6 +13166,42 @@ mod tests {
         )
         .expect_err("unmapped plan");
         assert!(unmapped.to_string().contains("cannot be mapped"));
+    }
+
+    #[test]
+    fn blocked_capability_failure_routes_to_guide() {
+        let mut capability = CapabilityV1::new(
+            "cache-purge",
+            "Purge cached content",
+            "POST",
+            "/zones/{zone_id}/purge_cache",
+        );
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "operation contract incomplete: operation-specific verification is not declared"
+                .to_owned(),
+        );
+        let envelope = blocked_capability_envelope(
+            "call",
+            &capability,
+            capability.blocked_reason.as_deref().unwrap(),
+        );
+        assert!(!envelope.ok);
+        assert_eq!(envelope.capability_id.as_deref(), Some("cache-purge"));
+        assert!(
+            envelope
+                .result
+                .get("blocking_gaps")
+                .is_some_and(Value::is_array)
+        );
+        let error = envelope.error.expect("blocked envelope carries an error");
+        assert_eq!(error.code, "CFCTL_CAPABILITY_BLOCKED");
+        assert!(error.message.contains("capability is blocked"));
+        let next_step = error
+            .next_step
+            .expect("blocked envelope carries a next step");
+        assert!(next_step.contains("cfctl guide cache-purge --json"));
+        assert!(next_step.contains("never bypass"));
     }
 
     #[test]
