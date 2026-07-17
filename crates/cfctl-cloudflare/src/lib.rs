@@ -2623,6 +2623,12 @@ fn selector_can_be_response_id(selector: &str) -> bool {
 }
 
 fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
+    // Fail closed: an identity pointer that names a secret field is never
+    // supported (mirrors the core gate), so no verifier dereferences secret
+    // material as a resource identity.
+    if cfctl_core::pointer_names_secret_field(pointer) {
+        return false;
+    }
     (selector_can_be_response_id(selector) && pointer == "/id")
         || (selector.ends_with("_name") && pointer == "/name")
         || (!selector
