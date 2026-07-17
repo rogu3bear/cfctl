@@ -4250,6 +4250,172 @@ async fn oauth_client_rotation_verifies_two_secret_overlap_without_echoing_secre
 }
 
 #[tokio::test]
+async fn workers_secret_put_verifies_exact_name_and_type_without_echoing_value() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"name":"DATABASE_TOKEN","type":"secret_text"},"errors":[]}"#,
+    ])
+    .await;
+    let mut plan = workers_secret_put_plan(json!({
+        "name":"DATABASE_TOKEN",
+        "type":"secret_text",
+        "text":"must-never-appear-in-proof"
+    }));
+    let execution_input: CallInput =
+        serde_json::from_value(plan.input.clone()).expect("resolved execution input");
+    plan.input = serde_json::to_value(CallInput {
+        selectors: execution_input.selectors.clone(),
+        query: json!({}),
+        body: Some(json!({
+            "$cfctl_secret_body_ref":"plan-input/test-reference",
+            "content_hash":"sha256:test"
+        })),
+        ..CallInput::default()
+    })
+    .expect("value-free durable input");
+    assert!(
+        !plan
+            .input
+            .to_string()
+            .contains("must-never-appear-in-proof")
+    );
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"name":"DATABASE_TOKEN","type":"secret_text"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan_with_input(
+            &plan,
+            &apply,
+            &execution_input,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("secret verification");
+
+    assert!(verification.passed, "{}", verification.basis);
+    assert!(!verification.basis.contains("must-never-appear-in-proof"));
+    assert!(
+        !verification
+            .readback
+            .result
+            .to_string()
+            .contains("must-never-appear-in-proof")
+    );
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with(
+        "GET /client/v4/accounts/account-1/workers/scripts/example-worker/secrets/DATABASE_TOKEN "
+    ));
+}
+
+#[tokio::test]
+async fn workers_secret_put_rejects_apply_or_readback_identity_drift_without_echoing_value() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"name":"DATABASE_TOKEN","type":"secret_key"},"errors":[]}"#,
+    ])
+    .await;
+    let plan = workers_secret_put_plan(json!({
+        "name":"DATABASE_TOKEN",
+        "type":"secret_text",
+        "text":"must-never-appear-in-proof"
+    }));
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"name":"DIFFERENT_SECRET","type":"secret_text"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("secret verification");
+
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("apply name matches=false"));
+    assert!(verification.basis.contains("readback type matches=false"));
+    assert!(!verification.basis.contains("must-never-appear-in-proof"));
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn workers_secret_put_rejects_a_grafted_or_broadened_target_before_network() {
+    let mut plan = workers_secret_put_plan(json!({
+        "name":"DATABASE_TOKEN",
+        "type":"secret_text",
+        "text":"must-not-cross-boundary"
+    }));
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({
+            "account_id":"account-1",
+            "script_name":"example-worker",
+            "secret_name":"grafted-secret"
+        }),
+        query: json!({}),
+        body: Some(json!({
+            "name":"DATABASE_TOKEN",
+            "type":"secret_text",
+            "text":"must-not-cross-boundary"
+        })),
+        ..CallInput::default()
+    })
+    .expect("input");
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"name":"DATABASE_TOKEN","type":"secret_text"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor =
+        Executor::new(reqwest::Client::new(), "http://127.0.0.1:9/client/v4").expect("executor");
+
+    let error = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect_err("a broadened secret target must fail before network")
+        .to_string();
+
+    assert!(error.contains("broader than the exact account and script target"));
+    assert!(!error.contains("must-not-cross-boundary"));
+}
+
+#[tokio::test]
 async fn access_service_token_refresh_verifies_exact_identity_and_expiration_readback() {
     let (address, server) = json_response_sequence_server(vec![
         r#"{"success":true,"result":{"id":"service-token-1","expires_at":"2099-07-15T22:00:00Z"},"errors":[]}"#,
@@ -4697,6 +4863,94 @@ fn oauth_client_secret_plan(id: &str, method: &str, verification_strategy: &str)
         }),
         query: json!({}),
         body: None,
+        ..CallInput::default()
+    })
+    .expect("input");
+    plan
+}
+
+fn workers_secret_put_plan(body: Value) -> PlanV1 {
+    let mut capability = CapabilityV1::new(
+        "worker-put-script-secret",
+        "Add script secret",
+        "PUT",
+        "/accounts/{account_id}/workers/scripts/{script_name}/secrets",
+    );
+    "Worker Script".clone_into(&mut capability.product);
+    capability.permissions = vec!["Workers Scripts Write".to_owned()];
+    capability.selectors = [
+        ("account_id", json!({"maxLength":32,"type":"string"})),
+        ("script_name", json!({"type":"string"})),
+    ]
+    .into_iter()
+    .map(|(name, schema)| SelectorV1 {
+        name: name.to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: Some(SelectorContractV1 {
+            schema,
+            query: None,
+        }),
+    })
+    .collect();
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "oneOf":[
+            {
+                "type":"object",
+                "required":["name","type","text"],
+                "properties":{
+                    "name":{"type":"string"},
+                    "type":{"type":"string","enum":["secret_text"]},
+                    "text":{"type":"string","writeOnly":true}
+                }
+            },
+            {
+                "type":"object",
+                "required":["name","type","format","algorithm","usages"],
+                "properties":{
+                    "name":{"type":"string"},
+                    "type":{"type":"string","enum":["secret_key"]},
+                    "format":{"type":"string","enum":["raw","pkcs8","spki","jwk"]},
+                    "algorithm":{"type":"object"},
+                    "usages":{"type":"array","items":{"type":"string","enum":["encrypt","decrypt","sign","verify","deriveKey","deriveBits","wrapKey","unwrapKey"]}},
+                    "key_base64":{"type":"string","writeOnly":true},
+                    "key_jwk":{"type":"object","writeOnly":true}
+                }
+            }
+        ],
+        "x-cfctl-body-required":true
+    }));
+    "worker_script_secret_reports_planned_name_and_type_after_put"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/accounts/{account_id}/workers/scripts/{script_name}/secrets/{secret_name}"
+            .to_owned(),
+        read_capability_id: "worker-get-script-secret".to_owned(),
+        verified_response_fields: vec!["name".to_owned(), "type".to_owned()],
+    });
+    assert!(
+        capability.verification_contract_supported(),
+        "test fixture must carry the exact Workers secret verifier contract: {}",
+        serde_json::to_string(&capability).expect("serialize capability")
+    );
+    let mut plan = PlanV1::draft(
+        "profile",
+        "account-1",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("plan");
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({
+            "account_id":"account-1",
+            "script_name":"example-worker"
+        }),
+        query: json!({}),
+        body: Some(body),
         ..CallInput::default()
     })
     .expect("input");
