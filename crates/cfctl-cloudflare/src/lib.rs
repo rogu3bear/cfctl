@@ -507,6 +507,10 @@ impl Executor {
     /// prove cache eviction, so this is deliberately a no-readback verifier:
     /// the `apply_response` itself is the evidence, and the basis states plainly
     /// that it proves acceptance and scoping, not eviction.
+    // Takes `&self` to sit uniformly beside the async `verify_*` siblings the
+    // dispatcher calls as methods, though this no-readback verifier needs no
+    // client state of its own.
+    #[allow(clippy::unused_self)]
     fn verify_cache_purge(
         &self,
         plan: &PlanV1,

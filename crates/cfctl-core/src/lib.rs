@@ -685,7 +685,11 @@ impl CapabilityV1 {
 
     /// Returns whether the selected adapter has an implementation for this
     /// capability's exact verification strategy and resource shape.
+    // The one match arm per supported strategy pushes this gate past the
+    // pedantic line ceiling; the strategies are intentionally enumerated in one
+    // place so the supported set stays auditable.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn verification_contract_supported(&self) -> bool {
         if !self.mutating {
             return true;
