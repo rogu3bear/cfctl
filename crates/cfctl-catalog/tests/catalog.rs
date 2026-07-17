@@ -2955,6 +2955,132 @@ fn exact_resource_deletes_pair_with_same_path_readback_contracts() {
     );
 }
 
+fn singleton_result_object_responses() -> Value {
+    json!({
+        "200": {"description":"envelope","content":{"application/json":{"schema":{
+            "type":"object","properties":{
+                "result":{"type":"object","properties":{"id":{"type":"string"}}},
+                "success":{"type":"boolean"}
+            }}}}}
+    })
+}
+
+fn singleton_result_array_responses() -> Value {
+    json!({
+        "200": {"description":"envelope","content":{"application/json":{"schema":{
+            "type":"object","properties":{
+                "result":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"}}}},
+                "success":{"type":"boolean"}
+            }}}}}
+    })
+}
+
+#[test]
+fn singleton_subresource_delete_closes_with_single_object_readback() {
+    // Terminal-literal path (`/gizmo/config`) under an identified parent: a
+    // singleton the id-parameter heuristic under-covers. Same-path GET returns
+    // a single object, so delete-then-not-found is a valid readback.
+    let document = json!({
+        "openapi":"3.0.3","info":{"title":"Cloudflare API","version":"4.0.0"},
+        "paths":{
+            "/accounts/{account_id}/gizmo/config":{
+                "parameters":[{"in":"path","name":"account_id","required":true,"schema":{"type":"string"}}],
+                "get":{"operationId":"gizmo-config-get","summary":"Get Gizmo Config","tags":["Gizmo"],
+                    "x-api-token-group":["Gizmo Read"],"responses": singleton_result_object_responses()},
+                "delete":{"operationId":"gizmo-config-delete","summary":"Delete Gizmo Config","tags":["Gizmo"],
+                    "x-api-token-group":["Gizmo Write"],"responses": singleton_result_object_responses()}
+            }
+        }
+    });
+    let snapshot = normalize_openapi(&document).expect("gizmo catalog");
+    let del = snapshot
+        .get("gizmo-config-delete")
+        .expect("singleton delete");
+    assert_eq!(
+        del.adapter_status,
+        AdapterStatus::DynamicApi,
+        "reason={:?}",
+        del.blocked_reason
+    );
+    assert_eq!(del.risk, RiskClass::Destructive);
+    assert_eq!(del.effect, EffectClass::Destructive);
+    assert_eq!(del.cost.maximum, Some(0.0));
+    assert_eq!(
+        del.verification.strategy,
+        "same_resource_returns_not_found_after_delete"
+    );
+    let target = del.same_path_read.as_ref().expect("same-path readback");
+    assert_eq!(target.path, del.path);
+    assert_eq!(target.read_capability_id, "gizmo-config-get");
+    assert!(!del.rollback.supported);
+    assert!(
+        del.rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("prior resource snapshot"))
+    );
+    assert!(del.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn singleton_subresource_delete_stays_blocked_when_readback_is_a_collection() {
+    // Same terminal-literal shape, but the GET returns an ARRAY: this is a
+    // collection, where a delete leaves an empty list, never a not-found. The
+    // single-object gate must refuse to auto-close it.
+    let document = json!({
+        "openapi":"3.0.3","info":{"title":"Cloudflare API","version":"4.0.0"},
+        "paths":{
+            "/accounts/{account_id}/gizmo/entries":{
+                "parameters":[{"in":"path","name":"account_id","required":true,"schema":{"type":"string"}}],
+                "get":{"operationId":"gizmo-entries-get","summary":"List Gizmo Entries","tags":["Gizmo"],
+                    "x-api-token-group":["Gizmo Read"],"responses": singleton_result_array_responses()},
+                "delete":{"operationId":"gizmo-entries-delete","summary":"Delete Gizmo Entries","tags":["Gizmo"],
+                    "x-api-token-group":["Gizmo Write"],"responses": singleton_result_array_responses()}
+            }
+        }
+    });
+    let snapshot = normalize_openapi(&document).expect("gizmo catalog");
+    let del = snapshot
+        .get("gizmo-entries-delete")
+        .expect("collection delete");
+    assert_eq!(
+        del.adapter_status,
+        AdapterStatus::Blocked,
+        "a collection delete must not receive the same-resource-not-found contract"
+    );
+    assert_ne!(
+        del.verification.strategy,
+        "same_resource_returns_not_found_after_delete"
+    );
+}
+
+#[test]
+fn singleton_subresource_delete_requires_a_declared_permission_lane() {
+    // Never fabricate a permission: a singleton delete whose OpenAPI omits
+    // `x-api-token-group` stays blocked on the permission gap.
+    let document = json!({
+        "openapi":"3.0.3","info":{"title":"Cloudflare API","version":"4.0.0"},
+        "paths":{
+            "/accounts/{account_id}/gizmo/config":{
+                "parameters":[{"in":"path","name":"account_id","required":true,"schema":{"type":"string"}}],
+                "get":{"operationId":"gizmo-config-get","summary":"Get Gizmo Config","tags":["Gizmo"],
+                    "x-api-token-group":["Gizmo Read"],"responses": singleton_result_object_responses()},
+                "delete":{"operationId":"gizmo-config-delete","summary":"Delete Gizmo Config","tags":["Gizmo"],
+                    "responses": singleton_result_object_responses()}
+            }
+        }
+    });
+    let snapshot = normalize_openapi(&document).expect("gizmo catalog");
+    let del = snapshot
+        .get("gizmo-config-delete")
+        .expect("singleton delete");
+    assert_eq!(
+        del.adapter_status,
+        AdapterStatus::Blocked,
+        "a missing permission lane must not be fabricated"
+    );
+}
+
 #[test]
 fn exact_resource_deletes_reject_broadening_inputs_and_required_read_controls() {
     let document = json!({
