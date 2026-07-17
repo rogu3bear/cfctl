@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use cfctl_core::{RETIRED_V1_PUBLIC_VERBS, RETIRED_V1_SURFACES};
 use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum};
 
+pub mod build_identity;
+#[doc(hidden)]
+pub mod build_support;
 mod profiles;
 pub mod runtime;
 
@@ -44,6 +47,8 @@ pub enum Command {
     Docs(DocsArgs),
     /// Inspect local runtime, authentication, and catalog health.
     Doctor,
+    /// Report the timestamp-free binary build identity.
+    Version,
     /// Check for or install a newer cfctl version.
     Update(UpdateArgs),
     /// Import explicitly supported v1 state into the v2 runtime.

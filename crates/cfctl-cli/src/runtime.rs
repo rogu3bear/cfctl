@@ -49,6 +49,7 @@ use crate::{
     KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs,
     KeyPolicySelector, KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs,
     PlanSelector, PlansCommand, ProfileSelector, SearchArgs, WorkspaceCommand,
+    build_identity::{current_build_info, inspect_path_build},
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
 
@@ -96,6 +97,9 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
     {
         return guide_topic_envelope(topic);
     }
+    if matches!(command, Command::Version) {
+        return version_command();
+    }
     let store = StateStore::open(RuntimePaths::discover()?)?;
     match command {
         Command::Auth(arguments) => auth_command(&store, arguments.command).await,
@@ -108,6 +112,7 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
         Command::Agents(arguments) => agents_command(&store, arguments.command),
         Command::Docs(arguments) => docs_command(&store, arguments.command).await,
         Command::Doctor => doctor_command(&store),
+        Command::Version => version_command(),
         Command::Update(arguments) => update_command(arguments.check).await,
         Command::Migrate(arguments) => migrate_command(&store, arguments.command),
     }
@@ -167,6 +172,18 @@ pub fn render(envelope: &ResultEnvelopeV2, json_output: bool) -> Result<String> 
             serde_json::from_value::<GuideTopicDocumentV1>(envelope.result.clone())
     {
         return Ok(render_guide_topic_document_markdown(&document));
+    }
+    if envelope.command == "version"
+        && let Ok(build) =
+            serde_json::from_value::<cfctl_core::BuildInfoV1>(envelope.result.clone())
+    {
+        let commit = build.git_commit.as_deref().unwrap_or("unknown");
+        let source = match build.identity_source {
+            cfctl_core::BuildIdentitySourceV1::ReleaseEnv => "release_env",
+            cfctl_core::BuildIdentitySourceV1::GitCheckout => "git_checkout",
+            cfctl_core::BuildIdentitySourceV1::Unknown => "unknown",
+        };
+        return Ok(format!("cfctl {} ({commit}, {source})\n", build.version));
     }
     if let Some(message) = envelope.result.get("message").and_then(Value::as_str) {
         return Ok(format!("{message}\n"));
@@ -7947,17 +7964,27 @@ fn agents_command(store: &StateStore, command: AgentsCommand) -> Result<ResultEn
                 .map(|agent| inspect_agent(&home, agent, which::which(agent.program()).is_ok()))
                 .collect();
             let configured = configured_agent()?;
-            Ok(ResultEnvelopeV2::success(
+            let running_build = current_build_info();
+            let path_build = inspect_path_build(&running_build);
+            let instruction_drift = status
+                .iter()
+                .filter(|agent| agent.skill_present && !agent.skill_current)
+                .count();
+            let healthy = path_build.healthy && instruction_drift == 0;
+            Ok(health_envelope(
                 "agents doctor",
                 json!({
-                    "binary_version": env!("CARGO_PKG_VERSION"),
-                    "binary_on_path": which::which("cfctl").ok(),
+                    "running_build": running_build,
+                    "path_build": path_build,
                     "configured_default_agent": configured,
                     "platform": env::consts::OS,
                     "platform_secret_store": platform_secret_store_health(store)?,
-                    "instruction_drift": status.iter().filter(|agent| agent.skill_present && !agent.skill_current).count(),
+                    "instruction_drift": instruction_drift,
                     "agents": status,
                 }),
+                healthy,
+                "CFCTL_AGENT_OR_BUILD_DRIFT",
+                "The PATH build or managed agent instructions are not current.",
             ))
         }
     }
@@ -8159,10 +8186,18 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
         .into_iter()
         .map(|agent| inspect_agent(&home, agent, which::which(agent.program()).is_ok()))
         .collect();
-    Ok(ResultEnvelopeV2::success(
+    let running_build = current_build_info();
+    let path_build = inspect_path_build(&running_build);
+    let instruction_drift = agents
+        .iter()
+        .filter(|agent| agent.skill_present && !agent.skill_current)
+        .count();
+    let healthy = path_build.healthy && instruction_drift == 0;
+    Ok(health_envelope(
         "doctor",
         json!({
-            "version": env!("CARGO_PKG_VERSION"),
+            "running_build": running_build,
+            "path_build": path_build,
             "platform": env::consts::OS,
             "config_dir": store.paths().config_dir,
             "data_dir": store.paths().data_dir,
@@ -8175,10 +8210,44 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "oauth_profiles": oauth_reconsent,
             "platform_secret_store": platform_secret_store_health(store)?,
             "standing_authorities": standing_authorities_health(store)?,
+            "instruction_drift": instruction_drift,
             "agents": agents,
             "public_oauth": "unconfigured until cfctl.io ownership, site publication, domain verification, and permanent promotion are explicitly completed; use `cfctl auth import-api-token --account <id> --stdin` for the scoped day-to-day lane",
         }),
+        healthy,
+        "CFCTL_RUNTIME_DRIFT",
+        "The PATH build or managed agent instructions are not current.",
     ))
+}
+
+fn version_command() -> Result<ResultEnvelopeV2> {
+    Ok(ResultEnvelopeV2::success(
+        "version",
+        serde_json::to_value(current_build_info())?,
+    ))
+}
+
+fn health_envelope(
+    command: &str,
+    result: Value,
+    healthy: bool,
+    code: &str,
+    message: &str,
+) -> ResultEnvelopeV2 {
+    let mut envelope = ResultEnvelopeV2::success(command, result);
+    if !healthy {
+        envelope.ok = false;
+        envelope.verification.state = VerificationState::Failed;
+        envelope.error = Some(ErrorV1 {
+            code: code.to_owned(),
+            message: message.to_owned(),
+            next_step: Some(
+                "Run ./bootstrap.sh from a tracked-clean checkout, then synchronize managed agents."
+                    .to_owned(),
+            ),
+        });
+    }
+    envelope
 }
 
 async fn update_command(check: bool) -> Result<ResultEnvelopeV2> {

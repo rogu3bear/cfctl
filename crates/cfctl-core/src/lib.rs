@@ -28,8 +28,27 @@ pub const PUBLIC_V2_SUBCOMMANDS: &[&str] = &[
     "migrate",
     "plans",
     "update",
+    "version",
     "workspace",
 ];
+
+/// Provenance source for the exact binary build identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildIdentitySourceV1 {
+    ReleaseEnv,
+    GitCheckout,
+    Unknown,
+}
+
+/// Stable, timestamp-free identity for one cfctl binary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildInfoV1 {
+    pub schema_version: u8,
+    pub version: String,
+    pub git_commit: Option<String>,
+    pub identity_source: BuildIdentitySourceV1,
+}
 
 /// Frozen top-level verbs from the retired shell control plane that must
 /// always reach the deterministic parser. Without this boundary, a stale
