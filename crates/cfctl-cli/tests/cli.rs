@@ -2,7 +2,7 @@
 
 use std::{fs, process::Command as ProcessCommand};
 
-use cfctl_cli::{Cli, Command, InvocationMode, classify_invocation};
+use cfctl_cli::{Cli, Command, InvocationMode, KeysCommand, classify_invocation};
 use cfctl_core::{GuideTopicV1, PUBLIC_V2_SUBCOMMANDS, render_guide_topic_markdown};
 use clap::{CommandFactory as _, Parser};
 
@@ -20,11 +20,12 @@ fn every_public_command_group_is_parseable() {
         "docs",
         "doctor",
         "update",
+        "version",
         "migrate",
     ] {
         let arguments: Vec<&str> = match command {
             "auth" => vec!["cfctl", "auth", "status"],
-            "keys" => vec!["cfctl", "keys", "permissions"],
+            "keys" => vec!["cfctl", "keys", "permissions", "--account", "account-a"],
             "catalog" => vec!["cfctl", "catalog", "coverage"],
             "call" => vec!["cfctl", "call", "dns-records-list"],
             "guide" => vec!["cfctl", "guide", "dns-records-delete"],
@@ -34,6 +35,7 @@ fn every_public_command_group_is_parseable() {
             "docs" => vec!["cfctl", "docs", "coverage"],
             "doctor" => vec!["cfctl", "doctor"],
             "update" => vec!["cfctl", "update", "--check"],
+            "version" => vec!["cfctl", "version"],
             "migrate" => vec!["cfctl", "migrate", "v1"],
             _ => unreachable!("fixed command set"),
         };
@@ -43,6 +45,143 @@ fn every_public_command_group_is_parseable() {
                 || command != "auth"
         );
     }
+}
+
+#[test]
+fn version_reports_structured_build_identity_without_touching_runtime_state() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args(["version", "--json"])
+        .output()
+        .expect("run version");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("version envelope");
+    assert_eq!(envelope["command"], "version");
+    assert_eq!(envelope["result"]["schema_version"], 1);
+    assert_eq!(envelope["result"]["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        matches!(
+            envelope["result"]["identity_source"].as_str(),
+            Some("release_env" | "git_checkout" | "unknown")
+        ),
+        "{envelope}"
+    );
+    let commit = envelope["result"]["git_commit"].as_str();
+    assert!(
+        commit.is_none()
+            || commit.is_some_and(|value| {
+                value.len() == 40
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }),
+        "{envelope}"
+    );
+    assert!(
+        fs::read_dir(runtime.path())
+            .expect("inspect untouched runtime root")
+            .next()
+            .is_none(),
+        "version must not initialize mutable runtime state"
+    );
+}
+
+#[test]
+fn clap_human_version_behavior_remains_compatible() {
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .arg("--version")
+        .output()
+        .expect("run clap version");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("version is UTF-8"),
+        format!("cfctl {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn json_parser_failures_are_v2_usage_envelopes_with_exit_two() {
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .args(["--json", "keys", "permissions"])
+        .output()
+        .expect("run invalid JSON invocation");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("usage failure envelope");
+    assert_eq!(envelope["schema_version"], 2);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["command"], "cfctl");
+    assert_eq!(envelope["error"]["code"], "CFCTL_USAGE");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--account")),
+        "{envelope}"
+    );
+}
+
+#[test]
+fn human_parser_failures_and_metadata_keep_clap_behavior() {
+    let failure = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .args(["keys", "permissions"])
+        .output()
+        .expect("run invalid human invocation");
+    assert_eq!(failure.status.code(), Some(2));
+    assert!(failure.stdout.is_empty());
+    let stderr = String::from_utf8(failure.stderr).expect("human usage is UTF-8");
+    assert!(stderr.starts_with("error:"), "{stderr}");
+    assert!(serde_json::from_str::<serde_json::Value>(&stderr).is_err());
+
+    for argument in ["--help", "--version"] {
+        let metadata = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+            .args(["--json", argument])
+            .output()
+            .expect("run Clap metadata with JSON flag present");
+        assert!(metadata.status.success(), "{argument}");
+        assert!(!metadata.stdout.is_empty(), "{argument}");
+        assert!(metadata.stderr.is_empty(), "{argument}");
+    }
+}
+
+#[test]
+fn permission_inventory_requires_account_for_both_owners() {
+    assert!(Cli::try_parse_from(["cfctl", "keys", "permissions"]).is_err());
+
+    let account = Cli::try_parse_from(["cfctl", "keys", "permissions", "--account", "account-a"])
+        .expect("account-owned inventory parses");
+    let Some(Command::Keys(account)) = account.command else {
+        panic!("keys command");
+    };
+    let KeysCommand::Permissions(account) = account.command else {
+        panic!("permissions command");
+    };
+    assert!(!account.user);
+    assert_eq!(account.account, "account-a");
+
+    let user = Cli::try_parse_from([
+        "cfctl",
+        "keys",
+        "permissions",
+        "--user",
+        "--account",
+        "account-a",
+    ])
+    .expect("user-owned inventory parses");
+    let Some(Command::Keys(user)) = user.command else {
+        panic!("keys command");
+    };
+    let KeysCommand::Permissions(user) = user.command else {
+        panic!("permissions command");
+    };
+    assert!(user.user);
+    assert_eq!(user.account, "account-a");
 }
 
 #[test]
@@ -617,9 +756,13 @@ fn help_and_version_are_successful_public_commands() {
 fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
     let runtime = tempfile::tempdir().expect("runtime root");
     let workspace = tempfile::tempdir().expect("workspace root");
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cfctl"));
+    let binary_dir = binary.parent().expect("binary directory");
 
-    let doctor = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+    let doctor = ProcessCommand::new(binary)
         .env("CFCTL_HOME", runtime.path())
+        .env("HOME", runtime.path())
+        .env("PATH", binary_dir)
         .args(["doctor", "--json"])
         .output()
         .expect("run isolated doctor");
@@ -635,6 +778,11 @@ fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
     assert_eq!(doctor["performed"], false);
     assert_eq!(doctor["command"], "doctor");
     assert_eq!(doctor["result"]["catalog"]["present"], false);
+    assert_eq!(doctor["result"]["path_build"]["state"], "current");
+    assert_eq!(
+        doctor["result"]["running_build"],
+        doctor["result"]["path_build"]["build"]
+    );
     assert!(doctor["result"]["public_oauth"].is_string());
 
     let add = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
@@ -695,6 +843,31 @@ fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
 }
 
 #[test]
+fn isolated_agents_doctor_accepts_the_exact_running_path_build() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cfctl"));
+    let binary_dir = binary.parent().expect("binary directory");
+    let output = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .env("HOME", runtime.path())
+        .env("PATH", binary_dir)
+        .env("CFCTL_AGENT", "codex")
+        .args(["agents", "doctor", "--json"])
+        .output()
+        .expect("run isolated agents doctor");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("agents doctor JSON envelope");
+    assert_eq!(envelope["command"], "agents doctor");
+    assert_eq!(envelope["result"]["path_build"]["state"], "current");
+    assert_eq!(envelope["result"]["instruction_drift"], 0);
+}
+
+#[test]
 fn v1_migration_imports_safe_state_without_copying_secret_content() {
     let source = tempfile::tempdir().expect("source root");
     let runtime = tempfile::tempdir().expect("runtime root");
@@ -751,6 +924,8 @@ fn v1_migration_imports_safe_state_without_copying_secret_content() {
 fn legacy_wrangler_profile_can_be_inspected_and_removed_without_revival() {
     let runtime = tempfile::tempdir().expect("runtime root");
     write_legacy_wrangler_profile(runtime.path());
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cfctl"));
+    let binary_dir = binary.parent().expect("binary directory");
 
     let profiles = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
         .env("CFCTL_HOME", runtime.path())
@@ -769,8 +944,10 @@ fn legacy_wrangler_profile_can_be_inspected_and_removed_without_revival() {
         "{profiles}"
     );
 
-    let doctor = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+    let doctor = ProcessCommand::new(binary)
         .env("CFCTL_HOME", runtime.path())
+        .env("HOME", runtime.path())
+        .env("PATH", binary_dir)
         .args(["doctor", "--json"])
         .output()
         .expect("diagnose legacy profile");

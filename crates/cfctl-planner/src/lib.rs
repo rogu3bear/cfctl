@@ -64,7 +64,17 @@ impl PolicyEngine {
             );
         }
 
-        if capability.effect == EffectClass::ReadOnly && capability.risk == RiskClass::Read {
+        require_incremental_cost_approval(
+            capability,
+            &mut disposition,
+            &mut requires_cost_ceiling,
+            &mut reasons,
+        );
+
+        if capability.effect == EffectClass::ReadOnly
+            && capability.risk == RiskClass::Read
+            && !capability.cost.incremental
+        {
             return decision(
                 PolicyDisposition::AutoExecute,
                 ["read-only operation"],
@@ -81,31 +91,12 @@ impl PolicyEngine {
             reasons.push("operation has dependent or unmanaged configuration".to_owned());
         }
 
-        match capability.effect {
-            EffectClass::ReadOnly => {}
-            EffectClass::ReversibleWrite => {
-                if capability.risk != RiskClass::ScopedWrite || !capability.rollback.supported {
-                    disposition = PolicyDisposition::ApprovalRequired;
-                    reasons.push(
-                        "write is not both known-scoped and backed by a declared rollback"
-                            .to_owned(),
-                    );
-                }
-            }
-            EffectClass::Spend => {
-                disposition = PolicyDisposition::ApprovalRequired;
-                requires_cost_ceiling = true;
-                reasons.push("operation can incur incremental cost".to_owned());
-            }
-            EffectClass::Destructive
-            | EffectClass::ExternalCommunication
-            | EffectClass::IdentityOrOwnership
-            | EffectClass::Irreversible
-            | EffectClass::Unknown => {
-                disposition = PolicyDisposition::ApprovalRequired;
-                reasons.push(format!("operation has {:?} effects", capability.effect));
-            }
-        }
+        apply_effect_policy(
+            capability,
+            &mut disposition,
+            &mut requires_cost_ceiling,
+            &mut reasons,
+        );
 
         if matches!(capability.risk, RiskClass::Unknown | RiskClass::CrossConfig) {
             disposition = PolicyDisposition::ApprovalRequired;
@@ -120,6 +111,56 @@ impl PolicyEngine {
             disposition,
             reasons,
             requires_cost_ceiling,
+        }
+    }
+}
+
+fn require_incremental_cost_approval(
+    capability: &CapabilityV1,
+    disposition: &mut PolicyDisposition,
+    requires_cost_ceiling: &mut bool,
+    reasons: &mut Vec<String>,
+) {
+    if capability.cost.incremental {
+        *disposition = PolicyDisposition::ApprovalRequired;
+        *requires_cost_ceiling = true;
+        reasons.push("operation can incur incremental cost".to_owned());
+    }
+}
+
+fn apply_effect_policy(
+    capability: &CapabilityV1,
+    disposition: &mut PolicyDisposition,
+    requires_cost_ceiling: &mut bool,
+    reasons: &mut Vec<String>,
+) {
+    match capability.effect {
+        EffectClass::ReadOnly => {}
+        EffectClass::ReversibleWrite => {
+            if capability.risk != RiskClass::ScopedWrite || !capability.rollback.supported {
+                *disposition = PolicyDisposition::ApprovalRequired;
+                reasons.push(
+                    "write is not both known-scoped and backed by a declared rollback".to_owned(),
+                );
+            }
+        }
+        EffectClass::Spend => {
+            *disposition = PolicyDisposition::ApprovalRequired;
+            *requires_cost_ceiling = true;
+            if !reasons
+                .iter()
+                .any(|reason| reason == "operation can incur incremental cost")
+            {
+                reasons.push("operation can incur incremental cost".to_owned());
+            }
+        }
+        EffectClass::Destructive
+        | EffectClass::ExternalCommunication
+        | EffectClass::IdentityOrOwnership
+        | EffectClass::Irreversible
+        | EffectClass::Unknown => {
+            *disposition = PolicyDisposition::ApprovalRequired;
+            reasons.push(format!("operation has {:?} effects", capability.effect));
         }
     }
 }

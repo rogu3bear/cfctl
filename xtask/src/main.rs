@@ -986,8 +986,10 @@ fn assemble(requested_targets: &[String]) -> Result<(), TaskError> {
         let second_target_dir = PathBuf::from("target/release-proof").join(format!("{target}-2"));
         remove_directory_if_present(&first_target_dir)?;
         remove_directory_if_present(&second_target_dir)?;
-        let first = build_release_target(target, &first_target_dir, &source_date_epoch)?;
-        let second = build_release_target(target, &second_target_dir, &source_date_epoch)?;
+        let first =
+            build_release_target(target, &first_target_dir, &source_date_epoch, &git_commit)?;
+        let second =
+            build_release_target(target, &second_target_dir, &source_date_epoch, &git_commit)?;
         let first_hash = sha256_file(&first)?;
         let second_hash = sha256_file(&second)?;
         if first_hash != second_hash {
@@ -1201,6 +1203,7 @@ fn build_release_target(
     target: &str,
     target_dir: &Path,
     source_date_epoch: &str,
+    git_commit: &str,
 ) -> Result<PathBuf, TaskError> {
     let mut command = Command::new("cargo");
     command.args(release_build_driver(target)).args([
@@ -1215,6 +1218,7 @@ fn build_release_target(
     command
         .arg(target_dir)
         .env("SOURCE_DATE_EPOCH", source_date_epoch)
+        .env("CFCTL_BUILD_GIT_COMMIT", git_commit)
         .env("CARGO_INCREMENTAL", "0")
         .env("TZ", "UTC");
     run_command(

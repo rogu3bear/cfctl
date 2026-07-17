@@ -16,6 +16,7 @@ Cloudflare.
 2. Orient and refresh current official capability data:
 
    ```bash
+   cfctl version --json
    cfctl doctor
    cfctl catalog sync
    cfctl catalog coverage
@@ -34,6 +35,8 @@ Cloudflare.
    repository configuration is only source evidence.
 5. Register repository boundaries explicitly before workspace analysis. Use
    `workspace discover`, `graph`, and `audit`; never scan arbitrary roots.
+   Nested `fixtures`, `__fixtures__`, `testdata`, `test-data`, and `test_data`
+   directories are skipped. Register a fixture directory directly to opt it in.
 6. A mutating call creates a plan rather than changing Cloudflare. Review its
    operation ID, selected account, exact targets, Cloudflare and local diffs,
    permission lane, entitlement, cost, verification, compensation, and
@@ -49,7 +52,14 @@ Cloudflare.
 8. Execute only with `cfctl plans run <operation-id>`, then inspect `plans
    status`. Use `plans rectify` after uncertain boundary crossing or unsupported
    verification; never replay a consumed plan.
-9. Report source config, live read, preview, apply, post-change verification,
+9. Read account-owned permission inventory with `cfctl keys permissions
+   --account <account-id> --json`. For user-owned inventory use `--user` while
+   retaining the same explicit account context.
+10. For recurring token lifecycle, load `cfctl guide --topic
+   standing-authority --json`, approve only the exact reviewed policy with
+   `cfctl keys policy approve <authority-id> --yes`, and revoke it with `cfctl
+   keys policy revoke <authority-id>`.
+11. Report source config, live read, preview, apply, post-change verification,
    local proof, and agent action as distinct evidence classes.
 
 ## Adapter rules
@@ -68,6 +78,8 @@ Cloudflare.
 ## Trust invariants
 
 - Profiles and workspaces pin one account; ambiguity fails closed.
+- Running-build, PATH-build, and managed-instruction drift is unhealthy; repair
+  installation before relying on the operator surface.
 - Secrets enter through stdin or the platform secret store. Secret-producing
   calls require a new `--value-out` destination.
 - Mutation contracts must know risk, effect, cost, permissions, entitlement,

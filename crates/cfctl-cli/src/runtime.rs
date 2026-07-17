@@ -49,6 +49,7 @@ use crate::{
     KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs,
     KeyPolicySelector, KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs,
     PlanSelector, PlansCommand, ProfileSelector, SearchArgs, WorkspaceCommand,
+    build_identity::{current_build_info, inspect_path_build},
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
 
@@ -96,6 +97,9 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
     {
         return guide_topic_envelope(topic);
     }
+    if matches!(command, Command::Version) {
+        return version_command();
+    }
     let store = StateStore::open(RuntimePaths::discover()?)?;
     match command {
         Command::Auth(arguments) => auth_command(&store, arguments.command).await,
@@ -108,6 +112,7 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
         Command::Agents(arguments) => agents_command(&store, arguments.command),
         Command::Docs(arguments) => docs_command(&store, arguments.command).await,
         Command::Doctor => doctor_command(&store),
+        Command::Version => version_command(),
         Command::Update(arguments) => update_command(arguments.check).await,
         Command::Migrate(arguments) => migrate_command(&store, arguments.command),
     }
@@ -167,6 +172,18 @@ pub fn render(envelope: &ResultEnvelopeV2, json_output: bool) -> Result<String> 
             serde_json::from_value::<GuideTopicDocumentV1>(envelope.result.clone())
     {
         return Ok(render_guide_topic_document_markdown(&document));
+    }
+    if envelope.command == "version"
+        && let Ok(build) =
+            serde_json::from_value::<cfctl_core::BuildInfoV1>(envelope.result.clone())
+    {
+        let commit = build.git_commit.as_deref().unwrap_or("unknown");
+        let source = match build.identity_source {
+            cfctl_core::BuildIdentitySourceV1::ReleaseEnv => "release_env",
+            cfctl_core::BuildIdentitySourceV1::GitCheckout => "git_checkout",
+            cfctl_core::BuildIdentitySourceV1::Unknown => "unknown",
+        };
+        return Ok(format!("cfctl {} ({commit}, {source})\n", build.version));
     }
     if let Some(message) = envelope.result.get("message").and_then(Value::as_str) {
         return Ok(format!("{message}\n"));
@@ -796,6 +813,26 @@ fn preflight_call_input(
     validate_request_contract(capability, &resolved)?;
     validate_cloudflare_tunnel_configuration_ingress(capability, &resolved)?;
     validate_warp_connector_configuration_semantics(capability, &resolved)?;
+    validate_d1_database_create_semantics(capability, &resolved)?;
+    Ok(())
+}
+
+fn validate_d1_database_create_semantics(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    if capability.id != "d1-create-database" {
+        return Ok(());
+    }
+    let Some(body) = input.body.as_ref().and_then(Value::as_object) else {
+        return Ok(());
+    };
+    if body.contains_key("jurisdiction") && body.contains_key("primary_location_hint") {
+        return Err(CliError::Input(
+            "D1 database creation cannot combine `jurisdiction` with `primary_location_hint`: Cloudflare gives jurisdiction precedence and ignores the location hint; choose the hard jurisdiction boundary or the best-effort location hint"
+                .to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1350,6 +1387,11 @@ const GLOBAL_WARP_OVERRIDE_PATH: &str = "/accounts/{account_id}/devices/resilien
 const D1_READ_REPLICATION_READ_CAPABILITY_ID: &str = "d1-get-database";
 const D1_READ_REPLICATION_PATH: &str = "/accounts/{account_id}/d1/database/{database_id}";
 const D1_READ_REPLICATION_PRECONDITION: &str = "d1_read_replication_state";
+const D1_DATABASE_CREATE_CAPABILITY_ID: &str = "d1-create-database";
+const D1_DATABASE_DELETE_CAPABILITY_ID: &str = "d1-delete-database";
+const D1_EMPTY_DATABASE_PRECONDITION: &str = "d1_empty_database_state";
+const D1_EMPTY_DATABASE_COMPENSATION_STRATEGY: &str =
+    "delete_created_empty_d1_database_by_returned_uuid_if_unchanged";
 const CLOUDFLARE_TUNNEL_CONFIGURATION_MUTATION_CAPABILITY_ID: &str =
     "cloudflare-tunnel-configuration-put-configuration";
 const CLOUDFLARE_TUNNEL_CONFIGURATION_READ_CAPABILITY_ID: &str =
@@ -1645,6 +1687,40 @@ fn should_bind_d1_read_replication_state(capability: &CapabilityV1) -> bool {
         )
         && capability.rollback.strategy.as_deref() == Some("restore_d1_read_replication_prior_mode")
         && capability.rollback_contract_supported()
+}
+
+fn is_d1_database_delete(capability: &CapabilityV1) -> bool {
+    capability.id == D1_DATABASE_DELETE_CAPABILITY_ID
+        && capability.title == "Delete D1 Database"
+        && capability.method == "DELETE"
+        && capability.path == D1_READ_REPLICATION_PATH
+        && capability.product == "D1"
+        && capability.account_scope == "account"
+        && capability.mutating
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+}
+
+fn should_bind_d1_empty_database_state(capability: &CapabilityV1, adapter_targets: &Value) -> bool {
+    is_d1_database_delete(capability)
+        && adapter_targets
+            .get("compensates_capability_id")
+            .and_then(Value::as_str)
+            == Some(D1_DATABASE_CREATE_CAPABILITY_ID)
+        && adapter_targets
+            .get("compensation_strategy")
+            .and_then(Value::as_str)
+            == Some(D1_EMPTY_DATABASE_COMPENSATION_STRATEGY)
+        && adapter_targets
+            .get("compensates_operation_id")
+            .and_then(Value::as_str)
+            .is_some_and(|operation_id| !operation_id.is_empty())
+        && adapter_targets
+            .get("source_receipt_hash")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| hash.starts_with("sha256:"))
 }
 
 fn d1_read_replication_read_contract_supported(capability: &CapabilityV1) -> bool {
@@ -2220,6 +2296,207 @@ async fn read_live_d1_read_replication_state(
         .await?;
     let receipt =
         apply_d1_read_replication_state_response(capability, account_id, database_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
+
+fn apply_d1_empty_database_state_response(
+    capability: &CapabilityV1,
+    adapter_targets: &Value,
+    account_id: &str,
+    database_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the D1 empty-state read with HTTP {}; the compensation plan was not created",
+            response.status
+        )));
+    }
+    let uuid = response
+        .result
+        .get("uuid")
+        .and_then(Value::as_str)
+        .filter(|uuid| *uuid == database_id)
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 empty-state read did not return the exact created database UUID; the compensation plan was not created"
+                    .to_owned(),
+            )
+        })?;
+    let name = response
+        .result
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 empty-state read omitted the database name; the compensation plan was not created"
+                    .to_owned(),
+            )
+        })?;
+    let num_tables = response
+        .result
+        .get("num_tables")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 empty-state read omitted an integer num_tables value; the compensation plan was not created"
+                    .to_owned(),
+            )
+        })?;
+    if num_tables != 0 {
+        return Err(CliError::Input(format!(
+            "D1 database `{database_id}` now contains {num_tables} table(s); cfctl will not derive a destructive compensation plan"
+        )));
+    }
+    let file_size = response
+        .result
+        .get("file_size")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 empty-state read omitted an integer file_size value; the compensation plan was not created"
+                    .to_owned(),
+            )
+        })?;
+    let jurisdiction = response
+        .result
+        .get("jurisdiction")
+        .filter(|value| value.is_null() || value.is_string())
+        .cloned()
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 empty-state read omitted its nullable jurisdiction; the compensation plan was not created"
+                    .to_owned(),
+            )
+        })?;
+    let replication_mode = response
+        .result
+        .pointer("/read_replication/mode")
+        .and_then(Value::as_str)
+        .filter(|mode| matches!(*mode, "auto" | "disabled"))
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 empty-state read omitted the bounded read-replication mode; the compensation plan was not created"
+                    .to_owned(),
+            )
+        })?;
+    let (source_operation_id, source_receipt_hash) =
+        d1_compensation_source_binding(adapter_targets)?;
+    Ok(json!({
+        "schema_version": 1,
+        "source_capability_id": D1_READ_REPLICATION_READ_CAPABILITY_ID,
+        "source_path": D1_READ_REPLICATION_PATH,
+        "target_capability_id": capability.id,
+        "target_method": capability.method,
+        "target_path": capability.path,
+        "target_scope": "account",
+        "account_id": account_id,
+        "database_id": uuid,
+        "database_name": name,
+        "num_tables": num_tables,
+        "file_size": file_size,
+        "jurisdiction": jurisdiction,
+        "read_replication": {"mode": replication_mode},
+        "compensates_operation_id": source_operation_id,
+        "source_create_receipt_hash": source_receipt_hash,
+    }))
+}
+
+fn d1_compensation_source_binding(adapter_targets: &Value) -> Result<(&str, &str)> {
+    let source_operation_id = adapter_targets
+        .get("compensates_operation_id")
+        .and_then(Value::as_str)
+        .filter(|operation_id| !operation_id.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 compensation target omitted its source operation ID; the compensation plan was not created"
+                    .to_owned(),
+            )
+        })?;
+    let source_receipt_hash = adapter_targets
+        .get("source_receipt_hash")
+        .and_then(Value::as_str)
+        .filter(|hash| hash.starts_with("sha256:"))
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 compensation target omitted its source create receipt hash; the compensation plan was not created"
+                    .to_owned(),
+            )
+        })?;
+    Ok((source_operation_id, source_receipt_hash))
+}
+
+async fn read_live_d1_empty_database_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    adapter_targets: &Value,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !should_bind_d1_empty_database_state(capability, adapter_targets) {
+        return Err(CliError::Input(
+            "D1 compensation drifted from its governed empty-database contract".to_owned(),
+        ));
+    }
+    let selected_account = input
+        .selectors
+        .get("account_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 empty-state precondition requires string selector `account_id`".to_owned(),
+            )
+        })?;
+    if selected_account != account_id {
+        return Err(CliError::Input(format!(
+            "D1 compensation account `{selected_account}` differs from selected account `{account_id}`; the compensation plan was not created"
+        )));
+    }
+    let database_id = input
+        .selectors
+        .get("database_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 empty-state precondition requires string selector `database_id`".to_owned(),
+            )
+        })?;
+    let source_capability = catalog
+        .get(D1_READ_REPLICATION_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(D1_READ_REPLICATION_READ_CAPABILITY_ID))?;
+    if !d1_read_replication_read_contract_supported(source_capability) {
+        return Err(CliError::Input(
+            "D1 empty-state source capability drifted from the governed database read".to_owned(),
+        ));
+    }
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source_capability,
+            &CallInput {
+                selectors: json!({"account_id": account_id, "database_id": database_id}),
+                query: json!({"fields":[
+                    "uuid", "name", "jurisdiction", "num_tables", "file_size", "read_replication"
+                ]}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt = apply_d1_empty_database_state_response(
+        capability,
+        adapter_targets,
+        account_id,
+        database_id,
+        &response,
+    )?;
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok((receipt, evidence))
 }
@@ -2948,11 +3225,12 @@ async fn read_live_zone_account(
     Ok((receipt, evidence))
 }
 
-fn plan_requires_live_credential(capability: &CapabilityV1) -> bool {
+fn plan_requires_live_credential(capability: &CapabilityV1, adapter_targets: &Value) -> bool {
     should_resolve_zone_entitlement(capability)
         || should_bind_zone_account(capability)
         || should_bind_global_warp_override_state(capability)
         || should_bind_d1_read_replication_state(capability)
+        || should_bind_d1_empty_database_state(capability, adapter_targets)
         || should_bind_cloudflare_tunnel_configuration_state(capability)
         || should_bind_warp_connector_configuration_state(capability)
         || should_bind_web_analytics_rum_state(capability)
@@ -2982,7 +3260,7 @@ async fn create_plan(
             )
     })?;
     let resolve_entitlement = should_resolve_zone_entitlement(&capability);
-    let credential = if plan_requires_live_credential(&capability) {
+    let credential = if plan_requires_live_credential(&capability, &adapter_targets) {
         Some(fresh_credential(profile, &platform_secrets(store)).await?)
     } else {
         None
@@ -3018,6 +3296,7 @@ async fn create_plan(
         catalog,
         &capability,
         &input,
+        &adapter_targets,
         account_id,
         credential.as_ref(),
     )
@@ -3078,6 +3357,34 @@ async fn prepare_d1_read_replication_state_precondition(
     read_live_d1_read_replication_state(store, catalog, capability, input, account_id, credential)
         .await
         .map(Some)
+}
+
+async fn prepare_d1_empty_database_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    adapter_targets: &Value,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !should_bind_d1_empty_database_state(capability, adapter_targets) {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input("D1 empty-state precondition credential was not resolved".to_owned())
+    })?;
+    read_live_d1_empty_database_state(
+        store,
+        catalog,
+        capability,
+        input,
+        adapter_targets,
+        account_id,
+        credential,
+    )
+    .await
+    .map(Some)
 }
 
 async fn prepare_cloudflare_tunnel_configuration_state_precondition(
@@ -3191,6 +3498,7 @@ async fn prepare_live_plan_preconditions(
     catalog: &CatalogSnapshot,
     capability: &CapabilityV1,
     input: &CallInput,
+    adapter_targets: &Value,
     account_id: &str,
     credential: Option<&AuthCredential>,
 ) -> Result<LivePlanPreconditions> {
@@ -3203,6 +3511,16 @@ async fn prepare_live_plan_preconditions(
         .await?,
         d1_read_replication_state: prepare_d1_read_replication_state_precondition(
             store, catalog, capability, input, account_id, credential,
+        )
+        .await?,
+        d1_empty_database_state: prepare_d1_empty_database_state_precondition(
+            store,
+            catalog,
+            capability,
+            input,
+            adapter_targets,
+            account_id,
+            credential,
         )
         .await?,
         cloudflare_tunnel_configuration_state:
@@ -3240,6 +3558,7 @@ struct LivePlanPreconditions {
     zone_account: Option<(Value, EvidenceV1)>,
     global_warp_override_state: Option<(Value, EvidenceV1)>,
     d1_read_replication_state: Option<(Value, EvidenceV1)>,
+    d1_empty_database_state: Option<(Value, EvidenceV1)>,
     cloudflare_tunnel_configuration_state: Option<(Value, EvidenceV1)>,
     warp_connector_configuration_state: Option<(Value, EvidenceV1)>,
     web_analytics_rum_state: Option<(Value, EvidenceV1)>,
@@ -3263,6 +3582,9 @@ fn plan_targets(
     }
     if let Some((receipt, _)) = &live_preconditions.d1_read_replication_state {
         targets["live_preconditions"][D1_READ_REPLICATION_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.d1_empty_database_state {
+        targets["live_preconditions"][D1_EMPTY_DATABASE_PRECONDITION] = receipt.clone();
     }
     if let Some((receipt, _)) = &live_preconditions.cloudflare_tunnel_configuration_state {
         targets["live_preconditions"][CLOUDFLARE_TUNNEL_CONFIGURATION_STATE_PRECONDITION] =
@@ -3298,6 +3620,10 @@ fn bind_live_plan_preconditions(
         (
             D1_READ_REPLICATION_PRECONDITION,
             &live_preconditions.d1_read_replication_state,
+        ),
+        (
+            D1_EMPTY_DATABASE_PRECONDITION,
+            &live_preconditions.d1_empty_database_state,
         ),
         (
             CLOUDFLARE_TUNNEL_CONFIGURATION_STATE_PRECONDITION,
@@ -3486,7 +3812,7 @@ fn persist_prepared_plan(
         "call",
         json!({
             "plan": plan,
-            "approval_command": format!("cfctl plans approve {} --yes", plan.operation_id),
+            "approval_command": approval_command_argv(&plan.capability, &plan.operation_id).join(" "),
             "run_command": format!("cfctl plans run {}", plan.operation_id),
             "message": if policy.disposition == PolicyDisposition::AutoExecute {
                 "Plan created and policy-authorized for automatic execution; run the exact operation ID."
@@ -4395,6 +4721,7 @@ struct LivePreconditionEvidence {
     permission_inventory: Option<EvidenceV1>,
     global_warp_override_state: Option<EvidenceV1>,
     d1_read_replication_state: Option<EvidenceV1>,
+    d1_empty_database_state: Option<EvidenceV1>,
     cloudflare_tunnel_configuration_state: Option<EvidenceV1>,
     warp_connector_configuration_state: Option<EvidenceV1>,
     web_analytics_rum_state: Option<EvidenceV1>,
@@ -4432,6 +4759,10 @@ async fn validate_live_plan_precondition_evidence(
         )
         .await?,
         d1_read_replication_state: validate_live_d1_read_replication_state_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        d1_empty_database_state: validate_live_d1_empty_database_state_precondition(
             store, catalog, plan, input, credential,
         )
         .await?,
@@ -4529,6 +4860,7 @@ fn prepend_live_precondition_evidence(
         evidence.web_analytics_rum_state,
         evidence.warp_connector_configuration_state,
         evidence.cloudflare_tunnel_configuration_state,
+        evidence.d1_empty_database_state,
         evidence.d1_read_replication_state,
         evidence.global_warp_override_state,
         evidence.permission_inventory,
@@ -4686,6 +5018,146 @@ async fn validate_live_d1_read_replication_state_precondition(
     if hash_value(&receipt)? != expected_hash {
         return Err(CliError::Input(
             "live D1 read-replication state drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
+}
+
+fn validate_d1_empty_database_state_receipt(plan: &PlanV1, receipt: &Value) -> Result<()> {
+    let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    let database_id = plan
+        .targets
+        .pointer("/selectors/database_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 compensation plan omitted its hash-bound database selector; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let source_operation_id = adapter_targets
+        .get("compensates_operation_id")
+        .and_then(Value::as_str);
+    let source_receipt_hash = adapter_targets
+        .get("source_receipt_hash")
+        .and_then(Value::as_str);
+    let exact = receipt.as_object().is_some_and(|object| object.len() == 16)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("source_capability_id").and_then(Value::as_str)
+            == Some(D1_READ_REPLICATION_READ_CAPABILITY_ID)
+        && receipt.get("source_path").and_then(Value::as_str) == Some(D1_READ_REPLICATION_PATH)
+        && receipt.get("target_capability_id").and_then(Value::as_str)
+            == Some(D1_DATABASE_DELETE_CAPABILITY_ID)
+        && receipt.get("target_method").and_then(Value::as_str) == Some("DELETE")
+        && receipt.get("target_path").and_then(Value::as_str) == Some(D1_READ_REPLICATION_PATH)
+        && receipt.get("target_scope").and_then(Value::as_str) == Some("account")
+        && receipt.get("account_id").and_then(Value::as_str) == Some(plan.account_id.as_str())
+        && receipt.get("database_id").and_then(Value::as_str) == Some(database_id)
+        && receipt
+            .get("database_name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.is_empty())
+        && receipt.get("num_tables").and_then(Value::as_u64) == Some(0)
+        && receipt.get("file_size").and_then(Value::as_u64).is_some()
+        && receipt
+            .get("jurisdiction")
+            .is_some_and(|value| value.is_null() || value.is_string())
+        && receipt
+            .pointer("/read_replication/mode")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| matches!(mode, "auto" | "disabled"))
+        && receipt
+            .get("read_replication")
+            .and_then(Value::as_object)
+            .is_some_and(|state| state.len() == 1)
+        && receipt
+            .get("compensates_operation_id")
+            .and_then(Value::as_str)
+            == source_operation_id
+        && receipt
+            .get("source_create_receipt_hash")
+            .and_then(Value::as_str)
+            == source_receipt_hash;
+    if !exact {
+        return Err(CliError::Input(
+            "plan D1 empty-state receipt has an invalid source create receipt, account, database, table count, or state shape; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn required_d1_empty_database_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    if !is_d1_database_delete(&plan.capability)
+        || adapter_targets
+            .get("compensates_capability_id")
+            .and_then(Value::as_str)
+            != Some(D1_DATABASE_CREATE_CAPABILITY_ID)
+    {
+        return Ok(None);
+    }
+    if !should_bind_d1_empty_database_state(&plan.capability, adapter_targets) {
+        return Err(CliError::Input(
+            "D1 compensation plan is inconsistent with its hash-bound empty-database contract; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(D1_EMPTY_DATABASE_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 compensation plan predates the live empty-state contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/d1_empty_database_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "D1 compensation plan omitted its hash-bound empty-state receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    validate_d1_empty_database_state_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "plan D1 empty-state receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+async fn validate_live_d1_empty_database_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_d1_empty_database_state_precondition(plan)? else {
+        return Ok(None);
+    };
+    let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    let (receipt, evidence) = read_live_d1_empty_database_state(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        adapter_targets,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live D1 empty-database state drifted after planning; the delete boundary was not crossed and a new compensation review is required"
                 .to_owned(),
         ));
     }
@@ -6354,6 +6826,14 @@ struct CompensationRequest {
     requested_account: Option<String>,
 }
 
+struct CompensationTarget {
+    capability_id: String,
+    expected_method: String,
+    expected_path: String,
+    selectors: Value,
+    body: Option<Value>,
+}
+
 fn validate_compensation_contract(capability: &CapabilityV1) -> Result<()> {
     if capability.rollback_contract_supported() {
         return Ok(());
@@ -6591,6 +7071,27 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
         return Ok(Some(request));
     }
     let resource_id = compensation_resource_id(artifact)?;
+    let Some(target) = created_resource_compensation_target(plan, resource_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(CompensationRequest {
+        capability_id: target.capability_id,
+        expected_method: target.expected_method,
+        expected_path: target.expected_path,
+        input: CallInput {
+            selectors: target.selectors,
+            query: json!({}),
+            body: target.body,
+            ..CallInput::default()
+        },
+        requested_account: Some(plan.account_id.clone()),
+    }))
+}
+
+fn created_resource_compensation_target(
+    plan: &PlanV1,
+    resource_id: &str,
+) -> Result<Option<CompensationTarget>> {
     let (capability_id, expected_method, expected_path, selectors, body) = match plan
         .capability
         .id
@@ -6631,6 +7132,22 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
                 None,
             )
         }
+        D1_DATABASE_CREATE_CAPABILITY_ID => {
+            if plan.capability.rollback.strategy.as_deref()
+                != Some(D1_EMPTY_DATABASE_COMPENSATION_STRATEGY)
+            {
+                return Ok(None);
+            }
+            let (capability_id, expected_path, selectors) =
+                generic_created_resource_compensation(plan, resource_id)?;
+            (
+                capability_id,
+                "DELETE".to_owned(),
+                expected_path,
+                selectors,
+                None,
+            )
+        }
         _ => {
             if plan.capability.rollback.strategy.as_deref()
                 != Some("delete_created_resource_by_returned_id")
@@ -6648,17 +7165,12 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
             )
         }
     };
-    Ok(Some(CompensationRequest {
+    Ok(Some(CompensationTarget {
         capability_id,
         expected_method,
         expected_path,
-        input: CallInput {
-            selectors,
-            query: json!({}),
-            body,
-            ..CallInput::default()
-        },
-        requested_account: Some(plan.account_id.clone()),
+        selectors,
+        body,
     }))
 }
 
@@ -6755,6 +7267,7 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
             json!({
                 "compensates_operation_id": plan.operation_id,
                 "compensates_capability_id": plan.capability.id,
+                "compensation_strategy": plan.capability.rollback.strategy,
                 "source_receipt_hash": source_receipt_hash,
                 "source_precondition_hash": plan
                     .precondition_hashes
@@ -6880,7 +7393,7 @@ async fn key_policy_create(
     let inventory = key_permissions(
         store,
         &KeyPermissionArgs {
-            account: Some(arguments.account.clone()),
+            account: arguments.account.clone(),
             user: false,
         },
     )
@@ -7043,33 +7556,56 @@ async fn key_permissions(
     store: &StateStore,
     arguments: &KeyPermissionArgs,
 ) -> Result<ResultEnvelopeV2> {
-    let capability_id = if arguments.user || arguments.account.is_none() {
+    let envelope = call_command(store, permission_inventory_call(arguments)).await?;
+    Ok(permission_inventory_envelope(envelope))
+}
+
+fn permission_inventory_call(arguments: &KeyPermissionArgs) -> CallArgs {
+    let capability_id = if arguments.user {
         "permission-groups-list-permission-groups"
     } else {
         "account-api-tokens-list-permission-groups"
     };
     let mut selectors = Vec::new();
-    if !arguments.user
-        && let Some(account) = &arguments.account
-    {
-        selectors.push(("account_id".to_owned(), account.clone()));
+    if !arguments.user {
+        selectors.push(("account_id".to_owned(), arguments.account.clone()));
     }
-    call_command(
-        store,
-        CallArgs {
-            capability_id: capability_id.to_owned(),
-            selectors,
-            query: Vec::new(),
-            body_json: None,
-            body_stdin: false,
-            profile: None,
-            account: arguments.account.clone(),
-            if_match: None,
-            if_none_match: None,
-            value_out: None,
-        },
-    )
-    .await
+    CallArgs {
+        capability_id: capability_id.to_owned(),
+        selectors,
+        query: Vec::new(),
+        body_json: None,
+        body_stdin: false,
+        profile: None,
+        account: Some(arguments.account.clone()),
+        if_match: None,
+        if_none_match: None,
+        value_out: None,
+    }
+}
+
+fn permission_inventory_envelope(mut envelope: ResultEnvelopeV2) -> ResultEnvelopeV2 {
+    "keys permissions".clone_into(&mut envelope.command);
+    let forbidden = serde_json::from_value::<CloudflareResponseV1>(envelope.result.clone())
+        .is_ok_and(|response| {
+            !response.success
+                && (response.status == 403
+                    || response.errors.iter().any(|error| error.code == Some(9109)))
+        });
+    if forbidden {
+        envelope.ok = false;
+        envelope.verification.state = VerificationState::Failed;
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_PERMISSION_INVENTORY_FORBIDDEN".to_owned(),
+            message: "Cloudflare denied the permission-group inventory. The selected API token requires the `Account API Tokens Read` or `Account API Tokens Write` grant for the explicit account."
+                .to_owned(),
+            next_step: Some(
+                "Grant the selected token Account API Tokens Read or Write, then retry the same account-bound inventory command."
+                    .to_owned(),
+            ),
+        });
+    }
+    envelope
 }
 
 async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<ResultEnvelopeV2> {
@@ -7091,7 +7627,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
     let inventory = key_permissions(
         store,
         &KeyPermissionArgs {
-            account: Some(account.to_owned()),
+            account: account.to_owned(),
             user: arguments.user,
         },
     )
@@ -7451,17 +7987,27 @@ fn agents_command(store: &StateStore, command: AgentsCommand) -> Result<ResultEn
                 .map(|agent| inspect_agent(&home, agent, which::which(agent.program()).is_ok()))
                 .collect();
             let configured = configured_agent()?;
-            Ok(ResultEnvelopeV2::success(
+            let running_build = current_build_info();
+            let path_build = inspect_path_build(&running_build);
+            let instruction_drift = status
+                .iter()
+                .filter(|agent| agent.skill_present && !agent.skill_current)
+                .count();
+            let healthy = path_build.healthy && instruction_drift == 0;
+            Ok(health_envelope(
                 "agents doctor",
                 json!({
-                    "binary_version": env!("CARGO_PKG_VERSION"),
-                    "binary_on_path": which::which("cfctl").ok(),
+                    "running_build": running_build,
+                    "path_build": path_build,
                     "configured_default_agent": configured,
                     "platform": env::consts::OS,
                     "platform_secret_store": platform_secret_store_health(store)?,
-                    "instruction_drift": status.iter().filter(|agent| agent.skill_present && !agent.skill_current).count(),
+                    "instruction_drift": instruction_drift,
                     "agents": status,
                 }),
+                healthy,
+                "CFCTL_AGENT_OR_BUILD_DRIFT",
+                "The PATH build or managed agent instructions are not current.",
             ))
         }
     }
@@ -7663,10 +8209,18 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
         .into_iter()
         .map(|agent| inspect_agent(&home, agent, which::which(agent.program()).is_ok()))
         .collect();
-    Ok(ResultEnvelopeV2::success(
+    let running_build = current_build_info();
+    let path_build = inspect_path_build(&running_build);
+    let instruction_drift = agents
+        .iter()
+        .filter(|agent| agent.skill_present && !agent.skill_current)
+        .count();
+    let healthy = path_build.healthy && instruction_drift == 0;
+    Ok(health_envelope(
         "doctor",
         json!({
-            "version": env!("CARGO_PKG_VERSION"),
+            "running_build": running_build,
+            "path_build": path_build,
             "platform": env::consts::OS,
             "config_dir": store.paths().config_dir,
             "data_dir": store.paths().data_dir,
@@ -7679,10 +8233,44 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "oauth_profiles": oauth_reconsent,
             "platform_secret_store": platform_secret_store_health(store)?,
             "standing_authorities": standing_authorities_health(store)?,
+            "instruction_drift": instruction_drift,
             "agents": agents,
             "public_oauth": "unconfigured until cfctl.io ownership, site publication, domain verification, and permanent promotion are explicitly completed; use `cfctl auth import-api-token --account <id> --stdin` for the scoped day-to-day lane",
         }),
+        healthy,
+        "CFCTL_RUNTIME_DRIFT",
+        "The PATH build or managed agent instructions are not current.",
     ))
+}
+
+fn version_command() -> Result<ResultEnvelopeV2> {
+    Ok(ResultEnvelopeV2::success(
+        "version",
+        serde_json::to_value(current_build_info())?,
+    ))
+}
+
+fn health_envelope(
+    command: &str,
+    result: Value,
+    healthy: bool,
+    code: &str,
+    message: &str,
+) -> ResultEnvelopeV2 {
+    let mut envelope = ResultEnvelopeV2::success(command, result);
+    if !healthy {
+        envelope.ok = false;
+        envelope.verification.state = VerificationState::Failed;
+        envelope.error = Some(ErrorV1 {
+            code: code.to_owned(),
+            message: message.to_owned(),
+            next_step: Some(
+                "Run ./bootstrap.sh from a tracked-clean checkout, then synchronize managed agents."
+                    .to_owned(),
+            ),
+        });
+    }
+    envelope
 }
 
 async fn update_command(check: bool) -> Result<ResultEnvelopeV2> {
@@ -8012,6 +8600,7 @@ fn is_live_plan_precondition_hash(name: &str) -> bool {
             | "zone_account"
             | "global_warp_override_state"
             | D1_READ_REPLICATION_PRECONDITION
+            | D1_EMPTY_DATABASE_PRECONDITION
             | CLOUDFLARE_TUNNEL_CONFIGURATION_STATE_PRECONDITION
             | WARP_CONNECTOR_CONFIGURATION_STATE_PRECONDITION
             | WEB_ANALYTICS_RUM_STATE_PRECONDITION
@@ -8877,14 +9466,9 @@ fn guide_stage_commands(
         GuideStage::MapDependencies => {
             vec![argv(&["cfctl", "workspace", "graph", "--json"])]
         }
-        GuideStage::RequestApproval => conditional(Some(argv(&[
-            "cfctl",
-            "plans",
-            "approve",
-            "<operation-id>",
-            "--yes",
-            "--json",
-        ]))),
+        GuideStage::RequestApproval => {
+            conditional(Some(approval_command_argv(capability, "<operation-id>")))
+        }
         GuideStage::AcquireLocks => conditional(Some(argv(&[
             "cfctl",
             "plans",
@@ -8925,6 +9509,23 @@ fn guide_stage_commands(
         ]))),
         GuideStage::CloseWithEvidence => Vec::new(),
     }
+}
+
+fn approval_command_argv(capability: &CapabilityV1, operation_id: &str) -> Vec<String> {
+    let mut command = ["cfctl", "plans", "approve"].map(str::to_owned).to_vec();
+    command.extend([operation_id.to_owned(), "--yes".to_owned()]);
+    if capability.cost.incremental
+        && capability.cost.known
+        && let (Some(currency), Some(maximum)) =
+            (&capability.cost.currency, capability.cost.maximum)
+    {
+        command.extend([
+            "--max-cost".to_owned(),
+            format!("{}:{maximum}", currency.to_ascii_uppercase()),
+        ]);
+    }
+    command.push("--json".to_owned());
+    command
 }
 
 fn argv(parts: &[&str]) -> Vec<String> {
@@ -9342,19 +9943,23 @@ mod tests {
         CallInput, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
         OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, admit_standing_plan,
         apply_cloudflare_tunnel_configuration_state_response,
-        apply_d1_read_replication_state_response, apply_dns_record_state_response,
-        apply_global_warp_override_state_response, apply_oauth_client_secret_state_response,
+        apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
+        apply_dns_record_state_response, apply_global_warp_override_state_response,
+        apply_oauth_client_secret_state_response,
         apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
         apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
         bind_required_empty_compensation_body, boundary_response_artifact, call_command,
         capability_call_argv, compensation_request, execute_read, find_secret_value,
-        force_ipv4_from, guide_document, http_client, is_live_plan_precondition_hash,
-        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
-        non_readback_verification_basis, persist_prepared_plan, persist_secret_lifecycle,
-        persist_secret_lifecycle_and_reconcile_lineage, preflight_call_input,
-        preflight_standing_authority, preserve_previous_catalog, query_object_from_pairs,
-        read_import_secret, read_secret_file, reconcile_standing_lineage_from_plan, rectify_plan,
-        redact_secret_result, required_cloudflare_tunnel_configuration_state_precondition,
+        force_ipv4_from, guide_document, guide_stage_commands, http_client,
+        is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
+        key_policy_list, key_policy_revoke, non_readback_verification_basis,
+        permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
+        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
+        preflight_call_input, preflight_standing_authority, preserve_previous_catalog,
+        query_object_from_pairs, read_import_secret, read_secret_file,
+        reconcile_standing_lineage_from_plan, rectify_plan, redact_secret_result,
+        required_cloudflare_tunnel_configuration_state_precondition,
+        required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
         required_oauth_client_secret_state_precondition,
@@ -9373,16 +9978,19 @@ mod tests {
         workspace_resource_keys, zone_target,
     };
     use crate::profiles::ProfilesConfig;
-    use crate::{CallArgs, KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs, PlanSelector};
+    use crate::{
+        CallArgs, KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs,
+        PlanSelector,
+    };
     use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
-    use cfctl_cloudflare::{CloudflareResponseV1, OperationVerificationV1};
+    use cfctl_cloudflare::{CloudflareApiErrorV1, CloudflareResponseV1, OperationVerificationV1};
     use cfctl_core::{
         AdapterStatus, CapabilityV1, CostV1, CreatedCollectionResourceContractV1,
         CreatedResourceContractV1, EffectClass, EvidenceClass, EvidenceV1, PlanStatus, PlanV1,
-        QuerySerializationV1, RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1,
-        StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, VerificationState,
-        hash_value,
+        QuerySerializationV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1,
+        SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
+        TransactionStageV1, VerificationState, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -9396,6 +10004,80 @@ mod tests {
 
     fn guide_json(capability: &CapabilityV1) -> Value {
         serde_json::to_value(guide_document(capability)).expect("typed capability guide JSON")
+    }
+
+    #[test]
+    fn permission_inventory_routes_owner_without_dropping_account_context() {
+        let account = permission_inventory_call(&KeyPermissionArgs {
+            user: false,
+            account: "account-a".to_owned(),
+        });
+        assert_eq!(
+            account.capability_id,
+            "account-api-tokens-list-permission-groups"
+        );
+        assert_eq!(
+            account.selectors,
+            [("account_id".to_owned(), "account-a".to_owned())]
+        );
+        assert_eq!(account.account.as_deref(), Some("account-a"));
+
+        let user = permission_inventory_call(&KeyPermissionArgs {
+            user: true,
+            account: "account-a".to_owned(),
+        });
+        assert_eq!(
+            user.capability_id,
+            "permission-groups-list-permission-groups"
+        );
+        assert!(user.selectors.is_empty());
+        assert_eq!(user.account.as_deref(), Some("account-a"));
+    }
+
+    #[test]
+    fn permission_inventory_rewraps_command_and_maps_403_or_9109() {
+        let success_response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!([]),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let success = permission_inventory_envelope(ResultEnvelopeV2::success(
+            "call",
+            serde_json::to_value(success_response).expect("response JSON"),
+        ));
+        assert_eq!(success.command, "keys permissions");
+        assert!(success.ok);
+
+        for (status, code) in [(403, None), (400, Some(9109))] {
+            let response = CloudflareResponseV1 {
+                status,
+                success: false,
+                result: Value::Null,
+                errors: vec![CloudflareApiErrorV1 {
+                    code,
+                    message: "forbidden".to_owned(),
+                }],
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            };
+            let mut envelope = ResultEnvelopeV2::success(
+                "call",
+                serde_json::to_value(response).expect("response JSON"),
+            );
+            envelope.ok = false;
+            let mapped = permission_inventory_envelope(envelope);
+            assert_eq!(mapped.command, "keys permissions");
+            assert_eq!(mapped.verification.state, VerificationState::Failed);
+            let error = mapped.error.expect("actionable permission error");
+            assert_eq!(error.code, "CFCTL_PERMISSION_INVENTORY_FORBIDDEN");
+            assert!(error.message.contains("Account API Tokens Read"));
+            assert!(error.message.contains("Account API Tokens Write"));
+        }
     }
 
     struct DeleteFailingSecretStore;
@@ -9538,6 +10220,75 @@ mod tests {
         capability.rollback.supported = true;
         capability.rollback.strategy = Some("restore_d1_read_replication_prior_mode".to_owned());
         capability.rollback.warning = Some("restoration requires explicit approval".to_owned());
+        capability
+    }
+
+    fn d1_database_create_capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            "d1-create-database",
+            "Create D1 Database",
+            "POST",
+            "/accounts/{account_id}/d1/database",
+        );
+        capability.mutating = true;
+        capability.account_scope = "account".to_owned();
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.product = "D1".to_owned();
+        capability.risk = RiskClass::ScopedWrite;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.permissions = vec!["D1 Write".to_owned()];
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "required":["name"],
+            "x-cfctl-body-required":true,
+            "properties":{
+                "jurisdiction":{"type":"string","enum":["eu","fedramp"]},
+                "name":{"type":"string"},
+                "primary_location_hint":{
+                    "type":"string",
+                    "enum":["wnam","enam","weur","eeur","apac","oc"],
+                    "x-cfctl-verification-observable":false
+                },
+                "read_replication":{
+                    "type":"object",
+                    "required":["mode"],
+                    "properties":{"mode":{"type":"string","enum":["auto","disabled"]}}
+                }
+            }
+        }));
+        capability.verification.strategy =
+            "created_resource_contains_planned_fields_by_returned_id".to_owned();
+        capability.created_resource = Some(CreatedResourceContractV1 {
+            detail_path: "/accounts/{account_id}/d1/database/{database_id}".to_owned(),
+            identity_selector: "database_id".to_owned(),
+            response_result_identity_pointer: "/uuid".to_owned(),
+            read_capability_id: "d1-get-database".to_owned(),
+            delete_capability_id: "d1-delete-database".to_owned(),
+            verified_response_fields: vec![
+                "jurisdiction".to_owned(),
+                "name".to_owned(),
+                "read_replication".to_owned(),
+            ],
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy =
+            Some("delete_created_empty_d1_database_by_returned_uuid_if_unchanged".to_owned());
+        capability
+    }
+
+    fn d1_database_delete_capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            "d1-delete-database",
+            "Delete D1 Database",
+            "DELETE",
+            "/accounts/{account_id}/d1/database/{database_id}",
+        );
+        capability.mutating = true;
+        capability.account_scope = "account".to_owned();
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.product = "D1".to_owned();
+        capability.risk = RiskClass::Destructive;
+        capability.effect = EffectClass::Irreversible;
         capability
     }
 
@@ -10143,6 +10894,7 @@ mod tests {
                 zone_account: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
+                d1_empty_database_state: None,
                 cloudflare_tunnel_configuration_state: None,
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
@@ -10379,6 +11131,139 @@ mod tests {
             .expect_err("an earlier catch-all makes later rules unreachable");
         assert!(error.to_string().contains("rule 1"));
         assert!(error.to_string().contains("unreachable"));
+    }
+
+    #[test]
+    fn d1_database_create_preflight_rejects_ignored_location_hint_combinations() {
+        let mut capability = CapabilityV1::new(
+            "d1-create-database",
+            "Create D1 Database",
+            "POST",
+            "/accounts/{account_id}/d1/database",
+        );
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "required":["name"],
+            "properties":{
+                "name":{"type":"string"},
+                "jurisdiction":{"type":"string","enum":["eu","fedramp"]},
+                "primary_location_hint":{"type":"string","enum":["wnam","enam"]}
+            }
+        }));
+        let input = CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            body: Some(json!({
+                "name":"smoke-database",
+                "jurisdiction":"eu",
+                "primary_location_hint":"enam"
+            })),
+            ..CallInput::default()
+        };
+        let error = preflight_call_input(&capability, &input, None)
+            .expect_err("Cloudflare ignores the location hint when jurisdiction is set");
+        assert!(
+            error.to_string().contains("gives jurisdiction precedence"),
+            "{error}"
+        );
+
+        let mut location_only = input;
+        location_only
+            .body
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("D1 body")
+            .remove("jurisdiction");
+        preflight_call_input(&capability, &location_only, None)
+            .expect("a location hint without jurisdiction is unambiguous");
+    }
+
+    #[test]
+    fn d1_empty_database_compensation_binds_exact_live_state_and_rejects_tables() {
+        let capability = d1_database_delete_capability();
+        let adapter = json!({
+            "compensates_operation_id":"source-create-op",
+            "compensates_capability_id":"d1-create-database",
+            "compensation_strategy":"delete_created_empty_d1_database_by_returned_uuid_if_unchanged",
+            "source_receipt_hash":"sha256:source-create-receipt"
+        });
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "uuid":"database-a",
+                "name":"smoke-database",
+                "num_tables":0,
+                "file_size":12288,
+                "jurisdiction":"eu",
+                "read_replication":{"mode":"disabled"}
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let receipt = apply_d1_empty_database_state_response(
+            &capability,
+            &adapter,
+            "account-a",
+            "database-a",
+            &response,
+        )
+        .expect("empty database receipt");
+        assert_eq!(receipt["num_tables"], 0);
+        assert_eq!(receipt["database_id"], "database-a");
+        assert_eq!(
+            receipt["source_create_receipt_hash"],
+            "sha256:source-create-receipt"
+        );
+
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability.clone(),
+            json!({
+                "selectors":{"account_id":"account-a","database_id":"database-a"},
+                "account_id":"account-a",
+                "adapter":adapter,
+                "live_preconditions":{"d1_empty_database_state":receipt.clone()}
+            }),
+        )
+        .expect("D1 compensation plan");
+        plan.precondition_hashes.insert(
+            "d1_empty_database_state".to_owned(),
+            hash_value(&receipt).expect("receipt hash"),
+        );
+        assert_eq!(
+            required_d1_empty_database_state_precondition(&plan)
+                .expect("bound empty-state precondition"),
+            plan.precondition_hashes
+                .get("d1_empty_database_state")
+                .map(String::as_str)
+        );
+
+        let mut retargeted = receipt;
+        retargeted["database_id"] = json!("database-b");
+        plan.precondition_hashes.insert(
+            "d1_empty_database_state".to_owned(),
+            hash_value(&retargeted).expect("retargeted receipt hash"),
+        );
+        plan.targets["live_preconditions"]["d1_empty_database_state"] = retargeted;
+        let error = required_d1_empty_database_state_precondition(&plan)
+            .expect_err("a rehashed cross-database receipt must fail");
+        assert!(error.to_string().contains("account, database, table count"));
+
+        let mut populated = response;
+        populated.result["num_tables"] = json!(1);
+        let error = apply_d1_empty_database_state_response(
+            &capability,
+            &plan.targets["adapter"],
+            "account-a",
+            "database-a",
+            &populated,
+        )
+        .expect_err("a populated database must never become a compensation delete plan");
+        assert!(error.to_string().contains("contains 1 table"));
     }
 
     #[test]
@@ -10965,6 +11850,7 @@ mod tests {
                 zone_account: None,
                 global_warp_override_state: Some((receipt.clone(), receipt_evidence)),
                 d1_read_replication_state: None,
+                d1_empty_database_state: None,
                 cloudflare_tunnel_configuration_state: None,
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
@@ -11049,6 +11935,7 @@ mod tests {
                 zone_account: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: Some((receipt.clone(), receipt_evidence)),
+                d1_empty_database_state: None,
                 cloudflare_tunnel_configuration_state: None,
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
@@ -11138,6 +12025,7 @@ mod tests {
                 zone_account: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
+                d1_empty_database_state: None,
                 cloudflare_tunnel_configuration_state: Some((receipt.clone(), receipt_evidence)),
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
@@ -11224,6 +12112,7 @@ mod tests {
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
                 cloudflare_tunnel_configuration_state: None,
+                d1_empty_database_state: None,
                 warp_connector_configuration_state: Some((receipt.clone(), evidence)),
                 web_analytics_rum_state: None,
                 dns_record_state: None,
@@ -11304,6 +12193,7 @@ mod tests {
                 d1_read_replication_state: None,
                 cloudflare_tunnel_configuration_state: None,
                 warp_connector_configuration_state: None,
+                d1_empty_database_state: None,
                 web_analytics_rum_state: Some((receipt.clone(), evidence)),
                 dns_record_state: None,
                 oauth_client_secret_state: None,
@@ -11400,6 +12290,7 @@ mod tests {
                 cloudflare_tunnel_configuration_state: None,
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
+                d1_empty_database_state: None,
                 dns_record_state: Some((receipt.clone(), receipt_evidence)),
                 oauth_client_secret_state: None,
             },
@@ -12882,6 +13773,57 @@ mod tests {
                 "--body-stdin",
                 "--json"
             ])
+        );
+    }
+
+    #[test]
+    fn guide_binds_the_declared_ceiling_for_a_known_paid_operation() {
+        let mut capability = CapabilityV1::new(
+            "r2-create-bucket",
+            "Create R2 bucket",
+            "POST",
+            "/accounts/{account_id}/r2/buckets",
+        );
+        capability.product = "R2".to_owned();
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.risk = RiskClass::ScopedWrite;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.permissions = vec!["Workers R2 Storage Write".to_owned()];
+        capability.cost.incremental = true;
+        capability.cost.currency = Some("USD".to_owned());
+        capability.cost.maximum = Some(0.000_009);
+        capability.cost.known = true;
+        capability.entitlement.available = Some(true);
+        capability.verification.strategy = "created_resource_detail_matches".to_owned();
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete newly created empty bucket".to_owned());
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "x-cfctl-body-required":true,
+            "properties":{"name":{"type":"string"}}
+        }));
+
+        assert_eq!(
+            guide_stage_commands(
+                cfctl_core::GuideStage::RequestApproval,
+                &capability,
+                cfctl_core::GuideContractStateV1::Available,
+                None,
+            ),
+            vec![
+                [
+                    "cfctl",
+                    "plans",
+                    "approve",
+                    "<operation-id>",
+                    "--yes",
+                    "--max-cost",
+                    "USD:0.000009",
+                    "--json"
+                ]
+                .map(str::to_owned)
+                .to_vec()
+            ]
         );
     }
 
@@ -15026,6 +15968,135 @@ mod tests {
         }));
         bind_required_empty_compensation_body(&mut request, &delete_capability);
         assert_eq!(request.input.body, Some(json!({})));
+    }
+
+    #[test]
+    fn r2_bucket_creation_rectification_preserves_jurisdiction_for_exact_empty_bucket_delete() {
+        let mut capability = CapabilityV1::new(
+            "r2-create-bucket",
+            "Create Bucket",
+            "POST",
+            "/accounts/{account_id}/r2/buckets",
+        );
+        capability.product = "R2 Bucket".to_owned();
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.created_resource = Some(CreatedResourceContractV1 {
+            detail_path: "/accounts/{account_id}/r2/buckets/{bucket_name}".to_owned(),
+            identity_selector: "bucket_name".to_owned(),
+            response_result_identity_pointer: "/name".to_owned(),
+            read_capability_id: "r2-get-bucket".to_owned(),
+            delete_capability_id: "r2-delete-bucket".to_owned(),
+            verified_response_fields: vec!["name".to_owned()],
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "cf-r2-jurisdiction":"eu"
+            }),
+            query: json!({}),
+            body: Some(json!({
+                "name":"smoke-bucket",
+                "locationHint":"weur",
+                "storageClass":"InfrequentAccess"
+            })),
+            ..CallInput::default()
+        })
+        .expect("call input");
+        plan.refresh_hash().expect("bind call input");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({"name":"smoke-bucket"}),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let apply_evidence = EvidenceV1::new(
+            EvidenceClass::Apply,
+            "sha256:r2-create-apply-receipt",
+            "/tmp/r2-create-apply-receipt.json",
+        );
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            boundary_response_artifact(&plan, &response, Some(&apply_evidence)),
+        )
+        .expect("response receipt");
+        plan.status = PlanStatus::RectificationRequired;
+
+        let request = compensation_request(&plan)
+            .expect("request resolves")
+            .expect("compensation is supported");
+
+        assert_eq!(request.capability_id, "r2-delete-bucket");
+        assert_eq!(request.expected_method, "DELETE");
+        assert_eq!(
+            request.expected_path,
+            "/accounts/{account_id}/r2/buckets/{bucket_name}"
+        );
+        assert_eq!(request.input.selectors["account_id"], "account-a");
+        assert_eq!(request.input.selectors["bucket_name"], "smoke-bucket");
+        assert_eq!(request.input.selectors["cf-r2-jurisdiction"], "eu");
+        assert_eq!(request.input.query, json!({}));
+        assert!(request.input.body.is_none());
+        assert_eq!(request.requested_account.as_deref(), Some("account-a"));
+    }
+
+    #[test]
+    fn d1_creation_rectification_derives_only_the_guarded_uuid_delete_target() {
+        let capability = d1_database_create_capability();
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            body: Some(json!({"name":"smoke-database","jurisdiction":"eu"})),
+            ..CallInput::default()
+        })
+        .expect("call input");
+        plan.refresh_hash().expect("bind call input");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"resource_id":"database-a","success":true}),
+        )
+        .expect("response receipt");
+        plan.status = PlanStatus::RectificationRequired;
+
+        let request = compensation_request(&plan)
+            .expect("request resolves")
+            .expect("guarded D1 compensation is supported");
+        assert_eq!(request.capability_id, "d1-delete-database");
+        assert_eq!(request.expected_method, "DELETE");
+        assert_eq!(
+            request.expected_path,
+            "/accounts/{account_id}/d1/database/{database_id}"
+        );
+        assert_eq!(request.input.selectors["account_id"], "account-a");
+        assert_eq!(request.input.selectors["database_id"], "database-a");
+        assert!(request.input.body.is_none());
+        assert_eq!(request.requested_account.as_deref(), Some("account-a"));
     }
 
     #[test]

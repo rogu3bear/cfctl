@@ -88,6 +88,446 @@ fn official_docs_indexes_expose_product_and_page_links_deterministically() {
     );
 }
 
+fn d1_database_create_fixture() -> Value {
+    let account = json!({
+        "description":"Account identifier tag.",
+        "in":"path",
+        "name":"account_id",
+        "required":true,
+        "schema":{"maxLength":32,"type":"string"}
+    });
+    let database_id = json!({
+        "description":"D1 database identifier (UUID).",
+        "in":"path",
+        "name":"database_id",
+        "required":true,
+        "schema":{"type":"string"}
+    });
+    let database = json!({
+        "type":"object",
+        "properties":{
+            "created_at":{"type":"string"},
+            "file_size":{"type":"number"},
+            "jurisdiction":{"type":["string","null"]},
+            "name":{"type":"string"},
+            "num_tables":{"type":"number"},
+            "read_replication":{"type":"object","properties":{"mode":{"type":"string"}}},
+            "uuid":{"type":"string"},
+            "version":{"type":"string"}
+        }
+    });
+    let response = json!({"200":{"description":"ok","content":{"application/json":{"schema":{
+        "type":"object","required":["success"],"properties":{
+            "success":{"type":"boolean"},"result":database
+        }
+    }}}}});
+    json!({
+        "openapi":"3.0.3",
+        "info":{"title":"Cloudflare API","version":"4.0.0"},
+        "paths":{
+            "/accounts/{account_id}/d1/database":{
+                "post":{
+                    "operationId":"d1-create-database",
+                    "summary":"Create D1 Database",
+                    "description":"Returns the created D1 database.",
+                    "tags":["D1"],
+                    "x-api-token-group":["D1 Write"],
+                    "parameters":[account.clone()],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "type":"object",
+                        "required":["name"],
+                        "properties":{
+                            "jurisdiction":{"type":"string","enum":["eu","fedramp"]},
+                            "name":{"type":"string"},
+                            "primary_location_hint":{"type":"string","enum":["wnam","enam","weur","eeur","apac","oc"]},
+                            "read_replication":{"type":"object","required":["mode"],"properties":{
+                                "mode":{"type":"string","enum":["auto","disabled"]}
+                            }}
+                        }
+                    }}}},
+                    "responses":response.clone()
+                }
+            },
+            "/accounts/{account_id}/d1/database/{database_id}":{
+                "get":{
+                    "operationId":"d1-get-database",
+                    "summary":"Get D1 Database",
+                    "description":"Returns the specified D1 database.",
+                    "tags":["D1"],
+                    "x-api-token-group":["D1 Read","D1 Write"],
+                    "parameters":[account.clone(),{
+                        "in":"path","name":"database_id","required":true,
+                        "schema":{"oneOf":[{"type":"string"},{"type":"string"}]}
+                    },{
+                        "description":"Comma-separated list of fields to include in the response. When omitted, all fields are returned.",
+                        "in":"query","name":"fields","required":false,
+                        "style":"form","explode":false,
+                        "schema":{"type":"array","items":{"type":"string","enum":[
+                            "uuid","name","created_at","version","jurisdiction","num_tables","file_size","running_in_region","read_replication"
+                        ]}}
+                    }],
+                    "responses":response.clone()
+                },
+                "delete":{
+                    "operationId":"d1-delete-database",
+                    "summary":"Delete D1 Database",
+                    "description":"Deletes the specified D1 database.",
+                    "tags":["D1"],
+                    "x-api-token-group":["D1 Write"],
+                    "parameters":[account,database_id],
+                    "responses":cloudflare_envelope_responses()
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn d1_database_create_has_exact_readback_usage_cost_and_guarded_empty_database_compensation() {
+    let snapshot = normalize_openapi(&d1_database_create_fixture()).expect("D1 create catalog");
+    let create = snapshot
+        .get("d1-create-database")
+        .expect("create D1 database");
+
+    assert_eq!(
+        create.adapter_status,
+        AdapterStatus::DynamicApi,
+        "{:?}",
+        create.blocked_reason
+    );
+    assert_eq!(create.risk, RiskClass::ScopedWrite);
+    assert_eq!(create.effect, EffectClass::ReversibleWrite);
+    assert!(create.cost.known);
+    assert!(!create.cost.incremental);
+    assert_eq!(create.cost.maximum, Some(0.0));
+    assert_eq!(create.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(create.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(create.entitlement.available, Some(true));
+    assert_eq!(create.entitlement.plans.get("free"), Some(&true));
+    assert_eq!(create.entitlement.plans.get("paid"), Some(&true));
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    let target = create
+        .created_resource
+        .as_ref()
+        .expect("created D1 contract");
+    assert_eq!(target.identity_selector, "database_id");
+    assert_eq!(target.response_result_identity_pointer, "/uuid");
+    assert_eq!(target.read_capability_id, "d1-get-database");
+    assert_eq!(target.delete_capability_id, "d1-delete-database");
+    assert_eq!(
+        target.verified_response_fields,
+        ["jurisdiction", "name", "read_replication"]
+    );
+    assert_eq!(
+        create.request_schema.as_ref().expect("request schema")["properties"]["primary_location_hint"]
+            ["x-cfctl-verification-observable"],
+        false
+    );
+    assert!(create.rollback.supported);
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_empty_d1_database_by_returned_uuid_if_unchanged")
+    );
+    assert!(create.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("empty-state") && warning.contains("explicit approval")
+    }));
+    assert!(
+        create.mutation_contract_gaps().is_empty(),
+        "{:?}",
+        create.mutation_contract_gaps()
+    );
+}
+
+#[test]
+fn d1_database_create_classifier_rejects_request_response_read_and_delete_drift() {
+    let mut request = d1_database_create_fixture();
+    request["paths"]["/accounts/{account_id}/d1/database"]["post"]["requestBody"]["content"]["application/json"]
+        ["schema"]["properties"]["read_replication"]["properties"]["mode"]["enum"] =
+        json!(["auto", "disabled", "experimental"]);
+    assert_eq!(
+        normalize_openapi(&request)
+            .expect("request drift")
+            .get("d1-create-database")
+            .expect("create")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+
+    let mut response = d1_database_create_fixture();
+    response["paths"]["/accounts/{account_id}/d1/database"]["post"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("result fields")
+        .remove("uuid");
+    assert_eq!(
+        normalize_openapi(&response)
+            .expect("response drift")
+            .get("d1-create-database")
+            .expect("create")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+
+    let mut read = d1_database_create_fixture();
+    read["paths"]["/accounts/{account_id}/d1/database/{database_id}"]["get"]["operationId"] =
+        json!("untrusted-d1-read");
+    assert_eq!(
+        normalize_openapi(&read)
+            .expect("read drift")
+            .get("d1-create-database")
+            .expect("create")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+
+    let mut delete = d1_database_create_fixture();
+    delete["paths"]["/accounts/{account_id}/d1/database/{database_id}"]["delete"]["x-api-token-group"] =
+        json!(["D1 Read"]);
+    assert_eq!(
+        normalize_openapi(&delete)
+            .expect("delete drift")
+            .get("d1-create-database")
+            .expect("create")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+}
+
+fn r2_bucket_response() -> Value {
+    json!({
+        "200": {
+            "description": "R2 bucket response.",
+            "content": {"application/json": {"schema": {"allOf": [
+                {"$ref": "#/components/schemas/api-response-common"},
+                {"type": "object", "properties": {
+                    "result": {"$ref": "#/components/schemas/r2-bucket"}
+                }}
+            ]}}}
+        }
+    })
+}
+
+fn r2_bucket_fixture() -> Value {
+    let account = json!({
+        "in": "path",
+        "name": "account_id",
+        "required": true,
+        "description": "Account ID.",
+        "schema": {"$ref": "#/components/schemas/identifier"}
+    });
+    let bucket = json!({
+        "in": "path",
+        "name": "bucket_name",
+        "required": true,
+        "description": "Name of the bucket.",
+        "schema": {"$ref": "#/components/schemas/bucket-name"}
+    });
+    let jurisdiction = json!({
+        "in": "header",
+        "name": "cf-r2-jurisdiction",
+        "required": false,
+        "description": "Jurisdiction where objects in this bucket are guaranteed to be stored.",
+        "schema": {"$ref": "#/components/schemas/jurisdiction"}
+    });
+    let response = r2_bucket_response();
+    json!({
+        "openapi": "3.0.3",
+        "info": {"title": "Cloudflare API", "version": "4.0.0"},
+        "servers": [{"url": "https://api.cloudflare.com/client/v4"}],
+        "components": {"schemas": {
+            "identifier": {"type": "string", "maxLength": 32},
+            "bucket-name": {"type": "string", "minLength": 3, "maxLength": 64},
+            "jurisdiction": {"type": "string", "enum": ["default", "eu", "fedramp"]},
+            "location": {"type": "string", "enum": ["apac", "eeur", "enam", "weur", "wnam", "oc"]},
+            "storage-class": {"type": "string", "enum": ["Standard", "InfrequentAccess"]},
+            "api-response-common": {
+                "type": "object",
+                "required": ["success"],
+                "properties": {"success": {"type": "boolean", "enum": [true]}}
+            },
+            "r2-bucket-create": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": {"$ref": "#/components/schemas/bucket-name"},
+                    "locationHint": {"$ref": "#/components/schemas/location"},
+                    "storageClass": {"$ref": "#/components/schemas/storage-class"}
+                }
+            },
+            "r2-bucket": {
+                "type": "object",
+                "properties": {
+                    "creation_date": {"type": "string"},
+                    "jurisdiction": {"$ref": "#/components/schemas/jurisdiction"},
+                    "location": {"$ref": "#/components/schemas/location"},
+                    "name": {"$ref": "#/components/schemas/bucket-name"},
+                    "storage_class": {"$ref": "#/components/schemas/storage-class"}
+                }
+            }
+        }},
+        "paths": {
+            "/accounts/{account_id}/r2/buckets": {
+                "post": {
+                    "operationId": "r2-create-bucket",
+                    "summary": "Create Bucket",
+                    "description": "Creates a new R2 bucket.",
+                    "tags": ["R2 Bucket"],
+                    "x-api-token-group": ["Workers R2 Storage Write"],
+                    "parameters": [account.clone(), jurisdiction.clone()],
+                    "requestBody": {"required": true, "content": {"application/json": {
+                        "schema": {"$ref": "#/components/schemas/r2-bucket-create"}
+                    }}},
+                    "responses": response.clone()
+                }
+            },
+            "/accounts/{account_id}/r2/buckets/{bucket_name}": {
+                "get": {
+                    "operationId": "r2-get-bucket",
+                    "summary": "Get Bucket",
+                    "description": "Gets properties of an existing R2 bucket.",
+                    "tags": ["R2 Bucket"],
+                    "parameters": [account.clone(), bucket.clone(), jurisdiction.clone()],
+                    "responses": response
+                },
+                "delete": {
+                    "operationId": "r2-delete-bucket",
+                    "summary": "Delete Bucket",
+                    "description": "Deletes an existing R2 bucket.",
+                    "tags": ["R2 Bucket"],
+                    "x-api-token-group": ["Workers R2 Storage Write"],
+                    "parameters": [bucket, account, jurisdiction],
+                    "responses": {"200": {"description": "Delete bucket response", "content": {
+                        "application/json": {"schema": {"allOf": [
+                            {"$ref": "#/components/schemas/api-response-common"},
+                            {"type": "object", "properties": {"result": {"type": "object", "nullable": true}}}
+                        ]}}
+                    }}}
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn r2_bucket_create_has_paid_ceiling_exact_readback_and_reviewed_empty_bucket_compensation() {
+    let snapshot = normalize_openapi(&r2_bucket_fixture()).expect("R2 bucket catalog");
+    let create = snapshot.get("r2-create-bucket").expect("create R2 bucket");
+
+    assert_eq!(
+        create.adapter_status,
+        AdapterStatus::DynamicApi,
+        "{:?}",
+        create.blocked_reason
+    );
+    assert_eq!(create.risk, RiskClass::ScopedWrite);
+    assert_eq!(create.effect, EffectClass::ReversibleWrite);
+    assert!(create.cost.known);
+    assert!(create.cost.incremental);
+    assert_eq!(create.cost.currency.as_deref(), Some("USD"));
+    assert_eq!(create.cost.maximum, Some(0.000_009));
+    assert_eq!(create.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(create.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(create.entitlement.available, Some(true));
+    assert_eq!(
+        create.entitlement.plans.get("r2_active_subscription"),
+        Some(&true)
+    );
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    let target = create
+        .created_resource
+        .as_ref()
+        .expect("created bucket contract");
+    assert_eq!(
+        target.detail_path,
+        "/accounts/{account_id}/r2/buckets/{bucket_name}"
+    );
+    assert_eq!(target.identity_selector, "bucket_name");
+    assert_eq!(target.response_result_identity_pointer, "/name");
+    assert_eq!(target.read_capability_id, "r2-get-bucket");
+    assert_eq!(target.delete_capability_id, "r2-delete-bucket");
+    assert_eq!(target.verified_response_fields, ["name", "storageClass"]);
+    assert_eq!(
+        create.request_schema.as_ref().expect("request schema")["properties"]["locationHint"]["x-cfctl-verification-observable"],
+        false
+    );
+    assert_eq!(
+        create.request_schema.as_ref().expect("request schema")["properties"]["storageClass"]["x-cfctl-verification-response-field"],
+        "storage_class"
+    );
+    assert!(
+        create.request_schema.as_ref().expect("request schema")["properties"]["storageClass"]
+            .get("x-cfctl-verification-observable")
+            .is_none()
+    );
+    assert!(create.rollback.supported);
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    assert!(create.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("empty") && warning.contains("separately reviewed")
+    }));
+    assert!(create.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn r2_bucket_create_classifier_rejects_permission_request_response_and_readback_drift() {
+    let mut permission = r2_bucket_fixture();
+    permission["paths"]["/accounts/{account_id}/r2/buckets"]["post"]["x-api-token-group"] =
+        json!(["Workers R2 Storage Read"]);
+    assert_eq!(
+        normalize_openapi(&permission)
+            .expect("permission-drifted catalog")
+            .get("r2-create-bucket")
+            .expect("create bucket")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+
+    let mut request = r2_bucket_fixture();
+    request["components"]["schemas"]["storage-class"]["enum"] = json!(["Standard"]);
+    assert_eq!(
+        normalize_openapi(&request)
+            .expect("request-drifted catalog")
+            .get("r2-create-bucket")
+            .expect("create bucket")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+
+    let mut response = r2_bucket_fixture();
+    response["components"]["schemas"]["r2-bucket"]["properties"]
+        .as_object_mut()
+        .expect("bucket fields")
+        .remove("storage_class");
+    assert_eq!(
+        normalize_openapi(&response)
+            .expect("response-drifted catalog")
+            .get("r2-create-bucket")
+            .expect("create bucket")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+
+    let mut readback = r2_bucket_fixture();
+    readback["paths"]["/accounts/{account_id}/r2/buckets/{bucket_name}"]["get"]["operationId"] =
+        json!("untrusted-r2-bucket-readback");
+    assert_eq!(
+        normalize_openapi(&readback)
+            .expect("readback-drifted catalog")
+            .get("r2-create-bucket")
+            .expect("create bucket")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+}
+
 fn assert_nested_replication_schema(schema: &serde_json::Value) {
     assert_eq!(schema["properties"]["replication"]["type"], "object");
     assert_eq!(

@@ -1046,12 +1046,13 @@ impl Executor {
             target.identity_selector.clone(),
             Value::String(resource_id.to_owned()),
         );
-        let details = CapabilityV1::new(
+        let mut details = CapabilityV1::new(
             &target.read_capability_id,
             "Created resource verification readback",
             "GET",
             &target.detail_path,
         );
+        details.selectors.clone_from(&plan.capability.selectors);
         let request = self.builder.build(
             &details,
             &CallInput {
@@ -1066,8 +1067,9 @@ impl Executor {
             .result
             .pointer(&target.response_result_identity_pointer)
             .and_then(Value::as_str);
-        let mismatches =
+        let mut mismatches =
             mismatched_verifiable_planned_fields(&plan.capability, planned, &readback.result);
+        extend_r2_bucket_create_mismatches(plan, input, &readback.result, &mut mismatches);
         let passed = apply_response.success
             && readback.success
             && readback_identity == Some(resource_id)
@@ -1683,8 +1685,10 @@ fn mismatched_verifiable_planned_fields(
         .iter()
         .filter(|(name, planned_value)| {
             let mut path = vec![RequestSchemaPathStep::Property((*name).clone())];
+            let response_field =
+                verification_response_field(capability, name).unwrap_or_else(|| (*name).clone());
             !contains_verifiable_planned_value(
-                actual.get(name.as_str()),
+                actual.get(response_field.as_str()),
                 planned_value,
                 schema,
                 &mut path,
@@ -1693,6 +1697,45 @@ fn mismatched_verifiable_planned_fields(
         })
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+fn verification_response_field(capability: &CapabilityV1, request_field: &str) -> Option<String> {
+    if capability.id != "r2-create-bucket"
+        || capability.method != "POST"
+        || capability.product != "R2 Bucket"
+        || capability.path != "/accounts/{account_id}/r2/buckets"
+        || request_field != "storageClass"
+    {
+        return None;
+    }
+    capability
+        .request_object_field_verification_response_field(request_field)
+        .filter(|response_field| response_field == "storage_class")
+}
+
+fn extend_r2_bucket_create_mismatches(
+    plan: &PlanV1,
+    input: &CallInput,
+    actual: &Value,
+    mismatches: &mut Vec<String>,
+) {
+    if plan.capability.id != "r2-create-bucket"
+        || plan.capability.product != "R2 Bucket"
+        || plan.capability.path != "/accounts/{account_id}/r2/buckets"
+    {
+        return;
+    }
+    if input
+        .selectors
+        .get("cf-r2-jurisdiction")
+        .is_some_and(|planned_jurisdiction| {
+            actual.get("jurisdiction") != Some(planned_jurisdiction)
+        })
+    {
+        mismatches.push("cf-r2-jurisdiction".to_owned());
+    }
+    mismatches.sort();
+    mismatches.dedup();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2331,6 +2374,7 @@ fn selector_can_be_response_id(selector: &str) -> bool {
 
 fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
     (selector_can_be_response_id(selector) && pointer == "/id")
+        || (selector.ends_with("_name") && pointer == "/name")
         || (!selector
             .chars()
             .any(|character| matches!(character, '/' | '~'))

@@ -309,7 +309,19 @@ fn included_entry(entry: &DirEntry) -> bool {
     }
     !matches!(
         entry.file_name().to_str(),
-        Some(".git" | ".terraform" | ".wrangler" | "node_modules" | "target" | "vendor")
+        Some(
+            ".git"
+                | ".terraform"
+                | ".wrangler"
+                | "__fixtures__"
+                | "fixtures"
+                | "node_modules"
+                | "target"
+                | "test-data"
+                | "test_data"
+                | "testdata"
+                | "vendor"
+        )
     )
 }
 

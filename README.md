@@ -7,6 +7,9 @@ with stable JSON for automation.
 
 ```bash
 ./bootstrap.sh
+cfctl version --json
+cfctl doctor --json
+cfctl agents doctor --json
 cfctl catalog sync
 cfctl catalog search "Worker secret"
 cfctl guide worker-put-script-secret
@@ -26,11 +29,11 @@ cfctl is a local-first, catalog-driven control plane: it separates intent, live 
 
 **What happens after a failure or crash?** Once consumption or a boundary attempt is durable, cfctl never guesses that replay is safe. Inspect `plans status`; use `plans rectify` to reconcile durable receipts and verification without replaying the original Cloudflare mutation.
 
-**What should I do next?** Run doctor, search the catalog for the intent, inspect the selected capability, and load its capability-specific guide before calling it.
+**What should I do next?** Run `cfctl version --json` and both doctors before work; running-build, PATH-build, or managed-instruction drift is unhealthy. Read token permissions only with an explicit account context (`keys permissions --account`, adding `--user` only to select user ownership). Nested fixture basenames are skipped during broader workspace scans; fixture directories are opt-in roots and must be registered directly. Then search the catalog for the intent, inspect the selected capability, and load its capability-specific guide before calling it.
 
 ### Lifecycle
 
-1. **Orient** (`none`) — Check local state, credentials, catalog health, and agent integration.
+1. **Orient** (`none`) — Check running and PATH build identity, local state, credentials, catalog health, and agent integration.
 2. **Discover** (`none`) — Search and inspect the catalog-selected capability and adapter.
 3. **Read** (`read`) — Inspect exact live Cloudflare state and registered-workspace impact. Durable state: redacted live-read and source-config evidence
 4. **Plan** (`none`) — Bind the request, account, catalog, impact, cost, verification, and compensation contracts. Durable state: hash-bound PlanV1 and PlanPrepared checkpoint
@@ -42,7 +45,12 @@ cfctl is a local-first, catalog-driven control plane: it separates intent, live 
 ### Commands
 
 ```bash
+cfctl version --json
 cfctl doctor --json
+cfctl agents doctor --json
+cfctl keys permissions --account <account-id> --json
+cfctl keys permissions --user --account <account-id> --json
+cfctl guide --topic standing-authority --json
 cfctl catalog search <intent> --json
 cfctl catalog show <capability-id> --json
 cfctl guide <capability-id> --json
@@ -96,6 +104,7 @@ check before sending a mutation.
 
 ```text
 cfctl "<natural-language request>"
+cfctl version
 cfctl auth login|status|profiles|use|logout|import-api-token|import-global-key
 cfctl keys permissions|mint|rotate|revoke|policy
 cfctl catalog sync|search|show|changes|coverage
@@ -112,8 +121,8 @@ cfctl migrate v1
 ```
 
 Every command has concise human output and stable `--json` output. The public
-contracts are `CapabilityV1`, `CapabilityGuideV1`, `GuideTopicDocumentV1`,
-`PlanV1`, `PolicyDecisionV1`, `AgentActionV1`, `EvidenceV1`, and
+contracts are `BuildInfoV1`, `CapabilityV1`, `CapabilityGuideV1`,
+`GuideTopicDocumentV1`, `PlanV1`, `PolicyDecisionV1`, `AgentActionV1`, `EvidenceV1`, and
 `ResultEnvelopeV2`.
 
 ## Authentication
@@ -348,12 +357,22 @@ includes staged, unstaged, and untracked configuration,
 configless repositories, and duplicate repository basenames without collapsing
 their canonical identities.
 
+Nested directories named `fixtures`, `__fixtures__`, `testdata`, `test-data`,
+or `test_data` are excluded from broader scans so test configurations cannot
+pollute the operational graph. Register a fixture directory itself when its
+contents are intentional workspace evidence; the registered root is always
+included.
+
 Install managed instructions for detected local agents:
 
 ```bash
 cfctl agents install --all-detected
 cfctl agents doctor
 ```
+
+`version --json`, `doctor`, and `agents doctor` expose the running and PATH
+build identities. A missing or legacy PATH binary, a same-version binary from
+a different commit, or drifted managed instructions is unhealthy.
 
 Natural language launches the configured agent once. Quote it: a bare single
 token that is not a known command fails closed with a usage error and a

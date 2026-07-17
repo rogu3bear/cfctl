@@ -30,6 +30,7 @@ the local proof lane, then orient through the public CLI:
 
 ```bash
 ./bootstrap.sh
+cfctl version --json
 cfctl doctor
 cfctl catalog sync
 cfctl catalog coverage
@@ -37,6 +38,11 @@ cfctl workspace discover
 cfctl workspace audit
 cargo xtask verify
 ```
+
+Bootstrap requires a tracked-clean checkout, proves the installed binary is
+the exact `HEAD` commit, synchronizes only managed agent integrations, and runs
+both doctors. Use `--check-only` for source proof or `--skip-agent-sync` for an
+intentional binary-only install.
 
 Authentication is optional for offline development. Use `cfctl auth login` or
 an explicitly scoped token profile when live-read proof is required; never

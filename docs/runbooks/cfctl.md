@@ -3,12 +3,17 @@
 ## Health and discovery
 
 ```bash
+cfctl version --json
 cfctl doctor --json
 cfctl catalog sync --json
 cfctl catalog coverage --json
 cfctl docs changes --json
 cfctl agents doctor --json
 ```
+
+Require the running and PATH identities reported by both doctors to match the
+same commit. Missing or legacy binaries, same-version/different-commit builds,
+and managed-instruction drift are unhealthy installation states.
 
 If a command reports `catalog content hash mismatch`, do not edit the stored
 hash. Run `cfctl catalog sync --json` to fetch a fresh official snapshot and
@@ -105,8 +110,10 @@ cfctl workspace graph --json
 cfctl workspace audit --json
 ```
 
-Only registered roots are scanned. Fix account ambiguity or dirty overlap
-before planning writes.
+Only registered roots are scanned. Nested `fixtures`, `__fixtures__`,
+`testdata`, `test-data`, and `test_data` directories are excluded from a
+broader root; register a fixture directory directly to opt it into discovery.
+Fix account ambiguity or dirty overlap before planning writes.
 
 ## Reads
 
