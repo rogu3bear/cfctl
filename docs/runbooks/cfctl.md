@@ -29,6 +29,19 @@ workflow blockers. Search a stable gap name such as `verification_missing` or
 its spaced form (`verification missing`) to list matching operations before
 choosing a repair slice.
 
+A blocked capability hit at execution time fails closed with error code
+`CFCTL_CAPABILITY_BLOCKED`. The envelope carries the `capability_id`, the
+`blocking_gaps` list, and a `next_step` that routes to
+`cfctl guide <capability-id> --json`; follow the guide's `next_action` instead
+of retrying the call or routing around cfctl.
+
+Choosing a repair slice: read `mutation_contract_gap_counts` from
+`cfctl catalog coverage --json`, pick one gap code, and list its operations
+with `cfctl catalog search "<gap_code> <product>" --json`. Close the slice in
+source (catalog classifier plus, when a new verification strategy is declared,
+its support arm in `cfctl-core`), then prove it with before/after coverage
+counts from `cfctl catalog sync` and `cfctl catalog coverage --json`.
+
 Find and inspect an operation:
 
 ```bash
