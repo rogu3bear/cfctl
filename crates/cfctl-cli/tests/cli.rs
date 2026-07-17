@@ -304,6 +304,19 @@ fn retired_v1_command_shapes_fail_closed_instead_of_launching_an_agent() {
             "retired token lifecycle command must fail closed"
         );
     }
+    for arguments in [
+        ["cfctl", "token", "permission-groups"],
+        ["cfctl", "token", "rotate"],
+        ["cfctl", "audit", "trust"],
+        ["cfctl", "audit", "access"],
+        ["cfctl", "audit", "state"],
+    ] {
+        assert_eq!(
+            classify_invocation(arguments),
+            InvocationMode::Deterministic,
+            "concrete retired v1 command must fail closed: {arguments:?}"
+        );
+    }
 }
 
 #[test]
@@ -327,16 +340,25 @@ fn retired_words_do_not_disable_clear_natural_language_requests() {
 
 #[test]
 fn retired_multi_token_command_exits_nonzero_without_launching_an_agent() {
-    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
-        .args(["diff", "dns.record"])
-        .output()
-        .expect("cfctl binary runs");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("unrecognized subcommand"),
-        "retired command must reach clap instead of the agent launcher, got: {stderr}"
-    );
+    for arguments in [
+        ["diff", "dns.record"],
+        ["token", "permission-groups"],
+        ["token", "rotate"],
+        ["audit", "trust"],
+        ["audit", "access"],
+        ["audit", "state"],
+    ] {
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+            .args(arguments)
+            .output()
+            .expect("cfctl binary runs");
+        assert!(!output.status.success(), "{arguments:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unrecognized subcommand"),
+            "retired command {arguments:?} must reach clap instead of the agent launcher, got: {stderr}"
+        );
+    }
 }
 
 #[test]

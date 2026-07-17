@@ -423,7 +423,25 @@ fn verify_v1_quarantine_manifest() -> Result<(), TaskError> {
             )));
         }
     }
+    let declared_roots = ["compat/v1/catalog", "compat/v1/state"];
+    for path in tracked_files(repository_root)? {
+        if path.starts_with("compat/v1/") && !is_declared_quarantine_path(&path, &declared_roots) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "tracked path is outside the declared v1 quarantine roots: {path}"
+            )));
+        }
+    }
     verify_frozen_v1_catalog_contract(repository_root)
+}
+
+fn is_declared_quarantine_path(path: &str, declared_roots: &[&str]) -> bool {
+    matches!(path, "compat/v1/README.md" | "compat/v1/manifest.json")
+        || declared_roots.iter().any(|root| {
+            path == *root
+                || path
+                    .strip_prefix(root)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
 }
 
 fn verify_frozen_v1_catalog_contract(repository_root: &Path) -> Result<(), TaskError> {
@@ -501,27 +519,63 @@ fn tracked_files(repository_root: &Path) -> Result<Vec<String>, TaskError> {
 fn verify_quarantine_code_consumers() -> Result<(), TaskError> {
     let repository_root = repository_root()?;
     for path in tracked_files(repository_root)? {
-        if !path.starts_with("crates/") || !path_has_extension(&path, "rs") {
-            continue;
-        }
         let absolute_path = repository_root.join(&path);
-        let content = fs::read_to_string(&absolute_path)
-            .map_err(|source| io_error(&absolute_path, source))?;
-        if content.contains("compat/v1/state")
-            && path != "crates/cfctl-cli/src/runtime.rs"
-            && path != "crates/cfctl-cli/tests/cli.rs"
-        {
+        let bytes = fs::read(&absolute_path).map_err(|source| io_error(&absolute_path, source))?;
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if is_forbidden_quarantine_consumer(&path, content) {
             return Err(TaskError::InvalidSourceContract(format!(
-                "{path} consumes quarantined v1 state outside the migration boundary"
-            )));
-        }
-        if content.contains("compat/v1/catalog") && path != "crates/cfctl-cli/tests/cli.rs" {
-            return Err(TaskError::InvalidSourceContract(format!(
-                "{path} consumes the inert v1 static catalog"
+                "{path} consumes a quarantined v1 root outside its declared boundary"
             )));
         }
     }
     Ok(())
+}
+
+fn is_forbidden_quarantine_consumer(path: &str, content: &str) -> bool {
+    let source_extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "bash"
+                    | "cjs"
+                    | "fish"
+                    | "go"
+                    | "java"
+                    | "js"
+                    | "jsx"
+                    | "kt"
+                    | "kts"
+                    | "mjs"
+                    | "pl"
+                    | "py"
+                    | "rb"
+                    | "rs"
+                    | "sh"
+                    | "swift"
+                    | "ts"
+                    | "tsx"
+                    | "zsh"
+            )
+        });
+    if !source_extension && !content.starts_with("#!") {
+        return false;
+    }
+
+    let consumes_state = content.contains("compat/v1/state");
+    let consumes_catalog = content.contains("compat/v1/catalog");
+    if !consumes_state && !consumes_catalog {
+        return false;
+    }
+
+    match path {
+        "crates/cfctl-cli/src/runtime.rs" => consumes_catalog,
+        "crates/cfctl-cli/tests/cli.rs" | "xtask/src/main.rs" => false,
+        _ => true,
+    }
 }
 
 fn verify_tracked_cfctl_command_references() -> Result<(), TaskError> {
@@ -550,7 +604,7 @@ fn extract_cfctl_command_references(path: &str, content: &str) -> Vec<String> {
     let mut verbs = Vec::new();
     if path_has_extension(path, "json") {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
-            collect_json_command_references(&value, &mut verbs);
+            collect_json_command_references(&value, false, &mut verbs);
         }
         return verbs;
     }
@@ -574,6 +628,9 @@ fn extract_cfctl_command_references(path: &str, content: &str) -> Vec<String> {
             verbs.push(verb);
         }
         if markdown && !in_fence {
+            if let Some(verb) = cfctl_command_verb_in_prose(trimmed) {
+                verbs.push(verb);
+            }
             for (index, inline) in line.split('`').enumerate() {
                 if index % 2 == 1
                     && let Some(verb) = cfctl_command_verb(inline)
@@ -592,28 +649,64 @@ fn path_has_extension(path: &str, expected: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
-fn collect_json_command_references(value: &serde_json::Value, verbs: &mut Vec<String>) {
+fn collect_json_command_references(
+    value: &serde_json::Value,
+    command_context: bool,
+    verbs: &mut Vec<String>,
+) {
     match value {
         serde_json::Value::String(value) => {
-            if let Some(verb) = cfctl_command_verb(value) {
+            let verb = if command_context {
+                cfctl_command_verb(value)
+            } else {
+                cfctl_command_verb_in_prose(value)
+            };
+            if let Some(verb) = verb {
                 verbs.push(verb);
             }
         }
         serde_json::Value::Array(values) => {
             for value in values {
-                collect_json_command_references(value, verbs);
+                collect_json_command_references(value, command_context, verbs);
             }
         }
         serde_json::Value::Object(values) => {
-            for value in values.values() {
-                collect_json_command_references(value, verbs);
+            for (key, value) in values {
+                collect_json_command_references(
+                    value,
+                    command_context || is_json_command_reference_key(key),
+                    verbs,
+                );
             }
         }
         _ => {}
     }
 }
 
+fn is_json_command_reference_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "action",
+        "argv",
+        "command",
+        "entrypoint",
+        "example",
+        "invocation",
+        "next",
+    ]
+    .iter()
+    .any(|fragment| key.contains(fragment))
+}
+
 fn cfctl_command_verb(command: &str) -> Option<String> {
+    cfctl_command_verb_with_context(command, true)
+}
+
+fn cfctl_command_verb_in_prose(command: &str) -> Option<String> {
+    cfctl_command_verb_with_context(command, false)
+}
+
+fn cfctl_command_verb_with_context(command: &str, command_context: bool) -> Option<String> {
     let command = command
         .trim()
         .trim_start_matches(['$', '>', '-'])
@@ -622,18 +715,6 @@ fn cfctl_command_verb(command: &str) -> Option<String> {
     let command_index = tokens
         .iter()
         .position(|token| matches!(*token, "cfctl" | "./cfctl"))?;
-    if command_index > 0 {
-        let prefix = &tokens[..command_index];
-        let previous = prefix.last().copied().unwrap_or_default();
-        let shell_boundary = matches!(
-            previous,
-            "|" | "||" | "&&" | ";" | "exec" | "env" | "command" | "sudo"
-        );
-        let environment_prefix = prefix.iter().all(|token| token.contains('='));
-        if !shell_boundary && !environment_prefix {
-            return None;
-        }
-    }
     let mut arguments = tokens.iter().skip(command_index + 1).copied();
     let mut verb = arguments.next()?;
     while verb == "--json" {
@@ -642,10 +723,37 @@ fn cfctl_command_verb(command: &str) -> Option<String> {
     if verb.starts_with(['\"', '\'', '<', '{']) || verb == "\\" {
         return None;
     }
-    Some(
-        verb.trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '-')
-            .to_owned(),
-    )
+    let verb = verb
+        .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+        .to_owned();
+
+    if command_index > 0 {
+        let prefix = &tokens[..command_index];
+        let previous = prefix.last().copied().unwrap_or_default();
+        let shell_boundary = matches!(
+            previous,
+            "|" | "||" | "&&" | ";" | "exec" | "env" | "command" | "sudo"
+        );
+        let environment_prefix = prefix.iter().all(|token| token.contains('='));
+        let instructional_prefix = matches!(
+            previous
+                .trim_matches(|character: char| !character.is_ascii_alphabetic())
+                .to_ascii_lowercase()
+                .as_str(),
+            "execute" | "invoke" | "run" | "try" | "use"
+        );
+        if !shell_boundary && !environment_prefix && !instructional_prefix {
+            return None;
+        }
+    }
+    if !command_context
+        && verb != "help"
+        && !PUBLIC_V2_SUBCOMMANDS.contains(&verb.as_str())
+        && !RETIRED_V1_PUBLIC_VERBS.contains(&verb.as_str())
+    {
+        return None;
+    }
+    Some(verb)
 }
 
 fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
@@ -2089,18 +2197,19 @@ mod tests {
 
     use super::{
         expected_signed_release_file_names, extract_cfctl_command_references,
-        parse_remote_tag_commit, release_build_driver, release_build_subcommand,
-        release_tag_is_exact_version, render_linux_installer_text, security_proof_commands,
-        validate_codesign_details, validate_notary_receipt_value, validate_signed_release_file_set,
-        validated_release_targets, verify_active_guidance_has_no_v1_commands,
-        verify_documented_contracts, verify_generated_guidance_section_text,
-        verify_v1_cutover_contract,
+        is_declared_quarantine_path, is_forbidden_quarantine_consumer, parse_remote_tag_commit,
+        release_build_driver, release_build_subcommand, release_tag_is_exact_version,
+        render_linux_installer_text, security_proof_commands, validate_codesign_details,
+        validate_notary_receipt_value, validate_signed_release_file_set, validated_release_targets,
+        verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
+        verify_generated_guidance_section_text, verify_v1_cutover_contract,
     };
 
     #[test]
     fn command_reference_extraction_is_structural_and_ignores_prose() {
         let markdown = concat!(
             "cfctl persists managed state without teaching a command.\n",
+            "To compare the desired state, run cfctl diff dns.record before approval.\n",
             "`cfctl catalog search \"dns\" --json`\n",
             "```bash\n",
             "./cfctl diff dns.record\n",
@@ -2108,14 +2217,48 @@ mod tests {
         );
         assert_eq!(
             extract_cfctl_command_references("docs/example.md", markdown),
-            vec!["catalog".to_owned(), "diff".to_owned()]
+            vec!["diff".to_owned(), "catalog".to_owned(), "diff".to_owned()]
         );
 
-        let json = r#"{"commands":["cfctl guide --topic system","not a command"]}"#;
+        let json = r#"{"commands":["cfctl guide --topic system","not a command"],"description":"cfctl persists managed state","next_action":"Run cfctl hostname verify now"}"#;
         assert_eq!(
             extract_cfctl_command_references("example.json", json),
-            vec!["guide".to_owned()]
+            vec!["guide".to_owned(), "hostname".to_owned()]
         );
+    }
+
+    #[test]
+    fn quarantine_consumers_cover_tracked_source_and_executable_files() {
+        assert!(is_forbidden_quarantine_consumer(
+            "tools/replay.sh",
+            "jq . compat/v1/catalog/runtime.json"
+        ));
+        assert!(!is_forbidden_quarantine_consumer(
+            "docs/v1-parity.md",
+            "The compat/v1/catalog tree is inert migration evidence."
+        ));
+        assert!(!is_forbidden_quarantine_consumer(
+            "crates/cfctl-cli/src/runtime.rs",
+            "let retained_repo_state = \"compat/v1/state\";"
+        ));
+    }
+
+    #[test]
+    fn quarantine_manifest_does_not_exempt_undeclared_subtrees() {
+        let roots = ["compat/v1/catalog", "compat/v1/state"];
+        assert!(is_declared_quarantine_path(
+            "compat/v1/catalog/runtime.json",
+            &roots
+        ));
+        assert!(is_declared_quarantine_path("compat/v1/README.md", &roots));
+        assert!(is_declared_quarantine_path(
+            "compat/v1/manifest.json",
+            &roots
+        ));
+        assert!(!is_declared_quarantine_path(
+            "compat/v1/undeclared/run.sh",
+            &roots
+        ));
     }
 
     #[test]
