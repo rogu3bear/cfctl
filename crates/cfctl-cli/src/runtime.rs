@@ -7393,7 +7393,7 @@ async fn key_policy_create(
     let inventory = key_permissions(
         store,
         &KeyPermissionArgs {
-            account: Some(arguments.account.clone()),
+            account: arguments.account.clone(),
             user: false,
         },
     )
@@ -7556,33 +7556,56 @@ async fn key_permissions(
     store: &StateStore,
     arguments: &KeyPermissionArgs,
 ) -> Result<ResultEnvelopeV2> {
-    let capability_id = if arguments.user || arguments.account.is_none() {
+    let envelope = call_command(store, permission_inventory_call(arguments)).await?;
+    Ok(permission_inventory_envelope(envelope))
+}
+
+fn permission_inventory_call(arguments: &KeyPermissionArgs) -> CallArgs {
+    let capability_id = if arguments.user {
         "permission-groups-list-permission-groups"
     } else {
         "account-api-tokens-list-permission-groups"
     };
     let mut selectors = Vec::new();
-    if !arguments.user
-        && let Some(account) = &arguments.account
-    {
-        selectors.push(("account_id".to_owned(), account.clone()));
+    if !arguments.user {
+        selectors.push(("account_id".to_owned(), arguments.account.clone()));
     }
-    call_command(
-        store,
-        CallArgs {
-            capability_id: capability_id.to_owned(),
-            selectors,
-            query: Vec::new(),
-            body_json: None,
-            body_stdin: false,
-            profile: None,
-            account: arguments.account.clone(),
-            if_match: None,
-            if_none_match: None,
-            value_out: None,
-        },
-    )
-    .await
+    CallArgs {
+        capability_id: capability_id.to_owned(),
+        selectors,
+        query: Vec::new(),
+        body_json: None,
+        body_stdin: false,
+        profile: None,
+        account: Some(arguments.account.clone()),
+        if_match: None,
+        if_none_match: None,
+        value_out: None,
+    }
+}
+
+fn permission_inventory_envelope(mut envelope: ResultEnvelopeV2) -> ResultEnvelopeV2 {
+    "keys permissions".clone_into(&mut envelope.command);
+    let forbidden = serde_json::from_value::<CloudflareResponseV1>(envelope.result.clone())
+        .is_ok_and(|response| {
+            !response.success
+                && (response.status == 403
+                    || response.errors.iter().any(|error| error.code == Some(9109)))
+        });
+    if forbidden {
+        envelope.ok = false;
+        envelope.verification.state = VerificationState::Failed;
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_PERMISSION_INVENTORY_FORBIDDEN".to_owned(),
+            message: "Cloudflare denied the permission-group inventory. The selected API token requires the `Account API Tokens Read` or `Account API Tokens Write` grant for the explicit account."
+                .to_owned(),
+            next_step: Some(
+                "Grant the selected token Account API Tokens Read or Write, then retry the same account-bound inventory command."
+                    .to_owned(),
+            ),
+        });
+    }
+    envelope
 }
 
 async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<ResultEnvelopeV2> {
@@ -7604,7 +7627,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
     let inventory = key_permissions(
         store,
         &KeyPermissionArgs {
-            account: Some(account.to_owned()),
+            account: account.to_owned(),
             user: arguments.user,
         },
     )
@@ -9929,7 +9952,8 @@ mod tests {
         capability_call_argv, compensation_request, execute_read, find_secret_value,
         force_ipv4_from, guide_document, guide_stage_commands, http_client,
         is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
-        key_policy_list, key_policy_revoke, non_readback_verification_basis, persist_prepared_plan,
+        key_policy_list, key_policy_revoke, non_readback_verification_basis,
+        permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
         persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
         preflight_call_input, preflight_standing_authority, preserve_previous_catalog,
         query_object_from_pairs, read_import_secret, read_secret_file,
@@ -9954,16 +9978,19 @@ mod tests {
         workspace_resource_keys, zone_target,
     };
     use crate::profiles::ProfilesConfig;
-    use crate::{CallArgs, KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs, PlanSelector};
+    use crate::{
+        CallArgs, KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs,
+        PlanSelector,
+    };
     use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
-    use cfctl_cloudflare::{CloudflareResponseV1, OperationVerificationV1};
+    use cfctl_cloudflare::{CloudflareApiErrorV1, CloudflareResponseV1, OperationVerificationV1};
     use cfctl_core::{
         AdapterStatus, CapabilityV1, CostV1, CreatedCollectionResourceContractV1,
         CreatedResourceContractV1, EffectClass, EvidenceClass, EvidenceV1, PlanStatus, PlanV1,
-        QuerySerializationV1, RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1,
-        StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, VerificationState,
-        hash_value,
+        QuerySerializationV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1,
+        SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
+        TransactionStageV1, VerificationState, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -9977,6 +10004,80 @@ mod tests {
 
     fn guide_json(capability: &CapabilityV1) -> Value {
         serde_json::to_value(guide_document(capability)).expect("typed capability guide JSON")
+    }
+
+    #[test]
+    fn permission_inventory_routes_owner_without_dropping_account_context() {
+        let account = permission_inventory_call(&KeyPermissionArgs {
+            user: false,
+            account: "account-a".to_owned(),
+        });
+        assert_eq!(
+            account.capability_id,
+            "account-api-tokens-list-permission-groups"
+        );
+        assert_eq!(
+            account.selectors,
+            [("account_id".to_owned(), "account-a".to_owned())]
+        );
+        assert_eq!(account.account.as_deref(), Some("account-a"));
+
+        let user = permission_inventory_call(&KeyPermissionArgs {
+            user: true,
+            account: "account-a".to_owned(),
+        });
+        assert_eq!(
+            user.capability_id,
+            "permission-groups-list-permission-groups"
+        );
+        assert!(user.selectors.is_empty());
+        assert_eq!(user.account.as_deref(), Some("account-a"));
+    }
+
+    #[test]
+    fn permission_inventory_rewraps_command_and_maps_403_or_9109() {
+        let success_response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!([]),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let success = permission_inventory_envelope(ResultEnvelopeV2::success(
+            "call",
+            serde_json::to_value(success_response).expect("response JSON"),
+        ));
+        assert_eq!(success.command, "keys permissions");
+        assert!(success.ok);
+
+        for (status, code) in [(403, None), (400, Some(9109))] {
+            let response = CloudflareResponseV1 {
+                status,
+                success: false,
+                result: Value::Null,
+                errors: vec![CloudflareApiErrorV1 {
+                    code,
+                    message: "forbidden".to_owned(),
+                }],
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            };
+            let mut envelope = ResultEnvelopeV2::success(
+                "call",
+                serde_json::to_value(response).expect("response JSON"),
+            );
+            envelope.ok = false;
+            let mapped = permission_inventory_envelope(envelope);
+            assert_eq!(mapped.command, "keys permissions");
+            assert_eq!(mapped.verification.state, VerificationState::Failed);
+            let error = mapped.error.expect("actionable permission error");
+            assert_eq!(error.code, "CFCTL_PERMISSION_INVENTORY_FORBIDDEN");
+            assert!(error.message.contains("Account API Tokens Read"));
+            assert!(error.message.contains("Account API Tokens Write"));
+        }
     }
 
     struct DeleteFailingSecretStore;

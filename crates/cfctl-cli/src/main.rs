@@ -15,6 +15,21 @@ async fn main() -> ExitCode {
             Ok(cli) => runtime::execute(cli).await,
             Err(error) => {
                 let exit_code = u8::try_from(error.exit_code()).unwrap_or(2);
+                if json_requested && exit_code == 2 {
+                    let envelope = ResultEnvelopeV2::failure(
+                        "cfctl",
+                        "CFCTL_USAGE",
+                        &error.to_string(),
+                        Some("Run `cfctl --help` and correct the rejected arguments."),
+                    );
+                    let Ok(output) = runtime::render(&envelope, true) else {
+                        return ExitCode::from(1);
+                    };
+                    if std::io::stderr().write_all(output.as_bytes()).is_err() {
+                        return ExitCode::from(1);
+                    }
+                    return ExitCode::from(exit_code);
+                }
                 let _ignored = error.print();
                 return ExitCode::from(exit_code);
             }

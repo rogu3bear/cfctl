@@ -2,7 +2,7 @@
 
 use std::{fs, process::Command as ProcessCommand};
 
-use cfctl_cli::{Cli, Command, InvocationMode, classify_invocation};
+use cfctl_cli::{Cli, Command, InvocationMode, KeysCommand, classify_invocation};
 use cfctl_core::{GuideTopicV1, PUBLIC_V2_SUBCOMMANDS, render_guide_topic_markdown};
 use clap::{CommandFactory as _, Parser};
 
@@ -25,7 +25,7 @@ fn every_public_command_group_is_parseable() {
     ] {
         let arguments: Vec<&str> = match command {
             "auth" => vec!["cfctl", "auth", "status"],
-            "keys" => vec!["cfctl", "keys", "permissions"],
+            "keys" => vec!["cfctl", "keys", "permissions", "--account", "account-a"],
             "catalog" => vec!["cfctl", "catalog", "coverage"],
             "call" => vec!["cfctl", "call", "dns-records-list"],
             "guide" => vec!["cfctl", "guide", "dns-records-delete"],
@@ -103,6 +103,85 @@ fn clap_human_version_behavior_remains_compatible() {
         String::from_utf8(output.stdout).expect("version is UTF-8"),
         format!("cfctl {}\n", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn json_parser_failures_are_v2_usage_envelopes_with_exit_two() {
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .args(["--json", "keys", "permissions"])
+        .output()
+        .expect("run invalid JSON invocation");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("usage failure envelope");
+    assert_eq!(envelope["schema_version"], 2);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["command"], "cfctl");
+    assert_eq!(envelope["error"]["code"], "CFCTL_USAGE");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--account")),
+        "{envelope}"
+    );
+}
+
+#[test]
+fn human_parser_failures_and_metadata_keep_clap_behavior() {
+    let failure = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .args(["keys", "permissions"])
+        .output()
+        .expect("run invalid human invocation");
+    assert_eq!(failure.status.code(), Some(2));
+    assert!(failure.stdout.is_empty());
+    let stderr = String::from_utf8(failure.stderr).expect("human usage is UTF-8");
+    assert!(stderr.starts_with("error:"), "{stderr}");
+    assert!(serde_json::from_str::<serde_json::Value>(&stderr).is_err());
+
+    for argument in ["--help", "--version"] {
+        let metadata = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+            .args(["--json", argument])
+            .output()
+            .expect("run Clap metadata with JSON flag present");
+        assert!(metadata.status.success(), "{argument}");
+        assert!(!metadata.stdout.is_empty(), "{argument}");
+        assert!(metadata.stderr.is_empty(), "{argument}");
+    }
+}
+
+#[test]
+fn permission_inventory_requires_account_for_both_owners() {
+    assert!(Cli::try_parse_from(["cfctl", "keys", "permissions"]).is_err());
+
+    let account = Cli::try_parse_from(["cfctl", "keys", "permissions", "--account", "account-a"])
+        .expect("account-owned inventory parses");
+    let Some(Command::Keys(account)) = account.command else {
+        panic!("keys command");
+    };
+    let KeysCommand::Permissions(account) = account.command else {
+        panic!("permissions command");
+    };
+    assert!(!account.user);
+    assert_eq!(account.account, "account-a");
+
+    let user = Cli::try_parse_from([
+        "cfctl",
+        "keys",
+        "permissions",
+        "--user",
+        "--account",
+        "account-a",
+    ])
+    .expect("user-owned inventory parses");
+    let Some(Command::Keys(user)) = user.command else {
+        panic!("keys command");
+    };
+    let KeysCommand::Permissions(user) = user.command else {
+        panic!("permissions command");
+    };
+    assert!(user.user);
+    assert_eq!(user.account, "account-a");
 }
 
 #[test]

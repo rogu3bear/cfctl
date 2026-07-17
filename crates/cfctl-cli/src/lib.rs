@@ -216,7 +216,7 @@ pub struct KeyPermissionArgs {
     )]
     pub user: bool,
     #[arg(long)]
-    pub account: Option<String>,
+    pub account: String,
 }
 
 #[derive(Debug, Args)]
