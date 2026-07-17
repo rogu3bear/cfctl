@@ -7,11 +7,17 @@ fallbacks without an MCP dependency.
 ## Orient
 
 ```bash
+cfctl version --json
 cfctl doctor --json
 cfctl catalog sync --json
 cfctl catalog coverage --json
 cfctl agents doctor --json
 ```
+
+`version`, `doctor`, and `agents doctor` distinguish the running build from
+the `cfctl` resolved on `PATH`. A missing or legacy PATH binary, a
+same-version/different-commit binary, or drifted managed guidance is unhealthy;
+repair installation before relying on the operator surface.
 
 Coverage includes stable `mutation_contract_gap_counts`. The counts overlap by
 design because one capability can lack risk, cost, permissions, verification,
@@ -106,6 +112,10 @@ Workspace account pins resolve ambiguity. Source configuration, routes,
 hostnames, bindings, desired state, and cross-repository references become
 preconditions in transaction plans. A source audit is not live Cloudflare
 truth; use a live `call` for edge/account assertions.
+
+Nested directories named `fixtures`, `__fixtures__`, `testdata`, `test-data`,
+and `test_data` are excluded. Fixture directories are opt-in roots: register
+one directly only when its contents are intended to enter the workspace graph.
 
 ## Authentication and secrets
 

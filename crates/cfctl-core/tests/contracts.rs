@@ -104,6 +104,29 @@ fn system_and_standing_topics_answer_the_operator_questions_from_one_contract() 
             .iter()
             .any(|command| command == &["cfctl", "plans", "run", "<operation-id>", "--json"])
     );
+    assert!(
+        system
+            .commands
+            .iter()
+            .any(|command| command == &["cfctl", "version", "--json"])
+    );
+    assert!(system.commands.iter().any(|command| {
+        command
+            == &[
+                "cfctl",
+                "keys",
+                "permissions",
+                "--account",
+                "<account-id>",
+                "--json",
+            ]
+    }));
+    assert!(system.answers.iter().any(|answer| {
+        answer
+            .answer
+            .contains("fixture directories are opt-in roots")
+            && answer.answer.contains("PATH-build")
+    }));
 
     let standing = guide_topic_document(GuideTopicV1::StandingAuthority);
     assert_eq!(standing.schema_version, 1);
@@ -123,6 +146,9 @@ fn canonical_topic_markdown_is_complete_and_status_free() {
     let system = render_guide_topic_markdown(GuideTopicV1::System);
     assert!(system.starts_with("## How cfctl works\n"));
     assert!(system.contains("**Will this mutate Cloudflare now?**"));
+    assert!(system.contains("cfctl version --json"));
+    assert!(system.contains("cfctl keys permissions --account <account-id> --json"));
+    assert!(system.contains("fixture directories are opt-in roots"));
     assert!(system.contains("cfctl guide <capability-id> --json"));
 
     let standing = render_guide_topic_markdown(GuideTopicV1::StandingAuthority);

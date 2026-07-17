@@ -2215,7 +2215,7 @@ fn system_guide_answers() -> Vec<GuideAnswerV1> {
         ),
         guide_answer(
             GuideQuestionV1::NextAction,
-            "Run doctor, search the catalog for the intent, inspect the selected capability, and load its capability-specific guide before calling it.",
+            "Run `cfctl version --json` and both doctors before work; running-build, PATH-build, or managed-instruction drift is unhealthy. Read token permissions only with an explicit account context (`keys permissions --account`, adding `--user` only to select user ownership). Nested fixture basenames are skipped during broader workspace scans; fixture directories are opt-in roots and must be registered directly. Then search the catalog for the intent, inspect the selected capability, and load its capability-specific guide before calling it.",
         ),
     ]
 }
@@ -2225,7 +2225,7 @@ fn system_guide_flow() -> Vec<GuideFlowStepV1> {
         guide_flow_step(
             1,
             "Orient",
-            "Check local state, credentials, catalog health, and agent integration.",
+            "Check running and PATH build identity, local state, credentials, catalog health, and agent integration.",
             GuideCloudflareEffectV1::None,
             None,
         ),
@@ -2283,7 +2283,27 @@ fn system_guide_flow() -> Vec<GuideFlowStepV1> {
 
 fn system_guide_commands(next_argv: &[String]) -> Vec<Vec<String>> {
     vec![
+        guide_argv(&["cfctl", "version", "--json"]),
         guide_argv(&["cfctl", "doctor", "--json"]),
+        guide_argv(&["cfctl", "agents", "doctor", "--json"]),
+        guide_argv(&[
+            "cfctl",
+            "keys",
+            "permissions",
+            "--account",
+            "<account-id>",
+            "--json",
+        ]),
+        guide_argv(&[
+            "cfctl",
+            "keys",
+            "permissions",
+            "--user",
+            "--account",
+            "<account-id>",
+            "--json",
+        ]),
+        guide_argv(&["cfctl", "guide", "--topic", "standing-authority", "--json"]),
         next_argv.to_vec(),
         guide_argv(&["cfctl", "catalog", "show", "<capability-id>", "--json"]),
         guide_argv(&["cfctl", "guide", "<capability-id>", "--json"]),

@@ -35,6 +35,83 @@ fn discovery_stays_inside_registered_roots_and_finds_cloudflare_configs() {
 }
 
 #[test]
+fn nested_fixture_directories_are_excluded_but_explicit_fixture_roots_are_discoverable() {
+    let root = tempfile::tempdir().expect("workspace root");
+    let repository = root.path().join("production-app");
+    init_repo(
+        &repository,
+        "wrangler.toml",
+        concat!(
+            "name = \"real-worker\"\n",
+            "routes = [{ pattern = \"real.example.com/*\", zone_name = \"example.com\" }]\n",
+            "d1_databases = [{ binding = \"DATABASE\", database_id = \"real-d1\" }]\n",
+            "r2_buckets = [{ binding = \"ASSETS\", bucket_name = \"real-r2\" }]\n",
+        ),
+    );
+    for (index, basename) in [
+        "fixtures",
+        "__fixtures__",
+        "testdata",
+        "test-data",
+        "test_data",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = repository.join("nested").join(basename);
+        fs::create_dir_all(&fixture).expect("nested fixture directory");
+        fs::write(
+            fixture.join("wrangler.toml"),
+            format!(
+                "name = \"fixture-{index}\"\nroutes = [{{ pattern = \"fixture-{index}.example.com/*\", zone_name = \"fixture-{index}.example.com\" }}]\n"
+            ),
+        )
+        .expect("nested fixture config");
+    }
+
+    let graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
+        .expect("fixture-safe discovery");
+    for (key, kind) in [
+        ("worker:real-worker", "wrangler_worker"),
+        ("hostname:real.example.com", "wrangler_route"),
+        ("zone:example.com", "wrangler_zone"),
+        ("d1_database:real-d1", "wrangler_d1"),
+        ("r2_bucket:real-r2", "wrangler_r2"),
+    ] {
+        assert!(
+            graph
+                .resources
+                .iter()
+                .any(|resource| resource.key == key && resource.kind == kind),
+            "missing real resource {key}"
+        );
+    }
+    assert!(
+        graph
+            .resources
+            .iter()
+            .all(|resource| !resource.key.contains("fixture-")),
+        "nested fixture resources polluted the graph: {:?}",
+        graph.resources
+    );
+
+    let explicit_fixture = root.path().join("fixtures");
+    init_repo(
+        &explicit_fixture,
+        "wrangler.toml",
+        "name = \"fixture-opt-in\"\n",
+    );
+    let explicit_graph = WorkspaceGraph::discover(&[RegisteredRoot::new(&explicit_fixture)])
+        .expect("explicit fixture-root discovery");
+    assert!(
+        explicit_graph
+            .resources
+            .iter()
+            .any(|resource| resource.key == "worker:fixture-opt-in")
+    );
+}
+
+#[test]
 fn impact_query_returns_every_repository_linked_to_a_resource() {
     let graph = WorkspaceGraph::from_links([
         ("repo-a", "hostname:api.example.com"),

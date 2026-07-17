@@ -34,12 +34,16 @@ fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() 
     let receipt = install_agent_skill(root.path(), AgentKind::Codex, InstallMode::Install)
         .expect("install skill");
     let content = std::fs::read_to_string(&receipt.path).expect("installed skill");
+    assert!(content.contains("cfctl version --json"));
     assert!(content.contains("cfctl catalog search"));
     assert!(content.contains("cfctl guide --topic system --json"));
+    assert!(content.contains("cfctl keys permissions --account <account-id> --json"));
+    assert!(content.contains("cfctl keys permissions --user --account <account-id> --json"));
     assert!(content.contains("cfctl guide --topic standing-authority --json"));
     assert!(content.contains("cfctl plans approve <operation-id> --yes"));
     assert!(content.contains("cfctl keys policy approve <authority-id> --yes"));
     assert!(content.contains("cfctl keys policy revoke <authority-id>"));
+    assert!(content.contains("fixture directories are opt-in roots"));
     assert!(!content.to_ascii_lowercase().contains("mcp"));
 
     std::fs::write(&receipt.path, "user-owned drift").expect("drift fixture");
@@ -55,11 +59,15 @@ fn cursor_guidance_preserves_plan_approval_and_explains_standing_policy_ceremony
         .expect("install Cursor rule");
     let content = std::fs::read_to_string(&receipt.path).expect("installed Cursor rule");
 
+    assert!(content.contains("cfctl version --json"));
     assert!(content.contains("cfctl plans approve <operation-id> --yes"));
     assert!(content.contains("cfctl guide --topic system --json"));
+    assert!(content.contains("cfctl keys permissions --account <account-id> --json"));
+    assert!(content.contains("cfctl keys permissions --user --account <account-id> --json"));
     assert!(content.contains("cfctl guide --topic standing-authority --json"));
     assert!(content.contains("cfctl keys policy approve <authority-id> --yes"));
     assert!(content.contains("cfctl keys policy revoke <authority-id>"));
+    assert!(content.contains("fixture directories are opt-in roots"));
 }
 
 #[test]

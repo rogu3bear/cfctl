@@ -7,20 +7,32 @@ unclassified browser path.
 
 For every request:
 
-1. Run `cfctl catalog search "<bounded non-secret intent>" --json`.
-2. Inspect the selected operation with
+1. Run `cfctl version --json`, `cfctl doctor --json`, and `cfctl agents doctor
+   --json`. Running-build, PATH-build, or managed-instruction drift is
+   unhealthy.
+2. Run `cfctl catalog search "<bounded non-secret intent>" --json`.
+3. Inspect the selected operation with
    `cfctl catalog show <capability-id> --json`.
-3. For unfamiliar or mutating work, run `cfctl guide <capability-id> --json`.
-4. Register and inspect relevant repository roots with `cfctl workspace ...`.
-5. Use `cfctl call <capability-id> ... --json` for a live read or to create a
+4. For unfamiliar or mutating work, run `cfctl guide <capability-id> --json`.
+5. Register and inspect relevant repository roots with `cfctl workspace ...`.
+   Nested fixture basenames are skipped; fixture directories are opt-in roots
+   and must be registered directly when intentional.
+6. Read account-owned permission inventory only with `cfctl keys permissions
+   --account <account-id> --json`. Add `--user` to select the user endpoint
+   while retaining that explicit account resource context.
+7. Use `cfctl call <capability-id> ... --json` for a live read or to create a
    hash-bound plan.
-6. If policy requires approval, show the exact operation ID, account, targets,
+8. If policy requires approval, show the exact operation ID, account, targets,
    diffs, costs, warnings, compensation, and verification. Ask y/n.
-7. Translate yes only into
+9. Translate yes only into
    `cfctl plans approve <operation-id> --yes`; paid plans also require the
    reviewed `--max-cost CURRENCY:AMOUNT`.
-8. Execute only with `cfctl plans run <operation-id> --json`.
-9. Inspect `cfctl plans status <operation-id> --json` and report the evidence
+10. Execute only with `cfctl plans run <operation-id> --json`.
+11. For recurring token lifecycle, first load `cfctl guide --topic
+    standing-authority --json`; activate the exact reviewed policy only after
+    explicit approval with `cfctl keys policy approve <authority-id> --yes`,
+    and revoke it with `cfctl keys policy revoke <authority-id>`.
+12. Inspect `cfctl plans status <operation-id> --json` and report the evidence
    class and verification state honestly. Use `plans rectify` for uncertain or
    non-replayable outcomes.
 

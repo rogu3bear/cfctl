@@ -7,6 +7,19 @@ Rust 1.93 or newer is pinned by `rust-toolchain.toml`.
 ```bash
 ./bootstrap.sh --check-only
 ./bootstrap.sh
+# Intentional binary-only install; leaves managed agent integrations untouched.
+./bootstrap.sh --skip-agent-sync
+```
+
+Bootstrap requires a tracked-clean checkout, runs the full verification lane,
+installs with `cargo install --force`, proves the installed commit equals
+`HEAD`, synchronizes only already-managed agent integrations unless skipped,
+and runs both doctors. Confirm the exact running build after installation:
+
+```bash
+cfctl version --json
+cfctl doctor --json
+cfctl agents doctor --json
 ```
 
 Or install directly from the checkout:
@@ -26,6 +39,7 @@ curl -fsSL https://cfctl.io/install.sh | CFCTL_VERSION=v2.0.0 sh
 ## Discover Cloudflare
 
 ```bash
+cfctl version --json
 cfctl doctor
 cfctl catalog sync
 cfctl catalog coverage --json
