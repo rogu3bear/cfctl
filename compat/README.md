@@ -5,6 +5,7 @@ backend and no bypass lane remains.
 
 - [Machine-readable parity audit](v1-parity-audit.json)
 - [Human-readable parity audit](../docs/v1-parity.md)
+- [Quarantined retained data contract](v1/README.md)
 
 The ignored local archive is migration evidence only. It is neither shipped
 nor invoked by v2.

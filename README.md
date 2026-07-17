@@ -13,6 +13,48 @@ cfctl guide worker-put-script-secret
 cfctl "rotate the production Worker secret"
 ```
 
+<!-- BEGIN CFCTL GENERATED: system-guide -->
+## How cfctl works
+
+cfctl is a local-first, catalog-driven control plane: it separates intent, live reads, durable authority, one Cloudflare boundary, verification, and evidence.
+
+**Will this mutate Cloudflare now?** Discovery, guides, workspace inspection, and read capabilities do not write Cloudflare. A mutating `cfctl call` creates a plan; `cfctl plans run` is the normal write boundary. A token command with `--under-policy` may plan and run in one invocation only under an explicitly approved standing authority. Agent output, guide output, and approval alone do not mutate Cloudflare.
+
+**What grants authority?** The deterministic policy engine grants automatic admission only to the narrow safe class. Otherwise authority is either explicit approval of one reviewed operation ID or explicit approval of one bounded standing token policy. A model never grants authority.
+
+**What is persisted?** Under its managed state root, cfctl persists profile metadata, the live CapabilityV1 catalog and official-doc caches, workspace registrations and imports, plans, approval and admission checkpoints, transaction journals, standing-authority records, locks, and redacted evidence. Credential values remain in the platform secret store or an explicit mode-0600 sink. The source checkout's compat/v1 tree is inert migration evidence, not runtime state or a live catalog.
+
+**What happens after a failure or crash?** Once consumption or a boundary attempt is durable, cfctl never guesses that replay is safe. Inspect `plans status`; use `plans rectify` to reconcile durable receipts and verification without replaying the original Cloudflare mutation.
+
+**What should I do next?** Run doctor, search the catalog for the intent, inspect the selected capability, and load its capability-specific guide before calling it.
+
+### Lifecycle
+
+1. **Orient** (`none`) — Check local state, credentials, catalog health, and agent integration.
+2. **Discover** (`none`) — Search and inspect the catalog-selected capability and adapter.
+3. **Read** (`read`) — Inspect exact live Cloudflare state and registered-workspace impact. Durable state: redacted live-read and source-config evidence
+4. **Plan** (`none`) — Bind the request, account, catalog, impact, cost, verification, and compensation contracts. Durable state: hash-bound PlanV1 and PlanPrepared checkpoint
+5. **Admit** (`none`) — Apply policy, bind any explicit approval, acquire locks, and recheck drift. Durable state: approval, standing reservation, and consumption checkpoints
+6. **Execute** (`write`) — Persist the boundary attempt, then cross exactly one catalog-selected adapter boundary. Durable state: boundary-attempt and response checkpoints
+7. **Verify** (`read`) — Run the operation-specific verifier or record why rectification is required. Durable state: sink and verification receipts
+8. **Close or rectify** (`none`) — Close with evidence or reconcile the durable journal; any compensation is a new plan with independent authority. Durable state: terminal plan status and content-addressed evidence
+
+### Commands
+
+```bash
+cfctl doctor --json
+cfctl catalog search <intent> --json
+cfctl catalog show <capability-id> --json
+cfctl guide <capability-id> --json
+cfctl call <capability-id> --json
+cfctl plans show <operation-id> --json
+cfctl plans approve <operation-id> --yes --json
+cfctl plans run <operation-id> --json
+cfctl plans status <operation-id> --json
+cfctl plans rectify <operation-id> --json
+```
+<!-- END CFCTL GENERATED: system-guide -->
+
 ## What it covers
 
 Catalog refresh ingests Cloudflare's official OpenAPI schema, OAuth permission
@@ -59,6 +101,7 @@ cfctl keys permissions|mint|rotate|revoke|policy
 cfctl catalog sync|search|show|changes|coverage
 cfctl call <capability-id> [selectors/body]
 cfctl guide <capability-id>
+cfctl guide --topic system|standing-authority
 cfctl plans show|approve|run|status|resume|rectify
 cfctl workspace add|discover|graph|audit
 cfctl agents install|doctor|sync
@@ -69,8 +112,9 @@ cfctl migrate v1
 ```
 
 Every command has concise human output and stable `--json` output. The public
-contracts are `CapabilityV1`, `PlanV1`, `PolicyDecisionV1`, `AgentActionV1`,
-`EvidenceV1`, and `ResultEnvelopeV2`.
+contracts are `CapabilityV1`, `CapabilityGuideV1`, `GuideTopicDocumentV1`,
+`PlanV1`, `PolicyDecisionV1`, `AgentActionV1`, `EvidenceV1`, and
+`ResultEnvelopeV2`.
 
 ## Authentication
 
@@ -334,7 +378,9 @@ not verification.
 content-addressed imports. It skips secret-shaped paths/content and never
 imports credentials implicitly. The original dirty shell runtime was frozen
 before cutover in the gitignored private v1 archive for the one-release
-compatibility window.
+compatibility window. This checkout's retained v1 data is quarantined under
+[`compat/v1/`](compat/v1/README.md); the live v2 catalog is managed under
+`CFCTL_HOME`, not loaded from that retained tree.
 
 ## Development and release
 
@@ -430,3 +476,4 @@ under `site/`; these external steps are not silently performed or claimed.
 - [v2 stacked review, merge, and rollback runbook](docs/v2-pr-sequence.md)
 - [Rust clean-break ADR](docs/architecture/adr/0001-rust-clean-break.md)
 - [Risk-based approval ADR](docs/architecture/adr/0002-risk-based-approval.md)
+- [Executable guidance projection ADR](docs/architecture/adr/0003-executable-guidance-projection.md)

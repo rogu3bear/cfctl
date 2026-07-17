@@ -1,6 +1,9 @@
 //! Versioned domain contracts for the cfctl v2 control plane.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -8,6 +11,101 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+
+/// Exact sorted inventory of the executable v2 top-level command surface.
+///
+/// The CLI tests bind this contract to the live Clap tree, while `xtask`
+/// uses it to reject stale checked-in command examples.
+pub const PUBLIC_V2_SUBCOMMANDS: &[&str] = &[
+    "agents",
+    "auth",
+    "call",
+    "catalog",
+    "docs",
+    "doctor",
+    "guide",
+    "keys",
+    "migrate",
+    "plans",
+    "update",
+    "workspace",
+];
+
+/// Frozen top-level verbs from the retired shell control plane that must
+/// always reach the deterministic parser. Without this boundary, a stale
+/// multi-token v1 command would be mistaken for natural-language intent and
+/// could launch an agent instead of failing closed.
+pub const RETIRED_V1_PUBLIC_VERBS: &[&str] = &[
+    "admin",
+    "apply",
+    "audit",
+    "bootstrap",
+    "can",
+    "classify",
+    "cloudflared",
+    "diff",
+    "env",
+    "explain",
+    "form-intake",
+    "get",
+    "hostname",
+    "lanes",
+    "list",
+    "locks",
+    "maildesk-cf",
+    "ownership",
+    "previews",
+    "skills",
+    "snapshot",
+    "standards",
+    "surfaces",
+    "token",
+    "verify",
+    "wrangler",
+];
+
+/// Frozen surface identifiers used to distinguish concrete v1 command shapes
+/// from legitimate natural-language requests that begin with words such as
+/// `list`, `explain`, or `verify`.
+pub const RETIRED_V1_SURFACES: &[&str] = &[
+    "access.app",
+    "access.group",
+    "access.idp",
+    "access.login_method",
+    "access.organization",
+    "access.policy",
+    "access.service_token",
+    "api_gateway.discovery",
+    "api_gateway.operation",
+    "api_gateway.schema",
+    "audit.log",
+    "d1.database",
+    "dns.record",
+    "edge.certificate",
+    "email.routing_rule",
+    "form.intake",
+    "logpush.job",
+    "maildesk-cf",
+    "pages.project",
+    "pages.secret",
+    "queue",
+    "r2.bucket",
+    "security.txt",
+    "sender_domain",
+    "tunnel",
+    "turnstile.widget",
+    "vulnerability_scanner.credential_set",
+    "vulnerability_scanner.scan",
+    "vulnerability_scanner.target_environment",
+    "waiting_room",
+    "worker.route",
+    "worker.script",
+    "worker.secret",
+    "workflow",
+    "zone",
+    "zone.ruleset",
+    "zone.setting",
+];
 
 /// Errors shared by the deterministic planner, policy engine, and executors.
 #[derive(Debug, Error)]
@@ -1713,6 +1811,535 @@ pub fn guide_stages() -> &'static [GuideStage; 15] {
         GuideStage::Verify,
         GuideStage::Rectify,
         GuideStage::CloseWithEvidence,
+    ]
+}
+
+/// Machine-readable availability state for one capability-guide stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuideContractStateV1 {
+    Available,
+    Blocked,
+    ManualReview,
+    NotApplicable,
+    LiveReadRequired,
+}
+
+/// One safe next action emitted by a guide document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuideActionV1 {
+    pub summary: String,
+    pub argv: Vec<String>,
+}
+
+/// Typed form of one stage in the existing capability-guide JSON contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityGuideStageV1 {
+    pub stage: usize,
+    pub name: GuideStage,
+    pub capability_id: String,
+    pub required: bool,
+    pub contract_state: GuideContractStateV1,
+    pub summary: String,
+    pub evidence_class: EvidenceClass,
+    pub commands: Vec<Vec<String>>,
+}
+
+/// Typed form of the existing `cfctl guide <capability-id>` JSON payload.
+///
+/// This deliberately has no additional discriminator or schema field so its
+/// serialized shape remains compatible with the previously untyped payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityGuideV1 {
+    pub capability: CapabilityV1,
+    pub contract_state: GuideContractStateV1,
+    pub blocking_gaps: Vec<String>,
+    pub blocked_reason: Option<String>,
+    pub call_argv: Option<Vec<String>>,
+    pub post_resolution_call_argv: Vec<String>,
+    pub next_action: GuideActionV1,
+    pub stages: Vec<CapabilityGuideStageV1>,
+}
+
+/// Stable system-level topics exposed through `cfctl guide --topic`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GuideTopicV1 {
+    System,
+    StandingAuthority,
+}
+
+impl GuideTopicV1 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::StandingAuthority => "standing-authority",
+        }
+    }
+
+    #[must_use]
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::System => "How cfctl works",
+            Self::StandingAuthority => "Standing authority lifecycle",
+        }
+    }
+}
+
+/// The five operator questions every system-level guide must answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuideQuestionV1 {
+    MutatesCloudflare,
+    GrantsAuthority,
+    PersistsState,
+    FailureRecovery,
+    NextAction,
+}
+
+impl GuideQuestionV1 {
+    #[must_use]
+    pub const fn prompt(self) -> &'static str {
+        match self {
+            Self::MutatesCloudflare => "Will this mutate Cloudflare now?",
+            Self::GrantsAuthority => "What grants authority?",
+            Self::PersistsState => "What is persisted?",
+            Self::FailureRecovery => "What happens after a failure or crash?",
+            Self::NextAction => "What should I do next?",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuideCloudflareEffectV1 {
+    None,
+    Read,
+    Write,
+}
+
+impl GuideCloudflareEffectV1 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuideAnswerV1 {
+    pub question: GuideQuestionV1,
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuideFlowStepV1 {
+    pub stage: u8,
+    pub name: String,
+    pub summary: String,
+    pub cloudflare_effect: GuideCloudflareEffectV1,
+    pub durable_state: Option<String>,
+}
+
+/// Versioned system explanation projected into CLI JSON and checked-in docs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuideTopicDocumentV1 {
+    pub schema_version: u8,
+    pub topic: GuideTopicV1,
+    pub title: String,
+    pub summary: String,
+    pub answers: Vec<GuideAnswerV1>,
+    pub flow: Vec<GuideFlowStepV1>,
+    pub commands: Vec<Vec<String>>,
+    pub next_action: GuideActionV1,
+}
+
+#[must_use]
+pub fn guide_topic_document(topic: GuideTopicV1) -> GuideTopicDocumentV1 {
+    match topic {
+        GuideTopicV1::System => system_guide_document(),
+        GuideTopicV1::StandingAuthority => standing_authority_guide_document(),
+    }
+}
+
+#[must_use]
+pub fn render_guide_topic_markdown(topic: GuideTopicV1) -> String {
+    let document = guide_topic_document(topic);
+    render_guide_topic_document_markdown(&document)
+}
+
+/// Render an already-materialized topic document without consulting mutable
+/// runtime state. This keeps human CLI output and checked-in projections on
+/// the exact same typed document.
+#[must_use]
+pub fn render_guide_topic_document_markdown(document: &GuideTopicDocumentV1) -> String {
+    let mut markdown = format!("## {}\n\n{}\n\n", document.title, document.summary);
+    for answer in &document.answers {
+        if write!(
+            markdown,
+            "**{}** {}\n\n",
+            answer.question.prompt(),
+            answer.answer
+        )
+        .is_err()
+        {
+            return markdown;
+        }
+    }
+    markdown.push_str("### Lifecycle\n\n");
+    for step in &document.flow {
+        let durable_state = step
+            .durable_state
+            .as_deref()
+            .map_or_else(String::new, |state| format!(" Durable state: {state}"));
+        if writeln!(
+            markdown,
+            "{}. **{}** (`{}`) — {}{}",
+            step.stage,
+            step.name,
+            step.cloudflare_effect.as_str(),
+            step.summary,
+            durable_state
+        )
+        .is_err()
+        {
+            return markdown;
+        }
+    }
+    markdown.push_str("\n### Commands\n\n```bash\n");
+    for command in &document.commands {
+        markdown.push_str(&command.join(" "));
+        markdown.push('\n');
+    }
+    markdown.push_str("```\n");
+    markdown
+}
+
+fn guide_answer(question: GuideQuestionV1, answer: &str) -> GuideAnswerV1 {
+    GuideAnswerV1 {
+        question,
+        answer: answer.to_owned(),
+    }
+}
+
+fn guide_flow_step(
+    stage: u8,
+    name: &str,
+    summary: &str,
+    cloudflare_effect: GuideCloudflareEffectV1,
+    durable_state: Option<&str>,
+) -> GuideFlowStepV1 {
+    GuideFlowStepV1 {
+        stage,
+        name: name.to_owned(),
+        summary: summary.to_owned(),
+        cloudflare_effect,
+        durable_state: durable_state.map(str::to_owned),
+    }
+}
+
+fn guide_argv(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(ToString::to_string).collect()
+}
+
+fn system_guide_document() -> GuideTopicDocumentV1 {
+    let next_argv = guide_argv(&["cfctl", "catalog", "search", "<intent>", "--json"]);
+    GuideTopicDocumentV1 {
+        schema_version: 1,
+        topic: GuideTopicV1::System,
+        title: GuideTopicV1::System.title().to_owned(),
+        summary: "cfctl is a local-first, catalog-driven control plane: it separates intent, live reads, durable authority, one Cloudflare boundary, verification, and evidence.".to_owned(),
+        answers: system_guide_answers(),
+        flow: system_guide_flow(),
+        commands: system_guide_commands(&next_argv),
+        next_action: GuideActionV1 {
+            summary: "Search the catalog for the intended Cloudflare outcome.".to_owned(),
+            argv: next_argv,
+        },
+    }
+}
+
+fn system_guide_answers() -> Vec<GuideAnswerV1> {
+    vec![
+        guide_answer(
+            GuideQuestionV1::MutatesCloudflare,
+            "Discovery, guides, workspace inspection, and read capabilities do not write Cloudflare. A mutating `cfctl call` creates a plan; `cfctl plans run` is the normal write boundary. A token command with `--under-policy` may plan and run in one invocation only under an explicitly approved standing authority. Agent output, guide output, and approval alone do not mutate Cloudflare.",
+        ),
+        guide_answer(
+            GuideQuestionV1::GrantsAuthority,
+            "The deterministic policy engine grants automatic admission only to the narrow safe class. Otherwise authority is either explicit approval of one reviewed operation ID or explicit approval of one bounded standing token policy. A model never grants authority.",
+        ),
+        guide_answer(
+            GuideQuestionV1::PersistsState,
+            "Under its managed state root, cfctl persists profile metadata, the live CapabilityV1 catalog and official-doc caches, workspace registrations and imports, plans, approval and admission checkpoints, transaction journals, standing-authority records, locks, and redacted evidence. Credential values remain in the platform secret store or an explicit mode-0600 sink. The source checkout's compat/v1 tree is inert migration evidence, not runtime state or a live catalog.",
+        ),
+        guide_answer(
+            GuideQuestionV1::FailureRecovery,
+            "Once consumption or a boundary attempt is durable, cfctl never guesses that replay is safe. Inspect `plans status`; use `plans rectify` to reconcile durable receipts and verification without replaying the original Cloudflare mutation.",
+        ),
+        guide_answer(
+            GuideQuestionV1::NextAction,
+            "Run doctor, search the catalog for the intent, inspect the selected capability, and load its capability-specific guide before calling it.",
+        ),
+    ]
+}
+
+fn system_guide_flow() -> Vec<GuideFlowStepV1> {
+    vec![
+        guide_flow_step(
+            1,
+            "Orient",
+            "Check local state, credentials, catalog health, and agent integration.",
+            GuideCloudflareEffectV1::None,
+            None,
+        ),
+        guide_flow_step(
+            2,
+            "Discover",
+            "Search and inspect the catalog-selected capability and adapter.",
+            GuideCloudflareEffectV1::None,
+            None,
+        ),
+        guide_flow_step(
+            3,
+            "Read",
+            "Inspect exact live Cloudflare state and registered-workspace impact.",
+            GuideCloudflareEffectV1::Read,
+            Some("redacted live-read and source-config evidence"),
+        ),
+        guide_flow_step(
+            4,
+            "Plan",
+            "Bind the request, account, catalog, impact, cost, verification, and compensation contracts.",
+            GuideCloudflareEffectV1::None,
+            Some("hash-bound PlanV1 and PlanPrepared checkpoint"),
+        ),
+        guide_flow_step(
+            5,
+            "Admit",
+            "Apply policy, bind any explicit approval, acquire locks, and recheck drift.",
+            GuideCloudflareEffectV1::None,
+            Some("approval, standing reservation, and consumption checkpoints"),
+        ),
+        guide_flow_step(
+            6,
+            "Execute",
+            "Persist the boundary attempt, then cross exactly one catalog-selected adapter boundary.",
+            GuideCloudflareEffectV1::Write,
+            Some("boundary-attempt and response checkpoints"),
+        ),
+        guide_flow_step(
+            7,
+            "Verify",
+            "Run the operation-specific verifier or record why rectification is required.",
+            GuideCloudflareEffectV1::Read,
+            Some("sink and verification receipts"),
+        ),
+        guide_flow_step(
+            8,
+            "Close or rectify",
+            "Close with evidence or reconcile the durable journal; any compensation is a new plan with independent authority.",
+            GuideCloudflareEffectV1::None,
+            Some("terminal plan status and content-addressed evidence"),
+        ),
+    ]
+}
+
+fn system_guide_commands(next_argv: &[String]) -> Vec<Vec<String>> {
+    vec![
+        guide_argv(&["cfctl", "doctor", "--json"]),
+        next_argv.to_vec(),
+        guide_argv(&["cfctl", "catalog", "show", "<capability-id>", "--json"]),
+        guide_argv(&["cfctl", "guide", "<capability-id>", "--json"]),
+        guide_argv(&["cfctl", "call", "<capability-id>", "--json"]),
+        guide_argv(&["cfctl", "plans", "show", "<operation-id>", "--json"]),
+        guide_argv(&[
+            "cfctl",
+            "plans",
+            "approve",
+            "<operation-id>",
+            "--yes",
+            "--json",
+        ]),
+        guide_argv(&["cfctl", "plans", "run", "<operation-id>", "--json"]),
+        guide_argv(&["cfctl", "plans", "status", "<operation-id>", "--json"]),
+        guide_argv(&["cfctl", "plans", "rectify", "<operation-id>", "--json"]),
+    ]
+}
+
+fn standing_authority_guide_document() -> GuideTopicDocumentV1 {
+    let next_argv = guide_argv(&[
+        "cfctl",
+        "keys",
+        "permissions",
+        "--account",
+        "<account-id>",
+        "--json",
+    ]);
+    GuideTopicDocumentV1 {
+        schema_version: 1,
+        topic: GuideTopicV1::StandingAuthority,
+        title: GuideTopicV1::StandingAuthority.title().to_owned(),
+        summary: "Standing authority is the bounded token-lifecycle exception: one explicitly approved local policy may admit matching token mints and lineage-bound revocations without per-operation approval.".to_owned(),
+        answers: standing_authority_guide_answers(),
+        flow: standing_authority_guide_flow(),
+        commands: standing_authority_guide_commands(&next_argv),
+        next_action: GuideActionV1 {
+            summary: "Read the account permission inventory before drafting a policy.".to_owned(),
+            argv: next_argv,
+        },
+    }
+}
+
+fn standing_authority_guide_answers() -> Vec<GuideAnswerV1> {
+    vec![
+        guide_answer(
+            GuideQuestionV1::MutatesCloudflare,
+            "Permission reads and policy create, list, approve, and revoke are local or read-only. A matching `keys mint --under-policy` or lineage-bound token revoke may cross the Cloudflare boundary after durable admission.",
+        ),
+        guide_answer(
+            GuideQuestionV1::GrantsAuthority,
+            "Only `cfctl keys policy approve <authority-id> --yes` activates the exact reviewed policy. Its account, capabilities, permission allowlist, token-name prefix, child TTL, rate budget, expiry, and content hash remain binding.",
+        ),
+        guide_answer(
+            GuideQuestionV1::PersistsState,
+            "cfctl persists the schema-v1 authority document, approval, run reservations, plan journals, reconciled minted-token lineage, and redacted evidence. The one-time token value goes only to the requested mode-0600 sink.",
+        ),
+        guide_answer(
+            GuideQuestionV1::FailureRecovery,
+            "Revocation blocks runs not yet durably admitted; an already durably admitted run may finish. A validated boundary receipt is reconciled into lineage even after sink or verification failure, and later recovery never replays the Cloudflare mutation.",
+        ),
+        guide_answer(
+            GuideQuestionV1::NextAction,
+            "Read the fresh account permission inventory, then create a narrow policy using exact permission IDs or unambiguous exact names.",
+        ),
+    ]
+}
+
+fn standing_authority_guide_flow() -> Vec<GuideFlowStepV1> {
+    vec![
+        guide_flow_step(
+            1,
+            "Read permissions",
+            "Fetch one fresh account-owned permission inventory.",
+            GuideCloudflareEffectV1::Read,
+            Some("live permission receipt"),
+        ),
+        guide_flow_step(
+            2,
+            "Create policy",
+            "Resolve the allowlist and bind every standing-authority limit.",
+            GuideCloudflareEffectV1::None,
+            Some("pending StandingAuthorityV1"),
+        ),
+        guide_flow_step(
+            3,
+            "Approve policy",
+            "Review the exact authority ID and activate it with explicit `--yes`.",
+            GuideCloudflareEffectV1::None,
+            Some("approved authority content hash"),
+        ),
+        guide_flow_step(
+            4,
+            "Admit child",
+            "Recheck the child subset and complete allowlist, reserve the run under lock, and consume the child plan.",
+            GuideCloudflareEffectV1::None,
+            Some("run reservation and plan consumption"),
+        ),
+        guide_flow_step(
+            5,
+            "Execute child",
+            "Release the authority lock, then mint or revoke exactly within the approved bounds.",
+            GuideCloudflareEffectV1::Write,
+            Some("boundary attempt and response"),
+        ),
+        guide_flow_step(
+            6,
+            "Sink and reconcile",
+            "Write the one-time secret sink and reconcile any created token ID from the validated response.",
+            GuideCloudflareEffectV1::None,
+            Some("secret-sink receipt and minted-token lineage"),
+        ),
+        guide_flow_step(
+            7,
+            "Verify",
+            "Verify the remote token identity and status or require rectification without replay.",
+            GuideCloudflareEffectV1::Read,
+            Some("verification receipt and final plan status"),
+        ),
+        guide_flow_step(
+            8,
+            "Revoke policy",
+            "Close future admission immediately; already minted child tokens remain separate resources.",
+            GuideCloudflareEffectV1::None,
+            Some("monotonic revoked authority status"),
+        ),
+    ]
+}
+
+fn standing_authority_guide_commands(next_argv: &[String]) -> Vec<Vec<String>> {
+    vec![
+        next_argv.to_vec(),
+        guide_argv(&[
+            "cfctl",
+            "keys",
+            "policy",
+            "create",
+            "--account",
+            "<account-id>",
+            "--name-prefix",
+            "<token-prefix>",
+            "--permission",
+            "<permission-group-id>",
+            "--max-child-ttl-hours",
+            "24",
+            "--max-runs-per-day",
+            "4",
+            "--expires-days",
+            "30",
+            "--json",
+        ]),
+        guide_argv(&["cfctl", "keys", "policy", "list", "--json"]),
+        guide_argv(&[
+            "cfctl",
+            "keys",
+            "policy",
+            "approve",
+            "<authority-id>",
+            "--yes",
+            "--json",
+        ]),
+        guide_argv(&[
+            "cfctl",
+            "keys",
+            "mint",
+            "--name",
+            "<token-name>",
+            "--permission",
+            "<permission-group-id>",
+            "--account",
+            "<account-id>",
+            "--ttl-hours",
+            "12",
+            "--value-out",
+            "<new-mode-0600-path>",
+            "--under-policy",
+            "<authority-id>",
+            "--json",
+        ]),
+        guide_argv(&["cfctl", "keys", "policy", "list", "--json"]),
+        guide_argv(&[
+            "cfctl",
+            "keys",
+            "policy",
+            "revoke",
+            "<authority-id>",
+            "--json",
+        ]),
     ]
 }
 

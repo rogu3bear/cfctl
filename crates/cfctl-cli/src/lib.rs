@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, CommandFactory as _, Parser, Subcommand};
+use cfctl_core::{RETIRED_V1_PUBLIC_VERBS, RETIRED_V1_SURFACES};
+use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum};
 
 mod profiles;
 pub mod runtime;
@@ -23,17 +24,29 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Manage credential profiles and login state.
     Auth(AuthArgs),
+    /// Inspect and govern Cloudflare token lifecycles.
     Keys(KeysArgs),
+    /// Discover the executable Cloudflare capability catalog.
     Catalog(CatalogArgs),
+    /// Read live state or create a mutation plan.
     Call(CallArgs),
+    /// Explain a capability lifecycle or a system-level control-plane topic.
     Guide(GuideArgs),
+    /// Review, approve, run, recover, and inspect durable plans.
     Plans(PlansArgs),
+    /// Register and inspect repository impact boundaries.
     Workspace(WorkspaceArgs),
+    /// Install and verify managed agent guidance.
     Agents(AgentsArgs),
+    /// Search current official Cloudflare documentation and changes.
     Docs(DocsArgs),
+    /// Inspect local runtime, authentication, and catalog health.
     Doctor,
+    /// Check for or install a newer cfctl version.
     Update(UpdateArgs),
+    /// Import explicitly supported v1 state into the v2 runtime.
     Migrate(MigrateArgs),
 }
 
@@ -142,9 +155,13 @@ pub struct KeyPolicyArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum KeyPolicyCommand {
+    /// Draft a bounded standing token policy from a fresh permission inventory.
     Create(KeyPolicyCreateArgs),
+    /// Show effective status, remaining budget, lineage, and next action.
     List,
+    /// Activate one exact reviewed authority ID with explicit `--yes`.
     Approve(KeyPolicyApproveArgs),
+    /// Immediately close future admission under one authority ID.
     Revoke(KeyPolicySelector),
 }
 
@@ -283,9 +300,30 @@ pub struct CapabilitySelector {
     pub capability_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GuideTopicArg {
+    System,
+    StandingAuthority,
+}
+
 #[derive(Debug, Args)]
 pub struct GuideArgs {
-    pub capability_id: String,
+    /// Catalog capability to explain through its exact 15-stage lifecycle.
+    #[arg(
+        value_name = "CAPABILITY_ID",
+        required_unless_present = "topic",
+        conflicts_with = "topic"
+    )]
+    pub capability_id: Option<String>,
+    /// Explain the control-plane model or standing-authority lifecycle without loading the catalog.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "TOPIC",
+        required_unless_present = "capability_id",
+        conflicts_with = "capability_id"
+    )]
+    pub topic: Option<GuideTopicArg>,
 }
 
 #[derive(Debug, Args)]
@@ -434,7 +472,10 @@ where
     let Some(first) = remaining.first() else {
         return InvocationMode::Deterministic;
     };
-    if first.starts_with('-') || is_known_subcommand(first) {
+    if first.starts_with('-')
+        || is_known_subcommand(first)
+        || is_retired_v1_command_shape(&remaining)
+    {
         return InvocationMode::Deterministic;
     }
     // A bare single token is far more likely a mistyped subcommand than a
@@ -445,6 +486,28 @@ where
         return InvocationMode::Deterministic;
     }
     InvocationMode::NaturalLanguage(remaining.join(" "))
+}
+
+fn is_retired_v1_command_shape(arguments: &[String]) -> bool {
+    let Some(first) = arguments.first().map(String::as_str) else {
+        return false;
+    };
+    if !RETIRED_V1_PUBLIC_VERBS.contains(&first) {
+        return false;
+    }
+    let second = arguments.get(1).map(String::as_str);
+    match first {
+        "apply" | "can" | "classify" | "diff" | "explain" | "get" | "list" | "snapshot"
+        | "verify" => second.is_some_and(|surface| RETIRED_V1_SURFACES.contains(&surface)),
+        "audit" => {
+            arguments.len() == 2
+                && second.is_some_and(|scope| matches!(scope, "access" | "state" | "trust"))
+        }
+        "token" => second.is_some_and(|action| {
+            matches!(action, "mint" | "permission-groups" | "revoke" | "rotate")
+        }),
+        _ => true,
+    }
 }
 
 fn is_known_subcommand(name: &str) -> bool {

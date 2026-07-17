@@ -11,6 +11,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use cfctl_core::{
+    GuideTopicV1, PUBLIC_V2_SUBCOMMANDS, RETIRED_V1_PUBLIC_VERBS, RETIRED_V1_SURFACES,
+    render_guide_topic_markdown,
+};
 use clap::{Parser, Subcommand};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -279,17 +283,18 @@ fn verify_workspace_contract() -> Result<(), TaskError> {
 }
 
 fn verify_v1_cutover_contract() -> Result<(), TaskError> {
-    for forbidden in ["commands", "lib", "scripts"] {
-        if Path::new(forbidden).exists() {
+    let repository_root = repository_root()?;
+    for forbidden in ["catalog", "commands", "lib", "scripts", "state"] {
+        if repository_root.join(forbidden).exists() {
             return Err(TaskError::InvalidSourceContract(format!(
                 "archived v1 runtime path still exists: {forbidden}/"
             )));
         }
     }
 
-    let audit_path = Path::new("compat/v1-parity-audit.json");
+    let audit_path = repository_root.join("compat/v1-parity-audit.json");
     let audit: serde_json::Value = serde_json::from_slice(
-        &fs::read(audit_path).map_err(|source| io_error(audit_path, source))?,
+        &fs::read(&audit_path).map_err(|source| io_error(&audit_path, source))?,
     )
     .map_err(|error| TaskError::InvalidSourceContract(format!("v1 parity audit: {error}")))?;
     let removed_root_count = audit
@@ -341,7 +346,440 @@ fn verify_v1_cutover_contract() -> Result<(), TaskError> {
             "v1 parity audit does not bind the reviewed 147-path archive".to_owned(),
         ));
     }
+    verify_v1_quarantine_manifest()?;
+    verify_quarantine_code_consumers()?;
+    verify_tracked_cfctl_command_references()?;
     verify_active_guidance_has_no_v1_commands()
+}
+
+fn repository_root() -> Result<&'static Path, TaskError> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| {
+            TaskError::InvalidSourceContract("xtask has no repository parent".to_owned())
+        })
+}
+
+fn verify_v1_quarantine_manifest() -> Result<(), TaskError> {
+    let repository_root = repository_root()?;
+    let manifest_path = repository_root.join("compat/v1/manifest.json");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(&manifest_path).map_err(|source| io_error(&manifest_path, source))?,
+    )
+    .map_err(|error| {
+        TaskError::InvalidSourceContract(format!("v1 quarantine manifest: {error}"))
+    })?;
+    let expected_roots = serde_json::json!([
+        {
+            "path": "compat/v1/catalog",
+            "kind": "static_catalog",
+            "consumer": null
+        },
+        {
+            "path": "compat/v1/state",
+            "kind": "desired_state",
+            "consumer": "cfctl migrate v1"
+        }
+    ]);
+    let retired_verbs = manifest
+        .get("retired_public_verbs")
+        .and_then(serde_json::Value::as_array)
+        .map(|verbs| {
+            verbs
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+        });
+    let retired_surfaces = manifest
+        .get("retired_surfaces")
+        .and_then(serde_json::Value::as_array)
+        .map(|surfaces| {
+            surfaces
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+        });
+    if manifest
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || manifest
+            .get("executable")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || manifest.get("roots") != Some(&expected_roots)
+        || retired_verbs.as_deref() != Some(RETIRED_V1_PUBLIC_VERBS)
+        || retired_surfaces.as_deref() != Some(RETIRED_V1_SURFACES)
+    {
+        return Err(TaskError::InvalidSourceContract(
+            "compat/v1/manifest.json must exactly bind the inert roots and retired verb inventory"
+                .to_owned(),
+        ));
+    }
+    for root in ["compat/v1/catalog", "compat/v1/state"] {
+        if !repository_root.join(root).is_dir() {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "quarantined v1 root is missing: {root}"
+            )));
+        }
+    }
+    let declared_roots = ["compat/v1/catalog", "compat/v1/state"];
+    for path in tracked_files(repository_root)? {
+        if path.starts_with("compat/v1/") && !is_declared_quarantine_path(&path, &declared_roots) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "tracked path is outside the declared v1 quarantine roots: {path}"
+            )));
+        }
+    }
+    verify_frozen_v1_catalog_contract(repository_root)
+}
+
+fn is_declared_quarantine_path(path: &str, declared_roots: &[&str]) -> bool {
+    matches!(path, "compat/v1/README.md" | "compat/v1/manifest.json")
+        || declared_roots.iter().any(|root| {
+            path == *root
+                || path
+                    .strip_prefix(root)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+}
+
+fn verify_frozen_v1_catalog_contract(repository_root: &Path) -> Result<(), TaskError> {
+    let runtime_path = repository_root.join("compat/v1/catalog/runtime.json");
+    let runtime: serde_json::Value = serde_json::from_slice(
+        &fs::read(&runtime_path).map_err(|source| io_error(&runtime_path, source))?,
+    )
+    .map_err(|error| {
+        TaskError::InvalidSourceContract(format!("frozen v1 runtime catalog: {error}"))
+    })?;
+    let catalog_retired_verbs = runtime
+        .get("public_verbs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            TaskError::InvalidSourceContract(
+                "frozen v1 runtime catalog has no public_verbs".to_owned(),
+            )
+        })?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|verb| !PUBLIC_V2_SUBCOMMANDS.contains(verb))
+        .collect::<BTreeSet<_>>();
+    if catalog_retired_verbs != RETIRED_V1_PUBLIC_VERBS.iter().copied().collect() {
+        return Err(TaskError::InvalidSourceContract(
+            "retired verb contract drifted from the frozen v1 runtime catalog".to_owned(),
+        ));
+    }
+
+    let surfaces_path = repository_root.join("compat/v1/catalog/surfaces.json");
+    let surfaces: serde_json::Value = serde_json::from_slice(
+        &fs::read(&surfaces_path).map_err(|source| io_error(&surfaces_path, source))?,
+    )
+    .map_err(|error| {
+        TaskError::InvalidSourceContract(format!("frozen v1 surface catalog: {error}"))
+    })?;
+    let catalog_surfaces = surfaces
+        .get("surfaces")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            TaskError::InvalidSourceContract(
+                "frozen v1 surface catalog has no surfaces object".to_owned(),
+            )
+        })?
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if catalog_surfaces != RETIRED_V1_SURFACES.iter().copied().collect() {
+        return Err(TaskError::InvalidSourceContract(
+            "retired surface contract drifted from the frozen v1 surface catalog".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn tracked_files(repository_root: &Path) -> Result<Vec<String>, TaskError> {
+    let result = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(repository_root)
+        .output()
+        .map_err(|source| io_error(Path::new("git ls-files"), source))?;
+    if !result.status.success() {
+        return Err(TaskError::Command(format!(
+            "git ls-files exited {:?}",
+            result.status.code()
+        )));
+    }
+    Ok(result
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect())
+}
+
+fn verify_quarantine_code_consumers() -> Result<(), TaskError> {
+    let repository_root = repository_root()?;
+    for path in tracked_files(repository_root)? {
+        let absolute_path = repository_root.join(&path);
+        let bytes = fs::read(&absolute_path).map_err(|source| io_error(&absolute_path, source))?;
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if is_forbidden_quarantine_consumer(&path, content) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "{path} consumes a quarantined v1 root outside its declared boundary"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_forbidden_quarantine_consumer(path: &str, content: &str) -> bool {
+    let source_extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "bash"
+                    | "cjs"
+                    | "fish"
+                    | "go"
+                    | "java"
+                    | "js"
+                    | "jsx"
+                    | "kt"
+                    | "kts"
+                    | "mjs"
+                    | "pl"
+                    | "py"
+                    | "rb"
+                    | "rs"
+                    | "sh"
+                    | "swift"
+                    | "ts"
+                    | "tsx"
+                    | "zsh"
+            )
+        });
+    if !source_extension && !content.starts_with("#!") {
+        return false;
+    }
+
+    let consumes_state = content.contains("compat/v1/state");
+    let consumes_catalog = content.contains("compat/v1/catalog");
+    if !consumes_state && !consumes_catalog {
+        return false;
+    }
+
+    match path {
+        "crates/cfctl-cli/src/runtime.rs" => consumes_catalog,
+        "crates/cfctl-cli/tests/cli.rs" | "xtask/src/main.rs" => false,
+        _ => true,
+    }
+}
+
+fn verify_tracked_cfctl_command_references() -> Result<(), TaskError> {
+    let repository_root = repository_root()?;
+    for path in tracked_files(repository_root)? {
+        if path.starts_with("compat/v1/") {
+            continue;
+        }
+        let absolute_path = repository_root.join(&path);
+        let bytes = fs::read(&absolute_path).map_err(|source| io_error(&absolute_path, source))?;
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        for verb in extract_cfctl_command_references(&path, content) {
+            if verb != "help" && !PUBLIC_V2_SUBCOMMANDS.contains(&verb.as_str()) {
+                return Err(TaskError::InvalidSourceContract(format!(
+                    "{path} teaches non-v2 command `cfctl {verb}` outside compat/v1"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_cfctl_command_references(path: &str, content: &str) -> Vec<String> {
+    let mut verbs = Vec::new();
+    if path_has_extension(path, "json") {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+            collect_json_command_references(&value, false, &mut verbs);
+        }
+        return verbs;
+    }
+
+    let markdown = path_has_extension(path, "md");
+    let shell = path_has_extension(path, "sh") || content.starts_with("#!");
+    if !markdown && !shell {
+        return verbs;
+    }
+
+    let mut in_fence = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if markdown && trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if (shell || in_fence)
+            && let Some(verb) = cfctl_command_verb(trimmed)
+        {
+            verbs.push(verb);
+        }
+        if markdown && !in_fence {
+            if let Some(verb) = cfctl_command_verb_in_prose(trimmed) {
+                verbs.push(verb);
+            }
+            for (index, inline) in line.split('`').enumerate() {
+                if index % 2 == 1
+                    && let Some(verb) = cfctl_command_verb(inline)
+                {
+                    verbs.push(verb);
+                }
+            }
+        }
+    }
+    verbs
+}
+
+fn path_has_extension(path: &str, expected: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+}
+
+fn collect_json_command_references(
+    value: &serde_json::Value,
+    command_context: bool,
+    verbs: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::String(value) => {
+            let verb = if command_context {
+                cfctl_command_verb(value)
+            } else {
+                cfctl_command_verb_in_prose(value)
+            };
+            if let Some(verb) = verb {
+                verbs.push(verb);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_command_references(value, command_context, verbs);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                if is_json_argv_reference_key(key)
+                    && let Some(command) = json_argv_command(value)
+                    && let Some(verb) = cfctl_command_verb(&command)
+                {
+                    verbs.push(verb);
+                    continue;
+                }
+                collect_json_command_references(
+                    value,
+                    command_context || is_json_command_reference_key(key),
+                    verbs,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_json_argv_reference_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("argv")
+}
+
+fn json_argv_command(value: &serde_json::Value) -> Option<String> {
+    let arguments = value
+        .as_array()?
+        .iter()
+        .map(serde_json::Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    (!arguments.is_empty()).then(|| arguments.join(" "))
+}
+
+fn is_json_command_reference_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "action",
+        "argv",
+        "command",
+        "entrypoint",
+        "example",
+        "invocation",
+        "next",
+    ]
+    .iter()
+    .any(|fragment| key.contains(fragment))
+}
+
+fn cfctl_command_verb(command: &str) -> Option<String> {
+    cfctl_command_verb_with_context(command, true)
+}
+
+fn cfctl_command_verb_in_prose(command: &str) -> Option<String> {
+    cfctl_command_verb_with_context(command, false)
+}
+
+fn cfctl_command_verb_with_context(command: &str, command_context: bool) -> Option<String> {
+    let command = command
+        .trim()
+        .trim_start_matches(['$', '>', '-'])
+        .trim_start();
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let command_index = tokens
+        .iter()
+        .position(|token| matches!(*token, "cfctl" | "./cfctl"))?;
+    let mut arguments = tokens.iter().skip(command_index + 1).copied();
+    let mut verb = arguments.next()?;
+    while verb == "--json" {
+        verb = arguments.next()?;
+    }
+    if verb.starts_with(['\"', '\'', '<', '{']) || verb == "\\" {
+        return None;
+    }
+    let verb = verb
+        .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+        .to_owned();
+
+    let mut explicit_command_context = false;
+    if command_index > 0 {
+        let prefix = &tokens[..command_index];
+        let previous = prefix.last().copied().unwrap_or_default();
+        let shell_boundary = matches!(
+            previous,
+            "|" | "||" | "&&" | ";" | "exec" | "env" | "command" | "sudo"
+        );
+        let environment_prefix = prefix.iter().all(|token| token.contains('='));
+        let instructional_prefix = matches!(
+            previous
+                .trim_matches(|character: char| !character.is_ascii_alphabetic())
+                .to_ascii_lowercase()
+                .as_str(),
+            "execute" | "invoke" | "run" | "try" | "use"
+        );
+        explicit_command_context = shell_boundary || environment_prefix || instructional_prefix;
+        if !explicit_command_context {
+            return None;
+        }
+    }
+    if !command_context && matches!(verb.as_str(), "it" | "itself" | "that" | "this") {
+        return None;
+    }
+    if !command_context
+        && !explicit_command_context
+        && verb != "help"
+        && !PUBLIC_V2_SUBCOMMANDS.contains(&verb.as_str())
+        && !RETIRED_V1_PUBLIC_VERBS.contains(&verb.as_str())
+    {
+        return None;
+    }
+    Some(verb)
 }
 
 fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
@@ -351,7 +789,7 @@ fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
             TaskError::InvalidSourceContract("xtask has no repository parent".to_owned())
         })?;
     // First-load agent doctrine must not re-teach archived v1 verbs or layout.
-    // Historical/migration docs (docs/v1-parity.md, NUANCE.md, state/*) are out of scope.
+    // Historical material below compat/v1 is governed by the quarantine manifest instead.
     // Tracked public guidance is always required. Local strategy files are gitignored for
     // public releases but, when present in a private checkout, must stay v2-aligned.
     let required_guidance = [
@@ -390,6 +828,8 @@ fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
         "verify_public_contract.sh",
         "cfctl standards audit",
         "cfctl admin authorize-backend",
+        // Branch or PR lifecycle text must not survive into active guidance.
+        "pending merge",
     ];
     for path in required_guidance {
         verify_guidance_file_has_no_stale_v1(repository_root, path, &stale_v1_guidance)?;
@@ -422,6 +862,11 @@ fn verify_guidance_file_has_no_stale_v1(
 }
 
 fn verify_documented_contracts() -> Result<(), TaskError> {
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| {
+            TaskError::InvalidSourceContract("xtask has no repository parent".to_owned())
+        })?;
     for (path, phrase) in [
         ("README.md", "hash-chained transaction journal"),
         ("SECURITY.md", "full-history Gitleaks scan"),
@@ -429,13 +874,71 @@ fn verify_documented_contracts() -> Result<(), TaskError> {
         ("docs/v2-security.md", "operation-specific verification"),
         ("docs/v2-architecture.md", "Wrangler TOML/JSONC, Terraform"),
     ] {
-        let content =
-            fs::read_to_string(path).map_err(|source| io_error(Path::new(path), source))?;
+        let absolute_path = repository_root.join(path);
+        let content = fs::read_to_string(&absolute_path)
+            .map_err(|source| io_error(&absolute_path, source))?;
         if !content.contains(phrase) {
             return Err(TaskError::InvalidSourceContract(format!(
                 "{path} omits required contract text `{phrase}`"
             )));
         }
+    }
+    verify_generated_guidance_section(
+        &repository_root.join("README.md"),
+        "system-guide",
+        &render_guide_topic_markdown(GuideTopicV1::System),
+    )?;
+    verify_generated_guidance_section(
+        &repository_root.join("QUICKSTART.md"),
+        "standing-authority-guide",
+        &render_guide_topic_markdown(GuideTopicV1::StandingAuthority),
+    )?;
+    Ok(())
+}
+
+fn verify_generated_guidance_section(
+    path: &Path,
+    key: &str,
+    expected: &str,
+) -> Result<(), TaskError> {
+    let content = fs::read_to_string(path).map_err(|source| io_error(path, source))?;
+    verify_generated_guidance_section_text(&content, key, expected)
+        .map_err(|error| TaskError::InvalidSourceContract(format!("{}: {error}", path.display())))
+}
+
+fn verify_generated_guidance_section_text(
+    content: &str,
+    key: &str,
+    expected: &str,
+) -> Result<(), TaskError> {
+    let start = format!("<!-- BEGIN CFCTL GENERATED: {key} -->");
+    let end = format!("<!-- END CFCTL GENERATED: {key} -->");
+    if content.matches(&start).count() != 1 || content.matches(&end).count() != 1 {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "generated guidance section `{key}` must have exactly one start and end marker"
+        )));
+    }
+    let (_, after_start) = content.split_once(&start).ok_or_else(|| {
+        TaskError::InvalidSourceContract(format!(
+            "generated guidance section `{key}` has no start marker"
+        ))
+    })?;
+    let after_start = after_start.strip_prefix('\n').ok_or_else(|| {
+        TaskError::InvalidSourceContract(format!(
+            "generated guidance section `{key}` must start on the line after its marker"
+        ))
+    })?;
+    let (actual, _) = after_start.split_once(&end).ok_or_else(|| {
+        TaskError::InvalidSourceContract(format!(
+            "generated guidance section `{key}` has no end marker"
+        ))
+    })?;
+    let actual = actual.strip_suffix('\n').unwrap_or(actual);
+    let expected = expected.strip_suffix('\n').unwrap_or(expected);
+    if actual != expected {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "generated guidance section `{key}` drifted from the executable projection"
+        )));
     }
     Ok(())
 }
@@ -1719,12 +2222,96 @@ mod tests {
     };
 
     use super::{
-        expected_signed_release_file_names, parse_remote_tag_commit, release_build_driver,
-        release_build_subcommand, release_tag_is_exact_version, render_linux_installer_text,
-        security_proof_commands, validate_codesign_details, validate_notary_receipt_value,
-        validate_signed_release_file_set, validated_release_targets,
-        verify_active_guidance_has_no_v1_commands,
+        expected_signed_release_file_names, extract_cfctl_command_references,
+        is_declared_quarantine_path, is_forbidden_quarantine_consumer, parse_remote_tag_commit,
+        release_build_driver, release_build_subcommand, release_tag_is_exact_version,
+        render_linux_installer_text, security_proof_commands, validate_codesign_details,
+        validate_notary_receipt_value, validate_signed_release_file_set, validated_release_targets,
+        verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
+        verify_generated_guidance_section_text, verify_v1_cutover_contract,
     };
+
+    #[test]
+    fn command_reference_extraction_is_structural_and_ignores_prose() {
+        let markdown = concat!(
+            "cfctl persists managed state without teaching a command.\n",
+            "To compare the desired state, run cfctl diff dns.record before approval.\n",
+            "`cfctl catalog search \"dns\" --json`\n",
+            "```bash\n",
+            "./cfctl diff dns.record\n",
+            "```\n",
+        );
+        assert_eq!(
+            extract_cfctl_command_references("docs/example.md", markdown),
+            vec!["diff".to_owned(), "catalog".to_owned(), "diff".to_owned()]
+        );
+
+        let json = r#"{"commands":["cfctl guide --topic system","not a command"],"description":"cfctl persists managed state","next_action":"Run cfctl hostname verify now"}"#;
+        assert_eq!(
+            extract_cfctl_command_references("example.json", json),
+            vec!["guide".to_owned(), "hostname".to_owned()]
+        );
+
+        let structured_argv = r#"{"next_action":{"argv":["cfctl","diff","dns.record"]}}"#;
+        assert_eq!(
+            extract_cfctl_command_references("example.json", structured_argv),
+            vec!["diff".to_owned()]
+        );
+    }
+
+    #[test]
+    fn instructional_unknown_command_references_are_not_treated_as_description() {
+        assert_eq!(
+            extract_cfctl_command_references(
+                "docs/example.md",
+                concat!(
+                    "When you invoke cfctl that way, use a file.\n",
+                    "To inspect the legacy edge, run cfctl frobnicate now.\n",
+                ),
+            ),
+            vec!["frobnicate".to_owned()]
+        );
+    }
+
+    #[test]
+    fn quarantine_consumers_cover_tracked_source_and_executable_files() {
+        assert!(is_forbidden_quarantine_consumer(
+            "tools/replay.sh",
+            "jq . compat/v1/catalog/runtime.json"
+        ));
+        assert!(!is_forbidden_quarantine_consumer(
+            "docs/v1-parity.md",
+            "The compat/v1/catalog tree is inert migration evidence."
+        ));
+        assert!(!is_forbidden_quarantine_consumer(
+            "crates/cfctl-cli/src/runtime.rs",
+            "let retained_repo_state = \"compat/v1/state\";"
+        ));
+    }
+
+    #[test]
+    fn quarantine_manifest_does_not_exempt_undeclared_subtrees() {
+        let roots = ["compat/v1/catalog", "compat/v1/state"];
+        assert!(is_declared_quarantine_path(
+            "compat/v1/catalog/runtime.json",
+            &roots
+        ));
+        assert!(is_declared_quarantine_path("compat/v1/README.md", &roots));
+        assert!(is_declared_quarantine_path(
+            "compat/v1/manifest.json",
+            &roots
+        ));
+        assert!(!is_declared_quarantine_path(
+            "compat/v1/undeclared/run.sh",
+            &roots
+        ));
+    }
+
+    #[test]
+    fn v1_quarantine_manifest_and_tracked_commands_are_bound() {
+        let result = verify_v1_cutover_contract();
+        assert!(result.is_ok(), "{result:?}");
+    }
 
     #[test]
     fn local_proof_includes_dependency_policy_and_full_history_secret_scan() {
@@ -1743,6 +2330,39 @@ mod tests {
     #[test]
     fn active_guidance_does_not_reteach_archived_v1_commands() {
         let result = verify_active_guidance_has_no_v1_commands();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn generated_guidance_sections_require_an_exact_projection_match() {
+        let content = concat!(
+            "before\n",
+            "<!-- BEGIN CFCTL GENERATED: system-guide -->\n",
+            "canonical body\n",
+            "<!-- END CFCTL GENERATED: system-guide -->\n",
+            "after\n",
+        );
+        assert!(
+            verify_generated_guidance_section_text(content, "system-guide", "canonical body")
+                .is_ok()
+        );
+        assert!(
+            verify_generated_guidance_section_text(content, "system-guide", "drifted body")
+                .is_err()
+        );
+        assert!(
+            verify_generated_guidance_section_text(
+                "<!-- BEGIN CFCTL GENERATED: system-guide -->\ncanonical body\n",
+                "system-guide",
+                "canonical body",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn checked_in_guidance_matches_the_executable_projection() {
+        let result = verify_documented_contracts();
         assert!(result.is_ok(), "{result:?}");
     }
 

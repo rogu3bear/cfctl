@@ -91,4 +91,19 @@ not part of the pre-execution approval hash, but they cannot be changed after
 the boundary without invalidating the transaction chain. A supported rollback
 uses them only to create a new compensation plan with independent authority.
 
-See [ADR 0001](architecture/adr/0001-rust-clean-break.md) and [ADR 0002](architecture/adr/0002-risk-based-approval.md).
+## Executable guidance projection
+
+The public explanation layer is a projection of the executable contracts, not
+an independent architecture source. `cfctl-core` owns the typed
+`CapabilityGuideV1` and versioned `GuideTopicDocumentV1` models. The CLI exposes
+them through the compatible `cfctl guide <capability-id>` path and the additive
+`cfctl guide --topic system|standing-authority` topics. Static topics do not
+need a catalog refresh or network access.
+
+The README and Quickstart embed canonical Markdown rendered from those topic
+documents. Managed agent instructions route operators back to the same CLI
+topics. `cargo xtask verify` compares each generated documentation section to
+the core renderer byte-for-byte, so lifecycle facts cannot drift silently
+between the executable behavior, human documentation, and agent guidance.
+
+See [ADR 0001](architecture/adr/0001-rust-clean-break.md), [ADR 0002](architecture/adr/0002-risk-based-approval.md), and [ADR 0003](architecture/adr/0003-executable-guidance-projection.md).

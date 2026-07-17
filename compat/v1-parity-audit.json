@@ -179,11 +179,11 @@
   "retained_v1_data": {
     "executable": false,
     "state": {
-      "path": "state",
+      "path": "compat/v1/state",
       "purpose": "local desired-state input for migrate v1 during the compatibility window"
     },
     "static_catalog": {
-      "path": "catalog",
+      "path": "compat/v1/catalog",
       "purpose": "non-executable v1 reference data; it is not loaded by the Rust v2 runtime"
     },
     "rule": "credentials and secret-shaped content are never imported"

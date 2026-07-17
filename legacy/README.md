@@ -1,9 +1,10 @@
-# Legacy
+# Legacy namespace
 
-This repo began as an email-routing and direct-API operations workspace.
+The retired shell and Python control plane is not operational and is not a
+fallback. Its hash-bound private source archive is migration evidence only.
 
-Those workflows still exist and remain operational, but they are no longer the product shape of the repo. Over time they should be:
-
-1. exposed through `cfctl` where they fit the runtime model
-2. documented as compatibility workflows where they do not
-3. removed from public docs once a stable replacement exists
+The small amount of checked-in v1 data retained for the compatibility window
+lives under [`compat/v1/`](../compat/v1/README.md), where its non-executable
+status and only permitted consumer are machine-checked. New capabilities must
+be added to the Rust v2 catalog, parser, guides, tests, and agent discovery
+together.

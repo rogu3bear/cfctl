@@ -3,7 +3,8 @@
 use std::{fs, process::Command as ProcessCommand};
 
 use cfctl_cli::{Cli, Command, InvocationMode, classify_invocation};
-use clap::Parser;
+use cfctl_core::{GuideTopicV1, PUBLIC_V2_SUBCOMMANDS, render_guide_topic_markdown};
+use clap::{CommandFactory as _, Parser};
 
 #[test]
 fn every_public_command_group_is_parseable() {
@@ -40,6 +41,174 @@ fn every_public_command_group_is_parseable() {
         assert!(
             matches!(parsed.command, Some(Command::Auth(_))) == (command == "auth")
                 || command != "auth"
+        );
+    }
+}
+
+#[test]
+fn public_command_contract_exactly_matches_the_clap_tree() {
+    let command = Cli::command();
+    let mut actual = command
+        .get_subcommands()
+        .map(clap::Command::get_name)
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    assert_eq!(actual, PUBLIC_V2_SUBCOMMANDS);
+}
+
+#[test]
+fn guide_topics_are_additive_and_capability_guides_remain_compatible() {
+    let capability = Cli::try_parse_from(["cfctl", "guide", "dns-records-list"])
+        .expect("existing capability guide parses");
+    let Some(Command::Guide(capability)) = capability.command else {
+        panic!("guide command");
+    };
+    assert_eq!(
+        capability.capability_id.as_deref(),
+        Some("dns-records-list")
+    );
+    assert!(capability.topic.is_none());
+
+    for (value, expected) in [
+        ("system", cfctl_cli::GuideTopicArg::System),
+        (
+            "standing-authority",
+            cfctl_cli::GuideTopicArg::StandingAuthority,
+        ),
+    ] {
+        let parsed =
+            Cli::try_parse_from(["cfctl", "guide", "--topic", value]).expect("guide topic parses");
+        let Some(Command::Guide(arguments)) = parsed.command else {
+            panic!("guide command");
+        };
+        assert!(arguments.capability_id.is_none());
+        assert_eq!(arguments.topic, Some(expected));
+    }
+
+    assert!(Cli::try_parse_from(["cfctl", "guide"]).is_err());
+    assert!(
+        Cli::try_parse_from(["cfctl", "guide", "dns-records-list", "--topic", "system"]).is_err()
+    );
+}
+
+#[test]
+fn guide_help_explains_capability_and_system_targets() {
+    let mut guide = Cli::command()
+        .find_subcommand("guide")
+        .expect("guide subcommand")
+        .clone();
+    let help = guide.render_long_help().to_string();
+    assert!(help.contains("CAPABILITY_ID"));
+    assert!(help.contains("--topic <TOPIC>"));
+    assert!(help.contains("system"));
+    assert!(help.contains("standing-authority"));
+}
+
+#[test]
+fn system_topics_run_without_opening_mutable_runtime_state() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    for topic in ["system", "standing-authority"] {
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+            .env("CFCTL_HOME", runtime.path())
+            .args(["guide", "--topic", topic, "--json"])
+            .output()
+            .expect("run system topic");
+        assert!(
+            output.status.success(),
+            "{topic}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("guide topic envelope");
+        assert_eq!(envelope["schema_version"], 2);
+        assert_eq!(envelope["performed"], false);
+        assert_eq!(envelope["result"]["schema_version"], 1);
+        assert_eq!(envelope["result"]["topic"], topic);
+        assert_eq!(
+            envelope["result"]["answers"].as_array().map(Vec::len),
+            Some(5)
+        );
+        assert!(
+            fs::read_dir(runtime.path())
+                .expect("inspect untouched runtime root")
+                .next()
+                .is_none(),
+            "a static topic must not create the runtime tree, load a catalog, or touch account state"
+        );
+    }
+}
+
+#[test]
+fn human_system_topics_render_the_same_markdown_as_checked_in_guidance() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    for (topic, contract) in [
+        ("system", GuideTopicV1::System),
+        ("standing-authority", GuideTopicV1::StandingAuthority),
+    ] {
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+            .env("CFCTL_HOME", runtime.path())
+            .args(["guide", "--topic", topic])
+            .output()
+            .expect("run human system topic");
+        assert!(
+            output.status.success(),
+            "{topic}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("topic markdown is UTF-8"),
+            render_guide_topic_markdown(contract)
+        );
+        assert!(
+            fs::read_dir(runtime.path())
+                .expect("inspect untouched runtime root")
+                .next()
+                .is_none(),
+            "human topic rendering must remain stateless"
+        );
+    }
+}
+
+#[test]
+fn migrate_v1_accepts_quarantined_repo_state_and_external_legacy_state() {
+    for source_root in ["compat/v1/state", "state"] {
+        let workspace = tempfile::tempdir().expect("legacy workspace");
+        let runtime = tempfile::tempdir().expect("runtime root");
+        let source = workspace.path().join(source_root).join("dns.record");
+        fs::create_dir_all(&source).expect("create retained state root");
+        fs::write(
+            source.join("example.json"),
+            r#"{"match":{"name":"example"},"body":{"name":"example"}}"#,
+        )
+        .expect("write retained state");
+
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+            .current_dir(workspace.path())
+            .env("CFCTL_HOME", runtime.path())
+            .args(["migrate", "v1", "--json"])
+            .output()
+            .expect("run v1 migration");
+        assert!(
+            output.status.success(),
+            "{source_root}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("migration envelope");
+        let imported = envelope["result"]["imported"]
+            .as_array()
+            .expect("import list");
+        assert_eq!(imported.len(), 1, "{source_root}");
+        assert!(
+            imported[0]["source_path"].as_str().is_some_and(
+                |path| path.ends_with(&format!("{source_root}/dns.record/example.json"))
+            )
+        );
+        assert!(
+            imported[0]["destination"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("/state/dns.record/example.json")),
+            "both source layouts must preserve the v1 `state` import label"
         );
     }
 }
@@ -92,6 +261,122 @@ fn bare_single_unknown_tokens_fail_closed_to_the_deterministic_parser() {
         classify_invocation(["cfctl", "help"]),
         InvocationMode::Deterministic
     );
+}
+
+#[test]
+fn retired_v1_command_shapes_fail_closed_instead_of_launching_an_agent() {
+    for verb in [
+        "admin",
+        "bootstrap",
+        "cloudflared",
+        "env",
+        "form-intake",
+        "hostname",
+        "lanes",
+        "locks",
+        "maildesk-cf",
+        "ownership",
+        "previews",
+        "skills",
+        "standards",
+        "surfaces",
+        "wrangler",
+    ] {
+        assert_eq!(
+            classify_invocation(["cfctl", verb, "legacy-target"]),
+            InvocationMode::Deterministic,
+            "retired v1 command `{verb}` must reach clap and fail closed"
+        );
+    }
+    for verb in [
+        "apply", "can", "classify", "diff", "explain", "get", "list", "snapshot", "verify",
+    ] {
+        assert_eq!(
+            classify_invocation(["cfctl", verb, "dns.record"]),
+            InvocationMode::Deterministic,
+            "retired v1 surface command `{verb}` must fail closed"
+        );
+    }
+    for arguments in [["cfctl", "token", "mint"], ["cfctl", "token", "revoke"]] {
+        assert_eq!(
+            classify_invocation(arguments),
+            InvocationMode::Deterministic,
+            "retired token lifecycle command must fail closed"
+        );
+    }
+    for arguments in [
+        ["cfctl", "token", "permission-groups"],
+        ["cfctl", "token", "rotate"],
+        ["cfctl", "audit", "trust"],
+        ["cfctl", "audit", "access"],
+        ["cfctl", "audit", "state"],
+    ] {
+        assert_eq!(
+            classify_invocation(arguments),
+            InvocationMode::Deterministic,
+            "concrete retired v1 command must fail closed: {arguments:?}"
+        );
+    }
+}
+
+#[test]
+fn retired_words_do_not_disable_clear_natural_language_requests() {
+    for arguments in [
+        ["cfctl", "audit", "my Cloudflare account"],
+        ["cfctl", "diff", "current DNS configuration"],
+        ["cfctl", "explain", "how standing authority works"],
+        ["cfctl", "list", "dns records"],
+        ["cfctl", "verify", "the production zone"],
+    ] {
+        assert!(
+            matches!(
+                classify_invocation(arguments),
+                InvocationMode::NaturalLanguage(_)
+            ),
+            "clear natural language must keep the agent lane: {arguments:?}"
+        );
+    }
+
+    let audit_request = [
+        "cfctl",
+        "audit",
+        "access",
+        "posture",
+        "for",
+        "the",
+        "production",
+        "account",
+    ];
+    assert!(
+        matches!(
+            classify_invocation(audit_request),
+            InvocationMode::NaturalLanguage(_)
+        ),
+        "only the exact retired two-token audit command may fail closed"
+    );
+}
+
+#[test]
+fn retired_multi_token_command_exits_nonzero_without_launching_an_agent() {
+    for arguments in [
+        ["diff", "dns.record"],
+        ["token", "permission-groups"],
+        ["token", "rotate"],
+        ["audit", "trust"],
+        ["audit", "access"],
+        ["audit", "state"],
+    ] {
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+            .args(arguments)
+            .output()
+            .expect("cfctl binary runs");
+        assert!(!output.status.success(), "{arguments:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unrecognized subcommand"),
+            "retired command {arguments:?} must reach clap instead of the agent launcher, got: {stderr}"
+        );
+    }
 }
 
 #[test]
