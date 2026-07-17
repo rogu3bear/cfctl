@@ -1370,6 +1370,85 @@ fn created_resource_contracts_require_exact_identity_pointers() {
 }
 
 #[test]
+fn d1_create_rollback_is_bound_to_returned_uuid_and_empty_database_compensation() {
+    let mut capability = CapabilityV1::new(
+        "d1-create-database",
+        "Create D1 Database",
+        "POST",
+        "/accounts/{account_id}/d1/database",
+    );
+    capability.mutating = true;
+    capability.product = "D1".to_owned();
+    capability.account_scope = "account".to_owned();
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "required":["name"],
+        "x-cfctl-body-required":true,
+        "properties":{
+            "jurisdiction":{"type":"string","enum":["eu","fedramp"]},
+            "name":{"type":"string"},
+            "primary_location_hint":{
+                "type":"string",
+                "enum":["wnam","enam","weur","eeur","apac","oc"],
+                "x-cfctl-verification-observable":false
+            },
+            "read_replication":{
+                "type":"object",
+                "required":["mode"],
+                "properties":{"mode":{"type":"string","enum":["auto","disabled"]}}
+            }
+        }
+    }));
+    capability.verification.strategy =
+        "created_resource_contains_planned_fields_by_returned_id".to_owned();
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/d1/database/{database_id}".to_owned(),
+        identity_selector: "database_id".to_owned(),
+        response_result_identity_pointer: "/uuid".to_owned(),
+        read_capability_id: "d1-get-database".to_owned(),
+        delete_capability_id: "d1-delete-database".to_owned(),
+        verified_response_fields: vec![
+            "jurisdiction".to_owned(),
+            "name".to_owned(),
+            "read_replication".to_owned(),
+        ],
+    });
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("delete_created_empty_d1_database_by_returned_uuid_if_unchanged".to_owned());
+
+    assert!(capability.verification_contract_supported());
+    assert!(capability.rollback_contract_supported());
+
+    let mut generic = capability.clone();
+    generic.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    assert!(!generic.rollback_contract_supported());
+
+    let mut grafted = capability.clone();
+    grafted.id = "widgets-create".to_owned();
+    assert!(!grafted.rollback_contract_supported());
+
+    let mut broadened = capability.clone();
+    broadened
+        .request_schema
+        .as_mut()
+        .expect("D1 request schema")["properties"]["read_replication"]["properties"]["mode"]["enum"] =
+        json!(["auto", "disabled", "future"]);
+    assert!(!broadened.rollback_contract_supported());
+
+    let mut wrong_pointer = capability;
+    wrong_pointer
+        .created_resource
+        .as_mut()
+        .expect("created D1 resource")
+        .response_result_identity_pointer = "/id".to_owned();
+    assert!(!wrong_pointer.rollback_contract_supported());
+}
+
+#[test]
 fn created_collection_contract_excludes_write_only_fields_from_its_allowlist() {
     let mut capability = CapabilityV1::new(
         "widgets-create",

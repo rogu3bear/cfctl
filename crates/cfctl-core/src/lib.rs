@@ -805,8 +805,12 @@ impl CapabilityV1 {
             }
             Some("delete_created_resource_by_returned_id") => {
                 self.method == "POST"
+                    && self.id != "d1-create-database"
                     && (self.created_resource_contract_supported()
                         || self.created_collection_resource_contract_supported())
+            }
+            Some("delete_created_empty_d1_database_by_returned_uuid_if_unchanged") => {
+                d1_database_create_rollback_contract_supported(self)
             }
             Some("restore_global_warp_override_prior_disconnect_state") => {
                 self.id == "devices-resilience-set-global-warp-override"
@@ -1253,10 +1257,61 @@ fn access_service_token_refresh_selector_supported(
 
 fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
     (selector_can_be_response_id(selector) && pointer == "/id")
+        || (selector == "database_id" && pointer == "/uuid")
         || (!selector
             .chars()
             .any(|character| matches!(character, '/' | '~'))
             && pointer.strip_prefix('/') == Some(selector))
+}
+
+fn d1_database_create_request_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.request_schema.as_ref()
+        == Some(&serde_json::json!({
+            "properties": {
+                "jurisdiction": {"enum": ["eu", "fedramp"], "type": "string"},
+                "name": {"type": "string"},
+                "primary_location_hint": {
+                    "enum": ["wnam", "enam", "weur", "eeur", "apac", "oc"],
+                    "type": "string",
+                    "x-cfctl-verification-observable": false
+                },
+                "read_replication": {
+                    "properties": {
+                        "mode": {"enum": ["auto", "disabled"], "type": "string"}
+                    },
+                    "required": ["mode"],
+                    "type": "object"
+                }
+            },
+            "required": ["name"],
+            "type": "object",
+            "x-cfctl-body-required": true
+        }))
+}
+
+fn d1_database_create_rollback_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "d1-create-database"
+        && capability.title == "Create D1 Database"
+        && capability.method == "POST"
+        && capability.path == "/accounts/{account_id}/d1/database"
+        && capability.product == "D1"
+        && capability.account_scope == "account"
+        && capability.mutating
+        && capability.permissions == ["D1 Write"]
+        && capability.risk == RiskClass::ScopedWrite
+        && capability.effect == EffectClass::ReversibleWrite
+        && capability.verification.strategy
+            == "created_resource_contains_planned_fields_by_returned_id"
+        && capability.verification_contract_supported()
+        && d1_database_create_request_contract_supported(capability)
+        && capability.created_resource_contract_supported()
+        && capability.created_resource.as_ref().is_some_and(|target| {
+            target.detail_path == "/accounts/{account_id}/d1/database/{database_id}"
+                && target.identity_selector == "database_id"
+                && target.response_result_identity_pointer == "/uuid"
+                && target.read_capability_id == "d1-get-database"
+                && target.delete_capability_id == "d1-delete-database"
+        })
 }
 
 fn d1_read_replication_request_contract_supported(capability: &CapabilityV1) -> bool {
