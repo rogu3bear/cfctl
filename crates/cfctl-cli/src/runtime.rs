@@ -10821,9 +10821,11 @@ mod tests {
         sink_secret_result, store_imported_api_token, validate_api_token_creation_contract,
         validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
-        validate_selected_permission_groups, validate_standing_authority_permission_inventory,
+        validate_permission_group_resource_scope, validate_selected_permission_groups,
+        validate_standing_authority_permission_inventory, validate_token_policy_body,
         validate_worker_script_secret_semantics, validate_zone_account_receipt_precondition,
-        validated_standing_lineage_token_id, workspace_resource_keys, zone_target,
+        validate_zone_id, validated_standing_lineage_token_id, workspace_resource_keys,
+        zone_target,
     };
     use crate::profiles::ProfilesConfig;
     use crate::{
@@ -14545,6 +14547,185 @@ mod tests {
     }
 
     #[test]
+    fn validate_zone_id_accepts_only_32_char_lowercase_hex() {
+        validate_zone_id("e826a542f6b80137a949a3291c1cad9c").expect("valid zone id");
+        // uppercase, wrong length, and non-hex are all rejected.
+        validate_zone_id("E826A542F6B80137A949A3291C1CAD9C").expect_err("uppercase");
+        validate_zone_id("e826a542").expect_err("too short");
+        validate_zone_id("g826a542f6b80137a949a3291c1cad9z").expect_err("non-hex");
+        validate_zone_id("").expect_err("empty");
+    }
+
+    #[test]
+    fn resource_scope_guard_admits_zone_groups_only_under_zone_scope() {
+        let zone_group = json!([{
+            "id": "e17beae8b8cb423a99b1730f21238bed",
+            "name": "Cache Purge",
+            "scopes": ["com.cloudflare.api.account.zone"]
+        }]);
+        let account_group = json!([{
+            "id": "group-a",
+            "name": "Workers Scripts Write",
+            "scopes": ["com.cloudflare.api.account"]
+        }]);
+        let zone = zone_group.as_array().expect("zone groups");
+        let account = account_group.as_array().expect("account groups");
+        // A zone-scoped group is admitted only under the zone scope.
+        validate_permission_group_resource_scope(zone, "com.cloudflare.api.account.zone")
+            .expect("zone group under zone scope");
+        validate_permission_group_resource_scope(zone, "com.cloudflare.api.account")
+            .expect_err("zone group cannot be minted under account scope");
+        // …and an account-only group cannot be minted under the zone scope.
+        validate_permission_group_resource_scope(account, "com.cloudflare.api.account.zone")
+            .expect_err("account group cannot be minted under zone scope");
+    }
+
+    #[test]
+    fn zone_scoped_token_creation_binds_the_zone_resource_and_rejects_drift() {
+        let capability = CapabilityV1::new(
+            "account-api-tokens-create-token",
+            "Create account token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        let zone = "e826a542f6b80137a949a3291c1cad9c";
+        let resource = format!("com.cloudflare.api.account.zone.{zone}");
+        let groups = json!([{
+            "id": "e17beae8b8cb423a99b1730f21238bed",
+            "name": "Cache Purge",
+            "scopes": ["com.cloudflare.api.account.zone"]
+        }]);
+        let groups_hash = hash_value(&groups).expect("group hash");
+        let adapter = json!({
+            "permission_inventory": {
+                "source_capability_id": "account-api-tokens-list-permission-groups",
+                "selected_groups": groups,
+                "selected_groups_hash": groups_hash,
+                "token_resource": resource,
+                "permission_scope": "com.cloudflare.api.account.zone",
+                "evidence_hashes": [format!("sha256:{}", "a".repeat(64))]
+            }
+        });
+        let input = CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            query: json!({}),
+            body: Some(json!({
+                "name":"cache purge token",
+                "policies":[{
+                    "effect":"allow",
+                    "permission_groups":[{"id":"e17beae8b8cb423a99b1730f21238bed"}],
+                    "resources":{resource.clone():"*"}
+                }]
+            })),
+            ..CallInput::default()
+        };
+        validate_api_token_creation_contract(&capability, &input, &adapter, "account-a")
+            .expect("zone-scoped token plan is valid");
+
+        // Body scoped to a different zone than the bound resource is rejected.
+        let mut drifted = input.clone();
+        drifted.body = Some(json!({
+            "name":"cache purge token",
+            "policies":[{
+                "effect":"allow",
+                "permission_groups":[{"id":"e17beae8b8cb423a99b1730f21238bed"}],
+                "resources":{"com.cloudflare.api.account.zone.ffffffffffffffffffffffffffffffff":"*"}
+            }]
+        }));
+        validate_api_token_creation_contract(&capability, &drifted, &adapter, "account-a")
+            .expect_err("resource drift off the bound zone is rejected");
+    }
+
+    #[test]
+    fn account_scope_claim_cannot_bind_a_zone_resource() {
+        // The cross-scope attack: claim whole-account permission scope (so the
+        // group check is lax) but bind a narrower-looking zone resource. The
+        // single-segment-under-scope guard must reject it.
+        let capability = CapabilityV1::new(
+            "account-api-tokens-create-token",
+            "Create account token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        let zone_resource = "com.cloudflare.api.account.zone.e826a542f6b80137a949a3291c1cad9c";
+        let groups = json!([{
+            "id": "group-a",
+            "name": "Workers Scripts Write",
+            "scopes": ["com.cloudflare.api.account", "com.cloudflare.api.account.zone"]
+        }]);
+        let groups_hash = hash_value(&groups).expect("group hash");
+        let adapter = json!({
+            "permission_inventory": {
+                "source_capability_id": "account-api-tokens-list-permission-groups",
+                "selected_groups": groups,
+                "selected_groups_hash": groups_hash,
+                "token_resource": zone_resource,
+                "permission_scope": "com.cloudflare.api.account",
+                "evidence_hashes": [format!("sha256:{}", "a".repeat(64))]
+            }
+        });
+        let input = CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            query: json!({}),
+            body: Some(json!({
+                "name":"mismatched token",
+                "policies":[{
+                    "effect":"allow",
+                    "permission_groups":[{"id":"group-a"}],
+                    "resources":{zone_resource:"*"}
+                }]
+            })),
+            ..CallInput::default()
+        };
+        let error =
+            validate_api_token_creation_contract(&capability, &input, &adapter, "account-a")
+                .expect_err("account scope claim with a zone resource is rejected");
+        assert!(
+            error.to_string().contains("not a single resource"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn token_policy_body_accepts_the_bound_resource_verbatim() {
+        // Backward-compat + zone: validate_token_policy_body scopes to exactly
+        // the expected resource, whatever its shape.
+        let account_body = json!({
+            "policies":[{
+                "effect":"allow",
+                "permission_groups":[{"id":"group-a"}],
+                "resources":{"com.cloudflare.api.account.account-a":"*"}
+            }]
+        });
+        validate_token_policy_body(
+            Some(&account_body),
+            &["group-a".to_owned()],
+            "com.cloudflare.api.account.account-a",
+        )
+        .expect("account resource accepted");
+        let zone_body = json!({
+            "policies":[{
+                "effect":"allow",
+                "permission_groups":[{"id":"group-a"}],
+                "resources":{"com.cloudflare.api.account.zone.e826a542f6b80137a949a3291c1cad9c":"*"}
+            }]
+        });
+        validate_token_policy_body(
+            Some(&zone_body),
+            &["group-a".to_owned()],
+            "com.cloudflare.api.account.zone.e826a542f6b80137a949a3291c1cad9c",
+        )
+        .expect("zone resource accepted");
+        // Mismatch between the bound resource and the body is rejected.
+        validate_token_policy_body(
+            Some(&zone_body),
+            &["group-a".to_owned()],
+            "com.cloudflare.api.account.account-a",
+        )
+        .expect_err("resource mismatch rejected");
+    }
+
+    #[test]
     fn user_token_creation_requires_its_own_inventory_and_account_compatible_groups() {
         let user_capability = CapabilityV1::new(
             "user-api-tokens-create-token",
@@ -14618,7 +14799,12 @@ mod tests {
             "account-a",
         )
         .expect_err("zone-only permission cannot be attached to an account resource");
-        assert!(incompatible.to_string().contains("account resource scope"));
+        assert!(
+            incompatible.to_string().contains(
+                "does not support the required resource scope `com.cloudflare.api.account`"
+            ),
+            "{incompatible}"
+        );
     }
 
     #[test]
