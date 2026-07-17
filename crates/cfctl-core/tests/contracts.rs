@@ -2563,3 +2563,69 @@ fn standing_consumption_accepts_only_in_scope_unapproved_drafts_and_records_the_
         "standing consumption is not replayable"
     );
 }
+
+fn zone_cache_purge_capability(id: &str, path: &str) -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(id, "Purge Cached Content", "POST", path);
+    "Zone".clone_into(&mut capability.product);
+    capability.permissions = vec!["Cache Purge".to_owned()];
+    capability.risk = RiskClass::Destructive;
+    capability.effect = EffectClass::Destructive;
+    capability.cost = CostV1::default();
+    capability.cost.known = true;
+    capability.cost.incremental = false;
+    capability.cost.maximum = Some(0.0);
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans = ["free", "pro", "business", "enterprise"]
+        .into_iter()
+        .map(|plan| (plan.to_owned(), true))
+        .collect();
+    capability.verification.required = true;
+    "cache_purge_response_reports_target_zone_id".clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "a cache purge is irreversible — content is re-fetched from origin on next request; no snapshot restores prior cache state"
+            .to_owned(),
+    );
+    capability.request_schema = Some(json!({
+        "anyOf": [{"type": "object", "properties": {"purge_everything": {"type": "boolean"}}}],
+        "x-cfctl-body-required": true
+    }));
+    capability
+}
+
+#[test]
+fn zone_cache_purge_verifier_is_bound_to_purge_ids_and_post() {
+    for id in [
+        "zone-purge",
+        "zone-purge-tagged",
+        "zone-environment-purge",
+        "zone-environment-purge-tagged",
+    ] {
+        let capability = zone_cache_purge_capability(id, "/zones/{zone_id}/purge_cache");
+        assert!(
+            capability.verification_contract_supported(),
+            "{id} should support the purge verifier"
+        );
+        assert!(
+            capability.mutation_contract_gaps().is_empty(),
+            "{id} gaps: {:?}",
+            capability.mutation_contract_gaps()
+        );
+    }
+
+    let mut wrong_method =
+        zone_cache_purge_capability("zone-purge", "/zones/{zone_id}/purge_cache");
+    "PUT".clone_into(&mut wrong_method.method);
+    assert!(
+        !wrong_method.verification_contract_supported(),
+        "the purge verifier must be bound to POST"
+    );
+
+    let wrong_id =
+        zone_cache_purge_capability("zone-settings-edit", "/zones/{zone_id}/purge_cache");
+    assert!(
+        !wrong_id.verification_contract_supported(),
+        "the purge verifier must be bound to the purge ids"
+    );
+}

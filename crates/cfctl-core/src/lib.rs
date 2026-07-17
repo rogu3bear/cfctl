@@ -685,7 +685,11 @@ impl CapabilityV1 {
 
     /// Returns whether the selected adapter has an implementation for this
     /// capability's exact verification strategy and resource shape.
+    // The one match arm per supported strategy pushes this gate past the
+    // pedantic line ceiling; the strategies are intentionally enumerated in one
+    // place so the supported set stays auditable.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn verification_contract_supported(&self) -> bool {
         if !self.mutating {
             return true;
@@ -785,6 +789,22 @@ impl CapabilityV1 {
             }
             "parent_collection_contains_created_resource_id_and_planned_fields" => {
                 self.method == "POST" && self.created_collection_resource_contract_supported()
+            }
+            // Cache purge cannot be verified by readback: there is no
+            // "is-this-cached?" GET. The executor asserts only that Cloudflare
+            // accepted the purge and echoed the target zone id in `result.id`;
+            // the basis string states plainly this proves acceptance and
+            // scoping, not eviction. Bound to the exact purge ids (including
+            // the derived Enterprise-scoped `-tagged` variants).
+            "cache_purge_response_reports_target_zone_id" => {
+                self.method == "POST"
+                    && matches!(
+                        self.id.as_str(),
+                        "zone-purge"
+                            | "zone-purge-tagged"
+                            | "zone-environment-purge"
+                            | "zone-environment-purge-tagged"
+                    )
             }
             _ => false,
         }

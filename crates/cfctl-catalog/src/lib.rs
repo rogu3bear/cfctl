@@ -981,6 +981,7 @@ fn apply_post_normalization_contracts(
     finalize_d1_database_create_contract(document, capabilities);
     finalize_workers_kv_namespace_contracts(document, capabilities);
     finalize_r2_temporary_credentials_contract(document, capabilities);
+    finalize_zone_cache_purge_contracts(document, capabilities);
     finalize_oauth_client_secret_rotation_contract(document, capabilities);
     finalize_global_warp_override_rollback_contract(capabilities);
     finalize_d1_read_replication_rollback_contract(capabilities);
@@ -3552,6 +3553,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         }
     } else if r2_temporary_credentials_operation_supported(capability) {
         classify_r2_temporary_credentials(capability);
+    } else if zone_cache_purge_operation_supported(capability) {
+        classify_zone_cache_purge(capability);
     } else if let Some(kind) = oauth_client_secret_operation_kind(capability) {
         classify_oauth_client_secret_operation(capability, kind);
     } else if is_workers_ai_model_run(capability) {
@@ -4208,6 +4211,13 @@ const R2_TEMPORARY_CREDENTIAL_PERMISSIONS: [&str; 6] = [
     "Workers R2 Data Catalog Read",
 ];
 
+const ZONE_CACHE_PURGE_BASE_IDS: [&str; 2] = ["zone-purge", "zone-environment-purge"];
+const ZONE_CACHE_PURGE_PERMISSION: &str = "Cache Purge";
+const CACHE_PURGE_DOCS_URL: &str = "https://developers.cloudflare.com/cache/how-to/purge-cache/";
+const CACHE_PURGE_BY_TAGS_DOCS_URL: &str =
+    "https://developers.cloudflare.com/cache/how-to/purge-cache/purge-cache-by-cache-tags/";
+const CACHE_PURGE_VERIFICATION_STRATEGY: &str = "cache_purge_response_reports_target_zone_id";
+
 fn r2_temporary_credentials_operation_supported(capability: &CapabilityV1) -> bool {
     capability.id == R2_TEMPORARY_CREDENTIALS_CAPABILITY_ID
         && capability.title == "Create Temporary Access Credentials"
@@ -4390,6 +4400,213 @@ fn finalize_r2_temporary_credentials_contract(
         );
     }
     refresh_dynamic_mutation_contract(capability);
+}
+
+/// Recognizes the two zone cache-purge write operations. The finalizer, not the
+/// classifier, resolves the honest entitlement split, so the guard is narrow: a
+/// base purge id issued as a POST. The derived `-tagged` variants never reach
+/// this guard because they are inserted after classification.
+fn zone_cache_purge_operation_supported(capability: &CapabilityV1) -> bool {
+    ZONE_CACHE_PURGE_BASE_IDS.contains(&capability.id.as_str()) && capability.method == "POST"
+}
+
+/// Classifies the base cache-purge capability. Verification is left at the
+/// generic placeholder here; `finalize_zone_cache_purge_contracts` upgrades it
+/// to the operation-specific verifier only after validating the request and
+/// response contracts against the official document.
+fn classify_zone_cache_purge(capability: &mut CapabilityV1) {
+    capability.risk = RiskClass::Destructive;
+    capability.effect = EffectClass::Destructive;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.known = true;
+    capability.cost.incremental = false;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "purging cache has no direct per-request charge; the origin re-fetch it forces is billed only as ordinary downstream usage. Cache-tag, host, and prefix purge is Enterprise-only and is modeled as the separate `-tagged` capability."
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "Purge cache".to_owned(),
+            url: CACHE_PURGE_DOCS_URL.to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "Purge cache by cache-tags".to_owned(),
+            url: CACHE_PURGE_BY_TAGS_DOCS_URL.to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+    ];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans = zone_cache_purge_all_plans();
+    capability.entitlement.blocker = None;
+    capability.entitlement.source = Some(CACHE_PURGE_DOCS_URL.to_owned());
+    capability.entitlement.requires_live_resolution = false;
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "a cache purge is irreversible — content is re-fetched from origin on next request; no snapshot restores prior cache state"
+            .to_owned(),
+    );
+}
+
+fn zone_cache_purge_all_plans() -> BTreeMap<String, bool> {
+    ["free", "pro", "business", "enterprise"]
+        .into_iter()
+        .map(|plan| (plan.to_owned(), true))
+        .collect()
+}
+
+fn zone_cache_purge_enterprise_only_plans() -> BTreeMap<String, bool> {
+    ["free", "pro", "business", "enterprise"]
+        .into_iter()
+        .map(|plan| (plan.to_owned(), plan == "enterprise"))
+        .collect()
+}
+
+/// A request-body variant is Enterprise-scoped when it declares any of the
+/// cache-tag, host, or prefix purge selectors; every other declared variant
+/// (`purge_everything` and both `files` shapes) is available on all plans.
+fn cache_purge_variant_is_enterprise(variant: &Value) -> bool {
+    variant
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| {
+            ["tags", "hosts", "prefixes"]
+                .iter()
+                .any(|key| properties.contains_key(*key))
+        })
+}
+
+/// Confirms the official request body is the full six-variant `anyOf` the split
+/// depends on: three Enterprise selectors (tags, hosts, prefixes) and three
+/// all-plan selectors (`purge_everything` and both `files` shapes).
+fn cache_purge_request_schema_declares_all_variants(schema: &Value) -> bool {
+    let Some(variants) = schema.get("anyOf").and_then(Value::as_array) else {
+        return false;
+    };
+    let declared_keys: BTreeSet<&str> = variants
+        .iter()
+        .filter_map(|variant| variant.get("properties").and_then(Value::as_object))
+        .flat_map(serde_json::Map::keys)
+        .map(String::as_str)
+        .collect();
+    let enterprise_variants = variants
+        .iter()
+        .filter(|variant| cache_purge_variant_is_enterprise(variant))
+        .count();
+    schema.get("x-cfctl-body-required").and_then(Value::as_bool) == Some(true)
+        && variants.len() == 6
+        && enterprise_variants == 3
+        && variants.len() - enterprise_variants == 3
+        && ["tags", "hosts", "prefixes", "purge_everything", "files"]
+            .iter()
+            .all(|key| declared_keys.contains(key))
+}
+
+/// Filters the request `anyOf` in place to only the requested entitlement tier,
+/// preserving the surrounding schema wrapper (including `x-cfctl-body-required`).
+fn narrow_cache_purge_request_schema(schema: &mut Value, keep_enterprise: bool) {
+    if let Some(variants) = schema.get_mut("anyOf").and_then(Value::as_array_mut) {
+        variants.retain(|variant| cache_purge_variant_is_enterprise(variant) == keep_enterprise);
+    }
+}
+
+const fn zone_cache_purge_operation_pointer(base_id: &str) -> Option<&'static str> {
+    match base_id.as_bytes() {
+        b"zone-purge" => Some("/paths/~1zones~1{zone_id}~1purge_cache/post"),
+        b"zone-environment-purge" => {
+            Some("/paths/~1zones~1{zone_id}~1environments~1{environment_id}~1purge_cache/post")
+        }
+        _ => None,
+    }
+}
+
+/// Finalizes both zone cache-purge capabilities: it validates each base against
+/// the official document, narrows the base to the all-plan body variants, and
+/// derives the Enterprise-only `-tagged` capability from the pre-narrow base so
+/// that a plan-gated agent cannot even plan a tag, host, or prefix purge through
+/// the base id. Validation is fail-closed: on drift the base stays blocked and
+/// no `-tagged` capability is inserted.
+fn finalize_zone_cache_purge_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    for base_id in ZONE_CACHE_PURGE_BASE_IDS {
+        finalize_zone_cache_purge_contract(document, capabilities, base_id);
+    }
+}
+
+fn finalize_zone_cache_purge_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+    base_id: &str,
+) {
+    let Some(capability) = capabilities.get(base_id) else {
+        return;
+    };
+    if !zone_cache_purge_operation_supported(capability) {
+        return;
+    }
+    let permission_supported = capability.permissions == [ZONE_CACHE_PURGE_PERMISSION];
+    let request_supported = capability
+        .request_schema
+        .as_ref()
+        .is_some_and(cache_purge_request_schema_declares_all_variants);
+    let response_supported = zone_cache_purge_operation_pointer(base_id)
+        .and_then(|pointer| document.pointer(pointer))
+        .is_some_and(|operation| {
+            success_response_declares_result_string_field(document, operation, "id")
+        });
+
+    let Some(capability) = capabilities.get_mut(base_id) else {
+        return;
+    };
+    if !permission_supported || !request_supported || !response_supported {
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "zone cache-purge Cache Purge permission, six-variant request body, or result.id response contract drifted"
+                .to_owned(),
+        );
+        return;
+    }
+
+    // Clone before narrowing so the Enterprise variant inherits the full base
+    // contract and only its own request body is restricted.
+    let mut derived = capability.clone();
+
+    if let Some(schema) = capability.request_schema.as_mut() {
+        narrow_cache_purge_request_schema(schema, false);
+    }
+    CACHE_PURGE_VERIFICATION_STRATEGY.clone_into(&mut capability.verification.strategy);
+    refresh_dynamic_mutation_contract(capability);
+
+    let tagged_id = format!("{base_id}-tagged");
+    tagged_id.clone_into(&mut derived.id);
+    derived.title = format!(
+        "{} (Enterprise cache-tag, host, and prefix purge)",
+        derived.title
+    );
+    derived.description = Some(format!(
+        "Enterprise-only cache purge scoped by cache-tag, host, or prefix. Split from `{base_id}`: this capability accepts only the tags, hosts, or prefixes selectors and is gated to the Enterprise plan, so a lower-tier profile cannot plan a tag, host, or prefix purge."
+    ));
+    derived.cost.basis = Some(
+        "purging cache has no direct per-request charge; the origin re-fetch it forces is billed only as ordinary downstream usage. Cache-tag, host, and prefix purge requires an Enterprise plan."
+            .to_owned(),
+    );
+    if let Some(schema) = derived.request_schema.as_mut() {
+        narrow_cache_purge_request_schema(schema, true);
+    }
+    derived.entitlement.available = Some(true);
+    derived.entitlement.plans = zone_cache_purge_enterprise_only_plans();
+    CACHE_PURGE_VERIFICATION_STRATEGY.clone_into(&mut derived.verification.strategy);
+    refresh_dynamic_mutation_contract(&mut derived);
+    capabilities.insert(derived.id.clone(), derived);
 }
 
 fn success_response_result_field_boolean_annotation(

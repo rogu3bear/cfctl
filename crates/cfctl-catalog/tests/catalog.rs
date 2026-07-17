@@ -8102,3 +8102,253 @@ fn executable_catalog_hash_changes_when_a_local_contract_changes() {
     assert_eq!(snapshot.source_hash, source_hash);
     assert_ne!(snapshot.schema_hash, original_catalog_hash);
 }
+
+fn zone_cache_purge_request_body() -> Value {
+    json!({
+        "required": true,
+        "content": {"application/json": {"schema": {"anyOf": [
+            {"type": "object", "properties": {"tags": {"type": "array", "items": {"type": "string"}}}},
+            {"type": "object", "properties": {"hosts": {"type": "array", "items": {"type": "string"}}}},
+            {"type": "object", "properties": {"prefixes": {"type": "array", "items": {"type": "string"}}}},
+            {"type": "object", "properties": {"purge_everything": {"type": "boolean"}}},
+            {"type": "object", "properties": {"files": {"type": "array", "items": {"type": "string"}}}},
+            {"type": "object", "properties": {"files": {"type": "array", "items": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}}
+                }
+            }}}}
+        ]}}}
+    })
+}
+
+fn zone_cache_purge_success_response() -> Value {
+    json!({"200": {"description": "Purge response", "content": {
+        "application/json": {"schema": {"allOf": [
+            {"$ref": "#/components/schemas/api-response-common"},
+            {"type": "object", "properties": {
+                "result": {"$ref": "#/components/schemas/purge-result"}
+            }}
+        ]}}
+    }}})
+}
+
+fn zone_cache_purge_fixture() -> Value {
+    json!({
+        "openapi": "3.0.3",
+        "info": {"title": "Cloudflare API", "version": "4.0.0"},
+        "servers": [{"url": "https://api.cloudflare.com/client/v4"}],
+        "components": {
+            "schemas": {
+                "identifier": {"type": "string", "maxLength": 32},
+                "api-response-common": {
+                    "type": "object",
+                    "required": ["success"],
+                    "properties": {"success": {"type": "boolean"}}
+                },
+                "purge-result": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}}
+                }
+            }
+        },
+        "paths": {
+            "/zones/{zone_id}/purge_cache": {
+                "post": {
+                    "operationId": "zone-purge",
+                    "summary": "Purge Cached Content",
+                    "tags": ["Zone"],
+                    "x-api-token-group": ["Cache Purge"],
+                    "parameters": [{
+                        "in": "path",
+                        "name": "zone_id",
+                        "required": true,
+                        "schema": {"$ref": "#/components/schemas/identifier"},
+                        "description": "Zone ID."
+                    }],
+                    "requestBody": zone_cache_purge_request_body(),
+                    "responses": zone_cache_purge_success_response()
+                }
+            },
+            "/zones/{zone_id}/environments/{environment_id}/purge_cache": {
+                "post": {
+                    "operationId": "zone-environment-purge",
+                    "summary": "Purge Cached Content by Environment",
+                    "tags": ["Zone"],
+                    "x-api-token-group": ["Cache Purge"],
+                    "parameters": [
+                        {
+                            "in": "path",
+                            "name": "zone_id",
+                            "required": true,
+                            "schema": {"$ref": "#/components/schemas/identifier"},
+                            "description": "Zone ID."
+                        },
+                        {
+                            "in": "path",
+                            "name": "environment_id",
+                            "required": true,
+                            "schema": {"$ref": "#/components/schemas/identifier"},
+                            "description": "Environment ID."
+                        }
+                    ],
+                    "requestBody": zone_cache_purge_request_body(),
+                    "responses": zone_cache_purge_success_response()
+                }
+            }
+        }
+    })
+}
+
+fn purge_variant_keys(capability: &CapabilityV1) -> std::collections::BTreeSet<String> {
+    capability
+        .request_schema
+        .as_ref()
+        .and_then(|schema| schema.get("anyOf"))
+        .and_then(Value::as_array)
+        .map(|variants| {
+            variants
+                .iter()
+                .filter_map(|variant| variant.get("properties").and_then(Value::as_object))
+                .flat_map(|properties| properties.keys().cloned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn assert_zone_cache_purge_split(snapshot: &CatalogSnapshot, base_id: &str) {
+    let base = snapshot
+        .get(base_id)
+        .unwrap_or_else(|| panic!("{base_id} present"));
+    assert_eq!(
+        base.adapter_status,
+        AdapterStatus::DynamicApi,
+        "{base_id}: {:?}",
+        base.blocked_reason
+    );
+    assert_eq!(base.risk, RiskClass::Destructive);
+    assert_eq!(base.effect, EffectClass::Destructive);
+    assert!(base.cost.known);
+    assert!(!base.cost.incremental);
+    assert_eq!(base.cost.maximum, Some(0.0));
+    assert_eq!(base.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(base.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(base.entitlement.available, Some(true));
+    for plan in ["free", "pro", "business", "enterprise"] {
+        assert_eq!(
+            base.entitlement.plans.get(plan),
+            Some(&true),
+            "{base_id} base plan {plan}"
+        );
+    }
+    assert_eq!(
+        base.verification.strategy,
+        "cache_purge_response_reports_target_zone_id"
+    );
+    assert!(base.verification.required);
+    assert!(!base.rollback.supported);
+    assert!(
+        base.rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("irreversible"))
+    );
+    assert!(
+        base.mutation_contract_gaps().is_empty(),
+        "{base_id} gaps: {:?}",
+        base.mutation_contract_gaps()
+    );
+
+    // Honest split: the all-plan base must not accept a tag, host, or prefix purge.
+    let base_keys = purge_variant_keys(base);
+    assert!(
+        base_keys.contains("purge_everything"),
+        "{base_id} base keys"
+    );
+    assert!(base_keys.contains("files"), "{base_id} base keys");
+    assert!(!base_keys.contains("tags"), "{base_id} base keys");
+    assert!(!base_keys.contains("hosts"), "{base_id} base keys");
+    assert!(!base_keys.contains("prefixes"), "{base_id} base keys");
+
+    let tagged_id = format!("{base_id}-tagged");
+    let tagged = snapshot
+        .get(&tagged_id)
+        .unwrap_or_else(|| panic!("{tagged_id} present"));
+    assert_eq!(
+        tagged.adapter_status,
+        AdapterStatus::DynamicApi,
+        "{tagged_id}: {:?}",
+        tagged.blocked_reason
+    );
+    assert_eq!(tagged.entitlement.available, Some(true));
+    assert_eq!(tagged.entitlement.plans.get("free"), Some(&false));
+    assert_eq!(tagged.entitlement.plans.get("pro"), Some(&false));
+    assert_eq!(tagged.entitlement.plans.get("business"), Some(&false));
+    assert_eq!(tagged.entitlement.plans.get("enterprise"), Some(&true));
+    assert_eq!(
+        tagged.verification.strategy,
+        "cache_purge_response_reports_target_zone_id"
+    );
+    assert!(
+        tagged.mutation_contract_gaps().is_empty(),
+        "{tagged_id} gaps: {:?}",
+        tagged.mutation_contract_gaps()
+    );
+
+    // Honest split: the Enterprise capability must accept only tag, host, or prefix purge.
+    let tagged_keys = purge_variant_keys(tagged);
+    assert!(tagged_keys.contains("tags"), "{tagged_id} keys");
+    assert!(tagged_keys.contains("hosts"), "{tagged_id} keys");
+    assert!(tagged_keys.contains("prefixes"), "{tagged_id} keys");
+    assert!(
+        !tagged_keys.contains("purge_everything"),
+        "{tagged_id} keys"
+    );
+    assert!(!tagged_keys.contains("files"), "{tagged_id} keys");
+}
+
+#[test]
+fn zone_cache_purge_splits_basic_and_enterprise_by_entitlement() {
+    let snapshot =
+        normalize_openapi(&zone_cache_purge_fixture()).expect("zone cache purge catalog");
+    assert_zone_cache_purge_split(&snapshot, "zone-purge");
+    assert_zone_cache_purge_split(&snapshot, "zone-environment-purge");
+}
+
+#[test]
+fn zone_cache_purge_classifier_fails_closed_on_permission_or_response_drift() {
+    let mut permission = zone_cache_purge_fixture();
+    permission["paths"]["/zones/{zone_id}/purge_cache"]["post"]["x-api-token-group"] =
+        json!(["Zone Settings Write"]);
+    let snapshot = normalize_openapi(&permission).expect("permission-drifted catalog");
+    assert_eq!(
+        snapshot
+            .get("zone-purge")
+            .expect("zone-purge present")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+    assert!(
+        snapshot.get("zone-purge-tagged").is_none(),
+        "no Enterprise capability may be derived from a drifted base"
+    );
+
+    let mut response = zone_cache_purge_fixture();
+    response["components"]["schemas"]["purge-result"]["properties"]
+        .as_object_mut()
+        .expect("purge-result properties")
+        .remove("id");
+    let snapshot = normalize_openapi(&response).expect("response-drifted catalog");
+    assert_eq!(
+        snapshot
+            .get("zone-purge")
+            .expect("zone-purge present")
+            .adapter_status,
+        AdapterStatus::Blocked
+    );
+    assert!(
+        snapshot.get("zone-purge-tagged").is_none(),
+        "no Enterprise capability may be derived when result.id is undeclared"
+    );
+}
