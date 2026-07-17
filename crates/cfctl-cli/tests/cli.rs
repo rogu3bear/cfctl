@@ -336,6 +336,24 @@ fn retired_words_do_not_disable_clear_natural_language_requests() {
             "clear natural language must keep the agent lane: {arguments:?}"
         );
     }
+
+    let audit_request = [
+        "cfctl",
+        "audit",
+        "access",
+        "posture",
+        "for",
+        "the",
+        "production",
+        "account",
+    ];
+    assert!(
+        matches!(
+            classify_invocation(audit_request),
+            InvocationMode::NaturalLanguage(_)
+        ),
+        "only the exact retired two-token audit command may fail closed"
+    );
 }
 
 #[test]

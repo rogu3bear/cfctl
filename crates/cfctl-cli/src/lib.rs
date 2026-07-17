@@ -499,7 +499,10 @@ fn is_retired_v1_command_shape(arguments: &[String]) -> bool {
     match first {
         "apply" | "can" | "classify" | "diff" | "explain" | "get" | "list" | "snapshot"
         | "verify" => second.is_some_and(|surface| RETIRED_V1_SURFACES.contains(&surface)),
-        "audit" => second.is_some_and(|scope| matches!(scope, "access" | "state" | "trust")),
+        "audit" => {
+            arguments.len() == 2
+                && second.is_some_and(|scope| matches!(scope, "access" | "state" | "trust"))
+        }
         "token" => second.is_some_and(|action| {
             matches!(action, "mint" | "permission-groups" | "revoke" | "rotate")
         }),

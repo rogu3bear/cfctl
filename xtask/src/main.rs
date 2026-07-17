@@ -672,6 +672,13 @@ fn collect_json_command_references(
         }
         serde_json::Value::Object(values) => {
             for (key, value) in values {
+                if is_json_argv_reference_key(key)
+                    && let Some(command) = json_argv_command(value)
+                    && let Some(verb) = cfctl_command_verb(&command)
+                {
+                    verbs.push(verb);
+                    continue;
+                }
                 collect_json_command_references(
                     value,
                     command_context || is_json_command_reference_key(key),
@@ -681,6 +688,19 @@ fn collect_json_command_references(
         }
         _ => {}
     }
+}
+
+fn is_json_argv_reference_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("argv")
+}
+
+fn json_argv_command(value: &serde_json::Value) -> Option<String> {
+    let arguments = value
+        .as_array()?
+        .iter()
+        .map(serde_json::Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    (!arguments.is_empty()).then(|| arguments.join(" "))
 }
 
 fn is_json_command_reference_key(key: &str) -> bool {
@@ -727,6 +747,7 @@ fn cfctl_command_verb_with_context(command: &str, command_context: bool) -> Opti
         .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '-')
         .to_owned();
 
+    let mut explicit_command_context = false;
     if command_index > 0 {
         let prefix = &tokens[..command_index];
         let previous = prefix.last().copied().unwrap_or_default();
@@ -742,11 +763,16 @@ fn cfctl_command_verb_with_context(command: &str, command_context: bool) -> Opti
                 .as_str(),
             "execute" | "invoke" | "run" | "try" | "use"
         );
-        if !shell_boundary && !environment_prefix && !instructional_prefix {
+        explicit_command_context = shell_boundary || environment_prefix || instructional_prefix;
+        if !explicit_command_context {
             return None;
         }
     }
+    if !command_context && matches!(verb.as_str(), "it" | "itself" | "that" | "this") {
+        return None;
+    }
     if !command_context
+        && !explicit_command_context
         && verb != "help"
         && !PUBLIC_V2_SUBCOMMANDS.contains(&verb.as_str())
         && !RETIRED_V1_PUBLIC_VERBS.contains(&verb.as_str())
@@ -2224,6 +2250,26 @@ mod tests {
         assert_eq!(
             extract_cfctl_command_references("example.json", json),
             vec!["guide".to_owned(), "hostname".to_owned()]
+        );
+
+        let structured_argv = r#"{"next_action":{"argv":["cfctl","diff","dns.record"]}}"#;
+        assert_eq!(
+            extract_cfctl_command_references("example.json", structured_argv),
+            vec!["diff".to_owned()]
+        );
+    }
+
+    #[test]
+    fn instructional_unknown_command_references_are_not_treated_as_description() {
+        assert_eq!(
+            extract_cfctl_command_references(
+                "docs/example.md",
+                concat!(
+                    "When you invoke cfctl that way, use a file.\n",
+                    "To inspect the legacy edge, run cfctl frobnicate now.\n",
+                ),
+            ),
+            vec!["frobnicate".to_owned()]
         );
     }
 
