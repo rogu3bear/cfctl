@@ -44,6 +44,10 @@ fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() 
     assert!(content.contains("cfctl keys policy approve <authority-id> --yes"));
     assert!(content.contains("cfctl keys policy revoke <authority-id>"));
     assert!(content.contains("fixture directories are opt-in roots"));
+    assert!(content.contains("contract: 3"));
+    assert!(content.contains("CFCTL_CAPABILITY_BLOCKED"));
+    assert!(content.contains("cfctl guide <capability-id> --json"));
+    assert!(content.contains("report the capability id, `blocking_gaps`, and the guide output"));
     assert!(!content.to_ascii_lowercase().contains("mcp"));
 
     std::fs::write(&receipt.path, "user-owned drift").expect("drift fixture");
@@ -68,6 +72,8 @@ fn cursor_guidance_preserves_plan_approval_and_explains_standing_policy_ceremony
     assert!(content.contains("cfctl keys policy approve <authority-id> --yes"));
     assert!(content.contains("cfctl keys policy revoke <authority-id>"));
     assert!(content.contains("fixture directories are opt-in roots"));
+    assert!(content.contains("CFCTL_CAPABILITY_BLOCKED"));
+    assert!(content.contains("cfctl guide <capability-id> --json"));
 }
 
 #[test]

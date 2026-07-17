@@ -73,7 +73,9 @@ Cloudflare.
 - `governed_ui`: target-bound `AgentActionV1` only after API and CLI
   insufficiency is established. It is a handoff, not approval or completion.
 - `blocked`: discovery only. Satisfy the named contract gap or extend cfctl;
-  never route around it.
+  never route around it. Execution attempts fail closed with error code
+  `CFCTL_CAPABILITY_BLOCKED`; load `cfctl guide <capability-id> --json` and
+  follow `next_action`, and report unresolvable gaps to the operator.
 
 ## Trust invariants
 
