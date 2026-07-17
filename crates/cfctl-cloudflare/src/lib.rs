@@ -432,6 +432,10 @@ impl Executor {
                 .await;
         }
 
+        if strategy == "cache_purge_response_reports_target_zone_id" {
+            return self.verify_cache_purge(plan, apply_response, input);
+        }
+
         if is_delete_verifier(strategy) {
             return self
                 .verify_resource_delete(plan, apply_response, input, credential)
@@ -495,6 +499,55 @@ impl Executor {
             passed,
             basis,
             readback,
+        })
+    }
+
+    /// Verifies a cache purge by asserting Cloudflare accepted the request and
+    /// echoed the target zone id in `result.id`. There is no readback that can
+    /// prove cache eviction, so this is deliberately a no-readback verifier:
+    /// the `apply_response` itself is the evidence, and the basis states plainly
+    /// that it proves acceptance and scoping, not eviction.
+    fn verify_cache_purge(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+    ) -> Result<OperationVerificationV1> {
+        let strategy = plan.capability.verification.strategy.clone();
+        let zone_id = input
+            .selectors
+            .as_object()
+            .and_then(|selectors| selectors.get("zone_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the planned cache purge zone_id selector is absent".to_owned(),
+                )
+            })?;
+        let returned_id = apply_response.result.pointer("/id").and_then(Value::as_str);
+        let (passed, basis) = match returned_id {
+            Some(id) if id == zone_id => (
+                true,
+                format!(
+                    "Cloudflare accepted the cache purge and echoed the target zone id `{zone_id}` in result.id; this proves the purge was accepted and scoped to the target zone, not that cached content was evicted (no readback can verify eviction)"
+                ),
+            ),
+            Some(id) => (
+                false,
+                format!(
+                    "cache purge response reported zone id `{id}`, which does not match the target zone `{zone_id}`; the purge scope cannot be confirmed"
+                ),
+            ),
+            None => (
+                false,
+                "cache purge response did not report a result.id; acceptance and scope cannot be confirmed".to_owned(),
+            ),
+        };
+        Ok(OperationVerificationV1 {
+            strategy,
+            passed,
+            basis,
+            readback: apply_response.clone(),
         })
     }
 
