@@ -4414,7 +4414,32 @@ fn validate_api_token_creation_contract(
         .collect::<Result<Vec<_>>>()?;
     let normalized_groups =
         validate_selected_permission_groups(&selected_ids, &Value::Array(selected_groups.clone()))?;
-    validate_permission_group_resource_scope(&normalized_groups, "com.cloudflare.api.account")?;
+    // The mint records the intended least-privilege scope in the hash-bound
+    // permission inventory. Derive the required permission scope and the exact
+    // resource the policy must carry from it, falling back to whole-account
+    // scope for plans minted before zone scope existed (and any other token
+    // create). The resource must be exactly `{scope}.{id}` with a single id
+    // segment, so a plan cannot claim account scope for the permission check
+    // while binding a zone resource (or vice versa).
+    let permission_scope = inventory
+        .get("permission_scope")
+        .and_then(Value::as_str)
+        .unwrap_or("com.cloudflare.api.account");
+    let default_resource = format!("com.cloudflare.api.account.{account_id}");
+    let expected_resource = inventory
+        .get("token_resource")
+        .and_then(Value::as_str)
+        .unwrap_or(&default_resource);
+    let resource_is_single_segment_under_scope = expected_resource
+        .strip_prefix(permission_scope)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|id| !id.is_empty() && !id.contains('.'));
+    if !resource_is_single_segment_under_scope {
+        return Err(CliError::Input(format!(
+            "token mint resource `{expected_resource}` is not a single resource under its declared permission scope `{permission_scope}`"
+        )));
+    }
+    validate_permission_group_resource_scope(&normalized_groups, permission_scope)?;
     let expected_hash = inventory
         .get("selected_groups_hash")
         .and_then(Value::as_str)
@@ -4447,7 +4472,7 @@ fn validate_api_token_creation_contract(
                 .to_owned(),
         ));
     }
-    validate_token_policy_body(input.body.as_ref(), &selected_ids, account_id)
+    validate_token_policy_body(input.body.as_ref(), &selected_ids, expected_resource)
 }
 
 #[derive(Clone, Copy)]
@@ -4491,17 +4516,92 @@ fn validate_permission_group_resource_scope(groups: &[Value], required_scope: &s
             });
         if !supports_scope {
             return Err(CliError::Input(format!(
-                "permission group `{id}` does not support the required account resource scope `{required_scope}`"
+                "permission group `{id}` does not support the required resource scope `{required_scope}`"
             )));
         }
     }
     Ok(())
 }
 
+/// Resolves the least-privilege resource scope for a mint: the whole `--account`
+/// (default) or a single `--zone`. Returns the permission scope selected groups
+/// must support and the exact policy resource `{scope}.{id}`. Zone-scoped
+/// permission groups (Cache Purge, DNS Write, …) carry scope
+/// `com.cloudflare.api.account.zone`, which the whole-account scope does not
+/// admit — resolving to the zone scope is what lets those groups mint through
+/// the governed lane instead of an out-of-band raw token.
+fn resolve_mint_token_scope(
+    arguments: &KeyMutationArgs,
+    account: &str,
+) -> Result<(&'static str, String)> {
+    match arguments.zone.as_deref() {
+        Some(zone_id) => {
+            if arguments.user {
+                return Err(CliError::Input(
+                    "zone-scoped minting is account-owned; omit --user (the token still belongs to --account)"
+                        .to_owned(),
+                ));
+            }
+            validate_zone_id(zone_id)?;
+            Ok((
+                "com.cloudflare.api.account.zone",
+                format!("com.cloudflare.api.account.zone.{zone_id}"),
+            ))
+        }
+        None => Ok((
+            "com.cloudflare.api.account",
+            format!("com.cloudflare.api.account.{account}"),
+        )),
+    }
+}
+
+/// Builds the single least-privilege token-create policy body: exactly the
+/// selected permission groups scoped to exactly `token_resource`, with an
+/// optional expiry. The resulting body is what `validate_token_policy_body`
+/// re-checks against the hash-bound inventory before the mint runs.
+fn build_mint_policy_body(
+    name: &str,
+    selected_group_ids: &[String],
+    token_resource: &str,
+    ttl_hours: Option<u32>,
+) -> Value {
+    let mut body = json!({
+        "name": name,
+        "policies": [{
+            "effect": "allow",
+            "permission_groups": selected_group_ids.iter().map(|id| json!({"id": id})).collect::<Vec<_>>(),
+            "resources": {token_resource: "*"}
+        }]
+    });
+    if let Some(hours) = ttl_hours {
+        body["expires_on"] =
+            json!((Utc::now() + ChronoDuration::hours(i64::from(hours))).to_rfc3339());
+    }
+    body
+}
+
+/// Fail-closed local check on a `--zone` argument: Cloudflare zone ids are
+/// 32-character lowercase hex. Cross-account zone ownership is still enforced at
+/// the Cloudflare boundary when the governed plan runs; this only rejects
+/// obviously-malformed input before it becomes a plan.
+fn validate_zone_id(zone_id: &str) -> Result<()> {
+    let well_formed = zone_id.len() == 32
+        && zone_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if well_formed {
+        Ok(())
+    } else {
+        Err(CliError::Input(format!(
+            "`--zone` expects a 32-character lowercase-hex Cloudflare zone id, got `{zone_id}`"
+        )))
+    }
+}
+
 fn validate_token_policy_body(
     body: Option<&Value>,
     selected_ids: &[String],
-    account_id: &str,
+    expected_resource: &str,
 ) -> Result<()> {
     let policies = body
         .and_then(|body| body.get("policies"))
@@ -4550,12 +4650,10 @@ fn validate_token_policy_body(
         .get("resources")
         .and_then(Value::as_object)
         .ok_or_else(|| CliError::Input("token mint policy has no resource scope".to_owned()))?;
-    let expected_resource = format!("com.cloudflare.api.account.{account_id}");
-    if resources.len() != 1
-        || resources.get(&expected_resource).and_then(Value::as_str) != Some("*")
+    if resources.len() != 1 || resources.get(expected_resource).and_then(Value::as_str) != Some("*")
     {
         return Err(CliError::Input(format!(
-            "token mint policy must be scoped only to account `{account_id}`"
+            "token mint policy must be scoped only to `{expected_resource}`"
         )));
     }
     Ok(())
@@ -8325,11 +8423,12 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
                 .to_owned(),
         ));
     }
+    let (permission_scope, token_resource) = resolve_mint_token_scope(arguments, account)?;
     let selected_groups = validate_selected_permission_groups(
         &arguments.permissions,
         inventory.result.get("result").unwrap_or(&Value::Null),
     )?;
-    validate_permission_group_resource_scope(&selected_groups, "com.cloudflare.api.account")?;
+    validate_permission_group_resource_scope(&selected_groups, permission_scope)?;
     let selected_group_ids = selected_groups
         .iter()
         .filter_map(|group| group.get("id").and_then(Value::as_str))
@@ -8341,18 +8440,12 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
         .iter()
         .map(|evidence| evidence.content_hash.clone())
         .collect::<Vec<_>>();
-    let mut body = json!({
-        "name": arguments.name,
-        "policies": [{
-            "effect": "allow",
-            "permission_groups": selected_group_ids.iter().map(|id| json!({"id": id})).collect::<Vec<_>>(),
-            "resources": {format!("com.cloudflare.api.account.{account}"): "*"}
-        }]
-    });
-    if let Some(hours) = arguments.ttl_hours {
-        body["expires_on"] =
-            json!((Utc::now() + ChronoDuration::hours(i64::from(hours))).to_rfc3339());
-    }
+    let body = build_mint_policy_body(
+        &arguments.name,
+        &selected_group_ids,
+        &token_resource,
+        arguments.ttl_hours,
+    );
     let catalog = ensure_catalog(store).await?;
     let capability_id = if arguments.user {
         "user-api-tokens-create-token"
@@ -8387,6 +8480,8 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
                 "source_capability_id": inventory_contract.capability_id,
                 "selected_groups": selected_groups,
                 "selected_groups_hash": selected_groups_hash,
+                "token_resource": token_resource,
+                "permission_scope": permission_scope,
                 "evidence_hashes": inventory_evidence_hashes,
             }
         }),
