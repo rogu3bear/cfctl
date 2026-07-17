@@ -744,8 +744,16 @@ impl CapabilityV1 {
                 self.method == "DELETE" && self.id == "dns-records-for-a-zone-delete-dns-record"
             }
             "same_resource_returns_not_found_after_delete" => {
+                // Accepts both an id-parameter-terminated resource path and a
+                // singleton sub-resource path (terminal literal segment under an
+                // identified parent, e.g. `/apps/{app_id}/ca`). Both are proven
+                // single resources by the bound same-path readback contract; the
+                // catalog only binds `same_path_read` on a singleton after
+                // confirming its readback GET returns a single object, not a
+                // collection, so delete-then-not-found is a valid readback here.
                 self.method == "DELETE"
-                    && path_targets_exact_resource(&self.path)
+                    && (path_targets_exact_resource(&self.path)
+                        || path_targets_singleton_subresource(&self.path))
                     && (self.request_schema.is_none()
                         || self.required_empty_request_body_contract())
                     && self.same_path_readback_selectors_supported()
@@ -1960,6 +1968,20 @@ fn path_targets_exact_resource(path: &str) -> bool {
     path.rsplit('/').next().is_some_and(|segment| {
         segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2
     })
+}
+
+/// A singleton sub-resource path: a terminal literal segment (not a path
+/// parameter) beneath at least one identified parent parameter — e.g.
+/// `/accounts/{account_id}/access/apps/{app_id}/ca`. Structurally this is a
+/// necessary-but-not-sufficient signal (a collection path like `.../rules` also
+/// matches); the sufficient proof that it is a single resource is the bound
+/// same-path readback contract, which the catalog only attaches after
+/// confirming the readback GET returns a single object rather than an array.
+fn path_targets_singleton_subresource(path: &str) -> bool {
+    let terminal_is_literal = path.rsplit('/').next().is_some_and(|segment| {
+        !(segment.is_empty() || segment.starts_with('{') && segment.ends_with('}'))
+    });
+    terminal_is_literal && path.contains('{')
 }
 
 fn selector_can_be_response_id(selector: &str) -> bool {
