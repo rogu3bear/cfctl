@@ -976,6 +976,7 @@ fn apply_post_normalization_contracts(
     classify_created_collection_resource_contracts(document, capabilities);
     classify_global_warp_override_contract(document, capabilities);
     classify_same_path_object_mutation_contracts(document, capabilities);
+    finalize_r2_bucket_create_contract(document, capabilities);
     finalize_d1_database_create_contract(document, capabilities);
     finalize_oauth_client_secret_rotation_contract(document, capabilities);
     finalize_global_warp_override_rollback_contract(capabilities);
@@ -3470,6 +3471,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
     .contains(&capability.id.as_str())
     {
         classify_api_token_lifecycle(capability);
+    } else if r2_bucket_create_operation_supported(capability) {
+        classify_r2_bucket_create(capability);
     } else if d1_database_create_operation_supported(capability) {
         classify_d1_database_create(capability);
     } else if let Some(kind) = oauth_client_secret_operation_kind(capability) {
@@ -4151,6 +4154,305 @@ fn d1_read_replication_request_contract_supported(capability: &CapabilityV1) -> 
                         && mode.get("enum") == Some(&serde_json::json!(["auto", "disabled"]))
                 })
         })
+}
+
+const R2_BUCKET_CREATE_CAPABILITY_ID: &str = "r2-create-bucket";
+const R2_BUCKET_READ_CAPABILITY_ID: &str = "r2-get-bucket";
+const R2_BUCKET_DELETE_CAPABILITY_ID: &str = "r2-delete-bucket";
+const R2_BUCKET_COLLECTION_PATH: &str = "/accounts/{account_id}/r2/buckets";
+const R2_BUCKET_DETAIL_PATH: &str = "/accounts/{account_id}/r2/buckets/{bucket_name}";
+
+fn r2_bucket_create_operation_supported(capability: &CapabilityV1) -> bool {
+    capability.id == R2_BUCKET_CREATE_CAPABILITY_ID
+        && capability.title == "Create Bucket"
+        && capability.description.as_deref() == Some("Creates a new R2 bucket.")
+        && capability.method == "POST"
+        && capability.path == R2_BUCKET_COLLECTION_PATH
+        && capability.product == "R2 Bucket"
+        && capability.account_scope == "account"
+        && capability.permissions == ["Workers R2 Storage Write"]
+        && r2_bucket_selectors_supported(capability, false)
+        && capability.request_schema.as_ref()
+            == Some(&serde_json::json!({
+                "properties": {
+                    "locationHint": {
+                        "enum": ["apac", "eeur", "enam", "weur", "wnam", "oc"],
+                        "type": "string"
+                    },
+                    "name": {"maxLength": 64, "minLength": 3, "type": "string"},
+                    "storageClass": {
+                        "enum": ["Standard", "InfrequentAccess"],
+                        "type": "string"
+                    }
+                },
+                "required": ["name"],
+                "type": "object",
+                "x-cfctl-body-required": true
+            }))
+        && r2_bucket_response_contract_supported(capability)
+}
+
+fn r2_bucket_selectors_supported(capability: &CapabilityV1, includes_bucket_name: bool) -> bool {
+    let expected_len = if includes_bucket_name { 3 } else { 2 };
+    capability.selectors.len() == expected_len
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "account_id"
+                && selector.location == "path"
+                && selector.required
+                && selector.value_type == "string"
+                && selector.description.as_deref() == Some("Account ID.")
+                && selector.contract.as_ref().is_some_and(|contract| {
+                    contract.schema == serde_json::json!({"maxLength":32,"type":"string"})
+                        && contract.query.is_none()
+                })
+        })
+        && (!includes_bucket_name
+            || capability.selectors.iter().any(|selector| {
+                selector.name == "bucket_name"
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+                    && selector.description.as_deref() == Some("Name of the bucket.")
+                    && selector.contract.as_ref().is_some_and(|contract| {
+                        contract.schema
+                            == serde_json::json!({"maxLength":64,"minLength":3,"type":"string"})
+                            && contract.query.is_none()
+                    })
+            }))
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "cf-r2-jurisdiction"
+                && selector.location == "header"
+                && !selector.required
+                && selector.value_type == "string"
+                && selector.description.as_deref()
+                    == Some(
+                        "Jurisdiction where objects in this bucket are guaranteed to be stored.",
+                    )
+                && selector.contract.as_ref().is_some_and(|contract| {
+                    contract.schema
+                        == serde_json::json!({"enum":["default","eu","fedramp"],"type":"string"})
+                        && contract.query.is_none()
+                })
+        })
+}
+
+fn r2_bucket_response_contract_supported(capability: &CapabilityV1) -> bool {
+    capability
+        .response_contract
+        .as_ref()
+        .is_some_and(|response| {
+            response.success_statuses == ["200"]
+                && response.success_media_types == ["application/json"]
+                && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+        })
+}
+
+fn r2_bucket_references() -> Vec<KnowledgeReferenceV1> {
+    vec![
+        KnowledgeReferenceV1 {
+            title: "R2 Create Bucket API".to_owned(),
+            url: "https://developers.cloudflare.com/api/resources/r2/subresources/buckets/methods/create/"
+                .to_owned(),
+            source: "official Cloudflare API reference".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "R2 pricing".to_owned(),
+            url: "https://developers.cloudflare.com/r2/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "R2 storage classes".to_owned(),
+            url: "https://developers.cloudflare.com/r2/buckets/storage-classes/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "R2 data location".to_owned(),
+            url: "https://developers.cloudflare.com/r2/reference/data-location/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+    ]
+}
+
+fn classify_r2_bucket_create(capability: &mut CapabilityV1) {
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost.incremental = true;
+    capability.cost.currency = Some("USD".to_owned());
+    capability.cost.maximum = Some(0.000_009);
+    capability.cost.known = true;
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "Cloudflare classifies PutBucket as one Class A operation; the ceiling uses the current higher Infrequent Access rate of USD 9.00 per million requests, while later storage, data retrieval, and Class A/Class B operations remain usage-billed"
+            .to_owned(),
+    );
+    capability.cost.references = r2_bucket_references();
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans = BTreeMap::from([("r2_active_subscription".to_owned(), true)]);
+    capability.entitlement.blocker = None;
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/r2/api/tokens/".to_owned());
+    capability.entitlement.requires_live_resolution = false;
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "compensation is possible only through a separately reviewed exact-bucket delete plan while the newly created bucket remains empty"
+            .to_owned(),
+    );
+}
+
+fn r2_bucket_read_contract_supported(
+    document: &Value,
+    capabilities: &BTreeMap<String, CapabilityV1>,
+) -> bool {
+    capabilities
+        .get(R2_BUCKET_READ_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.id == R2_BUCKET_READ_CAPABILITY_ID
+                && capability.title == "Get Bucket"
+                && capability.description.as_deref()
+                    == Some("Gets properties of an existing R2 bucket.")
+                && capability.method == "GET"
+                && capability.path == R2_BUCKET_DETAIL_PATH
+                && capability.product == "R2 Bucket"
+                && capability.account_scope == "account"
+                && capability.permissions.is_empty()
+                && capability.request_schema.is_none()
+                && r2_bucket_selectors_supported(capability, true)
+                && r2_bucket_response_contract_supported(capability)
+        })
+        && r2_bucket_response_fields_supported(document, "get")
+}
+
+fn r2_bucket_delete_contract_supported(capabilities: &BTreeMap<String, CapabilityV1>) -> bool {
+    capabilities
+        .get(R2_BUCKET_DELETE_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.id == R2_BUCKET_DELETE_CAPABILITY_ID
+                && capability.title == "Delete Bucket"
+                && capability.description.as_deref() == Some("Deletes an existing R2 bucket.")
+                && capability.method == "DELETE"
+                && capability.path == R2_BUCKET_DETAIL_PATH
+                && capability.product == "R2 Bucket"
+                && capability.account_scope == "account"
+                && capability.permissions == ["Workers R2 Storage Write"]
+                && capability.request_schema.is_none()
+                && r2_bucket_selectors_supported(capability, true)
+                && r2_bucket_response_contract_supported(capability)
+                && capability.verification.strategy
+                    == "same_resource_returns_not_found_after_delete"
+                && capability.verification_contract_supported()
+        })
+}
+
+fn r2_bucket_response_fields_supported(document: &Value, method: &str) -> bool {
+    let pointer = format!(
+        "/paths/~1accounts~1{{account_id}}~1r2~1buckets{}/{}",
+        if method == "post" {
+            ""
+        } else {
+            "~1{bucket_name}"
+        },
+        method
+    );
+    document.pointer(&pointer).is_some_and(|operation| {
+        success_response_declares_result_fields(
+            document,
+            operation,
+            &[
+                "creation_date",
+                "jurisdiction",
+                "location",
+                "name",
+                "storage_class",
+            ],
+        )
+    })
+}
+
+fn annotate_r2_bucket_verification_projection(capability: &mut CapabilityV1) -> bool {
+    let Some(properties) = capability
+        .request_schema
+        .as_mut()
+        .and_then(|schema| schema.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let Some(location_hint) = properties
+        .get_mut("locationHint")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    location_hint.insert(
+        "x-cfctl-verification-observable".to_owned(),
+        Value::Bool(false),
+    );
+    let Some(storage_class) = properties
+        .get_mut("storageClass")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    storage_class.insert(
+        "x-cfctl-verification-response-field".to_owned(),
+        Value::String("storage_class".to_owned()),
+    );
+    true
+}
+
+fn finalize_r2_bucket_create_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let read_supported = r2_bucket_read_contract_supported(document, capabilities);
+    let delete_supported = r2_bucket_delete_contract_supported(capabilities);
+    let create_response_supported = r2_bucket_response_fields_supported(document, "post");
+    let Some(capability) = capabilities.get_mut(R2_BUCKET_CREATE_CAPABILITY_ID) else {
+        return;
+    };
+    if !r2_bucket_create_operation_supported(capability)
+        || !read_supported
+        || !delete_supported
+        || !create_response_supported
+    {
+        capability.created_resource = None;
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "R2 bucket create, exact readback, or empty-bucket compensation contract drifted"
+                .to_owned(),
+        );
+        return;
+    }
+
+    classify_r2_bucket_create(capability);
+    if !annotate_r2_bucket_verification_projection(capability) {
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason =
+            Some("R2 bucket request annotations could not be bound".to_owned());
+        return;
+    }
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: R2_BUCKET_DETAIL_PATH.to_owned(),
+        identity_selector: "bucket_name".to_owned(),
+        response_result_identity_pointer: "/name".to_owned(),
+        read_capability_id: R2_BUCKET_READ_CAPABILITY_ID.to_owned(),
+        delete_capability_id: R2_BUCKET_DELETE_CAPABILITY_ID.to_owned(),
+        verified_response_fields: vec!["name".to_owned(), "storageClass".to_owned()],
+    });
+    "created_resource_contains_planned_fields_by_returned_id"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    capability.rollback.warning = Some(
+        "compensation creates a separately reviewed and explicitly approved exact-bucket delete plan; it can succeed only while the newly created bucket remains empty"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
 }
 
 const D1_DATABASE_CREATE_CAPABILITY_ID: &str = "d1-create-database";

@@ -998,6 +998,28 @@ impl CapabilityV1 {
             .is_some_and(|schemas| property_schemas_are_verification_omitted(&schemas))
     }
 
+    /// Returns a catalog-pinned response field name when an operation's read
+    /// model spells a verifiable request field differently. Conflicting or
+    /// unsafe annotations fail closed by returning no mapping.
+    #[must_use]
+    pub fn request_object_field_verification_response_field(&self, field: &str) -> Option<String> {
+        let schemas = self
+            .request_schema
+            .as_ref()
+            .and_then(request_object_property_schemas)?
+            .remove(field)?;
+        let mut names = BTreeSet::new();
+        let mut remaining_steps = MAX_REQUEST_OBJECT_SCHEMA_STEPS;
+        for schema in schemas {
+            collect_verification_response_field_names(schema, 0, &mut remaining_steps, &mut names);
+        }
+        if names.len() == 1 {
+            names.into_iter().next()
+        } else {
+            None
+        }
+    }
+
     /// Returns whether this capability's pinned request contract requires one
     /// exact empty JSON object. Catalog classifiers may deliberately narrow an
     /// official open object to this safe subset, but only when `{}` is valid
@@ -1051,6 +1073,7 @@ impl CapabilityV1 {
                 )
                 && !target.read_capability_id.is_empty()
                 && !target.delete_capability_id.is_empty()
+                && self.same_path_readback_selectors_supported()
                 && !target.verified_response_fields.is_empty()
                 && self
                     .verified_response_fields_match_request_schema(&target.verified_response_fields)
@@ -1257,6 +1280,7 @@ fn access_service_token_refresh_selector_supported(
 
 fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
     (selector_can_be_response_id(selector) && pointer == "/id")
+        || (selector.ends_with("_name") && pointer == "/name")
         || (selector == "database_id" && pointer == "/uuid")
         || (!selector
             .chars()
@@ -1706,6 +1730,40 @@ fn property_schemas_are_verification_omitted(schemas: &[&Value]) -> bool {
     schemas
         .iter()
         .all(|schema| schema_declares_verification_omitted(schema, 0, &mut remaining_steps))
+}
+
+fn collect_verification_response_field_names(
+    schema: &Value,
+    depth: usize,
+    remaining_steps: &mut usize,
+    names: &mut BTreeSet<String>,
+) {
+    if depth > MAX_REQUEST_OBJECT_SCHEMA_DEPTH || *remaining_steps == 0 {
+        return;
+    }
+    *remaining_steps -= 1;
+    if let Some(name) = schema
+        .get("x-cfctl-verification-response-field")
+        .and_then(Value::as_str)
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+    {
+        names.insert(name.to_owned());
+    }
+    for composition in ["allOf", "oneOf", "anyOf"] {
+        for member in schema
+            .get(composition)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            collect_verification_response_field_names(member, depth + 1, remaining_steps, names);
+        }
+    }
 }
 
 fn schema_declares_verification_omitted(

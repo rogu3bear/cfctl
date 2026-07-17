@@ -1985,7 +1985,7 @@ async fn exact_resource_deletion_is_verified_by_same_path_not_found_readback() {
         json!({"account_id":"account-1", "widget_id":"widget-1"}),
         None,
     );
-    plan.capability.product = "R2 Bucket".to_owned();
+    "R2 Bucket".clone_into(&mut plan.capability.product);
     plan.capability.selectors.push(SelectorV1 {
         name: "cf-r2-jurisdiction".to_owned(),
         location: "header".to_owned(),
@@ -3188,6 +3188,147 @@ async fn created_resource_is_read_back_by_hash_bound_identity_and_planned_fields
     assert!(!request.contains("mutation_mode"));
     assert!(!request.contains("mutation-etag"));
     assert!(!request.contains("\"name\":\"created\""));
+}
+
+fn r2_bucket_create_plan() -> PlanV1 {
+    let mut plan = dns_record_plan(
+        "r2-create-bucket",
+        "POST",
+        "/accounts/{account_id}/r2/buckets",
+        "created_resource_contains_planned_fields_by_returned_id",
+        json!({"account_id":"account-1", "cf-r2-jurisdiction":"eu"}),
+        Some(json!({
+            "name":"smoke-bucket",
+            "locationHint":"weur",
+            "storageClass":"InfrequentAccess"
+        })),
+    );
+    "R2 Bucket".clone_into(&mut plan.capability.product);
+    plan.capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "cf-r2-jurisdiction".to_owned(),
+            location: "header".to_owned(),
+            required: false,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: json!({"enum":["default","eu","fedramp"],"type":"string"}),
+                query: None,
+            }),
+        },
+    ];
+    plan.capability.request_schema = Some(json!({
+        "type":"object",
+        "required":["name"],
+        "properties":{
+            "locationHint":{
+                "enum":["apac","eeur","enam","weur","wnam","oc"],
+                "type":"string",
+                "x-cfctl-verification-observable":false
+            },
+            "name":{"minLength":3,"maxLength":64,"type":"string"},
+            "storageClass":{
+                "enum":["Standard","InfrequentAccess"],
+                "type":"string",
+                "x-cfctl-verification-response-field":"storage_class"
+            }
+        },
+        "x-cfctl-body-required":true
+    }));
+    plan.capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/r2/buckets/{bucket_name}".to_owned(),
+        identity_selector: "bucket_name".to_owned(),
+        response_result_identity_pointer: "/name".to_owned(),
+        read_capability_id: "r2-get-bucket".to_owned(),
+        delete_capability_id: "r2-delete-bucket".to_owned(),
+        verified_response_fields: vec!["name".to_owned(), "storageClass".to_owned()],
+    });
+    assert!(plan.capability.verification_contract_supported());
+    plan
+}
+
+#[tokio::test]
+async fn r2_bucket_create_preserves_jurisdiction_and_verifies_storage_class_mapping() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"name":"smoke-bucket","jurisdiction":"eu","location":"weur","storage_class":"InfrequentAccess"},"errors":[]}"#,
+        r#"{"success":true,"result":{"name":"smoke-bucket","jurisdiction":"eu","location":"weur","storage_class":"Standard"},"errors":[]}"#,
+        r#"{"success":true,"result":{"name":"smoke-bucket","jurisdiction":"eu","location":"weur","storage_class":"Standard","forged_storage_class":"InfrequentAccess"},"errors":[]}"#,
+    ])
+    .await;
+    let plan = r2_bucket_create_plan();
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"name":"smoke-bucket"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verified = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("R2 bucket verification");
+    assert!(verified.passed, "{}", verified.basis);
+    let drifted = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("storage-class drift is a failed verification");
+    assert!(!drifted.passed, "{}", drifted.basis);
+    assert!(drifted.basis.contains("storageClass"));
+    let mut forged_mapping = plan.clone();
+    forged_mapping
+        .capability
+        .request_schema
+        .as_mut()
+        .expect("request schema")["properties"]["storageClass"]["x-cfctl-verification-response-field"] =
+        json!("forged_storage_class");
+    assert!(forged_mapping.capability.verification_contract_supported());
+    let forged = executor
+        .verify_plan(
+            &forged_mapping,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("forged response-field mapping fails closed");
+    assert!(!forged.passed, "{}", forged.basis);
+    assert!(forged.basis.contains("storageClass"));
+    let requests = server.await.expect("server joins");
+    assert!(requests.iter().all(|request| {
+        request.starts_with("GET /client/v4/accounts/account-1/r2/buckets/smoke-bucket ")
+            && request
+                .to_ascii_lowercase()
+                .contains("cf-r2-jurisdiction: eu")
+    }));
 }
 
 #[tokio::test]

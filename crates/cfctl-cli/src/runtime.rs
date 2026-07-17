@@ -3795,7 +3795,7 @@ fn persist_prepared_plan(
         "call",
         json!({
             "plan": plan,
-            "approval_command": format!("cfctl plans approve {} --yes", plan.operation_id),
+            "approval_command": approval_command_argv(&plan.capability, &plan.operation_id).join(" "),
             "run_command": format!("cfctl plans run {}", plan.operation_id),
             "message": if policy.disposition == PolicyDisposition::AutoExecute {
                 "Plan created and policy-authorized for automatic execution; run the exact operation ID."
@@ -9374,14 +9374,9 @@ fn guide_stage_commands(
         GuideStage::MapDependencies => {
             vec![argv(&["cfctl", "workspace", "graph", "--json"])]
         }
-        GuideStage::RequestApproval => conditional(Some(argv(&[
-            "cfctl",
-            "plans",
-            "approve",
-            "<operation-id>",
-            "--yes",
-            "--json",
-        ]))),
+        GuideStage::RequestApproval => {
+            conditional(Some(approval_command_argv(capability, "<operation-id>")))
+        }
         GuideStage::AcquireLocks => conditional(Some(argv(&[
             "cfctl",
             "plans",
@@ -9422,6 +9417,23 @@ fn guide_stage_commands(
         ]))),
         GuideStage::CloseWithEvidence => Vec::new(),
     }
+}
+
+fn approval_command_argv(capability: &CapabilityV1, operation_id: &str) -> Vec<String> {
+    let mut command = ["cfctl", "plans", "approve"].map(str::to_owned).to_vec();
+    command.extend([operation_id.to_owned(), "--yes".to_owned()]);
+    if capability.cost.incremental
+        && capability.cost.known
+        && let (Some(currency), Some(maximum)) =
+            (&capability.cost.currency, capability.cost.maximum)
+    {
+        command.extend([
+            "--max-cost".to_owned(),
+            format!("{}:{maximum}", currency.to_ascii_uppercase()),
+        ]);
+    }
+    command.push("--json".to_owned());
+    command
 }
 
 fn argv(parts: &[&str]) -> Vec<String> {
@@ -9846,13 +9858,14 @@ mod tests {
         apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
         bind_required_empty_compensation_body, boundary_response_artifact, call_command,
         capability_call_argv, compensation_request, execute_read, find_secret_value,
-        force_ipv4_from, guide_document, http_client, is_live_plan_precondition_hash,
-        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
-        non_readback_verification_basis, persist_prepared_plan, persist_secret_lifecycle,
-        persist_secret_lifecycle_and_reconcile_lineage, preflight_call_input,
-        preflight_standing_authority, preserve_previous_catalog, query_object_from_pairs,
-        read_import_secret, read_secret_file, reconcile_standing_lineage_from_plan, rectify_plan,
-        redact_secret_result, required_cloudflare_tunnel_configuration_state_precondition,
+        force_ipv4_from, guide_document, guide_stage_commands, http_client,
+        is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
+        key_policy_list, key_policy_revoke, non_readback_verification_basis, persist_prepared_plan,
+        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
+        preflight_call_input, preflight_standing_authority, preserve_previous_catalog,
+        query_object_from_pairs, read_import_secret, read_secret_file,
+        reconcile_standing_lineage_from_plan, rectify_plan, redact_secret_result,
+        required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -13594,6 +13607,57 @@ mod tests {
     }
 
     #[test]
+    fn guide_binds_the_declared_ceiling_for_a_known_paid_operation() {
+        let mut capability = CapabilityV1::new(
+            "r2-create-bucket",
+            "Create R2 bucket",
+            "POST",
+            "/accounts/{account_id}/r2/buckets",
+        );
+        capability.product = "R2".to_owned();
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.risk = RiskClass::ScopedWrite;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.permissions = vec!["Workers R2 Storage Write".to_owned()];
+        capability.cost.incremental = true;
+        capability.cost.currency = Some("USD".to_owned());
+        capability.cost.maximum = Some(0.000_009);
+        capability.cost.known = true;
+        capability.entitlement.available = Some(true);
+        capability.verification.strategy = "created_resource_detail_matches".to_owned();
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete newly created empty bucket".to_owned());
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "x-cfctl-body-required":true,
+            "properties":{"name":{"type":"string"}}
+        }));
+
+        assert_eq!(
+            guide_stage_commands(
+                cfctl_core::GuideStage::RequestApproval,
+                &capability,
+                cfctl_core::GuideContractStateV1::Available,
+                None,
+            ),
+            vec![
+                [
+                    "cfctl",
+                    "plans",
+                    "approve",
+                    "<operation-id>",
+                    "--yes",
+                    "--max-cost",
+                    "USD:0.000009",
+                    "--json"
+                ]
+                .map(str::to_owned)
+                .to_vec()
+            ]
+        );
+    }
+
+    #[test]
     fn guide_requests_optional_meaningful_bodies_without_prompting_for_empty_objects() {
         let mut queue_update = CapabilityV1::new(
             "queues-update-partial",
@@ -15734,6 +15798,91 @@ mod tests {
         }));
         bind_required_empty_compensation_body(&mut request, &delete_capability);
         assert_eq!(request.input.body, Some(json!({})));
+    }
+
+    #[test]
+    fn r2_bucket_creation_rectification_preserves_jurisdiction_for_exact_empty_bucket_delete() {
+        let mut capability = CapabilityV1::new(
+            "r2-create-bucket",
+            "Create Bucket",
+            "POST",
+            "/accounts/{account_id}/r2/buckets",
+        );
+        capability.product = "R2 Bucket".to_owned();
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.created_resource = Some(CreatedResourceContractV1 {
+            detail_path: "/accounts/{account_id}/r2/buckets/{bucket_name}".to_owned(),
+            identity_selector: "bucket_name".to_owned(),
+            response_result_identity_pointer: "/name".to_owned(),
+            read_capability_id: "r2-get-bucket".to_owned(),
+            delete_capability_id: "r2-delete-bucket".to_owned(),
+            verified_response_fields: vec!["name".to_owned()],
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "cf-r2-jurisdiction":"eu"
+            }),
+            query: json!({}),
+            body: Some(json!({
+                "name":"smoke-bucket",
+                "locationHint":"weur",
+                "storageClass":"InfrequentAccess"
+            })),
+            ..CallInput::default()
+        })
+        .expect("call input");
+        plan.refresh_hash().expect("bind call input");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({"name":"smoke-bucket"}),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let apply_evidence = EvidenceV1::new(
+            EvidenceClass::Apply,
+            "sha256:r2-create-apply-receipt",
+            "/tmp/r2-create-apply-receipt.json",
+        );
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            boundary_response_artifact(&plan, &response, Some(&apply_evidence)),
+        )
+        .expect("response receipt");
+        plan.status = PlanStatus::RectificationRequired;
+
+        let request = compensation_request(&plan)
+            .expect("request resolves")
+            .expect("compensation is supported");
+
+        assert_eq!(request.capability_id, "r2-delete-bucket");
+        assert_eq!(request.expected_method, "DELETE");
+        assert_eq!(
+            request.expected_path,
+            "/accounts/{account_id}/r2/buckets/{bucket_name}"
+        );
+        assert_eq!(request.input.selectors["account_id"], "account-a");
+        assert_eq!(request.input.selectors["bucket_name"], "smoke-bucket");
+        assert_eq!(request.input.selectors["cf-r2-jurisdiction"], "eu");
+        assert_eq!(request.input.query, json!({}));
+        assert!(request.input.body.is_none());
+        assert_eq!(request.requested_account.as_deref(), Some("account-a"));
     }
 
     #[test]

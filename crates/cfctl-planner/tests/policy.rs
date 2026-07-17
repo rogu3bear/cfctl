@@ -106,6 +106,20 @@ fn paid_operations_with_unknown_cost_are_blocked() {
 }
 
 #[test]
+fn known_incremental_cost_requires_a_ceiling_even_for_a_reversible_write() {
+    let engine = PolicyEngine;
+    let mut paid = reversible_write();
+    paid.cost.incremental = true;
+    paid.cost.known = true;
+    paid.cost.currency = Some("USD".to_owned());
+    paid.cost.maximum = Some(0.000_009);
+
+    let decision = engine.evaluate(&paid, &ImpactContext::default());
+    assert_eq!(decision.disposition, PolicyDisposition::ApprovalRequired);
+    assert!(decision.requires_cost_ceiling);
+}
+
+#[test]
 fn destructive_subscription_deletes_always_require_exact_approval() {
     let mut delete = CapabilityV1::new(
         "account-subscriptions-delete-subscription",

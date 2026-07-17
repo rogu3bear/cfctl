@@ -780,6 +780,35 @@ fn same_path_state_contract_can_omit_an_explicitly_unobservable_request_field() 
 }
 
 #[test]
+fn request_field_can_bind_an_explicit_response_field_name() {
+    let mut capability = CapabilityV1::new(
+        "r2-create-bucket",
+        "Create Bucket",
+        "POST",
+        "/accounts/{account_id}/r2/buckets",
+    );
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{
+            "name":{"type":"string"},
+            "storageClass":{
+                "type":"string",
+                "x-cfctl-verification-response-field":"storage_class"
+            }
+        }
+    }));
+
+    assert_eq!(
+        capability.request_object_field_verification_response_field("storageClass"),
+        Some("storage_class".to_owned())
+    );
+    assert_eq!(
+        capability.request_object_field_verification_response_field("name"),
+        None
+    );
+}
+
+#[test]
 fn updated_resource_contract_rejects_noncanonical_field_allowlists() {
     let mut capability = CapabilityV1::new(
         "widgets-update",
