@@ -980,6 +980,7 @@ fn apply_post_normalization_contracts(
     finalize_r2_bucket_create_contract(document, capabilities);
     finalize_d1_database_create_contract(document, capabilities);
     finalize_workers_kv_namespace_contracts(document, capabilities);
+    finalize_r2_temporary_credentials_contract(document, capabilities);
     finalize_oauth_client_secret_rotation_contract(document, capabilities);
     finalize_global_warp_override_rollback_contract(capabilities);
     finalize_d1_read_replication_rollback_contract(capabilities);
@@ -3549,6 +3550,8 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         if let Some(kind) = workers_kv_namespace_operation_kind(capability) {
             classify_workers_kv_namespace_operation(capability, kind);
         }
+    } else if r2_temporary_credentials_operation_supported(capability) {
+        classify_r2_temporary_credentials(capability);
     } else if let Some(kind) = oauth_client_secret_operation_kind(capability) {
         classify_oauth_client_secret_operation(capability, kind);
     } else if is_workers_ai_model_run(capability) {
@@ -4190,6 +4193,262 @@ fn finalize_workers_kv_namespace_contracts(
         }
         refresh_dynamic_mutation_contract(capability);
     }
+}
+
+const R2_TEMPORARY_CREDENTIALS_CAPABILITY_ID: &str = "r2-create-temp-access-credentials";
+const R2_TEMPORARY_CREDENTIALS_PATH: &str = "/accounts/{account_id}/r2/temp-access-credentials";
+const USER_TOKEN_VERIFY_CAPABILITY_ID: &str = "user-api-tokens-verify-token";
+const USER_TOKEN_VERIFY_PATH: &str = "/user/tokens/verify";
+const R2_TEMPORARY_CREDENTIAL_PERMISSIONS: [&str; 6] = [
+    "Workers R2 Storage Write",
+    "Workers R2 Storage Read",
+    "Workers R2 Storage Bucket Item Write",
+    "Workers R2 Storage Bucket Item Read",
+    "Workers R2 Data Catalog Write",
+    "Workers R2 Data Catalog Read",
+];
+
+fn r2_temporary_credentials_operation_supported(capability: &CapabilityV1) -> bool {
+    capability.id == R2_TEMPORARY_CREDENTIALS_CAPABILITY_ID
+        && capability.title == "Create Temporary Access Credentials"
+        && capability.description.as_deref()
+            == Some(
+                "Creates temporary access credentials on a bucket that can be optionally scoped to prefixes or objects.",
+            )
+        && capability.method == "POST"
+        && capability.path == R2_TEMPORARY_CREDENTIALS_PATH
+        && capability.product == "R2 Bucket"
+        && capability.account_scope == "account"
+        && capability.permissions.is_empty()
+        && capability.selectors.len() == 1
+        && capability.selectors.first().is_some_and(|selector| {
+            selector.name == "account_id"
+                && selector.location == "path"
+                && selector.required
+                && selector.value_type == "string"
+                && selector.description.as_deref() == Some("Account ID.")
+                && selector.contract.as_ref().is_some_and(|contract| {
+                    contract.schema == serde_json::json!({"maxLength":32,"type":"string"})
+                        && contract.query.is_none()
+                })
+        })
+        && capability.request_schema.as_ref()
+            == Some(&serde_json::json!({
+                "type":"object",
+                "required":["bucket","permission","ttlSeconds","parentAccessKeyId"],
+                "properties":{
+                    "bucket":{"type":"string"},
+                    "objects":{"type":"array","items":{"type":"string"}},
+                    "parentAccessKeyId":{"type":"string"},
+                    "permission":{"type":"string","enum":["admin-read-write","admin-read-only","object-read-write","object-read-only"]},
+                    "prefixes":{"type":"array","items":{"type":"string"}},
+                    "ttlSeconds":{"type":"number","maximum":604_800}
+                },
+                "x-cfctl-body-required":true
+            }))
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+                    && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            })
+}
+
+fn classify_r2_temporary_credentials(capability: &mut CapabilityV1) {
+    capability.permissions = R2_TEMPORARY_CREDENTIAL_PERMISSIONS
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    capability.risk = RiskClass::SecretSensitive;
+    capability.effect = EffectClass::IdentityOrOwnership;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "minting the temporary credential has no direct operation charge and cannot activate or purchase R2; storage and Class A/Class B operations performed with the credential remain usage-billed"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        KnowledgeReferenceV1 {
+            title: "R2 temporary credentials".to_owned(),
+            url: "https://developers.cloudflare.com/r2/api/s3/temporary-credentials/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+        KnowledgeReferenceV1 {
+            title: "R2 pricing".to_owned(),
+            url: "https://developers.cloudflare.com/r2/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        },
+    ];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans = BTreeMap::from([("r2_active_subscription".to_owned(), true)]);
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/r2/api/tokens/".to_owned());
+    capability.entitlement.blocker = None;
+    capability.entitlement.requires_live_resolution = false;
+    capability.verification.required = false;
+    "sink_write_and_source_response_status".clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "the temporary credential expires automatically at its hash-bound TTL and cannot be revoked individually; revoking the parent API token invalidates every derived credential and requires a separate destructive plan"
+            .to_owned(),
+    );
+}
+
+fn finalize_r2_temporary_credentials_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let verify_supported = capabilities
+        .get(USER_TOKEN_VERIFY_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.id == USER_TOKEN_VERIFY_CAPABILITY_ID
+                && capability.title == "Verify Token"
+                && capability.method == "GET"
+                && capability.path == USER_TOKEN_VERIFY_PATH
+                && capability.product == "User API Tokens"
+                && capability.account_scope == "user"
+                && capability.selectors.is_empty()
+                && capability.permissions.is_empty()
+                && capability.request_schema.is_none()
+                && capability
+                    .response_contract
+                    .as_ref()
+                    .is_some_and(|response| {
+                        response.success_statuses == ["200"]
+                            && response.success_media_types == ["application/json"]
+                            && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                    })
+        })
+        && document
+            .pointer("/paths/~1user~1tokens~1verify/get")
+            .is_some_and(|operation| {
+                success_response_declares_result_fields(document, operation, &["id", "status"])
+                    && success_response_declares_result_string_field(document, operation, "id")
+                    && success_response_declares_result_string_field(document, operation, "status")
+            });
+    let response_supported = document
+        .pointer("/paths/~1accounts~1{account_id}~1r2~1temp-access-credentials/post")
+        .is_some_and(|operation| {
+            ["accessKeyId", "secretAccessKey", "sessionToken"]
+                .iter()
+                .all(|field| {
+                    success_response_declares_result_string_field(document, operation, field)
+                })
+                && ["secretAccessKey", "sessionToken"].iter().all(|field| {
+                    success_response_result_field_boolean_annotation(
+                        document,
+                        operation,
+                        field,
+                        "x-sensitive",
+                    )
+                })
+        });
+
+    let Some(capability) = capabilities.get_mut(R2_TEMPORARY_CREDENTIALS_CAPABILITY_ID) else {
+        return;
+    };
+    let request_supported = capability.permissions
+        == R2_TEMPORARY_CREDENTIAL_PERMISSIONS
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+        && capability.request_schema.as_ref()
+            == Some(&serde_json::json!({
+                "type":"object",
+                "required":["bucket","permission","ttlSeconds","parentAccessKeyId"],
+                "properties":{
+                    "bucket":{"type":"string"},
+                    "objects":{"type":"array","items":{"type":"string"}},
+                    "parentAccessKeyId":{"type":"string"},
+                    "permission":{"type":"string","enum":["admin-read-write","admin-read-only","object-read-write","object-read-only"]},
+                    "prefixes":{"type":"array","items":{"type":"string"}},
+                    "ttlSeconds":{"type":"number","maximum":604_800}
+                },
+                "x-cfctl-body-required":true
+            }));
+    if !request_supported || !verify_supported || !response_supported {
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "R2 temporary-credential request, one-time response, or active parent-token verification contract drifted"
+                .to_owned(),
+        );
+        return;
+    }
+    if let Some(parent) = capability
+        .request_schema
+        .as_mut()
+        .and_then(|schema| schema.pointer_mut("/properties/parentAccessKeyId"))
+        .and_then(Value::as_object_mut)
+    {
+        parent.insert(
+            "x-cfctl-derived-from-active-profile".to_owned(),
+            Value::Bool(true),
+        );
+    }
+    refresh_dynamic_mutation_contract(capability);
+}
+
+fn success_response_result_field_boolean_annotation(
+    document: &Value,
+    operation: &Value,
+    field: &str,
+    annotation: &str,
+) -> bool {
+    operation
+        .get("responses")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(status, _)| status.starts_with('2'))
+        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
+        .any(|schema| {
+            schema_path_boolean_annotation(document, schema, &["result", field], annotation, 0)
+        })
+}
+
+fn schema_path_boolean_annotation(
+    document: &Value,
+    schema: &Value,
+    path: &[&str],
+    annotation: &str,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                schema_path_boolean_annotation(document, resolved, path, annotation, depth + 1)
+            });
+    }
+    if path.is_empty() {
+        return schema.get(annotation).and_then(Value::as_bool) == Some(true);
+    }
+    if let Some(property) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(path[0]))
+        && schema_path_boolean_annotation(document, property, &path[1..], annotation, depth + 1)
+    {
+        return true;
+    }
+    ["allOf", "oneOf", "anyOf"].iter().any(|composition| {
+        schema
+            .get(composition)
+            .and_then(Value::as_array)
+            .is_some_and(|members| {
+                members.iter().any(|member| {
+                    schema_path_boolean_annotation(document, member, path, annotation, depth + 1)
+                })
+            })
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
