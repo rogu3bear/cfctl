@@ -14,10 +14,13 @@ cfctl catalog coverage --json
 cfctl agents doctor --json
 ```
 
-`version`, `doctor`, and `agents doctor` distinguish the running build from
-the `cfctl` resolved on `PATH`. A missing or legacy PATH binary, a
-same-version/different-commit binary, or drifted managed guidance is unhealthy;
-repair installation before relying on the operator surface.
+`version` reports the invoked binary's build identity. `doctor` and `agents
+doctor` trust the `cfctl` resolved on `PATH` only when it is the same
+executable as the running build. They never launch a different PATH executable
+to inspect it; invoke that binary directly with `cfctl version --json` if its
+self-reported identity is needed. Missing or different PATH executables and
+drifted managed guidance are unhealthy; repair installation before relying on
+the operator surface.
 
 Coverage includes stable `mutation_contract_gap_counts`. The counts overlap by
 design because one capability can lack risk, cost, permissions, verification,

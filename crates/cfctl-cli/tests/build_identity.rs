@@ -2,6 +2,9 @@
 
 use std::{fs, path::Path, process::Command};
 
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt as _, symlink};
+
 use cfctl_cli::{
     build_identity::{PathBuildProbeV1, PathBuildStateV1, classify_path_build},
     build_support::{ResolvedIdentitySource, resolve_build_identity},
@@ -120,4 +123,77 @@ fn path_identity_classifies_match_stale_legacy_and_missing() {
     let missing = classify_path_build(&running, PathBuildProbeV1::Missing);
     assert!(!missing.healthy);
     assert_eq!(missing.state, PathBuildStateV1::Missing);
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_never_executes_a_different_path_cfctl() {
+    let root = tempfile::tempdir().expect("runtime root");
+    let fake_bin = root.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("create fake bin");
+    let fake_cfctl = fake_bin.join("cfctl");
+    fs::write(
+        &fake_cfctl,
+        "#!/bin/sh\n: > \"$CFCTL_TEST_MARKER\"\nexit 0\n",
+    )
+    .expect("write fake cfctl");
+    fs::set_permissions(&fake_cfctl, fs::Permissions::from_mode(0o700))
+        .expect("make fake cfctl executable");
+
+    for (command, arguments) in [
+        ("doctor", &["doctor", "--json"][..]),
+        ("agents-doctor", &["agents", "doctor", "--json"][..]),
+    ] {
+        let marker = root.path().join(format!("{command}.marker"));
+        let output = Command::new(env!("CARGO_BIN_EXE_cfctl"))
+            .env("CFCTL_HOME", root.path().join(command))
+            .env("CFCTL_TEST_MARKER", &marker)
+            .env("PATH", &fake_bin)
+            .args(arguments)
+            .output()
+            .expect("run doctor with shadowed PATH");
+        assert!(!output.status.success(), "{command} must fail closed");
+        assert!(
+            !marker.exists(),
+            "{command} executed an untrusted cfctl from PATH"
+        );
+
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stderr).expect("doctor JSON envelope");
+        assert_eq!(envelope["result"]["path_build"]["state"], "uninspectable");
+        assert_eq!(envelope["result"]["path_build"]["healthy"], false);
+        assert!(
+            envelope["result"]["path_build"]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("was not run")),
+            "doctor must explain the fail-closed trust boundary"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_accepts_a_path_symlink_to_the_running_cfctl() {
+    let root = tempfile::tempdir().expect("runtime root");
+    let linked_bin = root.path().join("linked-bin");
+    fs::create_dir(&linked_bin).expect("create linked bin");
+    symlink(env!("CARGO_BIN_EXE_cfctl"), linked_bin.join("cfctl")).expect("link running cfctl");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", root.path().join("current"))
+        .env("HOME", root.path().join("current"))
+        .env("PATH", &linked_bin)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run doctor through same-file PATH");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("doctor JSON envelope");
+
+    assert_eq!(envelope["result"]["path_build"]["state"], "current");
+    assert_eq!(envelope["result"]["path_build"]["healthy"], true);
 }

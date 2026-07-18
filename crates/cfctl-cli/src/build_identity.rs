@@ -1,12 +1,9 @@
 use std::{
     fs,
-    io::{self, Read as _},
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Output, Stdio},
-    time::{Duration, Instant},
 };
 
-use cfctl_core::{BuildIdentitySourceV1, BuildInfoV1, ResultEnvelopeV2};
+use cfctl_core::{BuildIdentitySourceV1, BuildInfoV1};
 use serde::{Deserialize, Serialize};
 
 #[must_use]
@@ -151,32 +148,11 @@ pub fn inspect_path_build(running: &BuildInfoV1) -> PathBuildIdentityV1 {
             detail: "PATH resolves to the running cfctl executable".to_owned(),
         };
     }
-    let structured = bounded_output(&path, &["version", "--json"]);
-    if let Ok(output) = structured
-        && output.status.success()
-        && let Ok(envelope) = serde_json::from_slice::<ResultEnvelopeV2>(&output.stdout)
-        && let Ok(build) = serde_json::from_value::<BuildInfoV1>(envelope.result)
-    {
-        return classify_path_build(running, PathBuildProbeV1::Build { path, build });
-    }
-    let legacy = bounded_output(&path, &["--version"]);
-    if let Ok(output) = legacy
-        && output.status.success()
-    {
-        let version_output = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        return classify_path_build(
-            running,
-            PathBuildProbeV1::Legacy {
-                path,
-                version_output,
-            },
-        );
-    }
     classify_path_build(
         running,
         PathBuildProbeV1::Uninspectable {
             path,
-            detail: "PATH cfctl could not return structured or legacy version information"
+            detail: "PATH cfctl is a different executable and was not run; invoke it directly to inspect its build identity"
                 .to_owned(),
         },
     )
@@ -187,39 +163,4 @@ fn same_file(path: &Path, current: Option<&Path>) -> bool {
         return false;
     };
     fs::canonicalize(path).ok() == fs::canonicalize(current).ok()
-}
-
-fn bounded_output(path: &Path, arguments: &[&str]) -> io::Result<Output> {
-    let mut child = ProcessCommand::new(path)
-        .args(arguments)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            if let Some(mut pipe) = child.stdout.take() {
-                pipe.read_to_end(&mut stdout)?;
-            }
-            if let Some(mut pipe) = child.stderr.take() {
-                pipe.read_to_end(&mut stderr)?;
-            }
-            return Ok(Output {
-                status,
-                stdout,
-                stderr,
-            });
-        }
-        if started.elapsed() >= Duration::from_secs(2) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "cfctl build identity probe exceeded two seconds",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
