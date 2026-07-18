@@ -11,14 +11,14 @@ name = "cfctl"
 path = "src/main.rs"
 
 [dependencies]
-cfctl-agent = { version = "2.0.0-alpha.1", path = "../cfctl-agent" }
-cfctl-auth = { version = "2.0.0-alpha.1", path = "../cfctl-auth" }
-cfctl-catalog = { version = "2.0.0-alpha.1", path = "../cfctl-catalog" }
-cfctl-cloudflare = { version = "2.0.0-alpha.1", path = "../cfctl-cloudflare" }
-cfctl-core = { version = "2.0.0-alpha.1", path = "../cfctl-core" }
-cfctl-planner = { version = "2.0.0-alpha.1", path = "../cfctl-planner" }
-cfctl-storage = { version = "2.0.0-alpha.1", path = "../cfctl-storage" }
-cfctl-workspace = { version = "2.0.0-alpha.1", path = "../cfctl-workspace" }
+cfctl-agent = { workspace = true }
+cfctl-auth = { workspace = true }
+cfctl-catalog = { workspace = true }
+cfctl-cloudflare = { workspace = true }
+cfctl-core = { workspace = true }
+cfctl-planner = { workspace = true }
+cfctl-storage = { workspace = true }
+cfctl-workspace = { workspace = true }
 chrono.workspace = true
 clap.workspace = true
 futures-util.workspace = true
@@ -34,9 +34,9 @@ walkdir.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-cfctl-auth = { version = "2.0.0-alpha.1", path = "../cfctl-auth" }
-cfctl-catalog = { version = "2.0.0-alpha.1", path = "../cfctl-catalog" }
-cfctl-core = { version = "2.0.0-alpha.1", path = "../cfctl-core" }
+cfctl-auth = { workspace = true }
+cfctl-catalog = { workspace = true }
+cfctl-core = { workspace = true }
 chrono.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
