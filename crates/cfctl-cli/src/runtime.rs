@@ -4430,15 +4430,7 @@ fn validate_api_token_creation_contract(
         .get("token_resource")
         .and_then(Value::as_str)
         .unwrap_or(&default_resource);
-    let resource_is_single_segment_under_scope = expected_resource
-        .strip_prefix(permission_scope)
-        .and_then(|rest| rest.strip_prefix('.'))
-        .is_some_and(|id| !id.is_empty() && !id.contains('.'));
-    if !resource_is_single_segment_under_scope {
-        return Err(CliError::Input(format!(
-            "token mint resource `{expected_resource}` is not a single resource under its declared permission scope `{permission_scope}`"
-        )));
-    }
+    validate_resource_is_single_concrete_id_under_scope(expected_resource, permission_scope)?;
     validate_permission_group_resource_scope(&normalized_groups, permission_scope)?;
     let expected_hash = inventory
         .get("selected_groups_hash")
@@ -4594,6 +4586,33 @@ fn validate_zone_id(zone_id: &str) -> Result<()> {
     } else {
         Err(CliError::Input(format!(
             "`--zone` expects a 32-character lowercase-hex Cloudflare zone id, got `{zone_id}`"
+        )))
+    }
+}
+
+/// Fail-closed: the token resource must be exactly `{scope}.{id}` where `id` is
+/// a single concrete account/zone identifier — ASCII alphanumeric and `-` only.
+/// This rejects a nested scope (`.zone.<id>` under the account scope, or the
+/// reverse) AND a wildcard id (`*`), so no claimed permission scope can be
+/// widened to a broader resource even if the hash-bound metadata were tampered.
+fn validate_resource_is_single_concrete_id_under_scope(
+    expected_resource: &str,
+    permission_scope: &str,
+) -> Result<()> {
+    let ok = expected_resource
+        .strip_prefix(permission_scope)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|id| {
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(CliError::Input(format!(
+            "token mint resource `{expected_resource}` is not a single concrete resource under its declared permission scope `{permission_scope}`"
         )))
     }
 }
@@ -14681,9 +14700,30 @@ mod tests {
             validate_api_token_creation_contract(&capability, &input, &adapter, "account-a")
                 .expect_err("account scope claim with a zone resource is rejected");
         assert!(
-            error.to_string().contains("not a single resource"),
+            error.to_string().contains("not a single concrete resource"),
             "{error}"
         );
+
+        // A wildcard id (`*`) is single-segment but not a concrete resource;
+        // the guard must reject it so a tampered metadata resource cannot widen
+        // to the whole account under an account scope claim.
+        let mut wildcard = adapter.clone();
+        wildcard["permission_inventory"]["token_resource"] = json!("com.cloudflare.api.account.*");
+        let wildcard_input = CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            query: json!({}),
+            body: Some(json!({
+                "name":"wildcard token",
+                "policies":[{
+                    "effect":"allow",
+                    "permission_groups":[{"id":"group-a"}],
+                    "resources":{"com.cloudflare.api.account.*":"*"}
+                }]
+            })),
+            ..CallInput::default()
+        };
+        validate_api_token_creation_contract(&capability, &wildcard_input, &wildcard, "account-a")
+            .expect_err("a wildcard resource id is rejected");
     }
 
     #[test]
