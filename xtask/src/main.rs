@@ -584,6 +584,12 @@ fn verify_tracked_cfctl_command_references() -> Result<(), TaskError> {
         if path.starts_with("compat/v1/") {
             continue;
         }
+        // SHA-pinned frozen migration fixtures are inert evidence like
+        // compat/v1: their bytes authorize legacy-skill deletion and must
+        // never change to satisfy the live command lint.
+        if path.starts_with("crates/cfctl-agent/tests/fixtures/") {
+            continue;
+        }
         let absolute_path = repository_root.join(&path);
         let bytes = fs::read(&absolute_path).map_err(|source| io_error(&absolute_path, source))?;
         let Ok(content) = std::str::from_utf8(&bytes) else {
