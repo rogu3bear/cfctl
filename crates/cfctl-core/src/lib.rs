@@ -806,6 +806,21 @@ impl CapabilityV1 {
                             | "zone-environment-purge-tagged"
                     )
             }
+            // The Email Routing enable/disable toggles have no same-path
+            // readback of a resource, so verification asserts the toggle's own
+            // `result.enabled` boolean in the settings object the action
+            // endpoint returns. The basis states plainly this proves the
+            // setting now reports the intended value, not that MX/DNS
+            // propagation or live mail delivery has converged. Bound to the
+            // exact enable/disable ids.
+            "email_routing_settings_response_reports_enabled_state" => {
+                self.method == "POST"
+                    && matches!(
+                        self.id.as_str(),
+                        "email-routing-settings-enable-email-routing"
+                            | "email-routing-settings-disable-email-routing"
+                    )
+            }
             _ => false,
         }
     }
