@@ -1517,6 +1517,64 @@ fn created_resource_contracts_require_exact_identity_pointers() {
 }
 
 #[test]
+fn pointer_names_secret_field_flags_only_secret_leaves() {
+    for secret in cfctl_core::SECRET_FIELD_NAMES {
+        assert!(
+            cfctl_core::pointer_names_secret_field(&format!("/{secret}")),
+            "expected /{secret} to be flagged"
+        );
+        // Nested leaf is flagged too — the guard reads the last segment.
+        assert!(cfctl_core::pointer_names_secret_field(&format!(
+            "/result/{secret}"
+        )));
+    }
+    for safe in ["/id", "/name", "/uuid", "/slug", "/account_id", ""] {
+        assert!(
+            !cfctl_core::pointer_names_secret_field(safe),
+            "expected {safe} not to be flagged"
+        );
+    }
+}
+
+#[test]
+fn identity_pointer_naming_a_secret_field_is_never_supported() {
+    // A well-formed created-resource contract whose identity selector/pointer
+    // both name a secret field (`value`) would satisfy the loose selector==leaf
+    // branch, but the secret-field guard must fail it closed so no verifier
+    // dereferences the secret as an identity.
+    let mut capability = CapabilityV1::new(
+        "tokens-create",
+        "Create token",
+        "POST",
+        "/accounts/{account_id}/tokens",
+    );
+    capability.verification.strategy =
+        "created_resource_contains_planned_fields_by_returned_id".to_owned();
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{"name":{"type":"string"}}
+    }));
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/tokens/{value}".to_owned(),
+        identity_selector: "value".to_owned(),
+        response_result_identity_pointer: "/value".to_owned(),
+        read_capability_id: "tokens-get".to_owned(),
+        delete_capability_id: "tokens-delete".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+    });
+    assert!(!capability.verification_contract_supported());
+
+    // Swapping the identity back to a non-secret field restores support,
+    // proving the guard is what rejected it (not some unrelated mismatch).
+    if let Some(contract) = capability.created_resource.as_mut() {
+        "/id".clone_into(&mut contract.response_result_identity_pointer);
+        "id".clone_into(&mut contract.identity_selector);
+        "/accounts/{account_id}/tokens/{id}".clone_into(&mut contract.detail_path);
+    }
+    assert!(capability.verification_contract_supported());
+}
+
+#[test]
 fn d1_create_rollback_is_bound_to_returned_uuid_and_empty_database_compensation() {
     let mut capability = CapabilityV1::new(
         "d1-create-database",

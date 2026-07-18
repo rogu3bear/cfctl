@@ -2682,13 +2682,52 @@ fn selector_can_be_response_id(selector: &str) -> bool {
         || selector.ends_with("_identifier")
 }
 
+// Kept in sync with `cfctl_core::response_identity_pointer_supported` — the
+// classifier gate (core) and the executor verify gate (here) must accept the
+// same identity pointers, or a capability the catalog marks `dynamic_api` fails
+// closed at verify time. The `database_id`->`/uuid` branch mirrors core so D1
+// database creates (identity `database_id`, pointer `/uuid`) verify instead of
+// falsely landing in RectificationRequired after a successful create.
 fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
+    // Fail closed: an identity pointer that names a secret field is never
+    // supported (mirrors the core gate), so no verifier dereferences secret
+    // material as a resource identity.
+    if cfctl_core::pointer_names_secret_field(pointer) {
+        return false;
+    }
     (selector_can_be_response_id(selector) && pointer == "/id")
         || (selector.ends_with("_name") && pointer == "/name")
+        || (selector == "database_id" && pointer == "/uuid")
         || (!selector
             .chars()
             .any(|character| matches!(character, '/' | '~'))
             && pointer.strip_prefix('/') == Some(selector))
+}
+
+#[cfg(test)]
+mod identity_pointer_parity_tests {
+    use super::response_identity_pointer_supported;
+
+    #[test]
+    fn executor_gate_matches_core_including_database_id_uuid() {
+        // Regression: the D1 create contract (identity `database_id`, pointer
+        // `/uuid`) is classified `dynamic_api` by the core gate, so the executor
+        // gate must accept it too — otherwise a successful create verifies
+        // false and lands in RectificationRequired.
+        assert!(response_identity_pointer_supported("database_id", "/uuid"));
+        // Standard identities still hold.
+        assert!(response_identity_pointer_supported("id", "/id"));
+        assert!(response_identity_pointer_supported("widget_name", "/name"));
+        assert!(response_identity_pointer_supported("slug", "/slug"));
+        // The secret-field guard still fails closed for every shape.
+        assert!(!response_identity_pointer_supported("value", "/value"));
+        assert!(!response_identity_pointer_supported(
+            "secretAccessKey",
+            "/secretAccessKey"
+        ));
+        // A pointer that does not match its selector is rejected.
+        assert!(!response_identity_pointer_supported("database_id", "/name"));
+    }
 }
 
 fn validate_created_collection_resource_target(
