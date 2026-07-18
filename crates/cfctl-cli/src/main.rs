@@ -40,15 +40,20 @@ async fn main() -> ExitCode {
             let success = envelope.ok;
             (envelope, success)
         }
-        Err(error) => (
-            ResultEnvelopeV2::failure(
-                "cfctl",
-                "CFCTL_ERROR",
-                &error.to_string(),
-                Some("Run `cfctl doctor --json` and inspect the exact blocker."),
-            ),
-            false,
-        ),
+        Err(error) => {
+            let next_step = error.next_step().unwrap_or_else(|| {
+                "Run `cfctl doctor --json` and inspect the exact blocker.".to_owned()
+            });
+            (
+                ResultEnvelopeV2::failure(
+                    "cfctl",
+                    error.code(),
+                    &error.to_string(),
+                    Some(next_step.as_str()),
+                ),
+                false,
+            )
+        }
     };
     match runtime::render(&envelope, json_requested) {
         Ok(output) => {
