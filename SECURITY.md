@@ -7,7 +7,7 @@ security-sensitive boundaries.
 
 ## Reporting a vulnerability
 
-If you find a security issue — a credential leak, a way to bypass the preview/ack gate, a path traversal in `--value-out`, an injection in any wrapped command — **do not open a public issue**.
+If you find a security issue — a credential leak, a way to bypass plan approval (`cfctl plans approve <operation-id> --yes` followed by `cfctl plans run`), a path traversal in `--value-out`, an injection in any wrapped command — **do not open a public issue**.
 
 Instead, report it privately:
 

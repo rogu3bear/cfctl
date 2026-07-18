@@ -3,6 +3,15 @@
 The policy engine, never an agent, classifies a plan as `auto_execute`,
 `approval_required`, or `blocked`.
 
+> Authority: this file is the runtime policy — it is authoritative for plan
+> classification (`auto_execute` / `approval_required` / `blocked`), approval
+> and standing-authority mechanics, and the adapter boundary. For the
+> credential-storage, secret-sink, catalog and journal hashing, redaction, and
+> per-capability safety invariants it references, `docs/v2-security.md` is
+> authoritative. The two documents overlap by design and must agree — defer to
+> the security contract on a secret, journal, or redaction detail, and to this
+> file on a classification or approval detail.
+
 ## Automatic execution
 
 Automatic execution is limited to operations with all of these properties:
@@ -126,8 +135,12 @@ token-lifecycle capabilities named in the approved grant.
 
 ## Secrets
 
-Credential material lives only in Keychain on macOS or Secret Service on
-Linux. Secret request fields enter through stdin and become opaque references.
+Credential material is written to the platform keyring first — Keychain on
+macOS or Secret Service on Linux — and fails down to a governed mode-0600 file
+store under cfctl's data directory (`auth/secrets`, a mode-0700 directory) when
+the keyring is unavailable; reads reject any group- or world-readable secret
+file, and `cfctl doctor` names the active backend. Secret request fields enter
+through stdin and become opaque references.
 Secret results require `--value-out`, which must not exist and is created mode
 0600. Arguments, stdout, plans, logs, evidence, and delegated subprocess
 receipts are redacted. When an API cannot read a newly issued credential back,

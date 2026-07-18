@@ -22,18 +22,32 @@ cfctl doctor --json
 cfctl agents doctor --json
 ```
 
-Or install directly from the checkout:
+Or install directly from the checkout (works today):
 
 ```bash
 cargo install --path crates/cfctl-cli --locked
 ```
 
-The Linux release installer requires Cosign, verifies the release's signed
+The published installers below are not live yet: `cfctl.io` is not serving them
+and no release tag has been published. Both are pending operator actions (see
+the README's external activation boundary), so the commands in this subsection
+will not resolve until those steps happen — use the source-install paths above
+in the meantime.
+
+On macOS, `cargo xtask release` assembles a Homebrew formula (`cfctl.rb`) that
+installs the signed `cfctl-aarch64-apple-darwin` or `cfctl-x86_64-apple-darwin`
+binary from the matching GitHub release tag. Once that release is published:
+
+```bash
+brew install --formula ./cfctl.rb
+```
+
+On Linux, the release installer requires Cosign, verifies the release's signed
 checksum manifest against its exact Fulcio identity and issuer, and requires an
 existing release tag:
 
 ```bash
-curl -fsSL https://cfctl.io/install.sh | CFCTL_VERSION=v2.0.0 sh
+curl -fsSL https://cfctl.io/install.sh | CFCTL_VERSION=v2.0.0-alpha.1 sh
 ```
 
 ## Discover Cloudflare
@@ -65,7 +79,7 @@ For disposable tests, isolate all non-credential state explicitly:
 CFCTL_HOME=/tmp/cfctl-proof cfctl doctor --json
 ```
 
-`CFCTL_HOME` must be absolute. Credentials remain in Keychain on macOS or Secret Service on Linux.
+`CFCTL_HOME` must be absolute. Credentials go to the platform keyring first — Keychain on macOS or Secret Service on Linux — and fail down to a governed mode-0600 file store under cfctl's data directory (`auth/secrets`) when that keyring is unavailable; `cfctl doctor` reports the active backend.
 
 ## Authenticate
 

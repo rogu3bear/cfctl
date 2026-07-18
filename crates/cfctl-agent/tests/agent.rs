@@ -33,7 +33,12 @@ fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() 
     let root = tempfile::tempdir().expect("agent home");
     let receipt = install_agent_skill(root.path(), AgentKind::Codex, InstallMode::Install)
         .expect("install skill");
+    assert_eq!(
+        receipt.path,
+        root.path().join(".agents/skills/cfctl/SKILL.md")
+    );
     let content = std::fs::read_to_string(&receipt.path).expect("installed skill");
+    assert!(content.starts_with("---\nname: cfctl\n"));
     assert!(content.contains("cfctl version --json"));
     assert!(content.contains("cfctl resolve \"<intent>\" --json"));
     assert!(content.contains("cfctl catalog search"));
@@ -59,6 +64,37 @@ fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() 
 }
 
 #[test]
+fn sync_migrates_only_the_exact_legacy_codex_skill() {
+    let root = tempfile::tempdir().expect("agent home");
+    let legacy = root.path().join(".agents/skills/cloudflare/SKILL.md");
+    std::fs::create_dir_all(legacy.parent().expect("legacy parent"))
+        .expect("create legacy directory");
+    std::fs::write(&legacy, legacy_managed_skill()).expect("legacy skill");
+
+    let receipt = install_agent_skill(root.path(), AgentKind::Codex, InstallMode::Sync)
+        .expect("sync migrates exact legacy skill");
+    assert!(receipt.changed);
+    assert!(!legacy.exists());
+    assert!(!legacy.parent().expect("legacy directory").exists());
+    assert!(receipt.path.is_file());
+
+    std::fs::create_dir_all(legacy.parent().expect("legacy parent"))
+        .expect("recreate legacy directory");
+    std::fs::write(&legacy, "operator-owned drift").expect("legacy drift");
+    let error = install_agent_skill(root.path(), AgentKind::Codex, InstallMode::Sync)
+        .expect_err("sync must preserve unknown legacy content");
+    assert!(error.to_string().contains("local drift"));
+    assert_eq!(
+        std::fs::read_to_string(&legacy).expect("preserved legacy drift"),
+        "operator-owned drift"
+    );
+}
+
+fn legacy_managed_skill() -> &'static str {
+    include_str!("fixtures/cfctl-managed-skill-v2.md")
+}
+
+#[test]
 fn cursor_guidance_preserves_plan_approval_and_explains_standing_policy_ceremony() {
     let root = tempfile::tempdir().expect("agent home");
     let receipt = install_agent_skill(root.path(), AgentKind::Cursor, InstallMode::Install)
@@ -76,6 +112,41 @@ fn cursor_guidance_preserves_plan_approval_and_explains_standing_policy_ceremony
     assert!(content.contains("fixture directories are opt-in roots"));
     assert!(content.contains("CFCTL_CAPABILITY_BLOCKED"));
     assert!(content.contains("cfctl guide <capability-id> --json"));
+    // Drift rectification: the Cursor rule must carry the paid-plan cost gate
+    // and present `resolve` as the primary intent translator, matching the
+    // operator skill rather than flattening it into an undifferentiated list.
+    assert!(content.contains("`--max-cost CURRENCY:AMOUNT`"));
+    assert!(content.contains("cfctl resolve \"<intent>\" --json"));
+}
+
+/// The shared doctrine fragments are single-sourced, so every load-bearing
+/// line must appear verbatim in both the operator skill and the Cursor rule.
+#[test]
+fn shared_doctrine_is_identical_across_the_skill_and_cursor_rule() {
+    let root = tempfile::tempdir().expect("agent home");
+    let skill = install_and_read(root.path(), AgentKind::Codex);
+    let cursor = install_and_read(root.path(), AgentKind::Cursor);
+    for fragment in [
+        "cfctl resolve \"<intent>\" --json",
+        "Paid plans also require the reviewed `--max-cost CURRENCY:AMOUNT`.",
+        "`cfctl plans approve <operation-id> --yes`",
+        "fixture directories are opt-in roots",
+        "cfctl keys permissions --user --account <account-id> --json",
+        "cfctl guide --topic standing-authority --json",
+        "CFCTL_CAPABILITY_BLOCKED",
+    ] {
+        assert!(
+            skill.contains(fragment),
+            "operator skill missing: {fragment}"
+        );
+        assert!(cursor.contains(fragment), "cursor rule missing: {fragment}");
+    }
+}
+
+fn install_and_read(home: &std::path::Path, agent: AgentKind) -> String {
+    let receipt =
+        install_agent_skill(home, agent, InstallMode::Install).expect("install managed guidance");
+    std::fs::read_to_string(&receipt.path).expect("installed managed guidance")
 }
 
 #[test]

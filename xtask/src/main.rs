@@ -12,8 +12,8 @@ use std::{
 };
 
 use cfctl_core::{
-    GuideTopicV1, PUBLIC_V2_SUBCOMMANDS, RETIRED_V1_PUBLIC_VERBS, RETIRED_V1_SURFACES,
-    render_guide_topic_markdown,
+    GuideTopicV1, PUBLIC_V2_COMMAND_TREE, PUBLIC_V2_SUBCOMMANDS, RETIRED_V1_PUBLIC_VERBS,
+    RETIRED_V1_SURFACES, render_guide_topic_markdown,
 };
 use clap::{Parser, Subcommand};
 use sha2::{Digest, Sha256};
@@ -589,10 +589,22 @@ fn verify_tracked_cfctl_command_references() -> Result<(), TaskError> {
         let Ok(content) = std::str::from_utf8(&bytes) else {
             continue;
         };
-        for verb in extract_cfctl_command_references(&path, content) {
+        for reference in extract_cfctl_command_refs(&path, content) {
+            let verb = &reference.verb;
             if verb != "help" && !PUBLIC_V2_SUBCOMMANDS.contains(&verb.as_str()) {
                 return Err(TaskError::InvalidSourceContract(format!(
                     "{path} teaches non-v2 command `cfctl {verb}` outside compat/v1"
+                )));
+            }
+            // Validate one level deeper against the single-sourced command tree.
+            if let Some(sub) = reference.sub.as_deref()
+                && let Some(node) = PUBLIC_V2_COMMAND_TREE
+                    .iter()
+                    .find(|node| node.name == verb.as_str())
+                && !node.subcommands.iter().any(|child| child.name == sub)
+            {
+                return Err(TaskError::InvalidSourceContract(format!(
+                    "{path} teaches unknown subcommand `cfctl {verb} {sub}` outside compat/v1"
                 )));
             }
         }
@@ -600,19 +612,35 @@ fn verify_tracked_cfctl_command_references() -> Result<(), TaskError> {
     Ok(())
 }
 
+/// One extracted `cfctl` command reference: the top-level verb and, when the
+/// reference is a real invocation (not loose prose), the second token when it is
+/// plausibly a subcommand.
+struct CfctlReference {
+    verb: String,
+    sub: Option<String>,
+}
+
+#[cfg(test)]
 fn extract_cfctl_command_references(path: &str, content: &str) -> Vec<String> {
-    let mut verbs = Vec::new();
+    extract_cfctl_command_refs(path, content)
+        .into_iter()
+        .map(|reference| reference.verb)
+        .collect()
+}
+
+fn extract_cfctl_command_refs(path: &str, content: &str) -> Vec<CfctlReference> {
+    let mut references = Vec::new();
     if path_has_extension(path, "json") {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
-            collect_json_command_references(&value, false, &mut verbs);
+            collect_json_command_references(&value, false, &mut references);
         }
-        return verbs;
+        return references;
     }
 
     let markdown = path_has_extension(path, "md");
     let shell = path_has_extension(path, "sh") || content.starts_with("#!");
     if !markdown && !shell {
-        return verbs;
+        return references;
     }
 
     let mut in_fence = false;
@@ -623,24 +651,24 @@ fn extract_cfctl_command_references(path: &str, content: &str) -> Vec<String> {
             continue;
         }
         if (shell || in_fence)
-            && let Some(verb) = cfctl_command_verb(trimmed)
+            && let Some(reference) = cfctl_command_ref(trimmed)
         {
-            verbs.push(verb);
+            references.push(reference);
         }
         if markdown && !in_fence {
-            if let Some(verb) = cfctl_command_verb_in_prose(trimmed) {
-                verbs.push(verb);
+            if let Some(reference) = cfctl_command_ref_in_prose(trimmed) {
+                references.push(reference);
             }
             for (index, inline) in line.split('`').enumerate() {
                 if index % 2 == 1
-                    && let Some(verb) = cfctl_command_verb(inline)
+                    && let Some(reference) = cfctl_command_ref(inline)
                 {
-                    verbs.push(verb);
+                    references.push(reference);
                 }
             }
         }
     }
-    verbs
+    references
 }
 
 fn path_has_extension(path: &str, expected: &str) -> bool {
@@ -652,37 +680,37 @@ fn path_has_extension(path: &str, expected: &str) -> bool {
 fn collect_json_command_references(
     value: &serde_json::Value,
     command_context: bool,
-    verbs: &mut Vec<String>,
+    references: &mut Vec<CfctlReference>,
 ) {
     match value {
         serde_json::Value::String(value) => {
-            let verb = if command_context {
-                cfctl_command_verb(value)
+            let reference = if command_context {
+                cfctl_command_ref(value)
             } else {
-                cfctl_command_verb_in_prose(value)
+                cfctl_command_ref_in_prose(value)
             };
-            if let Some(verb) = verb {
-                verbs.push(verb);
+            if let Some(reference) = reference {
+                references.push(reference);
             }
         }
         serde_json::Value::Array(values) => {
             for value in values {
-                collect_json_command_references(value, command_context, verbs);
+                collect_json_command_references(value, command_context, references);
             }
         }
         serde_json::Value::Object(values) => {
             for (key, value) in values {
                 if is_json_argv_reference_key(key)
                     && let Some(command) = json_argv_command(value)
-                    && let Some(verb) = cfctl_command_verb(&command)
+                    && let Some(reference) = cfctl_command_ref(&command)
                 {
-                    verbs.push(verb);
+                    references.push(reference);
                     continue;
                 }
                 collect_json_command_references(
                     value,
                     command_context || is_json_command_reference_key(key),
-                    verbs,
+                    references,
                 );
             }
         }
@@ -718,15 +746,15 @@ fn is_json_command_reference_key(key: &str) -> bool {
     .any(|fragment| key.contains(fragment))
 }
 
-fn cfctl_command_verb(command: &str) -> Option<String> {
-    cfctl_command_verb_with_context(command, true)
+fn cfctl_command_ref(command: &str) -> Option<CfctlReference> {
+    cfctl_command_ref_with_context(command, true)
 }
 
-fn cfctl_command_verb_in_prose(command: &str) -> Option<String> {
-    cfctl_command_verb_with_context(command, false)
+fn cfctl_command_ref_in_prose(command: &str) -> Option<CfctlReference> {
+    cfctl_command_ref_with_context(command, false)
 }
 
-fn cfctl_command_verb_with_context(command: &str, command_context: bool) -> Option<String> {
+fn cfctl_command_ref_with_context(command: &str, command_context: bool) -> Option<CfctlReference> {
     let command = command
         .trim()
         .trim_start_matches(['$', '>', '-'])
@@ -746,6 +774,15 @@ fn cfctl_command_verb_with_context(command: &str, command_context: bool) -> Opti
     let verb = verb
         .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '-')
         .to_owned();
+    // The token after the verb is only treated as a subcommand inside a real
+    // command context (a fence, a shell line, an inline command span, or a
+    // structured argv), and only when it is plausibly a subcommand token rather
+    // than a flag, placeholder, quoted argument, or prose word.
+    let sub = if command_context {
+        arguments.next().and_then(plausible_subcommand_token)
+    } else {
+        None
+    };
 
     let mut explicit_command_context = false;
     if command_index > 0 {
@@ -779,7 +816,24 @@ fn cfctl_command_verb_with_context(command: &str, command_context: bool) -> Opti
     {
         return None;
     }
-    Some(verb)
+    Some(CfctlReference { verb, sub })
+}
+
+/// Returns the token when it is plausibly a subcommand: a lowercase word of
+/// ASCII letters, digits, and hyphens. Flags (`--json`), placeholders (`<id>`),
+/// quoted arguments, dotted state paths, and prose punctuation are rejected so
+/// the second-token check never false-positives on non-subcommand tokens.
+fn plausible_subcommand_token(token: &str) -> Option<String> {
+    let first = token.chars().next()?;
+    if !first.is_ascii_lowercase() {
+        return None;
+    }
+    token
+        .chars()
+        .all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+        .then(|| token.to_owned())
 }
 
 fn verify_active_guidance_has_no_v1_commands() -> Result<(), TaskError> {
@@ -2227,12 +2281,13 @@ mod tests {
 
     use super::{
         expected_signed_release_file_names, extract_cfctl_command_references,
-        is_declared_quarantine_path, is_forbidden_quarantine_consumer, parse_remote_tag_commit,
-        release_build_driver, release_build_subcommand, release_tag_is_exact_version,
-        render_linux_installer_text, security_proof_commands, validate_codesign_details,
-        validate_notary_receipt_value, validate_signed_release_file_set, validated_release_targets,
-        verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
-        verify_generated_guidance_section_text, verify_v1_cutover_contract,
+        extract_cfctl_command_refs, is_declared_quarantine_path, is_forbidden_quarantine_consumer,
+        parse_remote_tag_commit, release_build_driver, release_build_subcommand,
+        release_tag_is_exact_version, render_linux_installer_text, security_proof_commands,
+        validate_codesign_details, validate_notary_receipt_value, validate_signed_release_file_set,
+        validated_release_targets, verify_active_guidance_has_no_v1_commands,
+        verify_documented_contracts, verify_generated_guidance_section_text,
+        verify_tracked_cfctl_command_references, verify_v1_cutover_contract,
     };
 
     #[test]
@@ -2261,6 +2316,48 @@ mod tests {
             extract_cfctl_command_references("example.json", structured_argv),
             vec!["diff".to_owned()]
         );
+    }
+
+    #[test]
+    fn subcommand_references_are_extracted_only_in_command_context() {
+        let markdown = concat!(
+            "```bash\n",
+            "cfctl catalog show dns-records-list\n",
+            "cfctl keys policy approve authority-1\n",
+            "cfctl call dns-records-list\n",
+            "cfctl catalog search \"dns\"\n",
+            "cfctl resolve \"list dns records\"\n",
+            "cfctl migrate v1\n",
+            "```\n",
+            "Prose mentioning cfctl workspace discovery must not be checked.\n",
+        );
+        let pairs = extract_cfctl_command_refs("docs/example.md", markdown)
+            .into_iter()
+            .map(|reference| (reference.verb, reference.sub))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            vec![
+                ("catalog".to_owned(), Some("show".to_owned())),
+                ("keys".to_owned(), Some("policy".to_owned())),
+                // `call` is not a command group, but the second token is still
+                // extracted; the verifier simply never checks it against a tree.
+                ("call".to_owned(), Some("dns-records-list".to_owned())),
+                // The subcommand is the second token; a trailing quoted argument
+                // does not disturb it.
+                ("catalog".to_owned(), Some("search".to_owned())),
+                // A quoted argument in the subcommand position is not plausible.
+                ("resolve".to_owned(), None),
+                ("migrate".to_owned(), Some("v1".to_owned())),
+            ],
+            "prose `workspace discovery` must not appear as a checked subcommand"
+        );
+    }
+
+    #[test]
+    fn tracked_subcommand_references_bind_to_the_command_tree() {
+        let result = verify_tracked_cfctl_command_references();
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]

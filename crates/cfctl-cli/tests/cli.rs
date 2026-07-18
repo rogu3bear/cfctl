@@ -8,26 +8,16 @@ use clap::{CommandFactory as _, Parser};
 
 #[test]
 fn every_public_command_group_is_parseable() {
-    for command in [
-        "auth",
-        "keys",
-        "catalog",
-        "call",
-        "guide",
-        "plans",
-        "workspace",
-        "agents",
-        "docs",
-        "doctor",
-        "update",
-        "version",
-        "migrate",
-    ] {
-        let arguments: Vec<&str> = match command {
+    // Iterate the single source of truth so a newly added top-level verb cannot
+    // slip in without a parse example here (this is what once let `resolve`
+    // escape coverage).
+    for command in PUBLIC_V2_SUBCOMMANDS {
+        let arguments: Vec<&str> = match *command {
             "auth" => vec!["cfctl", "auth", "status"],
             "keys" => vec!["cfctl", "keys", "permissions", "--account", "account-a"],
             "catalog" => vec!["cfctl", "catalog", "coverage"],
             "call" => vec!["cfctl", "call", "dns-records-list"],
+            "resolve" => vec!["cfctl", "resolve", "list dns records"],
             "guide" => vec!["cfctl", "guide", "dns-records-delete"],
             "plans" => vec!["cfctl", "plans", "status", "operation-id"],
             "workspace" => vec!["cfctl", "workspace", "graph"],
@@ -37,12 +27,12 @@ fn every_public_command_group_is_parseable() {
             "update" => vec!["cfctl", "update", "--check"],
             "version" => vec!["cfctl", "version"],
             "migrate" => vec!["cfctl", "migrate", "v1"],
-            _ => unreachable!("fixed command set"),
+            other => panic!("PUBLIC_V2_SUBCOMMANDS verb `{other}` has no parse example"),
         };
         let parsed = Cli::try_parse_from(arguments).expect("public command parses");
         assert!(
-            matches!(parsed.command, Some(Command::Auth(_))) == (command == "auth")
-                || command != "auth"
+            matches!(parsed.command, Some(Command::Auth(_))) == (*command == "auth")
+                || *command != "auth"
         );
     }
 }
@@ -193,6 +183,74 @@ fn public_command_contract_exactly_matches_the_clap_tree() {
         .collect::<Vec<_>>();
     actual.sort_unstable();
     assert_eq!(actual, PUBLIC_V2_SUBCOMMANDS);
+}
+
+#[test]
+fn public_subcommand_tree_exactly_matches_the_clap_tree() {
+    use cfctl_core::{CommandNodeV1, PUBLIC_V2_COMMAND_TREE};
+
+    fn child_names(command: &clap::Command) -> Vec<String> {
+        let mut names = command
+            .get_subcommands()
+            .map(|sub| sub.get_name().to_owned())
+            .filter(|name| name != "help")
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    fn declared_names(node: &CommandNodeV1) -> Vec<String> {
+        let mut names = node
+            .subcommands
+            .iter()
+            .map(|child| child.name.to_owned())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    fn assert_node_matches(parent: &clap::Command, node: &CommandNodeV1) {
+        let clap_child = parent
+            .find_subcommand(node.name)
+            .unwrap_or_else(|| panic!("clap tree is missing subcommand `{}`", node.name));
+        assert_eq!(
+            child_names(clap_child),
+            declared_names(node),
+            "subcommands of `{}` drifted from PUBLIC_V2_COMMAND_TREE",
+            node.name
+        );
+        for child in node.subcommands {
+            if !child.subcommands.is_empty() {
+                assert_node_matches(clap_child, child);
+            }
+        }
+    }
+
+    let root = Cli::command();
+    for node in PUBLIC_V2_COMMAND_TREE {
+        assert_node_matches(&root, node);
+    }
+
+    // Every clap verb that itself takes subcommands must be declared in the
+    // tree, so a newly added command group cannot silently escape the contract.
+    let mut clap_groups = root
+        .get_subcommands()
+        .filter(|sub| {
+            sub.get_subcommands()
+                .any(|nested| nested.get_name() != "help")
+        })
+        .map(|sub| sub.get_name().to_owned())
+        .collect::<Vec<_>>();
+    clap_groups.sort_unstable();
+    let mut tree_groups = PUBLIC_V2_COMMAND_TREE
+        .iter()
+        .map(|node| node.name.to_owned())
+        .collect::<Vec<_>>();
+    tree_groups.sort_unstable();
+    assert_eq!(
+        clap_groups, tree_groups,
+        "top-level command groups drifted from PUBLIC_V2_COMMAND_TREE"
+    );
 }
 
 #[test]

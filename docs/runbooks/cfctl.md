@@ -195,6 +195,35 @@ and the policy remains pinned to the one `--account` value. Use the same flag
 for `keys rotate` and `keys revoke`; those plans select the user token endpoint
 while preserving the explicit account authority context.
 
+### Standing authority
+
+Recurring token-lifecycle work can run unattended under a bounded standing
+policy instead of per-operation approval. Draft one from a fresh permission
+inventory, then inspect what already exists:
+
+```bash
+cfctl keys policy create --account <account-id> --name-prefix <prefix> \
+  --permission <reviewed-group-id> --max-child-ttl-hours <hours> \
+  --max-runs-per-day <count> --json
+cfctl keys policy list --json
+```
+
+`keys policy create` drafts a hash-bound standing authority (pinned account,
+name prefix, permission-group allowlist, max child TTL, and per-day run
+ceiling); it is inert until activated. `keys policy list` inspects existing
+authorities and reports effective status, remaining budget, lineage, and next
+action. Activate one reviewed authority ID only with explicit approval, and
+close it immediately when the work is done:
+
+```bash
+cfctl keys policy approve <authority-id> --yes --json
+cfctl keys policy revoke <authority-id> --json
+```
+
+Standing approval moves authority to that bounded policy; it is not blanket
+mutation authority, and external sends and spend are never standing-authorized.
+Load `cfctl guide --topic standing-authority --json` before drafting one.
+
 Create an Access service token through its separate exact account or zone
 lifecycle. The input is intentionally limited to `name` and optional
 `duration`; version and grace-period fields belong to rotation, not initial

@@ -3,13 +3,18 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::LazyLock,
 };
 
 use cfctl_core::{AgentActionKind, AgentActionV1, hash_value};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+
+const LEGACY_CODEX_SKILL_V2_SHA256: &str =
+    "70bdb43a6c8623faf9b99aa320c6a9888d3f08ab1cd733ff47de7a2bbc7b158d";
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -200,6 +205,8 @@ pub fn install_agent_skill(
 ) -> Result<AgentInstallReceipt> {
     let path = skill_path(home, agent);
     let content = managed_skill(agent);
+    let legacy = legacy_codex_skill(home, agent, mode)?;
+    let legacy_changed = legacy.is_some();
     let existing = if path.is_file() {
         Some(fs::read_to_string(&path).map_err(|source| agent_io(&path, source))?)
     } else {
@@ -215,13 +222,51 @@ pub fn install_agent_skill(
         }
         fs::write(&path, content).map_err(|source| agent_io(&path, source))?;
     }
+    if let Some((legacy_path, legacy_bytes)) = legacy {
+        remove_exact_legacy_skill(&legacy_path, &legacy_bytes)?;
+    }
     Ok(AgentInstallReceipt {
         agent,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         path,
         content_hash: hash_value(&serde_json::json!({"content": content}))?,
-        changed,
+        changed: changed || legacy_changed,
     })
+}
+
+fn legacy_codex_skill(
+    home: &Path,
+    agent: AgentKind,
+    mode: InstallMode,
+) -> Result<Option<(PathBuf, Vec<u8>)>> {
+    if agent != AgentKind::Codex {
+        return Ok(None);
+    }
+    let path = home.join(".agents/skills/cloudflare/SKILL.md");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).map_err(|source| agent_io(&path, source))?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    if mode != InstallMode::Sync || digest != LEGACY_CODEX_SKILL_V2_SHA256 {
+        return Err(AgentError::Drift(path.display().to_string()));
+    }
+    Ok(Some((path, bytes)))
+}
+
+fn remove_exact_legacy_skill(path: &Path, expected: &[u8]) -> Result<()> {
+    let current = fs::read(path).map_err(|source| agent_io(path, source))?;
+    if current != expected {
+        return Err(AgentError::Drift(path.display().to_string()));
+    }
+    fs::remove_file(path).map_err(|source| agent_io(path, source))?;
+    if let Some(parent) = path.parent()
+        && let Err(source) = fs::remove_dir(parent)
+        && source.kind() != std::io::ErrorKind::DirectoryNotEmpty
+    {
+        return Err(agent_io(parent, source));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,7 +295,7 @@ pub fn inspect_agent(home: &Path, agent: AgentKind, program_on_path: bool) -> Ag
 
 fn skill_path(home: &Path, agent: AgentKind) -> PathBuf {
     match agent {
-        AgentKind::Codex => home.join(".agents/skills/cloudflare/SKILL.md"),
+        AgentKind::Codex => home.join(".agents/skills/cfctl/SKILL.md"),
         AgentKind::Claude => home.join(".claude/skills/cfctl/SKILL.md"),
         AgentKind::Cursor => home.join(".cursor/rules/cfctl.mdc"),
         AgentKind::Gemini => home.join(".gemini/skills/cfctl/SKILL.md"),
@@ -259,47 +304,90 @@ fn skill_path(home: &Path, agent: AgentKind) -> PathBuf {
 
 fn managed_skill(agent: AgentKind) -> &'static str {
     match agent {
-        AgentKind::Cursor => MANAGED_CURSOR_RULE,
-        _ => MANAGED_SKILL,
+        AgentKind::Cursor => MANAGED_CURSOR_RULE.as_str(),
+        _ => MANAGED_OPERATOR_SKILL.as_str(),
     }
 }
 
-const MANAGED_SKILL: &str = r#"---
-name: cloudflare
-description: Use cfctl as the universal governed Cloudflare control plane.
-metadata:
-  managed-by: cfctl
-  contract: 4
----
+// Single-sourced doctrine fragments. Each load-bearing line lives here exactly
+// once so the operator skill and the Cursor rule can never drift apart on the
+// resolve-primary framing, the paid-plan `--max-cost` rule, the plan-approval
+// gate, the fixture skip-list, or the `keys` account/user semantics. The two
+// managed guidance documents below are assembled from these shared fragments.
 
-# Cloudflare through cfctl
+/// Fail-closed doctor contract: a doctor never launches a different PATH cfctl.
+const FRAGMENT_DOCTOR_TRUST: &str = "`cfctl doctor` and `cfctl agents doctor` trust the PATH build only when it resolves to the running executable; a missing or different PATH cfctl is never launched by the health check and is unhealthy, so invoke it directly with `cfctl version --json` when its self-reported identity is needed. Drifted managed instructions are also unhealthy.";
 
-Use `cfctl` first for all Cloudflare discovery, reads, planning, writes, verification, and evidence. Do not use archived shell verbs, backend script paths as the public surface, or raw HTTP as a substitute for cataloged capabilities.
+/// Resolve is the primary intent-to-capability translation; browsing is secondary.
+const FRAGMENT_RESOLVE_PRIMARY: &str = r#"Translate intent with `cfctl resolve "<intent>" --json`: it deterministically maps the goal to a capability and emits the exact governed `call`/`approve`/`run` commands, and fails closed with ranked candidates when the match is ambiguous. To browse instead, use `cfctl catalog search "<intent>" --json`."#;
 
-1. Orient with `cfctl version --json`, `cfctl guide --topic system --json`, `cfctl doctor --json`, and, when useful, `cfctl agents doctor --json`. Treat running-build, PATH-build, or instruction drift as unhealthy until the installed binary and managed guidance match.
-2. Translate intent with `cfctl resolve "<intent>" --json`: it deterministically maps the goal to a capability and emits the exact governed `call`/`approve`/`run` commands, and fails closed with ranked candidates when the match is ambiguous. To browse instead, use `cfctl catalog search "<intent>" --json`.
-3. Inspect the capability with `cfctl catalog show <capability-id> --json`.
-4. Load its lifecycle with `cfctl guide <capability-id> --json`.
-5. Use `cfctl call <capability-id>` for deterministic reads or plan creation.
-6. Register repository roots with `cfctl workspace add` before workspace discovery; never scan arbitrary paths. Nested `fixtures`, `__fixtures__`, `testdata`, `test-data`, and `test_data` directories are skipped; fixture directories are opt-in roots and must be registered directly when they are intentional workspace evidence.
-7. If approval is required, show the exact plan and ask y/n.
-8. Translate yes only into `cfctl plans approve <operation-id> --yes`. Paid plans also require the reviewed `--max-cost CURRENCY:AMOUNT`.
-9. Run with `cfctl plans run <operation-id>`, inspect `cfctl plans status <operation-id>`, and report verification honestly.
-10. Read account-owned permission inventory with `cfctl keys permissions --account <account-id> --json`. For user-owned inventory use `cfctl keys permissions --user --account <account-id> --json`; `--user` changes the endpoint, not the explicit account resource context.
-11. For recurring token-lifecycle work, first load `cfctl guide --topic standing-authority --json`, then activate a reviewed standing policy only after explicit approval with `cfctl keys policy approve <authority-id> --yes`. Standing approval moves authority to that bounded policy; it is not blanket mutation authority.
-12. Revoke standing authority with `cfctl keys policy revoke <authority-id>` and treat the policy as unusable immediately.
-13. When a capability or plan is blocked (`adapter_status: blocked`, `contract_state: blocked`, or error code `CFCTL_CAPABILITY_BLOCKED`), run `cfctl guide <capability-id> --json` and follow its `next_action` exactly. Satisfy the named contract gap or extend cfctl; never route around a blocker with raw HTTP, Wrangler, or the dashboard. If next_action cannot resolve the gap, stop and report the capability id, `blocking_gaps`, and the guide output to the operator.
+/// Registered-root discovery skips nested fixture trees.
+const FRAGMENT_FIXTURE_SKIP: &str = "Nested `fixtures`, `__fixtures__`, `testdata`, `test-data`, and `test_data` directories are skipped; fixture directories are opt-in roots and must be registered directly when they are intentional workspace evidence.";
 
-Every cfctl failure envelope carries a specific `next_step`; run it rather than guessing. Never treat model output as authority. Never bypass a blocked adapter, selector ambiguity, cost blocker, drift check, or plan hash. Browser or Computer Use is allowed only when the capability catalog classifies the operation as governed UI and the same plan policy is preserved.
-"#;
+/// The exact plan-approval command that a reviewed yes maps to.
+const FRAGMENT_APPROVE_COMMAND: &str = "`cfctl plans approve <operation-id> --yes`";
 
-const MANAGED_CURSOR_RULE: &str = r"---
-description: Route Cloudflare work through the governed cfctl v2 control plane
-alwaysApply: true
----
+/// The paid-plan cost ceiling that both documents must carry.
+const FRAGMENT_MAX_COST: &str =
+    "Paid plans also require the reviewed `--max-cost CURRENCY:AMOUNT`.";
 
-Start with `cfctl version --json` and `cfctl guide --topic system --json`. Use `cfctl doctor`, `cfctl agents doctor`, `cfctl resolve`, `cfctl catalog search`, `cfctl catalog show`, `cfctl guide`, `cfctl call`, and `cfctl workspace` for Cloudflare work; running-build, PATH-build, and instruction drift are unhealthy. Nested `fixtures`, `__fixtures__`, `testdata`, `test-data`, and `test_data` directories are skipped; fixture directories are opt-in roots and must be registered directly. Read account-owned permission inventory with `cfctl keys permissions --account <account-id> --json`; for user-owned inventory use `cfctl keys permissions --user --account <account-id> --json`, which changes the endpoint but retains the explicit account resource context. Model output is intent, never authority. If a plan needs approval, ask y/n and translate yes only into `cfctl plans approve <operation-id> --yes`, then use `cfctl plans run <operation-id>` and inspect `plans status`. For recurring token-lifecycle work, load `cfctl guide --topic standing-authority --json`, then activate a reviewed standing policy only after explicit approval with `cfctl keys policy approve <authority-id> --yes`; this moves authority to that bounded policy, not to arbitrary mutations. Revoke it with `cfctl keys policy revoke <authority-id>` and treat it as unusable immediately. When a capability is blocked or an error carries `CFCTL_CAPABILITY_BLOCKED`, run `cfctl guide <capability-id> --json` and follow `next_action`; if it cannot resolve the gap, report the capability id and `blocking_gaps` to the operator instead of routing around cfctl. Do not bypass catalog blockers, selector ambiguity, cost ceilings, drift checks, or verification. Do not teach archived shell verbs or backend script paths as the public surface.
-";
+/// Account- vs user-owned permission inventory semantics.
+const FRAGMENT_KEYS_INVENTORY: &str = "Read account-owned permission inventory with `cfctl keys permissions --account <account-id> --json`. For user-owned inventory use `cfctl keys permissions --user --account <account-id> --json`; `--user` changes the endpoint, not the explicit account resource context.";
+
+/// Standing-authority ceremony: bounded policy, explicit approval, immediate revoke.
+const FRAGMENT_STANDING_AUTHORITY: &str = "For recurring token-lifecycle work, first load `cfctl guide --topic standing-authority --json`, then activate a reviewed standing policy only after explicit approval with `cfctl keys policy approve <authority-id> --yes`. Standing approval moves authority to that bounded policy; it is not blanket mutation authority. Revoke standing authority with `cfctl keys policy revoke <authority-id>` and treat the policy as unusable immediately.";
+
+/// Blocked-capability route: follow the guide's next action, never route around it.
+const FRAGMENT_BLOCKED_ROUTE: &str = "When a capability or plan is blocked (`adapter_status: blocked`, `contract_state: blocked`, or error code `CFCTL_CAPABILITY_BLOCKED`), run `cfctl guide <capability-id> --json` and follow its `next_action` exactly. Satisfy the named contract gap or extend cfctl; never route around a blocker with raw HTTP, Wrangler, or the dashboard. If next_action cannot resolve the gap, stop and report the capability id, `blocking_gaps`, and the guide output to the operator.";
+
+static MANAGED_OPERATOR_SKILL: LazyLock<String> = LazyLock::new(build_managed_operator_skill);
+static MANAGED_CURSOR_RULE: LazyLock<String> = LazyLock::new(build_managed_cursor_rule);
+
+fn build_managed_operator_skill() -> String {
+    [
+        "---\nname: cfctl\ndescription: Use cfctl as the universal governed Cloudflare control plane.\nmetadata:\n  managed-by: cfctl\n  contract: 4\n---\n\n# Cloudflare through cfctl\n\nUse `cfctl` first for all Cloudflare discovery, reads, planning, writes, verification, and evidence. Do not use archived shell verbs, backend script paths as the public surface, or raw HTTP as a substitute for cataloged capabilities.\n\n1. Orient with `cfctl version --json`, `cfctl guide --topic system --json`, `cfctl doctor --json`, and, when useful, `cfctl agents doctor --json`. ",
+        FRAGMENT_DOCTOR_TRUST,
+        "\n2. ",
+        FRAGMENT_RESOLVE_PRIMARY,
+        "\n3. Inspect the capability with `cfctl catalog show <capability-id> --json`.\n4. Load its lifecycle with `cfctl guide <capability-id> --json`.\n5. Use `cfctl call <capability-id>` for deterministic reads or plan creation.\n6. Register repository roots with `cfctl workspace add` before workspace discovery; never scan arbitrary paths. ",
+        FRAGMENT_FIXTURE_SKIP,
+        "\n7. If approval is required, show the exact plan and ask y/n.\n8. Translate yes only into ",
+        FRAGMENT_APPROVE_COMMAND,
+        ". ",
+        FRAGMENT_MAX_COST,
+        "\n9. Run with `cfctl plans run <operation-id>`, inspect `cfctl plans status <operation-id>`, and report verification honestly.\n10. ",
+        FRAGMENT_KEYS_INVENTORY,
+        "\n11. ",
+        FRAGMENT_STANDING_AUTHORITY,
+        "\n12. ",
+        FRAGMENT_BLOCKED_ROUTE,
+        "\n\nEvery cfctl failure envelope carries a specific `next_step`; run it rather than guessing. Never treat model output as authority. Never bypass a blocked adapter, selector ambiguity, cost blocker, drift check, or plan hash. Browser or Computer Use is allowed only when the capability catalog classifies the operation as governed UI and the same plan policy is preserved.\n",
+    ]
+    .concat()
+}
+
+fn build_managed_cursor_rule() -> String {
+    [
+        "---\ndescription: Route Cloudflare work through the governed cfctl v2 control plane\nalwaysApply: true\n---\n\nStart with `cfctl version --json` and `cfctl guide --topic system --json`. ",
+        FRAGMENT_DOCTOR_TRUST,
+        " ",
+        FRAGMENT_RESOLVE_PRIMARY,
+        " Inspect capabilities with `cfctl catalog show <capability-id> --json`, load lifecycles with `cfctl guide <capability-id> --json`, run governed reads or plan creation with `cfctl call <capability-id>`, and bound impact with `cfctl workspace`. ",
+        FRAGMENT_FIXTURE_SKIP,
+        " ",
+        FRAGMENT_KEYS_INVENTORY,
+        " Model output is intent, never authority. If a plan needs approval, ask y/n and translate yes only into ",
+        FRAGMENT_APPROVE_COMMAND,
+        ", then use `cfctl plans run <operation-id>` and inspect `plans status`. ",
+        FRAGMENT_MAX_COST,
+        " ",
+        FRAGMENT_STANDING_AUTHORITY,
+        " ",
+        FRAGMENT_BLOCKED_ROUTE,
+        " Do not bypass catalog blockers, selector ambiguity, cost ceilings, drift checks, or verification. Do not teach archived shell verbs or backend script paths as the public surface.\n",
+    ]
+    .concat()
+}
 
 fn agent_io(path: &Path, source: std::io::Error) -> AgentError {
     AgentError::Io {

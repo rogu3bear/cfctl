@@ -36,13 +36,19 @@ cfctl catalog search "cost unbounded" --json
 Search derives these terms from the current catalog contract; it does not make
 a blocked operation executable.
 
-Search before acting:
+Resolve intent first:
 
 ```bash
-cfctl catalog search "inspect production Worker routes" --json
+cfctl resolve "inspect production Worker routes" --json
 cfctl catalog show <capability-id> --json
 cfctl guide <capability-id> --json
 ```
+
+`resolve` deterministically maps the goal to a capability: it either commits to
+a single confident match and emits the exact governed `call`/`approve`/`run`
+commands, or fails closed with ranked candidates when the match is ambiguous.
+To browse the catalog by keyword instead, use
+`cfctl catalog search "<intent>" --json`.
 
 The generated guide always covers 15 stages: discover, authenticate, select
 account, check entitlement, inspect current state, load standards, map
@@ -91,14 +97,20 @@ Reads emit redacted live-read evidence. Writes emit `PlanV1` first. Review the
 plan, then use the exact ID:
 
 ```bash
+cfctl plans show <operation-id> --json
 cfctl plans approve <operation-id> --yes --json
 cfctl plans run <operation-id> --json
 cfctl plans status <operation-id> --json
+cfctl plans resume <operation-id> --json
+cfctl plans rectify <operation-id> --json
 ```
 
 Paid work also requires `--max-cost CURRENCY:AMOUNT`; unknown cost is blocked.
 Plans expire within 24 hours, approvals are invalidated by relevant drift, and
-consumed plans cannot be replayed after a crash.
+consumed plans cannot be replayed after a crash. `plans resume` continues a
+draft or approved plan; `plans rectify` reconciles durable receipts and
+verification without replaying the Cloudflare mutation. See the operator
+runbook for the full lifecycle.
 
 ## Workspace impact
 
@@ -126,7 +138,9 @@ one directly only when its contents are intended to enter the workspace graph.
 - Profiles and workspaces pin accounts; ambiguity fails closed.
 - API tokens are scoped profiles.
 - The global-key profile is emergency-only and never selected silently.
-- Keychain on macOS and Secret Service on Linux hold credentials.
+- Credentials live in the platform keyring (Keychain on macOS, Secret Service
+  on Linux), falling back to a mode-0600 file store under the cfctl data dir
+  when the keyring is unavailable; `cfctl doctor` reports the active backend.
 - Secret inputs come from stdin and become opaque key-store references.
 - Secret outputs require `--value-out` to a new mode-0600 file. Access
   service-token creation writes a JSON object containing exactly `client_id`
