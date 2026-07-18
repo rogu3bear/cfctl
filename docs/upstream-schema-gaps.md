@@ -22,8 +22,6 @@ Of the currently-blocked capabilities, **83% are blocked on one of the two
 upstream gaps below** — neither of which cfctl can safely close on its own.
 This document is the basis for filing them against `cloudflare/api-schemas`.
 
-Counts are a snapshot; regenerate them with the command under "Reproduce" below.
-
 ---
 
 ## Gap 1 — 242 mutating operations carry no permission annotation

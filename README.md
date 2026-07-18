@@ -152,10 +152,6 @@ cfctl auth import-api-token --account <account-id> --value-in token.tok
 rm -f token.tok
 ```
 
-`CFCTL_FORCE_IPV4=1` (or `true`/`yes`/`on`) pins outbound Cloudflare API calls
-to an IPv4 source so an IP-allowlisted token keeps working when the host
-default-routes over IPv6; it is off by default.
-
 OAuth Authorization Code with PKCE remains available when you have a
 Cloudflare OAuth client (`--client-id` / `CFCTL_OAUTH_CLIENT_ID`). Public cfctl
 OAuth is not the default until cfctl.io ownership and permanent promotion
@@ -178,6 +174,10 @@ printf '%s' "$CLOUDFLARE_API_KEY" | \
 cfctl auth import-global-key --profile emergency-global --email you@example.com --value-in key.tok
 rm -f key.tok
 ```
+
+`CFCTL_FORCE_IPV4=1` (or `true`/`yes`/`on`) pins outbound Cloudflare API calls
+to an IPv4 source so an IP-allowlisted token keeps working when the host
+default-routes over IPv6; it is off by default.
 
 ## Read and change
 
@@ -387,14 +387,14 @@ check and is unhealthy; invoke it directly with `cfctl version --json` when
 its self-reported identity is needed. Drifted managed instructions are also
 unhealthy.
 
-Natural language launches the configured agent once. `CFCTL_AGENT` selects
+Natural language launches the configured agent once; `CFCTL_AGENT` selects
 which delegated agent binary is launched (default `codex`; also `claude`,
-`cursor`, or `gemini`). Quote it: a bare single token that is not a known
-command fails closed with a usage error and a did-you-mean — a typo is never an
-agent launch. The `CFCTL_AGENT_SESSION` marker prevents recursion. Agents
-translate intent into a deterministic `cfctl resolve` match — `cfctl catalog
-search` is the browse fallback — and governed commands; model output never
-grants authority or directly mutates Cloudflare.
+`cursor`, or `gemini`). The agent translates intent into a deterministic
+`cfctl resolve` match — `cfctl catalog search` is the browse fallback — and
+governed commands; model output never grants authority or directly mutates
+Cloudflare. The `CFCTL_AGENT_SESSION` marker prevents recursion. Quote natural
+language: a bare single token that is not a known command fails closed with a
+usage error and a did-you-mean, so a typo is never an agent launch.
 
 Browser or Computer Use is available only for cataloged `governed_ui`
 capabilities after API/CLI coverage cannot finish the task. UI actions bind the

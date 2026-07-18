@@ -2,7 +2,8 @@
 
 ## Build and install
 
-Rust 1.93 or newer is pinned by `rust-toolchain.toml`.
+Rust 1.93 or newer is pinned by `rust-toolchain.toml`. Install from a checkout
+today with the guided bootstrap:
 
 ```bash
 ./bootstrap.sh --check-only
@@ -14,7 +15,13 @@ Rust 1.93 or newer is pinned by `rust-toolchain.toml`.
 Bootstrap requires a tracked-clean checkout, runs the full verification lane,
 installs with `cargo install --force`, proves the installed commit equals
 `HEAD`, synchronizes only already-managed agent integrations unless skipped,
-and runs both doctors. Confirm the exact running build after installation:
+and runs both doctors. To skip that lane and install straight from the checkout:
+
+```bash
+cargo install --path crates/cfctl-cli --locked
+```
+
+Confirm the exact running build after either path:
 
 ```bash
 cfctl version --json
@@ -22,28 +29,21 @@ cfctl doctor --json
 cfctl agents doctor --json
 ```
 
-Or install directly from the checkout (works today):
-
-```bash
-cargo install --path crates/cfctl-cli --locked
-```
-
 The published installers below are not live yet: `cfctl.io` is not serving them
 and no release tag has been published. Both are pending operator actions (see
-the README's external activation boundary), so the commands in this subsection
-will not resolve until those steps happen — use the source-install paths above
-in the meantime.
+the README's external activation boundary), so use the source-install paths
+above until those steps complete.
 
 On macOS, `cargo xtask release` assembles a Homebrew formula (`cfctl.rb`) that
 installs the signed `cfctl-aarch64-apple-darwin` or `cfctl-x86_64-apple-darwin`
-binary from the matching GitHub release tag. Once that release is published:
+binary from the matching GitHub release tag:
 
 ```bash
 brew install --formula ./cfctl.rb
 ```
 
 On Linux, the release installer requires Cosign, verifies the release's signed
-checksum manifest against its exact Fulcio identity and issuer, and requires an
+checksum manifest against its exact Fulcio identity and issuer, and needs an
 existing release tag:
 
 ```bash
