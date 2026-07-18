@@ -10054,10 +10054,14 @@ fn resolve_result(
 
     let runner_up = ranked.get(1).map_or(0, |(_, score)| *score);
     // Commit only to a confident, unambiguous top match: score above the floor
-    // and at least 1.5x the runner-up (or a sole match). Integer test avoids
-    // float rounding: top/runner >= 3/2.
+    // and at least 1.2x the runner-up (or a sole match). Integer test avoids
+    // float rounding: top/runner >= 6/5. The 1.2x margin is evidence-backed: a
+    // 28-intent live-catalog study showed the top candidate is correct in ~93%
+    // of cases, yet a 1.5x gate committed only 7% because near-duplicate
+    // capabilities cluster; 1.2x commits clearly-dominant matches while exact
+    // and near ties (below 1.2x) still fail closed.
     let confident = top_score >= RESOLVE_MIN_CONFIDENT_SCORE
-        && (runner_up == 0 || top_score * 2 >= runner_up * 3);
+        && (runner_up == 0 || top_score * 5 >= runner_up * 6);
 
     if !confident {
         let reason = if top_score < RESOLVE_MIN_CONFIDENT_SCORE {
@@ -18715,12 +18719,50 @@ mod tests {
     fn resolve_result_close_scores_fail_closed_as_ambiguous() {
         let a = resolver_read_capability("cap-a", "Cap A", "P");
         let b = resolver_read_capability("cap-b", "Cap B", "P");
-        // 8 vs 7: top*2=16 < runner*3=21 -> not confident.
+        // 8 vs 7 (1.14x): top*5=40 < runner*6=42 -> below the 1.2x margin.
         let ranked = vec![(&a, 8usize), (&b, 7usize)];
         let (result, error) = super::resolve_result("ambiguous intent", &ranked, None, 5);
         assert!(error.is_some(), "close scores fail closed");
         assert_eq!(result["ambiguous"], serde_json::Value::Bool(true));
         assert_eq!(result["matched"].as_array().map(Vec::len), Some(2));
+    }
+
+    // The 1.2x commit-margin boundary (evidence-backed by the live-catalog
+    // effectiveness study). Deterministic, and every ambiguity safeguard below
+    // 1.2x remains fail-closed.
+    #[test]
+    fn resolve_exact_tie_stays_fail_closed() {
+        let a = resolver_read_capability("cap-a", "Cap A", "P");
+        let b = resolver_read_capability("cap-b", "Cap B", "P");
+        // 24 vs 24 (1.0x): the score cannot distinguish the pair; e.g. a "set"
+        // intent tying a get/update pair must never auto-commit the wrong one.
+        let ranked = vec![(&a, 24usize), (&b, 24usize)];
+        let (result, error) = super::resolve_result("tied intent", &ranked, None, 5);
+        assert!(error.is_some(), "an exact tie must fail closed");
+        assert_eq!(result["resolved"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn resolve_near_tie_below_margin_stays_fail_closed() {
+        let a = resolver_read_capability("cap-a", "Cap A", "P");
+        let b = resolver_read_capability("cap-b", "Cap B", "P");
+        // 11 vs 10 (1.1x): top*5=55 < runner*6=60 -> just below 1.2x.
+        let ranked = vec![(&a, 11usize), (&b, 10usize)];
+        let (result, error) = super::resolve_result("near tie intent", &ranked, None, 5);
+        assert!(error.is_some(), "a sub-1.2x near tie must fail closed");
+        assert_eq!(result["resolved"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn resolve_clear_winner_at_margin_commits() {
+        let a = resolver_read_capability("cap-win", "Winner", "P");
+        let b = resolver_read_capability("cap-b", "Cap B", "P");
+        // 12 vs 10 (exactly 1.2x): top*5=60 >= runner*6=60 -> commits.
+        let ranked = vec![(&a, 12usize), (&b, 10usize)];
+        let (result, error) = super::resolve_result("clear winner intent", &ranked, None, 5);
+        assert!(error.is_none(), "a >=1.2x clear winner must commit");
+        assert_eq!(result["resolved"]["capability_id"], "cap-win");
+        assert!(result["resolved"]["commands"]["draft_argv"].is_array());
     }
 
     #[test]
