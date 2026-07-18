@@ -969,6 +969,7 @@ fn apply_post_normalization_contracts(
 ) {
     finalize_worker_script_secret_contracts(document, capabilities);
     classify_exact_resource_contracts(document, capabilities);
+    finalize_singleton_resource_delete_contracts(document, capabilities);
     classify_parent_collection_delete_contracts(document, capabilities);
     classify_parent_collection_update_contracts(document, capabilities);
     classify_access_service_token_create_contract(document, capabilities);
@@ -1799,6 +1800,185 @@ fn classify_exact_resource_contracts(
     }
 }
 
+/// Confirms an operation's 2xx success response declares its `result` as a
+/// single object rather than an array. This is the structural proof that a
+/// same-path GET is a singleton readback (delete-then-not-found is valid) and
+/// not a collection list (where a delete would leave an empty array, never a
+/// not-found), which is the one signal the terminal-literal path shape cannot
+/// distinguish on its own.
+fn success_response_result_is_single_object(document: &Value, operation: &Value) -> bool {
+    operation
+        .get("responses")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(status, _)| status.starts_with('2'))
+        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
+        .any(|schema| schema_result_is_object_not_array(document, schema, 0))
+}
+
+fn schema_result_is_object_not_array(document: &Value, schema: &Value, depth: usize) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                schema_result_is_object_not_array(document, resolved, depth + 1)
+            });
+    }
+    if let Some(result) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get("result"))
+    {
+        return schema_is_object_not_array(document, result, depth + 1);
+    }
+    schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| schema_result_is_object_not_array(document, member, depth + 1))
+        })
+}
+
+fn schema_is_object_not_array(document: &Value, schema: &Value, depth: usize) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| schema_is_object_not_array(document, resolved, depth + 1));
+    }
+    match schema.get("type").and_then(Value::as_str) {
+        // Only an explicit object is a singleton; "array" and every other
+        // scalar type fall through to false (a collection or non-resource).
+        Some("object") => true,
+        Some(_) => false,
+        None => {
+            schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some_and(|properties| !properties.is_empty())
+                || schema
+                    .get("allOf")
+                    .and_then(Value::as_array)
+                    .is_some_and(|members| {
+                        members
+                            .iter()
+                            .any(|member| schema_is_object_not_array(document, member, depth + 1))
+                    })
+        }
+    }
+}
+
+/// Closes the delete contract for singleton sub-resource deletes that the
+/// `classify_exact_resource_contracts` id-parameter heuristic under-covers
+/// (terminal-literal paths such as `/apps/{app_id}/ca`). Applies the identical
+/// readback-verified delete contract, but only when every safety condition
+/// holds: the operation is a declared delete, its permission lane is already
+/// declared (never fabricated), a same-path GET readback exists, that readback
+/// returns a single object (not a collection), and no pricing reference is
+/// attached (paid-operation deletes are left for human review). risk/effect are
+/// already Destructive from the generic classifier; this only fills the
+/// cost/verification/rollback gaps. Fabricates nothing: verification is
+/// readback-real.
+fn finalize_singleton_resource_delete_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let delete_readback_targets = same_path_readback_targets(capabilities, true);
+    let candidates: Vec<String> = capabilities
+        .values()
+        .filter_map(|capability| {
+            let contract_incomplete = capability.adapter_status == AdapterStatus::Blocked
+                && capability
+                    .blocked_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("operation contract incomplete:"));
+            if !contract_incomplete
+                || capability.method != "DELETE"
+                || capability.verification.strategy
+                    != "post_change_read_or_operation_specific_verifier"
+                || path_targets_exact_resource(&capability.path)
+                || !path_targets_singleton_subresource(&capability.path)
+                || !declares_exact_resource_deletion(capability)
+                || capability.permissions.is_empty()
+                || !capability.cost.references.is_empty()
+            {
+                return None;
+            }
+            let routing_headers = same_path_mutation_routing_headers(capability)?;
+            let key = (
+                capability.path.clone(),
+                capability.product.clone(),
+                routing_headers,
+            );
+            if !delete_readback_targets.contains_key(&key) {
+                return None;
+            }
+            let get_operation = document
+                .get("paths")
+                .and_then(Value::as_object)
+                .and_then(|paths| paths.get(&capability.path))
+                .and_then(|path_item| path_item.get("get"))?;
+            if !success_response_result_is_single_object(document, get_operation) {
+                return None;
+            }
+            Some(capability.id.clone())
+        })
+        .collect();
+
+    for id in candidates {
+        let read_capability_id = {
+            let capability = &capabilities[&id];
+            same_path_mutation_routing_headers(capability).and_then(|routing_headers| {
+                delete_readback_targets
+                    .get(&(
+                        capability.path.clone(),
+                        capability.product.clone(),
+                        routing_headers,
+                    ))
+                    .cloned()
+            })
+        };
+        let Some(read_capability_id) = read_capability_id else {
+            continue;
+        };
+        let Some(capability) = capabilities.get_mut(&id) else {
+            continue;
+        };
+        if !narrow_required_open_delete_body(capability) {
+            continue;
+        }
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: capability.path.clone(),
+            read_capability_id,
+            verified_response_fields: Vec::new(),
+        });
+        capability.cost = cfctl_core::CostV1::default();
+        capability.cost.basis = Some(
+            "deleting an existing resource has no incremental operation charge; refunds, retained usage, and downstream billing are not claimed"
+                .to_owned(),
+        );
+        "same_resource_returns_not_found_after_delete"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "deletion is irreversible without a prior resource snapshot; any recreation must be a separately reviewed plan"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
+
 fn same_path_readback_targets(
     capabilities: &BTreeMap<String, CapabilityV1>,
     allow_delete_projections: bool,
@@ -2311,6 +2491,17 @@ fn path_targets_exact_resource(path: &str) -> bool {
     path.rsplit('/').next().is_some_and(|segment| {
         segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2
     })
+}
+
+/// A singleton sub-resource path: terminal literal segment beneath an
+/// identified parent parameter (e.g. `/apps/{app_id}/ca`). Mirrors the core
+/// predicate of the same name; kept a necessary-but-not-sufficient signal, with
+/// the single-object readback response as the sufficient singleton proof.
+fn path_targets_singleton_subresource(path: &str) -> bool {
+    let terminal_is_literal = path.rsplit('/').next().is_some_and(|segment| {
+        !(segment.is_empty() || segment.starts_with('{') && segment.ends_with('}'))
+    });
+    terminal_is_literal && path.contains('{')
 }
 
 pub async fn fetch_official(client: &reqwest::Client) -> Result<CatalogSnapshot> {
