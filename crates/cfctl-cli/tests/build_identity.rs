@@ -9,23 +9,7 @@ use cfctl_cli::{
     build_identity::{PathBuildProbeV1, PathBuildStateV1, classify_path_build},
     build_support::{ResolvedIdentitySource, resolve_build_identity},
 };
-use cfctl_core::{BuildIdentitySourceV1, BuildInfoV1};
-
 const COMMIT_A: &str = "0123456789abcdef0123456789abcdef01234567";
-const COMMIT_B: &str = "89abcdef0123456789abcdef0123456789abcdef";
-
-fn build(commit: Option<&str>) -> BuildInfoV1 {
-    BuildInfoV1 {
-        schema_version: 1,
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        git_commit: commit.map(str::to_owned),
-        identity_source: if commit.is_some() {
-            BuildIdentitySourceV1::GitCheckout
-        } else {
-            BuildIdentitySourceV1::Unknown
-        },
-    }
-}
 
 fn git(repository: &Path, arguments: &[&str]) {
     let status = Command::new("git")
@@ -88,41 +72,25 @@ fn clean_checkout_fallback_binds_head_and_dirty_checkout_is_unknown() {
 }
 
 #[test]
-fn path_identity_classifies_match_stale_legacy_and_missing() {
-    let running = build(Some(COMMIT_A));
-    let matching = classify_path_build(
-        &running,
-        PathBuildProbeV1::Build {
-            path: "/bin/cfctl".into(),
-            build: build(Some(COMMIT_A)),
-        },
-    );
-    assert!(matching.healthy);
-    assert_eq!(matching.state, PathBuildStateV1::Current);
-
-    let stale = classify_path_build(
-        &running,
-        PathBuildProbeV1::Build {
-            path: "/bin/cfctl".into(),
-            build: build(Some(COMMIT_B)),
-        },
-    );
-    assert!(!stale.healthy);
-    assert_eq!(stale.state, PathBuildStateV1::Stale);
-
-    let legacy = classify_path_build(
-        &running,
-        PathBuildProbeV1::Legacy {
-            path: "/bin/cfctl".into(),
-            version_output: format!("cfctl {}", env!("CARGO_PKG_VERSION")),
-        },
-    );
-    assert!(!legacy.healthy);
-    assert_eq!(legacy.state, PathBuildStateV1::Legacy);
-
-    let missing = classify_path_build(&running, PathBuildProbeV1::Missing);
+fn path_identity_classifies_missing_and_uninspectable() {
+    let missing = classify_path_build(PathBuildProbeV1::Missing);
     assert!(!missing.healthy);
     assert_eq!(missing.state, PathBuildStateV1::Missing);
+    assert!(missing.path.is_none());
+    assert!(missing.build.is_none());
+
+    let uninspectable = classify_path_build(PathBuildProbeV1::Uninspectable {
+        path: "/bin/cfctl".into(),
+        detail: "PATH cfctl is a different executable and was not run".to_owned(),
+    });
+    assert!(!uninspectable.healthy);
+    assert_eq!(uninspectable.state, PathBuildStateV1::Uninspectable);
+    assert_eq!(uninspectable.path.as_deref(), Some(Path::new("/bin/cfctl")));
+    assert!(uninspectable.build.is_none());
+    assert_eq!(
+        uninspectable.detail,
+        "PATH cfctl is a different executable and was not run"
+    );
 }
 
 #[cfg(unix)]
