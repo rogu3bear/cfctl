@@ -814,6 +814,21 @@ impl CapabilityV1 {
                             | "zone-environment-purge-tagged"
                     )
             }
+            // The Email Routing enable/disable toggles have no same-path
+            // readback of a resource, so verification asserts the toggle's own
+            // `result.enabled` boolean in the settings object the action
+            // endpoint returns. The basis states plainly this proves the
+            // setting now reports the intended value, not that MX/DNS
+            // propagation or live mail delivery has converged. Bound to the
+            // exact enable/disable ids.
+            "email_routing_settings_response_reports_enabled_state" => {
+                self.method == "POST"
+                    && matches!(
+                        self.id.as_str(),
+                        "email-routing-settings-enable-email-routing"
+                            | "email-routing-settings-disable-email-routing"
+                    )
+            }
             _ => false,
         }
     }
@@ -1403,7 +1418,43 @@ fn access_service_token_refresh_selector_supported(
     })
 }
 
+/// Response-field names that carry secret material in Cloudflare create
+/// responses (e.g. an API token's `value`, an R2 credential's `secretAccessKey`).
+/// A verification or identity pointer must never resolve to one of these:
+/// lifting a secret into an identity slot would echo it into a readback URL or a
+/// journal artifact. Kept in sync with the executor's secret-redaction set.
+pub const SECRET_FIELD_NAMES: &[&str] = &[
+    "value",
+    "token",
+    "secret",
+    "access_token",
+    "client_secret",
+    "text",
+    "key_base64",
+    "key_jwk",
+    "accessKeyId",
+    "secretAccessKey",
+    "sessionToken",
+];
+
+/// Returns whether an RFC 6901 JSON pointer's leaf segment names a known secret
+/// field. Used as a fail-closed guard so a drifted catalog identity pointer can
+/// never dereference secret material as a resource identity.
+#[must_use]
+pub fn pointer_names_secret_field(pointer: &str) -> bool {
+    pointer
+        .rsplit('/')
+        .next()
+        .is_some_and(|leaf| SECRET_FIELD_NAMES.contains(&leaf))
+}
+
 fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
+    // Fail closed: an identity pointer that names a secret field is never
+    // supported, regardless of selector shape. Guards against a catalog whose
+    // identity pointer drifts onto secret material.
+    if pointer_names_secret_field(pointer) {
+        return false;
+    }
     (selector_can_be_response_id(selector) && pointer == "/id")
         || (selector.ends_with("_name") && pointer == "/name")
         || (selector == "database_id" && pointer == "/uuid")

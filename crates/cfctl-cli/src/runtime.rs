@@ -4414,7 +4414,24 @@ fn validate_api_token_creation_contract(
         .collect::<Result<Vec<_>>>()?;
     let normalized_groups =
         validate_selected_permission_groups(&selected_ids, &Value::Array(selected_groups.clone()))?;
-    validate_permission_group_resource_scope(&normalized_groups, "com.cloudflare.api.account")?;
+    // The mint records the intended least-privilege scope in the hash-bound
+    // permission inventory. Derive the required permission scope and the exact
+    // resource the policy must carry from it, falling back to whole-account
+    // scope for plans minted before zone scope existed (and any other token
+    // create). The resource must be exactly `{scope}.{id}` with a single id
+    // segment, so a plan cannot claim account scope for the permission check
+    // while binding a zone resource (or vice versa).
+    let permission_scope = inventory
+        .get("permission_scope")
+        .and_then(Value::as_str)
+        .unwrap_or("com.cloudflare.api.account");
+    let default_resource = format!("com.cloudflare.api.account.{account_id}");
+    let expected_resource = inventory
+        .get("token_resource")
+        .and_then(Value::as_str)
+        .unwrap_or(&default_resource);
+    validate_resource_is_single_concrete_id_under_scope(expected_resource, permission_scope)?;
+    validate_permission_group_resource_scope(&normalized_groups, permission_scope)?;
     let expected_hash = inventory
         .get("selected_groups_hash")
         .and_then(Value::as_str)
@@ -4447,7 +4464,7 @@ fn validate_api_token_creation_contract(
                 .to_owned(),
         ));
     }
-    validate_token_policy_body(input.body.as_ref(), &selected_ids, account_id)
+    validate_token_policy_body(input.body.as_ref(), &selected_ids, expected_resource)
 }
 
 #[derive(Clone, Copy)]
@@ -4491,17 +4508,125 @@ fn validate_permission_group_resource_scope(groups: &[Value], required_scope: &s
             });
         if !supports_scope {
             return Err(CliError::Input(format!(
-                "permission group `{id}` does not support the required account resource scope `{required_scope}`"
+                "permission group `{id}` does not support the required resource scope `{required_scope}`"
             )));
         }
     }
     Ok(())
 }
 
+/// Resolves the least-privilege resource scope for a mint: the whole `--account`
+/// (default) or a single `--zone`. Returns the permission scope selected groups
+/// must support and the exact policy resource `{scope}.{id}`. Zone-scoped
+/// permission groups (Cache Purge, DNS Write, …) carry scope
+/// `com.cloudflare.api.account.zone`, which the whole-account scope does not
+/// admit — resolving to the zone scope is what lets those groups mint through
+/// the governed lane instead of an out-of-band raw token.
+fn resolve_mint_token_scope(
+    arguments: &KeyMutationArgs,
+    account: &str,
+) -> Result<(&'static str, String)> {
+    match arguments.zone.as_deref() {
+        Some(zone_id) => {
+            if arguments.user {
+                return Err(CliError::Input(
+                    "zone-scoped minting is account-owned; omit --user (the token still belongs to --account)"
+                        .to_owned(),
+                ));
+            }
+            validate_zone_id(zone_id)?;
+            Ok((
+                "com.cloudflare.api.account.zone",
+                format!("com.cloudflare.api.account.zone.{zone_id}"),
+            ))
+        }
+        None => Ok((
+            "com.cloudflare.api.account",
+            format!("com.cloudflare.api.account.{account}"),
+        )),
+    }
+}
+
+/// Builds the single least-privilege token-create policy body: exactly the
+/// selected permission groups scoped to exactly `token_resource`, with an
+/// optional expiry. The resulting body is what `validate_token_policy_body`
+/// re-checks against the hash-bound inventory before the mint runs.
+fn build_mint_policy_body(
+    name: &str,
+    selected_group_ids: &[String],
+    token_resource: &str,
+    ttl_hours: Option<u32>,
+) -> Value {
+    let mut body = json!({
+        "name": name,
+        "policies": [{
+            "effect": "allow",
+            "permission_groups": selected_group_ids.iter().map(|id| json!({"id": id})).collect::<Vec<_>>(),
+            "resources": {token_resource: "*"}
+        }]
+    });
+    if let Some(hours) = ttl_hours {
+        // Cloudflare's token API requires seconds-precision UTC with a `Z`
+        // suffix (e.g. 2005-12-30T01:02:03Z) and rejects the fractional-second
+        // `+00:00` form that `to_rfc3339()` emits with a 400.
+        body["expires_on"] = json!(
+            (Utc::now() + ChronoDuration::hours(i64::from(hours)))
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        );
+    }
+    body
+}
+
+/// Fail-closed local check on a `--zone` argument: Cloudflare zone ids are
+/// 32-character lowercase hex. Cross-account zone ownership is still enforced at
+/// the Cloudflare boundary when the governed plan runs; this only rejects
+/// obviously-malformed input before it becomes a plan.
+fn validate_zone_id(zone_id: &str) -> Result<()> {
+    let well_formed = zone_id.len() == 32
+        && zone_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if well_formed {
+        Ok(())
+    } else {
+        Err(CliError::Input(format!(
+            "`--zone` expects a 32-character lowercase-hex Cloudflare zone id, got `{zone_id}`"
+        )))
+    }
+}
+
+/// Fail-closed: the token resource must be exactly `{scope}.{id}` where `id` is
+/// a single concrete account/zone identifier — ASCII alphanumeric and `-` only.
+/// This rejects a nested scope (`.zone.<id>` under the account scope, or the
+/// reverse) AND a wildcard id (`*`), so no claimed permission scope can be
+/// widened to a broader resource even if the hash-bound metadata were tampered.
+fn validate_resource_is_single_concrete_id_under_scope(
+    expected_resource: &str,
+    permission_scope: &str,
+) -> Result<()> {
+    let ok = expected_resource
+        .strip_prefix(permission_scope)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|id| {
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(CliError::Input(format!(
+            "token mint resource `{expected_resource}` is not a single concrete resource under its declared permission scope `{permission_scope}`"
+        )))
+    }
+}
+
 fn validate_token_policy_body(
     body: Option<&Value>,
     selected_ids: &[String],
-    account_id: &str,
+    expected_resource: &str,
 ) -> Result<()> {
     let policies = body
         .and_then(|body| body.get("policies"))
@@ -4550,12 +4675,10 @@ fn validate_token_policy_body(
         .get("resources")
         .and_then(Value::as_object)
         .ok_or_else(|| CliError::Input("token mint policy has no resource scope".to_owned()))?;
-    let expected_resource = format!("com.cloudflare.api.account.{account_id}");
-    if resources.len() != 1
-        || resources.get(&expected_resource).and_then(Value::as_str) != Some("*")
+    if resources.len() != 1 || resources.get(expected_resource).and_then(Value::as_str) != Some("*")
     {
         return Err(CliError::Input(format!(
-            "token mint policy must be scoped only to account `{account_id}`"
+            "token mint policy must be scoped only to `{expected_resource}`"
         )));
     }
     Ok(())
@@ -7163,11 +7286,22 @@ fn boundary_response_artifact(
                 .map(|target| target.response_result_identity_pointer.as_str())
         })
         .unwrap_or("/id");
+    // Fail closed: never lift a secret field into the journal's `resource_id`.
+    // The core contract gate already refuses a secret-named identity pointer, so
+    // this is belt-and-suspenders against a pointer that slipped through.
+    let resource_id = if cfctl_core::pointer_names_secret_field(identity_pointer) {
+        None
+    } else {
+        response
+            .result
+            .pointer(identity_pointer)
+            .and_then(Value::as_str)
+    };
     json!({
         "apply_evidence_hash": apply_evidence.map(|evidence| evidence.content_hash.as_str()),
         "http_status": response.status,
         "success": response.success,
-        "resource_id": response.result.pointer(identity_pointer).and_then(Value::as_str),
+        "resource_id": resource_id,
         "resource_status": response.result.get("status").and_then(Value::as_str),
         "etag": response.etag,
         "cf_ray": response.cf_ray,
@@ -7439,10 +7573,22 @@ fn verification_outcome(
     } else {
         PlanStatus::RectificationRequired
     };
-    let evidence = Some(store.write_evidence(
-        EvidenceClass::PostChangeVerification,
-        &serde_json::to_value(&verification)?,
-    )?);
+    // Defense in depth: the verifier readback is the full Cloudflare response,
+    // which for a secret-sensitive capability can carry secret material. Apply
+    // the same secret-aware redaction the Apply receipt gets before this reaches
+    // evidence — the storage-layer `redact_json` alone misses camelCase/bare
+    // secret fields (e.g. `secretAccessKey`, `sessionToken`, `value`).
+    let mut verification_value = serde_json::to_value(&verification)?;
+    if should_redact_secret_response(&plan.capability)
+        && let Some(readback) = verification_value.get("readback")
+    {
+        let redacted = redact_secret_result(readback);
+        if let Some(object) = verification_value.as_object_mut() {
+            object.insert("readback".to_owned(), redacted);
+        }
+    }
+    let evidence =
+        Some(store.write_evidence(EvidenceClass::PostChangeVerification, &verification_value)?);
     let error = (!verification.passed).then(|| ErrorV1 {
         code: "CFCTL_VERIFICATION_FAILED".to_owned(),
         message: verification.basis.clone(),
@@ -8325,11 +8471,12 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
                 .to_owned(),
         ));
     }
+    let (permission_scope, token_resource) = resolve_mint_token_scope(arguments, account)?;
     let selected_groups = validate_selected_permission_groups(
         &arguments.permissions,
         inventory.result.get("result").unwrap_or(&Value::Null),
     )?;
-    validate_permission_group_resource_scope(&selected_groups, "com.cloudflare.api.account")?;
+    validate_permission_group_resource_scope(&selected_groups, permission_scope)?;
     let selected_group_ids = selected_groups
         .iter()
         .filter_map(|group| group.get("id").and_then(Value::as_str))
@@ -8341,18 +8488,12 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
         .iter()
         .map(|evidence| evidence.content_hash.clone())
         .collect::<Vec<_>>();
-    let mut body = json!({
-        "name": arguments.name,
-        "policies": [{
-            "effect": "allow",
-            "permission_groups": selected_group_ids.iter().map(|id| json!({"id": id})).collect::<Vec<_>>(),
-            "resources": {format!("com.cloudflare.api.account.{account}"): "*"}
-        }]
-    });
-    if let Some(hours) = arguments.ttl_hours {
-        body["expires_on"] =
-            json!((Utc::now() + ChronoDuration::hours(i64::from(hours))).to_rfc3339());
-    }
+    let body = build_mint_policy_body(
+        &arguments.name,
+        &selected_group_ids,
+        &token_resource,
+        arguments.ttl_hours,
+    );
     let catalog = ensure_catalog(store).await?;
     let capability_id = if arguments.user {
         "user-api-tokens-create-token"
@@ -8387,6 +8528,8 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
                 "source_capability_id": inventory_contract.capability_id,
                 "selected_groups": selected_groups,
                 "selected_groups_hash": selected_groups_hash,
+                "token_resource": token_resource,
+                "permission_scope": permission_scope,
                 "evidence_hashes": inventory_evidence_hashes,
             }
         }),
@@ -10702,13 +10845,14 @@ mod tests {
         apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
         apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
         bind_required_empty_compensation_body, blocked_capability_envelope,
-        boundary_response_artifact, call_command, capability_call_argv, compensation_request,
-        execute_read, find_secret_value, force_ipv4_from, guide_document, guide_stage_commands,
-        http_client, is_live_plan_precondition_hash, is_secret_output_capability,
-        key_policy_approve, key_policy_list, key_policy_revoke, non_readback_verification_basis,
-        permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
-        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
-        preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
+        boundary_response_artifact, build_mint_policy_body, call_command, capability_call_argv,
+        compensation_request, execute_read, find_secret_value, force_ipv4_from, guide_document,
+        guide_stage_commands, http_client, is_live_plan_precondition_hash,
+        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
+        non_readback_verification_basis, permission_inventory_call, permission_inventory_envelope,
+        persist_prepared_plan, persist_secret_lifecycle,
+        persist_secret_lifecycle_and_reconcile_lineage, preflight_call_input,
+        preflight_standing_authority, prepare_r2_temporary_credentials_input,
         preserve_previous_catalog, query_object_from_pairs, read_import_secret, read_secret_file,
         reconcile_standing_lineage_from_plan, rectify_plan, redact_secret_result,
         request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
@@ -10726,9 +10870,11 @@ mod tests {
         sink_secret_result, store_imported_api_token, validate_api_token_creation_contract,
         validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
-        validate_selected_permission_groups, validate_standing_authority_permission_inventory,
+        validate_permission_group_resource_scope, validate_selected_permission_groups,
+        validate_standing_authority_permission_inventory, validate_token_policy_body,
         validate_worker_script_secret_semantics, validate_zone_account_receipt_precondition,
-        validated_standing_lineage_token_id, workspace_resource_keys, zone_target,
+        validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
+        workspace_resource_keys, zone_target,
     };
     use crate::profiles::ProfilesConfig;
     use crate::{
@@ -14450,6 +14596,228 @@ mod tests {
     }
 
     #[test]
+    fn validate_zone_id_accepts_only_32_char_lowercase_hex() {
+        validate_zone_id("e826a542f6b80137a949a3291c1cad9c").expect("valid zone id");
+        // uppercase, wrong length, and non-hex are all rejected.
+        validate_zone_id("E826A542F6B80137A949A3291C1CAD9C").expect_err("uppercase");
+        validate_zone_id("e826a542").expect_err("too short");
+        validate_zone_id("g826a542f6b80137a949a3291c1cad9z").expect_err("non-hex");
+        validate_zone_id("").expect_err("empty");
+    }
+
+    #[test]
+    fn resource_scope_guard_admits_zone_groups_only_under_zone_scope() {
+        let zone_group = json!([{
+            "id": "e17beae8b8cb423a99b1730f21238bed",
+            "name": "Cache Purge",
+            "scopes": ["com.cloudflare.api.account.zone"]
+        }]);
+        let account_group = json!([{
+            "id": "group-a",
+            "name": "Workers Scripts Write",
+            "scopes": ["com.cloudflare.api.account"]
+        }]);
+        let zone = zone_group.as_array().expect("zone groups");
+        let account = account_group.as_array().expect("account groups");
+        // A zone-scoped group is admitted only under the zone scope.
+        validate_permission_group_resource_scope(zone, "com.cloudflare.api.account.zone")
+            .expect("zone group under zone scope");
+        validate_permission_group_resource_scope(zone, "com.cloudflare.api.account")
+            .expect_err("zone group cannot be minted under account scope");
+        // …and an account-only group cannot be minted under the zone scope.
+        validate_permission_group_resource_scope(account, "com.cloudflare.api.account.zone")
+            .expect_err("account group cannot be minted under zone scope");
+    }
+
+    #[test]
+    fn zone_scoped_token_creation_binds_the_zone_resource_and_rejects_drift() {
+        let capability = CapabilityV1::new(
+            "account-api-tokens-create-token",
+            "Create account token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        let zone = "e826a542f6b80137a949a3291c1cad9c";
+        let resource = format!("com.cloudflare.api.account.zone.{zone}");
+        let groups = json!([{
+            "id": "e17beae8b8cb423a99b1730f21238bed",
+            "name": "Cache Purge",
+            "scopes": ["com.cloudflare.api.account.zone"]
+        }]);
+        let groups_hash = hash_value(&groups).expect("group hash");
+        let adapter = json!({
+            "permission_inventory": {
+                "source_capability_id": "account-api-tokens-list-permission-groups",
+                "selected_groups": groups,
+                "selected_groups_hash": groups_hash,
+                "token_resource": resource,
+                "permission_scope": "com.cloudflare.api.account.zone",
+                "evidence_hashes": [format!("sha256:{}", "a".repeat(64))]
+            }
+        });
+        let input = CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            query: json!({}),
+            body: Some(json!({
+                "name":"cache purge token",
+                "policies":[{
+                    "effect":"allow",
+                    "permission_groups":[{"id":"e17beae8b8cb423a99b1730f21238bed"}],
+                    "resources":{resource.clone():"*"}
+                }]
+            })),
+            ..CallInput::default()
+        };
+        validate_api_token_creation_contract(&capability, &input, &adapter, "account-a")
+            .expect("zone-scoped token plan is valid");
+
+        // Body scoped to a different zone than the bound resource is rejected.
+        let mut drifted = input.clone();
+        drifted.body = Some(json!({
+            "name":"cache purge token",
+            "policies":[{
+                "effect":"allow",
+                "permission_groups":[{"id":"e17beae8b8cb423a99b1730f21238bed"}],
+                "resources":{"com.cloudflare.api.account.zone.ffffffffffffffffffffffffffffffff":"*"}
+            }]
+        }));
+        validate_api_token_creation_contract(&capability, &drifted, &adapter, "account-a")
+            .expect_err("resource drift off the bound zone is rejected");
+    }
+
+    #[test]
+    fn account_scope_claim_cannot_bind_a_zone_resource() {
+        // The cross-scope attack: claim whole-account permission scope (so the
+        // group check is lax) but bind a narrower-looking zone resource. The
+        // single-segment-under-scope guard must reject it.
+        let capability = CapabilityV1::new(
+            "account-api-tokens-create-token",
+            "Create account token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        let zone_resource = "com.cloudflare.api.account.zone.e826a542f6b80137a949a3291c1cad9c";
+        let groups = json!([{
+            "id": "group-a",
+            "name": "Workers Scripts Write",
+            "scopes": ["com.cloudflare.api.account", "com.cloudflare.api.account.zone"]
+        }]);
+        let groups_hash = hash_value(&groups).expect("group hash");
+        let adapter = json!({
+            "permission_inventory": {
+                "source_capability_id": "account-api-tokens-list-permission-groups",
+                "selected_groups": groups,
+                "selected_groups_hash": groups_hash,
+                "token_resource": zone_resource,
+                "permission_scope": "com.cloudflare.api.account",
+                "evidence_hashes": [format!("sha256:{}", "a".repeat(64))]
+            }
+        });
+        let input = CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            query: json!({}),
+            body: Some(json!({
+                "name":"mismatched token",
+                "policies":[{
+                    "effect":"allow",
+                    "permission_groups":[{"id":"group-a"}],
+                    "resources":{zone_resource:"*"}
+                }]
+            })),
+            ..CallInput::default()
+        };
+        let error =
+            validate_api_token_creation_contract(&capability, &input, &adapter, "account-a")
+                .expect_err("account scope claim with a zone resource is rejected");
+        assert!(
+            error.to_string().contains("not a single concrete resource"),
+            "{error}"
+        );
+
+        // A wildcard id (`*`) is single-segment but not a concrete resource;
+        // the guard must reject it so a tampered metadata resource cannot widen
+        // to the whole account under an account scope claim.
+        let mut wildcard = adapter.clone();
+        wildcard["permission_inventory"]["token_resource"] = json!("com.cloudflare.api.account.*");
+        let wildcard_input = CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            query: json!({}),
+            body: Some(json!({
+                "name":"wildcard token",
+                "policies":[{
+                    "effect":"allow",
+                    "permission_groups":[{"id":"group-a"}],
+                    "resources":{"com.cloudflare.api.account.*":"*"}
+                }]
+            })),
+            ..CallInput::default()
+        };
+        validate_api_token_creation_contract(&capability, &wildcard_input, &wildcard, "account-a")
+            .expect_err("a wildcard resource id is rejected");
+    }
+
+    #[test]
+    fn token_policy_body_accepts_the_bound_resource_verbatim() {
+        // Backward-compat + zone: validate_token_policy_body scopes to exactly
+        // the expected resource, whatever its shape.
+        let account_body = json!({
+            "policies":[{
+                "effect":"allow",
+                "permission_groups":[{"id":"group-a"}],
+                "resources":{"com.cloudflare.api.account.account-a":"*"}
+            }]
+        });
+        validate_token_policy_body(
+            Some(&account_body),
+            &["group-a".to_owned()],
+            "com.cloudflare.api.account.account-a",
+        )
+        .expect("account resource accepted");
+        let zone_body = json!({
+            "policies":[{
+                "effect":"allow",
+                "permission_groups":[{"id":"group-a"}],
+                "resources":{"com.cloudflare.api.account.zone.e826a542f6b80137a949a3291c1cad9c":"*"}
+            }]
+        });
+        validate_token_policy_body(
+            Some(&zone_body),
+            &["group-a".to_owned()],
+            "com.cloudflare.api.account.zone.e826a542f6b80137a949a3291c1cad9c",
+        )
+        .expect("zone resource accepted");
+        // Mismatch between the bound resource and the body is rejected.
+        validate_token_policy_body(
+            Some(&zone_body),
+            &["group-a".to_owned()],
+            "com.cloudflare.api.account.account-a",
+        )
+        .expect_err("resource mismatch rejected");
+    }
+
+    #[test]
+    fn mint_policy_body_expires_on_is_cloudflare_compatible() {
+        // Cloudflare rejects the fractional-second `+00:00` form that
+        // `to_rfc3339()` emits with a 400; it requires seconds-precision UTC
+        // with a `Z` suffix (e.g. 2005-12-30T01:02:03Z).
+        let body = build_mint_policy_body(
+            "t",
+            &["group-a".to_owned()],
+            "com.cloudflare.api.account.zone.e826a542f6b80137a949a3291c1cad9c",
+            Some(1),
+        );
+        let expires = body["expires_on"].as_str().expect("expires_on present");
+        assert!(expires.ends_with('Z'), "{expires}");
+        assert!(!expires.contains('.'), "no fractional seconds: {expires}");
+        assert!(!expires.contains('+'), "no numeric offset: {expires}");
+        // Cloudflare's parser and cfctl's standing-mint parser both accept it.
+        chrono::DateTime::parse_from_rfc3339(expires).expect("valid rfc3339");
+        // No TTL → no expiry field.
+        let no_ttl = build_mint_policy_body("t", &["group-a".to_owned()], "res", None);
+        assert!(no_ttl.get("expires_on").is_none());
+    }
+
+    #[test]
     fn user_token_creation_requires_its_own_inventory_and_account_compatible_groups() {
         let user_capability = CapabilityV1::new(
             "user-api-tokens-create-token",
@@ -14523,7 +14891,12 @@ mod tests {
             "account-a",
         )
         .expect_err("zone-only permission cannot be attached to an account resource");
-        assert!(incompatible.to_string().contains("account resource scope"));
+        assert!(
+            incompatible.to_string().contains(
+                "does not support the required resource scope `com.cloudflare.api.account`"
+            ),
+            "{incompatible}"
+        );
     }
 
     #[test]
@@ -16466,6 +16839,98 @@ mod tests {
         assert_eq!(redacted["result"]["status"], "active");
         assert_eq!(redacted["result"]["value"], "[SUNK]");
         assert!(!redacted.to_string().contains("must-not-survive"));
+    }
+
+    #[test]
+    fn verification_evidence_redacts_secret_readback_fields_storage_redaction_misses() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = r2_temporary_credentials_capability();
+        assert!(should_redact_secret_response(&capability));
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"selectors":{"account_id":"account-a"}}),
+        )
+        .expect("plan");
+        // A verifier readback carrying camelCase secret fields the storage-layer
+        // `redact_json` does not catch (no `_secret`/`_token` suffix). Only the
+        // defensive `redact_secret_result` pass on this evidence class stops them.
+        let verification = OperationVerificationV1 {
+            strategy: "sink_write_and_source_response_status".to_owned(),
+            passed: true,
+            basis: "sink-only receipt".to_owned(),
+            readback: CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: json!({
+                    "accessKeyId":"AKIAEXAMPLE",
+                    "secretAccessKey":"must-not-survive",
+                    "sessionToken":"also-must-not-survive"
+                }),
+                errors: vec![],
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        };
+        let outcome =
+            verification_outcome(&store, &mut plan, verification).expect("verification outcome");
+        let evidence = outcome.evidence.expect("post-change evidence recorded");
+        let stored = fs::read_to_string(&evidence.path).expect("evidence file");
+        assert!(
+            !stored.contains("must-not-survive"),
+            "secretAccessKey leaked into verification evidence: {stored}"
+        );
+        assert!(
+            !stored.contains("also-must-not-survive"),
+            "sessionToken leaked into verification evidence: {stored}"
+        );
+        assert!(stored.contains("[SUNK]"), "expected redaction marker");
+    }
+
+    #[test]
+    fn boundary_artifact_never_lifts_a_secret_field_into_resource_id() {
+        let mut capability = CapabilityV1::new(
+            "tokens-create",
+            "Create token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        // A (hypothetically drifted) identity pointer naming a secret field.
+        capability.created_resource = Some(CreatedResourceContractV1 {
+            detail_path: "/accounts/{account_id}/tokens/{value}".to_owned(),
+            identity_selector: "value".to_owned(),
+            response_result_identity_pointer: "/value".to_owned(),
+            read_capability_id: "tokens-get".to_owned(),
+            delete_capability_id: "tokens-delete".to_owned(),
+            verified_response_fields: vec!["name".to_owned()],
+        });
+        let plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("plan");
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({"id":"abc","value":"super-secret-token"}),
+            errors: vec![],
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let artifact = boundary_response_artifact(&plan, &response, None);
+        assert!(
+            artifact["resource_id"].is_null(),
+            "a secret field must never be lifted into resource_id: {artifact}"
+        );
+        assert!(!artifact.to_string().contains("super-secret-token"));
     }
 
     fn r2_temporary_credentials_capability() -> CapabilityV1 {

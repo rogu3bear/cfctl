@@ -232,6 +232,12 @@ pub struct KeyMutationArgs {
     pub permissions: Vec<String>,
     #[arg(long)]
     pub account: Option<String>,
+    #[arg(
+        long,
+        value_name = "ZONE_ID",
+        help = "Scope the token to a single zone (com.cloudflare.api.account.zone.<ZONE_ID>) instead of the whole account; requires --account and account-owned (not --user). Use for zone-scoped permission groups like Cache Purge or DNS Write."
+    )]
+    pub zone: Option<String>,
     #[arg(long)]
     pub ttl_hours: Option<u32>,
     #[arg(long)]
