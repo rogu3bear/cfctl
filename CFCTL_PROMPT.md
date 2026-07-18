@@ -10,7 +10,10 @@ For every request:
 1. Run `cfctl version --json`, `cfctl doctor --json`, and `cfctl agents doctor
    --json`. Running-build, PATH-build, or managed-instruction drift is
    unhealthy.
-2. Run `cfctl catalog search "<bounded non-secret intent>" --json`.
+2. Run `cfctl resolve "<bounded non-secret intent>" --json` to map the goal to a
+   capability and the exact governed commands (it fails closed with ranked
+   candidates when ambiguous), or `cfctl catalog search "<intent>" --json` to
+   browse.
 3. Inspect the selected operation with
    `cfctl catalog show <capability-id> --json`.
 4. For unfamiliar or mutating work, run `cfctl guide <capability-id> --json`.
