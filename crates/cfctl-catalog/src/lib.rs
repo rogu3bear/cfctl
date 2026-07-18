@@ -3553,6 +3553,10 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
         }
     } else if r2_temporary_credentials_operation_supported(capability) {
         classify_r2_temporary_credentials(capability);
+    } else if email_routing_mutation_supported(capability) {
+        classify_email_routing_mutation(capability);
+    } else if email_routing_settings_toggle_supported(capability) {
+        classify_email_routing_settings_toggle(capability);
     } else if zone_cache_purge_operation_supported(capability) {
         classify_zone_cache_purge(capability);
     } else if let Some(kind) = oauth_client_secret_operation_kind(capability) {
@@ -4408,6 +4412,158 @@ fn finalize_r2_temporary_credentials_contract(
 /// this guard because they are inserted after classification.
 fn zone_cache_purge_operation_supported(capability: &CapabilityV1) -> bool {
     ZONE_CACHE_PURGE_BASE_IDS.contains(&capability.id.as_str()) && capability.method == "POST"
+}
+
+/// Email Routing create/update mutations whose only blocking gaps are
+/// risk/effect/cost. Their verification (created-resource / same-path update)
+/// and rollback are already bound by the generic post-normalization
+/// classifiers; this only supplies the missing risk/effect/cost so the contract
+/// completes. Table is (id, method, product, permission) and the guard matches a
+/// capability against its row exactly — fail-closed on any drift. The PATCH
+/// `update-destination-address` op is deliberately excluded: its only writable
+/// field (`status`) is absent from the readback result, so it cannot be
+/// readback-verified and stays blocked.
+const EMAIL_ROUTING_MUTATION_CONTRACTS: &[(&str, &str, &str, &str)] = &[
+    (
+        "email-routing-destination-addresses-create-a-destination-address",
+        "POST",
+        "Email Routing destination addresses",
+        "Email Routing Addresses Write",
+    ),
+    (
+        "email-routing-routing-rules-create-routing-rule",
+        "POST",
+        "Email Routing routing rules",
+        "Email Routing Rules Write",
+    ),
+    (
+        "email-routing-routing-rules-update-routing-rule",
+        "PUT",
+        "Email Routing routing rules",
+        "Email Routing Rules Write",
+    ),
+    (
+        "email-routing-routing-rules-update-catch-all-rule",
+        "PUT",
+        "Email Routing routing rules",
+        "Email Routing Rules Write",
+    ),
+];
+
+fn email_routing_mutation_supported(capability: &CapabilityV1) -> bool {
+    EMAIL_ROUTING_MUTATION_CONTRACTS
+        .iter()
+        .any(|(id, method, product, permission)| {
+            capability.id == *id
+                && capability.method == *method
+                && capability.product == *product
+                && capability.permissions == [*permission]
+                && capability
+                    .response_contract
+                    .as_ref()
+                    .is_some_and(|contract| {
+                        contract.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                    })
+        })
+}
+
+fn classify_email_routing_mutation(capability: &mut CapabilityV1) {
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.known = true;
+    capability.cost.incremental = false;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.billing_model = BillingModelV1::None;
+    capability.cost.exposure = CostExposureV1::None;
+    capability.cost.basis = Some(
+        "creating or updating an Email Routing destination address or routing rule has no direct per-operation charge; Email Routing is a free zone feature"
+            .to_owned(),
+    );
+    capability.cost.references = vec![KnowledgeReferenceV1 {
+        title: "Email Routing".to_owned(),
+        url: "https://developers.cloudflare.com/email-routing/".to_owned(),
+        source: "official Cloudflare docs".to_owned(),
+    }];
+    capability.entitlement.available = Some(true);
+    // Returning true from classify_operation_specific_contract short-circuits
+    // the sentinel that classify() would otherwise set at its tail; restore it
+    // so the generic post-normalization classifiers bind the real created-
+    // resource / same-path-update verifier and rollback contract.
+    capability.verification.required = true;
+    "post_change_read_or_operation_specific_verifier"
+        .clone_into(&mut capability.verification.strategy);
+}
+
+/// The Email Routing enable/disable toggles, paired with the intended
+/// `enabled` state each one reports. Only the two crisply-verifiable toggles
+/// are listed: `unlock`, `enable-dns`, and `disable-dns` return the settings
+/// object rather than the sub-resource they mutate, so they lack a crisp
+/// operation-specific verifier and stay honestly blocked.
+const EMAIL_ROUTING_SETTINGS_TOGGLES: &[(&str, bool)] = &[
+    ("email-routing-settings-enable-email-routing", true),
+    ("email-routing-settings-disable-email-routing", false),
+];
+
+fn email_routing_settings_toggle_supported(capability: &CapabilityV1) -> bool {
+    EMAIL_ROUTING_SETTINGS_TOGGLES
+        .iter()
+        .any(|(id, _)| capability.id == *id)
+        && capability.method == "POST"
+        && capability.product == "Email Routing settings"
+        && capability.permissions == ["Zone Settings Write"]
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|contract| {
+                contract.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            })
+}
+
+/// Closes the Email Routing enable/disable toggles. Unlike the create/update
+/// mutations, these action endpoints have no same-path readback of a resource,
+/// so the generic classifiers cannot bind a verifier — this classifier sets the
+/// operation-specific `enabled`-state verifier directly (the cache-purge model)
+/// so it survives the generic post-normalization pass, which only rebinds
+/// capabilities still carrying the sentinel strategy. The generic "disable"
+/// keyword heuristic would mark disable Destructive; that is legitimately
+/// superseded here — the toggle is a scoped, reversible setting change.
+fn classify_email_routing_settings_toggle(capability: &mut CapabilityV1) {
+    let enabling = capability.id == "email-routing-settings-enable-email-routing";
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.known = true;
+    capability.cost.incremental = false;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.billing_model = BillingModelV1::None;
+    capability.cost.exposure = CostExposureV1::None;
+    capability.cost.basis = Some(
+        "enabling or disabling Email Routing toggles a free zone setting and carries no direct per-operation charge"
+            .to_owned(),
+    );
+    capability.cost.references = vec![KnowledgeReferenceV1 {
+        title: "Email Routing".to_owned(),
+        url: "https://developers.cloudflare.com/email-routing/".to_owned(),
+        source: "official Cloudflare docs".to_owned(),
+    }];
+    capability.entitlement.available = Some(true);
+    // The toggle is logically reversible by its inverse, but cfctl has no
+    // registered auto-compensation for it, so rollback stays unsupported with an
+    // explanatory warning (the cache-purge model). Disabling additionally drops
+    // in-flight mail, which re-enabling cannot recover — stated plainly.
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(if enabling {
+        "reversible by disabling Email Routing (POST /zones/{zone_id}/email/routing/disable); cfctl does not auto-compensate, so reversal is a separate governed operation"
+            .to_owned()
+    } else {
+        "reversible by re-enabling Email Routing (POST /zones/{zone_id}/email/routing/enable); cfctl does not auto-compensate. While routing is disabled, inbound messages are not routed and are not retroactively delivered after re-enabling"
+            .to_owned()
+    });
+    capability.verification.required = true;
+    "email_routing_settings_response_reports_enabled_state"
+        .clone_into(&mut capability.verification.strategy);
 }
 
 /// Classifies the base cache-purge capability. Verification is left at the
@@ -8424,5 +8580,185 @@ const fn adapter_status_name(status: AdapterStatus) -> &'static str {
         AdapterStatus::DelegatedCli => "delegated_cli",
         AdapterStatus::GovernedUi => "governed_ui",
         AdapterStatus::Blocked => "blocked",
+    }
+}
+
+#[cfg(test)]
+mod email_routing_tests {
+    use super::*;
+
+    fn envelope_response() -> ResponseContractV1 {
+        ResponseContractV1 {
+            success_statuses: vec!["200".to_owned()],
+            success_media_types: vec!["application/json".to_owned()],
+            body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+        }
+    }
+
+    fn cap(id: &str, method: &str, product: &str, permission: &str) -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(id, "t", method, "/p");
+        product.clone_into(&mut capability.product);
+        capability.permissions = vec![permission.to_owned()];
+        capability.response_contract = Some(envelope_response());
+        capability
+    }
+
+    #[test]
+    fn guard_matches_only_the_four_in_scope_ops() {
+        // Exactly the four rows in EMAIL_ROUTING_MUTATION_CONTRACTS match.
+        for (id, method, product, permission) in EMAIL_ROUTING_MUTATION_CONTRACTS {
+            assert!(
+                email_routing_mutation_supported(&cap(id, method, product, permission)),
+                "expected {id} to match"
+            );
+        }
+        // The PATCH update-destination-address is deliberately excluded (its
+        // status field is not readback-verifiable) — it is not in the table.
+        assert!(!email_routing_mutation_supported(&cap(
+            "email-routing-destination-addresses-update-destination-address",
+            "PATCH",
+            "Email Routing destination addresses",
+            "Email Routing Addresses Write",
+        )));
+    }
+
+    #[test]
+    fn guard_fails_closed_on_drift() {
+        let base = (
+            "email-routing-routing-rules-create-routing-rule",
+            "POST",
+            "Email Routing routing rules",
+            "Email Routing Rules Write",
+        );
+        // wrong permission
+        assert!(!email_routing_mutation_supported(&cap(
+            base.0,
+            base.1,
+            base.2,
+            "Zone Write"
+        )));
+        // wrong product
+        assert!(!email_routing_mutation_supported(&cap(
+            base.0, base.1, "Zone", base.3
+        )));
+        // wrong method
+        assert!(!email_routing_mutation_supported(&cap(
+            base.0, "DELETE", base.2, base.3
+        )));
+        // empty permission (never fabricated)
+        let mut no_perm = cap(base.0, base.1, base.2, base.3);
+        no_perm.permissions.clear();
+        assert!(!email_routing_mutation_supported(&no_perm));
+        // non-envelope response
+        let mut no_env = cap(base.0, base.1, base.2, base.3);
+        no_env.response_contract = None;
+        assert!(!email_routing_mutation_supported(&no_env));
+    }
+
+    #[test]
+    fn classifier_sets_scoped_write_zero_cost_and_the_sentinel() {
+        let mut capability = cap(
+            "email-routing-routing-rules-create-routing-rule",
+            "POST",
+            "Email Routing routing rules",
+            "Email Routing Rules Write",
+        );
+        classify_email_routing_mutation(&mut capability);
+        assert_eq!(capability.risk, RiskClass::ScopedWrite);
+        assert_eq!(capability.effect, EffectClass::ReversibleWrite);
+        assert!(capability.cost.known);
+        assert!(!capability.cost.incremental);
+        assert_eq!(capability.cost.maximum, Some(0.0));
+        assert_eq!(capability.entitlement.available, Some(true));
+        // Sentinel restored so the generic post-normalization classifiers bind
+        // the real created-resource / same-path verifier.
+        assert_eq!(
+            capability.verification.strategy,
+            "post_change_read_or_operation_specific_verifier"
+        );
+        assert!(capability.verification.required);
+    }
+
+    fn settings_toggle(id: &str) -> CapabilityV1 {
+        let mut capability = cap(id, "POST", "Email Routing settings", "Zone Settings Write");
+        // The action endpoints target zone-scoped setting paths.
+        "/zones/{zone_id}/email/routing/enable".clone_into(&mut capability.path);
+        capability.account_scope = "zone".to_owned();
+        capability
+    }
+
+    #[test]
+    fn settings_guard_matches_only_enable_and_disable() {
+        for (id, _) in EMAIL_ROUTING_SETTINGS_TOGGLES {
+            assert!(
+                email_routing_settings_toggle_supported(&settings_toggle(id)),
+                "expected {id} to match"
+            );
+        }
+        // unlock / enable-dns return the settings object rather than the
+        // sub-resource they mutate, so they are deliberately out of scope.
+        assert!(!email_routing_settings_toggle_supported(&settings_toggle(
+            "email-routing-settings-unlock-email-routing"
+        )));
+        assert!(!email_routing_settings_toggle_supported(&settings_toggle(
+            "email-routing-settings-enable-email-routing-dns"
+        )));
+    }
+
+    #[test]
+    fn settings_guard_fails_closed_on_drift() {
+        let id = "email-routing-settings-enable-email-routing";
+        // wrong method
+        let mut wrong_method = settings_toggle(id);
+        "GET".clone_into(&mut wrong_method.method);
+        assert!(!email_routing_settings_toggle_supported(&wrong_method));
+        // wrong permission
+        let mut wrong_perm = settings_toggle(id);
+        wrong_perm.permissions = vec!["Zone Write".to_owned()];
+        assert!(!email_routing_settings_toggle_supported(&wrong_perm));
+        // empty permission (never fabricated)
+        let mut no_perm = settings_toggle(id);
+        no_perm.permissions.clear();
+        assert!(!email_routing_settings_toggle_supported(&no_perm));
+        // wrong product
+        let mut wrong_product = settings_toggle(id);
+        "Zone".clone_into(&mut wrong_product.product);
+        assert!(!email_routing_settings_toggle_supported(&wrong_product));
+        // non-envelope response
+        let mut no_env = settings_toggle(id);
+        no_env.response_contract = None;
+        assert!(!email_routing_settings_toggle_supported(&no_env));
+    }
+
+    #[test]
+    fn settings_classifier_closes_the_contract_with_the_direct_verifier() {
+        for (id, _) in EMAIL_ROUTING_SETTINGS_TOGGLES {
+            let mut capability = settings_toggle(id);
+            capability.mutating = true;
+            capability.adapter_status = AdapterStatus::DynamicApi;
+            classify_email_routing_settings_toggle(&mut capability);
+            assert_eq!(capability.risk, RiskClass::ScopedWrite, "{id}");
+            assert_eq!(capability.effect, EffectClass::ReversibleWrite, "{id}");
+            assert!(
+                capability.cost.known && !capability.cost.incremental,
+                "{id}"
+            );
+            assert_eq!(capability.cost.maximum, Some(0.0), "{id}");
+            assert_eq!(capability.entitlement.available, Some(true), "{id}");
+            // The operation-specific verifier is set directly (not the
+            // sentinel), because these toggles have no same-path readback.
+            assert_eq!(
+                capability.verification.strategy,
+                "email_routing_settings_response_reports_enabled_state",
+                "{id}"
+            );
+            assert!(capability.verification_contract_supported(), "{id}");
+            // Contract is complete: no residual mutation gaps → unblocked.
+            assert!(
+                capability.mutation_contract_gaps().is_empty(),
+                "{id} residual gaps: {:?}",
+                capability.mutation_contract_gaps()
+            );
+        }
     }
 }

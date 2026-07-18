@@ -436,6 +436,10 @@ impl Executor {
             return self.verify_cache_purge(plan, apply_response, input);
         }
 
+        if strategy == "email_routing_settings_response_reports_enabled_state" {
+            return self.verify_email_routing_settings(plan, apply_response);
+        }
+
         if is_delete_verifier(strategy) {
             return self
                 .verify_resource_delete(plan, apply_response, input, credential)
@@ -545,6 +549,62 @@ impl Executor {
             None => (
                 false,
                 "cache purge response did not report a result.id; acceptance and scope cannot be confirmed".to_owned(),
+            ),
+        };
+        Ok(OperationVerificationV1 {
+            strategy,
+            passed,
+            basis,
+            readback: apply_response.clone(),
+        })
+    }
+
+    /// Verifies an Email Routing enable/disable toggle by asserting the settings
+    /// object the action endpoint returns reports `enabled` at the intended
+    /// value (`true` for enable, `false` for disable). Like the cache-purge
+    /// verifier this is deliberately a no-readback verifier: the `apply_response`
+    /// is the evidence, and the basis states plainly it proves the setting now
+    /// reports the intended value, not that MX/DNS propagation or live mail
+    /// delivery has converged.
+    // Takes `&self` to sit uniformly beside the async `verify_*` siblings the
+    // dispatcher calls as methods, though this no-readback verifier needs no
+    // client state of its own.
+    #[allow(clippy::unused_self)]
+    fn verify_email_routing_settings(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+    ) -> Result<OperationVerificationV1> {
+        let strategy = plan.capability.verification.strategy.clone();
+        let expected_enabled = match plan.capability.id.as_str() {
+            "email-routing-settings-enable-email-routing" => true,
+            "email-routing-settings-disable-email-routing" => false,
+            other => {
+                return Err(CloudflareError::MissingVerificationTarget(format!(
+                    "the Email Routing settings verifier is bound to an unexpected capability `{other}`"
+                )));
+            }
+        };
+        let reported = apply_response
+            .result
+            .pointer("/enabled")
+            .and_then(Value::as_bool);
+        let (passed, basis) = match reported {
+            Some(state) if state == expected_enabled => (
+                true,
+                format!(
+                    "Cloudflare accepted the request and its Email Routing settings response reports enabled={state}, matching the intended state; this proves the routing setting now reports the target value, not that MX/DNS propagation or live mail delivery has converged"
+                ),
+            ),
+            Some(state) => (
+                false,
+                format!(
+                    "Email Routing settings response reports enabled={state}, but the operation intended enabled={expected_enabled}; the setting change cannot be confirmed"
+                ),
+            ),
+            None => (
+                false,
+                "Email Routing settings response did not report a boolean result.enabled; the setting change cannot be confirmed".to_owned(),
             ),
         };
         Ok(OperationVerificationV1 {
@@ -2622,13 +2682,52 @@ fn selector_can_be_response_id(selector: &str) -> bool {
         || selector.ends_with("_identifier")
 }
 
+// Kept in sync with `cfctl_core::response_identity_pointer_supported` — the
+// classifier gate (core) and the executor verify gate (here) must accept the
+// same identity pointers, or a capability the catalog marks `dynamic_api` fails
+// closed at verify time. The `database_id`->`/uuid` branch mirrors core so D1
+// database creates (identity `database_id`, pointer `/uuid`) verify instead of
+// falsely landing in RectificationRequired after a successful create.
 fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
+    // Fail closed: an identity pointer that names a secret field is never
+    // supported (mirrors the core gate), so no verifier dereferences secret
+    // material as a resource identity.
+    if cfctl_core::pointer_names_secret_field(pointer) {
+        return false;
+    }
     (selector_can_be_response_id(selector) && pointer == "/id")
         || (selector.ends_with("_name") && pointer == "/name")
+        || (selector == "database_id" && pointer == "/uuid")
         || (!selector
             .chars()
             .any(|character| matches!(character, '/' | '~'))
             && pointer.strip_prefix('/') == Some(selector))
+}
+
+#[cfg(test)]
+mod identity_pointer_parity_tests {
+    use super::response_identity_pointer_supported;
+
+    #[test]
+    fn executor_gate_matches_core_including_database_id_uuid() {
+        // Regression: the D1 create contract (identity `database_id`, pointer
+        // `/uuid`) is classified `dynamic_api` by the core gate, so the executor
+        // gate must accept it too — otherwise a successful create verifies
+        // false and lands in RectificationRequired.
+        assert!(response_identity_pointer_supported("database_id", "/uuid"));
+        // Standard identities still hold.
+        assert!(response_identity_pointer_supported("id", "/id"));
+        assert!(response_identity_pointer_supported("widget_name", "/name"));
+        assert!(response_identity_pointer_supported("slug", "/slug"));
+        // The secret-field guard still fails closed for every shape.
+        assert!(!response_identity_pointer_supported("value", "/value"));
+        assert!(!response_identity_pointer_supported(
+            "secretAccessKey",
+            "/secretAccessKey"
+        ));
+        // A pointer that does not match its selector is rejected.
+        assert!(!response_identity_pointer_supported("database_id", "/name"));
+    }
 }
 
 fn validate_created_collection_resource_target(

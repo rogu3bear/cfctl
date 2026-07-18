@@ -7286,11 +7286,22 @@ fn boundary_response_artifact(
                 .map(|target| target.response_result_identity_pointer.as_str())
         })
         .unwrap_or("/id");
+    // Fail closed: never lift a secret field into the journal's `resource_id`.
+    // The core contract gate already refuses a secret-named identity pointer, so
+    // this is belt-and-suspenders against a pointer that slipped through.
+    let resource_id = if cfctl_core::pointer_names_secret_field(identity_pointer) {
+        None
+    } else {
+        response
+            .result
+            .pointer(identity_pointer)
+            .and_then(Value::as_str)
+    };
     json!({
         "apply_evidence_hash": apply_evidence.map(|evidence| evidence.content_hash.as_str()),
         "http_status": response.status,
         "success": response.success,
-        "resource_id": response.result.pointer(identity_pointer).and_then(Value::as_str),
+        "resource_id": resource_id,
         "resource_status": response.result.get("status").and_then(Value::as_str),
         "etag": response.etag,
         "cf_ray": response.cf_ray,
@@ -7562,10 +7573,22 @@ fn verification_outcome(
     } else {
         PlanStatus::RectificationRequired
     };
-    let evidence = Some(store.write_evidence(
-        EvidenceClass::PostChangeVerification,
-        &serde_json::to_value(&verification)?,
-    )?);
+    // Defense in depth: the verifier readback is the full Cloudflare response,
+    // which for a secret-sensitive capability can carry secret material. Apply
+    // the same secret-aware redaction the Apply receipt gets before this reaches
+    // evidence — the storage-layer `redact_json` alone misses camelCase/bare
+    // secret fields (e.g. `secretAccessKey`, `sessionToken`, `value`).
+    let mut verification_value = serde_json::to_value(&verification)?;
+    if should_redact_secret_response(&plan.capability)
+        && let Some(readback) = verification_value.get("readback")
+    {
+        let redacted = redact_secret_result(readback);
+        if let Some(object) = verification_value.as_object_mut() {
+            object.insert("readback".to_owned(), redacted);
+        }
+    }
+    let evidence =
+        Some(store.write_evidence(EvidenceClass::PostChangeVerification, &verification_value)?);
     let error = (!verification.passed).then(|| ErrorV1 {
         code: "CFCTL_VERIFICATION_FAILED".to_owned(),
         message: verification.basis.clone(),
@@ -10850,8 +10873,8 @@ mod tests {
         validate_permission_group_resource_scope, validate_selected_permission_groups,
         validate_standing_authority_permission_inventory, validate_token_policy_body,
         validate_worker_script_secret_semantics, validate_zone_account_receipt_precondition,
-        validate_zone_id, validated_standing_lineage_token_id, workspace_resource_keys,
-        zone_target,
+        validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
+        workspace_resource_keys, zone_target,
     };
     use crate::profiles::ProfilesConfig;
     use crate::{
@@ -16816,6 +16839,98 @@ mod tests {
         assert_eq!(redacted["result"]["status"], "active");
         assert_eq!(redacted["result"]["value"], "[SUNK]");
         assert!(!redacted.to_string().contains("must-not-survive"));
+    }
+
+    #[test]
+    fn verification_evidence_redacts_secret_readback_fields_storage_redaction_misses() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = r2_temporary_credentials_capability();
+        assert!(should_redact_secret_response(&capability));
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"selectors":{"account_id":"account-a"}}),
+        )
+        .expect("plan");
+        // A verifier readback carrying camelCase secret fields the storage-layer
+        // `redact_json` does not catch (no `_secret`/`_token` suffix). Only the
+        // defensive `redact_secret_result` pass on this evidence class stops them.
+        let verification = OperationVerificationV1 {
+            strategy: "sink_write_and_source_response_status".to_owned(),
+            passed: true,
+            basis: "sink-only receipt".to_owned(),
+            readback: CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: json!({
+                    "accessKeyId":"AKIAEXAMPLE",
+                    "secretAccessKey":"must-not-survive",
+                    "sessionToken":"also-must-not-survive"
+                }),
+                errors: vec![],
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        };
+        let outcome =
+            verification_outcome(&store, &mut plan, verification).expect("verification outcome");
+        let evidence = outcome.evidence.expect("post-change evidence recorded");
+        let stored = fs::read_to_string(&evidence.path).expect("evidence file");
+        assert!(
+            !stored.contains("must-not-survive"),
+            "secretAccessKey leaked into verification evidence: {stored}"
+        );
+        assert!(
+            !stored.contains("also-must-not-survive"),
+            "sessionToken leaked into verification evidence: {stored}"
+        );
+        assert!(stored.contains("[SUNK]"), "expected redaction marker");
+    }
+
+    #[test]
+    fn boundary_artifact_never_lifts_a_secret_field_into_resource_id() {
+        let mut capability = CapabilityV1::new(
+            "tokens-create",
+            "Create token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        // A (hypothetically drifted) identity pointer naming a secret field.
+        capability.created_resource = Some(CreatedResourceContractV1 {
+            detail_path: "/accounts/{account_id}/tokens/{value}".to_owned(),
+            identity_selector: "value".to_owned(),
+            response_result_identity_pointer: "/value".to_owned(),
+            read_capability_id: "tokens-get".to_owned(),
+            delete_capability_id: "tokens-delete".to_owned(),
+            verified_response_fields: vec!["name".to_owned()],
+        });
+        let plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("plan");
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({"id":"abc","value":"super-secret-token"}),
+            errors: vec![],
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let artifact = boundary_response_artifact(&plan, &response, None);
+        assert!(
+            artifact["resource_id"].is_null(),
+            "a secret field must never be lifted into resource_id: {artifact}"
+        );
+        assert!(!artifact.to_string().contains("super-secret-token"));
     }
 
     fn r2_temporary_credentials_capability() -> CapabilityV1 {
