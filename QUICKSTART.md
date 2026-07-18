@@ -29,26 +29,30 @@ cfctl doctor --json
 cfctl agents doctor --json
 ```
 
-The published installers below are not live yet: `cfctl.io` is not serving them
-and no release tag has been published. Both are pending operator actions (see
-the README's external activation boundary), so use the source-install paths
-above until those steps complete.
-
-On macOS, `cargo xtask release` assembles a Homebrew formula (`cfctl.rb`) that
-installs the signed `cfctl-aarch64-apple-darwin` or `cfctl-x86_64-apple-darwin`
-binary from the matching GitHub release tag:
+Prebuilt binaries ship from the GitHub release. Releases are unsigned by
+operator decision: integrity is checksum-based, so verify every download
+against the release's `SHA256SUMS` (each binary is also reproducible from the
+tagged source and carries an SPDX SBOM).
 
 ```bash
+curl -fsSLO https://github.com/rogu3bear/cfctl/releases/download/v1.0.0/cfctl-aarch64-apple-darwin
+curl -fsSLO https://github.com/rogu3bear/cfctl/releases/download/v1.0.0/SHA256SUMS
+shasum -a 256 --check --ignore-missing SHA256SUMS
+install -m 0755 cfctl-aarch64-apple-darwin ~/.local/bin/cfctl
+```
+
+On macOS you can instead use the release's Homebrew formula, which pins the
+same checksums:
+
+```bash
+curl -fsSLO https://github.com/rogu3bear/cfctl/releases/download/v1.0.0/cfctl.rb
 brew install --formula ./cfctl.rb
 ```
 
-On Linux, the release installer requires Cosign, verifies the release's signed
-checksum manifest against its exact Fulcio identity and issuer, and needs an
-existing release tag:
-
-```bash
-curl -fsSL https://cfctl.io/install.sh | CFCTL_VERSION=v1.0.0 sh
-```
+The identity-verifying Linux installer (`install.sh`) is not shipped while
+releases are unsigned; use the direct download + checksum path above with the
+`-unknown-linux-musl` binary for your architecture. `cfctl.io` hosting remains
+a pending operator action (see the README's external activation boundary).
 
 ## Discover Cloudflare
 
