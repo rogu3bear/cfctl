@@ -94,8 +94,6 @@ Docs access patterns worth remembering:
   https://developers.cloudflare.com/waf/reference/phases/
 - MCP servers for Cloudflare:
   https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/
-- Cloudflare docs AI tooling:
-  https://developers.cloudflare.com/style-guide/ai-tooling/
 
 Current capability watch links:
 

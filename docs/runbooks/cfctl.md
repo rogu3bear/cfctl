@@ -82,6 +82,14 @@ the returned zone and `account.id` to match the target and selected account.
 That ownership receipt is re-read before plan consumption; do not infer
 ownership from a profile label, workspace pin, or local IaC.
 
+## Exit codes
+
+Every invocation returns one of three exit codes. `0` is success. `1` is a
+handled failure that renders a `ResultEnvelopeV2`; every failure envelope
+carries a `next_step`. `2` is a clap usage error: the rejected arguments print
+as raw clap output, and an envelope appears only under `--json`, with error
+code `CFCTL_USAGE`.
+
 ## Authentication
 
 Day-to-day auth is a scoped API token imported out-of-band. Pipe it through
