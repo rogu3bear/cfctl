@@ -11,9 +11,11 @@ cfctl docs changes --json
 cfctl agents doctor --json
 ```
 
-Require the running and PATH identities reported by both doctors to match the
-same commit. Missing or legacy binaries, same-version/different-commit builds,
-and managed-instruction drift are unhealthy installation states.
+Require the PATH entry reported by both doctors to resolve to the running
+executable. A doctor never launches a different PATH executable to inspect it;
+invoke that binary directly with `cfctl version --json` if its self-reported
+identity is needed. Missing or different PATH executables and
+managed-instruction drift are unhealthy installation states.
 
 If a command reports `catalog content hash mismatch`, do not edit the stored
 hash. Run `cfctl catalog sync --json` to fetch a fresh official snapshot and

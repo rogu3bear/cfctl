@@ -371,9 +371,12 @@ cfctl agents install --all-detected
 cfctl agents doctor
 ```
 
-`version --json`, `doctor`, and `agents doctor` expose the running and PATH
-build identities. A missing or legacy PATH binary, a same-version binary from
-a different commit, or drifted managed instructions is unhealthy.
+`version --json` exposes the invoked binary's build identity. `doctor` and
+`agents doctor` trust the PATH build only when it resolves to that same
+executable. A missing or different PATH executable is not run by the health
+check and is unhealthy; invoke it directly with `cfctl version --json` when
+its self-reported identity is needed. Drifted managed instructions are also
+unhealthy.
 
 Natural language launches the configured agent once. Quote it: a bare single
 token that is not a known command fails closed with a usage error and a
