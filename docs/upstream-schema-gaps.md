@@ -1,5 +1,15 @@
 # Upstream Cloudflare OpenAPI gaps (root cause of the blocked-capability wall)
 
+> **Provenance — snapshot 2026-07-17.** Every hard count in this document (242
+> unannotated mutating operations, 1436 already annotated, 652 plan-availability
+> operations, 1336 cost-blocked capabilities, and the "~50%" / "83%" ratios) is
+> a point-in-time reading of `cloudflare/api-schemas@main` taken on 2026-07-17.
+> The live catalog owns the current numbers: **`cfctl catalog coverage`
+> supersedes anything here whenever they disagree** (per `LAYERS.md`, catalog
+> outranks prose). These figures are frozen so the document can be filed
+> upstream, not maintained as a live coverage source. Regenerate the raw counts
+> with the script under [Reproduce](#reproduce) below.
+
 `cfctl`'s catalog is generated from Cloudflare's official OpenAPI at
 `cloudflare/api-schemas` (`openapi.json`). A capability is marked `blocked`
 when the schema does not carry the metadata cfctl needs to govern a mutation

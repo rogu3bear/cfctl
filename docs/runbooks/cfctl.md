@@ -11,9 +11,11 @@ cfctl docs changes --json
 cfctl agents doctor --json
 ```
 
-Require the running and PATH identities reported by both doctors to match the
-same commit. Missing or legacy binaries, same-version/different-commit builds,
-and managed-instruction drift are unhealthy installation states.
+Require the PATH entry reported by both doctors to resolve to the running
+executable. A doctor never launches a different PATH executable to inspect it;
+invoke that binary directly with `cfctl version --json` if its self-reported
+identity is needed. Missing or different PATH executables and
+managed-instruction drift are unhealthy installation states.
 
 If a command reports `catalog content hash mismatch`, do not edit the stored
 hash. Run `cfctl catalog sync --json` to fetch a fresh official snapshot and
@@ -192,6 +194,35 @@ endpoint, not the policy scope: every selected group must declare account scope
 and the policy remains pinned to the one `--account` value. Use the same flag
 for `keys rotate` and `keys revoke`; those plans select the user token endpoint
 while preserving the explicit account authority context.
+
+### Standing authority
+
+Recurring token-lifecycle work can run unattended under a bounded standing
+policy instead of per-operation approval. Draft one from a fresh permission
+inventory, then inspect what already exists:
+
+```bash
+cfctl keys policy create --account <account-id> --name-prefix <prefix> \
+  --permission <reviewed-group-id> --max-child-ttl-hours <hours> \
+  --max-runs-per-day <count> --json
+cfctl keys policy list --json
+```
+
+`keys policy create` drafts a hash-bound standing authority (pinned account,
+name prefix, permission-group allowlist, max child TTL, and per-day run
+ceiling); it is inert until activated. `keys policy list` inspects existing
+authorities and reports effective status, remaining budget, lineage, and next
+action. Activate one reviewed authority ID only with explicit approval, and
+close it immediately when the work is done:
+
+```bash
+cfctl keys policy approve <authority-id> --yes --json
+cfctl keys policy revoke <authority-id> --json
+```
+
+Standing approval moves authority to that bounded policy; it is not blanket
+mutation authority, and external sends and spend are never standing-authorized.
+Load `cfctl guide --topic standing-authority --json` before drafting one.
 
 Create an Access service token through its separate exact account or zone
 lifecycle. The input is intentionally limited to `name` and optional

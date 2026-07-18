@@ -1,6 +1,16 @@
 # cfctl v2 security contract
 
-- OAuth uses Authorization Code with PKCE. Refresh tokens and imported keys live only in the macOS Keychain or Linux Secret Service.
+> Authority: this file is the security contract — it is authoritative for
+> credential storage, secret sinks, catalog and journal hashing, redaction, and
+> the per-capability safety invariants below. For how the policy engine
+> *classifies* a plan (`auto_execute` / `approval_required` / `blocked`),
+> approval mechanics, standing authority, and the adapter boundary,
+> `docs/runtime-policy.md` is authoritative. The two documents restate several
+> invariants in parallel by design; where they overlap they must agree — defer
+> to runtime-policy on a classification or approval question, and to this file
+> on a secret, journal, or redaction question.
+
+- OAuth uses Authorization Code with PKCE. Refresh tokens and imported keys are written to the platform keyring first — macOS Keychain or Linux Secret Service. When that keyring is unavailable (for example a login keychain desynchronized from the login password), cfctl fails down to a governed file store under its data directory (`auth/secrets`): a mode-0700 directory of atomically written mode-0600 files whose reads refuse any group- or world-readable secret. A later keyring success drops the stale fallback copy, and `cfctl doctor` reports the active backend.
 - The emergency global-key profile is never selected implicitly.
 - Secret-shaped request bodies are accepted only through stdin, stored temporarily in the platform secret store, and represented in plans by a hash and opaque reference.
 - Secret-producing responses require `--value-out`; the destination must not exist and is created mode `0600` on Unix. Only a bare credential, a recognized secret field, or the exact two-field Access service-token credential bundle is accepted. Account- and zone-scoped service-token creation are separate allowlisted operation/path/product/permission tuples; the bundle is created only when both `client_id` and `client_secret` are non-empty. Receipts retain safe resource metadata while replacing secret values with `[SUNK]`.

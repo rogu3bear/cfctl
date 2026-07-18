@@ -11,6 +11,7 @@ cfctl version --json
 cfctl doctor --json
 cfctl agents doctor --json
 cfctl catalog sync
+cfctl resolve "rotate a Worker secret"
 cfctl catalog search "Worker secret"
 cfctl guide worker-put-script-secret
 cfctl "rotate the production Worker secret"
@@ -29,12 +30,12 @@ cfctl is a local-first, catalog-driven control plane: it separates intent, live 
 
 **What happens after a failure or crash?** Once consumption or a boundary attempt is durable, cfctl never guesses that replay is safe. Inspect `plans status`; use `plans rectify` to reconcile durable receipts and verification without replaying the original Cloudflare mutation.
 
-**What should I do next?** Run `cfctl version --json` and both doctors before work; running-build, PATH-build, or managed-instruction drift is unhealthy. Read token permissions only with an explicit account context (`keys permissions --account`, adding `--user` only to select user ownership). Nested fixture basenames are skipped during broader workspace scans; fixture directories are opt-in roots and must be registered directly. Then search the catalog for the intent, inspect the selected capability, and load its capability-specific guide before calling it.
+**What should I do next?** Run `cfctl version --json` and both doctors before work; running-build, PATH-build, or managed-instruction drift is unhealthy. Read token permissions only with an explicit account context (`keys permissions --account`, adding `--user` only to select user ownership). Nested fixture basenames are skipped during broader workspace scans; fixture directories are opt-in roots and must be registered directly. Then resolve the intent deterministically (`cfctl resolve`), browse with `cfctl catalog search` only when exploring, and inspect the selected capability and its capability-specific guide before calling it.
 
 ### Lifecycle
 
 1. **Orient** (`none`) — Check running and PATH build identity, local state, credentials, catalog health, and agent integration.
-2. **Discover** (`none`) — Search and inspect the catalog-selected capability and adapter.
+2. **Discover** (`none`) — Resolve the intent to the catalog-selected capability and adapter; browse the catalog when exploring.
 3. **Read** (`read`) — Inspect exact live Cloudflare state and registered-workspace impact. Durable state: redacted live-read and source-config evidence
 4. **Plan** (`none`) — Bind the request, account, catalog, impact, cost, verification, and compensation contracts. Durable state: hash-bound PlanV1 and PlanPrepared checkpoint
 5. **Admit** (`none`) — Apply policy, bind any explicit approval, acquire locks, and recheck drift. Durable state: approval, standing reservation, and consumption checkpoints
@@ -51,6 +52,7 @@ cfctl agents doctor --json
 cfctl keys permissions --account <account-id> --json
 cfctl keys permissions --user --account <account-id> --json
 cfctl guide --topic standing-authority --json
+cfctl resolve <intent> --json
 cfctl catalog search <intent> --json
 cfctl catalog show <capability-id> --json
 cfctl guide <capability-id> --json
@@ -107,6 +109,7 @@ cfctl "<natural-language request>"
 cfctl version
 cfctl auth login|status|profiles|use|logout|import-api-token|import-global-key
 cfctl keys permissions|mint|rotate|revoke|policy
+cfctl keys policy create|list|approve|revoke
 cfctl catalog sync|search|show|changes|coverage
 cfctl resolve "<natural-language intent>"
 cfctl call <capability-id> [selectors/body]
@@ -129,8 +132,10 @@ contracts are `BuildInfoV1`, `CapabilityV1`, `CapabilityGuideV1`,
 ## Authentication
 
 Day-to-day auth is a scoped API token, imported only through stdin (never
-argv). The token lives in Keychain on macOS or Secret Service on Linux, and
-the account pin is required:
+argv). The token lives in the platform keyring — Keychain on macOS, Secret
+Service on Linux — and automatically falls back to a mode-0600 file store under
+the cfctl data dir when the keyring is unavailable; `cfctl doctor` reports which
+backend is active. The account pin is required:
 
 ```bash
 printf '%s' "$CLOUDFLARE_API_TOKEN" | \
@@ -146,6 +151,10 @@ touches stdin:
 cfctl auth import-api-token --account <account-id> --value-in token.tok
 rm -f token.tok
 ```
+
+`CFCTL_FORCE_IPV4=1` (or `true`/`yes`/`on`) pins outbound Cloudflare API calls
+to an IPv4 source so an IP-allowlisted token keeps working when the host
+default-routes over IPv6; it is off by default.
 
 OAuth Authorization Code with PKCE remains available when you have a
 Cloudflare OAuth client (`--client-id` / `CFCTL_OAUTH_CLIENT_ID`). Public cfctl
@@ -371,16 +380,21 @@ cfctl agents install --all-detected
 cfctl agents doctor
 ```
 
-`version --json`, `doctor`, and `agents doctor` expose the running and PATH
-build identities. A missing or legacy PATH binary, a same-version binary from
-a different commit, or drifted managed instructions is unhealthy.
+`version --json` exposes the invoked binary's build identity. `doctor` and
+`agents doctor` trust the PATH build only when it resolves to that same
+executable. A missing or different PATH executable is not run by the health
+check and is unhealthy; invoke it directly with `cfctl version --json` when
+its self-reported identity is needed. Drifted managed instructions are also
+unhealthy.
 
-Natural language launches the configured agent once. Quote it: a bare single
-token that is not a known command fails closed with a usage error and a
-did-you-mean — a typo is never an agent launch. The `CFCTL_AGENT_SESSION`
-marker prevents recursion. Agents translate intent into catalog searches and
-deterministic commands; model output never grants authority or directly
-mutates Cloudflare.
+Natural language launches the configured agent once. `CFCTL_AGENT` selects
+which delegated agent binary is launched (default `codex`; also `claude`,
+`cursor`, or `gemini`). Quote it: a bare single token that is not a known
+command fails closed with a usage error and a did-you-mean — a typo is never an
+agent launch. The `CFCTL_AGENT_SESSION` marker prevents recursion. Agents
+translate intent into a deterministic `cfctl resolve` match — `cfctl catalog
+search` is the browse fallback — and governed commands; model output never
+grants authority or directly mutates Cloudflare.
 
 Browser or Computer Use is available only for cataloged `governed_ui`
 capabilities after API/CLI coverage cannot finish the task. UI actions bind the

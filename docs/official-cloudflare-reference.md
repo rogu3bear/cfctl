@@ -2,12 +2,12 @@
 
 These are the primary official references this repo is designed around.
 
-Use the runtime bank for the compact, queryable view:
+Use the runtime docs bank for the compact, queryable view:
 
 ```bash
-cfctl docs
-cfctl docs watch
-cfctl docs <topic>
+cfctl docs search "<topic>"
+cfctl docs changes
+cfctl docs coverage
 ```
 
 Docs access patterns worth remembering:
