@@ -16,27 +16,18 @@ cfctl agents doctor --json
 
 `version` reports the invoked binary's build identity. `doctor` and `agents
 doctor` trust the `cfctl` resolved on `PATH` only when it is the same
-executable as the running build. They never launch a different PATH executable
-to inspect it; invoke that binary directly with `cfctl version --json` if its
-self-reported identity is needed. Missing or different PATH executables and
-drifted managed guidance are unhealthy; repair installation before relying on
-the operator surface.
+executable as the running build; they never launch a different PATH executable
+to inspect it. Missing or different PATH executables and drifted managed
+guidance are unhealthy — repair installation before relying on the operator
+surface.
 
-Coverage includes stable `mutation_contract_gap_counts`. The counts overlap by
-design because one capability can lack risk, cost, permissions, verification,
-rollback, and entitlement knowledge simultaneously.
+Coverage includes stable `mutation_contract_gap_counts`; the counts overlap by
+design because one capability can lack several contract fields at once. Use
+the same gap name in search — for example
+`cfctl catalog search "verification_missing" --json` — to find affected
+operations. Search never makes a blocked operation executable.
 
-Use the same gap name in search to find affected operations:
-
-```bash
-cfctl catalog search "verification_missing" --json
-cfctl catalog search "cost unbounded" --json
-```
-
-Search derives these terms from the current catalog contract; it does not make
-a blocked operation executable.
-
-Resolve intent first:
+## Resolve intent first
 
 ```bash
 cfctl resolve "inspect production Worker routes" --json
@@ -44,44 +35,26 @@ cfctl catalog show <capability-id> --json
 cfctl guide <capability-id> --json
 ```
 
-`resolve` deterministically maps the goal to a capability: it either commits to
-a single confident match and emits the exact governed `call`/`approve`/`run`
-commands, or fails closed with ranked candidates when the match is ambiguous.
-To browse the catalog by keyword instead, use
+`resolve` deterministically maps the goal to a capability: it either commits
+to a single confident match and emits the exact governed
+`call`/`approve`/`run` commands, or fails closed with ranked candidates when
+the match is ambiguous. To browse by keyword instead, use
 `cfctl catalog search "<intent>" --json`.
 
-The generated guide always covers 15 stages: discover, authenticate, select
-account, check entitlement, inspect current state, load standards, map
-dependencies, calculate cost, build plan, request approval if needed, acquire
-locks, execute, verify, rectify, and close with evidence.
-
-Each stage names its contract state, evidence class, and machine-safe argv
-arrays. `call_argv` is present only when the catalog contract is executable;
-blocked capabilities instead expose exact `blocking_gaps`, a safe next action,
-and, when a safe execution surface exists, a non-runnable
+The generated guide always covers 15 stages, discover through
+close-with-evidence, and names each stage's contract state, evidence class,
+and machine-safe argv arrays. `call_argv` is present only when the catalog
+contract is executable; blocked capabilities instead expose exact
+`blocking_gaps`, a safe next action, and at most a non-runnable
 `post_resolution_call_argv` template. Account and user API-token creation are
 routed through `keys mint`, which refreshes and binds the matching live
-permission-group inventory. User-owned creation is explicit
-(`--user --account <id>`) and remains limited to one exact account resource;
-generated guidance never offers arbitrary or wildcard token policies.
-
-Turnstile widget creation writes the returned secret only to an explicit new
-mode-0600 sink, proves the returned sitekey through an exact detail read, and
-offers deletion only as a separate reviewed compensation plan. Widget updates
-use an exact same-resource readback and a zero-direct-incremental-cost contract.
-Secret rotation requires an explicit `invalidate_immediately` choice and a new
-mode-0600 sink. The plan explains that immediate invalidation is irreversible,
-while the non-immediate path keeps the old secret for only two hours and blocks
-another rotation during that grace period.
-
-OAuth client secret rotation is a two-plan cutover. Before planning and again
-before consumption, cfctl reads the exact client and requires one active secret
-for rotation or two active secrets for old-secret deletion. Rotation writes the
-one-time `client_secret` only to a new mode-0600 sink, then verifies the same
-client reports `has_rotated_secret=true`. Deleting the old secret is a separate
-irreversible plan, allowed only after dependents have been moved to the new
-value; its readback must report `has_rotated_secret=false`. Neither phase is
-presented as rollback for the other.
+permission-group inventory; user-owned creation is explicit
+(`--user --account <id>`), limited to one exact account resource, and never
+offers arbitrary or wildcard token policies. Secret-producing lifecycles such
+as Turnstile widgets, Access service tokens, and OAuth client-secret rotation
+write one-time values only to a new mode-0600 sink, verify through exact
+readbacks, and expose destructive follow-ups only as separate reviewed plans;
+the per-capability invariants are in [docs/v2-security.md](v2-security.md).
 
 ## Deterministic execution
 
@@ -125,58 +98,47 @@ cfctl workspace audit --json
 
 Workspace account pins resolve ambiguity. Source configuration, routes,
 hostnames, bindings, desired state, and cross-repository references become
-preconditions in transaction plans. A source audit is not live Cloudflare
-truth; use a live `call` for edge/account assertions.
-
-Nested directories named `fixtures`, `__fixtures__`, `testdata`, `test-data`,
-and `test_data` are excluded. Fixture directories are opt-in roots: register
-one directly only when its contents are intended to enter the workspace graph.
+plan preconditions, but a source audit is not live Cloudflare truth; use a
+live `call` for edge/account assertions. Nested directories named `fixtures`,
+`__fixtures__`, `testdata`, `test-data`, and `test_data` are excluded;
+register a fixture directory directly only when its contents should enter the
+workspace graph.
 
 ## Authentication and secrets
 
-- OAuth Authorization Code with PKCE and refresh tokens is the default.
 - Profiles and workspaces pin accounts; ambiguity fails closed.
-- API tokens are scoped profiles.
-- The global-key profile is emergency-only and never selected silently.
+- API tokens are scoped profiles; the global-key profile is emergency-only and
+  never selected silently.
 - Credentials live in the platform keyring (Keychain on macOS, Secret Service
   on Linux), falling back to a mode-0600 file store under the cfctl data dir
   when the keyring is unavailable; `cfctl doctor` reports the active backend.
-- Secret inputs come from stdin and become opaque key-store references.
-- Secret outputs require `--value-out` to a new mode-0600 file. Access
-  service-token creation writes a JSON object containing exactly `client_id`
-  and `client_secret`; other secret outputs remain opaque text.
+- Secret inputs come from stdin and become opaque key-store references; secret
+  outputs require `--value-out` to a new mode-0600 file.
 - stdout, plans, logs, subprocess receipts, and evidence are redacted.
 
 ## Adapter rules
 
-Capability status controls the execution boundary:
-
-- `native`: cfctl implements operation-specific handling.
-- `dynamic_api`: the pinned OpenAPI schema validates and executes the call.
-- `delegated_cli`: governed Wrangler/cloudflared subprocess, cleared
-  environment, one selected credential, timeout, and redacted receipt.
-- `governed_ui`: target/account-bound UI action only after API/CLI
-  insufficiency is established.
-- `blocked`: discoverable but not executable, with an exact reason.
-
-Never improvise around a blocker. UI `AgentActionV1` output is a handoff, not
-authority or completion proof.
+Capability status controls the execution boundary: `native` means
+operation-specific handling, `dynamic_api` means pinned-schema validation and
+execution, `delegated_cli` means a governed Wrangler/cloudflared subprocess
+with a cleared environment and redacted receipt, `governed_ui` means a
+target/account-bound UI action only after API/CLI insufficiency is
+established, and `blocked` means discoverable but not executable, with an
+exact reason. Never improvise around a blocker. UI `AgentActionV1` output is a
+handoff, not authority or completion proof.
 
 ## Natural-language entry
 
-```bash
-cfctl "rotate the production Worker secret"
-```
-
-This launches the configured local agent. Agents must use deterministic cfctl
-commands underneath. `CFCTL_AGENT_SESSION` prevents recursive agent launch.
-Model output never approves or directly mutates Cloudflare. A bare single
-token that is not a known command fails closed with a usage error — mistyped
-verbs never become agent sessions.
+`cfctl "rotate the production Worker secret"` launches the configured local
+agent. Agents must use deterministic cfctl commands underneath;
+`CFCTL_AGENT_SESSION` prevents recursive agent launch, and model output never
+approves or directly mutates Cloudflare. A bare single token that is not a
+known command fails closed with a usage error — mistyped verbs never become
+agent sessions.
 
 ## Completion evidence
 
 Final claims must identify one of: source config, live Cloudflare read,
 preview/plan artifact, apply artifact, post-change verification, local proof,
 or agent action. Evidence presence alone is not verification. If a verifier is
-unsupported, status remains rectification-required rather than “done.”
+unsupported, status remains rectification-required rather than "done."

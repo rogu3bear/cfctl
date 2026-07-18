@@ -146,33 +146,11 @@ Secret results require `--value-out`, which must not exist and is created mode
 receipts are redacted. When an API cannot read a newly issued credential back,
 the truthful terminal proof is the successful Cloudflare response plus the
 durable sink receipt; cfctl does not claim that a later read verified the value.
-Account- and zone-scoped Access service-token creation are the structured
-exceptions to the opaque-text sink: cfctl recognizes only the two exact
-operation/path/product/permission tuples, requires both non-empty response
-fields, and writes only `client_id` and `client_secret` as one mode-0600 JSON
-object. The same-scope exact resource readback proves the returned ID, name,
-and duration, but never claims to re-read the one-time secret.
 
-Account- and zone-scoped service-token updates are distinct exact
-operation/path/product/selector contracts. Both accept only observable `name`
-and `duration` fields. Secret-version and prior-secret-expiration inputs stay
-outside that metadata-update path because they change credential cutover state.
-Exact same-scope field readback proves the requested metadata, while the
-irreversible expiration-clock reset is called out instead of being mislabeled
-as automatically restorable.
-
-Service-token refresh is an operation-specific irreversible verifier, not a
-generic successful-POST check. The apply response and exact detail readback
-must agree on both token identity and a valid future expiration. Neither the
-value nor a success flag alone proves the refresh, and the prior expiration is
-not represented as recoverable.
-
-OAuth client rotation combines that sink receipt with a separate state proof:
-the secret value itself remains unreadable, while an exact client-detail read
-must prove the transition from one secret to two. Old-secret deletion is a
-separate irreversible operation that requires and rechecks the two-secret
-pre-state, then proves the transition back to one. The delete is not a rollback
-for rotation because it retains the new value and destroys the old one.
+The per-capability secret-sink exceptions and verifiers — the Access
+service-token creation/update/refresh contracts and the two-phase OAuth
+client-secret rotation — are owned by [docs/v2-security.md](v2-security.md),
+which this file defers to for every secret, journal, or redaction detail.
 
 ## Adapter boundary
 
