@@ -48,7 +48,7 @@ use crate::{
     GuideArgs, GuideTopicArg, ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs,
     KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs,
     KeyPolicySelector, KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs,
-    PlanSelector, PlansCommand, ProfileSelector, SearchArgs, WorkspaceCommand,
+    PlanSelector, PlansCommand, ProfileSelector, ResolveArgs, SearchArgs, WorkspaceCommand,
     build_identity::{current_build_info, inspect_path_build},
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
@@ -349,6 +349,7 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
         Command::Keys(arguments) => keys_command(&store, arguments.command).await,
         Command::Catalog(arguments) => catalog_command(&store, arguments.command).await,
         Command::Call(arguments) => call_command(&store, arguments).await,
+        Command::Resolve(arguments) => resolve_command(&store, arguments).await,
         Command::Guide(arguments) => guide_command(&store, &arguments).await,
         Command::Plans(arguments) => plans_command(&store, arguments.command).await,
         Command::Workspace(arguments) => workspace_command(&store, arguments.command),
@@ -9925,6 +9926,244 @@ fn guide_document(capability: &CapabilityV1) -> CapabilityGuideV1 {
     }
 }
 
+/// Minimum top score for the resolver to commit to a single capability.
+/// A hit below this is a description-only near-miss; the resolver reports
+/// candidates but refuses to emit a call string.
+const RESOLVE_MIN_CONFIDENT_SCORE: usize = 6;
+
+/// Deterministically map a natural-language intent to a capability and the exact
+/// governed commands to run. Read-only: it never mutates Cloudflare and never
+/// launches an agent (that is `execute_natural_language`). It fails closed —
+/// emitting only disambiguation guidance — when nothing matches confidently or
+/// the top match does not clearly beat the runner-up.
+async fn resolve_command(store: &StateStore, arguments: ResolveArgs) -> Result<ResultEnvelopeV2> {
+    let intent = arguments.intent.trim();
+    if intent.is_empty() {
+        return Err(CliError::guided(
+            "CFCTL_RESOLVE_EMPTY",
+            "resolve needs a natural-language intent",
+            "Describe the goal, e.g. `cfctl resolve \"enable email routing on example.com\"`.",
+        ));
+    }
+    let catalog = ensure_catalog(store).await?;
+    let ranked = catalog.search_scored(intent);
+    let (result, ok) = resolve_result(
+        intent,
+        &ranked,
+        arguments.account.as_deref(),
+        arguments.limit,
+    );
+    let mut envelope = ResultEnvelopeV2::success("resolve", result);
+    envelope.ok = ok;
+    if ok {
+        envelope.capability_id = ranked.first().map(|(capability, _)| capability.id.clone());
+    }
+    Ok(envelope)
+}
+
+/// Pure decision core for `resolve`: given the ranked catalog hits, produce the
+/// result JSON and whether it is actionable (`ok`). Deterministic and
+/// side-effect-free so the fail-closed gating is unit-testable without a store.
+fn resolve_result(
+    intent: &str,
+    ranked: &[(&CapabilityV1, usize)],
+    account: Option<&str>,
+    limit: usize,
+) -> (Value, bool) {
+    let limit = limit.clamp(1, 25);
+    let candidates: Vec<Value> = ranked
+        .iter()
+        .take(limit)
+        .map(|(capability, score)| resolve_candidate_json(capability, *score))
+        .collect();
+
+    // No positive-scoring capability: fail closed with discovery guidance.
+    let Some((top_capability, top_score)) = ranked.first().map(|(cap, score)| (*cap, *score))
+    else {
+        let result = json!({
+            "intent": intent,
+            "matched": [],
+            "resolved": Value::Null,
+            "ambiguous": true,
+            "reason": "no catalog capability matched the intent terms",
+            "next_step": "Broaden the query, or run `cfctl catalog search \"<keywords>\" --json`. If the catalog is stale, run `cfctl catalog sync`.",
+            "disambiguation": {
+                "search_argv": ["cfctl", "catalog", "search", intent, "--json"],
+                "coverage_argv": ["cfctl", "catalog", "coverage", "--json"],
+            },
+        });
+        return (result, false);
+    };
+
+    let runner_up = ranked.get(1).map_or(0, |(_, score)| *score);
+    // Commit only to a confident, unambiguous top match: score above the floor
+    // and at least 1.5x the runner-up (or a sole match). Integer test avoids
+    // float rounding: top/runner >= 3/2.
+    let confident = top_score >= RESOLVE_MIN_CONFIDENT_SCORE
+        && (runner_up == 0 || top_score * 2 >= runner_up * 3);
+
+    if !confident {
+        let reason = if top_score < RESOLVE_MIN_CONFIDENT_SCORE {
+            format!(
+                "top match `{}` scored only {top_score}; too weak to commit",
+                top_capability.id
+            )
+        } else {
+            format!(
+                "top match `{}` (score {top_score}) does not clearly beat `{}` (score {runner_up})",
+                top_capability.id, ranked[1].0.id,
+            )
+        };
+        let result = json!({
+            "intent": intent,
+            "matched": candidates,
+            "resolved": Value::Null,
+            "ambiguous": true,
+            "reason": reason,
+            "next_step": "Pick a candidate and inspect it: `cfctl catalog show <capability-id> --json`, then `cfctl guide <capability-id>`.",
+        });
+        return (result, false);
+    }
+
+    let gaps = top_capability.mutation_contract_gaps();
+    let contract_ready = top_capability.adapter_status != AdapterStatus::Blocked && gaps.is_empty();
+    let call_argv = capability_call_argv(top_capability);
+    let next_action = guide_next_action(top_capability, contract_ready, Some(&call_argv));
+
+    // Contract-ready: emit the exact governed command sequence. Blocked or
+    // gap-incomplete: reuse guide_next_action's fail-closed guidance instead of
+    // fabricating a call the agent must not run.
+    let commands = if contract_ready {
+        let mut commands = json!({ "draft_argv": call_argv });
+        if top_capability.mutating {
+            commands["approve_argv"] =
+                json!(approval_command_argv(top_capability, "<operation-id>"));
+            commands["run_argv"] = json!(["cfctl", "plans", "run", "<operation-id>", "--json"]);
+            commands["status_argv"] =
+                json!(["cfctl", "plans", "status", "<operation-id>", "--json"]);
+        }
+        commands
+    } else {
+        json!({
+            "blocked": true,
+            "blocking_gaps": gaps,
+            "next_action": next_action,
+        })
+    };
+
+    let mut resolved = json!({
+        "capability_id": top_capability.id,
+        "title": top_capability.title,
+        "product": top_capability.product,
+        "mutating": top_capability.mutating,
+        "contract_ready": contract_ready,
+        "adapter_status": top_capability.adapter_status,
+        "required_selectors": required_selectors_json(top_capability),
+        "needs_request_body": capability_has_meaningful_request_body(top_capability),
+        "permission_lane": top_capability.permissions,
+        "commands": commands,
+    });
+    if let Some(hint) = resolve_zone_hint(top_capability, intent) {
+        resolved["zone_resolution_hint"] = hint;
+    }
+    if let Some(account) = account {
+        resolved["account"] = json!(account);
+    }
+
+    let result = json!({
+        "intent": intent,
+        "matched": candidates,
+        "resolved": resolved,
+        "ambiguous": false,
+        "guidance": next_action.summary,
+    });
+    (result, true)
+}
+
+fn resolve_candidate_json(capability: &CapabilityV1, score: usize) -> Value {
+    let contract_ready = capability.adapter_status != AdapterStatus::Blocked
+        && capability.mutation_contract_gaps().is_empty();
+    json!({
+        "capability_id": capability.id,
+        "score": score,
+        "title": capability.title,
+        "product": capability.product,
+        "mutating": capability.mutating,
+        "adapter_status": capability.adapter_status,
+        "contract_ready": contract_ready,
+        "show_argv": catalog_show_argv(&capability.id),
+        "guide_argv": ["cfctl", "guide", capability.id.as_str(), "--json"],
+    })
+}
+
+fn required_selectors_json(capability: &CapabilityV1) -> Vec<Value> {
+    capability
+        .selectors
+        .iter()
+        .filter(|selector| selector.required)
+        .map(|selector| {
+            json!({
+                "name": selector.name,
+                "location": selector.location,
+                "value_type": selector.value_type,
+                "description": selector.description,
+            })
+        })
+        .collect()
+}
+
+/// When a capability requires a zone path selector, emit a resolve-first hint:
+/// cfctl has no inline domain->zone_id resolver, so an agent must read the zone
+/// id from a `/zones` list before calling. Never guesses a zone id.
+fn resolve_zone_hint(capability: &CapabilityV1, intent: &str) -> Option<Value> {
+    let needs_zone = capability.selectors.iter().any(|selector| {
+        selector.required
+            && selector.location == "path"
+            && selector.name.to_ascii_lowercase().contains("zone")
+    });
+    if !needs_zone {
+        return None;
+    }
+    let domain = extract_domain(intent);
+    let domain_token = domain.as_deref().unwrap_or("<domain>");
+    Some(json!({
+        "reason": "This capability needs a 32-hex Cloudflare zone id, not a domain name.",
+        "resolve_first": "Find the zone-list capability, then read the zone id from its result.",
+        "search_argv": ["cfctl", "catalog", "search", "list zones", "--json"],
+        "example_read_argv": [
+            "cfctl", "call", "<zone-list-capability-id>", "--query", format!("name={domain_token}"), "--json"
+        ],
+        "use_field": "result[0].id",
+    }))
+}
+
+/// Extract the first domain-like token from an intent, for zone-hint examples.
+/// Deliberately conservative: no dependency on the regex crate.
+fn extract_domain(intent: &str) -> Option<String> {
+    intent
+        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '(' | ')' | ','))
+        .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+        .find(|token| is_domain_like(token))
+        .map(str::to_ascii_lowercase)
+}
+
+fn is_domain_like(token: &str) -> bool {
+    if token.len() < 3 || !token.contains('.') {
+        return false;
+    }
+    let labels: Vec<&str> = token.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+    let last = labels.last().copied().unwrap_or_default();
+    if last.len() < 2 || !last.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    labels.iter().all(|label| {
+        !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
 fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
     if matches!(
         capability.id.as_str(),
@@ -18296,5 +18535,193 @@ mod tests {
             "CFCTL_LIVE_UPSTREAM"
         );
         assert_eq!(super::live_read_failure_guidance(418).0, "CFCTL_LIVE_ERROR");
+    }
+
+    fn resolver_read_capability(id: &str, title: &str, product: &str) -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(id, title, "GET", "/accounts/{account_id}/things");
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.product = product.to_owned();
+        capability
+    }
+
+    fn resolver_mutation_capability() -> CapabilityV1 {
+        // A contract-complete mutating capability so mutation_contract_gaps() is
+        // empty and the resolver treats it as contract-ready. Uses the two
+        // synthetic-friendly gap-free paths: the secret-sink verification
+        // strategy (valid when required=false and risk=SecretSensitive) and a
+        // declared-irreversible rollback (supported=false plus a warning).
+        let mut capability = CapabilityV1::new(
+            "widget-secret-set",
+            "Set Widget Secret",
+            "PUT",
+            "/accounts/x/widget/secret",
+        );
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::Native; // avoids the permission-lane gap
+        capability.product = "Widgets".to_owned();
+        capability.risk = RiskClass::SecretSensitive;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.cost.known = true;
+        capability.cost.incremental = false;
+        capability.verification.required = false;
+        capability.verification.strategy = "sink_write_and_source_response_status".to_owned();
+        capability.rollback.supported = false;
+        capability.rollback.warning =
+            Some("this operation cannot be automatically rolled back".to_owned());
+        capability
+    }
+
+    #[test]
+    fn resolve_result_empty_fails_closed_with_discovery_guidance() {
+        let ranked: Vec<(&CapabilityV1, usize)> = Vec::new();
+        let (result, ok) = super::resolve_result("do a thing", &ranked, None, 5);
+        assert!(!ok);
+        assert_eq!(result["ambiguous"], serde_json::Value::Bool(true));
+        assert_eq!(result["resolved"], serde_json::Value::Null);
+        assert!(result["disambiguation"]["search_argv"].is_array());
+    }
+
+    #[test]
+    fn resolve_result_weak_top_score_fails_closed() {
+        let cap = resolver_read_capability("a-thing", "A Thing", "Things");
+        let ranked = vec![(&cap, 3usize)];
+        let (result, ok) = super::resolve_result("thing", &ranked, None, 5);
+        assert!(!ok, "a sub-threshold score must not commit");
+        assert!(
+            result["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("too weak")
+        );
+    }
+
+    #[test]
+    fn resolve_result_close_scores_fail_closed_as_ambiguous() {
+        let a = resolver_read_capability("cap-a", "Cap A", "P");
+        let b = resolver_read_capability("cap-b", "Cap B", "P");
+        // 8 vs 7: top*2=16 < runner*3=21 -> not confident.
+        let ranked = vec![(&a, 8usize), (&b, 7usize)];
+        let (result, ok) = super::resolve_result("ambiguous intent", &ranked, None, 5);
+        assert!(!ok);
+        assert_eq!(result["ambiguous"], serde_json::Value::Bool(true));
+        assert_eq!(result["matched"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn resolve_result_confident_read_emits_only_a_draft() {
+        let cap =
+            resolver_read_capability("email-routing-list", "List Email Routing", "Email Routing");
+        let ranked = vec![(&cap, 12usize)];
+        let (result, ok) = super::resolve_result("list email routing", &ranked, None, 5);
+        assert!(ok);
+        assert_eq!(result["ambiguous"], serde_json::Value::Bool(false));
+        assert_eq!(result["resolved"]["capability_id"], "email-routing-list");
+        assert!(result["resolved"]["commands"]["draft_argv"].is_array());
+        // A read draws no approve/run/status governed loop.
+        assert!(result["resolved"]["commands"]["approve_argv"].is_null());
+    }
+
+    #[test]
+    fn resolve_result_confident_mutation_emits_the_governed_loop() {
+        let cap = resolver_mutation_capability();
+        let ranked = vec![(&cap, 20usize)];
+        let (result, ok) = super::resolve_result("enable email routing", &ranked, None, 5);
+        assert!(ok);
+        assert_eq!(
+            result["resolved"]["contract_ready"],
+            serde_json::Value::Bool(true),
+            "fixture must be gap-free; resolved={}",
+            result["resolved"]
+        );
+        let commands = &result["resolved"]["commands"];
+        assert!(commands["draft_argv"].is_array());
+        let approve = commands["approve_argv"].as_array().expect("approve argv");
+        assert!(approve.iter().any(|part| part == "approve"));
+        assert!(approve.iter().any(|part| part == "--yes"));
+        assert!(commands["run_argv"].is_array());
+        assert!(commands["status_argv"].is_array());
+    }
+
+    #[test]
+    fn resolve_result_blocked_capability_withholds_the_call() {
+        let mut cap = resolver_read_capability("blocked-thing", "Blocked Thing", "Things");
+        cap.adapter_status = AdapterStatus::Blocked;
+        cap.blocked_reason = Some("operation contract incomplete: cost".to_owned());
+        let ranked = vec![(&cap, 12usize)];
+        let (result, ok) = super::resolve_result("blocked thing", &ranked, None, 5);
+        assert!(ok);
+        assert_eq!(
+            result["resolved"]["contract_ready"],
+            serde_json::Value::Bool(false)
+        );
+        let commands = &result["resolved"]["commands"];
+        assert_eq!(commands["blocked"], serde_json::Value::Bool(true));
+        // No draft call is offered for a blocked capability.
+        assert!(commands["draft_argv"].is_null());
+        assert!(commands["next_action"].is_object());
+    }
+
+    #[test]
+    fn resolve_result_emits_zone_hint_and_threads_account() {
+        let mut cap = CapabilityV1::new(
+            "zone-settings-get",
+            "Get Zone Setting",
+            "GET",
+            "/zones/{zone_id}/settings",
+        );
+        cap.adapter_status = AdapterStatus::DynamicApi;
+        cap.product = "Zones".to_owned();
+        cap.selectors = vec![cfctl_core::SelectorV1 {
+            name: "zone_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        }];
+        let ranked = vec![(&cap, 12usize)];
+        let (result, ok) =
+            super::resolve_result("get setting on example.com", &ranked, Some("acct-9"), 5);
+        assert!(ok);
+        let hint = &result["resolved"]["zone_resolution_hint"];
+        assert!(hint.is_object());
+        let example = hint["example_read_argv"].as_array().expect("example argv");
+        assert!(example.iter().any(|part| part == "name=example.com"));
+        assert_eq!(result["resolved"]["account"], "acct-9");
+    }
+
+    #[test]
+    fn resolve_candidate_limit_is_respected() {
+        let caps: Vec<CapabilityV1> = (0..8)
+            .map(|index| resolver_read_capability(&format!("cap-{index}"), "Cap", "P"))
+            .collect();
+        // Distinct descending scores so ordering is deterministic and the top is
+        // ambiguous-safe is irrelevant here; we only assert the candidate cap.
+        let ranked: Vec<(&CapabilityV1, usize)> = caps
+            .iter()
+            .enumerate()
+            .map(|(index, cap)| (cap, 100 - index))
+            .collect();
+        let (result, _ok) = super::resolve_result("cap", &ranked, None, 3);
+        assert_eq!(result["matched"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn is_domain_like_accepts_domains_and_rejects_noise() {
+        assert!(super::is_domain_like("example.com"));
+        assert!(super::is_domain_like("mail.example.co.uk"));
+        assert!(!super::is_domain_like("example"));
+        assert!(!super::is_domain_like("enable"));
+        assert!(!super::is_domain_like("v2.0")); // numeric TLD is not a domain
+        assert!(!super::is_domain_like("a.b")); // TLD too short
+    }
+
+    #[test]
+    fn extract_domain_finds_the_first_domain_token() {
+        assert_eq!(
+            super::extract_domain("enable email routing on Example.COM please").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(super::extract_domain("enable email routing"), None);
     }
 }

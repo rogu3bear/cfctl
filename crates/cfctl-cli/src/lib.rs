@@ -35,6 +35,10 @@ pub enum Command {
     Catalog(CatalogArgs),
     /// Read live state or create a mutation plan.
     Call(CallArgs),
+    /// Deterministically map a natural-language intent to a capability and the
+    /// exact governed commands to run. Reads only; never mutates or launches an
+    /// agent; fails closed when the match is ambiguous.
+    Resolve(ResolveArgs),
     /// Explain a capability lifecycle or a system-level control-plane topic.
     Guide(GuideArgs),
     /// Review, approve, run, recover, and inspect durable plans.
@@ -335,6 +339,18 @@ pub struct GuideArgs {
         conflicts_with = "capability_id"
     )]
     pub topic: Option<GuideTopicArg>,
+}
+
+#[derive(Debug, Args)]
+pub struct ResolveArgs {
+    /// The natural-language goal, e.g. "enable email routing on example.com".
+    pub intent: String,
+    /// Account context to thread into the emitted command hints.
+    #[arg(long)]
+    pub account: Option<String>,
+    /// Maximum number of candidate capabilities to report.
+    #[arg(long, default_value_t = 5)]
+    pub limit: usize,
 }
 
 #[derive(Debug, Args)]
