@@ -33,6 +33,118 @@ pub const PUBLIC_V2_SUBCOMMANDS: &[&str] = &[
     "workspace",
 ];
 
+/// One node in the exact public v2 command tree below the top level.
+///
+/// `PUBLIC_V2_SUBCOMMANDS` single-sources the top-level verbs; this tree extends
+/// the same single-source contract one (or more) levels deeper for every verb
+/// that itself takes subcommands. A leaf subcommand carries an empty
+/// `subcommands` slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandNodeV1 {
+    /// Exact clap-facing (kebab-cased) name of this subcommand.
+    pub name: &'static str,
+    /// Direct child subcommands, sorted, or empty for a leaf.
+    pub subcommands: &'static [CommandNodeV1],
+}
+
+impl CommandNodeV1 {
+    const fn leaf(name: &'static str) -> Self {
+        Self {
+            name,
+            subcommands: &[],
+        }
+    }
+}
+
+/// Exact sorted inventory of every public v2 subcommand below each verb that
+/// takes subcommands. Verbs without subcommands (`call`, `resolve`, `guide`,
+/// `doctor`, `version`, `update`) are absent by design.
+///
+/// The CLI test binds this tree to the live clap tree recursively, while `xtask`
+/// uses it to reject stale checked-in `cfctl <verb> <sub>` examples.
+pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
+    CommandNodeV1 {
+        name: "agents",
+        subcommands: &[
+            CommandNodeV1::leaf("doctor"),
+            CommandNodeV1::leaf("install"),
+            CommandNodeV1::leaf("sync"),
+        ],
+    },
+    CommandNodeV1 {
+        name: "auth",
+        subcommands: &[
+            CommandNodeV1::leaf("import-api-token"),
+            CommandNodeV1::leaf("import-global-key"),
+            CommandNodeV1::leaf("login"),
+            CommandNodeV1::leaf("logout"),
+            CommandNodeV1::leaf("profiles"),
+            CommandNodeV1::leaf("status"),
+            CommandNodeV1::leaf("use"),
+        ],
+    },
+    CommandNodeV1 {
+        name: "catalog",
+        subcommands: &[
+            CommandNodeV1::leaf("changes"),
+            CommandNodeV1::leaf("coverage"),
+            CommandNodeV1::leaf("search"),
+            CommandNodeV1::leaf("show"),
+            CommandNodeV1::leaf("sync"),
+        ],
+    },
+    CommandNodeV1 {
+        name: "docs",
+        subcommands: &[
+            CommandNodeV1::leaf("changes"),
+            CommandNodeV1::leaf("coverage"),
+            CommandNodeV1::leaf("search"),
+        ],
+    },
+    CommandNodeV1 {
+        name: "keys",
+        subcommands: &[
+            CommandNodeV1::leaf("mint"),
+            CommandNodeV1::leaf("permissions"),
+            CommandNodeV1 {
+                name: "policy",
+                subcommands: &[
+                    CommandNodeV1::leaf("approve"),
+                    CommandNodeV1::leaf("create"),
+                    CommandNodeV1::leaf("list"),
+                    CommandNodeV1::leaf("revoke"),
+                ],
+            },
+            CommandNodeV1::leaf("revoke"),
+            CommandNodeV1::leaf("rotate"),
+        ],
+    },
+    CommandNodeV1 {
+        name: "migrate",
+        subcommands: &[CommandNodeV1::leaf("v1")],
+    },
+    CommandNodeV1 {
+        name: "plans",
+        subcommands: &[
+            CommandNodeV1::leaf("approve"),
+            CommandNodeV1::leaf("rectify"),
+            CommandNodeV1::leaf("resume"),
+            CommandNodeV1::leaf("run"),
+            CommandNodeV1::leaf("show"),
+            CommandNodeV1::leaf("status"),
+        ],
+    },
+    CommandNodeV1 {
+        name: "workspace",
+        subcommands: &[
+            CommandNodeV1::leaf("add"),
+            CommandNodeV1::leaf("audit"),
+            CommandNodeV1::leaf("discover"),
+            CommandNodeV1::leaf("graph"),
+        ],
+    },
+];
+
 /// Provenance source for the exact binary build identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1423,7 +1535,19 @@ fn access_service_token_refresh_selector_supported(
 /// responses (e.g. an API token's `value`, an R2 credential's `secretAccessKey`).
 /// A verification or identity pointer must never resolve to one of these:
 /// lifting a secret into an identity slot would echo it into a readback URL or a
-/// journal artifact. Kept in sync with the executor's secret-redaction set.
+/// journal artifact.
+///
+/// This is the exact set consumed by `redact_secret_payload` in
+/// `cfctl-cli/src/runtime.rs`, which matches its arms against this constant and
+/// sinks every one of these keys to `[SUNK]` before an envelope is printed or
+/// journalled. The `cfctl-cli` test `secret_payload_redaction_mirrors_the_core_set`
+/// binds the two together so they cannot drift.
+///
+/// This is deliberately NOT the set used by `redact_json`/`is_sensitive_key`
+/// (above, in this file). That pass is a narrower, suffix-matching
+/// defense-in-depth layer over a different slice of key names (e.g.
+/// `authorization`, `password`, `cookie`, `*_token`) and sinks to `[REDACTED]`;
+/// it is not this identity-pointer guard and must not be conflated with it.
 pub const SECRET_FIELD_NAMES: &[&str] = &[
     "value",
     "token",
@@ -2351,7 +2475,7 @@ fn guide_argv(parts: &[&str]) -> Vec<String> {
 }
 
 fn system_guide_document() -> GuideTopicDocumentV1 {
-    let next_argv = guide_argv(&["cfctl", "catalog", "search", "<intent>", "--json"]);
+    let next_argv = guide_argv(&["cfctl", "resolve", "<intent>", "--json"]);
     GuideTopicDocumentV1 {
         schema_version: 1,
         topic: GuideTopicV1::System,
@@ -2361,7 +2485,7 @@ fn system_guide_document() -> GuideTopicDocumentV1 {
         flow: system_guide_flow(),
         commands: system_guide_commands(&next_argv),
         next_action: GuideActionV1 {
-            summary: "Search the catalog for the intended Cloudflare outcome.".to_owned(),
+            summary: "Resolve the intended Cloudflare outcome to one catalog capability.".to_owned(),
             argv: next_argv,
         },
     }
@@ -2387,7 +2511,7 @@ fn system_guide_answers() -> Vec<GuideAnswerV1> {
         ),
         guide_answer(
             GuideQuestionV1::NextAction,
-            "Run `cfctl version --json` and both doctors before work; running-build, PATH-build, or managed-instruction drift is unhealthy. Read token permissions only with an explicit account context (`keys permissions --account`, adding `--user` only to select user ownership). Nested fixture basenames are skipped during broader workspace scans; fixture directories are opt-in roots and must be registered directly. Then search the catalog for the intent, inspect the selected capability, and load its capability-specific guide before calling it.",
+            "Run `cfctl version --json` and both doctors before work; running-build, PATH-build, or managed-instruction drift is unhealthy. Read token permissions only with an explicit account context (`keys permissions --account`, adding `--user` only to select user ownership). Nested fixture basenames are skipped during broader workspace scans; fixture directories are opt-in roots and must be registered directly. Then resolve the intent deterministically (`cfctl resolve`), browse with `cfctl catalog search` only when exploring, and inspect the selected capability and its capability-specific guide before calling it.",
         ),
     ]
 }
@@ -2404,7 +2528,7 @@ fn system_guide_flow() -> Vec<GuideFlowStepV1> {
         guide_flow_step(
             2,
             "Discover",
-            "Search and inspect the catalog-selected capability and adapter.",
+            "Resolve the intent to the catalog-selected capability and adapter; browse the catalog when exploring.",
             GuideCloudflareEffectV1::None,
             None,
         ),
@@ -2477,6 +2601,7 @@ fn system_guide_commands(next_argv: &[String]) -> Vec<Vec<String>> {
         ]),
         guide_argv(&["cfctl", "guide", "--topic", "standing-authority", "--json"]),
         next_argv.to_vec(),
+        guide_argv(&["cfctl", "catalog", "search", "<intent>", "--json"]),
         guide_argv(&["cfctl", "catalog", "show", "<capability-id>", "--json"]),
         guide_argv(&["cfctl", "guide", "<capability-id>", "--json"]),
         guide_argv(&["cfctl", "call", "<capability-id>", "--json"]),

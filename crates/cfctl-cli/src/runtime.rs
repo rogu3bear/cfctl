@@ -11202,20 +11202,10 @@ fn redact_secret_payload(value: &Value, root: bool) -> Value {
             object
                 .iter()
                 .map(|(key, item)| {
-                    if matches!(
-                        key.as_str(),
-                        "value"
-                            | "token"
-                            | "secret"
-                            | "access_token"
-                            | "client_secret"
-                            | "text"
-                            | "key_base64"
-                            | "key_jwk"
-                            | "accessKeyId"
-                            | "secretAccessKey"
-                            | "sessionToken"
-                    ) {
+                    // Single-sourced against `cfctl_core::SECRET_FIELD_NAMES`;
+                    // the `secret_payload_redaction_mirrors_the_core_set` test
+                    // binds the two so this arm set cannot drift.
+                    if cfctl_core::SECRET_FIELD_NAMES.contains(&key.as_str()) {
                         (key.clone(), Value::String("[SUNK]".to_owned()))
                     } else {
                         (key.clone(), redact_secret_payload(item, false))
@@ -11431,8 +11421,9 @@ mod tests {
         persist_secret_lifecycle_and_reconcile_lineage, preflight_call_input,
         preflight_standing_authority, prepare_r2_temporary_credentials_input,
         preserve_previous_catalog, query_object_from_pairs, read_import_secret, read_secret_file,
-        reconcile_standing_lineage_from_plan, rectify_plan, redact_secret_result,
-        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
+        reconcile_standing_lineage_from_plan, rectify_plan, redact_secret_payload,
+        redact_secret_result, request_body_contains_secret,
+        required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -11464,9 +11455,9 @@ mod tests {
     use cfctl_core::{
         AdapterStatus, CapabilityV1, CostV1, CreatedCollectionResourceContractV1,
         CreatedResourceContractV1, EffectClass, EvidenceClass, EvidenceV1, PlanStatus, PlanV1,
-        QuerySerializationV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1,
-        SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
-        TransactionStageV1, VerificationState, hash_value,
+        QuerySerializationV1, ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES,
+        SamePathReadContractV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
+        StandingAuthorityV1, TransactionStageV1, VerificationState, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -11480,6 +11471,23 @@ mod tests {
 
     fn guide_json(capability: &CapabilityV1) -> Value {
         serde_json::to_value(guide_document(capability)).expect("typed capability guide JSON")
+    }
+
+    #[test]
+    fn secret_payload_redaction_mirrors_the_core_set() {
+        // Every field `cfctl-core` marks secret must be sunk by the payload
+        // redactor, and a non-secret sibling must survive untouched. Binding
+        // the redactor to `SECRET_FIELD_NAMES` keeps the two provably mirrored.
+        let mut object = serde_json::Map::new();
+        for name in SECRET_FIELD_NAMES {
+            object.insert((*name).to_owned(), json!("live-secret"));
+        }
+        object.insert("account_id".to_owned(), json!("acct-123"));
+        let redacted = redact_secret_payload(&Value::Object(object), false);
+        for name in SECRET_FIELD_NAMES {
+            assert_eq!(redacted[*name], json!("[SUNK]"), "{name} was not sunk");
+        }
+        assert_eq!(redacted["account_id"], json!("acct-123"));
     }
 
     #[test]
