@@ -43,6 +43,7 @@ cfctl version --json
 cfctl doctor
 cfctl catalog sync
 cfctl catalog coverage --json
+cfctl resolve "rotate a worker secret"
 cfctl catalog search "Worker secret"
 cfctl docs changes
 ```

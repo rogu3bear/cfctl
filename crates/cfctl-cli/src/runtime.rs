@@ -209,23 +209,9 @@ fn core_guidance(error: &cfctl_core::CoreError) -> Option<(&'static str, String)
         }
         E::InvalidPlanState {
             operation_id,
+            actual,
             expected,
-            ..
-        } => {
-            if expected.starts_with("draft") {
-                format!(
-                    "Approval needs a draft. Check `cfctl plans status {operation_id}`; if it is already approved, run `cfctl plans run {operation_id}`."
-                )
-            } else if expected.contains("approved") || expected.contains("auto-execute") {
-                format!(
-                    "Approve the plan first: `cfctl plans approve {operation_id} --yes`, then `cfctl plans run {operation_id}`."
-                )
-            } else {
-                format!(
-                    "Inspect the plan state with `cfctl plans status {operation_id}` and follow the required transition."
-                )
-            }
-        }
+        } => plan_state_next_step(operation_id, *actual, expected),
         E::PlanExpired { .. } => {
             "The plan expired. Re-draft with `cfctl call <capability-id> …`, then approve and run promptly."
                 .to_owned()
@@ -240,6 +226,65 @@ fn core_guidance(error: &cfctl_core::CoreError) -> Option<(&'static str, String)
         _ => return None,
     };
     Some((CODE, step))
+}
+
+/// Recovery guidance for a rejected plan transition. Keys on the plan's ACTUAL
+/// state — not the `expected` string — so a completed plan is never told to
+/// re-approve/re-run, and a genuine run-before-approve is told to approve.
+fn plan_state_next_step(
+    operation_id: &str,
+    actual: cfctl_core::PlanStatus,
+    expected: &str,
+) -> String {
+    use cfctl_core::PlanStatus as S;
+    match actual {
+        S::Consumed | S::Running | S::Verified => format!(
+            "This plan already ran (state: {}); do not re-approve or re-run it. Inspect `cfctl plans status {operation_id}`, or draft a new plan with `cfctl call <capability-id> …` to repeat the change.",
+            plan_status_label(actual)
+        ),
+        S::Failed | S::RectificationRequired => {
+            format!("The plan did not complete and needs recovery: `cfctl plans rectify {operation_id}`.")
+        }
+        S::Rectified => {
+            format!("The plan was already rectified; inspect `cfctl plans status {operation_id}`.")
+        }
+        S::Expired => {
+            "The plan expired. Re-draft with `cfctl call <capability-id> …`, then approve and run promptly."
+                .to_owned()
+        }
+        S::Approved => {
+            format!("The plan is already approved; run it: `cfctl plans run {operation_id}`.")
+        }
+        S::Draft => {
+            if expected.contains("unchanged") || expected.contains("hash") {
+                "The plan changed since it was drafted. Re-draft and re-approve: `cfctl call <capability-id> …`."
+                    .to_owned()
+            } else if expected.contains("unapproved") {
+                format!(
+                    "This draft is consumed under a standing policy, not approved by hand. Inspect it with `cfctl plans status {operation_id}`."
+                )
+            } else {
+                format!(
+                    "Approval is required before running. Approve it: `cfctl plans approve {operation_id} --yes`, then `cfctl plans run {operation_id}`."
+                )
+            }
+        }
+    }
+}
+
+fn plan_status_label(status: cfctl_core::PlanStatus) -> &'static str {
+    use cfctl_core::PlanStatus as S;
+    match status {
+        S::Draft => "draft",
+        S::Approved => "approved",
+        S::Running => "running",
+        S::Consumed => "consumed",
+        S::Verified => "verified",
+        S::Failed => "failed",
+        S::RectificationRequired => "rectification_required",
+        S::Rectified => "rectified",
+        S::Expired => "expired",
+    }
 }
 
 fn storage_guidance(error: &cfctl_storage::StorageError) -> Option<(&'static str, String)> {
@@ -1736,7 +1781,7 @@ async fn execute_read(
         envelope.error = Some(ErrorV1 {
             code: code.to_owned(),
             message: format!(
-                "Cloudflare returned HTTP {} for capability `{}`",
+                "the Cloudflare read did not succeed (HTTP {}) for capability `{}`",
                 response.status, capability.id
             ),
             next_step: Some(next_step),
@@ -9947,29 +9992,35 @@ async fn resolve_command(store: &StateStore, arguments: ResolveArgs) -> Result<R
     }
     let catalog = ensure_catalog(store).await?;
     let ranked = catalog.search_scored(intent);
-    let (result, ok) = resolve_result(
+    let (result, error) = resolve_result(
         intent,
         &ranked,
         arguments.account.as_deref(),
         arguments.limit,
     );
     let mut envelope = ResultEnvelopeV2::success("resolve", result);
-    envelope.ok = ok;
-    if ok {
+    // `error: Some` is a fail-closed resolve: mark it not-ok and surface the
+    // recovery hint at the canonical envelope level, matching every other
+    // failure surface. `None` means a capability was actionably resolved.
+    envelope.ok = error.is_none();
+    if envelope.ok {
         envelope.capability_id = ranked.first().map(|(capability, _)| capability.id.clone());
     }
+    envelope.error = error;
     Ok(envelope)
 }
 
 /// Pure decision core for `resolve`: given the ranked catalog hits, produce the
-/// result JSON and whether it is actionable (`ok`). Deterministic and
+/// result JSON and an optional `ErrorV1`. `Some(error)` means the resolve failed
+/// closed (not actionable) and carries the canonical envelope-level `next_step`;
+/// `None` means an actionable capability was resolved. Deterministic and
 /// side-effect-free so the fail-closed gating is unit-testable without a store.
 fn resolve_result(
     intent: &str,
     ranked: &[(&CapabilityV1, usize)],
     account: Option<&str>,
     limit: usize,
-) -> (Value, bool) {
+) -> (Value, Option<ErrorV1>) {
     let limit = limit.clamp(1, 25);
     let candidates: Vec<Value> = ranked
         .iter()
@@ -9980,19 +10031,25 @@ fn resolve_result(
     // No positive-scoring capability: fail closed with discovery guidance.
     let Some((top_capability, top_score)) = ranked.first().map(|(cap, score)| (*cap, *score))
     else {
+        let next_step = "Broaden the query, or run `cfctl catalog search \"<keywords>\" --json`. If the catalog is stale, run `cfctl catalog sync`.";
         let result = json!({
             "intent": intent,
             "matched": [],
             "resolved": Value::Null,
             "ambiguous": true,
             "reason": "no catalog capability matched the intent terms",
-            "next_step": "Broaden the query, or run `cfctl catalog search \"<keywords>\" --json`. If the catalog is stale, run `cfctl catalog sync`.",
+            "next_step": next_step,
             "disambiguation": {
                 "search_argv": ["cfctl", "catalog", "search", intent, "--json"],
                 "coverage_argv": ["cfctl", "catalog", "coverage", "--json"],
             },
         });
-        return (result, false);
+        let error = ErrorV1 {
+            code: "CFCTL_RESOLVE_NO_MATCH".to_owned(),
+            message: "no catalog capability matched the intent terms".to_owned(),
+            next_step: Some(next_step.to_owned()),
+        };
+        return (result, Some(error));
     };
 
     let runner_up = ranked.get(1).map_or(0, |(_, score)| *score);
@@ -10014,30 +10071,54 @@ fn resolve_result(
                 top_capability.id, ranked[1].0.id,
             )
         };
+        let next_step = "Pick a candidate and inspect it: `cfctl catalog show <capability-id> --json`, then `cfctl guide <capability-id>`.";
         let result = json!({
             "intent": intent,
             "matched": candidates,
             "resolved": Value::Null,
             "ambiguous": true,
-            "reason": reason,
-            "next_step": "Pick a candidate and inspect it: `cfctl catalog show <capability-id> --json`, then `cfctl guide <capability-id>`.",
+            "reason": reason.clone(),
+            "next_step": next_step,
         });
-        return (result, false);
+        let error = ErrorV1 {
+            code: "CFCTL_RESOLVE_AMBIGUOUS".to_owned(),
+            message: reason,
+            next_step: Some(next_step.to_owned()),
+        };
+        return (result, Some(error));
     }
 
-    let gaps = top_capability.mutation_contract_gaps();
-    let contract_ready = top_capability.adapter_status != AdapterStatus::Blocked && gaps.is_empty();
-    let call_argv = capability_call_argv(top_capability);
-    let next_action = guide_next_action(top_capability, contract_ready, Some(&call_argv));
+    let (resolved, guidance) = resolve_actionable(top_capability, intent, account);
+    let result = json!({
+        "intent": intent,
+        "matched": candidates,
+        "resolved": resolved,
+        "ambiguous": false,
+        "guidance": guidance,
+    });
+    (result, None)
+}
+
+/// Build the `resolved` object for a confident top match: capability metadata,
+/// the governed command set, and (when applicable) the zone hint and account.
+/// Returns the resolved JSON and the human-facing guidance summary.
+fn resolve_actionable(
+    capability: &CapabilityV1,
+    intent: &str,
+    account: Option<&str>,
+) -> (Value, String) {
+    let gaps = capability.mutation_contract_gaps();
+    let contract_ready = capability.adapter_status != AdapterStatus::Blocked && gaps.is_empty();
+    let call_argv = capability_call_argv(capability);
+    let next_action = guide_next_action(capability, contract_ready, Some(&call_argv));
 
     // Contract-ready: emit the exact governed command sequence. Blocked or
     // gap-incomplete: reuse guide_next_action's fail-closed guidance instead of
     // fabricating a call the agent must not run.
     let commands = if contract_ready {
         let mut commands = json!({ "draft_argv": call_argv });
-        if top_capability.mutating {
-            commands["approve_argv"] =
-                json!(approval_command_argv(top_capability, "<operation-id>"));
+        if capability.mutating {
+            commands["approve_argv"] = json!(approval_command_argv(capability, "<operation-id>"));
             commands["run_argv"] = json!(["cfctl", "plans", "run", "<operation-id>", "--json"]);
             commands["status_argv"] =
                 json!(["cfctl", "plans", "status", "<operation-id>", "--json"]);
@@ -10047,37 +10128,29 @@ fn resolve_result(
         json!({
             "blocked": true,
             "blocking_gaps": gaps,
-            "next_action": next_action,
+            "next_action": next_action.clone(),
         })
     };
 
     let mut resolved = json!({
-        "capability_id": top_capability.id,
-        "title": top_capability.title,
-        "product": top_capability.product,
-        "mutating": top_capability.mutating,
+        "capability_id": capability.id,
+        "title": capability.title,
+        "product": capability.product,
+        "mutating": capability.mutating,
         "contract_ready": contract_ready,
-        "adapter_status": top_capability.adapter_status,
-        "required_selectors": required_selectors_json(top_capability),
-        "needs_request_body": capability_has_meaningful_request_body(top_capability),
-        "permission_lane": top_capability.permissions,
+        "adapter_status": capability.adapter_status,
+        "required_selectors": required_selectors_json(capability),
+        "needs_request_body": capability_has_meaningful_request_body(capability),
+        "permission_lane": capability.permissions,
         "commands": commands,
     });
-    if let Some(hint) = resolve_zone_hint(top_capability, intent) {
+    if let Some(hint) = resolve_zone_hint(capability, intent) {
         resolved["zone_resolution_hint"] = hint;
     }
     if let Some(account) = account {
         resolved["account"] = json!(account);
     }
-
-    let result = json!({
-        "intent": intent,
-        "matched": candidates,
-        "resolved": resolved,
-        "ambiguous": false,
-        "guidance": next_action.summary,
-    });
-    (result, true)
+    (resolved, next_action.summary)
 }
 
 fn resolve_candidate_json(capability: &CapabilityV1, score: usize) -> Value {
@@ -18488,6 +18561,42 @@ mod tests {
     }
 
     #[test]
+    fn rerunning_a_completed_plan_is_not_told_to_approve_again() {
+        // Regression: a Consumed/Executed plan re-run raises the same `expected`
+        // string as run-before-approve. Keying on `actual` must NOT advise
+        // re-approving/re-running a completed mutation.
+        for actual in [
+            cfctl_core::PlanStatus::Consumed,
+            cfctl_core::PlanStatus::Verified,
+            cfctl_core::PlanStatus::Running,
+        ] {
+            let error = super::CliError::Core(cfctl_core::CoreError::InvalidPlanState {
+                operation_id: "op-9".to_owned(),
+                actual,
+                expected: "approved or policy-authorized auto-execute draft",
+            });
+            let step = error.next_step().expect("state errors carry a step");
+            assert!(step.contains("already ran"), "{actual:?}: {step}");
+            assert!(!step.contains("plans approve op-9"), "{actual:?}: {step}");
+        }
+    }
+
+    #[test]
+    fn unapproved_standing_draft_is_not_a_false_approved_match() {
+        // Regression: `expected` contains the substring "approved" inside
+        // "unapproved"; the old branch mis-routed this to "Approve the plan
+        // first". Keying on `actual` (Draft) + the "unapproved" marker fixes it.
+        let error = super::CliError::Core(cfctl_core::CoreError::InvalidPlanState {
+            operation_id: "op-7".to_owned(),
+            actual: cfctl_core::PlanStatus::Draft,
+            expected: "unapproved approval-required draft for standing-authority consumption",
+        });
+        let step = error.next_step().expect("state errors carry a step");
+        assert!(step.contains("standing policy"), "{step}");
+        assert!(!step.contains("Approve the plan first"), "{step}");
+    }
+
+    #[test]
     fn plan_not_found_names_the_operation_id() {
         let error = super::CliError::Storage(cfctl_storage::StorageError::PlanNotFound(
             "op-xyz".to_owned(),
@@ -18574,8 +18683,13 @@ mod tests {
     #[test]
     fn resolve_result_empty_fails_closed_with_discovery_guidance() {
         let ranked: Vec<(&CapabilityV1, usize)> = Vec::new();
-        let (result, ok) = super::resolve_result("do a thing", &ranked, None, 5);
-        assert!(!ok);
+        let (result, error) = super::resolve_result("do a thing", &ranked, None, 5);
+        let error = error.expect("empty match fails closed");
+        assert_eq!(error.code, "CFCTL_RESOLVE_NO_MATCH");
+        assert!(
+            error.next_step.is_some(),
+            "fail-closed carries envelope next_step"
+        );
         assert_eq!(result["ambiguous"], serde_json::Value::Bool(true));
         assert_eq!(result["resolved"], serde_json::Value::Null);
         assert!(result["disambiguation"]["search_argv"].is_array());
@@ -18585,8 +18699,10 @@ mod tests {
     fn resolve_result_weak_top_score_fails_closed() {
         let cap = resolver_read_capability("a-thing", "A Thing", "Things");
         let ranked = vec![(&cap, 3usize)];
-        let (result, ok) = super::resolve_result("thing", &ranked, None, 5);
-        assert!(!ok, "a sub-threshold score must not commit");
+        let (result, error) = super::resolve_result("thing", &ranked, None, 5);
+        let error = error.expect("a sub-threshold score must not commit");
+        assert_eq!(error.code, "CFCTL_RESOLVE_AMBIGUOUS");
+        assert!(error.next_step.is_some());
         assert!(
             result["reason"]
                 .as_str()
@@ -18601,8 +18717,8 @@ mod tests {
         let b = resolver_read_capability("cap-b", "Cap B", "P");
         // 8 vs 7: top*2=16 < runner*3=21 -> not confident.
         let ranked = vec![(&a, 8usize), (&b, 7usize)];
-        let (result, ok) = super::resolve_result("ambiguous intent", &ranked, None, 5);
-        assert!(!ok);
+        let (result, error) = super::resolve_result("ambiguous intent", &ranked, None, 5);
+        assert!(error.is_some(), "close scores fail closed");
         assert_eq!(result["ambiguous"], serde_json::Value::Bool(true));
         assert_eq!(result["matched"].as_array().map(Vec::len), Some(2));
     }
@@ -18612,8 +18728,8 @@ mod tests {
         let cap =
             resolver_read_capability("email-routing-list", "List Email Routing", "Email Routing");
         let ranked = vec![(&cap, 12usize)];
-        let (result, ok) = super::resolve_result("list email routing", &ranked, None, 5);
-        assert!(ok);
+        let (result, error) = super::resolve_result("list email routing", &ranked, None, 5);
+        assert!(error.is_none(), "a confident read resolves");
         assert_eq!(result["ambiguous"], serde_json::Value::Bool(false));
         assert_eq!(result["resolved"]["capability_id"], "email-routing-list");
         assert!(result["resolved"]["commands"]["draft_argv"].is_array());
@@ -18625,8 +18741,8 @@ mod tests {
     fn resolve_result_confident_mutation_emits_the_governed_loop() {
         let cap = resolver_mutation_capability();
         let ranked = vec![(&cap, 20usize)];
-        let (result, ok) = super::resolve_result("enable email routing", &ranked, None, 5);
-        assert!(ok);
+        let (result, error) = super::resolve_result("enable email routing", &ranked, None, 5);
+        assert!(error.is_none(), "a confident mutation resolves");
         assert_eq!(
             result["resolved"]["contract_ready"],
             serde_json::Value::Bool(true),
@@ -18648,8 +18764,11 @@ mod tests {
         cap.adapter_status = AdapterStatus::Blocked;
         cap.blocked_reason = Some("operation contract incomplete: cost".to_owned());
         let ranked = vec![(&cap, 12usize)];
-        let (result, ok) = super::resolve_result("blocked thing", &ranked, None, 5);
-        assert!(ok);
+        let (result, error) = super::resolve_result("blocked thing", &ranked, None, 5);
+        assert!(
+            error.is_none(),
+            "a blocked-but-unambiguous top match still resolves (with withheld commands)"
+        );
         assert_eq!(
             result["resolved"]["contract_ready"],
             serde_json::Value::Bool(false)
@@ -18680,9 +18799,9 @@ mod tests {
             contract: None,
         }];
         let ranked = vec![(&cap, 12usize)];
-        let (result, ok) =
+        let (result, error) =
             super::resolve_result("get setting on example.com", &ranked, Some("acct-9"), 5);
-        assert!(ok);
+        assert!(error.is_none());
         let hint = &result["resolved"]["zone_resolution_hint"];
         assert!(hint.is_object());
         let example = hint["example_read_argv"].as_array().expect("example argv");
@@ -18702,7 +18821,7 @@ mod tests {
             .enumerate()
             .map(|(index, cap)| (cap, 100 - index))
             .collect();
-        let (result, _ok) = super::resolve_result("cap", &ranked, None, 3);
+        let (result, _error) = super::resolve_result("cap", &ranked, None, 3);
         assert_eq!(result["matched"].as_array().map(Vec::len), Some(3));
     }
 
