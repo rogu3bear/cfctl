@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "cfctl-agent"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "cfctl-core",
  "directories",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "cfctl-auth"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64",
  "chrono",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "cfctl-catalog"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "cfctl-core",
  "chrono",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "cfctl-cli"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "cfctl-agent",
  "cfctl-auth",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "cfctl-cloudflare"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "cfctl-auth",
@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "cfctl-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "chrono",
  "hex",
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "cfctl-planner"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "cfctl-core",
  "chrono",
@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "cfctl-storage"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "cfctl-core",
  "chrono",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "cfctl-workspace"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "cfctl-core",
  "hex",
@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "cfctl-core",
  "clap",
