@@ -486,11 +486,13 @@ to an empty draft release without clobbering. If an upload fails, it removes
 only the assets from that failed attempt. Making the draft public remains a
 separate operator action.
 
-The published Linux installer requires Cosign. It verifies the downloaded
-checksum manifest against the exact Fulcio identity and OIDC issuer rendered by
-the release operator, then checks the selected binary against both that signed
-manifest and the installer-embedded architecture hash. It has no checksum-only
-fallback.
+The signed lane above is available tooling, not the current publishing
+posture: published releases are unsigned by operator decision, with integrity
+provided by `SHA256SUMS`, reproducible double-builds, SPDX SBOMs, and
+commit-bound provenance. Because the rendered Linux installer verifies a
+Cosign identity and has no checksum-only fallback, it is deliberately not
+shipped with unsigned releases — install by direct download plus checksum
+verification, the release's Homebrew formula, or source build.
 
 GitHub-hosted Rust builds are intentionally absent.
 
