@@ -108,6 +108,7 @@ cfctl version
 cfctl auth login|status|profiles|use|logout|import-api-token|import-global-key
 cfctl keys permissions|mint|rotate|revoke|policy
 cfctl catalog sync|search|show|changes|coverage
+cfctl resolve "<natural-language intent>"
 cfctl call <capability-id> [selectors/body]
 cfctl guide <capability-id>
 cfctl guide --topic system|standing-authority

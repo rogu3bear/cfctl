@@ -27,6 +27,7 @@ pub const PUBLIC_V2_SUBCOMMANDS: &[&str] = &[
     "keys",
     "migrate",
     "plans",
+    "resolve",
     "update",
     "version",
     "workspace",

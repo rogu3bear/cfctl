@@ -45,12 +45,16 @@ counts from `cfctl catalog sync` and `cfctl catalog coverage --json`.
 Find and inspect an operation:
 
 ```bash
+cfctl resolve "<natural-language intent>" --json
 cfctl catalog search "<intent>" --json
 cfctl catalog show <capability-id> --json
 cfctl guide <capability-id> --json
 ```
 
-Treat the guide as an executable safety contract, not prose. Run `call_argv`
+`cfctl resolve` deterministically maps a goal to a capability and emits the exact
+governed `call`/`approve`/`run` commands, failing closed with ranked candidates
+when the match is ambiguous. Treat the guide as an executable safety contract,
+not prose. Run `call_argv`
 only when `contract_state` is `available`. When it is `blocked`, resolve every
 named `blocking_gaps` entry through the supplied safe `next_action`; the
 `post_resolution_call_argv` field is a template and is deliberately not an

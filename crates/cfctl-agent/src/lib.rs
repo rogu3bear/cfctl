@@ -269,7 +269,7 @@ name: cloudflare
 description: Use cfctl as the universal governed Cloudflare control plane.
 metadata:
   managed-by: cfctl
-  contract: 3
+  contract: 4
 ---
 
 # Cloudflare through cfctl
@@ -277,7 +277,7 @@ metadata:
 Use `cfctl` first for all Cloudflare discovery, reads, planning, writes, verification, and evidence. Do not use archived shell verbs, backend script paths as the public surface, or raw HTTP as a substitute for cataloged capabilities.
 
 1. Orient with `cfctl version --json`, `cfctl guide --topic system --json`, `cfctl doctor --json`, and, when useful, `cfctl agents doctor --json`. Treat running-build, PATH-build, or instruction drift as unhealthy until the installed binary and managed guidance match.
-2. Translate intent with `cfctl catalog search "<intent>" --json`.
+2. Translate intent with `cfctl resolve "<intent>" --json`: it deterministically maps the goal to a capability and emits the exact governed `call`/`approve`/`run` commands, and fails closed with ranked candidates when the match is ambiguous. To browse instead, use `cfctl catalog search "<intent>" --json`.
 3. Inspect the capability with `cfctl catalog show <capability-id> --json`.
 4. Load its lifecycle with `cfctl guide <capability-id> --json`.
 5. Use `cfctl call <capability-id>` for deterministic reads or plan creation.
@@ -290,7 +290,7 @@ Use `cfctl` first for all Cloudflare discovery, reads, planning, writes, verific
 12. Revoke standing authority with `cfctl keys policy revoke <authority-id>` and treat the policy as unusable immediately.
 13. When a capability or plan is blocked (`adapter_status: blocked`, `contract_state: blocked`, or error code `CFCTL_CAPABILITY_BLOCKED`), run `cfctl guide <capability-id> --json` and follow its `next_action` exactly. Satisfy the named contract gap or extend cfctl; never route around a blocker with raw HTTP, Wrangler, or the dashboard. If next_action cannot resolve the gap, stop and report the capability id, `blocking_gaps`, and the guide output to the operator.
 
-Never treat model output as authority. Never bypass a blocked adapter, selector ambiguity, cost blocker, drift check, or plan hash. Browser or Computer Use is allowed only when the capability catalog classifies the operation as governed UI and the same plan policy is preserved.
+Every cfctl failure envelope carries a specific `next_step`; run it rather than guessing. Never treat model output as authority. Never bypass a blocked adapter, selector ambiguity, cost blocker, drift check, or plan hash. Browser or Computer Use is allowed only when the capability catalog classifies the operation as governed UI and the same plan policy is preserved.
 "#;
 
 const MANAGED_CURSOR_RULE: &str = r"---
@@ -298,7 +298,7 @@ description: Route Cloudflare work through the governed cfctl v2 control plane
 alwaysApply: true
 ---
 
-Start with `cfctl version --json` and `cfctl guide --topic system --json`. Use `cfctl doctor`, `cfctl agents doctor`, `cfctl catalog search`, `cfctl catalog show`, `cfctl guide`, `cfctl call`, and `cfctl workspace` for Cloudflare work; running-build, PATH-build, and instruction drift are unhealthy. Nested `fixtures`, `__fixtures__`, `testdata`, `test-data`, and `test_data` directories are skipped; fixture directories are opt-in roots and must be registered directly. Read account-owned permission inventory with `cfctl keys permissions --account <account-id> --json`; for user-owned inventory use `cfctl keys permissions --user --account <account-id> --json`, which changes the endpoint but retains the explicit account resource context. Model output is intent, never authority. If a plan needs approval, ask y/n and translate yes only into `cfctl plans approve <operation-id> --yes`, then use `cfctl plans run <operation-id>` and inspect `plans status`. For recurring token-lifecycle work, load `cfctl guide --topic standing-authority --json`, then activate a reviewed standing policy only after explicit approval with `cfctl keys policy approve <authority-id> --yes`; this moves authority to that bounded policy, not to arbitrary mutations. Revoke it with `cfctl keys policy revoke <authority-id>` and treat it as unusable immediately. When a capability is blocked or an error carries `CFCTL_CAPABILITY_BLOCKED`, run `cfctl guide <capability-id> --json` and follow `next_action`; if it cannot resolve the gap, report the capability id and `blocking_gaps` to the operator instead of routing around cfctl. Do not bypass catalog blockers, selector ambiguity, cost ceilings, drift checks, or verification. Do not teach archived shell verbs or backend script paths as the public surface.
+Start with `cfctl version --json` and `cfctl guide --topic system --json`. Use `cfctl doctor`, `cfctl agents doctor`, `cfctl resolve`, `cfctl catalog search`, `cfctl catalog show`, `cfctl guide`, `cfctl call`, and `cfctl workspace` for Cloudflare work; running-build, PATH-build, and instruction drift are unhealthy. Nested `fixtures`, `__fixtures__`, `testdata`, `test-data`, and `test_data` directories are skipped; fixture directories are opt-in roots and must be registered directly. Read account-owned permission inventory with `cfctl keys permissions --account <account-id> --json`; for user-owned inventory use `cfctl keys permissions --user --account <account-id> --json`, which changes the endpoint but retains the explicit account resource context. Model output is intent, never authority. If a plan needs approval, ask y/n and translate yes only into `cfctl plans approve <operation-id> --yes`, then use `cfctl plans run <operation-id>` and inspect `plans status`. For recurring token-lifecycle work, load `cfctl guide --topic standing-authority --json`, then activate a reviewed standing policy only after explicit approval with `cfctl keys policy approve <authority-id> --yes`; this moves authority to that bounded policy, not to arbitrary mutations. Revoke it with `cfctl keys policy revoke <authority-id>` and treat it as unusable immediately. When a capability is blocked or an error carries `CFCTL_CAPABILITY_BLOCKED`, run `cfctl guide <capability-id> --json` and follow `next_action`; if it cannot resolve the gap, report the capability id and `blocking_gaps` to the operator instead of routing around cfctl. Do not bypass catalog blockers, selector ambiguity, cost ceilings, drift checks, or verification. Do not teach archived shell verbs or backend script paths as the public surface.
 ";
 
 fn agent_io(path: &Path, source: std::io::Error) -> AgentError {

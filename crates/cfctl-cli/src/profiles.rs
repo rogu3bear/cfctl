@@ -51,9 +51,10 @@ impl ProfilesConfig {
         let id = requested
             .or(self.current_profile.as_deref())
             .ok_or_else(|| {
-                CliError::Input(
-                    "no active profile; run `cfctl auth import-api-token --account <id> --stdin` or `cfctl auth login --client-id <id>`"
-                        .to_owned(),
+                CliError::guided(
+                    "CFCTL_NO_PROFILE",
+                    "no active profile is selected",
+                    "Import a scoped token: `printf '%s' \"$TOKEN\" | cfctl auth import-api-token --account <account-id> --stdin`, or run `cfctl auth login --client-id <id>`. Check state with `cfctl auth status --json`.",
                 )
             })?;
         let profile = self

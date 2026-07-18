@@ -48,7 +48,7 @@ use crate::{
     GuideArgs, GuideTopicArg, ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs,
     KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs,
     KeyPolicySelector, KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs,
-    PlanSelector, PlansCommand, ProfileSelector, SearchArgs, WorkspaceCommand,
+    PlanSelector, PlansCommand, ProfileSelector, ResolveArgs, SearchArgs, WorkspaceCommand,
     build_identity::{current_build_info, inspect_path_build},
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
@@ -84,6 +84,294 @@ pub enum CliError {
     Http(#[from] reqwest::Error),
     #[error("subprocess `{0}` exceeded the 120-second governed timeout")]
     SubprocessTimeout(String),
+    /// A CLI-level blocker that carries its own stable code and a specific,
+    /// copy-pasteable next command for the agent. Prefer this over
+    /// `Input(String)` whenever the failure has a knowable recovery step.
+    #[error("{message}")]
+    Guided {
+        code: &'static str,
+        message: String,
+        next_step: String,
+    },
+}
+
+impl CliError {
+    /// Build a guided blocker: a stable code, a human message, and the exact
+    /// next command an agent should run to recover.
+    pub fn guided(
+        code: &'static str,
+        message: impl Into<String>,
+        next_step: impl Into<String>,
+    ) -> Self {
+        Self::Guided {
+            code,
+            message: message.into(),
+            next_step: next_step.into(),
+        }
+    }
+
+    /// Stable machine-readable code for the failure envelope. Defaults to
+    /// `CFCTL_ERROR` when the category is not specifically recognized.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        self.guidance().map_or("CFCTL_ERROR", |(code, _)| code)
+    }
+
+    /// A specific, copy-pasteable next command for the agent, when the error
+    /// category makes one knowable. `None` lets the caller fall back to the
+    /// generic doctor guidance.
+    #[must_use]
+    pub fn next_step(&self) -> Option<String> {
+        self.guidance().map(|(_, step)| step)
+    }
+
+    fn guidance(&self) -> Option<(&'static str, String)> {
+        match self {
+            Self::Guided {
+                code, next_step, ..
+            } => Some((code, next_step.clone())),
+            Self::Cloudflare(inner) => cloudflare_guidance(inner),
+            Self::Core(inner) => core_guidance(inner),
+            Self::Storage(inner) => storage_guidance(inner),
+            Self::Auth(inner) => auth_guidance(inner),
+            Self::Workspace(_) => Some((
+                "CFCTL_WORKSPACE",
+                "Run `cfctl workspace audit --json` to inspect registered roots and drift."
+                    .to_owned(),
+            )),
+            _ => None,
+        }
+    }
+}
+
+fn cloudflare_guidance(
+    error: &cfctl_cloudflare::CloudflareError,
+) -> Option<(&'static str, String)> {
+    use cfctl_cloudflare::CloudflareError as E;
+    let (code, step): (&'static str, &str) = match error {
+        E::MissingSelector(_)
+        | E::MissingHeaderSelector(_)
+        | E::InvalidSelector(_)
+        | E::InvalidSelectorObject
+        | E::InvalidSelectorSchema { .. } => (
+            "CFCTL_REQUEST_CONTRACT",
+            "Run `cfctl guide <capability-id> --json` for the required selectors, then re-run `cfctl call` with each `--selector name=value`.",
+        ),
+        E::UndeclaredSelector(_) | E::InvalidQueryObject | E::UndeclaredQuerySelector(_) => (
+            "CFCTL_REQUEST_CONTRACT",
+            "Run `cfctl catalog show <capability-id> --json` to see the declared selectors and query controls, then drop or rename the undeclared input.",
+        ),
+        E::MissingQuerySelector(_)
+        | E::InvalidQuerySelector { .. }
+        | E::InvalidQuerySelectorSchema { .. }
+        | E::UnsupportedQuerySerialization { .. } => (
+            "CFCTL_REQUEST_CONTRACT",
+            "Run `cfctl guide <capability-id>` and add each required `--query name=value`.",
+        ),
+        E::MissingRequestBody(_) | E::InvalidRequestBody(_) => (
+            "CFCTL_REQUEST_CONTRACT",
+            "Run `cfctl guide <capability-id>` for the body schema, then pass `--body-json '{…}'` (or `--body-stdin`).",
+        ),
+        E::ApprovedPlanRequired(_) => (
+            "CFCTL_PLAN_REQUIRED",
+            "This capability mutates state: draft, approve, then run. `cfctl call <capability-id> …` prints an operation id; then `cfctl plans approve <operation-id> --yes` and `cfctl plans run <operation-id>`.",
+        ),
+        E::CatalogDrift { .. } => (
+            "CFCTL_CATALOG_DRIFT",
+            "The catalog moved since the plan was drafted. Run `cfctl catalog sync`, then re-draft with `cfctl call <capability-id> …`.",
+        ),
+        E::Plan(core) => return core_guidance(core),
+        _ => return None,
+    };
+    Some((code, step.to_owned()))
+}
+
+fn core_guidance(error: &cfctl_core::CoreError) -> Option<(&'static str, String)> {
+    use cfctl_core::CoreError as E;
+    const CODE: &str = "CFCTL_PLAN_LIFECYCLE";
+    let step = match error {
+        E::ExplicitApprovalRequired => {
+            "Re-run with the explicit approval flag: `cfctl plans approve <operation-id> --yes`."
+                .to_owned()
+        }
+        E::CostCeilingRequired(operation_id) => format!(
+            "This plan needs an explicit cost ceiling: `cfctl plans approve {operation_id} --yes --max-cost USD:<amount>`."
+        ),
+        E::CostCeilingTooLow {
+            operation_id,
+            required_currency,
+            required_amount,
+        } => format!(
+            "Raise the ceiling to at least the declared maximum: `cfctl plans approve {operation_id} --yes --max-cost {required_currency}:{required_amount}`."
+        ),
+        E::InvalidCostCeiling { .. } => {
+            "Format the ceiling as CURRENCY:AMOUNT, for example `--max-cost USD:5`.".to_owned()
+        }
+        E::InvalidPlanState {
+            operation_id,
+            actual,
+            expected,
+        } => plan_state_next_step(operation_id, *actual, expected),
+        E::PlanExpired { .. } => {
+            "The plan expired. Re-draft with `cfctl call <capability-id> …`, then approve and run promptly."
+                .to_owned()
+        }
+        E::PlanDrifted(_) => {
+            "Approval no longer matches the plan content. Re-draft and re-approve: `cfctl call <capability-id> …`."
+                .to_owned()
+        }
+        E::InvalidTransactionJournal { operation_id, .. } => {
+            format!("Reconcile the plan's journal: `cfctl plans rectify {operation_id}`.")
+        }
+        _ => return None,
+    };
+    Some((CODE, step))
+}
+
+/// Recovery guidance for a rejected plan transition. Keys on the plan's ACTUAL
+/// state — not the `expected` string — so a completed plan is never told to
+/// re-approve/re-run, and a genuine run-before-approve is told to approve.
+fn plan_state_next_step(
+    operation_id: &str,
+    actual: cfctl_core::PlanStatus,
+    expected: &str,
+) -> String {
+    use cfctl_core::PlanStatus as S;
+    match actual {
+        S::Consumed | S::Running | S::Verified => format!(
+            "This plan already ran (state: {}); do not re-approve or re-run it. Inspect `cfctl plans status {operation_id}`, or draft a new plan with `cfctl call <capability-id> …` to repeat the change.",
+            plan_status_label(actual)
+        ),
+        S::Failed | S::RectificationRequired => {
+            format!("The plan did not complete and needs recovery: `cfctl plans rectify {operation_id}`.")
+        }
+        S::Rectified => {
+            format!("The plan was already rectified; inspect `cfctl plans status {operation_id}`.")
+        }
+        S::Expired => {
+            "The plan expired. Re-draft with `cfctl call <capability-id> …`, then approve and run promptly."
+                .to_owned()
+        }
+        S::Approved => {
+            format!("The plan is already approved; run it: `cfctl plans run {operation_id}`.")
+        }
+        S::Draft => {
+            if expected.contains("unchanged") || expected.contains("hash") {
+                "The plan changed since it was drafted. Re-draft and re-approve: `cfctl call <capability-id> …`."
+                    .to_owned()
+            } else if expected.contains("unapproved") {
+                format!(
+                    "This draft is consumed under a standing policy, not approved by hand. Inspect it with `cfctl plans status {operation_id}`."
+                )
+            } else {
+                format!(
+                    "Approval is required before running. Approve it: `cfctl plans approve {operation_id} --yes`, then `cfctl plans run {operation_id}`."
+                )
+            }
+        }
+    }
+}
+
+fn plan_status_label(status: cfctl_core::PlanStatus) -> &'static str {
+    use cfctl_core::PlanStatus as S;
+    match status {
+        S::Draft => "draft",
+        S::Approved => "approved",
+        S::Running => "running",
+        S::Consumed => "consumed",
+        S::Verified => "verified",
+        S::Failed => "failed",
+        S::RectificationRequired => "rectification_required",
+        S::Rectified => "rectified",
+        S::Expired => "expired",
+    }
+}
+
+fn storage_guidance(error: &cfctl_storage::StorageError) -> Option<(&'static str, String)> {
+    use cfctl_storage::StorageError as E;
+    let (code, step) = match error {
+        E::PlanNotFound(id) => (
+            "CFCTL_PLAN_LIFECYCLE",
+            format!(
+                "No plan with that id. Confirm it with `cfctl plans show {id}`; the operation id is printed by the `cfctl call` that drafted the plan."
+            ),
+        ),
+        E::PlanLocked(id) => (
+            "CFCTL_PLAN_LIFECYCLE",
+            format!(
+                "Another `cfctl plans` run holds the lock. Check `cfctl plans status {id}` and retry once it finishes."
+            ),
+        ),
+        E::InvalidPlanId(_) | E::InvalidAuthorityId(_) => (
+            "CFCTL_PLAN_LIFECYCLE",
+            "Pass the operation id exactly as printed by `cfctl call` (a lowercase hyphenated UUID)."
+                .to_owned(),
+        ),
+        E::WriteDurabilityUnknown { .. } => (
+            "CFCTL_PLAN_LIFECYCLE",
+            "The write is not durably confirmed. Reload with `cfctl plans status <operation-id>` before retrying."
+                .to_owned(),
+        ),
+        E::InvalidPlan(core) => return core_guidance(core),
+        _ => return None,
+    };
+    Some((code, step))
+}
+
+fn auth_guidance(error: &cfctl_auth::AuthError) -> Option<(&'static str, String)> {
+    use cfctl_auth::AuthError as E;
+    const CODE: &str = "CFCTL_AUTH";
+    let step = match error {
+        E::MissingCredential(_) => {
+            "The profile has no stored credential. Re-import it: `printf '%s' \"$TOKEN\" | cfctl auth import-api-token --account <account-id> --stdin`."
+                .to_owned()
+        }
+        E::NoAccounts | E::AmbiguousAccount { .. } | E::AccountNotFound(_) => {
+            "Pass `--account <account-id>` explicitly (list available accounts with `cfctl auth status --json`)."
+                .to_owned()
+        }
+        E::UnsupportedLegacyWranglerSession(id) => format!(
+            "Remove the legacy profile and re-authenticate: `cfctl auth logout {id}` then `cfctl auth login --profile {id}`."
+        ),
+        E::SecretStore(_) => {
+            "The secret backend is unavailable. Run `cfctl doctor --json` to inspect the credential store."
+                .to_owned()
+        }
+        _ => return None,
+    };
+    Some((CODE, step))
+}
+
+/// Map a non-2xx live Cloudflare read status to a stable code and a specific
+/// next command. Authorization failures point at the token scope; input
+/// failures point at the selector/zone contract; the rest fall back to doctor.
+fn live_read_failure_guidance(status: u16) -> (&'static str, String) {
+    match status {
+        401 | 403 => (
+            "CFCTL_LIVE_UNAUTHORIZED",
+            "The token lacks scope for this read. Confirm its permissions with `cfctl keys permissions --json`, or select a scoped profile with `--profile <id>`."
+                .to_owned(),
+        ),
+        400 | 404 | 422 => (
+            "CFCTL_LIVE_BAD_REQUEST",
+            "Cloudflare rejected the inputs. Run `cfctl guide <capability-id>` to check required selectors — zone selectors need the 32-hex zone id, not a domain (resolve it with a `/zones` read filtered by `--query name=<domain>`)."
+                .to_owned(),
+        ),
+        429 => (
+            "CFCTL_LIVE_RATE_LIMITED",
+            "Cloudflare rate-limited the request. Wait and retry the same `cfctl call`.".to_owned(),
+        ),
+        500..=599 => (
+            "CFCTL_LIVE_UPSTREAM",
+            "Cloudflare reported a server-side error. Retry shortly; if it persists, run `cfctl doctor --json`."
+                .to_owned(),
+        ),
+        _ => (
+            "CFCTL_LIVE_ERROR",
+            "The live read failed. Inspect the returned Cloudflare errors and run `cfctl doctor --json`."
+                .to_owned(),
+        ),
+    }
 }
 
 pub type Result<T> = std::result::Result<T, CliError>;
@@ -106,6 +394,7 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
         Command::Keys(arguments) => keys_command(&store, arguments.command).await,
         Command::Catalog(arguments) => catalog_command(&store, arguments.command).await,
         Command::Call(arguments) => call_command(&store, arguments).await,
+        Command::Resolve(arguments) => resolve_command(&store, arguments).await,
         Command::Guide(arguments) => guide_command(&store, &arguments).await,
         Command::Plans(arguments) => plans_command(&store, arguments.command).await,
         Command::Workspace(arguments) => workspace_command(&store, arguments.command),
@@ -1484,6 +1773,20 @@ async fn execute_read(
         "live Cloudflare read pinned to catalog {}",
         catalog.schema_hash
     ));
+    // A non-2xx Cloudflare response is `Ok` at the transport layer but a failure
+    // to the agent. Without an ErrorV1 it would surface as `ok:false` with no
+    // guidance; attach a status-specific next step so the agent knows the move.
+    if !response.success {
+        let (code, next_step) = live_read_failure_guidance(response.status);
+        envelope.error = Some(ErrorV1 {
+            code: code.to_owned(),
+            message: format!(
+                "the Cloudflare read did not succeed (HTTP {}) for capability `{}`",
+                response.status, capability.id
+            ),
+            next_step: Some(next_step),
+        });
+    }
     Ok(envelope)
 }
 
@@ -9668,6 +9971,272 @@ fn guide_document(capability: &CapabilityV1) -> CapabilityGuideV1 {
     }
 }
 
+/// Minimum top score for the resolver to commit to a single capability.
+/// A hit below this is a description-only near-miss; the resolver reports
+/// candidates but refuses to emit a call string.
+const RESOLVE_MIN_CONFIDENT_SCORE: usize = 6;
+
+/// Deterministically map a natural-language intent to a capability and the exact
+/// governed commands to run. Read-only: it never mutates Cloudflare and never
+/// launches an agent (that is `execute_natural_language`). It fails closed —
+/// emitting only disambiguation guidance — when nothing matches confidently or
+/// the top match does not clearly beat the runner-up.
+async fn resolve_command(store: &StateStore, arguments: ResolveArgs) -> Result<ResultEnvelopeV2> {
+    let intent = arguments.intent.trim();
+    if intent.is_empty() {
+        return Err(CliError::guided(
+            "CFCTL_RESOLVE_EMPTY",
+            "resolve needs a natural-language intent",
+            "Describe the goal, e.g. `cfctl resolve \"enable email routing on example.com\"`.",
+        ));
+    }
+    let catalog = ensure_catalog(store).await?;
+    let ranked = catalog.search_scored(intent);
+    let (result, error) = resolve_result(
+        intent,
+        &ranked,
+        arguments.account.as_deref(),
+        arguments.limit,
+    );
+    let mut envelope = ResultEnvelopeV2::success("resolve", result);
+    // `error: Some` is a fail-closed resolve: mark it not-ok and surface the
+    // recovery hint at the canonical envelope level, matching every other
+    // failure surface. `None` means a capability was actionably resolved.
+    envelope.ok = error.is_none();
+    if envelope.ok {
+        envelope.capability_id = ranked.first().map(|(capability, _)| capability.id.clone());
+    }
+    envelope.error = error;
+    Ok(envelope)
+}
+
+/// Pure decision core for `resolve`: given the ranked catalog hits, produce the
+/// result JSON and an optional `ErrorV1`. `Some(error)` means the resolve failed
+/// closed (not actionable) and carries the canonical envelope-level `next_step`;
+/// `None` means an actionable capability was resolved. Deterministic and
+/// side-effect-free so the fail-closed gating is unit-testable without a store.
+fn resolve_result(
+    intent: &str,
+    ranked: &[(&CapabilityV1, usize)],
+    account: Option<&str>,
+    limit: usize,
+) -> (Value, Option<ErrorV1>) {
+    let limit = limit.clamp(1, 25);
+    let candidates: Vec<Value> = ranked
+        .iter()
+        .take(limit)
+        .map(|(capability, score)| resolve_candidate_json(capability, *score))
+        .collect();
+
+    // No positive-scoring capability: fail closed with discovery guidance.
+    let Some((top_capability, top_score)) = ranked.first().map(|(cap, score)| (*cap, *score))
+    else {
+        let next_step = "Broaden the query, or run `cfctl catalog search \"<keywords>\" --json`. If the catalog is stale, run `cfctl catalog sync`.";
+        let result = json!({
+            "intent": intent,
+            "matched": [],
+            "resolved": Value::Null,
+            "ambiguous": true,
+            "reason": "no catalog capability matched the intent terms",
+            "next_step": next_step,
+            "disambiguation": {
+                "search_argv": ["cfctl", "catalog", "search", intent, "--json"],
+                "coverage_argv": ["cfctl", "catalog", "coverage", "--json"],
+            },
+        });
+        let error = ErrorV1 {
+            code: "CFCTL_RESOLVE_NO_MATCH".to_owned(),
+            message: "no catalog capability matched the intent terms".to_owned(),
+            next_step: Some(next_step.to_owned()),
+        };
+        return (result, Some(error));
+    };
+
+    let runner_up = ranked.get(1).map_or(0, |(_, score)| *score);
+    // Commit only to a confident, unambiguous top match: score above the floor
+    // and at least 1.5x the runner-up (or a sole match). Integer test avoids
+    // float rounding: top/runner >= 3/2.
+    let confident = top_score >= RESOLVE_MIN_CONFIDENT_SCORE
+        && (runner_up == 0 || top_score * 2 >= runner_up * 3);
+
+    if !confident {
+        let reason = if top_score < RESOLVE_MIN_CONFIDENT_SCORE {
+            format!(
+                "top match `{}` scored only {top_score}; too weak to commit",
+                top_capability.id
+            )
+        } else {
+            format!(
+                "top match `{}` (score {top_score}) does not clearly beat `{}` (score {runner_up})",
+                top_capability.id, ranked[1].0.id,
+            )
+        };
+        let next_step = "Pick a candidate and inspect it: `cfctl catalog show <capability-id> --json`, then `cfctl guide <capability-id>`.";
+        let result = json!({
+            "intent": intent,
+            "matched": candidates,
+            "resolved": Value::Null,
+            "ambiguous": true,
+            "reason": reason.clone(),
+            "next_step": next_step,
+        });
+        let error = ErrorV1 {
+            code: "CFCTL_RESOLVE_AMBIGUOUS".to_owned(),
+            message: reason,
+            next_step: Some(next_step.to_owned()),
+        };
+        return (result, Some(error));
+    }
+
+    let (resolved, guidance) = resolve_actionable(top_capability, intent, account);
+    let result = json!({
+        "intent": intent,
+        "matched": candidates,
+        "resolved": resolved,
+        "ambiguous": false,
+        "guidance": guidance,
+    });
+    (result, None)
+}
+
+/// Build the `resolved` object for a confident top match: capability metadata,
+/// the governed command set, and (when applicable) the zone hint and account.
+/// Returns the resolved JSON and the human-facing guidance summary.
+fn resolve_actionable(
+    capability: &CapabilityV1,
+    intent: &str,
+    account: Option<&str>,
+) -> (Value, String) {
+    let gaps = capability.mutation_contract_gaps();
+    let contract_ready = capability.adapter_status != AdapterStatus::Blocked && gaps.is_empty();
+    let call_argv = capability_call_argv(capability);
+    let next_action = guide_next_action(capability, contract_ready, Some(&call_argv));
+
+    // Contract-ready: emit the exact governed command sequence. Blocked or
+    // gap-incomplete: reuse guide_next_action's fail-closed guidance instead of
+    // fabricating a call the agent must not run.
+    let commands = if contract_ready {
+        let mut commands = json!({ "draft_argv": call_argv });
+        if capability.mutating {
+            commands["approve_argv"] = json!(approval_command_argv(capability, "<operation-id>"));
+            commands["run_argv"] = json!(["cfctl", "plans", "run", "<operation-id>", "--json"]);
+            commands["status_argv"] =
+                json!(["cfctl", "plans", "status", "<operation-id>", "--json"]);
+        }
+        commands
+    } else {
+        json!({
+            "blocked": true,
+            "blocking_gaps": gaps,
+            "next_action": next_action.clone(),
+        })
+    };
+
+    let mut resolved = json!({
+        "capability_id": capability.id,
+        "title": capability.title,
+        "product": capability.product,
+        "mutating": capability.mutating,
+        "contract_ready": contract_ready,
+        "adapter_status": capability.adapter_status,
+        "required_selectors": required_selectors_json(capability),
+        "needs_request_body": capability_has_meaningful_request_body(capability),
+        "permission_lane": capability.permissions,
+        "commands": commands,
+    });
+    if let Some(hint) = resolve_zone_hint(capability, intent) {
+        resolved["zone_resolution_hint"] = hint;
+    }
+    if let Some(account) = account {
+        resolved["account"] = json!(account);
+    }
+    (resolved, next_action.summary)
+}
+
+fn resolve_candidate_json(capability: &CapabilityV1, score: usize) -> Value {
+    let contract_ready = capability.adapter_status != AdapterStatus::Blocked
+        && capability.mutation_contract_gaps().is_empty();
+    json!({
+        "capability_id": capability.id,
+        "score": score,
+        "title": capability.title,
+        "product": capability.product,
+        "mutating": capability.mutating,
+        "adapter_status": capability.adapter_status,
+        "contract_ready": contract_ready,
+        "show_argv": catalog_show_argv(&capability.id),
+        "guide_argv": ["cfctl", "guide", capability.id.as_str(), "--json"],
+    })
+}
+
+fn required_selectors_json(capability: &CapabilityV1) -> Vec<Value> {
+    capability
+        .selectors
+        .iter()
+        .filter(|selector| selector.required)
+        .map(|selector| {
+            json!({
+                "name": selector.name,
+                "location": selector.location,
+                "value_type": selector.value_type,
+                "description": selector.description,
+            })
+        })
+        .collect()
+}
+
+/// When a capability requires a zone path selector, emit a resolve-first hint:
+/// cfctl has no inline domain->zone_id resolver, so an agent must read the zone
+/// id from a `/zones` list before calling. Never guesses a zone id.
+fn resolve_zone_hint(capability: &CapabilityV1, intent: &str) -> Option<Value> {
+    let needs_zone = capability.selectors.iter().any(|selector| {
+        selector.required
+            && selector.location == "path"
+            && selector.name.to_ascii_lowercase().contains("zone")
+    });
+    if !needs_zone {
+        return None;
+    }
+    let domain = extract_domain(intent);
+    let domain_token = domain.as_deref().unwrap_or("<domain>");
+    Some(json!({
+        "reason": "This capability needs a 32-hex Cloudflare zone id, not a domain name.",
+        "resolve_first": "Find the zone-list capability, then read the zone id from its result.",
+        "search_argv": ["cfctl", "catalog", "search", "list zones", "--json"],
+        "example_read_argv": [
+            "cfctl", "call", "<zone-list-capability-id>", "--query", format!("name={domain_token}"), "--json"
+        ],
+        "use_field": "result[0].id",
+    }))
+}
+
+/// Extract the first domain-like token from an intent, for zone-hint examples.
+/// Deliberately conservative: no dependency on the regex crate.
+fn extract_domain(intent: &str) -> Option<String> {
+    intent
+        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '(' | ')' | ','))
+        .map(|token| token.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+        .find(|token| is_domain_like(token))
+        .map(str::to_ascii_lowercase)
+}
+
+fn is_domain_like(token: &str) -> bool {
+    if token.len() < 3 || !token.contains('.') {
+        return false;
+    }
+    let labels: Vec<&str> = token.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+    let last = labels.last().copied().unwrap_or_default();
+    if last.len() < 2 || !last.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    labels.iter().all(|label| {
+        !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
 fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
     if matches!(
         capability.id.as_str(),
@@ -10786,9 +11355,13 @@ fn workspace_graph_file(store: &StateStore) -> PathBuf {
 }
 
 fn capability_missing(id: &str) -> CliError {
-    CliError::Input(format!(
-        "capability `{id}` is not in the current catalog; run `cfctl catalog search`"
-    ))
+    CliError::guided(
+        "CFCTL_UNKNOWN_CAPABILITY",
+        format!("capability `{id}` is not in the current catalog"),
+        format!(
+            "Find the correct id: `cfctl catalog search \"{id}\" --json` (or `cfctl resolve \"<what you want to do>\"`)."
+        ),
+    )
 }
 
 fn is_secret_path(path: &Path) -> bool {
@@ -17922,5 +18495,352 @@ mod tests {
         );
         plan.validate_transaction_journal()
             .expect("missing output receipt validates");
+    }
+
+    #[test]
+    fn guided_error_carries_its_own_code_and_next_step() {
+        let error =
+            super::CliError::guided("CFCTL_DEMO", "something is off", "Run `cfctl doctor`.");
+        assert_eq!(error.code(), "CFCTL_DEMO");
+        assert_eq!(error.next_step().as_deref(), Some("Run `cfctl doctor`."));
+    }
+
+    #[test]
+    fn plain_input_error_falls_back_to_generic() {
+        let error = super::CliError::Input("freeform".to_owned());
+        assert_eq!(error.code(), "CFCTL_ERROR");
+        assert_eq!(error.next_step(), None);
+    }
+
+    #[test]
+    fn missing_selector_points_at_guide() {
+        let error = super::CliError::Cloudflare(
+            cfctl_cloudflare::CloudflareError::MissingSelector("zone_id".to_owned()),
+        );
+        assert_eq!(error.code(), "CFCTL_REQUEST_CONTRACT");
+        let step = error
+            .next_step()
+            .expect("selector errors carry a next step");
+        assert!(step.contains("cfctl guide"), "{step}");
+        assert!(step.contains("--selector"), "{step}");
+    }
+
+    #[test]
+    fn approved_plan_required_points_at_the_governed_loop() {
+        let error = super::CliError::Cloudflare(
+            cfctl_cloudflare::CloudflareError::ApprovedPlanRequired("some-cap".to_owned()),
+        );
+        assert_eq!(error.code(), "CFCTL_PLAN_REQUIRED");
+        let step = error.next_step().expect("mutation needs the governed loop");
+        assert!(step.contains("cfctl plans approve"), "{step}");
+        assert!(step.contains("cfctl plans run"), "{step}");
+    }
+
+    #[test]
+    fn explicit_approval_required_points_at_yes_flag() {
+        let error = super::CliError::Core(cfctl_core::CoreError::ExplicitApprovalRequired);
+        assert_eq!(error.code(), "CFCTL_PLAN_LIFECYCLE");
+        assert!(
+            error
+                .next_step()
+                .expect("approval carries a step")
+                .contains("--yes")
+        );
+    }
+
+    #[test]
+    fn run_before_approve_points_at_approve_first() {
+        // Run-path rejection: the plan is not yet in an approved state.
+        let error = super::CliError::Core(cfctl_core::CoreError::InvalidPlanState {
+            operation_id: "op-123".to_owned(),
+            actual: cfctl_core::PlanStatus::Draft,
+            expected: "approved or policy-authorized auto-execute draft",
+        });
+        let step = error.next_step().expect("state errors carry a step");
+        assert!(step.contains("cfctl plans approve op-123 --yes"), "{step}");
+    }
+
+    #[test]
+    fn rerunning_a_completed_plan_is_not_told_to_approve_again() {
+        // Regression: a Consumed/Executed plan re-run raises the same `expected`
+        // string as run-before-approve. Keying on `actual` must NOT advise
+        // re-approving/re-running a completed mutation.
+        for actual in [
+            cfctl_core::PlanStatus::Consumed,
+            cfctl_core::PlanStatus::Verified,
+            cfctl_core::PlanStatus::Running,
+        ] {
+            let error = super::CliError::Core(cfctl_core::CoreError::InvalidPlanState {
+                operation_id: "op-9".to_owned(),
+                actual,
+                expected: "approved or policy-authorized auto-execute draft",
+            });
+            let step = error.next_step().expect("state errors carry a step");
+            assert!(step.contains("already ran"), "{actual:?}: {step}");
+            assert!(!step.contains("plans approve op-9"), "{actual:?}: {step}");
+        }
+    }
+
+    #[test]
+    fn unapproved_standing_draft_is_not_a_false_approved_match() {
+        // Regression: `expected` contains the substring "approved" inside
+        // "unapproved"; the old branch mis-routed this to "Approve the plan
+        // first". Keying on `actual` (Draft) + the "unapproved" marker fixes it.
+        let error = super::CliError::Core(cfctl_core::CoreError::InvalidPlanState {
+            operation_id: "op-7".to_owned(),
+            actual: cfctl_core::PlanStatus::Draft,
+            expected: "unapproved approval-required draft for standing-authority consumption",
+        });
+        let step = error.next_step().expect("state errors carry a step");
+        assert!(step.contains("standing policy"), "{step}");
+        assert!(!step.contains("Approve the plan first"), "{step}");
+    }
+
+    #[test]
+    fn plan_not_found_names_the_operation_id() {
+        let error = super::CliError::Storage(cfctl_storage::StorageError::PlanNotFound(
+            "op-xyz".to_owned(),
+        ));
+        assert_eq!(error.code(), "CFCTL_PLAN_LIFECYCLE");
+        assert!(
+            error
+                .next_step()
+                .expect("plan lookup carries a step")
+                .contains("cfctl plans show op-xyz")
+        );
+    }
+
+    #[test]
+    fn missing_credential_points_at_import() {
+        let error =
+            super::CliError::Auth(cfctl_auth::AuthError::MissingCredential("prod".to_owned()));
+        assert_eq!(error.code(), "CFCTL_AUTH");
+        assert!(
+            error
+                .next_step()
+                .expect("auth carries a step")
+                .contains("import-api-token")
+        );
+    }
+
+    #[test]
+    fn live_read_failure_guidance_is_status_specific() {
+        assert_eq!(
+            super::live_read_failure_guidance(403).0,
+            "CFCTL_LIVE_UNAUTHORIZED"
+        );
+        assert!(
+            super::live_read_failure_guidance(401)
+                .1
+                .contains("keys permissions")
+        );
+        assert_eq!(
+            super::live_read_failure_guidance(404).0,
+            "CFCTL_LIVE_BAD_REQUEST"
+        );
+        assert!(super::live_read_failure_guidance(400).1.contains("zone id"));
+        assert_eq!(
+            super::live_read_failure_guidance(503).0,
+            "CFCTL_LIVE_UPSTREAM"
+        );
+        assert_eq!(super::live_read_failure_guidance(418).0, "CFCTL_LIVE_ERROR");
+    }
+
+    fn resolver_read_capability(id: &str, title: &str, product: &str) -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(id, title, "GET", "/accounts/{account_id}/things");
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.product = product.to_owned();
+        capability
+    }
+
+    fn resolver_mutation_capability() -> CapabilityV1 {
+        // A contract-complete mutating capability so mutation_contract_gaps() is
+        // empty and the resolver treats it as contract-ready. Uses the two
+        // synthetic-friendly gap-free paths: the secret-sink verification
+        // strategy (valid when required=false and risk=SecretSensitive) and a
+        // declared-irreversible rollback (supported=false plus a warning).
+        let mut capability = CapabilityV1::new(
+            "widget-secret-set",
+            "Set Widget Secret",
+            "PUT",
+            "/accounts/x/widget/secret",
+        );
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::Native; // avoids the permission-lane gap
+        capability.product = "Widgets".to_owned();
+        capability.risk = RiskClass::SecretSensitive;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.cost.known = true;
+        capability.cost.incremental = false;
+        capability.verification.required = false;
+        capability.verification.strategy = "sink_write_and_source_response_status".to_owned();
+        capability.rollback.supported = false;
+        capability.rollback.warning =
+            Some("this operation cannot be automatically rolled back".to_owned());
+        capability
+    }
+
+    #[test]
+    fn resolve_result_empty_fails_closed_with_discovery_guidance() {
+        let ranked: Vec<(&CapabilityV1, usize)> = Vec::new();
+        let (result, error) = super::resolve_result("do a thing", &ranked, None, 5);
+        let error = error.expect("empty match fails closed");
+        assert_eq!(error.code, "CFCTL_RESOLVE_NO_MATCH");
+        assert!(
+            error.next_step.is_some(),
+            "fail-closed carries envelope next_step"
+        );
+        assert_eq!(result["ambiguous"], serde_json::Value::Bool(true));
+        assert_eq!(result["resolved"], serde_json::Value::Null);
+        assert!(result["disambiguation"]["search_argv"].is_array());
+    }
+
+    #[test]
+    fn resolve_result_weak_top_score_fails_closed() {
+        let cap = resolver_read_capability("a-thing", "A Thing", "Things");
+        let ranked = vec![(&cap, 3usize)];
+        let (result, error) = super::resolve_result("thing", &ranked, None, 5);
+        let error = error.expect("a sub-threshold score must not commit");
+        assert_eq!(error.code, "CFCTL_RESOLVE_AMBIGUOUS");
+        assert!(error.next_step.is_some());
+        assert!(
+            result["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("too weak")
+        );
+    }
+
+    #[test]
+    fn resolve_result_close_scores_fail_closed_as_ambiguous() {
+        let a = resolver_read_capability("cap-a", "Cap A", "P");
+        let b = resolver_read_capability("cap-b", "Cap B", "P");
+        // 8 vs 7: top*2=16 < runner*3=21 -> not confident.
+        let ranked = vec![(&a, 8usize), (&b, 7usize)];
+        let (result, error) = super::resolve_result("ambiguous intent", &ranked, None, 5);
+        assert!(error.is_some(), "close scores fail closed");
+        assert_eq!(result["ambiguous"], serde_json::Value::Bool(true));
+        assert_eq!(result["matched"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn resolve_result_confident_read_emits_only_a_draft() {
+        let cap =
+            resolver_read_capability("email-routing-list", "List Email Routing", "Email Routing");
+        let ranked = vec![(&cap, 12usize)];
+        let (result, error) = super::resolve_result("list email routing", &ranked, None, 5);
+        assert!(error.is_none(), "a confident read resolves");
+        assert_eq!(result["ambiguous"], serde_json::Value::Bool(false));
+        assert_eq!(result["resolved"]["capability_id"], "email-routing-list");
+        assert!(result["resolved"]["commands"]["draft_argv"].is_array());
+        // A read draws no approve/run/status governed loop.
+        assert!(result["resolved"]["commands"]["approve_argv"].is_null());
+    }
+
+    #[test]
+    fn resolve_result_confident_mutation_emits_the_governed_loop() {
+        let cap = resolver_mutation_capability();
+        let ranked = vec![(&cap, 20usize)];
+        let (result, error) = super::resolve_result("enable email routing", &ranked, None, 5);
+        assert!(error.is_none(), "a confident mutation resolves");
+        assert_eq!(
+            result["resolved"]["contract_ready"],
+            serde_json::Value::Bool(true),
+            "fixture must be gap-free; resolved={}",
+            result["resolved"]
+        );
+        let commands = &result["resolved"]["commands"];
+        assert!(commands["draft_argv"].is_array());
+        let approve = commands["approve_argv"].as_array().expect("approve argv");
+        assert!(approve.iter().any(|part| part == "approve"));
+        assert!(approve.iter().any(|part| part == "--yes"));
+        assert!(commands["run_argv"].is_array());
+        assert!(commands["status_argv"].is_array());
+    }
+
+    #[test]
+    fn resolve_result_blocked_capability_withholds_the_call() {
+        let mut cap = resolver_read_capability("blocked-thing", "Blocked Thing", "Things");
+        cap.adapter_status = AdapterStatus::Blocked;
+        cap.blocked_reason = Some("operation contract incomplete: cost".to_owned());
+        let ranked = vec![(&cap, 12usize)];
+        let (result, error) = super::resolve_result("blocked thing", &ranked, None, 5);
+        assert!(
+            error.is_none(),
+            "a blocked-but-unambiguous top match still resolves (with withheld commands)"
+        );
+        assert_eq!(
+            result["resolved"]["contract_ready"],
+            serde_json::Value::Bool(false)
+        );
+        let commands = &result["resolved"]["commands"];
+        assert_eq!(commands["blocked"], serde_json::Value::Bool(true));
+        // No draft call is offered for a blocked capability.
+        assert!(commands["draft_argv"].is_null());
+        assert!(commands["next_action"].is_object());
+    }
+
+    #[test]
+    fn resolve_result_emits_zone_hint_and_threads_account() {
+        let mut cap = CapabilityV1::new(
+            "zone-settings-get",
+            "Get Zone Setting",
+            "GET",
+            "/zones/{zone_id}/settings",
+        );
+        cap.adapter_status = AdapterStatus::DynamicApi;
+        cap.product = "Zones".to_owned();
+        cap.selectors = vec![cfctl_core::SelectorV1 {
+            name: "zone_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        }];
+        let ranked = vec![(&cap, 12usize)];
+        let (result, error) =
+            super::resolve_result("get setting on example.com", &ranked, Some("acct-9"), 5);
+        assert!(error.is_none());
+        let hint = &result["resolved"]["zone_resolution_hint"];
+        assert!(hint.is_object());
+        let example = hint["example_read_argv"].as_array().expect("example argv");
+        assert!(example.iter().any(|part| part == "name=example.com"));
+        assert_eq!(result["resolved"]["account"], "acct-9");
+    }
+
+    #[test]
+    fn resolve_candidate_limit_is_respected() {
+        let caps: Vec<CapabilityV1> = (0..8)
+            .map(|index| resolver_read_capability(&format!("cap-{index}"), "Cap", "P"))
+            .collect();
+        // Distinct descending scores so ordering is deterministic and the top is
+        // ambiguous-safe is irrelevant here; we only assert the candidate cap.
+        let ranked: Vec<(&CapabilityV1, usize)> = caps
+            .iter()
+            .enumerate()
+            .map(|(index, cap)| (cap, 100 - index))
+            .collect();
+        let (result, _error) = super::resolve_result("cap", &ranked, None, 3);
+        assert_eq!(result["matched"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn is_domain_like_accepts_domains_and_rejects_noise() {
+        assert!(super::is_domain_like("example.com"));
+        assert!(super::is_domain_like("mail.example.co.uk"));
+        assert!(!super::is_domain_like("example"));
+        assert!(!super::is_domain_like("enable"));
+        assert!(!super::is_domain_like("v2.0")); // numeric TLD is not a domain
+        assert!(!super::is_domain_like("a.b")); // TLD too short
+    }
+
+    #[test]
+    fn extract_domain_finds_the_first_domain_token() {
+        assert_eq!(
+            super::extract_domain("enable email routing on Example.COM please").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(super::extract_domain("enable email routing"), None);
     }
 }

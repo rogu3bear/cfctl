@@ -99,8 +99,12 @@ impl CatalogSnapshot {
         self.capabilities.get(id)
     }
 
+    /// Rank capabilities against the intent, keeping the numeric relevance
+    /// score. Deterministic: sorted by score descending, then id ascending.
+    /// `search` discards the scores; a caller that needs an ambiguity margin
+    /// (e.g. the deterministic resolver) uses this instead.
     #[must_use]
-    pub fn search(&self, query: &str) -> Vec<&CapabilityV1> {
+    pub fn search_scored(&self, query: &str) -> Vec<(&CapabilityV1, usize)> {
         let terms = intent_terms(query);
         let mut ranked: Vec<(&CapabilityV1, usize)> = self
             .capabilities
@@ -116,6 +120,11 @@ impl CatalogSnapshot {
                 .then_with(|| left.id.cmp(&right.id))
         });
         ranked
+    }
+
+    #[must_use]
+    pub fn search(&self, query: &str) -> Vec<&CapabilityV1> {
+        self.search_scored(query)
             .into_iter()
             .map(|(capability, _score)| capability)
             .collect()
@@ -8951,5 +8960,60 @@ mod email_routing_tests {
                 capability.mutation_contract_gaps()
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod search_scored_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn snapshot(caps: Vec<CapabilityV1>) -> CatalogSnapshot {
+        let mut capabilities = BTreeMap::new();
+        for capability in caps {
+            capabilities.insert(capability.id.clone(), capability);
+        }
+        CatalogSnapshot {
+            schema_version: 2,
+            generated_at: DateTime::from_timestamp(0, 0).expect("epoch is valid"),
+            source_url: "test".to_owned(),
+            source_hash: String::new(),
+            schema_hash: String::new(),
+            capabilities,
+        }
+    }
+
+    #[test]
+    fn search_scored_exposes_scores_and_ranks_title_over_description() {
+        // "email routing" is in the first capability's title (high weight) but
+        // only the second's description (weight 1), so the first must rank above.
+        let mut strong = CapabilityV1::new("z-strong", "Enable Email Routing", "POST", "/p");
+        strong.product = "Email Routing".to_owned();
+        let mut weak = CapabilityV1::new("a-weak", "Widgets", "GET", "/p");
+        weak.description = Some("manages email routing incidentally".to_owned());
+
+        let snap = snapshot(vec![strong, weak]);
+        let scored = snap.search_scored("email routing");
+
+        assert_eq!(scored.len(), 2);
+        assert_eq!(scored[0].0.id, "z-strong");
+        assert!(
+            scored[0].1 > scored[1].1,
+            "a title match must outscore a description-only match"
+        );
+        // search() is the score-dropping projection of the same ordering.
+        let ids: Vec<&str> = snap
+            .search("email routing")
+            .iter()
+            .map(|capability| capability.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["z-strong", "a-weak"]);
+    }
+
+    #[test]
+    fn search_scored_is_empty_when_nothing_matches() {
+        let snap = snapshot(vec![CapabilityV1::new("a", "Widgets", "GET", "/p")]);
+        assert!(snap.search_scored("nonexistent zzz term").is_empty());
     }
 }
