@@ -4566,8 +4566,14 @@ fn build_mint_policy_body(
         }]
     });
     if let Some(hours) = ttl_hours {
-        body["expires_on"] =
-            json!((Utc::now() + ChronoDuration::hours(i64::from(hours))).to_rfc3339());
+        // Cloudflare's token API requires seconds-precision UTC with a `Z`
+        // suffix (e.g. 2005-12-30T01:02:03Z) and rejects the fractional-second
+        // `+00:00` form that `to_rfc3339()` emits with a 400.
+        body["expires_on"] = json!(
+            (Utc::now() + ChronoDuration::hours(i64::from(hours)))
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        );
     }
     body
 }
@@ -10816,13 +10822,14 @@ mod tests {
         apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
         apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
         bind_required_empty_compensation_body, blocked_capability_envelope,
-        boundary_response_artifact, call_command, capability_call_argv, compensation_request,
-        execute_read, find_secret_value, force_ipv4_from, guide_document, guide_stage_commands,
-        http_client, is_live_plan_precondition_hash, is_secret_output_capability,
-        key_policy_approve, key_policy_list, key_policy_revoke, non_readback_verification_basis,
-        permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
-        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
-        preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
+        boundary_response_artifact, build_mint_policy_body, call_command, capability_call_argv,
+        compensation_request, execute_read, find_secret_value, force_ipv4_from, guide_document,
+        guide_stage_commands, http_client, is_live_plan_precondition_hash,
+        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
+        non_readback_verification_basis, permission_inventory_call, permission_inventory_envelope,
+        persist_prepared_plan, persist_secret_lifecycle,
+        persist_secret_lifecycle_and_reconcile_lineage, preflight_call_input,
+        preflight_standing_authority, prepare_r2_temporary_credentials_input,
         preserve_previous_catalog, query_object_from_pairs, read_import_secret, read_secret_file,
         reconcile_standing_lineage_from_plan, rectify_plan, redact_secret_result,
         request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
@@ -14763,6 +14770,28 @@ mod tests {
             "com.cloudflare.api.account.account-a",
         )
         .expect_err("resource mismatch rejected");
+    }
+
+    #[test]
+    fn mint_policy_body_expires_on_is_cloudflare_compatible() {
+        // Cloudflare rejects the fractional-second `+00:00` form that
+        // `to_rfc3339()` emits with a 400; it requires seconds-precision UTC
+        // with a `Z` suffix (e.g. 2005-12-30T01:02:03Z).
+        let body = build_mint_policy_body(
+            "t",
+            &["group-a".to_owned()],
+            "com.cloudflare.api.account.zone.e826a542f6b80137a949a3291c1cad9c",
+            Some(1),
+        );
+        let expires = body["expires_on"].as_str().expect("expires_on present");
+        assert!(expires.ends_with('Z'), "{expires}");
+        assert!(!expires.contains('.'), "no fractional seconds: {expires}");
+        assert!(!expires.contains('+'), "no numeric offset: {expires}");
+        // Cloudflare's parser and cfctl's standing-mint parser both accept it.
+        chrono::DateTime::parse_from_rfc3339(expires).expect("valid rfc3339");
+        // No TTL → no expiry field.
+        let no_ttl = build_mint_policy_body("t", &["group-a".to_owned()], "res", None);
+        assert!(no_ttl.get("expires_on").is_none());
     }
 
     #[test]
