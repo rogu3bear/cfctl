@@ -1,14 +1,30 @@
 # cfctl v2 architecture
 
-`cfctl` v2 is a local-first, catalog-driven Cloudflare control plane. It has no MCP dependency.
+`cfctl` v2 is a local-first, catalog-driven Cloudflare control plane with no
+MCP dependency. `cfctl-cli` orchestrates; each other crate owns one boundary,
+and every crate shares the `cfctl-core` contracts, hashing, and redaction. A
+governed write flows through the crates like this:
 
-## Crates
+```mermaid
+flowchart TD
+    CORE[cfctl-core] -.->|shared contracts and redaction| CLI
+    CLI[cfctl-cli] -->|resolve and browse intent| CAT[cfctl-catalog]
+    CLI -->|profile and account pin| AUTH[cfctl-auth]
+    CLI -->|registered-root impact| WS[cfctl-workspace]
+    CLI -->|managed instructions and handoff| AGENT[cfctl-agent]
+    CAT -->|capability contract| PLAN[cfctl-planner]
+    WS -->|impact graph| PLAN
+    PLAN -->|hash-bound PlanV1 and policy decision| STORE[cfctl-storage]
+    STORE -->|approved, durably consumed plan| CF[cfctl-cloudflare]
+    AUTH -->|one selected credential| CF
+    CF -->|receipts and verification| STORE
+```
 
 | Crate | Boundary |
 |---|---|
 | `cfctl-cli` | Public command parser, human/JSON rendering, orchestration |
 | `cfctl-core` | Versioned contracts, hashes, evidence, redaction, plan lifecycle |
-| `cfctl-auth` | OAuth PKCE, profiles, account selection, Keychain/Secret Service |
+| `cfctl-auth` | OAuth PKCE, profiles, account selection, Keychain/Secret Service with mode-0600 file fallback |
 | `cfctl-cloudflare` | Schema-validated HTTP execution, retries, pagination, conditionals, and idempotency |
 | `cfctl-catalog` | Official OpenAPI/docs/changelog/CLI ingestion and SQLite search index |
 | `cfctl-planner` | Risk, impact, cost, and approval policy |
@@ -19,57 +35,42 @@
 
 ## Adapter boundary
 
-Every capability is classified as `native`, `dynamic_api`, `delegated_cli`, `governed_ui`, or `blocked`. The adapter is selected by catalog data; it is never inferred from model output.
-
-- `native`: operation-specific behavior such as sink-only credential delivery.
-- `dynamic_api`: schema-validated Cloudflare HTTP execution.
-- `delegated_cli`: governed Wrangler/cloudflared process with a cleared environment, one selected credential, timeout, captured output, and redaction.
-- `governed_ui`: target-bound `AgentActionV1` after API/CLI insufficiency is established.
-- `blocked`: discoverable, with an exact missing permission, entitlement, cost, verification, or adapter reason.
-
-Generated API writes are executable only when their operation contract is
-complete. Reads remain dynamically executable; incomplete writes remain
-searchable and explain every missing contract field.
+Every capability is classified as `native`, `dynamic_api`, `delegated_cli`,
+`governed_ui`, or `blocked`; the adapter is selected by catalog data, never
+inferred from model output. Generated API writes are executable only when
+their operation contract is complete; reads remain dynamically executable, and
+incomplete writes stay searchable with every missing contract field explained.
 
 OpenAPI parameter selectors resolve local `$ref` chains, homogeneous enum
 values, and compatible value types carried through `allOf`, `oneOf`, or
-`anyOf`. Schema-backed descriptions are retained, while empty, mixed, or
-conflicting shapes stay explicitly `unknown`; normalization never guesses a
-type from a parameter name.
-
-Verification and automatic rollback strategies form a closed runtime set.
-Catalog metadata must select a strategy that is implemented for the exact
-operation identity and resource shape; a plausible but incompatible strategy
-is contract debt, not execution authority. The adapter validates the verifier
-again before network mutation to protect older or drifted plans.
+`anyOf`; empty, mixed, or conflicting shapes stay explicitly `unknown`, and
+normalization never guesses a type from a parameter name. Verification and
+automatic rollback strategies form a closed runtime set bound to the exact
+operation identity and resource shape — a plausible but incompatible strategy
+is contract debt, not execution authority — and the adapter validates the
+verifier again before network mutation.
 
 ## Workspace and transaction model
 
 Workspace discovery never scans outside explicitly registered roots. It finds
 configless Git repositories and parses Wrangler TOML/JSONC, Terraform, and
-Pulumi files while excluding generated and vendor directories. The exact
-supported representations are Wrangler TOML/JSON/JSONC, Terraform HCL/JSON,
-and Pulumi YAML. Resource links
-use canonical absolute repository paths, and every source-config snapshot
+Pulumi files while excluding generated and vendor directories (the README
+lists the exact supported representations). Every source-config snapshot
 records the current hash, `HEAD` hash, exact worktree-diff hash, and dirty
-status. Terraform and Pulumi resources also expose runtime identity links only
-from literal, resource-type-specific properties; dynamic expressions and local
-binding symbols never masquerade as Cloudflare identities. The supported-IaC
-fixture matrix exercises all of those formats plus
-staged, unstaged, and untracked state, duplicate repository basenames, and
-cross-repository resource impact.
+status. Terraform and Pulumi runtime
+identity links come only from literal, resource-type-specific properties;
+dynamic expressions and local binding symbols never masquerade as Cloudflare
+identities.
 
 `PlanV1` carries a hash-chained transaction journal. Checkpoints distinguish
 the point before a Cloudflare boundary from the persisted response, secret
-sink, and operation-specific verification. A network failure after a boundary
-attempt therefore enters rectification and cannot be mistaken for a safe
-retry. Each checkpoint hash includes the plan status, and the storage boundary
-validates the journal on both writes and reads. Adapter failures, missing
-receipts, request-body cleanup failures, and missing sink-only outputs advance
-through redacted response or sink artifacts instead of persisting a detached
-status. The storage crash matrix drops volatile state and reopens the real local
-store between each journal transition, proving recovery at every persisted
-stage; it does not claim account-backed network mutation proof.
+sink, and operation-specific verification, so a network failure after a
+boundary attempt enters rectification and cannot be mistaken for a safe retry.
+Each checkpoint hash includes the plan status, and the storage boundary
+validates the journal on both writes and reads. The storage crash matrix drops
+volatile state and reopens the real local store between each journal
+transition, proving recovery at every persisted stage; it does not claim
+account-backed network mutation proof.
 
 ## Trust sequence
 
@@ -85,25 +86,23 @@ stage; it does not claim account-backed network mutation proof.
 10. Close verified/rejected transactions or require rectification without replay.
 11. Write redacted, content-addressed evidence.
 
-Apply, sink, and verification responses carry compact non-secret artifacts whose
-hashes are part of their journal checkpoints. These mutable execution facts are
-not part of the pre-execution approval hash, but they cannot be changed after
-the boundary without invalidating the transaction chain. A supported rollback
-uses them only to create a new compensation plan with independent authority.
+Apply, sink, and verification receipts are hash-bound into their journal
+checkpoints: they are outside the pre-execution approval hash but cannot
+change after the boundary without invalidating the transaction chain, and a
+supported rollback uses them only to create a new compensation plan with
+independent authority.
 
 ## Executable guidance projection
 
 The public explanation layer is a projection of the executable contracts, not
 an independent architecture source. `cfctl-core` owns the typed
-`CapabilityGuideV1` and versioned `GuideTopicDocumentV1` models. The CLI exposes
-them through the compatible `cfctl guide <capability-id>` path and the additive
-`cfctl guide --topic system|standing-authority` topics. Static topics do not
-need a catalog refresh or network access.
-
-The README and Quickstart embed canonical Markdown rendered from those topic
-documents. Managed agent instructions route operators back to the same CLI
-topics. `cargo xtask verify` compares each generated documentation section to
-the core renderer byte-for-byte, so lifecycle facts cannot drift silently
-between the executable behavior, human documentation, and agent guidance.
+`CapabilityGuideV1` and versioned `GuideTopicDocumentV1` models, exposed
+through `cfctl guide <capability-id>` and the additive
+`cfctl guide --topic system|standing-authority` topics; static topics need no
+catalog refresh or network access. The README and Quickstart embed canonical
+Markdown rendered from those documents, managed agent instructions route
+operators back to the same CLI topics, and `cargo xtask verify` compares each
+generated section to the core renderer byte-for-byte, so lifecycle facts
+cannot drift silently.
 
 See [ADR 0001](architecture/adr/0001-rust-clean-break.md), [ADR 0002](architecture/adr/0002-risk-based-approval.md), and [ADR 0003](architecture/adr/0003-executable-guidance-projection.md).

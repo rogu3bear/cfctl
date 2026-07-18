@@ -2,31 +2,17 @@
 
 ## Build and install
 
-Rust 1.93 or newer is pinned by `rust-toolchain.toml`. Install from a checkout
-today with the guided bootstrap:
+Rust 1.93 or newer is pinned by `rust-toolchain.toml`. The guided bootstrap
+requires a tracked-clean checkout, runs the full verification lane, installs
+with `cargo install --force`, proves the installed commit equals `HEAD`,
+synchronizes only already-managed agent integrations (`--skip-agent-sync`
+leaves them untouched), and runs both doctors:
 
 ```bash
 ./bootstrap.sh --check-only
 ./bootstrap.sh
-# Intentional binary-only install; leaves managed agent integrations untouched.
-./bootstrap.sh --skip-agent-sync
-```
-
-Bootstrap requires a tracked-clean checkout, runs the full verification lane,
-installs with `cargo install --force`, proves the installed commit equals
-`HEAD`, synchronizes only already-managed agent integrations unless skipped,
-and runs both doctors. To skip that lane and install straight from the checkout:
-
-```bash
+# or, skipping that lane:
 cargo install --path crates/cfctl-cli --locked
-```
-
-Confirm the exact running build after either path:
-
-```bash
-cfctl version --json
-cfctl doctor --json
-cfctl agents doctor --json
 ```
 
 Prebuilt binaries ship from the GitHub release. Releases are unsigned by
@@ -41,24 +27,22 @@ shasum -a 256 --check --ignore-missing SHA256SUMS
 install -m 0755 cfctl-aarch64-apple-darwin ~/.local/bin/cfctl
 ```
 
-On macOS you can instead use the release's Homebrew formula, which pins the
-same checksums:
+On macOS the release's Homebrew formula (`cfctl.rb`) pins the same checksums:
+`brew install --formula ./cfctl.rb`. The identity-verifying Linux installer is
+not shipped while releases are unsigned; use the direct download + checksum
+path with the `-unknown-linux-musl` binary for your architecture.
+
+Confirm the exact running build after any install path:
 
 ```bash
-curl -fsSLO https://github.com/rogu3bear/cfctl/releases/download/v1.0.0/cfctl.rb
-brew install --formula ./cfctl.rb
+cfctl version --json
+cfctl doctor --json
+cfctl agents doctor --json
 ```
-
-The identity-verifying Linux installer (`install.sh`) is not shipped while
-releases are unsigned; use the direct download + checksum path above with the
-`-unknown-linux-musl` binary for your architecture. `cfctl.io` hosting remains
-a pending operator action (see the README's external activation boundary).
 
 ## Discover Cloudflare
 
 ```bash
-cfctl version --json
-cfctl doctor
 cfctl catalog sync
 cfctl catalog coverage --json
 cfctl resolve "rotate a worker secret"
@@ -66,24 +50,19 @@ cfctl catalog search "Worker secret"
 cfctl docs changes
 ```
 
-The catalog refreshes from Cloudflare's official OpenAPI schema, docs text feed, changelog, installed Wrangler help, and installed cloudflared help. A catalog older than 24 hours refreshes before use.
+The catalog refreshes from Cloudflare's official OpenAPI schema, docs text
+feed, changelog, and installed Wrangler/cloudflared help; a catalog older than
+24 hours refreshes before use. Reads with complete schemas execute through the
+dynamic API adapter; generated writes remain discoverable but blocked until
+their full safety contract is implemented, and `catalog show` explains every
+missing field.
 
-Reads with complete schemas can execute through the dynamic API adapter.
-Generated writes remain discoverable but are blocked until their exact risk,
-cost, entitlement, permission, verifier, and rollback/irreversibility contract
-is implemented. Official product pricing references and OpenAPI plan
-availability are attached when they match, but unbounded downstream usage
-remains blocked. `catalog show` explains every missing field, and `catalog
-coverage` separates pricing-reference and entitlement coverage from complete
-executable mutation contracts.
-
-For disposable tests, isolate all non-credential state explicitly:
-
-```bash
-CFCTL_HOME=/tmp/cfctl-proof cfctl doctor --json
-```
-
-`CFCTL_HOME` must be absolute. Credentials go to the platform keyring first — Keychain on macOS or Secret Service on Linux — and fail down to a governed mode-0600 file store under cfctl's data directory (`auth/secrets`) when that keyring is unavailable; `cfctl doctor` reports the active backend.
+For disposable tests, isolate all non-credential state with an absolute
+`CFCTL_HOME` (for example `CFCTL_HOME=/tmp/cfctl-proof cfctl doctor --json`).
+Credentials go to the platform keyring first — Keychain on macOS or Secret
+Service on Linux — and fail down to a governed mode-0600 file store under
+cfctl's data directory (`auth/secrets`) when that keyring is unavailable;
+`cfctl doctor` reports the active backend.
 
 ## Authenticate
 
@@ -95,45 +74,14 @@ printf '%s' "$CLOUDFLARE_API_TOKEN" | \
 cfctl auth status --json
 ```
 
-Piping through a build wrapper such as the in-repo `./cfctl` shim can lose
-stdin to `cargo`. When you invoke cfctl that way, hand it a mode-0600 file
-instead — the token never rides stdin:
+A build wrapper such as the in-repo `./cfctl` shim can lose stdin to `cargo`;
+when you invoke cfctl that way, hand it a new mode-0600 file with `--value-in`
+instead so the token never rides stdin. Optional OAuth login (explicit
+`--client-id`; public cfctl OAuth is not default until promoted) and the
+never-implicit emergency global key (`cfctl auth import-global-key`) are
+covered in the README.
 
-```bash
-( umask 077; printf '%s' "$CLOUDFLARE_API_TOKEN" > token.tok )
-cfctl auth import-api-token --account <account-id> --value-in token.tok
-rm -f token.tok
-```
-
-OAuth is optional when you have a Cloudflare OAuth client (public cfctl OAuth
-is not default until promoted):
-
-```bash
-cfctl auth login \
-  --profile default \
-  --client-id "$CFCTL_OAUTH_CLIENT_ID" \
-  --account <account-id>
-printf '%s\n' '<STATE CODE>' | cfctl auth login \
-  --complete \
-  --profile default \
-  --client-id "$CFCTL_OAUTH_CLIENT_ID"
-```
-
-An emergency global key can be imported through stdin, or from a mode-0600 file
-with `--value-in` (use the file form under `./cfctl`, whose cargo wrapper eats
-stdin). It is never selected automatically:
-
-```bash
-printf '%s' "$CLOUDFLARE_API_KEY" | \
-  cfctl auth import-global-key --profile emergency-global --email you@example.com --stdin
-
-# or stdin-free:
-( umask 077; printf '%s' "$CLOUDFLARE_API_KEY" > key.tok )
-cfctl auth import-global-key --profile emergency-global --email you@example.com --value-in key.tok
-rm -f key.tok
-```
-
-## Read and change
+## First governed write
 
 ```bash
 cfctl call zones-get --query name=example.com --json
@@ -153,16 +101,8 @@ cfctl plans status <operation-id>
 
 The plan's hash-chained journal makes crash position explicit. If cfctl may
 have crossed the Cloudflare boundary, do not replay the operation; inspect the
-status and run `cfctl plans rectify <operation-id>`.
-
-Credential-producing calls also require a new local sink:
-
-```bash
-cfctl call cloudflare-tunnel-get-a-cloudflare-tunnel-token \
-  --selector account_id=<account-id> \
-  --selector tunnel_id=<tunnel-id> \
-  --value-out /tmp/tunnel-token
-```
+status and run `cfctl plans rectify <operation-id>`. Credential-producing
+calls also require a new mode-0600 sink via `--value-out`.
 
 <!-- BEGIN CFCTL GENERATED: standing-authority-guide -->
 ## Standing authority lifecycle
@@ -211,4 +151,7 @@ cfctl agents doctor
 cfctl "inspect the current Worker routes for example.com"
 ```
 
-Agents use deterministic commands underneath. A recursion marker prevents an agent from launching another agent through the bare-intent path. Model output never approves or directly mutates Cloudflare. Quote natural language — a bare single token that is not a known command fails closed with a usage error instead of launching an agent.
+Agents use deterministic commands underneath; a recursion marker prevents an
+agent from launching another agent, and model output never approves or
+directly mutates Cloudflare. Quote natural language — a bare single token that
+is not a known command fails closed with a usage error, never an agent launch.
