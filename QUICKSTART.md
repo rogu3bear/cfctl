@@ -47,7 +47,7 @@ checksum manifest against its exact Fulcio identity and issuer, and needs an
 existing release tag:
 
 ```bash
-curl -fsSL https://cfctl.io/install.sh | CFCTL_VERSION=v2.0.0-alpha.1 sh
+curl -fsSL https://cfctl.io/install.sh | CFCTL_VERSION=v1.0.0 sh
 ```
 
 ## Discover Cloudflare
