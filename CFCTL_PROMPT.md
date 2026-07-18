@@ -8,8 +8,9 @@ unclassified browser path.
 For every request:
 
 1. Run `cfctl version --json`, `cfctl doctor --json`, and `cfctl agents doctor
-   --json`. Running-build, PATH-build, or managed-instruction drift is
-   unhealthy.
+   --json`. Doctors trust the PATH build only when it resolves to the running
+   executable and never launch a different PATH cfctl; a missing or different
+   PATH build and drifted managed instructions are unhealthy.
 2. Run `cfctl resolve "<bounded non-secret intent>" --json` to map the goal to a
    capability and the exact governed commands (it fails closed with ranked
    candidates when ambiguous), or `cfctl catalog search "<intent>" --json` to
