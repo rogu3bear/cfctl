@@ -442,3 +442,18 @@ cargo xtask verify
 
 Do not report completion without the applicable source-config, live-read,
 preview, apply, and post-change verification evidence.
+
+## Known limitations
+
+- **Access application and identity-provider create/update cannot yet be
+  planned**, even though their mutation contracts are complete. The plan
+  storage redaction guard (`redact_json` / `is_sensitive_key`) matches on field
+  *names* — `client_secret`, `token`, `secret`, `password` — and those five
+  Access capabilities embed their large request *schemas* in the plan, where
+  those names appear as legitimate SaaS/IdP configuration property keys, not as
+  secret values. Storage refuses the plan as `SensitiveData`. The fix is to
+  teach the redaction equality check to distinguish a schema key describing a
+  field from a document carrying a secret value; it touches a load-bearing
+  invariant used at 15 sites and is deferred to its own change. Until then,
+  `access-applications-add-an-application` reports governed in the catalog but
+  fails at plan storage.
