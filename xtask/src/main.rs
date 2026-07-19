@@ -204,7 +204,98 @@ fn verify() -> Result<(), TaskError> {
     )?;
     verify_security_contract()?;
     verify_source_contract()?;
+    report_pre_push_registration();
     Ok(())
+}
+
+/// Whether this checkout's tracked pre-push hook will actually run.
+///
+/// The hook ships with the repository but only executes when the machine's
+/// agentOS allowlist pins its digest, and an unregistered repo is passed over
+/// in silence. A clone therefore has an inert gate with nothing to say so.
+/// `verify` is the documented local-proof entry point, so it is where the
+/// operator finds out.
+#[derive(Debug, PartialEq)]
+enum PrePushRegistration {
+    /// The delegation mechanism is not present; nothing to report.
+    MechanismAbsent,
+    Registered,
+    NotRegistered,
+    /// Registered under a digest that no longer matches the hook on disk.
+    DigestStale,
+}
+
+fn classify_pre_push_registration(
+    allowlist: Option<&str>,
+    repository_root: &Path,
+    hook_digest: Option<&str>,
+) -> PrePushRegistration {
+    let (Some(allowlist), Some(hook_digest)) = (allowlist, hook_digest) else {
+        return PrePushRegistration::MechanismAbsent;
+    };
+    let root = repository_root.to_string_lossy();
+    for line in allowlist.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some(root.as_ref()) {
+            continue;
+        }
+        for field in fields {
+            if let Some(pinned) = field.strip_prefix("pre-push=") {
+                return if pinned == hook_digest {
+                    PrePushRegistration::Registered
+                } else {
+                    PrePushRegistration::DigestStale
+                };
+            }
+        }
+    }
+    PrePushRegistration::NotRegistered
+}
+
+fn report_pre_push_registration() {
+    let Ok(repository_root) = repository_root() else {
+        return;
+    };
+    let hook = repository_root.join(".githooks/pre-push");
+    if !hook.exists() {
+        return;
+    }
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let delegate = home.join(".agent/hooks/delegate-repo-hook.sh");
+    if !delegate.exists() {
+        return;
+    }
+    let allowlist = fs::read_to_string(home.join(".agent/repo-hook-allowlist")).ok();
+    let digest = sha256_file(&hook).ok();
+    let state =
+        classify_pre_push_registration(allowlist.as_deref(), repository_root, digest.as_deref());
+    let advice = match state {
+        PrePushRegistration::Registered | PrePushRegistration::MechanismAbsent => return,
+        PrePushRegistration::NotRegistered => {
+            "is not registered on this machine, so it will not run"
+        }
+        PrePushRegistration::DigestStale => {
+            "is registered under a stale digest, so every push will be blocked"
+        }
+    };
+    let digest = digest.unwrap_or_default();
+    let mut stderr = std::io::stderr();
+    let _result = writeln!(stderr, "xtask: notice: .githooks/pre-push {advice}.");
+    let _result = writeln!(
+        stderr,
+        "xtask: notice: add or update this line in ~/.agent/repo-hook-allowlist, then re-run:"
+    );
+    let _result = writeln!(
+        stderr,
+        "xtask: notice:   {} pre-push={digest}",
+        repository_root.display()
+    );
 }
 
 fn security_proof_commands() -> [(&'static str, &'static [&'static str]); 2] {
@@ -2282,18 +2373,20 @@ fn io_error(path: &Path, source: std::io::Error) -> TaskError {
 mod tests {
     use std::{
         io::Write as _,
+        path::Path,
         process::{Command, Stdio},
     };
 
     use super::{
-        expected_signed_release_file_names, extract_cfctl_command_references,
-        extract_cfctl_command_refs, is_declared_quarantine_path, is_forbidden_quarantine_consumer,
-        parse_remote_tag_commit, release_build_driver, release_build_subcommand,
-        release_tag_is_exact_version, render_linux_installer_text, security_proof_commands,
-        validate_codesign_details, validate_notary_receipt_value, validate_signed_release_file_set,
-        validated_release_targets, verify_active_guidance_has_no_v1_commands,
-        verify_documented_contracts, verify_generated_guidance_section_text,
-        verify_tracked_cfctl_command_references, verify_v1_cutover_contract,
+        PrePushRegistration, classify_pre_push_registration, expected_signed_release_file_names,
+        extract_cfctl_command_references, extract_cfctl_command_refs, is_declared_quarantine_path,
+        is_forbidden_quarantine_consumer, parse_remote_tag_commit, release_build_driver,
+        release_build_subcommand, release_tag_is_exact_version, render_linux_installer_text,
+        security_proof_commands, validate_codesign_details, validate_notary_receipt_value,
+        validate_signed_release_file_set, validated_release_targets,
+        verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
+        verify_generated_guidance_section_text, verify_tracked_cfctl_command_references,
+        verify_v1_cutover_contract,
     };
 
     #[test]
@@ -2418,6 +2511,51 @@ mod tests {
     fn v1_quarantine_manifest_and_tracked_commands_are_bound() {
         let result = verify_v1_cutover_contract();
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn pre_push_registration_reports_only_a_gate_that_will_not_run() {
+        let root = Path::new("/Users/star/dev/cloudflare");
+        let digest = "a".repeat(64);
+        let other = "b".repeat(64);
+        let allowlist = format!(
+            "# comment\n\
+             /Users/star/dev/adapter-os pre-commit={other} pre-push={other}\n\
+             /Users/star/dev/cloudflare pre-push={digest}\n"
+        );
+
+        assert_eq!(
+            classify_pre_push_registration(Some(&allowlist), root, Some(&digest)),
+            PrePushRegistration::Registered
+        );
+        assert_eq!(
+            classify_pre_push_registration(Some(&allowlist), root, Some(&other)),
+            PrePushRegistration::DigestStale,
+            "a pinned digest that no longer matches blocks every push"
+        );
+        assert_eq!(
+            classify_pre_push_registration(
+                Some(&allowlist),
+                Path::new("/Users/star/dev/unlisted"),
+                Some(&digest)
+            ),
+            PrePushRegistration::NotRegistered,
+            "an unregistered repo is passed over in silence and must be reported"
+        );
+        assert_eq!(
+            classify_pre_push_registration(None, root, Some(&digest)),
+            PrePushRegistration::MechanismAbsent,
+            "a machine without the allowlist gets no advice it cannot act on"
+        );
+        // A repo whose prefix matches another entry must not be mistaken for it.
+        assert_eq!(
+            classify_pre_push_registration(
+                Some(&allowlist),
+                Path::new("/Users/star/dev/cloud"),
+                Some(&digest)
+            ),
+            PrePushRegistration::NotRegistered
+        );
     }
 
     #[test]
