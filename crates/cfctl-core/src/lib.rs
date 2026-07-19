@@ -127,6 +127,7 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
         name: "plans",
         subcommands: &[
             CommandNodeV1::leaf("approve"),
+            CommandNodeV1::leaf("cancel"),
             CommandNodeV1::leaf("rectify"),
             CommandNodeV1::leaf("resume"),
             CommandNodeV1::leaf("run"),
@@ -2832,6 +2833,7 @@ pub enum PlanStatus {
     RectificationRequired,
     Rectified,
     Expired,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2937,6 +2939,11 @@ pub struct PlanV1 {
     pub policy: PolicyDecisionV1,
     pub status: PlanStatus,
     pub approval: Option<ApprovalV1>,
+    /// When the plan's latent authority was explicitly retired. Outside the
+    /// reviewed content hash, like `status` and `approval`, so cancellation
+    /// bookkeeping cannot drift an approved hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_at: Option<DateTime<Utc>>,
     pub content_hash: String,
     #[serde(default)]
     pub transaction_stage: TransactionStageV1,
@@ -2987,6 +2994,7 @@ impl PlanV1 {
             },
             status: PlanStatus::Draft,
             approval: None,
+            cancelled_at: None,
             content_hash: String::new(),
             transaction_stage: TransactionStageV1::PlanPrepared,
             transaction_journal: Vec::new(),
@@ -3192,6 +3200,44 @@ impl PlanV1 {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Retires the plan's latent authority immediately.
+    ///
+    /// A draft or approved plan is standing permission to mutate; standing
+    /// authorities could always be revoked at any moment, but a plan could
+    /// only be consumed or waited out. Cancellation is the symmetric verb.
+    ///
+    /// It deliberately skips the expiry and content-drift checks the
+    /// execution path enforces: refusing to de-authorize a drifted or expired
+    /// plan would preserve exactly the authority the caller is retiring.
+    /// The transition is journaled as the terminal `Closed` checkpoint — the
+    /// transaction closes without a boundary attempt — so the hash chain
+    /// stays coherent; a plan whose journal is already corrupt belongs to
+    /// storage integrity and `plans rectify`, not to cancellation.
+    /// Re-cancelling is a no-op success so a retried cancel never reads as
+    /// failure, and the original timestamp is kept. Consumed and later states
+    /// are history, not authority, and stay immutable.
+    pub fn cancel(&mut self) -> Result<()> {
+        match self.status {
+            PlanStatus::Draft | PlanStatus::Approved | PlanStatus::Expired => {
+                let previous_status = self.status;
+                self.status = PlanStatus::Cancelled;
+                self.cancelled_at = Some(Utc::now());
+                if let Err(error) = self.record_transaction_stage(TransactionStageV1::Closed) {
+                    self.status = previous_status;
+                    self.cancelled_at = None;
+                    return Err(error);
+                }
+                Ok(())
+            }
+            PlanStatus::Cancelled => Ok(()),
+            _ => Err(CoreError::InvalidPlanState {
+                operation_id: self.operation_id.clone(),
+                actual: self.status,
+                expected: "draft, approved, or expired",
+            }),
+        }
     }
 
     /// Appends a forward-only, hash-chained transaction checkpoint. Runtime

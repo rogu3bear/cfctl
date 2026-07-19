@@ -252,6 +252,10 @@ fn plan_state_next_step(
             "The plan expired. Re-draft with `cfctl call <capability-id> …`, then approve and run promptly."
                 .to_owned()
         }
+        S::Cancelled => {
+            "The plan was cancelled and its authority retired. If the change is still wanted, draft a new plan with `cfctl call <capability-id> …`."
+                .to_owned()
+        }
         S::Approved => {
             format!("The plan is already approved; run it: `cfctl plans run {operation_id}`.")
         }
@@ -284,6 +288,7 @@ fn plan_status_label(status: cfctl_core::PlanStatus) -> &'static str {
         S::RectificationRequired => "rectification_required",
         S::Rectified => "rectified",
         S::Expired => "expired",
+        S::Cancelled => "cancelled",
     }
 }
 
@@ -5680,6 +5685,7 @@ async fn plans_command(store: &StateStore, command: PlansCommand) -> Result<Resu
         PlansCommand::Run(selector) => run_plan(store, &selector).await,
         PlansCommand::Resume(selector) => resume_plan(store, &selector).await,
         PlansCommand::Rectify(selector) => rectify_plan(store, &selector).await,
+        PlansCommand::Cancel(selector) => cancel_plan(store, &selector),
     }
 }
 
@@ -5735,6 +5741,31 @@ fn approve_plan(store: &StateStore, arguments: &PlanApproveArgs) -> Result<Resul
             "expires_at": plan.expires_at,
             "run_command": format!("cfctl plans run {}", plan.operation_id),
             "message": "The exact hash-bound plan is approved."
+        }),
+    )
+    .with_evidence(evidence);
+    envelope.operation_id = Some(plan.operation_id);
+    envelope.capability_id = Some(plan.capability.id);
+    envelope.policy_decision = Some(plan.policy);
+    Ok(envelope)
+}
+
+fn cancel_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
+    let _lock = store.lock_plan(&selector.operation_id)?;
+    // Deliberately `load_plan`, not `load_validated_plan`: cancellation must
+    // de-authorize even a plan whose journal or content no longer validates —
+    // refusing would preserve exactly the authority being retired.
+    let mut plan = store.load_plan(&selector.operation_id)?;
+    plan.cancel()?;
+    store.save_plan(&plan)?;
+    let evidence = store.write_evidence(EvidenceClass::Preview, &serde_json::to_value(&plan)?)?;
+    let mut envelope = ResultEnvelopeV2::success(
+        "plans cancel",
+        json!({
+            "operation_id": plan.operation_id,
+            "status": plan_status_label(plan.status),
+            "cancelled_at": plan.cancelled_at,
+            "message": "The plan's latent authority is retired; it can no longer be approved or run."
         }),
     )
     .with_evidence(evidence);
@@ -11968,13 +11999,14 @@ mod tests {
         apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
         apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
         bind_required_empty_compensation_body, blocked_capability_envelope,
-        boundary_response_artifact, build_mint_policy_body, call_command, capability_call_argv,
-        compensation_request, execute_read, find_secret_value, force_ipv4_from, guide_document,
-        guide_stage_commands, http_client, is_live_plan_precondition_hash,
-        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
-        non_readback_verification_basis, permission_inventory_call, permission_inventory_envelope,
-        persist_prepared_plan, persist_secret_lifecycle,
-        persist_secret_lifecycle_and_reconcile_lineage, preflight_call_input,
+        boundary_response_artifact, build_mint_policy_body, call_command, cancel_plan,
+        capability_call_argv, compensation_request, execute_read, find_secret_value,
+        force_ipv4_from, guide_document, guide_stage_commands, http_client,
+        is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
+        key_policy_list, key_policy_revoke, non_readback_verification_basis,
+        permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
+        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
+        plan_state_next_step, plan_status_label, preflight_call_input,
         preflight_standing_authority, prepare_r2_temporary_credentials_input,
         preserve_previous_catalog, query_object_from_pairs, read_import_secret, read_secret_file,
         reconcile_standing_lineage_from_plan, rectify_plan, redact_secret_payload,
@@ -18087,6 +18119,79 @@ mod tests {
         let leaky = leaky.to_string();
         assert!(leaky.contains("group or others"), "{leaky}");
         assert!(leaky.contains("chmod 600"), "{leaky}");
+    }
+
+    #[test]
+    fn cancel_plan_retires_an_approved_plan_on_the_store_path() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = CapabilityV1::new(
+            "dns.records.update",
+            "Update DNS record",
+            "PUT",
+            "/zones/{zone_id}/dns_records/{record_id}",
+        );
+        let plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"zone_id":"zone-a","record_id":"record-a"}),
+        )
+        .expect("draft plan");
+        let operation_id = plan.operation_id.clone();
+        store.save_plan(&plan).expect("persist draft");
+        approve_plan(
+            &store,
+            &PlanApproveArgs {
+                operation_id: operation_id.clone(),
+                yes: true,
+                max_cost: None,
+            },
+        )
+        .expect("approve");
+
+        let envelope = cancel_plan(
+            &store,
+            &PlanSelector {
+                operation_id: operation_id.clone(),
+            },
+        )
+        .expect("an approved plan cancels");
+        assert!(envelope.ok);
+        assert_eq!(envelope.result["status"], "cancelled");
+        assert!(
+            envelope.result["cancelled_at"].as_str().is_some(),
+            "cancellation is timestamped in the envelope"
+        );
+        assert!(
+            !envelope.evidence.is_empty(),
+            "cancellation writes the retired plan as evidence"
+        );
+
+        // The persisted state is monotonic: the cancelled plan can be
+        // neither re-approved nor rerun through the store path.
+        let stored = store.load_plan(&operation_id).expect("reload");
+        assert_eq!(plan_status_label(stored.status), "cancelled");
+        let error = approve_plan(
+            &store,
+            &PlanApproveArgs {
+                operation_id: operation_id.clone(),
+                yes: true,
+                max_cost: None,
+            },
+        )
+        .expect_err("cancelled plans refuse re-approval");
+        assert!(
+            error.to_string().contains("cancelled") || error.to_string().contains("expected draft"),
+            "{error}"
+        );
+
+        // The recovery guidance names the retirement, not a retry.
+        let guidance =
+            plan_state_next_step(&operation_id, cfctl_core::PlanStatus::Cancelled, "draft");
+        assert!(guidance.contains("cancelled"), "{guidance}");
+        assert!(guidance.contains("cfctl call"), "{guidance}");
     }
 
     #[test]

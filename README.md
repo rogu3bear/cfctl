@@ -119,7 +119,7 @@ cfctl resolve "<natural-language intent>"
 cfctl call <capability-id> [selectors/body]
 cfctl guide <capability-id>
 cfctl guide --topic system|standing-authority
-cfctl plans show|approve|run|status|resume|rectify
+cfctl plans show|approve|run|status|resume|rectify|cancel
 cfctl workspace add|discover|graph|audit
 cfctl agents install|doctor|sync
 cfctl docs search|changes|coverage

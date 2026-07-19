@@ -41,6 +41,17 @@ inferred from model output. Generated API writes are executable only when
 their operation contract is complete; reads remain dynamically executable, and
 incomplete writes stay searchable with every missing contract field explained.
 
+Most of the catalog is therefore inventory, not capability: at the July 2026
+audit, roughly 84% of mutating operations were unexecutable because their
+contracts were incomplete, and only a governed core carried complete risk,
+effect, cost, verification, and rollback metadata. That ratio is the gate
+holding, not neglect — but it is deliberate **contract debt**, and closing it
+is per-capability review work, never a bulk default. `cfctl catalog coverage
+--json` is the measure: it reports the executable core, the blocked remainder,
+and the per-field gap counts. A capability graduates only when a change
+supplies its full mutation contract with tests and documentation together, the
+way `wrangler.deploy` was classified.
+
 OpenAPI parameter selectors resolve local `$ref` chains, homogeneous enum
 values, and compatible value types carried through `allOf`, `oneOf`, or
 `anyOf`; empty, mixed, or conflicting shapes stay explicitly `unknown`, and
