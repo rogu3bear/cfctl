@@ -1,0 +1,11 @@
+#!/bin/bash
+# Pinned by SHA-256 in ~/.agent/repo-hook-allowlist. Keep this file trivial:
+# every edit here requires re-pinning or all pushes hard-block. Gate logic
+# lives in .githooks/pre-push-gate.sh, which is not pinned.
+#
+# Note: gate logic cannot live in scripts/ — that is a quarantined v1 runtime
+# path the xtask source contract forbids from existing at all.
+set -euo pipefail
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+exec "$ROOT_DIR/.githooks/pre-push-gate.sh" "$@"
