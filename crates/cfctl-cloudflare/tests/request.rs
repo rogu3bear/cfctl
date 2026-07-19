@@ -4375,6 +4375,109 @@ async fn workers_secret_put_verifies_exact_name_and_type_without_echoing_value()
 }
 
 #[tokio::test]
+async fn workers_secret_put_accepts_the_201_cloudflare_actually_returns() {
+    // Cloudflare answers a successful secret put with 201 Created, though its
+    // OpenAPI declares only 200. Requiring 200 failed every genuine success
+    // live: the secret was created and cfctl reported verification failure
+    // while its own basis printed a truthful "apply HTTP 201".
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"name":"DATABASE_TOKEN","type":"secret_text"},"errors":[]}"#,
+    ])
+    .await;
+    let plan = workers_secret_put_plan(json!({
+        "name":"DATABASE_TOKEN",
+        "type":"secret_text",
+        "text":"must-never-appear-in-proof"
+    }));
+    let apply = CloudflareResponseV1 {
+        status: 201,
+        success: true,
+        result: json!({"name":"DATABASE_TOKEN","type":"secret_text"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("secret verification");
+
+    assert!(
+        verification.passed,
+        "201 Created is a successful put: {}",
+        verification.basis
+    );
+    // The status must be reported as a match, not just echoed as a value —
+    // printing it as a bare number is what hid the failing condition.
+    assert!(verification.basis.contains("apply HTTP 201 accepted=true"));
+    assert!(
+        verification
+            .basis
+            .contains("readback HTTP 200 accepted=true")
+    );
+    assert!(!verification.basis.contains("must-never-appear-in-proof"));
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn workers_secret_put_still_rejects_an_unexpected_success_status() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"name":"DATABASE_TOKEN","type":"secret_text"},"errors":[]}"#,
+    ])
+    .await;
+    let plan = workers_secret_put_plan(json!({
+        "name":"DATABASE_TOKEN",
+        "type":"secret_text",
+        "text":"must-never-appear-in-proof"
+    }));
+    let apply = CloudflareResponseV1 {
+        status: 202,
+        success: true,
+        result: json!({"name":"DATABASE_TOKEN","type":"secret_text"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("secret verification");
+
+    assert!(
+        !verification.passed,
+        "widening to the observed statuses must not accept any success status"
+    );
+    assert!(verification.basis.contains("apply HTTP 202 accepted=false"));
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
 async fn workers_secret_put_rejects_apply_or_readback_identity_drift_without_echoing_value() {
     let (address, server) = json_response_sequence_server(vec![
         r#"{"success":true,"result":{"name":"DATABASE_TOKEN","type":"secret_key"},"errors":[]}"#,

@@ -4124,6 +4124,18 @@ fn finalize_worker_script_secret_contracts(
             read_capability_id: WORKER_SCRIPT_SECRET_READ_CAPABILITY_ID.to_owned(),
             verified_response_fields: vec!["name".to_owned(), "type".to_owned()],
         });
+        // Cloudflare's OpenAPI declares only 200 for this operation, but the
+        // live API answers a successful secret put with 201 Created. Pinning
+        // 200 alone sent every successful put into post-boundary recovery:
+        // the secret was created, and cfctl could not confirm it. Observed
+        // live 2026-07-19; the upstream schema is the defect, so widen the
+        // pin to the statuses Cloudflare actually returns rather than
+        // accepting any success status.
+        if let Some(response) = capability.response_contract.as_mut()
+            && response.success_statuses == ["200"]
+        {
+            response.success_statuses = vec!["200".to_owned(), "201".to_owned()];
+        }
         refresh_dynamic_mutation_contract(capability);
     }
 

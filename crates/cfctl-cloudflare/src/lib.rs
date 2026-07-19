@@ -2222,21 +2222,30 @@ fn evaluate_worker_script_secret_put_readback(
         readback.result.get("name").and_then(Value::as_str) == Some(planned_name);
     let readback_type_matches =
         readback.result.get("type").and_then(Value::as_str) == Some(planned_type);
-    let passed = apply_response.status == 200
+    // A successful put answers 201 Created, not 200, even though Cloudflare's
+    // OpenAPI declares only 200. Requiring 200 here failed every genuine
+    // success while the basis printed a truthful "apply HTTP 201" — reporting
+    // the status as a value rather than as a match hid which condition
+    // actually failed, so the match is now explicit in both.
+    let apply_status_matches = matches!(apply_response.status, 200 | 201);
+    let readback_status_matches = readback.status == 200;
+    let passed = apply_status_matches
         && apply_response.success
         && apply_name_matches
         && apply_type_matches
-        && readback.status == 200
+        && readback_status_matches
         && readback.success
         && readback_name_matches
         && readback_type_matches;
     let basis = format!(
-        "Worker script secret proof (apply HTTP {}, apply success={}, apply name matches={}, apply type matches={}, readback HTTP {}, readback success={}, readback name matches={}, readback type matches={})",
+        "Worker script secret proof (apply HTTP {} accepted={}, apply success={}, apply name matches={}, apply type matches={}, readback HTTP {} accepted={}, readback success={}, readback name matches={}, readback type matches={})",
         apply_response.status,
+        apply_status_matches,
         apply_response.success,
         apply_name_matches,
         apply_type_matches,
         readback.status,
+        readback_status_matches,
         readback.success,
         readback_name_matches,
         readback_type_matches
