@@ -214,6 +214,8 @@ pub struct KeyPolicySelector {
 
 #[derive(Debug, Args)]
 pub struct KeyPermissionArgs {
+    #[arg(long)]
+    pub profile: Option<String>,
     #[arg(
         long,
         help = "Read the user-owned token permission inventory; --account remains the explicit resource and authority context"
@@ -225,6 +227,8 @@ pub struct KeyPermissionArgs {
 
 #[derive(Debug, Args)]
 pub struct KeyMutationArgs {
+    #[arg(long)]
+    pub profile: Option<String>,
     #[arg(
         long,
         help = "Create a user-owned token scoped to the explicit --account resource"

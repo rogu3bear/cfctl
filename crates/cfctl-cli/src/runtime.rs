@@ -1883,11 +1883,6 @@ async fn execute_delegated_plan(
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    plan.status = if success {
-        PlanStatus::RectificationRequired
-    } else {
-        PlanStatus::Failed
-    };
     let evidence = store.write_evidence(EvidenceClass::Apply, &receipt)?;
     persist_transaction_stage_with_artifact(
         store,
@@ -1900,29 +1895,270 @@ async fn execute_delegated_plan(
         }),
     )?;
     persist_secret_lifecycle(store, plan, success, Some(&receipt), secrets)?;
-    if plan.status == PlanStatus::Failed {
-        persist_transaction_stage(store, plan, TransactionStageV1::Closed)?;
+    if !success {
+        // A delegated CLI can fail after applying part of a mutation (Wrangler
+        // may upload and promote a Worker before a trigger update fails). Keep
+        // the transaction open for rectification and report that the boundary
+        // was performed; a non-zero exit is not proof of zero side effects.
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+        return Ok(delegated_cli_failure_envelope(plan, receipt, evidence));
     }
+
+    persist_transaction_stage(
+        store,
+        plan,
+        TransactionStageV1::VerificationAttemptPersisted,
+    )?;
+    let verification = verify_delegated_cli_plan(plan, input, &receipt, credential).await;
+    let verification_evidence =
+        store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
+    let passed = verification
+        .get("passed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let basis = verification
+        .get("basis")
+        .and_then(Value::as_str)
+        .unwrap_or("delegated CLI verification did not return a basis")
+        .to_owned();
+    plan.status = if passed {
+        PlanStatus::Verified
+    } else {
+        PlanStatus::RectificationRequired
+    };
+    persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::VerificationResponsePersisted,
+        json!({
+            "state": if passed { "passed" } else { "failed" },
+            "basis_hash": hash_value(&json!(basis))?,
+            "evidence_hash": verification_evidence.content_hash,
+        }),
+    )?;
+    if passed {
+        persist_transaction_stage(store, plan, TransactionStageV1::Closed)?;
+    } else {
+        store.save_plan(plan)?;
+    }
+
     let mut envelope = ResultEnvelopeV2::success("plans run", receipt).with_evidence(evidence);
-    envelope.ok = success;
-    envelope.performed = success;
+    envelope.evidence.push(verification_evidence);
+    envelope.ok = passed;
+    envelope.performed = true;
     envelope.operation_id = Some(plan.operation_id.clone());
     envelope.capability_id = Some(plan.capability.id.clone());
     envelope.profile_id = Some(plan.profile_id.clone());
     envelope.account_id = Some(plan.account_id.clone());
     envelope.policy_decision = Some(plan.policy.clone());
-    envelope.verification.state = if success {
-        VerificationState::Unsupported
+    envelope.verification.state = if passed {
+        VerificationState::Passed
     } else {
         VerificationState::Failed
     };
-    envelope.verification.basis = Some(if success {
-        "the governed subprocess completed successfully; operation-specific live verification is still required"
-            .to_owned()
-    } else {
-        "the governed subprocess returned a failing exit status".to_owned()
-    });
+    envelope.verification.basis = Some(basis.clone());
+    if !passed {
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_VERIFICATION_FAILED".to_owned(),
+            message: basis,
+            next_step: Some(format!(
+                "Do not replay the deployment; inspect live state with `cfctl plans rectify {}`.",
+                plan.operation_id
+            )),
+        });
+    }
     Ok(envelope)
+}
+
+fn delegated_cli_failure_envelope(
+    plan: &PlanV1,
+    receipt: Value,
+    evidence: EvidenceV1,
+) -> ResultEnvelopeV2 {
+    let mut envelope = ResultEnvelopeV2::success("plans run", receipt).with_evidence(evidence);
+    envelope.ok = false;
+    envelope.performed = true;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.policy_decision = Some(plan.policy.clone());
+    envelope.verification.state = VerificationState::Failed;
+    envelope.verification.basis =
+        Some("the governed subprocess returned a failing exit status".to_owned());
+    envelope.error = Some(ErrorV1 {
+        code: "CFCTL_DELEGATED_CLI_FAILED".to_owned(),
+        message:
+            "the governed subprocess returned a failing exit status; partial mutation is possible"
+                .to_owned(),
+        next_step: Some(format!(
+            "Do not replay automatically; inspect the receipt and use `cfctl plans rectify {}`.",
+            plan.operation_id
+        )),
+    });
+    envelope
+}
+
+async fn verify_delegated_cli_plan(
+    plan: &PlanV1,
+    input: &CallInput,
+    receipt: &Value,
+    credential: &AuthCredential,
+) -> Value {
+    if plan.capability.verification.strategy
+        != "wrangler_deployment_status_reports_promoted_version"
+    {
+        return json!({
+            "passed": false,
+            "basis": format!(
+                "delegated CLI verification strategy `{}` is not implemented",
+                plan.capability.verification.strategy
+            ),
+        });
+    }
+    let Some(version_id) = wrangler_deploy_version_id(receipt) else {
+        return json!({
+            "passed": false,
+            "basis": "Wrangler reported deploy success without a parseable Current Version ID",
+        });
+    };
+    let Some(config) = input
+        .query
+        .get("config")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return json!({
+            "passed": false,
+            "basis": "the deployment plan omitted its required Wrangler config selector",
+            "version_id": version_id,
+        });
+    };
+
+    verify_wrangler_deployment_status(config, &version_id, credential).await
+}
+
+async fn verify_wrangler_deployment_status(
+    config: &str,
+    version_id: &str,
+    credential: &AuthCredential,
+) -> Value {
+    let mut command = ProcessCommand::new("wrangler");
+    command
+        .args(["deployments", "status", "--config", config, "--json"])
+        .env_clear()
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .env("HOME", env::var_os("HOME").unwrap_or_default())
+        .env("NO_COLOR", "1")
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match credential {
+        AuthCredential::Bearer { token } => {
+            command.env("CLOUDFLARE_API_TOKEN", token);
+        }
+        AuthCredential::GlobalKey { email, key } => {
+            command
+                .env("CLOUDFLARE_EMAIL", email)
+                .env("CLOUDFLARE_API_KEY", key);
+        }
+    }
+    let output = match tokio::time::timeout(Duration::from_secs(120), command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler deployment-status verification could not start: {error}"),
+                "version_id": version_id,
+            });
+        }
+        Err(_) => {
+            return json!({
+                "passed": false,
+                "basis": "Wrangler deployment-status verification timed out",
+                "version_id": version_id,
+            });
+        }
+    };
+    let stdout = redact_subprocess_text(&String::from_utf8_lossy(&output.stdout), credential);
+    let stderr = redact_subprocess_text(&String::from_utf8_lossy(&output.stderr), credential);
+    if !output.status.success() {
+        return json!({
+            "passed": false,
+            "basis": "Wrangler deployment-status verification returned a failing exit status",
+            "version_id": version_id,
+            "exit_status": output.status.code(),
+            "stdout": stdout,
+            "stderr": stderr,
+        });
+    }
+    let status = match serde_json::from_str::<Value>(stdout.trim()) {
+        Ok(status) => status,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler deployment-status output was not JSON: {error}"),
+                "version_id": version_id,
+                "stdout": stdout,
+                "stderr": stderr,
+            });
+        }
+    };
+    let passed = wrangler_status_has_promoted_version(&status, version_id);
+    json!({
+        "passed": passed,
+        "basis": if passed {
+            format!("Wrangler production deployment reports promoted version {version_id}")
+        } else {
+            format!("Wrangler production deployment does not report version {version_id} at 100 percent")
+        },
+        "version_id": version_id,
+        "readback": status,
+        "stderr": stderr,
+    })
+}
+
+fn wrangler_deploy_version_id(receipt: &Value) -> Option<String> {
+    receipt
+        .get("stdout")
+        .and_then(Value::as_str)?
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Current Version ID:"))
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        })
+        .map(str::to_owned)
+}
+
+fn wrangler_status_has_promoted_version(value: &Value, expected_version_id: &str) -> bool {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .any(|item| wrangler_status_has_promoted_version(item, expected_version_id)),
+        Value::Object(fields) => {
+            let matches = fields
+                .get("version_id")
+                .and_then(Value::as_str)
+                .is_some_and(|version_id| version_id == expected_version_id);
+            let promoted = fields.get("percentage").is_some_and(|percentage| {
+                percentage
+                    .as_f64()
+                    .is_some_and(|percentage| (percentage - 100.0).abs() < f64::EPSILON)
+                    || percentage.as_str() == Some("100")
+            });
+            (matches && promoted)
+                || fields
+                    .values()
+                    .any(|value| wrangler_status_has_promoted_version(value, expected_version_id))
+        }
+        _ => false,
+    }
 }
 
 fn execute_governed_ui_plan(
@@ -8529,6 +8765,7 @@ async fn key_policy_create(
     let inventory = key_permissions(
         store,
         &KeyPermissionArgs {
+            profile: None,
             account: arguments.account.clone(),
             user: false,
         },
@@ -8712,7 +8949,7 @@ fn permission_inventory_call(arguments: &KeyPermissionArgs) -> CallArgs {
         query: Vec::new(),
         body_json: None,
         body_stdin: false,
-        profile: None,
+        profile: arguments.profile.clone(),
         account: Some(arguments.account.clone()),
         if_match: None,
         if_none_match: None,
@@ -8763,6 +9000,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
     let inventory = key_permissions(
         store,
         &KeyPermissionArgs {
+            profile: arguments.profile.clone(),
             account: account.to_owned(),
             user: arguments.user,
         },
@@ -8823,7 +9061,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
             body: Some(body),
             ..CallInput::default()
         },
-        None,
+        arguments.profile.as_deref(),
         Some(account),
         json!({
             "value_out": value_out,
@@ -11442,7 +11680,8 @@ mod tests {
         validate_standing_authority_permission_inventory, validate_token_policy_body,
         validate_worker_script_secret_semantics, validate_zone_account_receipt_precondition,
         validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
-        workspace_resource_keys, zone_target,
+        workspace_resource_keys, wrangler_deploy_version_id, wrangler_status_has_promoted_version,
+        zone_target,
     };
     use crate::profiles::ProfilesConfig;
     use crate::{
@@ -11474,6 +11713,35 @@ mod tests {
     }
 
     #[test]
+    fn wrangler_deploy_receipt_and_status_bind_the_promoted_version() {
+        let version_id = "11111111-2222-3333-4444-555555555555";
+        let receipt = json!({
+            "stdout": format!("Uploaded jkca-web-home\nCurrent Version ID: {version_id}\n")
+        });
+        assert_eq!(
+            wrangler_deploy_version_id(&receipt).as_deref(),
+            Some(version_id)
+        );
+
+        let promoted = json!([{
+            "strategy": "percentage",
+            "versions": [{"version_id": version_id, "percentage": 100}]
+        }]);
+        assert!(wrangler_status_has_promoted_version(&promoted, version_id));
+
+        let partial = json!([{
+            "versions": [{"version_id": version_id, "percentage": 25}]
+        }]);
+        assert!(!wrangler_status_has_promoted_version(&partial, version_id));
+        let unbound = json!({"version_id": version_id});
+        assert!(!wrangler_status_has_promoted_version(&unbound, version_id));
+        assert!(!wrangler_status_has_promoted_version(
+            &promoted,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        ));
+    }
+
+    #[test]
     fn secret_payload_redaction_mirrors_the_core_set() {
         // Every field `cfctl-core` marks secret must be sunk by the payload
         // redactor, and a non-secret sibling must survive untouched. Binding
@@ -11493,6 +11761,7 @@ mod tests {
     #[test]
     fn permission_inventory_routes_owner_without_dropping_account_context() {
         let account = permission_inventory_call(&KeyPermissionArgs {
+            profile: Some("minter".to_owned()),
             user: false,
             account: "account-a".to_owned(),
         });
@@ -11505,8 +11774,10 @@ mod tests {
             [("account_id".to_owned(), "account-a".to_owned())]
         );
         assert_eq!(account.account.as_deref(), Some("account-a"));
+        assert_eq!(account.profile.as_deref(), Some("minter"));
 
         let user = permission_inventory_call(&KeyPermissionArgs {
+            profile: None,
             user: true,
             account: "account-a".to_owned(),
         });

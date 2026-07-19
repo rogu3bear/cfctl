@@ -801,8 +801,58 @@ pub fn ingest_cli_help(snapshot: &mut CatalogSnapshot, program: &str, version: &
             capability.risk = RiskClass::Unknown;
             capability.effect = EffectClass::Unknown;
         }
+        classify_delegated_cli_capability(&mut capability);
         snapshot.capabilities.insert(id, capability);
     }
+}
+
+fn classify_delegated_cli_capability(capability: &mut CapabilityV1) {
+    if capability.id != "wrangler.deploy" {
+        return;
+    }
+
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost.known = true;
+    capability.cost.incremental = false;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "publishing a Worker has no direct per-deploy charge; the deployed Worker can create plan-specific downstream usage"
+            .to_owned(),
+    );
+    capability.cost.references = vec![KnowledgeReferenceV1 {
+        title: "Cloudflare Workers pricing".to_owned(),
+        url: "https://developers.cloudflare.com/workers/platform/pricing/".to_owned(),
+        source: "official Cloudflare docs".to_owned(),
+    }];
+    capability.verification.required = true;
+    "wrangler_deployment_status_reports_promoted_version"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.warning = Some(
+        "automatic rollback is not implemented; rollback requires a separate reviewed wrangler rollback plan targeting a known prior version"
+            .to_owned(),
+    );
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "config".to_owned(),
+            location: "query".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some(
+                "Absolute or workspace-relative Wrangler configuration path".to_owned(),
+            ),
+            contract: None,
+        },
+        SelectorV1 {
+            name: "var".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "string".to_owned(),
+            description: Some("One deploy-time Worker variable in KEY:VALUE form".to_owned()),
+            contract: None,
+        },
+    ];
 }
 
 pub fn ingest_governed_ui_capabilities(snapshot: &mut CatalogSnapshot) {
