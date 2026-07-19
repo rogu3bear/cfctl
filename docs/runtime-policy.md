@@ -39,13 +39,20 @@ selectors, request body hash, workspace graph, source-config hashes, local and
 Cloudflare diffs, cost, verification, compensation, and non-reversible
 warnings. It expires within 24 hours and any relevant drift invalidates it.
 
+An approved plan is latent authority until consumed, and expiry is only
+enforced when something tries to consume it. `cfctl plans cancel
+<operation-id>` retires that authority immediately — the plan-level
+counterpart to revoking a standing authority. Cancellation is monotonic: a
+cancelled plan can never be approved, run, or resumed.
+
 API-token mint plans additionally bind a fresh owner-specific live
 permission-group inventory receipt and the normalized metadata for only the
 selected groups. Account-owned tokens use the account inventory; user-owned
-tokens use the user inventory and require an explicit account resource. cfctl
-requires every group to declare account scope and re-reads the same inventory
-before durable consumption. Permission, owner, or account-scope drift
-invalidates the plan without crossing the token-create boundary.
+tokens use the user inventory and require an explicit account resource. Each
+selected group binds the exact resource its scope allows — the pinned account,
+or with `--zone`, that one zone — and cfctl re-reads the same inventory before
+durable consumption. Permission, owner, or scope drift invalidates the plan
+without crossing the token-create boundary.
 
 Zone-scoped writes whose only remaining gap is official plan entitlement use a
 fresh `GET /zones/{zone_id}/subscription` read during planning. cfctl binds the
@@ -87,12 +94,13 @@ per-operation to per-policy; it never disappears.
 
 The grant is defensible because its bounds are strict and enforced against
 the exact execution input at run time: children must carry the pinned name
-prefix, request only allowlisted permission groups, and expire within the
-maximum child TTL; revocations are lineage-bound to tokens the authority
-itself minted; runs are rate-limited per rolling 24h window; the authority
-expires on its own TTL. `cfctl keys policy revoke <authority-id>` closes
-admission immediately and unconditionally; it does not cancel work that was
-already durably admitted.
+prefix, request only allowlisted permission groups, bind only resources the
+authority pinned — its account, plus its one zone when created with `--zone` —
+and expire within the maximum child TTL; revocations are lineage-bound to
+tokens the authority itself minted; runs are rate-limited per rolling 24h
+window; the authority expires on its own TTL. `cfctl keys policy revoke
+<authority-id>` closes admission immediately and unconditionally; it does not
+cancel work that was already durably admitted.
 
 Standing mint admission applies two independent validations to one fresh,
 owner-specific permission-inventory response. The child plan's normalized
