@@ -172,6 +172,12 @@ uncertain or unsupported result.
 
 The DNS record lifecycle is governed end to end — create, update, patch, and
 delete — with deletion verified by a not-found readback of the exact record.
+
+Queue consumers are likewise governed end to end: create and update accept the
+worker and `http_pull` variants, verification reads the exact consumer back by
+its returned id, and consumer create binds a reviewed delete as compensation.
+Update does not snapshot prior settings; restoring them is a separately
+reviewed update.
 Note that Cloudflare canonicalizes record names to FQDNs: pass the fully
 qualified name (`_token.example.com`, not `_token`) or field verification will
 correctly refuse the mismatch after the record is created.

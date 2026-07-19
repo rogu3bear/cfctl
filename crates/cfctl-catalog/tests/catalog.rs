@@ -6691,6 +6691,246 @@ fn queue_configuration_fixture() -> serde_json::Value {
     document
 }
 
+/// Real shapes from cloudflare/api-schemas: the consumer body and response
+/// `result` are a discriminated `oneOf` (worker | `http_pull`); both response
+/// variants declare `consumer_id`, only the worker variant declares
+/// `script_name`. Fixtures must reproduce that asymmetry — it decides what
+/// the generic contract machinery can honestly bind.
+fn queue_consumer_components(document: &mut serde_json::Value) {
+    document["components"]["schemas"]["QueueConsumerEnvelope"] = json!({
+        "type": "object",
+        "required": ["success"],
+        "properties": {"success": {"type": "boolean", "enum": [true]}}
+    });
+    document["components"]["schemas"]["WorkerConsumer"] = json!({
+        "type": "object",
+        "properties": {
+            "consumer_id": {"type": "string"},
+            "created_on": {"type": "string"},
+            "dead_letter_queue": {"type": "string"},
+            "queue_name": {"type": "string"},
+            "script_name": {"type": "string"},
+            "settings": {"type": "object", "properties": {
+                "batch_size": {"type": "number"},
+                "max_concurrency": {"type": "number"},
+                "max_retries": {"type": "number"},
+                "max_wait_time_ms": {"type": "number"},
+                "retry_delay": {"type": "number"}
+            }},
+            "type": {"type": "string", "enum": ["worker"]}
+        }
+    });
+    document["components"]["schemas"]["HttpPullConsumer"] = json!({
+        "type": "object",
+        "properties": {
+            "consumer_id": {"type": "string"},
+            "created_on": {"type": "string"},
+            "dead_letter_queue": {"type": "string"},
+            "queue_name": {"type": "string"},
+            "settings": {"type": "object", "properties": {
+                "batch_size": {"type": "number"},
+                "max_retries": {"type": "number"},
+                "retry_delay": {"type": "number"},
+                "visibility_timeout_ms": {"type": "number"}
+            }},
+            "type": {"type": "string", "enum": ["http_pull"]}
+        }
+    });
+    document["components"]["schemas"]["ConsumerResponse"] = json!({
+        "type": "object",
+        "oneOf": [
+            {"$ref": "#/components/schemas/WorkerConsumer"},
+            {"$ref": "#/components/schemas/HttpPullConsumer"}
+        ]
+    });
+}
+
+fn queue_consumer_request_body() -> serde_json::Value {
+    json!({
+        "content": {"application/json": {"schema": {"oneOf": [
+            {
+                "type": "object",
+                "required": ["type", "script_name"],
+                "properties": {
+                    "dead_letter_queue": {"type": "string"},
+                    "script_name": {"type": "string"},
+                    "settings": {"type": "object", "properties": {
+                        "batch_size": {"type": "number"},
+                        "max_concurrency": {"type": "number"},
+                        "max_retries": {"type": "number"},
+                        "max_wait_time_ms": {"type": "number"},
+                        "retry_delay": {"type": "number"}
+                    }},
+                    "type": {"type": "string", "enum": ["worker"]}
+                }
+            },
+            {
+                "type": "object",
+                "required": ["type"],
+                "properties": {
+                    "dead_letter_queue": {"type": "string"},
+                    "settings": {"type": "object", "properties": {
+                        "batch_size": {"type": "number"},
+                        "max_retries": {"type": "number"},
+                        "retry_delay": {"type": "number"},
+                        "visibility_timeout_ms": {"type": "number"}
+                    }},
+                    "type": {"type": "string", "enum": ["http_pull"]}
+                }
+            }
+        ]}}}
+    })
+}
+
+fn queue_consumer_fixture() -> serde_json::Value {
+    let mut document = fixture();
+    queue_consumer_components(&mut document);
+    let consumer_request = queue_consumer_request_body();
+    let consumer_response = json!({
+        "200": {
+            "description": "Queue consumer response",
+            "content": {"application/json": {"schema": {"allOf": [
+                {"$ref": "#/components/schemas/QueueConsumerEnvelope"},
+                {"type": "object", "properties": {
+                    "result": {"$ref": "#/components/schemas/ConsumerResponse"}
+                }}
+            ]}}}
+        }
+    });
+    let collection_parameters = json!([
+        {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+        {"in":"path","name":"queue_id","required":true,"schema":{"type":"string"}}
+    ]);
+    let detail_parameters = json!([
+        {"in":"path","name":"account_id","required":true,"schema":{"type":"string"}},
+        {"in":"path","name":"queue_id","required":true,"schema":{"type":"string"}},
+        {"in":"path","name":"consumer_id","required":true,"schema":{"type":"string"}}
+    ]);
+    document["paths"]["/accounts/{account_id}/queues/{queue_id}/consumers"] = json!({
+        "post": {
+            "operationId":"queues-create-consumer",
+            "summary":"Create Queue Consumer",
+            "tags":["Queue"],
+            "x-api-token-group":["Queues Write", "Workers Scripts Write"],
+            "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true},
+            "parameters": collection_parameters.clone(),
+            "requestBody": consumer_request.clone(),
+            "responses": consumer_response.clone()
+        },
+        "get": {
+            "operationId":"queues-list-consumers",
+            "summary":"List Queue Consumers",
+            "tags":["Queue"],
+            "parameters": collection_parameters,
+            "responses": consumer_response.clone()
+        }
+    });
+    document["paths"]["/accounts/{account_id}/queues/{queue_id}/consumers/{consumer_id}"] = json!({
+        "get": {
+            "operationId":"queues-get-consumer",
+            "summary":"Get Queue Consumer",
+            "tags":["Queue"],
+            "parameters": detail_parameters.clone(),
+            "responses": consumer_response.clone()
+        },
+        "put": {
+            "operationId":"queues-update-consumer",
+            "summary":"Update Queue Consumer",
+            "tags":["Queue"],
+            "x-api-token-group":["Queues Write", "Workers Scripts Write"],
+            "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true},
+            "parameters": detail_parameters.clone(),
+            "requestBody": consumer_request,
+            "responses": consumer_response.clone()
+        },
+        "delete": {
+            "operationId":"queues-delete-consumer",
+            "summary":"Delete Queue Consumer",
+            "tags":["Queue"],
+            "x-api-token-group":["Queues Write", "Workers Scripts Write"],
+            "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true},
+            "parameters": detail_parameters,
+            "responses": consumer_response
+        }
+    });
+    document
+}
+
+#[test]
+fn queue_consumer_mutations_are_classified_and_bound_by_observable_contracts() {
+    let snapshot = normalize_openapi(&queue_consumer_fixture()).expect("consumer catalog");
+
+    let create = snapshot
+        .get("queues-create-consumer")
+        .expect("consumer create");
+    assert_eq!(create.risk, RiskClass::ScopedWrite);
+    assert_eq!(create.effect, EffectClass::ReversibleWrite);
+    assert!(create.cost.known);
+    assert_eq!(create.cost.maximum, Some(0.0));
+    assert_eq!(
+        create.adapter_status,
+        AdapterStatus::DynamicApi,
+        "create gaps: {:?} blocked: {:?}",
+        create.mutation_contract_gaps(),
+        create.blocked_reason
+    );
+
+    // The bound contract is the canonical request-field union across the
+    // worker | http_pull variants; the runtime compares only fields present
+    // in the planned body, so the union is honest.
+    let created = create.created_resource.as_ref().expect("created contract");
+    assert_eq!(created.identity_selector, "consumer_id");
+    assert_eq!(created.response_result_identity_pointer, "/consumer_id");
+    assert_eq!(created.read_capability_id, "queues-get-consumer");
+    assert_eq!(created.delete_capability_id, "queues-delete-consumer");
+    assert_eq!(
+        created.verified_response_fields,
+        ["dead_letter_queue", "script_name", "settings", "type"]
+    );
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+
+    let update = snapshot
+        .get("queues-update-consumer")
+        .expect("consumer update");
+    assert_eq!(update.risk, RiskClass::ScopedWrite);
+    assert_eq!(update.effect, EffectClass::ReversibleWrite);
+    assert!(update.cost.known);
+    assert_eq!(
+        update.adapter_status,
+        AdapterStatus::DynamicApi,
+        "update gaps: {:?} blocked: {:?}",
+        update.mutation_contract_gaps(),
+        update.blocked_reason
+    );
+    let update_read = update.same_path_read.as_ref().expect("update readback");
+    assert_eq!(update_read.read_capability_id, "queues-get-consumer");
+    assert_eq!(
+        update.verification.strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+    assert!(
+        update
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("does not snapshot prior consumer settings")),
+        "{:?}",
+        update.rollback.warning
+    );
+
+    let delete = snapshot
+        .get("queues-delete-consumer")
+        .expect("consumer delete");
+    assert_eq!(delete.adapter_status, AdapterStatus::DynamicApi);
+}
+
 #[test]
 fn queue_configuration_has_exact_cost_entitlement_risk_and_data_loss_contracts() {
     let snapshot = normalize_openapi(&queue_configuration_fixture()).expect("Queue catalog");
