@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.1.2"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -23,14 +23,14 @@ repository = "https://github.com/rogu3bear/cfctl"
 [workspace.dependencies]
 # Intra-workspace crates: path + version declared once here, consumed by member
 # crates as `cfctl-x = { workspace = true }`.
-cfctl-agent = { path = "crates/cfctl-agent", version = "1.1.2" }
-cfctl-auth = { path = "crates/cfctl-auth", version = "1.1.2" }
-cfctl-catalog = { path = "crates/cfctl-catalog", version = "1.1.2" }
-cfctl-cloudflare = { path = "crates/cfctl-cloudflare", version = "1.1.2" }
-cfctl-core = { path = "crates/cfctl-core", version = "1.1.2" }
-cfctl-planner = { path = "crates/cfctl-planner", version = "1.1.2" }
-cfctl-storage = { path = "crates/cfctl-storage", version = "1.1.2" }
-cfctl-workspace = { path = "crates/cfctl-workspace", version = "1.1.2" }
+cfctl-agent = { path = "crates/cfctl-agent", version = "1.2.0" }
+cfctl-auth = { path = "crates/cfctl-auth", version = "1.2.0" }
+cfctl-catalog = { path = "crates/cfctl-catalog", version = "1.2.0" }
+cfctl-cloudflare = { path = "crates/cfctl-cloudflare", version = "1.2.0" }
+cfctl-core = { path = "crates/cfctl-core", version = "1.2.0" }
+cfctl-planner = { path = "crates/cfctl-planner", version = "1.2.0" }
+cfctl-storage = { path = "crates/cfctl-storage", version = "1.2.0" }
+cfctl-workspace = { path = "crates/cfctl-workspace", version = "1.2.0" }
 async-trait = "0.1.88"
 base64 = "0.22.1"
 clap = { version = "4.5.40", features = ["derive", "env"] }
