@@ -1043,6 +1043,9 @@ impl CapabilityV1 {
             Some("delete_created_empty_d1_database_by_returned_uuid_if_unchanged") => {
                 d1_database_create_rollback_contract_supported(self)
             }
+            Some("delete_created_empty_kv_namespace_by_returned_id_if_unchanged") => {
+                kv_namespace_create_rollback_contract_supported(self)
+            }
             Some("restore_global_warp_override_prior_disconnect_state") => {
                 self.id == "devices-resilience-set-global-warp-override"
                     && self.method == "POST"
@@ -1704,6 +1707,25 @@ fn d1_database_create_request_contract_supported(capability: &CapabilityV1) -> b
             "type": "object",
             "x-cfctl-body-required": true
         }))
+}
+
+fn kv_namespace_create_rollback_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "workers-kv-namespace-create-a-namespace"
+        && capability.method == "POST"
+        && capability.path == "/accounts/{account_id}/storage/kv/namespaces"
+        && capability.product == "Workers KV Namespace"
+        && capability.account_scope == "account"
+        && capability.mutating
+        && capability.verification.strategy
+            == "created_resource_contains_planned_fields_by_returned_id"
+        && capability.verification_contract_supported()
+        && capability.created_resource_contract_supported()
+        && capability.created_resource.as_ref().is_some_and(|target| {
+            target.detail_path == "/accounts/{account_id}/storage/kv/namespaces/{namespace_id}"
+                && target.identity_selector == "namespace_id"
+                && target.response_result_identity_pointer == "/id"
+                && target.delete_capability_id == "workers-kv-namespace-remove-a-namespace"
+        })
 }
 
 fn d1_database_create_rollback_contract_supported(capability: &CapabilityV1) -> bool {

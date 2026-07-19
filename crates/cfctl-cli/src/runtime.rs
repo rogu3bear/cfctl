@@ -2401,6 +2401,12 @@ const D1_DATABASE_DELETE_CAPABILITY_ID: &str = "d1-delete-database";
 const D1_EMPTY_DATABASE_PRECONDITION: &str = "d1_empty_database_state";
 const D1_EMPTY_DATABASE_COMPENSATION_STRATEGY: &str =
     "delete_created_empty_d1_database_by_returned_uuid_if_unchanged";
+const KV_NAMESPACE_CREATE_CAPABILITY_ID: &str = "workers-kv-namespace-create-a-namespace";
+const KV_NAMESPACE_DELETE_CAPABILITY_ID: &str = "workers-kv-namespace-remove-a-namespace";
+const KV_NAMESPACE_KEYS_READ_CAPABILITY_ID: &str = "workers-kv-namespace-list-a-namespace'-s-keys";
+const KV_EMPTY_NAMESPACE_PRECONDITION: &str = "kv_empty_namespace_state";
+const KV_EMPTY_NAMESPACE_COMPENSATION_STRATEGY: &str =
+    "delete_created_empty_kv_namespace_by_returned_id_if_unchanged";
 const CLOUDFLARE_TUNNEL_CONFIGURATION_MUTATION_CAPABILITY_ID: &str =
     "cloudflare-tunnel-configuration-put-configuration";
 const CLOUDFLARE_TUNNEL_CONFIGURATION_READ_CAPABILITY_ID: &str =
@@ -4240,6 +4246,7 @@ fn plan_requires_live_credential(capability: &CapabilityV1, adapter_targets: &Va
         || should_bind_global_warp_override_state(capability)
         || should_bind_d1_read_replication_state(capability)
         || should_bind_d1_empty_database_state(capability, adapter_targets)
+        || should_bind_kv_empty_namespace_state(capability, adapter_targets)
         || should_bind_cloudflare_tunnel_configuration_state(capability)
         || should_bind_warp_connector_configuration_state(capability)
         || should_bind_web_analytics_rum_state(capability)
@@ -4338,6 +4345,7 @@ async fn create_plan(
     live_preconditions.entitlement = entitlement_precondition;
     live_preconditions.zone_account = zone_account_precondition;
     live_preconditions.r2_parent_token = r2_parent_token_precondition;
+    resolve_kv_empty_namespace_delete_cost(&mut capability, &live_preconditions);
     persist_prepared_plan(
         store,
         catalog,
@@ -4392,6 +4400,321 @@ async fn prepare_d1_read_replication_state_precondition(
     read_live_d1_read_replication_state(store, catalog, capability, input, account_id, credential)
         .await
         .map(Some)
+}
+
+/// The KV namespace delete, identified permissively of adapter status: unlike
+/// every other delete, it starts `Blocked` (cost unknown for a populated
+/// namespace), and the emptiness precondition is what resolves that block. So
+/// identity is by id/method/path/product, not by an already-unblocked status.
+fn is_kv_namespace_delete(capability: &CapabilityV1) -> bool {
+    capability.id == KV_NAMESPACE_DELETE_CAPABILITY_ID
+        && capability.method == "DELETE"
+        && capability.path == "/accounts/{account_id}/storage/kv/namespaces/{namespace_id}"
+        && capability.product == "Workers KV Namespace"
+        && capability.account_scope == "account"
+        && capability.mutating
+        && capability.request_schema.is_none()
+}
+
+/// Bind the empty-namespace precondition only when the delete is a compensation
+/// for a cfctl-created namespace, carrying a source receipt hash. This is the
+/// safety floor: the four production namespaces were not created by cfctl, so
+/// they can never enter this path, and arbitrary KV namespace deletion stays
+/// blocked.
+fn should_bind_kv_empty_namespace_state(
+    capability: &CapabilityV1,
+    adapter_targets: &Value,
+) -> bool {
+    is_kv_namespace_delete(capability)
+        && adapter_targets
+            .get("compensates_capability_id")
+            .and_then(Value::as_str)
+            == Some(KV_NAMESPACE_CREATE_CAPABILITY_ID)
+        && adapter_targets
+            .get("compensation_strategy")
+            .and_then(Value::as_str)
+            == Some(KV_EMPTY_NAMESPACE_COMPENSATION_STRATEGY)
+        && adapter_targets
+            .get("compensates_operation_id")
+            .and_then(Value::as_str)
+            .is_some_and(|operation_id| !operation_id.is_empty())
+        && adapter_targets
+            .get("source_receipt_hash")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| hash.starts_with("sha256:"))
+}
+
+/// Prove the namespace is empty from the paginated key-list read: the `result`
+/// array must be empty, `result_info.count` must be 0, and the list must be
+/// complete (no continuation cursor). Any populated or truncated result fails
+/// closed — cfctl will not derive a delete whose cost it cannot bound to zero.
+fn apply_kv_empty_namespace_state_response(
+    account_id: &str,
+    namespace_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the KV empty-namespace read with HTTP {}; the compensation plan was not created",
+            response.status
+        )));
+    }
+    let keys = response.result.as_array().ok_or_else(|| {
+        CliError::Input(
+            "KV empty-namespace read did not return a key-list array; the compensation plan was not created"
+                .to_owned(),
+        )
+    })?;
+    if !keys.is_empty() {
+        return Err(CliError::Input(format!(
+            "KV namespace `{namespace_id}` still contains keys; cfctl will not derive a destructive compensation plan whose per-key deletion cost is unbounded"
+        )));
+    }
+    let count = response
+        .result_info
+        .as_ref()
+        .and_then(|info| info.get("count"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            CliError::Input(
+                "KV empty-namespace read omitted an integer result_info.count; the compensation plan was not created"
+                    .to_owned(),
+            )
+        })?;
+    if count != 0 {
+        return Err(CliError::Input(format!(
+            "KV namespace `{namespace_id}` reports {count} key(s); cfctl will not derive a destructive compensation plan"
+        )));
+    }
+    // A non-empty cursor means the listing is truncated: emptiness is not
+    // proven. Cloudflare omits the cursor or returns an empty string when the
+    // list is complete.
+    let cursor_complete = response
+        .result_info
+        .as_ref()
+        .and_then(|info| info.get("cursor"))
+        .is_none_or(|cursor| cursor.as_str().is_some_and(str::is_empty));
+    if !cursor_complete {
+        return Err(CliError::Input(format!(
+            "KV empty-namespace read for `{namespace_id}` was truncated (a continuation cursor remains); emptiness is not proven"
+        )));
+    }
+    Ok(json!({
+        "account_id": account_id,
+        "namespace_id": namespace_id,
+        "key_count": count,
+        "list_complete": true,
+    }))
+}
+
+async fn read_live_kv_empty_namespace_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    adapter_targets: &Value,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !should_bind_kv_empty_namespace_state(capability, adapter_targets) {
+        return Err(CliError::Input(
+            "KV compensation drifted from its governed empty-namespace contract".to_owned(),
+        ));
+    }
+    let selected_account = input
+        .selectors
+        .get("account_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "KV empty-namespace precondition requires string selector `account_id`".to_owned(),
+            )
+        })?;
+    if selected_account != account_id {
+        return Err(CliError::Input(format!(
+            "KV compensation account `{selected_account}` differs from selected account `{account_id}`; the compensation plan was not created"
+        )));
+    }
+    let namespace_id = input
+        .selectors
+        .get("namespace_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "KV empty-namespace precondition requires string selector `namespace_id`"
+                    .to_owned(),
+            )
+        })?;
+    let source_capability = catalog
+        .get(KV_NAMESPACE_KEYS_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(KV_NAMESPACE_KEYS_READ_CAPABILITY_ID))?;
+    if source_capability.method != "GET"
+        || source_capability.path
+            != "/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/keys"
+    {
+        return Err(CliError::Input(
+            "KV empty-namespace source capability drifted from the governed key-list read"
+                .to_owned(),
+        ));
+    }
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source_capability,
+            &CallInput {
+                selectors: json!({"account_id": account_id, "namespace_id": namespace_id}),
+                query: json!({"limit": 1}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt = apply_kv_empty_namespace_state_response(account_id, namespace_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
+
+async fn prepare_kv_empty_namespace_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    adapter_targets: &Value,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !should_bind_kv_empty_namespace_state(capability, adapter_targets) {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input("KV empty-namespace precondition credential was not resolved".to_owned())
+    })?;
+    read_live_kv_empty_namespace_state(
+        store,
+        catalog,
+        capability,
+        input,
+        adapter_targets,
+        account_id,
+        credential,
+    )
+    .await
+    .map(Some)
+}
+
+fn required_kv_empty_namespace_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    if !is_kv_namespace_delete(&plan.capability)
+        || adapter_targets
+            .get("compensates_capability_id")
+            .and_then(Value::as_str)
+            != Some(KV_NAMESPACE_CREATE_CAPABILITY_ID)
+    {
+        return Ok(None);
+    }
+    if !should_bind_kv_empty_namespace_state(&plan.capability, adapter_targets) {
+        return Err(CliError::Input(
+            "KV compensation plan is inconsistent with its hash-bound empty-namespace contract; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(KV_EMPTY_NAMESPACE_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "KV compensation plan predates the live empty-namespace contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/kv_empty_namespace_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "KV compensation plan omitted its hash-bound empty-namespace receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    if receipt.get("key_count").and_then(Value::as_u64) != Some(0)
+        || receipt.get("list_complete").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(CliError::Input(
+            "KV compensation plan empty-namespace receipt does not prove an empty, fully-listed namespace; create a new plan"
+                .to_owned(),
+        ));
+    }
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "plan KV empty-namespace receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+async fn validate_live_kv_empty_namespace_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_kv_empty_namespace_state_precondition(plan)? else {
+        return Ok(None);
+    };
+    let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    let (receipt, evidence) = read_live_kv_empty_namespace_state(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        adapter_targets,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live KV empty-namespace state drifted after planning; the delete boundary was not crossed and a new compensation review is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
+}
+
+/// The cost-block resolution. A KV namespace delete is blocked because a
+/// populated namespace's per-key deletion billing is undocumented. When the
+/// governed empty-namespace precondition is bound — proving zero keys — the
+/// cost is provably zero, so this resolves the plan capability's cost and,
+/// only if that was the sole remaining gap, un-blocks it for this exact
+/// compensation plan. It fires nowhere else: the precondition binds only for a
+/// compensation of a cfctl-created namespace, and the plan re-reads emptiness
+/// live before the boundary is crossed.
+fn resolve_kv_empty_namespace_delete_cost(
+    capability: &mut CapabilityV1,
+    live_preconditions: &LivePlanPreconditions,
+) {
+    if live_preconditions.kv_empty_namespace_state.is_none() || !is_kv_namespace_delete(capability)
+    {
+        return;
+    }
+    capability.cost.known = true;
+    capability.cost.incremental = false;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.currency = None;
+    capability.cost.basis = Some(
+        "the namespace was proven empty by a hash-bound live key-list read re-checked before the boundary, so there are no keys to bill for deletion; the cost is zero for this compensation only"
+            .to_owned(),
+    );
+    if capability.mutation_contract_gaps().is_empty() {
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
+    }
 }
 
 async fn prepare_d1_empty_database_state_precondition(
@@ -4549,6 +4872,16 @@ async fn prepare_live_plan_preconditions(
             store, catalog, capability, input, account_id, credential,
         )
         .await?,
+        kv_empty_namespace_state: prepare_kv_empty_namespace_state_precondition(
+            store,
+            catalog,
+            capability,
+            input,
+            adapter_targets,
+            account_id,
+            credential,
+        )
+        .await?,
         d1_empty_database_state: prepare_d1_empty_database_state_precondition(
             store,
             catalog,
@@ -4596,6 +4929,7 @@ struct LivePlanPreconditions {
     global_warp_override_state: Option<(Value, EvidenceV1)>,
     d1_read_replication_state: Option<(Value, EvidenceV1)>,
     d1_empty_database_state: Option<(Value, EvidenceV1)>,
+    kv_empty_namespace_state: Option<(Value, EvidenceV1)>,
     cloudflare_tunnel_configuration_state: Option<(Value, EvidenceV1)>,
     warp_connector_configuration_state: Option<(Value, EvidenceV1)>,
     web_analytics_rum_state: Option<(Value, EvidenceV1)>,
@@ -4622,6 +4956,9 @@ fn plan_targets(
     }
     if let Some((receipt, _)) = &live_preconditions.d1_empty_database_state {
         targets["live_preconditions"][D1_EMPTY_DATABASE_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.kv_empty_namespace_state {
+        targets["live_preconditions"][KV_EMPTY_NAMESPACE_PRECONDITION] = receipt.clone();
     }
     if let Some((receipt, _)) = &live_preconditions.cloudflare_tunnel_configuration_state {
         targets["live_preconditions"][CLOUDFLARE_TUNNEL_CONFIGURATION_STATE_PRECONDITION] =
@@ -4664,6 +5001,10 @@ fn bind_live_plan_preconditions(
         (
             D1_EMPTY_DATABASE_PRECONDITION,
             &live_preconditions.d1_empty_database_state,
+        ),
+        (
+            KV_EMPTY_NAMESPACE_PRECONDITION,
+            &live_preconditions.kv_empty_namespace_state,
         ),
         (
             CLOUDFLARE_TUNNEL_CONFIGURATION_STATE_PRECONDITION,
@@ -6261,6 +6602,7 @@ struct LivePreconditionEvidence {
     global_warp_override_state: Option<EvidenceV1>,
     d1_read_replication_state: Option<EvidenceV1>,
     d1_empty_database_state: Option<EvidenceV1>,
+    kv_empty_namespace_state: Option<EvidenceV1>,
     cloudflare_tunnel_configuration_state: Option<EvidenceV1>,
     warp_connector_configuration_state: Option<EvidenceV1>,
     web_analytics_rum_state: Option<EvidenceV1>,
@@ -6299,6 +6641,10 @@ async fn validate_live_plan_precondition_evidence(
         )
         .await?,
         d1_read_replication_state: validate_live_d1_read_replication_state_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        kv_empty_namespace_state: validate_live_kv_empty_namespace_state_precondition(
             store, catalog, plan, input, credential,
         )
         .await?,
@@ -6406,6 +6752,7 @@ fn prepend_live_precondition_evidence(
         evidence.warp_connector_configuration_state,
         evidence.cloudflare_tunnel_configuration_state,
         evidence.d1_empty_database_state,
+        evidence.kv_empty_namespace_state,
         evidence.d1_read_replication_state,
         evidence.global_warp_override_state,
         evidence.permission_inventory,
@@ -12001,13 +12348,13 @@ mod tests {
         admit_standing_plan, apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
         apply_dns_record_state_response, apply_global_warp_override_state_response,
-        apply_oauth_client_secret_state_response, apply_r2_parent_token_response,
-        apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
-        apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
-        bind_required_empty_compensation_body, blocked_capability_envelope,
-        boundary_response_artifact, build_mint_policy_body, call_command, cancel_plan,
-        capability_call_argv, compensation_request, execute_read, find_secret_value,
-        force_ipv4_from, guide_document, guide_stage_commands, http_client,
+        apply_kv_empty_namespace_state_response, apply_oauth_client_secret_state_response,
+        apply_r2_parent_token_response, apply_warp_connector_configuration_state_response,
+        apply_web_analytics_rum_state_response, apply_zone_account_response,
+        apply_zone_entitlement_response, approve_plan, bind_required_empty_compensation_body,
+        blocked_capability_envelope, boundary_response_artifact, build_mint_policy_body,
+        call_command, cancel_plan, capability_call_argv, compensation_request, execute_read,
+        find_secret_value, force_ipv4_from, guide_document, guide_stage_commands, http_client,
         is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
         key_policy_list, key_policy_revoke, non_readback_verification_basis,
         permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
@@ -12024,13 +12371,14 @@ mod tests {
         required_oauth_client_secret_state_precondition, required_r2_parent_token_precondition,
         required_warp_connector_configuration_state_precondition,
         required_web_analytics_rum_state_precondition, required_zone_account_precondition,
-        resolve_mint_token_bindings, resolve_mint_token_scope, secret_sink_format,
+        resolve_kv_empty_namespace_delete_cost, resolve_mint_token_bindings,
+        resolve_mint_token_scope, secret_sink_format,
         should_bind_cloudflare_tunnel_configuration_state, should_bind_d1_read_replication_state,
         should_bind_dns_record_state, should_bind_global_warp_override_state,
-        should_bind_oauth_client_secret_state, should_bind_warp_connector_configuration_state,
-        should_bind_web_analytics_rum_state, should_bind_zone_account,
-        should_redact_secret_response, should_resolve_zone_entitlement, sink_secret_result,
-        store_imported_api_token, validate_api_token_creation_contract,
+        should_bind_kv_empty_namespace_state, should_bind_oauth_client_secret_state,
+        should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
+        should_bind_zone_account, should_redact_secret_response, should_resolve_zone_entitlement,
+        sink_secret_result, store_imported_api_token, validate_api_token_creation_contract,
         validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
         validate_permission_group_resource_scope, validate_selected_permission_groups,
@@ -12241,6 +12589,223 @@ mod tests {
         );
         assert!(user.selectors.is_empty());
         assert_eq!(user.account.as_deref(), Some("account-a"));
+    }
+
+    fn kv_key_list_response(
+        status: u16,
+        success: bool,
+        keys: Value,
+        result_info: Option<Value>,
+    ) -> CloudflareResponseV1 {
+        CloudflareResponseV1 {
+            status,
+            success,
+            result: keys,
+            errors: Vec::new(),
+            result_info,
+            etag: None,
+            cf_ray: None,
+        }
+    }
+
+    #[test]
+    fn kv_empty_namespace_receipt_proves_zero_keys_and_a_complete_list() {
+        // The one honest empty case: empty result, count 0, no continuation.
+        let receipt = apply_kv_empty_namespace_state_response(
+            "account-1",
+            "namespace-1",
+            &kv_key_list_response(
+                200,
+                true,
+                json!([]),
+                Some(json!({"count": 0, "cursor": ""})),
+            ),
+        )
+        .expect("an empty, fully-listed namespace is provable");
+        assert_eq!(receipt["key_count"], json!(0));
+        assert_eq!(receipt["list_complete"], json!(true));
+        assert_eq!(receipt["namespace_id"], json!("namespace-1"));
+
+        // Absent cursor also means complete.
+        apply_kv_empty_namespace_state_response(
+            "account-1",
+            "namespace-1",
+            &kv_key_list_response(200, true, json!([]), Some(json!({"count": 0}))),
+        )
+        .expect("an omitted cursor means the list is complete");
+    }
+
+    #[test]
+    fn kv_empty_namespace_receipt_fails_closed_on_any_non_empty_signal() {
+        // A key present in the result array.
+        assert!(
+            apply_kv_empty_namespace_state_response(
+                "account-1",
+                "namespace-1",
+                &kv_key_list_response(
+                    200,
+                    true,
+                    json!([{"name": "still-here"}]),
+                    Some(json!({"count": 1, "cursor": ""})),
+                ),
+            )
+            .is_err(),
+            "a populated result array must fail closed"
+        );
+        // Empty array but a non-zero count — trust neither over the other.
+        assert!(
+            apply_kv_empty_namespace_state_response(
+                "account-1",
+                "namespace-1",
+                &kv_key_list_response(
+                    200,
+                    true,
+                    json!([]),
+                    Some(json!({"count": 5, "cursor": ""}))
+                ),
+            )
+            .is_err(),
+            "a non-zero count must fail closed even with an empty page"
+        );
+        // Empty page, count 0, but a continuation cursor: the list is truncated.
+        assert!(
+            apply_kv_empty_namespace_state_response(
+                "account-1",
+                "namespace-1",
+                &kv_key_list_response(
+                    200,
+                    true,
+                    json!([]),
+                    Some(json!({"count": 0, "cursor": "next-page"})),
+                ),
+            )
+            .is_err(),
+            "a remaining cursor means emptiness is not proven"
+        );
+        // Missing result_info entirely.
+        assert!(
+            apply_kv_empty_namespace_state_response(
+                "account-1",
+                "namespace-1",
+                &kv_key_list_response(200, true, json!([]), None),
+            )
+            .is_err(),
+            "an absent result_info cannot prove count 0"
+        );
+        // Cloudflare-side failure.
+        assert!(
+            apply_kv_empty_namespace_state_response(
+                "account-1",
+                "namespace-1",
+                &kv_key_list_response(200, false, Value::Null, None),
+            )
+            .is_err(),
+            "an unsuccessful read cannot prove emptiness"
+        );
+    }
+
+    #[test]
+    fn kv_empty_namespace_gate_is_compensation_and_cfctl_created_only() {
+        let mut delete = CapabilityV1::new(
+            "workers-kv-namespace-remove-a-namespace",
+            "Remove a Namespace",
+            "DELETE",
+            "/accounts/{account_id}/storage/kv/namespaces/{namespace_id}",
+        );
+        "Workers KV Namespace".clone_into(&mut delete.product);
+        "account".clone_into(&mut delete.account_scope);
+        // Blocked status is expected — the gate must still recognize it.
+        delete.adapter_status = AdapterStatus::Blocked;
+
+        let full_targets = json!({
+            "compensates_capability_id": "workers-kv-namespace-create-a-namespace",
+            "compensation_strategy": "delete_created_empty_kv_namespace_by_returned_id_if_unchanged",
+            "compensates_operation_id": "11111111-2222-3333-4444-555555555555",
+            "source_receipt_hash": "sha256:abc",
+        });
+        assert!(should_bind_kv_empty_namespace_state(&delete, &full_targets));
+
+        // A direct (non-compensation) delete: no targets, never binds.
+        assert!(!should_bind_kv_empty_namespace_state(&delete, &json!({})));
+
+        // Compensating the wrong capability (not KV create) never binds — this
+        // is the barrier that keeps arbitrary and production namespaces out.
+        let mut wrong = full_targets.clone();
+        wrong["compensates_capability_id"] = json!("d1-create-database");
+        assert!(!should_bind_kv_empty_namespace_state(&delete, &wrong));
+
+        // Missing source receipt hash never binds.
+        let mut no_receipt = full_targets.clone();
+        no_receipt["source_receipt_hash"] = json!("not-a-sha");
+        assert!(!should_bind_kv_empty_namespace_state(&delete, &no_receipt));
+    }
+
+    #[test]
+    fn kv_cost_resolves_only_with_a_bound_empty_precondition() {
+        let mut delete = CapabilityV1::new(
+            "workers-kv-namespace-remove-a-namespace",
+            "Remove a Namespace",
+            "DELETE",
+            "/accounts/{account_id}/storage/kv/namespaces/{namespace_id}",
+        );
+        "Workers KV Namespace".clone_into(&mut delete.product);
+        "account".clone_into(&mut delete.account_scope);
+        delete.risk = RiskClass::Destructive;
+        delete.effect = EffectClass::Irreversible;
+        delete.permissions = vec!["Workers KV Storage Write".to_owned()];
+        delete.entitlement.available = Some(true);
+        delete.rollback.warning = Some("irreversible".to_owned());
+        delete.verification.strategy = "same_resource_returns_not_found_after_delete".to_owned();
+        delete.same_path_read = Some(SamePathReadContractV1 {
+            path: "/accounts/{account_id}/storage/kv/namespaces/{namespace_id}".to_owned(),
+            read_capability_id: "workers-kv-namespace-get-a-namespace".to_owned(),
+            verified_response_fields: Vec::new(),
+        });
+        delete.adapter_status = AdapterStatus::Blocked;
+
+        let no_preconditions = || LivePlanPreconditions {
+            entitlement: None,
+            zone_account: None,
+            r2_parent_token: None,
+            global_warp_override_state: None,
+            d1_read_replication_state: None,
+            d1_empty_database_state: None,
+            kv_empty_namespace_state: None,
+            cloudflare_tunnel_configuration_state: None,
+            warp_connector_configuration_state: None,
+            web_analytics_rum_state: None,
+            dns_record_state: None,
+            oauth_client_secret_state: None,
+        };
+
+        // Without a bound empty precondition, nothing changes.
+        let none = no_preconditions();
+        let mut untouched = delete.clone();
+        resolve_kv_empty_namespace_delete_cost(&mut untouched, &none);
+        assert_eq!(untouched.adapter_status, AdapterStatus::Blocked);
+        assert!(!untouched.cost.known);
+
+        // With the empty precondition bound, cost resolves to zero and the
+        // capability un-blocks for this plan.
+        let mut bound = no_preconditions();
+        bound.kv_empty_namespace_state = Some((
+            json!({"key_count": 0}),
+            EvidenceV1::new(
+                EvidenceClass::LiveRead,
+                "sha256:kv-empty",
+                "/managed/evidence/kv-empty.json",
+            ),
+        ));
+        resolve_kv_empty_namespace_delete_cost(&mut delete, &bound);
+        assert!(delete.cost.known);
+        assert_eq!(delete.cost.maximum, Some(0.0));
+        assert_eq!(delete.adapter_status, AdapterStatus::DynamicApi);
+
+        // A different capability with the precondition bound is not touched.
+        let mut other = CapabilityV1::new("some-other-delete", "x", "DELETE", "/x/{id}");
+        other.adapter_status = AdapterStatus::Blocked;
+        resolve_kv_empty_namespace_delete_cost(&mut other, &bound);
+        assert_eq!(other.adapter_status, AdapterStatus::Blocked);
     }
 
     #[test]
@@ -13254,6 +13819,7 @@ mod tests {
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
                 d1_empty_database_state: None,
+                kv_empty_namespace_state: None,
                 cloudflare_tunnel_configuration_state: None,
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
@@ -14211,6 +14777,7 @@ mod tests {
                 global_warp_override_state: Some((receipt.clone(), receipt_evidence)),
                 d1_read_replication_state: None,
                 d1_empty_database_state: None,
+                kv_empty_namespace_state: None,
                 cloudflare_tunnel_configuration_state: None,
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
@@ -14297,6 +14864,7 @@ mod tests {
                 global_warp_override_state: None,
                 d1_read_replication_state: Some((receipt.clone(), receipt_evidence)),
                 d1_empty_database_state: None,
+                kv_empty_namespace_state: None,
                 cloudflare_tunnel_configuration_state: None,
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
@@ -14388,6 +14956,7 @@ mod tests {
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
                 d1_empty_database_state: None,
+                kv_empty_namespace_state: None,
                 cloudflare_tunnel_configuration_state: Some((receipt.clone(), receipt_evidence)),
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
@@ -14476,6 +15045,7 @@ mod tests {
                 d1_read_replication_state: None,
                 cloudflare_tunnel_configuration_state: None,
                 d1_empty_database_state: None,
+                kv_empty_namespace_state: None,
                 warp_connector_configuration_state: Some((receipt.clone(), evidence)),
                 web_analytics_rum_state: None,
                 dns_record_state: None,
@@ -14558,6 +15128,7 @@ mod tests {
                 cloudflare_tunnel_configuration_state: None,
                 warp_connector_configuration_state: None,
                 d1_empty_database_state: None,
+                kv_empty_namespace_state: None,
                 web_analytics_rum_state: Some((receipt.clone(), evidence)),
                 dns_record_state: None,
                 oauth_client_secret_state: None,
@@ -14656,6 +15227,7 @@ mod tests {
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
                 d1_empty_database_state: None,
+                kv_empty_namespace_state: None,
                 dns_record_state: Some((receipt.clone(), receipt_evidence)),
                 oauth_client_secret_state: None,
             },
