@@ -1152,9 +1152,20 @@ fn assert_workers_kv_namespace_create(create: &CapabilityV1) {
     );
     assert_eq!(created.verified_response_fields, ["title"]);
     assert!(create.rollback.supported);
+    // Graduated to the emptiness-gated compensation strategy: rollback derives
+    // a delete that runs only against a provably-empty namespace.
     assert_eq!(
         create.rollback.strategy.as_deref(),
-        Some("delete_created_resource_by_returned_id")
+        Some("delete_created_empty_kv_namespace_by_returned_id_if_unchanged")
+    );
+    assert!(
+        create
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("provably empty")),
+        "{:?}",
+        create.rollback.warning
     );
     assert!(create.mutation_contract_gaps().is_empty());
 }

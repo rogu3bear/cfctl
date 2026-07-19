@@ -4478,10 +4478,16 @@ fn finalize_workers_kv_namespace_contracts(
                 "created_resource_contains_planned_fields_by_returned_id"
                     .clone_into(&mut capability.verification.strategy);
                 capability.rollback.supported = true;
-                capability.rollback.strategy =
-                    Some("delete_created_resource_by_returned_id".to_owned());
+                // Graduated from the generic delete strategy: rollback of a
+                // cfctl-created namespace derives a delete gated on a live
+                // empty-namespace proof, which bounds the otherwise-unknown
+                // per-key deletion cost to zero. Populated namespaces and
+                // arbitrary (non-cfctl-created) namespaces stay blocked.
+                capability.rollback.strategy = Some(
+                    "delete_created_empty_kv_namespace_by_returned_id_if_unchanged".to_owned(),
+                );
                 capability.rollback.warning = Some(
-                    "compensation creates a separate exact namespace delete plan that must be reviewed and explicitly approved; populated namespaces remain blocked from deletion until their cost and data-loss boundary is resolved"
+                    "compensation creates a separate namespace delete plan that must be reviewed and explicitly approved, and runs only if the namespace is still provably empty; a populated namespace fails closed, and arbitrary namespace deletion remains blocked"
                         .to_owned(),
                 );
             }

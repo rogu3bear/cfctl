@@ -197,6 +197,12 @@ through their own governed capabilities first. Deletion is irreversible and
 destroys any Durable Object storage the script hosts; redeployment is a
 separate `wrangler.deploy` plan.
 
+A KV namespace created through cfctl can be rolled back: `plans rectify` on the
+create plan derives a delete that runs only if the namespace is still provably
+empty (an empty, fully-listed key set), which bounds its otherwise-unknown cost
+to zero. Arbitrary namespace deletion and deletion of populated namespaces stay
+blocked.
+
 Note that Cloudflare canonicalizes record names to FQDNs: pass the fully
 qualified name (`_token.example.com`, not `_token`) or field verification will
 correctly refuse the mismatch after the record is created.
@@ -465,20 +471,14 @@ preview, apply, and post-change verification evidence.
   `access-applications-add-an-application` reports governed in the catalog but
   fails at plan storage.
 
-- **KV namespace deletion is blocked, including as rollback of a cfctl-created
-  namespace.** Cloudflare does not document whether deleting a *populated*
-  namespace bills the deletion of its contained keys, so
-  `workers-kv-namespace-remove-a-namespace` is blocked on unbounded cost. An
-  *empty* namespace has no keys to bill, so a governed emptiness proof — read
-  the key list and require an empty `result`, `result_info.count == 0`, and a
-  complete cursor — would bound the cost to zero for that case. The design is a
-  D1-style live precondition lane
-  (`workers-kv-namespace-list-a-namespace'-s-keys` is a governed read), but with
-  one difference that makes it more than a copy: D1's delete is unconditionally
-  zero-cost and never blocked, so its emptiness lane is a pure safety gate. KV's
-  delete is blocked *on cost*, so the emptiness proof must additionally resolve
-  a cost block and let a compensation execute a capability the fail-closed gate
-  otherwise refuses. That override of the blocked-capability execution gate, on
-  a destructive operation, is deferred to its own reviewed change rather than
-  bundled here. Until then, KV namespace create governs cleanly but its
-  namespaces cannot be removed through cfctl.
+- **Arbitrary KV namespace deletion stays blocked.**
+  `workers-kv-namespace-remove-a-namespace` cannot be called directly: Cloudflare
+  does not document whether deleting a *populated* namespace bills its contained
+  key deletions, so its cost is unbounded. Deletion is available only as the
+  reviewed rollback of a cfctl-created namespace, and only when the namespace is
+  proven empty — `plans rectify` on a KV-create plan derives a delete gated on a
+  live key-list read requiring an empty `result`, `result_info.count == 0`, and a
+  complete cursor. That proof bounds the cost to zero (no keys to bill); a
+  populated or truncated result fails closed, and the emptiness is re-read live
+  before the boundary is crossed. The four production namespaces were not created
+  by cfctl and can never enter this path.
