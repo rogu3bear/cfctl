@@ -1049,6 +1049,7 @@ fn apply_post_normalization_contracts(
     finalize_warp_connector_configuration_rollback_contract(capabilities);
     finalize_web_analytics_rum_rollback_contract(document, capabilities);
     finalize_dns_record_rollback_contract(document, capabilities);
+    finalize_dns_record_delete_response_contract(capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
@@ -1323,6 +1324,46 @@ fn finalize_dns_record_rollback_contract(
         );
         refresh_dynamic_mutation_contract(capability);
     }
+}
+
+/// Cloudflare's `OpenAPI` under-declares the DNS record delete 200-response:
+/// the declared schema carries no top-level boolean `success`, so the derived
+/// body mode lands `Unsupported` and the one remaining member of an otherwise
+/// fully-governed lifecycle stays blocked. The live API answers with the full
+/// envelope — `{"result":{"id":…},"success":true,"errors":[],"messages":[]}`,
+/// HTTP 200, `application/json`, observed live 2026-07-19 against a real zone
+/// record — so the honest repair is to pin the body mode to what Cloudflare
+/// actually returns. Identity is positively re-confirmed first so the pin can
+/// never leak to another capability, and the pin flips only the exact
+/// `Unsupported` + 200-json contract it was written against.
+fn finalize_dns_record_delete_response_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    let Some(capability) = capabilities.get_mut("dns-records-for-a-zone-delete-dns-record") else {
+        return;
+    };
+    let identity_confirmed = capability.method == "DELETE"
+        && capability.path == DNS_RECORD_DETAIL_PATH
+        && capability.mutating
+        && capability.request_schema.is_none()
+        && capability.selectors.len() == 2
+        && ["zone_id", "dns_record_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name && selector.location == "path" && selector.required
+            })
+        });
+    if !identity_confirmed {
+        return;
+    }
+    let Some(response) = capability.response_contract.as_mut() else {
+        return;
+    };
+    if response.body_mode != ResponseBodyModeV1::Unsupported
+        || response.success_statuses != ["200"]
+        || response.success_media_types != ["application/json"]
+    {
+        return;
+    }
+    response.body_mode = ResponseBodyModeV1::CloudflareJsonEnvelope;
+    refresh_dynamic_mutation_contract(capability);
 }
 
 fn dns_record_detail_read_contract_supported(capability: &CapabilityV1) -> bool {

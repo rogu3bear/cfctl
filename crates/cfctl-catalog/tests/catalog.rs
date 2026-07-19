@@ -74,6 +74,27 @@ fn cloudflare_envelope_responses() -> Value {
     })
 }
 
+/// The response shape Cloudflare's `OpenAPI` actually declares for the DNS
+/// record delete: a bare `result` object with no top-level `success` boolean.
+/// The live API returns the full envelope (observed 2026-07-19); the schema
+/// under-declares it. Fixtures must reproduce what the schema says so the
+/// finalizer pin — not a flattering fixture — is what makes the delete
+/// executable.
+fn bare_result_id_responses() -> Value {
+    json!({
+        "200": {
+            "description": "bare result without envelope fields",
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "properties": {"result": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}}
+                }}
+            }}}
+        }
+    })
+}
+
 #[test]
 fn official_docs_indexes_expose_product_and_page_links_deterministically() {
     let directory = "- [Browser Run](https://developers.cloudflare.com/browser-run/llms.txt): docs";
@@ -2737,6 +2758,14 @@ fn dns_record_crud_has_complete_operation_specific_contracts() {
             "Delete DNS Record",
         ),
     ] {
+        // The delete's declared 200 schema carries no `success` boolean — the
+        // live under-declaration that kept it blocked. The finalizer pin, not
+        // an envelope-declaring fixture, must be what governs it.
+        let responses = if method == "delete" {
+            bare_result_id_responses()
+        } else {
+            cloudflare_envelope_responses()
+        };
         document["paths"]["/zones/{zone_id}/dns_records/{dns_record_id}"][method] = json!({
             "operationId":id,
             "summary":summary,
@@ -2747,7 +2776,7 @@ fn dns_record_crud_has_complete_operation_specific_contracts() {
                 {"in":"path","name":"zone_id","required":true,"schema":{"type":"string"}},
                 {"in":"path","name":"dns_record_id","required":true,"schema":{"type":"string"}}
             ],
-            "responses": cloudflare_envelope_responses()
+            "responses": responses
         });
     }
 
@@ -2796,6 +2825,54 @@ fn dns_record_crud_has_complete_operation_specific_contracts() {
             .as_deref()
             .is_some_and(|warning| warning.contains("prior record snapshot"))
     );
+    // The fixture's delete schema deliberately omits the `success` envelope
+    // (the live under-declaration), so DynamicApi status above proves the
+    // finalizer pin fired — assert the pinned mode explicitly.
+    assert_eq!(
+        delete
+            .response_contract
+            .as_ref()
+            .expect("delete response contract")
+            .body_mode,
+        ResponseBodyModeV1::CloudflareJsonEnvelope
+    );
+}
+
+#[test]
+fn dns_record_delete_envelope_pin_does_not_leak_to_other_capabilities() {
+    // A non-DNS delete with the exact same under-declared bare-result shape
+    // must stay blocked: the pin is identity-bound, not shape-bound.
+    let mut document = fixture();
+    document["paths"]["/zones/{zone_id}/page_shield/policies/{policy_id}"]["delete"] = json!({
+        "operationId":"page-shield-delete-a-page-shield-policy",
+        "summary":"Delete policy",
+        "tags":["Page Shield"],
+        "x-api-token-group":["Page Shield"],
+        "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true},
+        "parameters":[
+            {"in":"path","name":"zone_id","required":true,"schema":{"type":"string"}},
+            {"in":"path","name":"policy_id","required":true,"schema":{"type":"string"}}
+        ],
+        "responses": bare_result_id_responses()
+    });
+    let snapshot = normalize_openapi(&document).expect("page shield catalog");
+    let capability = snapshot
+        .get("page-shield-delete-a-page-shield-policy")
+        .expect("page shield delete");
+    assert_eq!(
+        capability
+            .response_contract
+            .as_ref()
+            .expect("response contract")
+            .body_mode,
+        ResponseBodyModeV1::Unsupported,
+        "the DNS delete pin must not repair other under-declared responses"
+    );
+    assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+    // The precise blocked_reason wording is owned by gap-precedence (contract
+    // gaps outrank the response-contract blocker); the leak property under
+    // test is the unrepaired body mode and the blocked status above.
+    assert!(capability.blocked_reason.is_some());
 }
 
 #[test]

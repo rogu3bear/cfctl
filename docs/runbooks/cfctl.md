@@ -170,6 +170,12 @@ draft or approved plan; consumed/running plans are deliberately non-replayable.
 Use `plans rectify` to inspect compensation and verification steps after an
 uncertain or unsupported result.
 
+The DNS record lifecycle is governed end to end — create, update, patch, and
+delete — with deletion verified by a not-found readback of the exact record.
+Note that Cloudflare canonicalizes record names to FQDNs: pass the fully
+qualified name (`_token.example.com`, not `_token`) or field verification will
+correctly refuse the mismatch after the record is created.
+
 An approved plan is standing permission to mutate until it is consumed or
 expires. When the change is no longer wanted, retire that authority
 immediately instead of waiting out the TTL:

@@ -49,6 +49,26 @@ brapi (14), Brand Protection (13), R2 Bucket (13).
 with a model such as `free` | `flat` | `usage`, plus currency and unit where
 known) to paid operations, starting with those families.
 
+## Gap 3 — success responses that under-declare the JSON envelope
+
+Some mutating operations whose live responses carry the standard Cloudflare
+envelope declare a 200 schema **without** the top-level `success` boolean, so a
+schema-driven client cannot prove the envelope contract. Two confirmed cases,
+both observed live against real resources:
+
+- `dns-records-for-a-zone-delete-dns-record` — declared: bare
+  `{"result":{"id":…}}`; observed live 2026-07-19:
+  `{"result":{"id":…},"success":true,"errors":[],"messages":[]}` (HTTP 200,
+  `application/json`). cfctl pins this operation's response contract to the
+  observed envelope (identity-bound, in
+  `finalize_dns_record_delete_response_contract`).
+- `worker-put-script-secret` — declared status `200` only; observed live
+  2026-07-19: `201 Created` with the full envelope. Pinned to `["200","201"]`.
+
+**Ask:** declare the envelope (`success`, `errors`, `messages`) and the real
+success statuses on these operations' response schemas, consistent with the
+sibling operations on the same paths that already declare them.
+
 ## Reproduce
 
 Both operation lists are derived, not curated — regenerate them rather than
