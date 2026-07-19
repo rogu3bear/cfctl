@@ -227,7 +227,14 @@ because Wrangler resolves dotenv credentials relative to its working directory
 from wherever cfctl happened to be invoked. Other delegated CLI capabilities
 keep their existing working directory.
 
-Mint an account token only through the dedicated key workflow:
+Mint an account token only through the dedicated key workflow. The generic
+`account-api-tokens-update-token` and `user-api-tokens-update-token`
+capabilities stay blocked by design, not by a schema gap: their request
+bodies ingest completely (name, status, policies, condition, expiry), but
+token mutation is reserved to the inventory-bound `keys` workflow so every
+permission change is resolved against a fresh live permission inventory and
+hash-bound. A generic update path would bypass that governance, so it is not
+promoted.
 
 ```bash
 cfctl keys permissions --account <account-id> --json
