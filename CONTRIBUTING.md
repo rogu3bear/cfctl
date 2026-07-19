@@ -48,6 +48,36 @@ Authentication is optional for offline development. Use `cfctl auth login` or
 an explicitly scoped token profile when live-read proof is required; never
 create a repository `.env` with Cloudflare credentials.
 
+### Pre-push gate
+
+Remote CI is intentionally absent, so nothing catches a gate that was never
+run — this repository has shipped a red `main` that way. `.githooks/pre-push`
+runs `cargo xtask verify` and refuses the push when it fails.
+
+The hook is tracked, but it does not run merely because you cloned the
+repository. It executes only where an agentOS-style delegate pins its digest in
+`~/.agent/repo-hook-allowlist`, and an unregistered repository is passed over
+silently. Register it per machine:
+
+```bash
+shasum -a 256 .githooks/pre-push
+# append to ~/.agent/repo-hook-allowlist:
+#   <absolute-repo-root> pre-push=<digest>
+```
+
+`cargo xtask verify` reports when this checkout's hook is unregistered or
+pinned to a stale digest, and prints the exact line to add. Editing the hook
+without re-pinning blocks every push until the allowlist is updated; that
+tripwire is deliberate.
+
+Gate logic lives in `.githooks/pre-push-gate.sh`, which is not pinned, so it can
+change without re-pinning. `CFCTL_PRE_PUSH_GATE=off` skips the gate for genuine
+emergencies — prefer it over `git push --no-verify`, which also skips the global
+branch and tag deletion policy.
+
+Without the delegate, treat `cargo xtask verify` before every push as a manual
+obligation.
+
 ## Making a change
 
 1. Identify the owning crate and the catalog capability or public contract.

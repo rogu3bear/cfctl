@@ -16789,6 +16789,70 @@ mod tests {
     }
 
     #[test]
+    fn authority_listings_show_the_scope_being_approved() {
+        // The enforcement was right and well covered; what shipped broken was
+        // that `keys policy list` told the operator to "review the bounds"
+        // without printing the zone bound. Assert the scope is visible
+        // wherever an authority is inspected.
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let zone = "4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b";
+        let authority = StandingAuthorityV1::draft(
+            "account-a",
+            Some(zone),
+            vec!["account-api-tokens-create-token".to_owned()],
+            vec!["group-a".to_owned()],
+            "sha256:inventory-binding",
+            24,
+            "cf-rotation-",
+            2,
+            Utc::now() + ChronoDuration::days(30),
+        )
+        .expect("zone-bounded draft");
+        store.save_authority(&authority).expect("persist draft");
+
+        let listed = key_policy_list(&store).expect("list authorities");
+        let entry = &listed.result["authorities"][0];
+        assert_eq!(entry["zone_id"], json!(zone));
+        assert_eq!(
+            entry["bound_resources"],
+            json!([
+                "com.cloudflare.api.account.account-a",
+                format!("com.cloudflare.api.account.zone.{zone}"),
+            ]),
+            "an approver must see every resource a child could bind"
+        );
+
+        // An account-scoped authority reports a null zone and the account
+        // resource alone, so the absence of a zone bound is explicit.
+        let account_only = StandingAuthorityV1::draft(
+            "account-b",
+            None,
+            vec!["account-api-tokens-create-token".to_owned()],
+            vec!["group-a".to_owned()],
+            "sha256:inventory-binding",
+            24,
+            "cf-rotation-",
+            2,
+            Utc::now() + ChronoDuration::days(30),
+        )
+        .expect("account-only draft");
+        store.save_authority(&account_only).expect("persist draft");
+        let listed = key_policy_list(&store).expect("list authorities");
+        let entry = listed.result["authorities"]
+            .as_array()
+            .expect("authorities")
+            .iter()
+            .find(|entry| entry["account_id"] == json!("account-b"))
+            .expect("account-only authority listed");
+        assert_eq!(entry["zone_id"], Value::Null);
+        assert_eq!(
+            entry["bound_resources"],
+            json!(["com.cloudflare.api.account.account-b"])
+        );
+    }
+
+    #[test]
     fn standing_authority_lifecycle_approves_lists_and_revokes_offline() {
         let root = tempfile::tempdir().expect("runtime root");
         let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
