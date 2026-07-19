@@ -927,6 +927,18 @@ impl CapabilityV1 {
                             | "zone-environment-purge-tagged"
                     )
             }
+            "wrangler_deployment_status_reports_promoted_version" => {
+                self.id == "wrangler.deploy"
+                    && self.method == "CLI"
+                    && self.path == "wrangler deploy"
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.selectors.iter().any(|selector| {
+                        selector.name == "config"
+                            && selector.location == "query"
+                            && selector.required
+                            && selector.value_type == "string"
+                    })
+            }
             // The Email Routing enable/disable toggles have no same-path
             // readback of a resource, so verification asserts the toggle's own
             // `result.enabled` boolean in the settings object the action

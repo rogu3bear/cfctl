@@ -1908,6 +1908,19 @@ fn official_cli_help_becomes_delegated_capabilities() {
     let deploy = snapshot.get("wrangler.deploy").expect("deploy capability");
     assert_eq!(deploy.adapter_status, AdapterStatus::DelegatedCli);
     assert!(deploy.mutating);
+    assert_eq!(deploy.risk, RiskClass::CrossConfig);
+    assert_eq!(deploy.effect, EffectClass::ReversibleWrite);
+    assert!(deploy.cost.known);
+    assert!(!deploy.cost.incremental);
+    assert_eq!(
+        deploy.verification.strategy,
+        "wrangler_deployment_status_reports_promoted_version"
+    );
+    assert!(deploy.verification_contract_supported());
+    assert!(deploy.mutation_contract_gaps().is_empty());
+    assert!(deploy.selectors.iter().any(|selector| {
+        selector.name == "config" && selector.location == "query" && selector.required
+    }));
     assert!(
         !snapshot
             .get("wrangler.tail")
