@@ -470,6 +470,61 @@ fn access_service_token_refresh_verifier_is_bound_to_the_exact_expiry_contract()
 }
 
 #[test]
+fn worker_script_delete_strategy_is_bound_to_the_exact_settings_readback() {
+    let mut capability = CapabilityV1::new(
+        "worker-script-delete-worker",
+        "Delete Worker",
+        "DELETE",
+        "/accounts/{account_id}/workers/scripts/{script_name}",
+    );
+    capability.selectors = ["account_id", "script_name"]
+        .iter()
+        .map(|name| SelectorV1 {
+            name: (*name).to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .collect();
+    capability.verification.strategy =
+        "worker_script_settings_returns_not_found_after_delete".to_owned();
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/accounts/{account_id}/workers/scripts/{script_name}/settings".to_owned(),
+        read_capability_id: "worker-script-get-settings".to_owned(),
+        verified_response_fields: Vec::new(),
+    });
+    assert!(
+        capability.verification_contract_supported(),
+        "the exact settings-readback contract must be accepted"
+    );
+
+    let mut wrong_id = capability.clone();
+    "worker-script-download-worker".clone_into(&mut wrong_id.id);
+    assert!(!wrong_id.verification_contract_supported());
+
+    let mut with_force = capability.clone();
+    with_force.selectors.push(SelectorV1 {
+        name: "force".to_owned(),
+        location: "query".to_owned(),
+        required: false,
+        value_type: "boolean".to_owned(),
+        description: None,
+        contract: None,
+    });
+    assert!(!with_force.verification_contract_supported());
+
+    let mut wrong_readback = capability.clone();
+    wrong_readback.same_path_read = Some(SamePathReadContractV1 {
+        path: "/accounts/{account_id}/workers/scripts/{script_name}".to_owned(),
+        read_capability_id: "worker-script-download-worker".to_owned(),
+        verified_response_fields: Vec::new(),
+    });
+    assert!(!wrong_readback.verification_contract_supported());
+}
+
+#[test]
 fn global_warp_restore_strategy_is_bound_to_the_exact_account_state_contract() {
     let mut capability = CapabilityV1::new(
         "devices-resilience-set-global-warp-override",

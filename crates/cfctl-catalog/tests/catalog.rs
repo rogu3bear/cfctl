@@ -593,6 +593,101 @@ fn workers_script_secret_result_schema(secret_schema: Value) -> Value {
     })
 }
 
+fn worker_script_delete_fixture() -> Value {
+    let mut document = fixture();
+    let account = json!({
+        "in":"path","name":"account_id","required":true,"schema":{"type":"string"}
+    });
+    let script = json!({
+        "in":"path","name":"script_name","required":true,"schema":{"type":"string"}
+    });
+    // Cloudflare declares `force` as an optional query bypass for in-use
+    // checks; the classifier must strip it so it is unexpressable via cfctl.
+    let force = json!({
+        "in":"query","name":"force","required":false,"schema":{"type":"boolean"}
+    });
+    document["paths"]["/accounts/{account_id}/workers/scripts/{script_name}"] = json!({
+        "delete": {
+            "operationId":"worker-script-delete-worker",
+            "summary":"Delete Worker",
+            "tags":["Worker Script"],
+            "x-api-token-group":["Workers Scripts Write"],
+            "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true},
+            "parameters":[account.clone(), script.clone(), force],
+            "responses": cloudflare_envelope_responses()
+        }
+    });
+    document["paths"]["/accounts/{account_id}/workers/scripts/{script_name}/settings"] = json!({
+        "get": {
+            "operationId":"worker-script-get-settings",
+            "summary":"Get Script Settings",
+            "tags":["Worker Script"],
+            "parameters":[account, script],
+            "responses": cloudflare_envelope_responses()
+        }
+    });
+    document
+}
+
+#[test]
+fn worker_script_delete_is_governed_without_the_force_bypass() {
+    let snapshot = normalize_openapi(&worker_script_delete_fixture()).expect("worker catalog");
+    let delete = snapshot
+        .get("worker-script-delete-worker")
+        .expect("script delete");
+    assert_eq!(
+        delete.adapter_status,
+        AdapterStatus::DynamicApi,
+        "gaps: {:?} blocked: {:?}",
+        delete.mutation_contract_gaps(),
+        delete.blocked_reason
+    );
+    assert_eq!(delete.risk, RiskClass::Destructive);
+    assert_eq!(delete.effect, EffectClass::Irreversible);
+    assert!(delete.cost.known);
+    assert_eq!(delete.cost.maximum, Some(0.0));
+    // The force bypass must be structurally unexpressable, not discouraged.
+    assert!(
+        delete
+            .selectors
+            .iter()
+            .all(|selector| selector.location == "path"),
+        "force must be stripped: {:?}",
+        delete.selectors
+    );
+    assert_eq!(
+        delete.verification.strategy,
+        "worker_script_settings_returns_not_found_after_delete"
+    );
+    let readback = delete.same_path_read.as_ref().expect("settings readback");
+    assert_eq!(
+        readback.path,
+        "/accounts/{account_id}/workers/scripts/{script_name}/settings"
+    );
+    assert_eq!(readback.read_capability_id, "worker-script-get-settings");
+    assert!(delete.mutation_contract_gaps().is_empty());
+    assert!(
+        delete.rollback.warning.as_deref().is_some_and(|warning| {
+            warning.contains("Durable Object storage")
+                && warning.contains("never passes Cloudflare's force bypass")
+        }),
+        "{:?}",
+        delete.rollback.warning
+    );
+
+    // Without a governed settings readback the delete must stay blocked.
+    let mut without_settings = worker_script_delete_fixture();
+    without_settings["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/accounts/{account_id}/workers/scripts/{script_name}/settings");
+    let snapshot = normalize_openapi(&without_settings).expect("worker catalog");
+    let delete = snapshot
+        .get("worker-script-delete-worker")
+        .expect("script delete");
+    assert_eq!(delete.adapter_status, AdapterStatus::Blocked);
+}
+
 fn workers_script_secret_fixture() -> Value {
     let account = json!({
         "in": "path",

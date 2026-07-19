@@ -178,6 +178,16 @@ worker and `http_pull` variants, verification reads the exact consumer back by
 its returned id, and consumer create binds a reviewed delete as compensation.
 Update does not snapshot prior settings; restoring them is a separately
 reviewed update.
+
+Worker script deletion is governed: verification reads the script's `/settings`
+sub-path, which returns not-found once the script is gone (the script's own GET
+returns the raw module body, not a JSON envelope). cfctl never passes
+Cloudflare's `force` bypass, so a script bound as a queue consumer or hosting
+Durable Objects keeps Cloudflare's in-use refusal — remove those bindings
+through their own governed capabilities first. Deletion is irreversible and
+destroys any Durable Object storage the script hosts; redeployment is a
+separate `wrangler.deploy` plan.
+
 Note that Cloudflare canonicalizes record names to FQDNs: pass the fully
 qualified name (`_token.example.com`, not `_token`) or field verification will
 correctly refuse the mismatch after the record is created.

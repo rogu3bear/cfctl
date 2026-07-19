@@ -1051,6 +1051,7 @@ fn apply_post_normalization_contracts(
     finalize_dns_record_rollback_contract(document, capabilities);
     finalize_dns_record_delete_response_contract(capabilities);
     finalize_queue_consumer_contracts(document, capabilities);
+    finalize_worker_script_delete_contract(capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
@@ -8527,6 +8528,91 @@ const QUEUE_CONFIGURATION_CONTRACTS: &[QueueConfigurationContract] = &[
         kind: QueueConfigurationKind::ConsumerUpdate,
     },
 ];
+
+const WORKER_SCRIPT_DELETE_PATH: &str = "/accounts/{account_id}/workers/scripts/{script_name}";
+const WORKER_SCRIPT_SETTINGS_PATH: &str =
+    "/accounts/{account_id}/workers/scripts/{script_name}/settings";
+
+/// Govern Worker script deletion. The script's own GET returns the raw module
+/// body (blocked, non-JSON), so the not-found readback is bound to the
+/// `/settings` sub-path via a dedicated verification strategy. The `force`
+/// query selector is stripped rather than declared: cfctl never bypasses
+/// Cloudflare's in-use refusals, so a script bound as a queue consumer or
+/// hosting Durable Objects keeps its upstream guard, and anything in use must
+/// be unbound through its own governed capability first.
+fn finalize_worker_script_delete_contract(capabilities: &mut BTreeMap<String, CapabilityV1>) {
+    let settings_read_supported =
+        capabilities
+            .get("worker-script-get-settings")
+            .is_some_and(|capability| {
+                capability.method == "GET"
+                    && capability.path == WORKER_SCRIPT_SETTINGS_PATH
+                    && capability.product == "Worker Script"
+                    && capability
+                        .selectors
+                        .iter()
+                        .all(|selector| selector.location == "path")
+            });
+    if !settings_read_supported {
+        return;
+    }
+    let Some(capability) = capabilities.get_mut("worker-script-delete-worker") else {
+        return;
+    };
+    let identity_confirmed = capability.method == "DELETE"
+        && capability.path == WORKER_SCRIPT_DELETE_PATH
+        && capability.product == "Worker Script"
+        && capability.mutating
+        && capability.request_schema.is_none()
+        && capability.permissions == ["Workers Scripts Write"]
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                    && response.success_statuses == ["200"]
+            })
+        && ["account_id", "script_name"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name && selector.location == "path" && selector.required
+            })
+        });
+    if !identity_confirmed {
+        return;
+    }
+    capability
+        .selectors
+        .retain(|selector| selector.location == "path");
+    capability.risk = RiskClass::Destructive;
+    capability.effect = EffectClass::Irreversible;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "deleting a script has no per-operation charge; Workers billing is request and CPU usage, which ends when the script is gone"
+            .to_owned(),
+    );
+    capability.cost.references = vec![KnowledgeReferenceV1 {
+        title: "Workers pricing".to_owned(),
+        url: "https://developers.cloudflare.com/workers/platform/pricing/".to_owned(),
+        source: "official Cloudflare docs".to_owned(),
+    }];
+    capability.verification.required = true;
+    "worker_script_settings_returns_not_found_after_delete"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: WORKER_SCRIPT_SETTINGS_PATH.to_owned(),
+        read_capability_id: "worker-script-get-settings".to_owned(),
+        verified_response_fields: Vec::new(),
+    });
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = Some(
+        "deletion is irreversible and destroys any Durable Object storage hosted by the script; redeployment is a separately reviewed wrangler.deploy plan, and in-use bindings (queue consumers, service bindings) must be removed through their own governed capabilities first — cfctl never passes Cloudflare's force bypass"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
 
 const QUEUE_CONSUMER_DETAIL_PATH: &str =
     "/accounts/{account_id}/queues/{queue_id}/consumers/{consumer_id}";

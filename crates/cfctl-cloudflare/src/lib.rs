@@ -867,6 +867,10 @@ impl Executor {
                 self.verify_exact_resource_delete(plan, apply_response, input, credential)
                     .await
             }
+            "worker_script_settings_returns_not_found_after_delete" => {
+                self.verify_worker_script_delete(plan, apply_response, input, credential)
+                    .await
+            }
             "parent_collection_omits_deleted_resource_id" => {
                 self.verify_parent_collection_delete(plan, apply_response, input, credential)
                     .await
@@ -875,6 +879,54 @@ impl Executor {
                 strategy.to_owned(),
             )),
         }
+    }
+
+    /// A Worker script's own GET returns the raw module body, so deletion is
+    /// proven against the script's `/settings` sub-path, which answers 404
+    /// once the script is gone.
+    async fn verify_worker_script_delete(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let target = plan.capability.same_path_read.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the hash-bound Worker script settings readback contract is absent".to_owned(),
+            )
+        })?;
+        let details = same_path_verification_capability(
+            &plan.capability,
+            &target.read_capability_id,
+            "Worker script deletion settings readback",
+            &target.path,
+        );
+        let request = self.builder.build(
+            &details,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let passed = apply_response.success && readback.status == 404 && !readback.success;
+        let basis = if passed {
+            "the script's settings sub-path returned not found after deletion".to_owned()
+        } else {
+            format!(
+                "Worker script deletion was not proven (apply success={}, settings readback HTTP {}, readback success={})",
+                apply_response.success, readback.status, readback.success
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback,
+        })
     }
 
     async fn verify_exact_resource_delete(
@@ -2318,6 +2370,9 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
     if strategy == "worker_script_secret_reports_planned_name_and_type_after_put" {
         return validate_worker_script_secret_put_target(capability, input);
     }
+    if strategy == "worker_script_settings_returns_not_found_after_delete" {
+        return validate_worker_script_delete_target(capability, input);
+    }
     if strategy == "access_service_token_reports_refreshed_expiration" {
         return validate_access_service_token_refresh_target(capability, input);
     }
@@ -2544,6 +2599,47 @@ fn same_path_routing_header(capability: &CapabilityV1, selector: &SelectorV1) ->
         && !selector.required
         && selector.value_type == "string"
         && matches!(capability.product.as_str(), "R2 Bucket" | "R2 Object")
+}
+
+fn validate_worker_script_delete_target(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let target = capability.same_path_read.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the hash-bound Worker script settings readback contract is absent".to_owned(),
+        )
+    })?;
+    if target.path != "/accounts/{account_id}/workers/scripts/{script_name}/settings"
+        || target.read_capability_id != "worker-script-get-settings"
+        || !target.verified_response_fields.is_empty()
+        || !clean_verification_query(input)
+        || input.body.is_some()
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the Worker script delete does not match its hash-bound settings readback contract"
+                .to_owned(),
+        ));
+    }
+    let selectors = input.selectors.as_object().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the planned Worker script selectors are not an object".to_owned(),
+        )
+    })?;
+    if selectors.len() != 2
+        || ["account_id", "script_name"].iter().any(|name| {
+            selectors
+                .get(*name)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        })
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned Worker script selectors are missing, empty, or broader than the exact account and script target"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_same_path_delete_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
@@ -2922,6 +3018,7 @@ fn is_delete_verifier(strategy: &str) -> bool {
     matches!(
         strategy,
         "same_resource_returns_not_found_after_delete"
+            | "worker_script_settings_returns_not_found_after_delete"
             | "parent_collection_omits_deleted_resource_id"
     )
 }
