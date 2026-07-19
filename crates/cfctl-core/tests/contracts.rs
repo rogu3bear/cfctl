@@ -1989,6 +1989,66 @@ fn paid_plan_rejects_a_ceiling_below_the_declared_maximum() {
 }
 
 #[test]
+fn cancellation_retires_latent_authority_immediately_and_monotonically() {
+    let capability = CapabilityV1::new("op", "Operation", "POST", "/accounts/{account_id}/op");
+
+    // A draft is latent authority (auto-execute and standing-authority
+    // consumption both start from drafts) and is cancellable.
+    let mut draft =
+        PlanV1::draft("p", "a", "sha256:c", capability.clone(), json!({})).expect("draft");
+    draft.cancel().expect("draft cancels");
+    assert_eq!(draft.status, PlanStatus::Cancelled);
+    let first_stamp = draft.cancelled_at.expect("cancellation is timestamped");
+
+    // Re-cancel is a no-op success and keeps the original timestamp, so a
+    // retried cancel never reads as failure or rewrites the record.
+    draft.cancel().expect("re-cancel is idempotent");
+    assert_eq!(draft.cancelled_at, Some(first_stamp));
+
+    // A cancelled plan is dead: it can be neither approved nor consumed.
+    assert!(
+        draft.approve(true, None).is_err(),
+        "cancelled refuses approval"
+    );
+    assert!(
+        draft.mark_consumed().is_err(),
+        "cancelled refuses consumption"
+    );
+
+    // An approved plan — the audit finding's actual subject — cancels too.
+    let mut approved =
+        PlanV1::draft("p", "a", "sha256:c", capability.clone(), json!({})).expect("draft");
+    approved.approve(true, None).expect("approve");
+    approved.cancel().expect("approved cancels");
+    assert_eq!(approved.status, PlanStatus::Cancelled);
+    assert!(approved.mark_consumed().is_err(), "cancelled refuses run");
+
+    // Cancellation is unconditional within its states: a drifted approved
+    // plan must still cancel, because refusing to de-authorize tampered
+    // content would preserve exactly the authority being retired.
+    let mut drifted =
+        PlanV1::draft("p", "a", "sha256:c", capability.clone(), json!({})).expect("draft");
+    drifted.approve(true, None).expect("approve");
+    drifted.input = json!({"tampered": true});
+    assert!(
+        drifted.mark_consumed().is_err(),
+        "drifted content cannot run"
+    );
+    drifted.cancel().expect("drifted content still cancels");
+    assert_eq!(drifted.status, PlanStatus::Cancelled);
+
+    // History is not authority: a consumed plan refuses cancellation.
+    let mut consumed = PlanV1::draft("p", "a", "sha256:c", capability, json!({})).expect("draft");
+    consumed.approve(true, None).expect("approve");
+    consumed.mark_consumed().expect("consume");
+    assert!(
+        consumed.cancel().is_err(),
+        "consumed plans are immutable history"
+    );
+    assert_eq!(consumed.status, PlanStatus::Consumed);
+}
+
+#[test]
 fn approval_checkpoint_binds_the_exact_cost_ceiling_across_crash_reload() {
     let mut capability = CapabilityV1::new(
         "paid",

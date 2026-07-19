@@ -170,6 +170,20 @@ draft or approved plan; consumed/running plans are deliberately non-replayable.
 Use `plans rectify` to inspect compensation and verification steps after an
 uncertain or unsupported result.
 
+An approved plan is standing permission to mutate until it is consumed or
+expires. When the change is no longer wanted, retire that authority
+immediately instead of waiting out the TTL:
+
+```bash
+cfctl plans cancel <operation-id> --json
+```
+
+Cancellation mirrors authority revocation: it is immediate, works on draft and
+approved plans even when their content has drifted, is safe to retry, and is
+monotonic — a cancelled plan can never be approved, run, or resumed.
+Consumed and completed plans are history, not authority, and cannot be
+cancelled.
+
 Secret outputs require `--value-out /new/secure/path`; cfctl refuses an
 existing destination.
 

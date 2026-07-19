@@ -406,6 +406,8 @@ pub enum PlansCommand {
     Status(PlanSelector),
     Resume(PlanSelector),
     Rectify(PlanSelector),
+    /// Retire a draft or approved plan immediately without consuming it
+    Cancel(PlanSelector),
 }
 
 #[derive(Debug, Args)]

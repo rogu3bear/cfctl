@@ -2,4 +2,14 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec cargo run --quiet --manifest-path "$root/Cargo.toml" --locked -p cfctl-cli --bin cfctl -- "$@"
+
+# Build through the host cargo gate, then exec the binary directly. Compilation
+# is pure, so gate serialization and result caching are correct for the build —
+# but they are wrong for the CLI itself: cfctl's governed state (plans,
+# authorities, profiles) lives outside the repository, so an unchanged source
+# fingerprint does not imply an unchanged answer. Running the CLI under
+# `cargo run` let the gate replay stale stdout — an authority shown as
+# pending after approval, or active after revocation. State must never be
+# served from a build cache, so the cfctl process runs outside the gate.
+cargo build --quiet --manifest-path "$root/Cargo.toml" --locked -p cfctl-cli --bin cfctl
+exec "${CARGO_TARGET_DIR:-$root/target}/debug/cfctl" "$@"

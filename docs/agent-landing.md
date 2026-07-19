@@ -76,14 +76,17 @@ cfctl plans run <operation-id> --json
 cfctl plans status <operation-id> --json
 cfctl plans resume <operation-id> --json
 cfctl plans rectify <operation-id> --json
+cfctl plans cancel <operation-id> --json
 ```
 
 Paid work also requires `--max-cost CURRENCY:AMOUNT`; unknown cost is blocked.
 Plans expire within 24 hours, approvals are invalidated by relevant drift, and
 consumed plans cannot be replayed after a crash. `plans resume` continues a
 draft or approved plan; `plans rectify` reconciles durable receipts and
-verification without replaying the Cloudflare mutation. See the operator
-runbook for the full lifecycle.
+verification without replaying the Cloudflare mutation. `plans cancel` retires
+a draft or approved plan immediately — mirroring authority revocation — when
+the change is no longer wanted. See the operator runbook for the full
+lifecycle.
 
 ## Workspace impact
 
