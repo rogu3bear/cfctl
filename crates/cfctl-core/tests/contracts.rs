@@ -470,6 +470,72 @@ fn access_service_token_refresh_verifier_is_bound_to_the_exact_expiry_contract()
 }
 
 #[test]
+fn access_application_create_strategy_binds_a_curated_field_set() {
+    let mut capability = CapabilityV1::new(
+        "access-applications-add-an-application",
+        "Add an Access application",
+        "POST",
+        "/accounts/{account_id}/access/apps",
+    );
+    capability.selectors = vec![SelectorV1 {
+        name: "account_id".to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }];
+    // A polymorphic body with no universally required field — the union would
+    // not be an honest verified set.
+    capability.request_schema = Some(json!({
+        "anyOf": [
+            {"type":"object","required":["type"],"properties":{
+                "name":{"type":"string"},"type":{"type":"string","enum":["self_hosted"]},
+                "domain":{"type":"string"}}},
+            {"type":"object","required":["type"],"properties":{
+                "name":{"type":"string"},"type":{"type":"string","enum":["saas"]},
+                "saas_app":{"type":"object"}}}
+        ]
+    }));
+    capability.verification.strategy =
+        "created_access_application_contains_planned_fields_by_returned_id".to_owned();
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/access/apps/{app_id}".to_owned(),
+        identity_selector: "app_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "access-applications-get-an-access-application".to_owned(),
+        delete_capability_id: "access-applications-delete-an-access-application".to_owned(),
+        verified_response_fields: vec!["name".to_owned(), "type".to_owned()],
+    });
+    assert!(
+        capability.verification_contract_supported(),
+        "the curated Access create contract must be accepted"
+    );
+
+    // The generic union strategy must NOT accept this contract — the curated
+    // fields do not equal the request-field union.
+    let mut generic = capability.clone();
+    generic.verification.strategy =
+        "created_resource_contains_planned_fields_by_returned_id".to_owned();
+    assert!(
+        !generic.verification_contract_supported(),
+        "the generic union binder must reject a curated subset"
+    );
+
+    // The curated strategy is identity-bound: another id cannot borrow it.
+    let mut wrong_id = capability.clone();
+    "some-other-create".clone_into(&mut wrong_id.id);
+    assert!(!wrong_id.verification_contract_supported());
+
+    // A non-curated field set is rejected even for the right id.
+    let mut wrong_fields = capability.clone();
+    if let Some(target) = wrong_fields.created_resource.as_mut() {
+        target.verified_response_fields = vec!["domain".to_owned(), "name".to_owned()];
+    }
+    assert!(!wrong_fields.verification_contract_supported());
+}
+
+#[test]
 fn worker_script_delete_strategy_is_bound_to_the_exact_settings_readback() {
     let mut capability = CapabilityV1::new(
         "worker-script-delete-worker",

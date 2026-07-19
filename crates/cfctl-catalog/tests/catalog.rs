@@ -4896,6 +4896,144 @@ fn access_authorization_configuration_classifier_rejects_retargeting_and_permiss
     assert_eq!(drifted_create.adapter_status, AdapterStatus::Blocked);
 }
 
+/// Access app bodies are a polymorphic `anyOf` over app types. This fixture
+/// reproduces the two properties that decide the design: `name` and `type`
+/// are present in every variant, but variant-specific fields (`domain`,
+/// `saas_app`) are not — so the generic union binder cannot produce an honest
+/// verified set, and a curated `[name, type]` contract is required.
+fn access_application_fixture() -> serde_json::Value {
+    let mut document = fixture();
+    let variant = |ty: &str, extra: serde_json::Value| {
+        let mut props = json!({
+            "name": {"type": "string"},
+            "type": {"type": "string", "enum": [ty]}
+        });
+        for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+            props[k] = v;
+        }
+        json!({"type": "object", "required": ["type"], "properties": props})
+    };
+    let request_schema = json!({
+        "anyOf": [
+            variant("self_hosted", json!({"domain": {"type": "string"}})),
+            variant("saas", json!({"saas_app": {"type": "object"}})),
+            variant("ssh", json!({"domain": {"type": "string"}}))
+        ]
+    });
+    let app_result = json!({
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "name": {"type": "string"},
+            "type": {"type": "string"},
+            "domain": {"type": "string"}
+        }
+    });
+    let envelope_result = json!({
+        "type": "object",
+        "required": ["success"],
+        "properties": {
+            "success": {"type": "boolean"},
+            "result": app_result
+        }
+    });
+    let account =
+        json!({"in":"path","name":"account_id","required":true,"schema":{"type":"string"}});
+    let app = json!({"in":"path","name":"app_id","required":true,"schema":{"type":"string"}});
+    document["paths"]["/accounts/{account_id}/access/apps"] = json!({
+        "post": {
+            "operationId":"access-applications-add-an-application",
+            "summary":"Add an Access application",
+            "tags":["Access applications"],
+            "x-api-token-group":["Access: Apps and Policies Write"],
+            "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true},
+            "parameters":[account.clone()],
+            "requestBody":{"required":true,"content":{"application/json":{"schema":request_schema}}},
+            "responses":{"201":{"description":"Created","content":{"application/json":{"schema":envelope_result.clone()}}}}
+        },
+        "get": {
+            "operationId":"access-applications-list-access-applications",
+            "summary":"List Access applications",
+            "tags":["Access applications"],
+            "parameters":[account.clone()],
+            "responses":{"200":{"description":"OK","content":{"application/json":{"schema":envelope_result.clone()}}}}
+        }
+    });
+    document["paths"]["/accounts/{account_id}/access/apps/{app_id}"] = json!({
+        "get": {
+            "operationId":"access-applications-get-an-access-application",
+            "summary":"Get an Access application",
+            "tags":["Access applications"],
+            "parameters":[account.clone(), app.clone()],
+            "responses":{"200":{"description":"OK","content":{"application/json":{"schema":envelope_result.clone()}}}}
+        },
+        "put": {
+            "operationId":"access-applications-update-an-access-application",
+            "summary":"Update an Access application",
+            "tags":["Access applications"],
+            "x-api-token-group":["Access: Apps and Policies Write"],
+            "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true},
+            "parameters":[account.clone(), app.clone()],
+            "requestBody":{"required":true,"content":{"application/json":{"schema":json!({
+                "anyOf": [
+                    variant("self_hosted", json!({"domain": {"type": "string"}})),
+                    variant("saas", json!({"saas_app": {"type": "object"}})),
+                    variant("ssh", json!({"domain": {"type": "string"}}))
+                ]
+            })}}},
+            "responses":{"200":{"description":"OK","content":{"application/json":{"schema":envelope_result.clone()}}}}
+        },
+        "delete": {
+            "operationId":"access-applications-delete-an-access-application",
+            "summary":"Delete an Access application",
+            "tags":["Access applications"],
+            "x-api-token-group":["Access: Apps and Policies Write"],
+            "x-cfPlanAvailability":{"free":true,"pro":true,"business":true,"enterprise":true},
+            "parameters":[account, app],
+            "responses":{"200":{"description":"OK","content":{"application/json":{"schema":envelope_result}}}}
+        }
+    });
+    document
+}
+
+#[test]
+fn access_application_create_is_governed_with_a_curated_verified_field_set() {
+    let snapshot = normalize_openapi(&access_application_fixture()).expect("access catalog");
+    let create = snapshot
+        .get("access-applications-add-an-application")
+        .expect("access create");
+    assert_eq!(
+        create.adapter_status,
+        AdapterStatus::DynamicApi,
+        "gaps: {:?} blocked: {:?}",
+        create.mutation_contract_gaps(),
+        create.blocked_reason
+    );
+    // Access creation is identity-affecting, so it must never auto-execute.
+    assert_eq!(create.risk, RiskClass::IdentityOrOwnership);
+    assert_eq!(create.effect, EffectClass::IdentityOrOwnership);
+    assert!(create.cost.known);
+    assert_eq!(
+        create.verification.strategy,
+        "created_access_application_contains_planned_fields_by_returned_id"
+    );
+    let created = create.created_resource.as_ref().expect("created contract");
+    // Curated to the fields present in every variant, not the union.
+    assert_eq!(created.verified_response_fields, ["name", "type"]);
+    assert_eq!(created.response_result_identity_pointer, "/id");
+    assert_eq!(
+        created.delete_capability_id,
+        "access-applications-delete-an-access-application"
+    );
+    assert!(create.mutation_contract_gaps().is_empty());
+
+    // Update stays blocked by design: no honest universal field contract.
+    let update = snapshot
+        .get("access-applications-update-an-access-application")
+        .expect("access update");
+    assert_eq!(update.adapter_status, AdapterStatus::Blocked);
+}
+
 fn access_service_token_fixture() -> serde_json::Value {
     let mut fixture = json!({
         "openapi": "3.0.3",

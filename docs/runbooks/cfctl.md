@@ -179,6 +179,15 @@ its returned id, and consumer create binds a reviewed delete as compensation.
 Update does not snapshot prior settings; restoring them is a separately
 reviewed update.
 
+Access application creation is governed: its request body is a 13-way
+polymorphic union with no universally required field, so verification is bound
+to a curated set — `name` and `type`, present in every application type — read
+back by the returned id, with a reviewed delete as compensation. Variant fields
+like `domain` are part of the create but not verified. Access application
+*update* is deliberately left blocked: the union has no honest universal field
+contract to verify an update against. Creating or deleting an application is
+identity-affecting and always requires explicit approval.
+
 Worker script deletion is governed: verification reads the script's `/settings`
 sub-path, which returns not-found once the script is gone (the script's own GET
 returns the raw module body, not a JSON envelope). cfctl never passes

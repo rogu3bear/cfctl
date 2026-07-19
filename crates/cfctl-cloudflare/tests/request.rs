@@ -3244,6 +3244,139 @@ async fn created_resource_is_read_back_by_hash_bound_identity_and_planned_fields
     assert!(!request.contains("\"name\":\"created\""));
 }
 
+fn access_application_create_plan(body: serde_json::Value) -> PlanV1 {
+    let mut plan = dns_record_plan(
+        "access-applications-add-an-application",
+        "POST",
+        "/accounts/{account_id}/access/apps",
+        "created_access_application_contains_planned_fields_by_returned_id",
+        json!({"account_id":"account-1"}),
+        Some(body),
+    );
+    "Access applications".clone_into(&mut plan.capability.product);
+    plan.capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/access/apps/{app_id}".to_owned(),
+        identity_selector: "app_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "access-applications-get-an-access-application".to_owned(),
+        delete_capability_id: "access-applications-delete-an-access-application".to_owned(),
+        verified_response_fields: vec!["name".to_owned(), "type".to_owned()],
+    });
+    plan
+}
+
+#[tokio::test]
+async fn access_application_create_verifies_only_the_fields_a_variant_actually_sends() {
+    // A saas app plans no `domain`, yet the curated contract lists only
+    // `name`/`type`; verification must pass on the readback echoing them and
+    // must not fault the absent variant-only field.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let read = stream.read(&mut buffer).await.expect("read verification");
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let body =
+            r#"{"success":true,"result":{"id":"app-1","name":"SSO","type":"saas"},"errors":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+        request
+    });
+    let plan = access_application_create_plan(json!({"name":"SSO","type":"saas"}));
+    let apply = CloudflareResponseV1 {
+        status: 201,
+        success: true,
+        result: json!({"id":"app-1"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let request = server.await.expect("server joins");
+    assert!(request.starts_with("GET /client/v4/accounts/account-1/access/apps/app-1 "));
+}
+
+#[tokio::test]
+async fn access_application_create_faults_when_a_planned_field_drifts() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let _ = stream.read(&mut buffer).await.expect("read verification");
+        // Readback reports a different name than planned.
+        let body = r#"{"success":true,"result":{"id":"app-1","name":"WRONG","type":"self_hosted"},"errors":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+    });
+    let plan = access_application_create_plan(
+        json!({"name":"real","type":"self_hosted","domain":"x.example.com"}),
+    );
+    let apply = CloudflareResponseV1 {
+        status: 201,
+        success: true,
+        result: json!({"id":"app-1"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(!verification.passed, "{}", verification.basis);
+    server.await.expect("server joins");
+}
+
 fn r2_bucket_create_plan() -> PlanV1 {
     let mut plan = dns_record_plan(
         "r2-create-bucket",
