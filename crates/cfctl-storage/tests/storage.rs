@@ -27,6 +27,7 @@ fn draft_plan() -> PlanV1 {
 fn draft_authority() -> StandingAuthorityV1 {
     StandingAuthorityV1::draft(
         "account-a",
+        None,
         vec!["account-api-tokens-create-token".to_owned()],
         vec!["permission-a".to_owned()],
         "sha256:permission-inventory",

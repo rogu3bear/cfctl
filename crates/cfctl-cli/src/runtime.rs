@@ -5054,6 +5054,33 @@ fn token_permission_inventory_contract(
     }
 }
 
+/// A standing authority's groups must all be bindable to something the
+/// authority actually pins. Account scope is always acceptable; zone scope only
+/// when the authority pins a zone. A group supporting neither would be
+/// unmintable under the authority, so reject it at draft time rather than
+/// leaving a dead group in an approved allowlist.
+fn validate_standing_authority_group_scopes(groups: &[Value], zone_id: Option<&str>) -> Result<()> {
+    let account_scope = "com.cloudflare.api.account";
+    if zone_id.is_none() {
+        return validate_permission_group_resource_scope(groups, account_scope);
+    }
+    let zone_scope = "com.cloudflare.api.account.zone";
+    for group in groups {
+        let id = group
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        if !permission_group_supports_scope(group, account_scope)
+            && !permission_group_supports_scope(group, zone_scope)
+        {
+            return Err(CliError::Input(format!(
+                "permission group `{id}` supports neither `{account_scope}` nor `{zone_scope}`, so no child of this authority could bind it"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_permission_group_resource_scope(groups: &[Value], required_scope: &str) -> Result<()> {
     for group in groups {
         let id = group
@@ -5951,6 +5978,18 @@ fn authorize_standing_execution_at(
             .filter_map(|group| group.get("id").and_then(Value::as_str))
             .map(str::to_owned)
             .collect();
+        // Each policy's `resources` object is keyed by the resource string the
+        // child token would bind. The authority bounds which of those are
+        // permitted, so collect every key rather than assuming one policy.
+        let requested_resources: Vec<String> = body
+            .get("policies")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|policy| policy.get("resources").and_then(Value::as_object))
+            .flat_map(serde_json::Map::keys)
+            .map(String::to_owned)
+            .collect();
         let child_expires_at = body
             .get("expires_on")
             .and_then(Value::as_str)
@@ -5968,6 +6007,7 @@ fn authorize_standing_execution_at(
             now,
             child_name,
             &requested_group_ids,
+            &requested_resources,
             child_expires_at,
         )?;
     } else if plan.capability.id.ends_with("delete-token") {
@@ -9059,7 +9099,15 @@ async fn key_policy_create(
         &arguments.permissions,
         inventory.result.get("result").unwrap_or(&Value::Null),
     )?;
-    validate_permission_group_resource_scope(&selected_groups, "com.cloudflare.api.account")?;
+    let zone_id = arguments
+        .zone
+        .as_deref()
+        .map(str::trim)
+        .filter(|zone| !zone.is_empty());
+    if let Some(zone_id) = zone_id {
+        validate_zone_id(zone_id)?;
+    }
+    validate_standing_authority_group_scopes(&selected_groups, zone_id)?;
     let selected_group_ids = selected_groups
         .iter()
         .filter_map(|group| group.get("id").and_then(Value::as_str))
@@ -9069,6 +9117,7 @@ async fn key_policy_create(
     let expires_at = Utc::now() + ChronoDuration::days(i64::from(arguments.expires_days));
     let authority = StandingAuthorityV1::draft(
         &arguments.account,
+        zone_id,
         vec![
             "account-api-tokens-create-token".to_owned(),
             "account-api-tokens-delete-token".to_owned(),
@@ -11941,10 +11990,11 @@ mod tests {
         validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
         validate_permission_group_resource_scope, validate_selected_permission_groups,
-        validate_standing_authority_permission_inventory, validate_token_policy_body,
-        validate_worker_script_secret_semantics, validate_zone_account_receipt_precondition,
-        validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
-        workspace_resource_keys, wrangler_config_directory, wrangler_deploy_version_id,
+        validate_standing_authority_group_scopes, validate_standing_authority_permission_inventory,
+        validate_token_policy_body, validate_worker_script_secret_semantics,
+        validate_zone_account_receipt_precondition, validate_zone_id,
+        validated_standing_lineage_token_id, verification_outcome, workspace_resource_keys,
+        wrangler_config_directory, wrangler_deploy_version_id,
         wrangler_status_has_promoted_version, zone_target,
     };
     use crate::profiles::ProfilesConfig;
@@ -12004,6 +12054,35 @@ mod tests {
             &promoted,
             "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         ));
+    }
+
+    #[test]
+    fn standing_authority_group_scopes_follow_the_zone_bound() {
+        let account_group = json!({"id": "g-account", "scopes": ["com.cloudflare.api.account"]});
+        let zone_group = json!({"id": "g-zone", "scopes": ["com.cloudflare.api.account.zone"]});
+        let unrelated = json!({"id": "g-user", "scopes": ["com.cloudflare.api.user"]});
+
+        // Without a zone bound the authority stays account-only, so a
+        // zone-only group would be unmintable and is refused at draft time.
+        validate_standing_authority_group_scopes(std::slice::from_ref(&account_group), None)
+            .expect("account groups are always acceptable");
+        assert!(
+            validate_standing_authority_group_scopes(std::slice::from_ref(&zone_group), None)
+                .is_err(),
+            "a zone-only group needs the authority to pin a zone"
+        );
+
+        // With a zone bound both scopes are bindable.
+        let zone = Some("4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b");
+        validate_standing_authority_group_scopes(
+            &[account_group.clone(), zone_group.clone()],
+            zone,
+        )
+        .expect("mixed account and zone groups are acceptable under a zone bound");
+        assert!(
+            validate_standing_authority_group_scopes(&[unrelated], zone).is_err(),
+            "a group supporting neither scope is refused"
+        );
     }
 
     #[test]
@@ -16184,6 +16263,7 @@ mod tests {
         .expect("approved groups normalize");
         let authority = StandingAuthorityV1::draft(
             "account-a",
+            None,
             vec!["account-api-tokens-create-token".to_owned()],
             vec!["group-a".to_owned(), "group-b".to_owned()],
             &hash_value(&serde_json::to_value(&approved_groups).expect("approved groups JSON"))
@@ -16708,6 +16788,7 @@ mod tests {
         let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
         let authority = StandingAuthorityV1::draft(
             "account-a",
+            None,
             vec!["account-api-tokens-create-token".to_owned()],
             vec!["group-a".to_owned()],
             "sha256:inventory-binding",
@@ -16785,6 +16866,7 @@ mod tests {
         let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
         let expired = StandingAuthorityV1::draft(
             "account-a",
+            None,
             vec!["account-api-tokens-create-token".to_owned()],
             vec!["group-a".to_owned()],
             "sha256:inventory-binding",
@@ -16810,6 +16892,7 @@ mod tests {
         let store = StateStore::open(paths.clone()).expect("state store");
         let authority = StandingAuthorityV1::draft(
             "account-a",
+            None,
             vec!["account-api-tokens-create-token".to_owned()],
             vec!["group-a".to_owned()],
             "sha256:inventory-binding",
@@ -16866,6 +16949,7 @@ mod tests {
     fn active_standing_authority(max_runs_per_day: u32) -> StandingAuthorityV1 {
         let mut authority = StandingAuthorityV1::draft(
             "account-a",
+            None,
             vec![
                 "account-api-tokens-create-token".to_owned(),
                 "account-api-tokens-delete-token".to_owned(),
@@ -16922,6 +17006,7 @@ mod tests {
         let store = StateStore::open(paths.clone()).expect("state store");
         let mut authority = StandingAuthorityV1::draft(
             "account-a",
+            None,
             vec!["account-api-tokens-create-token".to_owned()],
             vec!["group-a".to_owned()],
             "sha256:inventory-binding",
@@ -17095,6 +17180,7 @@ mod tests {
     fn standing_lineage_uses_only_validated_success_receipts_and_survives_revocation() {
         let mut authority = StandingAuthorityV1::draft(
             "account-a",
+            None,
             vec!["account-api-tokens-create-token".to_owned()],
             vec!["group-a".to_owned()],
             "sha256:inventory-binding",

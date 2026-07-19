@@ -2166,6 +2166,7 @@ fn redaction_recurses_through_objects_and_arrays() {
 fn standing_authority_fixture() -> StandingAuthorityV1 {
     StandingAuthorityV1::draft(
         "account-a",
+        None,
         vec![
             "account-api-tokens-create-token".to_owned(),
             "account-api-tokens-delete-token".to_owned(),
@@ -2180,12 +2181,31 @@ fn standing_authority_fixture() -> StandingAuthorityV1 {
     .expect("authority fixture must be valid")
 }
 
+fn standing_authority_zone_fixture(zone_id: &str) -> StandingAuthorityV1 {
+    StandingAuthorityV1::draft(
+        "account-a",
+        Some(zone_id),
+        vec![
+            "account-api-tokens-create-token".to_owned(),
+            "account-api-tokens-delete-token".to_owned(),
+        ],
+        vec!["group-a".to_owned(), "group-b".to_owned()],
+        "sha256:inventory-binding",
+        24,
+        "cf-rotation-",
+        4,
+        Utc::now() + Duration::days(30),
+    )
+    .expect("zone-bounded authority fixture must be valid")
+}
+
 fn standing_authority_with_permission_inventory(
     permission_inventory: &Value,
     max_runs_per_day: u32,
 ) -> StandingAuthorityV1 {
     StandingAuthorityV1::draft(
         "account-a",
+        None,
         vec![
             "account-api-tokens-create-token".to_owned(),
             "account-api-tokens-delete-token".to_owned(),
@@ -2440,20 +2460,161 @@ fn standing_authority_reports_expiry_without_changing_schema_v1_status() {
 }
 
 #[test]
+fn standing_authority_bounds_child_tokens_to_its_pinned_resources() {
+    let now = Utc::now();
+    let expiry = Some(now + Duration::hours(12));
+    let group = vec!["group-a".to_owned()];
+    let account_resource = "com.cloudflare.api.account.account-a".to_owned();
+    let zone_resource =
+        "com.cloudflare.api.account.zone.4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b".to_owned();
+
+    // Account-only authority: the zone resource is out of bounds.
+    let mut account_only = standing_authority_fixture();
+    account_only.approve(true).expect("grant");
+    assert_eq!(
+        account_only.allowed_token_resources(),
+        vec![account_resource.clone()]
+    );
+    account_only
+        .authorize_token_create(
+            now,
+            "cf-rotation-x",
+            &group,
+            std::slice::from_ref(&account_resource),
+            expiry,
+        )
+        .expect("the pinned account resource is in bounds");
+    assert!(
+        account_only
+            .authorize_token_create(
+                now,
+                "cf-rotation-x",
+                &group,
+                std::slice::from_ref(&zone_resource),
+                expiry
+            )
+            .is_err(),
+        "an account-scoped authority must not mint a zone-bound child"
+    );
+
+    // Zone-bounded authority: both its account and its one zone are in bounds,
+    // but a different zone is not.
+    let mut zone_bound = standing_authority_zone_fixture("4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b");
+    zone_bound.approve(true).expect("grant");
+    zone_bound
+        .authorize_token_create(
+            now,
+            "cf-rotation-x",
+            &group,
+            std::slice::from_ref(&zone_resource),
+            expiry,
+        )
+        .expect("the pinned zone resource is in bounds");
+    zone_bound
+        .authorize_token_create(
+            now,
+            "cf-rotation-x",
+            &group,
+            std::slice::from_ref(&account_resource),
+            expiry,
+        )
+        .expect("the pinned account resource stays in bounds");
+    assert!(
+        zone_bound
+            .authorize_token_create(
+                now,
+                "cf-rotation-x",
+                &group,
+                &["com.cloudflare.api.account.zone.ffffffffffffffffffffffffffffffff".to_owned()],
+                expiry
+            )
+            .is_err(),
+        "a zone other than the pinned one is refused"
+    );
+    assert!(
+        zone_bound
+            .authorize_token_create(
+                now,
+                "cf-rotation-x",
+                &group,
+                &["com.cloudflare.api.account.other-account".to_owned()],
+                expiry
+            )
+            .is_err(),
+        "another account's resource is refused"
+    );
+    assert!(
+        zone_bound
+            .authorize_token_create(now, "cf-rotation-x", &group, &[], expiry)
+            .is_err(),
+        "a child binding no resource at all is refused"
+    );
+    assert!(
+        zone_bound
+            .authorize_token_create(
+                now,
+                "cf-rotation-x",
+                &group,
+                &[
+                    zone_resource,
+                    "com.cloudflare.api.account.other-account".to_owned()
+                ],
+                expiry
+            )
+            .is_err(),
+        "one out-of-bounds resource poisons an otherwise valid set"
+    );
+}
+
+#[test]
+fn zone_binding_is_additive_to_the_approved_authority_hash() {
+    // An account-scoped authority must hash exactly as it did before zone
+    // support existed, or every previously approved authority breaks.
+    let account_only = standing_authority_fixture();
+    let serialized = serde_json::to_value(&account_only).expect("serialize");
+    assert!(
+        serialized.get("zone_id").is_none(),
+        "an account-scoped authority must not serialize a zone_id at all"
+    );
+
+    let zone_bound = standing_authority_zone_fixture("4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b");
+    assert_ne!(
+        account_only.content_hash, zone_bound.content_hash,
+        "a zone bound must be part of the reviewed, hash-bound grant content"
+    );
+
+    // A stored authority written before zone support deserializes as
+    // account-scoped rather than failing.
+    let mut legacy = serialized.clone();
+    legacy.as_object_mut().expect("object").remove("zone_id");
+    let restored: StandingAuthorityV1 =
+        serde_json::from_value(legacy).expect("legacy authority still loads");
+    assert_eq!(restored.zone_id, None);
+    assert_eq!(restored.content_hash, account_only.content_hash);
+}
+
+#[test]
 fn standing_mints_fail_closed_on_prefix_groups_expiry_ttl_and_rate() {
     let mut authority = standing_authority_fixture();
     authority.approve(true).expect("grant");
     let now = Utc::now();
     let in_bounds_expiry = Some(now + Duration::hours(12));
     let group = vec!["group-a".to_owned()];
+    let resource = vec!["com.cloudflare.api.account.account-a".to_owned()];
 
     authority
-        .authorize_token_create(now, "cf-rotation-web-deploy", &group, in_bounds_expiry)
+        .authorize_token_create(
+            now,
+            "cf-rotation-web-deploy",
+            &group,
+            &resource,
+            in_bounds_expiry,
+        )
         .expect("in-bounds mint authorized");
 
     assert!(
         authority
-            .authorize_token_create(now, "unprefixed-name", &group, in_bounds_expiry)
+            .authorize_token_create(now, "unprefixed-name", &group, &resource, in_bounds_expiry)
             .is_err(),
         "name prefix is mandatory"
     );
@@ -2463,6 +2624,7 @@ fn standing_mints_fail_closed_on_prefix_groups_expiry_ttl_and_rate() {
                 now,
                 "cf-rotation-x",
                 &["group-outside".to_owned()],
+                &resource,
                 in_bounds_expiry
             )
             .is_err(),
@@ -2470,13 +2632,13 @@ fn standing_mints_fail_closed_on_prefix_groups_expiry_ttl_and_rate() {
     );
     assert!(
         authority
-            .authorize_token_create(now, "cf-rotation-x", &[], in_bounds_expiry)
+            .authorize_token_create(now, "cf-rotation-x", &[], &resource, in_bounds_expiry)
             .is_err(),
         "a child with no permission groups is refused"
     );
     assert!(
         authority
-            .authorize_token_create(now, "cf-rotation-x", &group, None)
+            .authorize_token_create(now, "cf-rotation-x", &group, &resource, None)
             .is_err(),
         "children must declare an expiry"
     );
@@ -2486,6 +2648,7 @@ fn standing_mints_fail_closed_on_prefix_groups_expiry_ttl_and_rate() {
                 now,
                 "cf-rotation-x",
                 &group,
+                &resource,
                 Some(now + Duration::hours(48))
             )
             .is_err(),
@@ -2499,7 +2662,7 @@ fn standing_mints_fail_closed_on_prefix_groups_expiry_ttl_and_rate() {
     }
     assert!(
         authority
-            .authorize_token_create(now, "cf-rotation-x", &group, in_bounds_expiry)
+            .authorize_token_create(now, "cf-rotation-x", &group, &resource, in_bounds_expiry)
             .is_err(),
         "the daily run budget limits attempts"
     );

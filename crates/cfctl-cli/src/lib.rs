@@ -180,6 +180,12 @@ pub struct KeyPolicyCreateArgs {
     pub account: String,
     #[arg(
         long,
+        value_name = "ZONE_ID",
+        help = "Also allow children bound to this one zone (com.cloudflare.api.account.zone.<ZONE_ID>); requires --account. Without it the authority is account-scoped only."
+    )]
+    pub zone: Option<String>,
+    #[arg(
+        long,
         help = "Name prefix every child token minted under this authority must carry"
     )]
     pub name_prefix: String,
