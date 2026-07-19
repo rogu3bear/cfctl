@@ -9358,6 +9358,12 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
                     .to_owned()
         }));
     }
+    // Resolve the requested scope before any network I/O. This is pure
+    // argument validation, and running it after the inventory read reported a
+    // contradiction like `--user --zone` as an inventory failure — naming the
+    // wrong problem, after spending a live call to find it. The same resolution
+    // runs again inside the binding partition below; it is idempotent.
+    resolve_mint_token_scope(arguments, account)?;
     let inventory = key_permissions(
         store,
         &KeyPermissionArgs {
@@ -12018,7 +12024,7 @@ mod tests {
         required_oauth_client_secret_state_precondition, required_r2_parent_token_precondition,
         required_warp_connector_configuration_state_precondition,
         required_web_analytics_rum_state_precondition, required_zone_account_precondition,
-        resolve_mint_token_bindings, secret_sink_format,
+        resolve_mint_token_bindings, resolve_mint_token_scope, secret_sink_format,
         should_bind_cloudflare_tunnel_configuration_state, should_bind_d1_read_replication_state,
         should_bind_dns_record_state, should_bind_global_warp_override_state,
         should_bind_oauth_client_secret_state, should_bind_warp_connector_configuration_state,
@@ -12092,6 +12098,53 @@ mod tests {
             &promoted,
             "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         ));
+    }
+
+    #[test]
+    fn mint_scope_contradictions_resolve_before_any_network_read() {
+        // key_mint resolves the requested scope before the live inventory
+        // call. When this ran after the read instead, `--user --zone` came
+        // back as an inventory failure — the wrong problem, reported only
+        // after spending a live call to reach it.
+        let zone = "4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b";
+        let arguments = |user: bool, zone: Option<&str>| KeyMutationArgs {
+            profile: None,
+            user,
+            name: "proof".to_owned(),
+            permissions: vec!["group-a".to_owned()],
+            account: Some("account-a".to_owned()),
+            zone: zone.map(str::to_owned),
+            ttl_hours: Some(1),
+            value_out: None,
+            under_policy: None,
+        };
+
+        let (scope, resource) =
+            resolve_mint_token_scope(&arguments(false, Some(zone)), "account-a")
+                .expect("account-owned zone minting resolves");
+        assert_eq!(scope, "com.cloudflare.api.account.zone");
+        assert_eq!(resource, format!("com.cloudflare.api.account.zone.{zone}"));
+
+        let denied = resolve_mint_token_scope(&arguments(true, Some(zone)), "account-a")
+            .expect_err("zone minting is account-owned");
+        assert!(
+            denied.to_string().contains("omit --user"),
+            "the error must name the contradiction, not an inventory failure: {denied}"
+        );
+
+        let malformed =
+            resolve_mint_token_scope(&arguments(false, Some("NOT-A-ZONE")), "account-a")
+                .expect_err("zone ids are validated before use");
+        assert!(
+            malformed.to_string().contains("32-character"),
+            "{malformed}"
+        );
+
+        // No zone: the account resource, and --user stays legal.
+        let (scope, resource) =
+            resolve_mint_token_scope(&arguments(true, None), "account-a").expect("user-owned mint");
+        assert_eq!(scope, "com.cloudflare.api.account");
+        assert_eq!(resource, "com.cloudflare.api.account.account-a");
     }
 
     #[test]
