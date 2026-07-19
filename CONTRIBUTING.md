@@ -110,5 +110,35 @@ secret-scan exceptions require explicit review; do not broaden `deny.toml` or
 - Public parsing and orchestration: `crates/cfctl-cli`
 - Verification and release assembly: `xtask`
 
+## Release lanes
+
+Three separate lanes, deliberately split so identity-bearing steps are never a
+side effect of building:
+
+- `cargo xtask assemble` builds Apple arm64/x86_64 and Linux musl arm64/x86_64
+  **twice** and compares hashes, creates SPDX SBOMs and provenance, and renders
+  the Homebrew formula and the checksum-verifying Linux installer. It stops
+  before any Apple or Sigstore activity.
+- `cargo xtask release` repeats that proof, then signs and notarizes both macOS
+  binaries against explicit operator-supplied identities and signs checksums
+  and provenance.
+- `cargo xtask publish` rechecks every identity and uploads the complete
+  four-platform set, one asset at a time, to an empty draft release.
+
+Making a draft public is always a separate operator action.
+
+The signing lane is available tooling, not the current posture: **published
+releases are unsigned by operator decision**, with integrity from `SHA256SUMS`,
+reproducible double-builds, SPDX SBOMs, and commit-bound provenance. Because
+the rendered Linux installer verifies a Cosign identity and has no
+checksum-only fallback, it is deliberately not shipped with unsigned releases.
+GitHub-hosted Rust builds are intentionally absent.
+
+An account-backed disposable token smoke test
+(`tests/account-backed-smoke.sh`) is kept out of the local proof lane because
+it mutates a real account. It requires an explicit disposable account,
+profile, reviewed permission group, and acknowledgement gate before it mints,
+rotates, revokes, and verifies one short-lived token.
+
 See [SECURITY.md](SECURITY.md) for private vulnerability reporting and
 [docs/v2-security.md](docs/v2-security.md) for the runtime security contract.
