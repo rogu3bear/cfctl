@@ -21,8 +21,8 @@ against the release's `SHA256SUMS` (each binary is also reproducible from the
 tagged source and carries an SPDX SBOM).
 
 ```bash
-curl -fsSLO https://github.com/rogu3bear/cfctl/releases/download/v1.1.2/cfctl-aarch64-apple-darwin
-curl -fsSLO https://github.com/rogu3bear/cfctl/releases/download/v1.1.2/SHA256SUMS
+curl -fsSLO https://github.com/rogu3bear/cfctl/releases/download/v1.2.0/cfctl-aarch64-apple-darwin
+curl -fsSLO https://github.com/rogu3bear/cfctl/releases/download/v1.2.0/SHA256SUMS
 shasum -a 256 --check --ignore-missing SHA256SUMS
 install -m 0755 cfctl-aarch64-apple-darwin ~/.local/bin/cfctl
 ```
