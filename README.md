@@ -1,25 +1,45 @@
 # cfctl v2
 
-`cfctl` is a universal, governed Cloudflare control plane for macOS and Linux.
-It is an open-source Rust CLI with no MCP dependency, accepts natural-language
-intent through a configured local agent, and exposes deterministic commands
-with stable JSON for automation.
+`cfctl` is a governed Cloudflare control plane for macOS and Linux: an
+open-source Rust CLI that makes every change to your Cloudflare account
+reviewable before it happens, and provable after.
+
+Cloudflare's API will let anything holding a token delete a zone, purge a
+cache, or rotate a secret in one unreviewed call — and an agent driving that
+API is one bad inference away from doing it. cfctl puts a hash-bound plan
+between intent and mutation: reads run freely, writes become a reviewed plan
+you approve by exact operation ID, and the result is verified against live
+Cloudflare state rather than assumed from a 200 response.
+
+It has no MCP dependency, accepts natural-language intent through a local
+agent, and every command emits stable JSON for automation.
+
+- [Quickstart](QUICKSTART.md) — install, first commands, first governed write
+- [Operator runbook](docs/runbooks/cfctl.md) — the full command lifecycle
+- [Runtime policy](docs/runtime-policy.md) — what needs approval, and why
+- [Security contract](docs/v2-security.md) — secrets, hashing, invariants
+- [Architecture](docs/v2-architecture.md) — crates, boundaries, trust sequence
+- [Agent landing](docs/agent-landing.md) — first-load doctrine for agents
+- [Contributing](CONTRIBUTING.md) — dev setup, proof lane, release lanes
+
+## Install
 
 ```bash
 ./bootstrap.sh
 cfctl version --json
 cfctl doctor --json
-cfctl agents doctor --json
-cfctl catalog sync
-cfctl resolve "rotate a Worker secret"
-cfctl catalog search "Worker secret"
-cfctl guide worker-put-script-secret
-cfctl "rotate the production Worker secret"
 ```
 
-Every mutation follows one governed loop — deterministic resolution, a
-reviewed hash-bound plan, explicit or policy authority, one Cloudflare
-boundary, then operation-specific verification:
+`bootstrap.sh` requires a tracked-clean checkout and proves the installed
+binary is the exact `HEAD` commit. Both doctors must report the PATH entry
+resolving to the running executable; a different or missing PATH binary and
+drifted agent instructions are unhealthy states, not warnings.
+
+## The governed loop
+
+Every mutation follows one path — deterministic resolution, a reviewed
+hash-bound plan, explicit or policy authority, one Cloudflare boundary, then
+operation-specific verification:
 
 ```mermaid
 flowchart TD
@@ -86,26 +106,6 @@ cfctl plans rectify <operation-id> --json
 ```
 <!-- END CFCTL GENERATED: system-guide -->
 
-## What it covers
-
-Catalog refresh ingests Cloudflare's official OpenAPI schema, OAuth permission
-inventory when authenticated, official docs/changelog feeds, installed
-Wrangler help, and installed cloudflared help. Every operation is discoverable
-and classified as `native`, `dynamic_api`, `delegated_cli`, `governed_ui`, or
-`blocked` with an exact reason. "Universal" means honest discovery and
-classification: entitlement, missing permission, unavailable adapters, unknown
-cost, and unsupported verification remain visible blockers.
-
-`catalog coverage` reports entitlement, pricing-reference, verification, and
-rollback coverage separately, plus stable, searchable mutation-gap classes
-such as `risk_unknown`, `cost_unbounded`, and `verification_missing`. Official
-product pricing references identify usage, subscription, pass-through, or
-contract exposure without pretending a variable downstream bill is a hard
-execution ceiling. Verification and rollback strategy names are executable
-contracts, not prose: only strategies implemented by the runtime for the
-capability's exact method, identity, and resource shape count as complete, and
-the Cloudflare adapter repeats the verifier check before sending a mutation.
-
 ## Public commands
 
 ```text
@@ -128,97 +128,73 @@ cfctl update
 cfctl migrate v1
 ```
 
-Every command has concise human output and stable `--json` output. The public
-contracts are `BuildInfoV1`, `CapabilityV1`, `CapabilityGuideV1`,
+Every command has concise human output and stable `--json` output, shaped by
+the public contracts `BuildInfoV1`, `CapabilityV1`, `CapabilityGuideV1`,
 `GuideTopicDocumentV1`, `PlanV1`, `PolicyDecisionV1`, `AgentActionV1`,
 `EvidenceV1`, and `ResultEnvelopeV2`.
 
-## Authentication
+## Authenticate
 
-Day-to-day auth is a scoped API token, imported only through stdin (never
-argv). The token lives in the platform keyring — Keychain on macOS, Secret
-Service on Linux — and automatically falls back to a mode-0600 file store under
-the cfctl data dir when the keyring is unavailable; `cfctl doctor` reports which
-backend is active. The account pin is required:
+Day-to-day auth is a scoped API token, imported only through stdin — never
+argv — and pinned to one account:
 
 ```bash
 printf '%s' "$CLOUDFLARE_API_TOKEN" | \
   cfctl auth import-api-token --account <account-id> --stdin
 ```
 
-If you drive cfctl through a wrapper that routes stdin through `cargo` (the
-in-repo `./cfctl` shim does), pass a new mode-0600 file with `--value-in`
-instead so the secret never touches stdin.
+The token lives in the platform keyring (Keychain on macOS, Secret Service on
+Linux) and falls back to a mode-0600 file store when the keyring is
+unavailable; `cfctl doctor` reports which backend is active.
 
-OAuth Authorization Code with PKCE remains available when you have a
-Cloudflare OAuth client (`--client-id` / `CFCTL_OAUTH_CLIENT_ID`); public
-cfctl OAuth is not the default until cfctl.io ownership and permanent
-promotion complete, and public clients never embed a client secret. An
-emergency global key can be imported with `cfctl auth import-global-key`
-(stdin or `--value-in`); it is never selected silently. `CFCTL_FORCE_IPV4=1`
-pins outbound Cloudflare API calls to an IPv4 source so an IP-allowlisted
-token keeps working when the host default-routes over IPv6; it is off by
-default.
+Two things that commonly bite:
 
-## Read and change
+- If a wrapper routes stdin through `cargo`, pass a new mode-0600 file with
+  `--value-in` instead, so the secret never touches stdin.
+- `CFCTL_FORCE_IPV4=1` pins outbound calls to an IPv4 source, which an
+  IP-allowlisted token needs when the host default-routes over IPv6.
+
+OAuth with PKCE is available when you have a Cloudflare OAuth client
+(`--client-id` / `CFCTL_OAUTH_CLIENT_ID`). An emergency global key can be
+imported with `cfctl auth import-global-key`, and is never selected silently.
+
+## Read, then change
+
+Reads run immediately and leave redacted evidence:
 
 ```bash
 cfctl call zones-get --query name=example.com --json
+```
+
+A mutating `call` writes nothing. It produces a hash-bound plan you review by
+exact operation ID:
+
+```bash
 cfctl guide dns-records-for-a-zone-create-dns-record
 cfctl call dns-records-for-a-zone-create-dns-record \
   --selector zone_id=<zone-id> \
   --body-json '{"type":"TXT","name":"_example","content":"hello"}'
-```
 
-`guide --json` returns the exact 15-stage lifecycle with contract states,
-evidence classes, blockers, safe next actions, and argv arrays; a blocked
-capability never receives a runnable `call_argv`. Token creation is exposed
-through the inventory-bound `keys mint` workflow, never a direct create call.
-
-A mutating `call` creates a hash-bound transaction plan. It does not write
-immediately. Review the plan and exact operation ID:
-
-```bash
 cfctl plans show <operation-id> --json
 cfctl plans approve <operation-id> --yes --json
 cfctl plans run <operation-id> --json
-cfctl plans status <operation-id> --json
 ```
 
-Known, scoped, reversible, isolated operations may be policy-authorized to run
-without a separate approval. Deletes, purges, identity/security/ownership
-changes, external sends, registrar/billing actions, irreversible data changes,
-unknown semantics, cross-repository impact, and paid actions require approval.
-Paid plans also require `--max-cost CURRENCY:AMOUNT`; unknown or unbounded
-downstream cost is blocked even when an official pricing page is available.
-The full classification contract is [docs/runtime-policy.md](docs/runtime-policy.md).
+Plans expire within 24 hours and any relevant drift invalidates approval. A
+hash-chained transaction journal persists every checkpoint from reviewed plan
+through close, so a plan consumed before a crash is never replayed — inspect
+`plans status` and reconcile with `plans rectify`. If you approved something
+you no longer want, `plans cancel <operation-id>` retires it immediately
+rather than leaving latent authority to expire.
 
-Plans bind the derived executable-catalog hash, account, permission lane,
-exact request, workspace graph, source configuration, impact, costs,
-verification, compensation, and warnings. They expire within 24 hours, and
-drift invalidates approval. A hash-chained transaction journal persists every
-checkpoint from reviewed plan through close; changing a status, returned
-resource ID, or evidence hash invalidates the journal, and a plan durably
-consumed before a crash cannot be replayed — inspect `plans status` and
-reconcile with `plans rectify` instead of retrying.
+A narrow safe class of known, scoped, reversible operations runs without
+separate approval. Deletes, purges, identity and ownership changes, external
+sends, billing actions, irreversible changes, and anything paid always require
+it — see [runtime policy](docs/runtime-policy.md) for the exact contract, and
+[the security contract](docs/v2-security.md) for per-capability invariants.
 
-Executable mutations carry operation-specific safety contracts on top of that
-loop: fresh live zone-ownership and plan-entitlement reads that are hash-bound
-and repeated before durable consumption, owner-specific permission-inventory
-binding for `keys mint`, exact-readback verification for DNS and settings
-writes, explicitly allowlisted Access service-token and Turnstile lifecycles,
-two-phase OAuth client-secret rotation, and compensation that is always a
-separate reviewed plan — never automatic. Generated write capabilities stay
-blocked until risk, cost, entitlement, permissions, verification, and rollback
-or irreversibility are known, so catalog coverage is broader than executable
-write coverage by design. The complete per-capability invariants are
-[docs/v2-security.md](docs/v2-security.md).
-
-## Secrets
-
-Secret inputs enter through stdin and become opaque platform-key-store
-references. Secret-producing calls require a new file sink, created mode 0600
-on Unix:
+Secret outputs never reach stdout, plans, logs, or evidence. They require a
+new file sink, created mode 0600:
 
 ```bash
 cfctl call cloudflare-tunnel-get-a-cloudflare-tunnel-token \
@@ -227,115 +203,83 @@ cfctl call cloudflare-tunnel-get-a-cloudflare-tunnel-token \
   --value-out /tmp/tunnel-token
 ```
 
-Raw values never enter stdout, plans, logs, delegated subprocess receipts, or
-evidence.
+Token creation is exposed only through the inventory-bound `keys mint`
+workflow, never a direct create call.
+
+## What cfctl refuses to do
+
+Expect to meet the wall early, and read it as the design working. cfctl
+catalogs every Cloudflare operation but executes a mutation only when its
+contract is fully known — risk, effect, cost, permission, entitlement,
+verification, and rollback or explicit irreversibility. At the July 2026
+snapshot roughly 84% of mutating operations were blocked on incomplete
+upstream metadata, and cfctl will not fabricate a permission or a price to
+close that gap: a guessed one is worse than an honest block.
+
+```bash
+cfctl catalog coverage --json          # what is executable, and what is not
+cfctl catalog show <capability-id>     # exactly which fields are missing
+```
+
+Blocked capabilities stay discoverable and explain themselves. Most of the
+root cause is upstream and filed in
+[upstream schema gaps](docs/upstream-schema-gaps.md).
 
 ## Workspaces and agents
 
-Registered roots bound all discovery:
+Registered roots bound all discovery — cfctl never scans outside them:
 
 ```bash
 cfctl workspace add /absolute/repository/root --account <account-id>
 cfctl workspace discover --json
-cfctl workspace graph --json
 cfctl workspace audit --json
 ```
 
-Discovery inventories Git repositories even when they contain no Cloudflare
-configuration. Supported files are Wrangler TOML/JSON/JSONC, Terraform
-HCL/JSON, and Pulumi YAML, each linked to catalog targets with
-current-content, `HEAD`-content, and exact worktree-diff hashes so dirty or
-unmanaged dependencies remain visible in a plan. Nested directories named
-`fixtures`, `__fixtures__`, `testdata`, `test-data`, or `test_data` are
-excluded from broader scans; register a fixture directory itself when its
-contents are intentional workspace evidence.
-
-Install managed instructions for detected local agents:
+Discovery inventories Git repositories even when they carry no Cloudflare
+configuration, and links Wrangler TOML/JSON/JSONC, Terraform HCL/JSON, and
+Pulumi YAML to catalog targets with current-content, `HEAD`-content, and exact
+worktree-diff hashes, so dirty or unmanaged dependencies stay visible in a
+plan.
 
 ```bash
 cfctl agents install --all-detected
 cfctl agents doctor
 ```
 
-`version --json` exposes the invoked binary's build identity. `doctor` and
-`agents doctor` trust the PATH build only when it resolves to that same
-executable; a missing or different PATH executable and drifted managed
-instructions are unhealthy.
+Natural language launches one configured agent (`CFCTL_AGENT`; default
+`codex`, also `claude`, `cursor`, `gemini`). The agent turns intent into a
+deterministic `cfctl resolve` match and governed commands — model output never
+grants authority or mutates Cloudflare directly. Quote natural language: a
+bare unknown token fails closed with a did-you-mean, so a typo is never an
+agent launch. Browser and Computer Use are available only for cataloged
+`governed_ui` capabilities, under the same account binding, redaction,
+approval, and evidence rules.
 
-Natural language launches the configured agent once; `CFCTL_AGENT` selects the
-delegated agent binary (default `codex`; also `claude`, `cursor`, or
-`gemini`). The agent translates intent into a deterministic `cfctl resolve`
-match — `cfctl catalog search` is the browse fallback — and governed commands;
-model output never grants authority or directly mutates Cloudflare. Quote
-natural language: a bare single token that is not a known command fails closed
-with a usage error and a did-you-mean, so a typo is never an agent launch.
-Browser or Computer Use is available only for cataloged `governed_ui`
-capabilities after API/CLI coverage cannot finish the task, under the same
-account binding, redaction, approval, and evidence rules.
-
-## Evidence and migration
+## Evidence and state
 
 Meaningful operations leave redacted, content-addressed local evidence, with
-evidence class distinguishing source config, live reads, plans, applies,
+the evidence class distinguishing source config, live reads, plans, applies,
 post-change verification, agent actions, and local proof. Artifact presence is
 not verification.
 
 `cfctl migrate v1` copies safe desired state and non-secret evidence into
-content-addressed imports; it skips secret-shaped paths/content and never
-imports credentials implicitly. This checkout's retained v1 data is
-quarantined under [`compat/v1/`](compat/v1/README.md); the live v2 catalog is
-managed under `CFCTL_HOME`, not loaded from that retained tree.
+content-addressed imports, skipping secret-shaped paths and never importing
+credentials implicitly. Retained v1 data is quarantined under
+[`compat/v1/`](compat/v1/README.md) as inert migration evidence; the live
+catalog is managed under `CFCTL_HOME`.
 
-## Development and release
+## Development
 
-Rust 1.93 is pinned. The local proof lane is:
+Rust 1.93 is pinned. The local proof lane is `cargo xtask verify`, which also
+needs `cargo-deny` and Gitleaks. Remote CI is intentionally absent. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for setup, the pre-push gate, and the
+assembly, signing, and publishing lanes.
 
-```bash
-cargo xtask verify
-```
-
-The proof host also needs `cargo-deny` and Gitleaks; the lane rejects yanked
-dependencies, unreviewed licenses or sources, unversioned dependency edges,
-and secret findings across the complete Git history.
-
-The assembly lane (`cargo xtask assemble`) builds Apple arm64/x86_64 and Linux
-musl arm64/x86_64 twice, compares hashes, creates SPDX SBOMs and provenance,
-and renders the Homebrew formula and checksum-verifying Linux installer; it
-deliberately stops before identity-bearing Apple or Sigstore activity. The
-signing lane (`cargo xtask release`) repeats that proof, signs and notarizes
-both macOS binaries against explicit operator-supplied identities, and signs
-checksums and provenance; `cargo xtask publish` rechecks every identity and
-uploads the complete four-platform set, one asset at a time, to an empty draft
-release. Making the draft public remains a separate operator action.
-
-The signed lane above is available tooling, not the current publishing
-posture: published releases are unsigned by operator decision, with integrity
-provided by `SHA256SUMS`, reproducible double-builds, SPDX SBOMs, and
-commit-bound provenance. Because the rendered Linux installer verifies a
-Cosign identity and has no checksum-only fallback, it is deliberately not
-shipped with unsigned releases — install by direct download plus checksum
-verification, the release's Homebrew formula, or source build.
-GitHub-hosted Rust builds are intentionally absent.
-
-An account-backed disposable token smoke test (`tests/account-backed-smoke.sh`)
-is intentionally separate from the local proof lane because it mutates a real
-account; it requires an explicit disposable account, profile, reviewed
-permission group, and acknowledgement gate before it mints, rotates, revokes,
-and verifies one short-lived token.
-
-## External activation boundary
+Published releases are unsigned by operator decision, with integrity from
+`SHA256SUMS`, reproducible double-builds, SPDX SBOMs, and commit-bound
+provenance. Install by direct download plus checksum verification, the
+release's Homebrew formula, or a source build.
 
 `cfctl.io` registration, site publication, publisher-domain verification,
-permanent Cloudflare OAuth promotion, and public release publication require
-explicit operator action. The project/privacy/terms/logo/callback site is ready
-under `site/`; these external steps are not silently performed or claimed.
-
-- [Quickstart](QUICKSTART.md) — install, first commands, first governed write
-- [Architecture](docs/v2-architecture.md) — crates, boundaries, trust sequence
-- [Runtime policy](docs/runtime-policy.md) — plan classification and approval
-- [Security contract](docs/v2-security.md) — secrets, hashing, invariants
-- [Agent landing](docs/agent-landing.md) — first-load agent doctrine
-- [v1 parity and shell-removal audit](docs/v1-parity.md)
-- [Rust clean-break ADR](docs/architecture/adr/0001-rust-clean-break.md)
-- [Risk-based approval ADR](docs/architecture/adr/0002-risk-based-approval.md)
-- [Executable guidance projection ADR](docs/architecture/adr/0003-executable-guidance-projection.md)
+permanent Cloudflare OAuth promotion, and release publication all require
+explicit operator action and are never silently performed or claimed.
