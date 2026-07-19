@@ -4953,24 +4953,12 @@ fn validate_api_token_creation_contract(
         .collect::<Result<Vec<_>>>()?;
     let normalized_groups =
         validate_selected_permission_groups(&selected_ids, &Value::Array(selected_groups.clone()))?;
-    // The mint records the intended least-privilege scope in the hash-bound
-    // permission inventory. Derive the required permission scope and the exact
-    // resource the policy must carry from it, falling back to whole-account
-    // scope for plans minted before zone scope existed (and any other token
-    // create). The resource must be exactly `{scope}.{id}` with a single id
-    // segment, so a plan cannot claim account scope for the permission check
-    // while binding a zone resource (or vice versa).
-    let permission_scope = inventory
-        .get("permission_scope")
-        .and_then(Value::as_str)
-        .unwrap_or("com.cloudflare.api.account");
-    let default_resource = format!("com.cloudflare.api.account.{account_id}");
-    let expected_resource = inventory
-        .get("token_resource")
-        .and_then(Value::as_str)
-        .unwrap_or(&default_resource);
-    validate_resource_is_single_concrete_id_under_scope(expected_resource, permission_scope)?;
-    validate_permission_group_resource_scope(&normalized_groups, permission_scope)?;
+    let policy_bindings = token_policy_bindings_from_inventory(
+        inventory,
+        &normalized_groups,
+        &selected_ids,
+        account_id,
+    )?;
     let expected_hash = inventory
         .get("selected_groups_hash")
         .and_then(Value::as_str)
@@ -5003,7 +4991,7 @@ fn validate_api_token_creation_contract(
                 .to_owned(),
         ));
     }
-    validate_token_policy_body(input.body.as_ref(), &selected_ids, expected_resource)
+    validate_token_policy_body_bindings(input.body.as_ref(), &policy_bindings)
 }
 
 #[derive(Clone, Copy)]
@@ -5086,23 +5074,205 @@ fn resolve_mint_token_scope(
     }
 }
 
-/// Builds the single least-privilege token-create policy body: exactly the
-/// selected permission groups scoped to exactly `token_resource`, with an
-/// optional expiry. The resulting body is what `validate_token_policy_body`
-/// re-checks against the hash-bound inventory before the mint runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TokenPolicyBinding {
+    permission_scope: String,
+    token_resource: String,
+    permission_group_ids: Vec<String>,
+}
+
+impl TokenPolicyBinding {
+    fn as_json(&self) -> Value {
+        json!({
+            "permission_scope": self.permission_scope,
+            "token_resource": self.token_resource,
+            "permission_group_ids": self.permission_group_ids,
+        })
+    }
+}
+
+fn permission_group_supports_scope(group: &Value, scope: &str) -> bool {
+    group
+        .get("scopes")
+        .and_then(Value::as_array)
+        .is_some_and(|scopes| {
+            scopes
+                .iter()
+                .any(|candidate| candidate.as_str() == Some(scope))
+        })
+}
+
+/// Partitions a token's selected permissions into the exact resource scopes
+/// Cloudflare accepts. With `--zone`, zone-capable permissions are bound to the
+/// named zone while account-only permissions remain bound to the account. A
+/// group supporting neither resource class fails closed.
+fn resolve_mint_token_bindings(
+    arguments: &KeyMutationArgs,
+    account: &str,
+    selected_groups: &[Value],
+) -> Result<Vec<TokenPolicyBinding>> {
+    let (preferred_scope, preferred_resource) = resolve_mint_token_scope(arguments, account)?;
+    let account_scope = "com.cloudflare.api.account";
+    let account_resource = format!("{account_scope}.{account}");
+    let mut account_ids = Vec::new();
+    let mut preferred_ids = Vec::new();
+
+    for group in selected_groups {
+        let id = group.get("id").and_then(Value::as_str).ok_or_else(|| {
+            CliError::Input("selected permission group is missing its ID".to_owned())
+        })?;
+        if preferred_scope != account_scope
+            && permission_group_supports_scope(group, preferred_scope)
+        {
+            preferred_ids.push(id.to_owned());
+        } else if permission_group_supports_scope(group, account_scope) {
+            account_ids.push(id.to_owned());
+        } else {
+            return Err(CliError::Input(format!(
+                "permission group `{id}` supports neither the account resource scope nor the requested `{preferred_scope}` scope"
+            )));
+        }
+    }
+
+    let mut bindings = Vec::new();
+    if !account_ids.is_empty() {
+        bindings.push(TokenPolicyBinding {
+            permission_scope: account_scope.to_owned(),
+            token_resource: account_resource,
+            permission_group_ids: account_ids,
+        });
+    }
+    if !preferred_ids.is_empty() {
+        bindings.push(TokenPolicyBinding {
+            permission_scope: preferred_scope.to_owned(),
+            token_resource: preferred_resource,
+            permission_group_ids: preferred_ids,
+        });
+    }
+    Ok(bindings)
+}
+
+fn token_policy_bindings_from_inventory(
+    inventory: &Value,
+    selected_groups: &[Value],
+    selected_ids: &[String],
+    account_id: &str,
+) -> Result<Vec<TokenPolicyBinding>> {
+    let Some(raw_bindings) = inventory.get("permission_bindings") else {
+        // Backward compatibility for plans minted before mixed-scope support.
+        let permission_scope = inventory
+            .get("permission_scope")
+            .and_then(Value::as_str)
+            .unwrap_or("com.cloudflare.api.account");
+        let default_resource = format!("com.cloudflare.api.account.{account_id}");
+        let token_resource = inventory
+            .get("token_resource")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_resource);
+        validate_token_binding_resource(permission_scope, token_resource, account_id)?;
+        validate_permission_group_resource_scope(selected_groups, permission_scope)?;
+        return Ok(vec![TokenPolicyBinding {
+            permission_scope: permission_scope.to_owned(),
+            token_resource: token_resource.to_owned(),
+            permission_group_ids: selected_ids.to_vec(),
+        }]);
+    };
+
+    let raw_bindings = raw_bindings
+        .as_array()
+        .filter(|bindings| !bindings.is_empty())
+        .ok_or_else(|| CliError::Input("token mint permission bindings are empty".to_owned()))?;
+    let groups_by_id = selected_groups
+        .iter()
+        .filter_map(|group| {
+            group
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|id| (id, group))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut bound_ids = Vec::new();
+    let mut resources = BTreeSet::new();
+    let mut bindings = Vec::new();
+    for raw in raw_bindings {
+        let permission_scope = raw
+            .get("permission_scope")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("token mint permission binding has no scope".to_owned())
+            })?;
+        let token_resource = raw
+            .get("token_resource")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("token mint permission binding has no resource".to_owned())
+            })?;
+        validate_token_binding_resource(permission_scope, token_resource, account_id)?;
+        if !resources.insert(token_resource.to_owned()) {
+            return Err(CliError::Input(
+                "token mint permission bindings repeat a resource".to_owned(),
+            ));
+        }
+        let permission_group_ids = raw
+            .get("permission_group_ids")
+            .and_then(Value::as_array)
+            .filter(|ids| !ids.is_empty())
+            .ok_or_else(|| {
+                CliError::Input("token mint permission binding has no permission groups".to_owned())
+            })?
+            .iter()
+            .map(|id| {
+                id.as_str().map(str::to_owned).ok_or_else(|| {
+                    CliError::Input(
+                        "token mint permission binding contains a non-string group ID".to_owned(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for id in &permission_group_ids {
+            let group = groups_by_id.get(id.as_str()).ok_or_else(|| {
+                CliError::Input(format!(
+                    "token mint permission binding references unselected group `{id}`"
+                ))
+            })?;
+            validate_permission_group_resource_scope(
+                std::slice::from_ref(group),
+                permission_scope,
+            )?;
+            bound_ids.push(id.clone());
+        }
+        bindings.push(TokenPolicyBinding {
+            permission_scope: permission_scope.to_owned(),
+            token_resource: token_resource.to_owned(),
+            permission_group_ids,
+        });
+    }
+    let original_len = bound_ids.len();
+    bound_ids.sort();
+    bound_ids.dedup();
+    if original_len != bound_ids.len() || bound_ids != selected_ids {
+        return Err(CliError::Input(
+            "token mint permission bindings do not partition the selected live inventory exactly once".to_owned(),
+        ));
+    }
+    Ok(bindings)
+}
+
+/// Builds one least-privilege token-create policy per exact resource binding,
+/// plus an optional expiry. The contract validator rechecks every policy
+/// against the hash-bound live permission inventory before the mint runs.
 fn build_mint_policy_body(
     name: &str,
-    selected_group_ids: &[String],
-    token_resource: &str,
+    bindings: &[TokenPolicyBinding],
     ttl_hours: Option<u32>,
 ) -> Value {
     let mut body = json!({
         "name": name,
-        "policies": [{
+        "policies": bindings.iter().map(|binding| json!({
             "effect": "allow",
-            "permission_groups": selected_group_ids.iter().map(|id| json!({"id": id})).collect::<Vec<_>>(),
-            "resources": {token_resource: "*"}
-        }]
+            "permission_groups": binding.permission_group_ids.iter().map(|id| json!({"id": id})).collect::<Vec<_>>(),
+            "resources": {binding.token_resource.clone(): "*"}
+        })).collect::<Vec<_>>()
     });
     if let Some(hours) = ttl_hours {
         // Cloudflare's token API requires seconds-precision UTC with a `Z`
@@ -5162,62 +5332,126 @@ fn validate_resource_is_single_concrete_id_under_scope(
     }
 }
 
+fn validate_token_binding_resource(
+    permission_scope: &str,
+    token_resource: &str,
+    account_id: &str,
+) -> Result<()> {
+    validate_resource_is_single_concrete_id_under_scope(token_resource, permission_scope)?;
+    match permission_scope {
+        "com.cloudflare.api.account" => {
+            let expected = format!("com.cloudflare.api.account.{account_id}");
+            if token_resource != expected {
+                return Err(CliError::Input(format!(
+                    "token mint account resource must be the selected account `{expected}`"
+                )));
+            }
+        }
+        "com.cloudflare.api.account.zone" => {
+            let zone_id = token_resource
+                .strip_prefix("com.cloudflare.api.account.zone.")
+                .expect("resource was validated under zone scope");
+            validate_zone_id(zone_id)?;
+        }
+        other => {
+            return Err(CliError::Input(format!(
+                "token mint permission binding uses unsupported resource scope `{other}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn validate_token_policy_body(
     body: Option<&Value>,
     selected_ids: &[String],
     expected_resource: &str,
 ) -> Result<()> {
+    validate_token_policy_body_bindings(
+        body,
+        &[TokenPolicyBinding {
+            permission_scope: String::new(),
+            token_resource: expected_resource.to_owned(),
+            permission_group_ids: selected_ids.to_vec(),
+        }],
+    )
+}
+
+fn validate_token_policy_body_bindings(
+    body: Option<&Value>,
+    bindings: &[TokenPolicyBinding],
+) -> Result<()> {
     let policies = body
         .and_then(|body| body.get("policies"))
         .and_then(Value::as_array)
-        .filter(|policies| policies.len() == 1)
+        .filter(|policies| policies.len() == bindings.len())
         .ok_or_else(|| {
             CliError::Input(
-                "token minting requires exactly one hash-bound least-privilege policy".to_owned(),
+                "token minting requires exactly one hash-bound least-privilege policy per resource binding".to_owned(),
             )
         })?;
-    let policy = &policies[0];
-    if policy.get("effect").and_then(Value::as_str) != Some("allow") {
-        return Err(CliError::Input(
-            "token minting requires one explicit allow policy".to_owned(),
-        ));
-    }
-    let mut body_ids = policy
-        .get("permission_groups")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            CliError::Input("token mint policy has no permission-group list".to_owned())
-        })?
+    let expected = bindings
         .iter()
-        .map(|group| {
-            group
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    CliError::Input(
-                        "token mint policy contains a permission group without an ID".to_owned(),
-                    )
-                })
+        .map(|binding| {
+            let mut ids = binding.permission_group_ids.clone();
+            ids.sort();
+            (binding.token_resource.clone(), ids)
         })
-        .collect::<Result<Vec<_>>>()?;
-    let original_len = body_ids.len();
-    body_ids.sort();
-    body_ids.dedup();
-    if original_len != body_ids.len() || body_ids != selected_ids {
-        return Err(CliError::Input(
-            "token mint policy permissions do not exactly match the bound live inventory selection"
-                .to_owned(),
-        ));
+        .collect::<BTreeMap<_, _>>();
+    let mut actual = BTreeMap::new();
+    for policy in policies {
+        if policy.get("effect").and_then(Value::as_str) != Some("allow") {
+            return Err(CliError::Input(
+                "token minting requires explicit allow policies".to_owned(),
+            ));
+        }
+        let mut body_ids = policy
+            .get("permission_groups")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                CliError::Input("token mint policy has no permission-group list".to_owned())
+            })?
+            .iter()
+            .map(|group| {
+                group
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        CliError::Input(
+                            "token mint policy contains a permission group without an ID"
+                                .to_owned(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let original_len = body_ids.len();
+        body_ids.sort();
+        body_ids.dedup();
+        if original_len != body_ids.len() {
+            return Err(CliError::Input(
+                "token mint policy repeats a permission group".to_owned(),
+            ));
+        }
+        let resources = policy
+            .get("resources")
+            .and_then(Value::as_object)
+            .filter(|resources| resources.len() == 1)
+            .ok_or_else(|| {
+                CliError::Input("token mint policy must bind exactly one resource".to_owned())
+            })?;
+        let (resource, value) = resources.iter().next().expect("single resource");
+        if value.as_str() != Some("*") || actual.insert(resource.clone(), body_ids).is_some() {
+            return Err(CliError::Input(
+                "token mint policy resource binding is invalid or repeated".to_owned(),
+            ));
+        }
     }
-    let resources = policy
-        .get("resources")
-        .and_then(Value::as_object)
-        .ok_or_else(|| CliError::Input("token mint policy has no resource scope".to_owned()))?;
-    if resources.len() != 1 || resources.get(expected_resource).and_then(Value::as_str) != Some("*")
-    {
+    if actual != expected {
+        let expected_resources = expected.keys().cloned().collect::<Vec<_>>().join(", ");
         return Err(CliError::Input(format!(
-            "token mint policy must be scoped only to `{expected_resource}`"
+            "token mint policies do not exactly match the hash-bound permission/resource partition for `{expected_resources}`"
         )));
     }
     Ok(())
@@ -9012,29 +9246,18 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
                 .to_owned(),
         ));
     }
-    let (permission_scope, token_resource) = resolve_mint_token_scope(arguments, account)?;
     let selected_groups = validate_selected_permission_groups(
         &arguments.permissions,
         inventory.result.get("result").unwrap_or(&Value::Null),
     )?;
-    validate_permission_group_resource_scope(&selected_groups, permission_scope)?;
-    let selected_group_ids = selected_groups
-        .iter()
-        .filter_map(|group| group.get("id").and_then(Value::as_str))
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let permission_bindings = resolve_mint_token_bindings(arguments, account, &selected_groups)?;
     let selected_groups_hash = hash_value(&serde_json::to_value(&selected_groups)?)?;
     let inventory_evidence_hashes = inventory
         .evidence
         .iter()
         .map(|evidence| evidence.content_hash.clone())
         .collect::<Vec<_>>();
-    let body = build_mint_policy_body(
-        &arguments.name,
-        &selected_group_ids,
-        &token_resource,
-        arguments.ttl_hours,
-    );
+    let body = build_mint_policy_body(&arguments.name, &permission_bindings, arguments.ttl_hours);
     let catalog = ensure_catalog(store).await?;
     let capability_id = if arguments.user {
         "user-api-tokens-create-token"
@@ -9069,8 +9292,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
                 "source_capability_id": inventory_contract.capability_id,
                 "selected_groups": selected_groups,
                 "selected_groups_hash": selected_groups_hash,
-                "token_resource": token_resource,
-                "permission_scope": permission_scope,
+                "permission_bindings": permission_bindings.iter().map(TokenPolicyBinding::as_json).collect::<Vec<_>>(),
                 "evidence_hashes": inventory_evidence_hashes,
             }
         }),
@@ -11642,8 +11864,8 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 mod tests {
     use super::{
         CallInput, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
-        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, admit_standing_plan,
-        apply_cloudflare_tunnel_configuration_state_response,
+        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, TokenPolicyBinding,
+        admit_standing_plan, apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
         apply_dns_record_state_response, apply_global_warp_override_state_response,
         apply_oauth_client_secret_state_response, apply_r2_parent_token_response,
@@ -11668,12 +11890,13 @@ mod tests {
         required_oauth_client_secret_state_precondition, required_r2_parent_token_precondition,
         required_warp_connector_configuration_state_precondition,
         required_web_analytics_rum_state_precondition, required_zone_account_precondition,
-        secret_sink_format, should_bind_cloudflare_tunnel_configuration_state,
-        should_bind_d1_read_replication_state, should_bind_dns_record_state,
-        should_bind_global_warp_override_state, should_bind_oauth_client_secret_state,
-        should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
-        should_bind_zone_account, should_redact_secret_response, should_resolve_zone_entitlement,
-        sink_secret_result, store_imported_api_token, validate_api_token_creation_contract,
+        resolve_mint_token_bindings, secret_sink_format,
+        should_bind_cloudflare_tunnel_configuration_state, should_bind_d1_read_replication_state,
+        should_bind_dns_record_state, should_bind_global_warp_override_state,
+        should_bind_oauth_client_secret_state, should_bind_warp_connector_configuration_state,
+        should_bind_web_analytics_rum_state, should_bind_zone_account,
+        should_redact_secret_response, should_resolve_zone_entitlement, sink_secret_result,
+        store_imported_api_token, validate_api_token_creation_contract,
         validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
         validate_permission_group_resource_scope, validate_selected_permission_groups,
@@ -11685,8 +11908,8 @@ mod tests {
     };
     use crate::profiles::ProfilesConfig;
     use crate::{
-        CallArgs, KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs,
-        PlanSelector,
+        CallArgs, KeyMutationArgs, KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicySelector,
+        PlanApproveArgs, PlanSelector,
     };
     use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
@@ -15656,12 +15879,13 @@ mod tests {
         // Cloudflare rejects the fractional-second `+00:00` form that
         // `to_rfc3339()` emits with a 400; it requires seconds-precision UTC
         // with a `Z` suffix (e.g. 2005-12-30T01:02:03Z).
-        let body = build_mint_policy_body(
-            "t",
-            &["group-a".to_owned()],
-            "com.cloudflare.api.account.zone.e826a542f6b80137a949a3291c1cad9c",
-            Some(1),
-        );
+        let binding = TokenPolicyBinding {
+            permission_scope: "com.cloudflare.api.account.zone".to_owned(),
+            token_resource: "com.cloudflare.api.account.zone.e826a542f6b80137a949a3291c1cad9c"
+                .to_owned(),
+            permission_group_ids: vec!["group-a".to_owned()],
+        };
+        let body = build_mint_policy_body("t", std::slice::from_ref(&binding), Some(1));
         let expires = body["expires_on"].as_str().expect("expires_on present");
         assert!(expires.ends_with('Z'), "{expires}");
         assert!(!expires.contains('.'), "no fractional seconds: {expires}");
@@ -15669,8 +15893,91 @@ mod tests {
         // Cloudflare's parser and cfctl's standing-mint parser both accept it.
         chrono::DateTime::parse_from_rfc3339(expires).expect("valid rfc3339");
         // No TTL → no expiry field.
-        let no_ttl = build_mint_policy_body("t", &["group-a".to_owned()], "res", None);
+        let no_ttl = build_mint_policy_body("t", &[binding], None);
         assert!(no_ttl.get("expires_on").is_none());
+    }
+
+    #[test]
+    fn mixed_scope_token_creation_partitions_account_and_zone_permissions() {
+        let capability = CapabilityV1::new(
+            "account-api-tokens-create-token",
+            "Create account token",
+            "POST",
+            "/accounts/{account_id}/tokens",
+        );
+        let zone = "e826a542f6b80137a949a3291c1cad9c";
+        let groups = json!([
+            {
+                "id": "account-group",
+                "name": "Workers Scripts Write",
+                "scopes": ["com.cloudflare.api.account"]
+            },
+            {
+                "id": "zone-group",
+                "name": "Workers Routes Read",
+                "scopes": ["com.cloudflare.api.account.zone"]
+            }
+        ]);
+        let selected = groups.as_array().expect("groups");
+        let arguments = KeyMutationArgs {
+            profile: None,
+            user: false,
+            name: "wrangler deploy".to_owned(),
+            permissions: vec![],
+            account: Some("account-a".to_owned()),
+            zone: Some(zone.to_owned()),
+            ttl_hours: Some(1),
+            value_out: None,
+            under_policy: None,
+        };
+        let bindings = resolve_mint_token_bindings(&arguments, "account-a", selected)
+            .expect("mixed scopes partition");
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(
+            bindings[0].token_resource,
+            "com.cloudflare.api.account.account-a"
+        );
+        assert_eq!(bindings[0].permission_group_ids, ["account-group"]);
+        assert_eq!(
+            bindings[1].token_resource,
+            format!("com.cloudflare.api.account.zone.{zone}")
+        );
+        assert_eq!(bindings[1].permission_group_ids, ["zone-group"]);
+
+        let groups_hash = hash_value(&groups).expect("group hash");
+        let adapter = json!({
+            "permission_inventory": {
+                "source_capability_id": "account-api-tokens-list-permission-groups",
+                "selected_groups": groups,
+                "selected_groups_hash": groups_hash,
+                "permission_bindings": bindings.iter().map(TokenPolicyBinding::as_json).collect::<Vec<_>>(),
+                "evidence_hashes": [format!("sha256:{}", "a".repeat(64))]
+            }
+        });
+        let input = CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            query: json!({}),
+            body: Some(build_mint_policy_body(
+                "wrangler deploy",
+                &bindings,
+                Some(1),
+            )),
+            ..CallInput::default()
+        };
+        validate_api_token_creation_contract(&capability, &input, &adapter, "account-a")
+            .expect("mixed-scope token plan is valid");
+
+        let mut drifted = input.clone();
+        drifted.body.as_mut().expect("body")["policies"][1]["permission_groups"] =
+            json!([{"id":"account-group"}]);
+        validate_api_token_creation_contract(&capability, &drifted, &adapter, "account-a")
+            .expect_err("permission migration across resource bindings is rejected");
+
+        let mut duplicated = adapter.clone();
+        duplicated["permission_inventory"]["permission_bindings"][1]["permission_group_ids"] =
+            json!(["account-group", "zone-group"]);
+        validate_api_token_creation_contract(&capability, &input, &duplicated, "account-a")
+            .expect_err("a group cannot appear in multiple bindings");
     }
 
     #[test]
