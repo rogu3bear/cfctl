@@ -675,6 +675,17 @@ fn workers_script_secret_put_and_delete_are_secret_safe_exact_lifecycles() {
         put.verification.strategy,
         "worker_script_secret_reports_planned_name_and_type_after_put"
     );
+    // Cloudflare's OpenAPI declares only 200, but a successful put answers
+    // 201 Created. Pinning 200 alone drove every real success into
+    // post-boundary recovery, so the contract carries both observed statuses
+    // — and no others.
+    assert_eq!(
+        put.response_contract
+            .as_ref()
+            .expect("secret put response contract")
+            .success_statuses,
+        ["200", "201"]
+    );
     assert!(!put.rollback.supported);
     assert!(
         put.rollback
