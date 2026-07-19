@@ -5350,7 +5350,11 @@ fn validate_token_binding_resource(
         "com.cloudflare.api.account.zone" => {
             let zone_id = token_resource
                 .strip_prefix("com.cloudflare.api.account.zone.")
-                .expect("resource was validated under zone scope");
+                .ok_or_else(|| {
+                    CliError::Input(format!(
+                        "token mint zone resource `{token_resource}` is not under the declared zone scope"
+                    ))
+                })?;
             validate_zone_id(zone_id)?;
         }
         other => {
@@ -5441,7 +5445,9 @@ fn validate_token_policy_body_bindings(
             .ok_or_else(|| {
                 CliError::Input("token mint policy must bind exactly one resource".to_owned())
             })?;
-        let (resource, value) = resources.iter().next().expect("single resource");
+        let (resource, value) = resources.iter().next().ok_or_else(|| {
+            CliError::Input("token mint policy must bind exactly one resource".to_owned())
+        })?;
         if value.as_str() != Some("*") || actual.insert(resource.clone(), body_ids).is_some() {
             return Err(CliError::Input(
                 "token mint policy resource binding is invalid or repeated".to_owned(),

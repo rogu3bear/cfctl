@@ -3725,7 +3725,12 @@ fn validate_schema_composition(
             return invalid_empty_composition(path, "oneOf");
         }
         let mut matches = 0_usize;
+        let mut distinct_members = BTreeSet::new();
         for member in members {
+            let equality_key = schema_equality_key(member, depth + 1, remaining_steps)?;
+            if !distinct_members.insert(equality_key) {
+                continue;
+            }
             match validate_request_schema_value_inner(
                 member,
                 value,

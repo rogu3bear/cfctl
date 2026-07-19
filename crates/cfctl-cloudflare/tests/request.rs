@@ -603,6 +603,59 @@ fn request_builder_rejects_undeclared_and_schema_invalid_selectors() {
 }
 
 #[test]
+fn request_builder_treats_identical_one_of_branches_as_one_pinned_alternative() {
+    let mut capability = CapabilityV1::new(
+        "d1-get-database",
+        "Get D1 database",
+        "GET",
+        "/accounts/{account_id}/d1/database/{database_id}",
+    );
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: json!({"type":"string"}),
+                query: None,
+            }),
+        },
+        SelectorV1 {
+            name: "database_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: json!({"oneOf":[{"type":"string"},{"type":"string"}]}),
+                query: None,
+            }),
+        },
+    ];
+
+    let request = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build(
+            &capability,
+            &CallInput {
+                selectors: json!({
+                    "account_id":"account-1",
+                    "database_id":"7c282983-2e48-4ea4-9f0d-09b0d718fe65"
+                }),
+                ..CallInput::default()
+            },
+        )
+        .expect("identical pinned alternatives represent one semantic branch");
+
+    assert_eq!(
+        request.url.path(),
+        "/client/v4/accounts/account-1/d1/database/7c282983-2e48-4ea4-9f0d-09b0d718fe65"
+    );
+}
+
+#[test]
 fn mutating_request_requires_a_consumable_approved_plan() {
     let capability = CapabilityV1::new(
         "dns-records-delete",
