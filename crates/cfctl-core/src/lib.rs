@@ -906,6 +906,37 @@ impl CapabilityV1 {
                     && self.same_path_readback_selectors_supported()
                     && self.same_path_read_contract_supported(true)
             }
+            // A Worker script has no same-path JSON readback — the script GET
+            // returns the raw module body — so deletion is verified against
+            // the script's `/settings` sub-path, which answers 404 once the
+            // script is gone. Identity-bound to the exact delete operation.
+            // cfctl deliberately never expresses Cloudflare's `force` bypass,
+            // so upstream in-use refusals (bound queue consumers, Durable
+            // Objects) remain live guards; the contract requires path-only
+            // selectors to keep that unexpressable.
+            "worker_script_settings_returns_not_found_after_delete" => {
+                self.id == "worker-script-delete-worker"
+                    && self.method == "DELETE"
+                    && self.path == "/accounts/{account_id}/workers/scripts/{script_name}"
+                    && self.request_schema.is_none()
+                    && self
+                        .selectors
+                        .iter()
+                        .all(|selector| selector.location == "path")
+                    && ["account_id", "script_name"].iter().all(|name| {
+                        self.selectors.iter().any(|selector| {
+                            selector.name == *name
+                                && selector.location == "path"
+                                && selector.required
+                        })
+                    })
+                    && self.same_path_read.as_ref().is_some_and(|target| {
+                        target.path
+                            == "/accounts/{account_id}/workers/scripts/{script_name}/settings"
+                            && target.read_capability_id == "worker-script-get-settings"
+                            && target.verified_response_fields.is_empty()
+                    })
+            }
             "created_resource_contains_planned_fields_by_returned_id" => {
                 self.method == "POST" && self.created_resource_contract_supported()
             }

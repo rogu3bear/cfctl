@@ -3,6 +3,7 @@
 use cfctl_auth::AuthCredential;
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, Executor, RequestBuilder,
+    validate_request_contract,
 };
 use cfctl_core::{
     CapabilityV1, CreatedCollectionResourceContractV1, CreatedResourceContractV1,
@@ -4969,6 +4970,209 @@ fn dns_record_plan(
     })
     .expect("input");
     plan
+}
+
+fn worker_script_delete_plan(selectors: serde_json::Value) -> PlanV1 {
+    let mut capability = CapabilityV1::new(
+        "worker-script-delete-worker",
+        "Delete Worker",
+        "DELETE",
+        "/accounts/{account_id}/workers/scripts/{script_name}",
+    );
+    "Worker Script".clone_into(&mut capability.product);
+    capability.permissions = vec!["Workers Scripts Write".to_owned()];
+    "worker_script_settings_returns_not_found_after_delete"
+        .clone_into(&mut capability.verification.strategy);
+    capability.selectors = ["account_id", "script_name"]
+        .iter()
+        .map(|name| SelectorV1 {
+            name: (*name).to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .collect();
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/accounts/{account_id}/workers/scripts/{script_name}/settings".to_owned(),
+        read_capability_id: "worker-script-get-settings".to_owned(),
+        verified_response_fields: Vec::new(),
+    });
+    let mut plan = PlanV1::draft(
+        "profile",
+        "account-1",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("plan");
+    plan.input = serde_json::to_value(CallInput {
+        selectors,
+        query: json!({}),
+        body: None,
+        ..CallInput::default()
+    })
+    .expect("input");
+    plan
+}
+
+#[tokio::test]
+async fn worker_script_deletion_is_verified_by_settings_not_found_readback() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let read = stream.read(&mut buffer).await.expect("read verification");
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let body =
+            r#"{"success":false,"result":null,"errors":[{"code":10007,"message":"not found"}]}"#;
+        let response = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+        request
+    });
+    let plan = worker_script_delete_plan(json!({
+        "account_id":"account-1",
+        "script_name":"scratch-worker"
+    }));
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"scratch-worker"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    assert!(verification.basis.contains("settings sub-path"));
+    // The readback must hit the settings sub-path, not the raw script GET.
+    let request = server.await.expect("server joins");
+    assert!(
+        request.starts_with(
+            "GET /client/v4/accounts/account-1/workers/scripts/scratch-worker/settings "
+        ),
+        "{request}"
+    );
+}
+
+#[tokio::test]
+async fn worker_script_deletion_refuses_a_still_present_script() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake server");
+    let address = listener.local_addr().expect("fake server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept verification");
+        let mut buffer = vec![0_u8; 8192];
+        let _ = stream.read(&mut buffer).await.expect("read verification");
+        let body = r#"{"success":true,"result":{"script":"still here"},"errors":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write verification");
+    });
+    let plan = worker_script_delete_plan(json!({
+        "account_id":"account-1",
+        "script_name":"scratch-worker"
+    }));
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"scratch-worker"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("settings readback HTTP 200"));
+    server.await.expect("server joins");
+}
+
+#[test]
+fn worker_script_delete_refuses_the_force_selector_as_undeclared() {
+    // The classifier strips `force` from the declared selectors, so the
+    // builder must refuse it as undeclared input — the bypass is
+    // unexpressable through cfctl, not merely discouraged.
+    let plan = worker_script_delete_plan(json!({
+        "account_id":"account-1",
+        "script_name":"scratch-worker"
+    }));
+    // Selector validation is the layer that owns this refusal; the builder's
+    // approved-plan guard would otherwise mask it for a mutating capability.
+    let error = validate_request_contract(
+        &plan.capability,
+        &CallInput {
+            selectors: json!({
+                "account_id":"account-1",
+                "script_name":"scratch-worker",
+                "force":"true"
+            }),
+            ..CallInput::default()
+        },
+    )
+    .expect_err("force must be refused as an undeclared selector");
+    assert!(error.to_string().contains("force"), "{error}");
+
+    let accepted = validate_request_contract(
+        &plan.capability,
+        &CallInput {
+            selectors: json!({
+                "account_id":"account-1",
+                "script_name":"scratch-worker"
+            }),
+            ..CallInput::default()
+        },
+    );
+    assert!(accepted.is_ok(), "path-only selectors remain valid");
 }
 
 fn oauth_client_secret_plan(id: &str, method: &str, verification_strategy: &str) -> PlanV1 {
