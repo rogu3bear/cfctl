@@ -192,9 +192,31 @@ cfctl keys mint --name <name> --permission <reviewed-group-id> \
 ```
 
 Mint planning repeats the live permission inventory and binds the exact group
-metadata and account-only resource policy. Running the approved plan repeats
-that inventory read before consumption; drift requires a new plan. Do not use
-generic `call` for account API-token creation.
+metadata and resource policy. Running the approved plan repeats that inventory
+read before consumption; drift requires a new plan. Do not use generic `call`
+for account API-token creation.
+
+Scope a token to one zone instead of the whole account with `--zone`, for
+zone-owned groups like Cache Purge or DNS Write:
+
+```bash
+cfctl keys mint --name <name> --permission <reviewed-group-id> \
+  --account <account-id> --zone <zone-id> --ttl-hours <hours> \
+  --value-out /new/secure/path --json
+```
+
+Zone-scoped groups are discoverable through the same
+`cfctl keys permissions --account <account-id>` inventory; each group reports
+the scopes it supports. Zone minting is account-owned, so `--zone` requires
+`--account` and is rejected with `--user`.
+
+Selected groups are partitioned by what each one actually supports: a group
+that declares zone scope binds to
+`com.cloudflare.api.account.zone.<zone-id>`, and one that only declares
+account scope binds to `com.cloudflare.api.account.<account-id>`. A single
+mint can therefore carry both bindings — a Worker deploy token needing
+account-owned script permissions plus zone-owned route permissions is one
+governed call, not two. A group supporting neither scope fails the plan.
 
 Mint a user-owned token for one explicit account with the parallel governed
 workflow:
@@ -225,9 +247,16 @@ cfctl keys policy create --account <account-id> --name-prefix <prefix> \
 cfctl keys policy list --json
 ```
 
+Add `--zone <zone-id>` to let children bind that one zone as well as the pinned
+account, which is what recurring zone-scoped rotation needs. Without it an
+authority is account-scoped only. Every child mint is checked against the
+authority's bound resources: the pinned account always, the pinned zone only if
+one was reviewed, and nothing else — a child naming another account or another
+zone is refused before mutation.
+
 `keys policy create` drafts a hash-bound standing authority (pinned account,
-name prefix, permission-group allowlist, max child TTL, and per-day run
-ceiling); it is inert until activated. `keys policy list` inspects existing
+optional pinned zone, name prefix, permission-group allowlist, max child TTL,
+and per-day run ceiling); it is inert until activated. `keys policy list` inspects existing
 authorities and reports effective status, remaining budget, lineage, and next
 action. Activate one reviewed authority ID only with explicit approval, and
 close it immediately when the work is done:

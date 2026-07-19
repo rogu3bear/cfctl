@@ -3547,6 +3547,11 @@ pub struct StandingAuthorityV1 {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub account_id: String,
+    /// When set, child tokens may additionally bind this one zone's resource.
+    /// Absent means the authority is account-scoped only, which is how every
+    /// authority drafted before zone support behaves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_id: Option<String>,
     pub capability_ids: Vec<String>,
     pub permission_group_ids: Vec<String>,
     pub permission_inventory_hash: String,
@@ -3566,6 +3571,7 @@ impl StandingAuthorityV1 {
     #[allow(clippy::too_many_arguments)]
     pub fn draft(
         account_id: &str,
+        zone_id: Option<&str>,
         capability_ids: Vec<String>,
         mut permission_group_ids: Vec<String>,
         permission_inventory_hash: &str,
@@ -3582,6 +3588,7 @@ impl StandingAuthorityV1 {
             created_at: Utc::now(),
             expires_at,
             account_id: account_id.to_owned(),
+            zone_id: zone_id.map(str::to_owned),
             capability_ids,
             permission_group_ids,
             permission_inventory_hash: permission_inventory_hash.to_owned(),
@@ -3601,8 +3608,12 @@ impl StandingAuthorityV1 {
     /// The reviewed grant content. Excludes status, approval, and the
     /// mutable run accounting so post-approval bookkeeping cannot drift the
     /// approved hash.
+    ///
+    /// `zone_id` is included only when present, so an account-scoped authority
+    /// hashes exactly as it did before zone support existed and previously
+    /// approved authorities keep validating.
     fn hashable_content(&self) -> Value {
-        serde_json::json!({
+        let mut content = serde_json::json!({
             "schema_version": self.schema_version,
             "authority_id": self.authority_id,
             "created_at": self.created_at,
@@ -3614,7 +3625,25 @@ impl StandingAuthorityV1 {
             "max_child_ttl_hours": self.max_child_ttl_hours,
             "name_prefix": self.name_prefix,
             "max_runs_per_day": self.max_runs_per_day,
-        })
+        });
+        if let Some(zone_id) = &self.zone_id
+            && let Some(object) = content.as_object_mut()
+        {
+            object.insert("zone_id".to_owned(), Value::String(zone_id.clone()));
+        }
+        content
+    }
+
+    /// Every token resource a child minted under this authority may bind.
+    /// The account resource is always permitted; the zone resource only when
+    /// the authority pinned that zone at draft time.
+    #[must_use]
+    pub fn allowed_token_resources(&self) -> Vec<String> {
+        let mut resources = vec![format!("com.cloudflare.api.account.{}", self.account_id)];
+        if let Some(zone_id) = &self.zone_id {
+            resources.push(format!("com.cloudflare.api.account.zone.{zone_id}"));
+        }
+        resources
     }
 
     pub fn refresh_hash(&mut self) -> Result<()> {
@@ -3764,6 +3793,7 @@ impl StandingAuthorityV1 {
         now: DateTime<Utc>,
         child_name: &str,
         requested_group_ids: &[String],
+        requested_resources: &[String],
         child_expires_at: Option<DateTime<Utc>>,
     ) -> Result<()> {
         self.ensure_operational_at(now)?;
@@ -3776,6 +3806,21 @@ impl StandingAuthorityV1 {
         }
         if requested_group_ids.is_empty() {
             return Err(self.denied("child token requests no permission groups".to_owned()));
+        }
+        // The allowlist bounds which permission groups a child may carry; this
+        // bounds what those groups may act on. Without it an authority pinned
+        // to one account or zone could mint a child bound elsewhere.
+        if requested_resources.is_empty() {
+            return Err(self.denied("child token binds no resource".to_owned()));
+        }
+        let allowed = self.allowed_token_resources();
+        for resource in requested_resources {
+            if !allowed.contains(resource) {
+                return Err(self.denied(format!(
+                    "child token resource `{resource}` is outside this authority's bound scope ({})",
+                    allowed.join(", ")
+                )));
+            }
         }
         for group_id in requested_group_ids {
             if !self.permission_group_ids.contains(group_id) {
