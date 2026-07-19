@@ -1050,6 +1050,7 @@ fn apply_post_normalization_contracts(
     finalize_web_analytics_rum_rollback_contract(document, capabilities);
     finalize_dns_record_rollback_contract(document, capabilities);
     finalize_dns_record_delete_response_contract(capabilities);
+    finalize_queue_consumer_contracts(document, capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
@@ -8483,6 +8484,8 @@ fn finalize_web_analytics_rum_rollback_contract(
 enum QueueConfigurationKind {
     Create,
     Update,
+    ConsumerCreate,
+    ConsumerUpdate,
 }
 
 struct QueueConfigurationContract {
@@ -8511,7 +8514,104 @@ const QUEUE_CONFIGURATION_CONTRACTS: &[QueueConfigurationContract] = &[
         path: "/accounts/{account_id}/queues/{queue_id}",
         kind: QueueConfigurationKind::Update,
     },
+    QueueConfigurationContract {
+        id: "queues-create-consumer",
+        method: "POST",
+        path: "/accounts/{account_id}/queues/{queue_id}/consumers",
+        kind: QueueConfigurationKind::ConsumerCreate,
+    },
+    QueueConfigurationContract {
+        id: "queues-update-consumer",
+        method: "PUT",
+        path: "/accounts/{account_id}/queues/{queue_id}/consumers/{consumer_id}",
+        kind: QueueConfigurationKind::ConsumerUpdate,
+    },
 ];
+
+const QUEUE_CONSUMER_DETAIL_PATH: &str =
+    "/accounts/{account_id}/queues/{queue_id}/consumers/{consumer_id}";
+
+/// Queue consumers are a discriminated `oneOf` (worker | `http_pull`) in both
+/// the request body and the response `result`, which sinks the generic
+/// created-resource and same-path binders: they demand a single object shape.
+/// Both variants declare `consumer_id`, so identity readback is provable
+/// across the union, and the runtime compares only fields present in the
+/// planned body — so binding the canonical request-field union is honest even
+/// though `script_name` exists only on the worker variant.
+fn finalize_queue_consumer_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let read_supported = capabilities
+        .get("queues-get-consumer")
+        .is_some_and(|capability| {
+            capability.method == "GET"
+                && capability.path == QUEUE_CONSUMER_DETAIL_PATH
+                && capability.product == "Queue"
+                && capability
+                    .selectors
+                    .iter()
+                    .all(|selector| selector.location == "path")
+        })
+        && document
+            .pointer(
+                "/paths/~1accounts~1{account_id}~1queues~1{queue_id}~1consumers~1{consumer_id}/get",
+            )
+            .is_some_and(|operation| {
+                success_response_declares_result_string_field(document, operation, "consumer_id")
+            });
+    let delete_supported = capabilities
+        .get("queues-delete-consumer")
+        .is_some_and(|capability| {
+            capability.method == "DELETE" && capability.path == QUEUE_CONSUMER_DETAIL_PATH
+        });
+    if !read_supported || !delete_supported {
+        return;
+    }
+
+    let create_declares_identity = document
+        .pointer("/paths/~1accounts~1{account_id}~1queues~1{queue_id}~1consumers/post")
+        .is_some_and(|operation| {
+            success_response_declares_result_string_field(document, operation, "consumer_id")
+        });
+    if create_declares_identity
+        && let Some(capability) = capabilities.get_mut("queues-create-consumer")
+        && queue_configuration_kind(capability) == Some(QueueConfigurationKind::ConsumerCreate)
+        && let Some(fields) = canonical_verifiable_request_object_fields(capability)
+    {
+        capability.created_resource = Some(CreatedResourceContractV1 {
+            detail_path: QUEUE_CONSUMER_DETAIL_PATH.to_owned(),
+            identity_selector: "consumer_id".to_owned(),
+            response_result_identity_pointer: "/consumer_id".to_owned(),
+            read_capability_id: "queues-get-consumer".to_owned(),
+            delete_capability_id: "queues-delete-consumer".to_owned(),
+            verified_response_fields: fields,
+        });
+        "created_resource_contains_planned_fields_by_returned_id"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.rollback.warning = Some(
+            "compensation creates a separate exact consumer delete plan that must be reviewed and explicitly approved"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+
+    if let Some(capability) = capabilities.get_mut("queues-update-consumer")
+        && queue_configuration_kind(capability) == Some(QueueConfigurationKind::ConsumerUpdate)
+        && let Some(fields) = canonical_verifiable_request_object_fields(capability)
+    {
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: QUEUE_CONSUMER_DETAIL_PATH.to_owned(),
+            read_capability_id: "queues-get-consumer".to_owned(),
+            verified_response_fields: fields,
+        });
+        "same_resource_contains_planned_fields_after_update"
+            .clone_into(&mut capability.verification.strategy);
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
 
 fn queue_configuration_kind(capability: &CapabilityV1) -> Option<QueueConfigurationKind> {
     QUEUE_CONFIGURATION_CONTRACTS
@@ -8533,6 +8633,29 @@ fn queue_configuration_request_contract_supported(
     capability: &CapabilityV1,
     kind: QueueConfigurationKind,
 ) -> bool {
+    if matches!(
+        kind,
+        QueueConfigurationKind::ConsumerCreate | QueueConfigurationKind::ConsumerUpdate
+    ) {
+        // The consumer body is a discriminated `oneOf` (worker | http_pull).
+        // Require exactly that shape with a string `type` discriminator on
+        // every member, without over-pinning variant internals.
+        return capability
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("oneOf"))
+            .and_then(Value::as_array)
+            .is_some_and(|members| {
+                members.len() == 2
+                    && members.iter().all(|member| {
+                        member.get("type").and_then(Value::as_str) == Some("object")
+                            && member
+                                .pointer("/properties/type/type")
+                                .and_then(Value::as_str)
+                                == Some("string")
+                    })
+            });
+    }
     let Some(properties) = capability
         .request_schema
         .as_ref()
@@ -8547,6 +8670,9 @@ fn queue_configuration_request_contract_supported(
         .and_then(Value::as_str)
         == Some("string");
     match kind {
+        // Consumer kinds return through the discriminated-oneOf check above
+        // and never reach the top-level-properties matching below.
+        QueueConfigurationKind::ConsumerCreate | QueueConfigurationKind::ConsumerUpdate => false,
         QueueConfigurationKind::Create => properties.len() == 1 && queue_name_is_string,
         QueueConfigurationKind::Update => {
             let settings = properties.get("settings");
@@ -8633,6 +8759,20 @@ fn classify_queue_configuration(capability: &mut CapabilityV1, kind: QueueConfig
             capability.rollback.strategy = None;
             capability.rollback.warning = Some(
                 "changing retention can cause queued messages to expire and changing delivery state affects connected consumers; configuration restoration requires a separately reviewed update, and expired messages cannot be restored"
+                    .to_owned(),
+            );
+        }
+        QueueConfigurationKind::ConsumerCreate => {
+            capability.risk = RiskClass::ScopedWrite;
+            capability.effect = EffectClass::ReversibleWrite;
+        }
+        QueueConfigurationKind::ConsumerUpdate => {
+            capability.risk = RiskClass::ScopedWrite;
+            capability.effect = EffectClass::ReversibleWrite;
+            capability.rollback.supported = false;
+            capability.rollback.strategy = None;
+            capability.rollback.warning = Some(
+                "the plan does not snapshot prior consumer settings; restoration requires a separately reviewed consumer update built from trusted evidence"
                     .to_owned(),
             );
         }
