@@ -2039,14 +2039,41 @@ async fn verify_delegated_cli_plan(
     verify_wrangler_deployment_status(config, &version_id, credential).await
 }
 
+/// Wrangler discovers dotenv credentials relative to its process working
+/// directory. A plan reviewed against one Worker config could therefore pass
+/// its account checks and then resolve a different account token when cfctl
+/// ran from somewhere else, so every governed Wrangler subprocess is pinned to
+/// the reviewed config's own directory.
+fn wrangler_config_directory(config: &str) -> Result<PathBuf> {
+    let parent = Path::new(config)
+        .parent()
+        .ok_or_else(|| CliError::Input("Wrangler config path has no parent".to_owned()))?;
+    if parent.as_os_str().is_empty() {
+        Ok(PathBuf::from("."))
+    } else {
+        Ok(parent.to_path_buf())
+    }
+}
+
 async fn verify_wrangler_deployment_status(
     config: &str,
     version_id: &str,
     credential: &AuthCredential,
 ) -> Value {
+    let working_directory = match wrangler_config_directory(config) {
+        Ok(directory) => directory,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler deployment-status verification could not resolve the reviewed config directory: {error}"),
+                "version_id": version_id,
+            });
+        }
+    };
     let mut command = ProcessCommand::new("wrangler");
     command
         .args(["deployments", "status", "--config", config, "--json"])
+        .current_dir(working_directory)
         .env_clear()
         .env("PATH", env::var_os("PATH").unwrap_or_default())
         .env("HOME", env::var_os("HOME").unwrap_or_default())
@@ -2239,6 +2266,14 @@ async fn run_delegated_cli(
     }
     let mut command = ProcessCommand::new(program);
     command.args(path_parts);
+    if let Some(config) = input
+        .query
+        .get("config")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        command.current_dir(wrangler_config_directory(config)?);
+    }
     append_cli_input(&mut command, &input.selectors)?;
     append_cli_input(&mut command, &input.query)?;
     if input.body.is_some() {
@@ -11909,8 +11944,8 @@ mod tests {
         validate_standing_authority_permission_inventory, validate_token_policy_body,
         validate_worker_script_secret_semantics, validate_zone_account_receipt_precondition,
         validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
-        workspace_resource_keys, wrangler_deploy_version_id, wrangler_status_has_promoted_version,
-        zone_target,
+        workspace_resource_keys, wrangler_config_directory, wrangler_deploy_version_id,
+        wrangler_status_has_promoted_version, zone_target,
     };
     use crate::profiles::ProfilesConfig;
     use crate::{
@@ -11930,6 +11965,7 @@ mod tests {
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::{Value, json};
+    use std::path::PathBuf;
     use std::{
         collections::BTreeMap,
         fs,
@@ -11968,6 +12004,25 @@ mod tests {
             &promoted,
             "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         ));
+    }
+
+    #[test]
+    fn wrangler_subprocesses_pin_to_the_reviewed_config_directory() {
+        assert_eq!(
+            wrangler_config_directory("/srv/jkca-web-home/wrangler.toml").expect("nested config"),
+            PathBuf::from("/srv/jkca-web-home")
+        );
+        assert_eq!(
+            wrangler_config_directory("workers/api/wrangler.jsonc").expect("relative config"),
+            PathBuf::from("workers/api")
+        );
+        // A bare filename has an empty parent; the subprocess must still get a
+        // usable directory rather than inheriting cfctl's own cwd implicitly.
+        assert_eq!(
+            wrangler_config_directory("wrangler.toml").expect("bare config"),
+            PathBuf::from(".")
+        );
+        assert!(wrangler_config_directory("/").is_err());
     }
 
     #[test]

@@ -173,6 +173,15 @@ uncertain or unsupported result.
 Secret outputs require `--value-out /new/secure/path`; cfctl refuses an
 existing destination.
 
+For `wrangler.deploy`, pass an absolute `config` selector. An optional `var`
+selector binds one plain-text `KEY:VALUE` Worker variable into the plan and
+evidence; never pass a secret through `var`. Both the deploy subprocess and the
+deployment-status verifier run from the reviewed config file's own directory,
+because Wrangler resolves dotenv credentials relative to its working directory
+— a plan reviewed against one config must not publish with a token discovered
+from wherever cfctl happened to be invoked. Other delegated CLI capabilities
+keep their existing working directory.
+
 Mint an account token only through the dedicated key workflow:
 
 ```bash
