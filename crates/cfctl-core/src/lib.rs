@@ -940,6 +940,21 @@ impl CapabilityV1 {
             "created_resource_contains_planned_fields_by_returned_id" => {
                 self.method == "POST" && self.created_resource_contract_supported()
             }
+            // An Access application body is a 13-way `anyOf` over app types
+            // with no universally-required field, so the generic binder — which
+            // unions every variant's fields — cannot produce an honest verified
+            // set. This strategy binds a curated set of fields present and
+            // observable across every variant (`name`, `type`), verified the
+            // same way the generic evaluator does: the runtime compares only
+            // fields actually present in the planned body, so a curated subset
+            // is honest. Identity-bound to the exact create operation.
+            "created_access_application_contains_planned_fields_by_returned_id" => {
+                self.id == "access-applications-add-an-application"
+                    && self.method == "POST"
+                    && self.path == "/accounts/{account_id}/access/apps"
+                    && self
+                        .created_resource_contract_supported_with_curated_fields(&["name", "type"])
+            }
             "parent_collection_contains_created_resource_id_and_planned_fields" => {
                 self.method == "POST" && self.created_collection_resource_contract_supported()
             }
@@ -1023,10 +1038,7 @@ impl CapabilityV1 {
                 self.method == "POST" && self.id == "dns-records-for-a-zone-create-dns-record"
             }
             Some("delete_created_resource_by_returned_id") => {
-                self.method == "POST"
-                    && self.id != "d1-create-database"
-                    && (self.created_resource_contract_supported()
-                        || self.created_collection_resource_contract_supported())
+                self.delete_created_resource_rollback_supported()
             }
             Some("delete_created_empty_d1_database_by_returned_uuid_if_unchanged") => {
                 d1_database_create_rollback_contract_supported(self)
@@ -1277,7 +1289,44 @@ impl CapabilityV1 {
         }
     }
 
+    fn delete_created_resource_rollback_supported(&self) -> bool {
+        self.method == "POST"
+            && self.id != "d1-create-database"
+            && (self.created_resource_contract_supported()
+                || self.created_collection_resource_contract_supported()
+                || (self.id == "access-applications-add-an-application"
+                    && self.created_resource_contract_supported_with_curated_fields(&[
+                        "name", "type",
+                    ])))
+    }
+
     fn created_resource_contract_supported(&self) -> bool {
+        self.created_resource_contract_structurally_supported(|target| {
+            self.verified_response_fields_match_request_schema(&target.verified_response_fields)
+        })
+    }
+
+    /// Like `created_resource_contract_supported`, but the verified fields are
+    /// a caller-curated set rather than the full request-field union. For
+    /// bodies whose polymorphic `anyOf` has no universally-required field, the
+    /// union is not an honest verified set; a curated set of fields present in
+    /// every variant is. The runtime compares only fields present in the
+    /// planned body, so verifying against a subset never over-asserts.
+    fn created_resource_contract_supported_with_curated_fields(&self, curated: &[&str]) -> bool {
+        self.created_resource_contract_structurally_supported(|target| {
+            target.verified_response_fields.len() == curated.len()
+                && target
+                    .verified_response_fields
+                    .iter()
+                    .zip(curated)
+                    .all(|(field, expected)| field == expected)
+        })
+    }
+
+    fn created_resource_contract_structurally_supported(
+        &self,
+        fields_valid: impl Fn(&CreatedResourceContractV1) -> bool,
+    ) -> bool {
         self.created_resource.as_ref().is_some_and(|target| {
             let expected_path = format!(
                 "{}/{{{}}}",
@@ -1294,8 +1343,7 @@ impl CapabilityV1 {
                 && !target.delete_capability_id.is_empty()
                 && self.same_path_readback_selectors_supported()
                 && !target.verified_response_fields.is_empty()
-                && self
-                    .verified_response_fields_match_request_schema(&target.verified_response_fields)
+                && fields_valid(target)
                 && target
                     .verified_response_fields
                     .iter()

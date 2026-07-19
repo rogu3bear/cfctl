@@ -1052,6 +1052,7 @@ fn apply_post_normalization_contracts(
     finalize_dns_record_delete_response_contract(capabilities);
     finalize_queue_consumer_contracts(document, capabilities);
     finalize_worker_script_delete_contract(capabilities);
+    finalize_access_application_create_contract(document, capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
@@ -8528,6 +8529,105 @@ const QUEUE_CONFIGURATION_CONTRACTS: &[QueueConfigurationContract] = &[
         kind: QueueConfigurationKind::ConsumerUpdate,
     },
 ];
+
+const ACCESS_APP_COLLECTION_PATH: &str = "/accounts/{account_id}/access/apps";
+const ACCESS_APP_DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}";
+
+/// Govern Access application creation. The delete side is already governed by
+/// the generic exact-resource path; the get and list readbacks exist. Create
+/// stays blocked under the generic binder because the request body is a 13-way
+/// `anyOf` over app types with no universally-required field — the generic
+/// union of variant fields is not an honest verified set. This finalizer binds
+/// a curated created-resource contract over `name` and `type`, which are
+/// present in every variant and declared on both the create and get responses,
+/// and routes it to a dedicated curated-fields strategy. Update stays blocked:
+/// there is no honest universal update-field contract across the union.
+fn finalize_access_application_create_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let read_supported = capabilities
+        .get("access-applications-get-an-access-application")
+        .is_some_and(|capability| {
+            capability.method == "GET"
+                && capability.path == ACCESS_APP_DETAIL_PATH
+                && capability.product == "Access applications"
+                && capability
+                    .selectors
+                    .iter()
+                    .all(|selector| selector.location == "path")
+        })
+        && capabilities
+            .get("access-applications-delete-an-access-application")
+            .is_some_and(|capability| {
+                capability.method == "DELETE" && capability.path == ACCESS_APP_DETAIL_PATH
+            });
+    if !read_supported {
+        return;
+    }
+    // `name`, `type`, and the returned `id` must be observable on both the
+    // create and the detail-read responses for the curated verification to be
+    // honest.
+    let create_operation = document.pointer("/paths/~1accounts~1{account_id}~1access~1apps/post");
+    let read_operation =
+        document.pointer("/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}/get");
+    let (Some(create_operation), Some(read_operation)) = (create_operation, read_operation) else {
+        return;
+    };
+    let fields_observable =
+        ["name", "type"].iter().all(|field| {
+            success_response_declares_result_string_field(document, create_operation, field)
+                && success_response_declares_result_string_field(document, read_operation, field)
+        }) && success_response_declares_result_string_field(document, create_operation, "id")
+            && success_response_declares_result_string_field(document, read_operation, "id");
+    if !fields_observable {
+        return;
+    }
+    let Some(capability) = capabilities.get_mut("access-applications-add-an-application") else {
+        return;
+    };
+    if capability.method != "POST"
+        || capability.path != ACCESS_APP_COLLECTION_PATH
+        || capability.product != "Access applications"
+        || capability.request_schema.is_none()
+    {
+        return;
+    }
+    // Access applications gate authentication in front of resources, so
+    // creation is identity-affecting and must land approval-required, never
+    // policy auto-execute.
+    capability.risk = RiskClass::IdentityOrOwnership;
+    capability.effect = EffectClass::IdentityOrOwnership;
+    capability.cost = cfctl_core::CostV1::default();
+    capability.cost.billing_model = BillingModelV1::Subscription;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "creating an Access application has no per-operation charge; Access is seat and plan billed, unaffected by the number of application objects"
+            .to_owned(),
+    );
+    capability.cost.references = vec![KnowledgeReferenceV1 {
+        title: "Cloudflare Access pricing".to_owned(),
+        url: "https://developers.cloudflare.com/cloudflare-one/policies/access/".to_owned(),
+        source: "official Cloudflare docs".to_owned(),
+    }];
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: ACCESS_APP_DETAIL_PATH.to_owned(),
+        identity_selector: "app_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "access-applications-get-an-access-application".to_owned(),
+        delete_capability_id: "access-applications-delete-an-access-application".to_owned(),
+        verified_response_fields: vec!["name".to_owned(), "type".to_owned()],
+    });
+    "created_access_application_contains_planned_fields_by_returned_id"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    capability.rollback.warning = Some(
+        "compensation creates a separate exact Access application delete plan that must be reviewed and explicitly approved; deleting an application removes its policies and revokes access it granted"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
 
 const WORKER_SCRIPT_DELETE_PATH: &str = "/accounts/{account_id}/workers/scripts/{script_name}";
 const WORKER_SCRIPT_SETTINGS_PATH: &str =

@@ -841,7 +841,8 @@ impl Executor {
         credential: &AuthCredential,
     ) -> Result<OperationVerificationV1> {
         match plan.capability.verification.strategy.as_str() {
-            "created_resource_contains_planned_fields_by_returned_id" => {
+            "created_resource_contains_planned_fields_by_returned_id"
+            | "created_access_application_contains_planned_fields_by_returned_id" => {
                 self.verify_created_resource(plan, apply_response, input, credential)
                     .await
             }
@@ -2378,6 +2379,7 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
     }
     let body_label = match strategy {
         "created_resource_contains_planned_fields_by_returned_id"
+        | "created_access_application_contains_planned_fields_by_returned_id"
         | "parent_collection_contains_created_resource_id_and_planned_fields"
         | "dns_record_details_match_created_id_and_planned_fields" => Some("create"),
         "same_resource_contains_planned_fields_after_update"
@@ -2410,6 +2412,9 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
         }
         "created_resource_contains_planned_fields_by_returned_id" => {
             validate_created_resource_target(capability, input)
+        }
+        "created_access_application_contains_planned_fields_by_returned_id" => {
+            validate_access_application_create_target(capability, input)
         }
         "parent_collection_contains_created_resource_id_and_planned_fields" => {
             validate_created_collection_resource_target(capability, input)
@@ -2482,6 +2487,78 @@ fn validate_worker_script_secret_put_target(
     {
         return Err(CloudflareError::MissingVerificationTarget(
             "the planned Worker script secret name or type is absent or invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The Access application create validator. Unlike the generic created-resource
+/// validator, it does NOT require every planned field to be a verified field:
+/// an Access app body carries variant-specific fields (`domain`, `saas_app`, …)
+/// that are legitimately part of the create but not part of the curated
+/// `[name, type]` verification set. It confirms the curated contract's shape
+/// and that the planned body actually carries the curated fields, then lets
+/// variant fields through unverified — the runtime evaluator only compares the
+/// curated set on readback, so this never over-asserts, and a curated-field
+/// drift (proven separately) still faults.
+fn validate_access_application_create_target(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let target = capability.created_resource.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the hash-bound Access application create contract is absent".to_owned(),
+        )
+    })?;
+    if target.detail_path != "/accounts/{account_id}/access/apps/{app_id}"
+        || target.identity_selector != "app_id"
+        || target.response_result_identity_pointer != "/id"
+        || target.read_capability_id != "access-applications-get-an-access-application"
+        || target.verified_response_fields != ["name", "type"]
+        || !clean_verification_query(input)
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the Access application create does not match its hash-bound curated readback contract"
+                .to_owned(),
+        ));
+    }
+    let planned = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|body| !body.is_empty())
+        .ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "planned Access application create body is absent, empty, or not an object"
+                    .to_owned(),
+            )
+        })?;
+    // The curated fields must actually be present to be verifiable.
+    for field in &target.verified_response_fields {
+        if planned
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(CloudflareError::MissingVerificationTarget(format!(
+                "the planned Access application is missing its verifiable `{field}`"
+            )));
+        }
+    }
+    let selectors = input.selectors.as_object().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the planned Access application selectors are not an object".to_owned(),
+        )
+    })?;
+    if selectors.len() != 1
+        || selectors
+            .get("account_id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned Access application selectors are missing, empty, or broader than the exact account target"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -3010,6 +3087,7 @@ fn is_create_verifier(strategy: &str) -> bool {
     matches!(
         strategy,
         "created_resource_contains_planned_fields_by_returned_id"
+            | "created_access_application_contains_planned_fields_by_returned_id"
             | "parent_collection_contains_created_resource_id_and_planned_fields"
     )
 }
