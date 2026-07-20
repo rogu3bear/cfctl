@@ -93,9 +93,16 @@ obligation.
    verification, or rollback is contract debt—not authority to execute.
 
 Internal path dependencies must include the exact workspace version as well as
-their local path. New licenses, registries, Git sources, duplicate versions, or
-secret-scan exceptions require explicit review; do not broaden `deny.toml` or
-`.gitleaksignore` merely to pass the gate.
+their local path; `verify` checks that by equality, because Cargo alone accepts
+a stale pin. A version bump must therefore update every intra-workspace pin and
+`QUICKSTART.md`'s download path in the same change. New licenses, registries,
+Git sources, duplicate versions, or secret-scan exceptions require explicit
+review; do not broaden `deny.toml` or `.gitleaksignore` merely to pass the gate.
+
+Every `cfctl` example is linted against the single-sourced command tree in
+`crates/cfctl-core`, at full subcommand depth, in all tracked files and in the
+managed agent instructions. A stale or mistyped example fails `verify`
+regardless of which file it lives in.
 
 ## Extending the runtime
 

@@ -329,6 +329,7 @@ fn verify_source_contract() -> Result<(), TaskError> {
 
     verify_workspace_contract()?;
     verify_v1_cutover_contract()?;
+    verify_managed_agent_documents()?;
     verify_documented_contracts()
 }
 
@@ -740,7 +741,25 @@ fn verify_tracked_cfctl_command_references() -> Result<(), TaskError> {
 /// command tree, walking the full token chain rather than stopping at the
 /// second token.
 fn validate_command_refs(path: &str, content: &str) -> Result<(), TaskError> {
-    for reference in extract_cfctl_command_refs(path, content) {
+    validate_extracted_command_refs(path, extract_cfctl_command_refs(path, content))
+}
+
+/// The managed agent instructions are the most consequential thing cfctl
+/// teaches — they are installed into four agent harnesses and read as
+/// authority — but they live in Rust source, which the tracked-file lint does
+/// not scan. This binds the commands they teach to the same command tree.
+fn verify_managed_agent_documents() -> Result<(), TaskError> {
+    for (label, document) in cfctl_agent::managed_documents() {
+        validate_extracted_command_refs(label, extract_prose_command_refs(document, true, false))?;
+    }
+    Ok(())
+}
+
+fn validate_extracted_command_refs(
+    path: &str,
+    references: Vec<CfctlReference>,
+) -> Result<(), TaskError> {
+    for reference in references {
         let verb = &reference.verb;
         if verb != "help" && !PUBLIC_V2_SUBCOMMANDS.contains(&verb.as_str()) {
             return Err(TaskError::InvalidSourceContract(format!(
@@ -799,8 +818,8 @@ fn extract_cfctl_command_references(path: &str, content: &str) -> Vec<String> {
 }
 
 fn extract_cfctl_command_refs(path: &str, content: &str) -> Vec<CfctlReference> {
-    let mut references = Vec::new();
     if path_has_extension(path, "json") {
+        let mut references = Vec::new();
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
             collect_json_command_references(&value, false, &mut references);
         }
@@ -810,12 +829,37 @@ fn extract_cfctl_command_refs(path: &str, content: &str) -> Vec<CfctlReference> 
     let markdown = path_has_extension(path, "md");
     let shell = path_has_extension(path, "sh") || content.starts_with("#!");
     if !markdown && !shell {
-        return references;
+        return Vec::new();
     }
+    extract_prose_command_refs(content, markdown, shell)
+}
 
+/// Extracts command references from markdown or shell text. Split out from the
+/// path-driven entry point so in-memory documents — the managed agent
+/// instructions, which live in Rust source and therefore have no path — bind to
+/// the same extractor rather than a second copy of these rules.
+fn extract_prose_command_refs(content: &str, markdown: bool, shell: bool) -> Vec<CfctlReference> {
+    let mut references = Vec::new();
     let mut in_fence = false;
-    for line in content.lines() {
+    let mut in_front_matter = false;
+    for (index, line) in content.lines().enumerate() {
         let trimmed = line.trim();
+        // YAML front matter is document metadata, not command examples. A
+        // description reading "Use cfctl as the universal control plane" is a
+        // sentence, and scanning it for commands finds `cfctl as`.
+        if markdown && trimmed == "---" {
+            if index == 0 {
+                in_front_matter = true;
+                continue;
+            }
+            if in_front_matter {
+                in_front_matter = false;
+                continue;
+            }
+        }
+        if in_front_matter {
+            continue;
+        }
         if markdown && trimmed.starts_with("```") {
             in_fence = !in_fence;
             continue;
@@ -2474,15 +2518,16 @@ mod tests {
 
     use super::{
         PrePushRegistration, classify_pre_push_registration, expected_signed_release_file_names,
-        extract_cfctl_command_references, extract_cfctl_command_refs, is_declared_quarantine_path,
-        is_forbidden_quarantine_consumer, parse_remote_tag_commit, release_build_driver,
-        release_build_subcommand, release_tag_is_exact_version, render_linux_installer_text,
-        repository_root, security_proof_commands, validate_codesign_details, validate_command_refs,
+        extract_cfctl_command_references, extract_cfctl_command_refs, extract_prose_command_refs,
+        is_declared_quarantine_path, is_forbidden_quarantine_consumer, parse_remote_tag_commit,
+        release_build_driver, release_build_subcommand, release_tag_is_exact_version,
+        render_linux_installer_text, repository_root, security_proof_commands,
+        validate_codesign_details, validate_command_refs, validate_extracted_command_refs,
         validate_notary_receipt_value, validate_signed_release_file_set, validated_release_targets,
         verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
-        verify_generated_guidance_section_text, verify_quickstart_pins_the_release_version,
-        verify_tracked_cfctl_command_references, verify_v1_cutover_contract,
-        verify_workspace_dependency_versions,
+        verify_generated_guidance_section_text, verify_managed_agent_documents,
+        verify_quickstart_pins_the_release_version, verify_tracked_cfctl_command_references,
+        verify_v1_cutover_contract, verify_workspace_dependency_versions,
     };
 
     #[test]
@@ -2557,6 +2602,46 @@ mod tests {
                 ("migrate".to_owned(), vec!["v1".to_owned()]),
             ],
             "prose `workspace discovery` must not appear as a checked subcommand"
+        );
+    }
+
+    #[test]
+    fn managed_agent_documents_teach_only_real_commands() {
+        verify_managed_agent_documents().expect("managed agent documents bind to the command tree");
+    }
+
+    #[test]
+    fn front_matter_is_metadata_not_command_examples() {
+        // "Use cfctl as …" reads as an instructional prefix plus a verb, so a
+        // description sentence would otherwise be linted as `cfctl as`.
+        let document = concat!(
+            "---\n",
+            "name: cfctl\n",
+            "description: Use cfctl as the universal governed Cloudflare control plane.\n",
+            "---\n\n",
+            "Run `cfctl doctor --json` to orient.\n",
+        );
+        let references = extract_prose_command_refs(document, true, false);
+        assert_eq!(references.len(), 1, "only the body command should extract");
+        assert_eq!(references[0].verb, "doctor");
+    }
+
+    #[test]
+    fn managed_agent_document_gate_rejects_an_unknown_subcommand() {
+        // The gate is only worth having if it fails on a document that teaches
+        // a command the tree does not declare, so prove that directly.
+        let taught = concat!(
+            "# Managed instructions\n\n",
+            "Run with `cfctl plans frobnicate <operation-id>`.\n",
+        );
+        let error = validate_extracted_command_refs(
+            "managed document fixture",
+            extract_prose_command_refs(taught, true, false),
+        )
+        .expect_err("an undeclared subcommand must be rejected");
+        assert!(
+            error.to_string().contains("plans frobnicate"),
+            "error must name the offending command: {error}"
         );
     }
 

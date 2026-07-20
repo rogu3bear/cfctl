@@ -211,10 +211,12 @@ workflow, never a direct create call.
 Expect to meet the wall early, and read it as the design working. cfctl
 catalogs every Cloudflare operation but executes a mutation only when its
 contract is fully known — risk, effect, cost, permission, entitlement,
-verification, and rollback or explicit irreversibility. At the July 2026
-snapshot roughly 84% of mutating operations were blocked on incomplete
-upstream metadata, and cfctl will not fabricate a permission or a price to
-close that gap: a guessed one is worse than an honest block.
+verification, and rollback or explicit irreversibility. Most mutating
+operations are blocked on incomplete upstream metadata — the executable core is
+a deliberate minority — and cfctl will not fabricate a permission or a price to
+close that gap: a guessed one is worse than an honest block. The live ratio is
+whatever `catalog coverage` reports; this file does not restate a number it
+cannot keep true.
 
 ```bash
 cfctl catalog coverage --json          # what is executable, and what is not
