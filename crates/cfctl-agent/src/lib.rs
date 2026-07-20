@@ -339,6 +339,15 @@ fn managed_skill(agent: AgentKind) -> &'static str {
 // resolve-primary framing, the paid-plan `--max-cost` rule, the plan-approval
 // gate, the fixture skip-list, or the `keys` account/user semantics. The two
 // managed guidance documents below are assembled from these shared fragments.
+//
+// Recovery verbs (`plans rectify`, `plans cancel`) are deliberately absent.
+// Step 4 sends every agent to `cfctl guide <capability-id> --json` before it
+// acts, and the guide emits a Rectify stage — with the exact
+// `cfctl plans rectify <operation-id> --json` argv — for every mutating
+// capability. Routing through the guide is strictly better than naming the verb
+// here: the guide knows whether the capability mutates and arrives with the
+// operation id in hand. Restating it would add a contract bump, and with it a
+// stale-install sweep across four harnesses, to teach less.
 
 /// Fail-closed doctor contract: a doctor never launches a different PATH cfctl.
 pub const FRAGMENT_DOCTOR_TRUST: &str = "`cfctl doctor` and `cfctl agents doctor` trust the PATH build only when it resolves to the running executable; a missing or different PATH cfctl is never launched by the health check and is unhealthy, so invoke it directly with `cfctl version --json` when its self-reported identity is needed. Drifted managed instructions are also unhealthy.";
