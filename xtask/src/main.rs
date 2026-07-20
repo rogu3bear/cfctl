@@ -26,6 +26,11 @@ const RELEASE_TARGETS: [&str; 4] = [
     "x86_64-unknown-linux-musl",
 ];
 const MACOS_RELEASE_TARGETS: [&str; 2] = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
+/// The Linux target `verify` cross-builds. One representative musl arch is
+/// enough to prove libc/dependency portability of a change (the code is
+/// arch-independent; the libc is the variable); `release` still builds both
+/// musl arches reproducibly. Must be one of `RELEASE_TARGETS`.
+const VERIFY_CROSS_TARGET: &str = "x86_64-unknown-linux-musl";
 const CARGO_AUDITABLE_VERSION: &str = "0.7.5";
 
 #[derive(Debug, Parser)]
@@ -204,8 +209,56 @@ fn verify() -> Result<(), TaskError> {
     )?;
     verify_security_contract()?;
     verify_source_contract()?;
+    verify_cross_target()?;
     report_pre_push_registration();
     Ok(())
+}
+
+/// Cross-build the Linux (musl) ship target so a change that compiles on the
+/// macOS host but breaks the shipped Linux artifact is caught by `verify`, not
+/// at `release` on someone else's machine.
+///
+/// The rest of `verify` runs only host-native checks. The most dangerous blind
+/// spot that leaves is the credential layer: `cfctl-auth` selects a different
+/// keyring backend per OS (`apple-native` on macOS, `dbus-secret-service` on
+/// Linux), so its Linux path — including the vendored dbus C — never touches a
+/// compiler during a macOS-only `verify`. Remote CI is intentionally absent, so
+/// this local build is the only mechanism that proves the Linux target compiles
+/// and links before it ships.
+///
+/// Fails closed when the cross toolchain is missing. For a control plane that
+/// holds production credentials, "verified" must mean "verified on the targets
+/// it ships to"; a silently skipped cross-build would reintroduce exactly the
+/// gap this check exists to close. This proves the build, not runtime Secret
+/// Service behavior, which still requires a real Linux host.
+fn verify_cross_target() -> Result<(), TaskError> {
+    let installed = output("rustup", &["target", "list", "--installed"])?;
+    if !installed.lines().any(|line| line == VERIFY_CROSS_TARGET) {
+        return Err(TaskError::MissingRustTarget(VERIFY_CROSS_TARGET.to_owned()));
+    }
+    // cargo-zigbuild supplies the cross linker and C compiler (zig) that the
+    // vendored dbus build in cfctl-auth's Linux backend needs. Absent it, this
+    // check cannot run — and must not be quietly skipped.
+    output("cargo", &["zigbuild", "--help"]).map_err(|_| {
+        TaskError::Command(
+            "verify requires cargo-zigbuild for the Linux cross-target build; install it with \
+             `cargo install cargo-zigbuild --locked` and ensure `zig` is on PATH"
+                .to_owned(),
+        )
+    })?;
+    run(
+        "cargo",
+        &[
+            "zigbuild",
+            "--locked",
+            "-p",
+            "cfctl-cli",
+            "--bin",
+            "cfctl",
+            "--target",
+            VERIFY_CROSS_TARGET,
+        ],
+    )
 }
 
 /// Whether this checkout's tracked pre-push hook will actually run.
@@ -2608,9 +2661,10 @@ mod tests {
     };
 
     use super::{
-        PrePushRegistration, classify_pre_push_registration, expected_signed_release_file_names,
-        extract_cfctl_command_references, extract_cfctl_command_refs, extract_prose_command_refs,
-        is_declared_quarantine_path, is_forbidden_quarantine_consumer, parse_remote_tag_commit,
+        PrePushRegistration, RELEASE_TARGETS, VERIFY_CROSS_TARGET, classify_pre_push_registration,
+        expected_signed_release_file_names, extract_cfctl_command_references,
+        extract_cfctl_command_refs, extract_prose_command_refs, is_declared_quarantine_path,
+        is_forbidden_quarantine_consumer, is_linux_musl, parse_remote_tag_commit,
         release_build_driver, release_build_subcommand, release_tag_is_exact_version,
         render_linux_installer_text, repository_root, security_proof_commands,
         validate_codesign_details, validate_command_refs, validate_extracted_command_refs,
@@ -2980,6 +3034,22 @@ mod tests {
         );
         assert_eq!(release_build_subcommand("aarch64-apple-darwin"), "build");
         assert_eq!(release_build_subcommand("x86_64-apple-darwin"), "build");
+    }
+
+    #[test]
+    fn verify_cross_target_is_a_real_musl_release_target() {
+        // The verify-time cross-build must exercise a genuinely shipped Linux
+        // target through the zig cross-linker; otherwise it proves nothing about
+        // what release produces.
+        assert!(
+            RELEASE_TARGETS.contains(&VERIFY_CROSS_TARGET),
+            "verify cross target must be a release target"
+        );
+        assert!(
+            is_linux_musl(VERIFY_CROSS_TARGET),
+            "verify cross target must be a Linux musl target"
+        );
+        assert_eq!(release_build_subcommand(VERIFY_CROSS_TARGET), "zigbuild");
     }
 
     #[test]

@@ -23,10 +23,38 @@ documentation, and evidence model agree.
 - Workspace discovery stays inside explicitly registered roots. Preserve
   unrelated dirty work and report exact local diffs.
 
+## Dependency policy
+
+`cfctl` holds production Cloudflare credentials and authorizes production
+mutations. For a tool with that blast radius, "up to date" is not the goal —
+"the trust boundary is provably intact on every target it ships to" is. Every
+dependency is both behavior-change surface and attack surface, so upgrades are
+governed by risk, not recency.
+
+- **Security-layer dependencies** — anything in the credential, crypto, or TLS
+  path (`keyring*`, `*secret-service*`, `rustls`/`*-tls`, `sha2`, `oauth2`,
+  `reqwest`, and the crates they pull into `cfctl-auth`) — upgrade **in
+  isolation, one per change**, never bundled with unrelated maintenance. Each
+  such change is reviewed on its own, must pass the `verify` Linux cross-build,
+  and, when it alters credential storage or retrieval, is not considered shipped
+  until its behavior is verified on a real Linux Secret Service host — the macOS
+  proof lane cannot exercise that path. Currency alone is never sufficient
+  justification; name the concrete driver (CVE, required feature, upstream drop).
+- **Leaf and maintenance dependencies** — everything else — may be upgraded in
+  routine batches, gated by `cargo xtask verify` (which now includes the Linux
+  cross-build). A blanket "make it current" sweep is allowed here and only here.
+
+The failure this policy prevents is a credential-layer rewrite riding into a
+release on the confidence earned by a pile of harmless leaf bumps. Keep the two
+lanes separate so a reviewer can see the risky change alone.
+
 ## Development setup
 
-Rust 1.97 is pinned by the repository. Install `cargo-deny` and Gitleaks for
-the local proof lane, then orient through the public CLI:
+Rust 1.97 is pinned by the repository. The local proof lane needs `cargo-deny`
+and Gitleaks, and — because `cargo xtask verify` cross-builds the Linux ship
+target — `zig` with `cargo-zigbuild` and the `x86_64-unknown-linux-musl` Rust
+target. `verify` fails closed when the cross toolchain is absent rather than
+skipping the Linux build. Install them, then orient through the public CLI:
 
 ```bash
 ./bootstrap.sh
