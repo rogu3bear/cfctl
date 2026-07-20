@@ -10,6 +10,7 @@ repository.workspace = true
 base64.workspace = true
 chrono.workspace = true
 directories.workspace = true
+keyring-core = "1.0.0"
 oauth2 = { workspace = true, features = ["reqwest", "rustls-tls"] }
 rand.workspace = true
 reqwest.workspace = true
@@ -20,11 +21,15 @@ thiserror.workspace = true
 url.workspace = true
 uuid.workspace = true
 
+# keyring 4.x splits the facade from the backends. Upstream directs apps that
+# choose their own per-platform store to link keyring-core plus the specific
+# store crates, rather than the `v1` bundle (which hardcodes async zbus on
+# Linux). We keep the sync Secret Service backend deliberately.
 [target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+apple-native-keyring-store = { version = "1.0.1", features = ["keychain"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust", "vendored"] }
+dbus-secret-service-keyring-store = { version = "1.0.0", features = ["crypto-rust", "vendored"] }
 
 [dev-dependencies]
 tempfile.workspace = true

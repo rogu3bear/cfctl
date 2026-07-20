@@ -9,7 +9,7 @@ use std::{
     fmt, fs,
     io::Write as _,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
 };
 
 use chrono::{DateTime, Duration, Utc};
@@ -439,34 +439,54 @@ impl SecretStore for MemorySecretStore {
 
 const KEYRING_SERVICE: &str = "io.cfctl.cfctl";
 
+/// keyring 4.x separates the facade from the backend: a credential store must
+/// be installed in the process before any entry is constructed. Install it
+/// once, and remember a failure so every later call reports the real reason
+/// instead of a bare `NoDefaultStore`.
+fn ensure_keyring_store() -> std::result::Result<(), String> {
+    static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        let store =
+            apple_native_keyring_store::keychain::Store::new().map_err(|it| it.to_string())?;
+        #[cfg(target_os = "linux")]
+        let store = dbus_secret_service_keyring_store::Store::new().map_err(|it| it.to_string())?;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        compile_error!("cfctl-auth supports the platform keyring on macOS and Linux only");
+        keyring_core::set_default_store(store);
+        Ok(())
+    })
+    .clone()
+}
+
+fn keyring_entry(key: &str) -> Result<keyring_core::Entry> {
+    ensure_keyring_store().map_err(AuthError::SecretStore)?;
+    keyring_core::Entry::new(KEYRING_SERVICE, key)
+        .map_err(|error| AuthError::SecretStore(error.to_string()))
+}
+
 /// Direct platform keyring access (macOS Keychain, Linux Secret Service).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KeyringSecretStore;
 
 impl SecretStore for KeyringSecretStore {
     fn put(&self, key: &str, value: &str) -> Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, key)
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-        entry
+        keyring_entry(key)?
             .set_password(value)
             .map_err(|error| AuthError::SecretStore(error.to_string()))
     }
 
     fn get(&self, key: &str) -> Result<Option<String>> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, key)
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-        match entry.get_password() {
+        match keyring_entry(key)?.get_password() {
             Ok(value) => Ok(Some(value)),
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
             Err(error) => Err(AuthError::SecretStore(error.to_string())),
         }
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, key)
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        match keyring_entry(key)?.delete_credential() {
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(error) => Err(AuthError::SecretStore(error.to_string())),
         }
     }
