@@ -1,7 +1,7 @@
 //! OAuth, profile, account selection, and secret-store contracts.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::{Rng as _, distr::Alphanumeric};
+use rand::{RngExt as _, distr::Alphanumeric};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::{

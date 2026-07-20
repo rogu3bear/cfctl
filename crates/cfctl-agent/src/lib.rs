@@ -271,7 +271,7 @@ fn legacy_codex_skill(home: &Path, agent: AgentKind) -> Result<Option<(PathBuf, 
         return Ok(None);
     }
     let bytes = fs::read(&path).map_err(|source| agent_io(&path, source))?;
-    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let digest = hex::encode(Sha256::digest(&bytes));
     if digest != LEGACY_CODEX_SKILL_V2_SHA256 {
         return Err(AgentError::LegacyDrift(path.display().to_string()));
     }
