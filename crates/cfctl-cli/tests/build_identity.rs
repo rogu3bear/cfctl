@@ -11,10 +11,28 @@ use cfctl_cli::{
 };
 const COMMIT_A: &str = "0123456789abcdef0123456789abcdef01234567";
 
+/// Builds a `git` invocation that cannot see the caller's git environment.
+///
+/// `current_dir` is not enough. Git resolves `GIT_DIR` before the working
+/// directory, so a test that shells out to git while one is exported operates
+/// on the caller's repository instead of its own fixture. That happens for real
+/// whenever the suite runs under a pre-push hook, and in a linked worktree the
+/// exported `GIT_DIR` shares the main repository's config file — so `git init`
+/// against a temporary directory rewrote that config and left the developer's
+/// actual repository marked `core.bare = true`.
+fn git_command(repository: &Path, arguments: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(repository).args(arguments);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command
+}
+
 fn git(repository: &Path, arguments: &[&str]) {
-    let status = Command::new("git")
-        .current_dir(repository)
-        .args(arguments)
+    let status = git_command(repository, arguments)
         .status()
         .expect("run git");
     assert!(status.success(), "git {arguments:?}");
@@ -51,9 +69,7 @@ fn clean_checkout_fallback_binds_head_and_dirty_checkout_is_unknown() {
     fs::write(repository.path().join("tracked"), "clean\n").expect("write tracked file");
     git(repository.path(), &["add", "tracked"]);
     git(repository.path(), &["commit", "--quiet", "-m", "initial"]);
-    let expected = Command::new("git")
-        .current_dir(repository.path())
-        .args(["rev-parse", "HEAD"])
+    let expected = git_command(repository.path(), &["rev-parse", "HEAD"])
         .output()
         .expect("read HEAD");
     let expected = String::from_utf8(expected.stdout)
@@ -164,4 +180,30 @@ fn doctor_accepts_a_path_symlink_to_the_running_cfctl() {
 
     assert_eq!(envelope["result"]["path_build"]["state"], "current");
     assert_eq!(envelope["result"]["path_build"]["healthy"], true);
+}
+
+/// Pins the sanitization itself, because its absence is silent: the suite still
+/// passes from a normal shell and only corrupts a repository when it runs under
+/// a git hook, which is exactly where nobody is watching.
+#[test]
+fn git_fixtures_never_inherit_the_callers_git_environment() {
+    let command = git_command(Path::new("/not-used"), &["status"]);
+    let removed: Vec<_> = command
+        .get_envs()
+        .filter(|(_, value)| value.is_none())
+        .map(|(key, _)| key.to_string_lossy().into_owned())
+        .collect();
+
+    for leaked in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+        if std::env::var_os(leaked).is_some() {
+            assert!(
+                removed.iter().any(|key| key == leaked),
+                "{leaked} is set in this environment and must be cleared for git fixtures"
+            );
+        }
+    }
+    assert!(
+        removed.iter().all(|key| key.starts_with("GIT_")),
+        "only git variables should be cleared: {removed:?}"
+    );
 }
