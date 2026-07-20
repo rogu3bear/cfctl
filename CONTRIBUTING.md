@@ -106,16 +106,9 @@ regardless of which file it lives in.
 
 ## Extending the runtime
 
-- Public contracts and redaction: `crates/cfctl-core`
-- Credentials and profiles: `crates/cfctl-auth`
-- API/schema/docs/CLI ingestion: `crates/cfctl-catalog`
-- Cloudflare HTTP execution: `crates/cfctl-cloudflare`
-- Risk, cost, approval, and impact: `crates/cfctl-planner`
-- Registered-root and IaC discovery: `crates/cfctl-workspace`
-- Agent installation and handoff: `crates/cfctl-agent`
-- Plans, locks, imports, and evidence: `crates/cfctl-storage`
-- Public parsing and orchestration: `crates/cfctl-cli`
-- Verification and release assembly: `xtask`
+Crate boundaries decide where a change belongs. `docs/v2-architecture.md`
+carries the table with each crate's boundary; this file does not restate it,
+because a second copy is a second thing to keep true.
 
 ## Release lanes
 

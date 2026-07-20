@@ -472,7 +472,11 @@ preview, apply, and post-change verification evidence.
   field from a document carrying a secret value; it touches a load-bearing
   invariant used at 15 sites and is deferred to its own change. Until then,
   `access-applications-add-an-application` reports governed in the catalog but
-  fails at plan storage.
+  fails at plan storage. Governing that capability did not change this: the
+  curated contract sets risk, cost, verification, and rollback but deliberately
+  leaves `request_schema` as the live-synced upstream schema, which is where the
+  property names come from. Only Access *service token* create and update carry
+  hand-curated request schemas, which is why they plan and these do not.
 
 - **Arbitrary KV namespace deletion stays blocked.**
   `workers-kv-namespace-remove-a-namespace` cannot be called directly: Cloudflare

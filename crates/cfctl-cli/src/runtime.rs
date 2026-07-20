@@ -10041,17 +10041,32 @@ fn agents_command(store: &StateStore, command: AgentsCommand) -> Result<ResultEn
             .with_evidence(evidence))
         }
         AgentsCommand::Sync => {
-            let receipts = AgentKind::all()
-                .into_iter()
-                .filter(|agent| {
+            // Sync replaces what is already installed; creating a missing
+            // integration is `agents install`. Naming the agents it passed over
+            // matters because the silent case is the confusing one: an operator
+            // who runs sync to fix a missing skill would otherwise read
+            // "synchronized" and believe it was done.
+            let (present, skipped): (Vec<_>, Vec<_>) =
+                AgentKind::all().into_iter().partition(|agent| {
                     inspect_agent(&home, *agent, which::which(agent.program()).is_ok())
                         .skill_present
-                })
+                });
+            let receipts = present
+                .into_iter()
                 .map(|agent| install_agent_skill(&home, agent, InstallMode::Sync))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            let skipped: Vec<_> = skipped.into_iter().map(AgentKind::label).collect();
+            let message = if skipped.is_empty() {
+                "Existing managed integrations synchronized.".to_owned()
+            } else {
+                format!(
+                    "Existing managed integrations synchronized. No managed instructions are installed for {}; run `cfctl agents install` to add them.",
+                    skipped.join(", ")
+                )
+            };
             Ok(ResultEnvelopeV2::success(
                 "agents sync",
-                json!({"receipts": receipts, "message": "Existing managed integrations synchronized."}),
+                json!({"receipts": receipts, "skipped_agents": skipped, "message": message}),
             ))
         }
         AgentsCommand::Doctor => {
