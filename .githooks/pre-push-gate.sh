@@ -42,7 +42,17 @@ echo "pre-push: running cargo xtask verify for $(git rev-parse --short HEAD)..."
 # has produced a false green in this repo before.
 log="$(mktemp -t cfctl-pre-push-gate)"
 set +e
-cargo xtask verify >"$log" 2>&1
+# Git exports GIT_DIR and friends into hooks. Left in place they reach every
+# subprocess the gate starts, including tests that create their own throwaway
+# repositories — and a `git init` that silently retargets at the exported
+# GIT_DIR rewrites this repository's config instead. From a linked worktree the
+# exported path shares the main repository's config file, so that mistake marks
+# the real repository bare. The gate resolved its own root above; nothing past
+# this point should inherit the hook's git context.
+env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+  -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+  -u GIT_PREFIX -u GIT_QUARANTINE_PATH -u GIT_CEILING_DIRECTORIES \
+  cargo xtask verify >"$log" 2>&1
 verify_exit=$?
 set -e
 
