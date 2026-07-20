@@ -316,36 +316,58 @@ fn managed_skill(agent: AgentKind) -> &'static str {
 // managed guidance documents below are assembled from these shared fragments.
 
 /// Fail-closed doctor contract: a doctor never launches a different PATH cfctl.
-const FRAGMENT_DOCTOR_TRUST: &str = "`cfctl doctor` and `cfctl agents doctor` trust the PATH build only when it resolves to the running executable; a missing or different PATH cfctl is never launched by the health check and is unhealthy, so invoke it directly with `cfctl version --json` when its self-reported identity is needed. Drifted managed instructions are also unhealthy.";
+pub const FRAGMENT_DOCTOR_TRUST: &str = "`cfctl doctor` and `cfctl agents doctor` trust the PATH build only when it resolves to the running executable; a missing or different PATH cfctl is never launched by the health check and is unhealthy, so invoke it directly with `cfctl version --json` when its self-reported identity is needed. Drifted managed instructions are also unhealthy.";
 
 /// Resolve is the primary intent-to-capability translation; browsing is secondary.
-const FRAGMENT_RESOLVE_PRIMARY: &str = r#"Translate intent with `cfctl resolve "<intent>" --json`: it deterministically maps the goal to a capability and emits the exact governed `call`/`approve`/`run` commands, and fails closed with ranked candidates when the match is ambiguous. To browse instead, use `cfctl catalog search "<intent>" --json`."#;
+pub const FRAGMENT_RESOLVE_PRIMARY: &str = r#"Translate intent with `cfctl resolve "<intent>" --json`: it deterministically maps the goal to a capability and emits the exact governed `call`/`approve`/`run` commands, and fails closed with ranked candidates when the match is ambiguous. To browse instead, use `cfctl catalog search "<intent>" --json`."#;
 
 /// Registered-root discovery skips nested fixture trees.
-const FRAGMENT_FIXTURE_SKIP: &str = "Nested `fixtures`, `__fixtures__`, `testdata`, `test-data`, and `test_data` directories are skipped; fixture directories are opt-in roots and must be registered directly when they are intentional workspace evidence.";
+pub const FRAGMENT_FIXTURE_SKIP: &str = "Nested `fixtures`, `__fixtures__`, `testdata`, `test-data`, and `test_data` directories are skipped; fixture directories are opt-in roots and must be registered directly when they are intentional workspace evidence.";
 
 /// The exact plan-approval command that a reviewed yes maps to.
-const FRAGMENT_APPROVE_COMMAND: &str = "`cfctl plans approve <operation-id> --yes`";
+pub const FRAGMENT_APPROVE_COMMAND: &str = "`cfctl plans approve <operation-id> --yes`";
 
 /// The paid-plan cost ceiling that both documents must carry.
-const FRAGMENT_MAX_COST: &str =
+pub const FRAGMENT_MAX_COST: &str =
     "Paid plans also require the reviewed `--max-cost CURRENCY:AMOUNT`.";
 
 /// Account- vs user-owned permission inventory semantics.
-const FRAGMENT_KEYS_INVENTORY: &str = "Read account-owned permission inventory with `cfctl keys permissions --account <account-id> --json`. For user-owned inventory use `cfctl keys permissions --user --account <account-id> --json`; `--user` changes the endpoint, not the explicit account resource context.";
+pub const FRAGMENT_KEYS_INVENTORY: &str = "Read account-owned permission inventory with `cfctl keys permissions --account <account-id> --json`. For user-owned inventory use `cfctl keys permissions --user --account <account-id> --json`; `--user` changes the endpoint, not the explicit account resource context.";
 
 /// Standing-authority ceremony: bounded policy, explicit approval, immediate revoke.
-const FRAGMENT_STANDING_AUTHORITY: &str = "For recurring token-lifecycle work, first load `cfctl guide --topic standing-authority --json`, then activate a reviewed standing policy only after explicit approval with `cfctl keys policy approve <authority-id> --yes`. Standing approval moves authority to that bounded policy; it is not blanket mutation authority. Revoke standing authority with `cfctl keys policy revoke <authority-id>` and treat the policy as unusable immediately.";
+pub const FRAGMENT_STANDING_AUTHORITY: &str = "For recurring token-lifecycle work, first load `cfctl guide --topic standing-authority --json`, then activate a reviewed standing policy only after explicit approval with `cfctl keys policy approve <authority-id> --yes`. Standing approval moves authority to that bounded policy; it is not blanket mutation authority. Revoke standing authority with `cfctl keys policy revoke <authority-id>` and treat the policy as unusable immediately.";
 
 /// Blocked-capability route: follow the guide's next action, never route around it.
-const FRAGMENT_BLOCKED_ROUTE: &str = "When a capability or plan is blocked (`adapter_status: blocked`, `contract_state: blocked`, or error code `CFCTL_CAPABILITY_BLOCKED`), run `cfctl guide <capability-id> --json` and follow its `next_action` exactly. Satisfy the named contract gap or extend cfctl; never route around a blocker with raw HTTP, Wrangler, or the dashboard. If next_action cannot resolve the gap, stop and report the capability id, `blocking_gaps`, and the guide output to the operator.";
+pub const FRAGMENT_BLOCKED_ROUTE: &str = "When a capability or plan is blocked (`adapter_status: blocked`, `contract_state: blocked`, or error code `CFCTL_CAPABILITY_BLOCKED`), run `cfctl guide <capability-id> --json` and follow its `next_action` exactly. Satisfy the named contract gap or extend cfctl; never route around a blocker with raw HTTP, Wrangler, or the dashboard. If next_action cannot resolve the gap, stop and report the capability id, `blocking_gaps`, and the guide output to the operator.";
+
+/// Every shared doctrine fragment, in document order. Tests iterate this rather
+/// than restating the fragment bodies, so a fragment added above is covered the
+/// moment it exists instead of the moment somebody remembers to assert it.
+pub const MANAGED_FRAGMENTS: &[&str] = &[
+    FRAGMENT_DOCTOR_TRUST,
+    FRAGMENT_RESOLVE_PRIMARY,
+    FRAGMENT_FIXTURE_SKIP,
+    FRAGMENT_APPROVE_COMMAND,
+    FRAGMENT_MAX_COST,
+    FRAGMENT_KEYS_INVENTORY,
+    FRAGMENT_STANDING_AUTHORITY,
+    FRAGMENT_BLOCKED_ROUTE,
+];
+
+/// The managed-skill contract number carried in the installed front matter.
+/// Bump this when the installed document's contract changes; `agents doctor`
+/// compares whole strings, so every install goes stale on purpose when it moves.
+pub const MANAGED_SKILL_CONTRACT: u32 = 4;
 
 static MANAGED_OPERATOR_SKILL: LazyLock<String> = LazyLock::new(build_managed_operator_skill);
 static MANAGED_CURSOR_RULE: LazyLock<String> = LazyLock::new(build_managed_cursor_rule);
 
 fn build_managed_operator_skill() -> String {
+    let header = format!(
+        "---\nname: cfctl\ndescription: Use cfctl as the universal governed Cloudflare control plane.\nmetadata:\n  managed-by: cfctl\n  contract: {MANAGED_SKILL_CONTRACT}\n---\n\n# Cloudflare through cfctl\n\nUse `cfctl` first for all Cloudflare discovery, reads, planning, writes, verification, and evidence. Do not use archived shell verbs, backend script paths as the public surface, or raw HTTP as a substitute for cataloged capabilities.\n\n1. Orient with `cfctl version --json`, `cfctl guide --topic system --json`, `cfctl doctor --json`, and, when useful, `cfctl agents doctor --json`. "
+    );
     [
-        "---\nname: cfctl\ndescription: Use cfctl as the universal governed Cloudflare control plane.\nmetadata:\n  managed-by: cfctl\n  contract: 4\n---\n\n# Cloudflare through cfctl\n\nUse `cfctl` first for all Cloudflare discovery, reads, planning, writes, verification, and evidence. Do not use archived shell verbs, backend script paths as the public surface, or raw HTTP as a substitute for cataloged capabilities.\n\n1. Orient with `cfctl version --json`, `cfctl guide --topic system --json`, `cfctl doctor --json`, and, when useful, `cfctl agents doctor --json`. ",
+        header.as_str(),
         FRAGMENT_DOCTOR_TRUST,
         "\n2. ",
         FRAGMENT_RESOLVE_PRIMARY,

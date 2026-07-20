@@ -629,6 +629,18 @@ pub struct CapabilityV1 {
     pub response_contract: Option<ResponseContractV1>,
 }
 
+/// Cloudflare's DNS record detail path. This is wire contract, not a local
+/// naming choice: the catalog derives the read capability from it, the planner
+/// pins it as a rollback and same-path-read target, and the executor builds
+/// verification readbacks against it. It lives here so those four crates bind
+/// one authority instead of four literals.
+pub const DNS_RECORD_DETAIL_PATH: &str = "/zones/{zone_id}/dns_records/{dns_record_id}";
+
+/// The capability id the catalog derives for [`DNS_RECORD_DETAIL_PATH`]. Pinned
+/// by `dns_record_detail_constants_pin_the_wire_contract`; every consumer reads
+/// this constant rather than restating the slug.
+pub const DNS_RECORD_DETAIL_READ_CAPABILITY_ID: &str = "dns-records-for-a-zone-dns-record-details";
+
 impl CapabilityV1 {
     #[must_use]
     pub fn new(id: &str, title: &str, method: &str, path: &str) -> Self {
@@ -1092,16 +1104,15 @@ impl CapabilityV1 {
                     ("dns-records-for-a-zone-update-dns-record", "PUT")
                         | ("dns-records-for-a-zone-patch-dns-record", "PATCH")
                 ) && self.product == "DNS Records for a Zone"
-                    && self.path == "/zones/{zone_id}/dns_records/{dns_record_id}"
+                    && self.path == DNS_RECORD_DETAIL_PATH
                     && self.account_scope == "zone"
                     && self.verification.strategy
                         == "dns_record_details_match_planned_id_and_fields"
                     && self.verification_contract_supported()
                     && dns_record_update_request_contract_supported(self)
                     && self.same_path_read.as_ref().is_some_and(|read| {
-                        read.path == "/zones/{zone_id}/dns_records/{dns_record_id}"
-                            && read.read_capability_id
-                                == "dns-records-for-a-zone-dns-record-details"
+                        read.path == DNS_RECORD_DETAIL_PATH
+                            && read.read_capability_id == DNS_RECORD_DETAIL_READ_CAPABILITY_ID
                             && read.verified_response_fields
                                 == [
                                     "comment",
@@ -1656,6 +1667,25 @@ pub const SECRET_FIELD_NAMES: &[&str] = &[
     "secretAccessKey",
     "sessionToken",
 ];
+
+/// The subset of [`SECRET_FIELD_NAMES`] whose keys carry a single opaque secret
+/// string that `find_secret_value` in `cfctl-cli` extracts for a `--value-out`
+/// sink.
+///
+/// The six excluded names are excluded deliberately, and widening this to the
+/// full set would be a bug rather than a hardening:
+/// - `accessKeyId`/`secretAccessKey`/`sessionToken` and the Access
+///   `client_id`/`client_secret` pair are multi-field credential bundles that
+///   dedicated extractors emit before the generic scan is ever reached.
+/// - `text`/`key_base64`/`key_jwk` are worker-secret *request* fields. That
+///   capability is write-only input, never a secret-output read, so matching
+///   them here could only latch onto an unrelated response field of the same
+///   name.
+///
+/// `secret_sink_value_keys_are_a_subset_of_secret_field_names` binds this to the
+/// redaction set: everything extractable is redactable, but not the reverse.
+pub const SECRET_SINK_VALUE_KEYS: &[&str] =
+    &["value", "token", "secret", "access_token", "client_secret"];
 
 /// Returns whether an RFC 6901 JSON pointer's leaf segment names a known secret
 /// field. Used as a fail-closed guard so a drifted catalog identity pointer can

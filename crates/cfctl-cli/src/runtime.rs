@@ -2426,8 +2426,8 @@ const WEB_ANALYTICS_RUM_MUTATION_CAPABILITY_ID: &str = "web-analytics-toggle-rum
 const WEB_ANALYTICS_RUM_READ_CAPABILITY_ID: &str = "web-analytics-get-rum-status";
 const WEB_ANALYTICS_RUM_PATH: &str = "/zones/{zone_id}/settings/rum";
 const WEB_ANALYTICS_RUM_STATE_PRECONDITION: &str = "web_analytics_rum_state";
-const DNS_RECORD_DETAIL_READ_CAPABILITY_ID: &str = "dns-records-for-a-zone-dns-record-details";
-const DNS_RECORD_DETAIL_PATH: &str = "/zones/{zone_id}/dns_records/{dns_record_id}";
+const DNS_RECORD_DETAIL_READ_CAPABILITY_ID: &str = cfctl_core::DNS_RECORD_DETAIL_READ_CAPABILITY_ID;
+const DNS_RECORD_DETAIL_PATH: &str = cfctl_core::DNS_RECORD_DETAIL_PATH;
 const DNS_RECORD_STATE_PRECONDITION: &str = "dns_record_state";
 const DNS_RECORD_RESTORE_CAPABILITY_ID: &str = "dns-records-for-a-zone-update-dns-record";
 const OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID: &str = "oauth-clients-get";
@@ -9194,7 +9194,7 @@ fn created_resource_compensation_target(
             (
                 "dns-records-for-a-zone-delete-dns-record".to_owned(),
                 "DELETE".to_owned(),
-                "/zones/{zone_id}/dns_records/{dns_record_id}".to_owned(),
+                DNS_RECORD_DETAIL_PATH.to_owned(),
                 json!({"zone_id": zone_id, "dns_record_id": resource_id}),
                 None,
             )
@@ -12105,7 +12105,7 @@ fn find_secret_value(value: &Value) -> Option<&str> {
         return Some(value);
     }
     if let Some(object) = value.as_object() {
-        for key in ["value", "token", "secret", "access_token", "client_secret"] {
+        for key in cfctl_core::SECRET_SINK_VALUE_KEYS.iter().copied() {
             if let Some(candidate) = object.get(key) {
                 if let Some(value) = candidate.as_str() {
                     return Some(value);
@@ -12343,7 +12343,8 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        CallInput, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
+        CallInput, DNS_RECORD_DETAIL_PATH, DNS_RECORD_DETAIL_READ_CAPABILITY_ID,
+        DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
         OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, TokenPolicyBinding,
         admit_standing_plan, apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
@@ -13375,12 +13376,8 @@ mod tests {
         } else {
             "dns-records-for-a-zone-patch-dns-record"
         };
-        let mut capability = CapabilityV1::new(
-            id,
-            "Update DNS Record",
-            method,
-            "/zones/{zone_id}/dns_records/{dns_record_id}",
-        );
+        let mut capability =
+            CapabilityV1::new(id, "Update DNS Record", method, DNS_RECORD_DETAIL_PATH);
         capability.mutating = true;
         capability.account_scope = "zone".to_owned();
         capability.adapter_status = AdapterStatus::DynamicApi;
@@ -13439,8 +13436,8 @@ mod tests {
         capability.verification.strategy =
             "dns_record_details_match_planned_id_and_fields".to_owned();
         capability.same_path_read = Some(SamePathReadContractV1 {
-            path: "/zones/{zone_id}/dns_records/{dns_record_id}".to_owned(),
-            read_capability_id: "dns-records-for-a-zone-dns-record-details".to_owned(),
+            path: DNS_RECORD_DETAIL_PATH.to_owned(),
+            read_capability_id: DNS_RECORD_DETAIL_READ_CAPABILITY_ID.to_owned(),
             verified_response_fields: [
                 "comment",
                 "content",
@@ -13530,8 +13527,8 @@ mod tests {
         let capability = dns_record_update_capability("PATCH");
         let receipt = json!({
             "schema_version":1,
-            "source_capability_id":"dns-records-for-a-zone-dns-record-details",
-            "source_path":"/zones/{zone_id}/dns_records/{dns_record_id}",
+            "source_capability_id": DNS_RECORD_DETAIL_READ_CAPABILITY_ID,
+            "source_path": DNS_RECORD_DETAIL_PATH,
             "target_capability_id":"dns-records-for-a-zone-patch-dns-record",
             "target_method":"PATCH",
             "target_scope":"zone",
@@ -15185,8 +15182,8 @@ mod tests {
         };
         let receipt = json!({
             "schema_version":1,
-            "source_capability_id":"dns-records-for-a-zone-dns-record-details",
-            "source_path":"/zones/{zone_id}/dns_records/{dns_record_id}",
+            "source_capability_id": DNS_RECORD_DETAIL_READ_CAPABILITY_ID,
+            "source_path": DNS_RECORD_DETAIL_PATH,
             "target_capability_id":"dns-records-for-a-zone-patch-dns-record",
             "target_method":"PATCH",
             "target_scope":"zone",
@@ -15602,8 +15599,8 @@ mod tests {
         let capability = dns_record_update_capability("PATCH");
         let receipt = json!({
             "schema_version":1,
-            "source_capability_id":"dns-records-for-a-zone-dns-record-details",
-            "source_path":"/zones/{zone_id}/dns_records/{dns_record_id}",
+            "source_capability_id": DNS_RECORD_DETAIL_READ_CAPABILITY_ID,
+            "source_path": DNS_RECORD_DETAIL_PATH,
             "target_capability_id":"dns-records-for-a-zone-patch-dns-record",
             "target_method":"PATCH",
             "target_scope":"zone",
@@ -15663,10 +15660,7 @@ mod tests {
             "dns-records-for-a-zone-update-dns-record"
         );
         assert_eq!(request.expected_method, "PUT");
-        assert_eq!(
-            request.expected_path,
-            "/zones/{zone_id}/dns_records/{dns_record_id}"
-        );
+        assert_eq!(request.expected_path, DNS_RECORD_DETAIL_PATH);
         assert_eq!(
             request.input.selectors,
             json!({"zone_id":"zone-a","dns_record_id":"record-a"})
@@ -15811,7 +15805,7 @@ mod tests {
             json!([
                 "cfctl",
                 "call",
-                "dns-records-for-a-zone-dns-record-details",
+                DNS_RECORD_DETAIL_READ_CAPABILITY_ID,
                 "--selector",
                 "zone_id=<zone_id>",
                 "--selector",

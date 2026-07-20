@@ -699,7 +699,7 @@ impl Executor {
             "dns-record-verification-readback",
             "DNS record verification readback",
             "GET",
-            "/zones/{zone_id}/dns_records/{dns_record_id}",
+            cfctl_core::DNS_RECORD_DETAIL_PATH,
         );
         let request = self.builder.build(
             &details,

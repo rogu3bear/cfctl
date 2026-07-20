@@ -240,7 +240,10 @@ bodies ingest completely (name, status, policies, condition, expiry), but
 token mutation is reserved to the inventory-bound `keys` workflow so every
 permission change is resolved against a fresh live permission inventory and
 hash-bound. A generic update path would bypass that governance, so it is not
-promoted.
+promoted. The catalog now says this machine-readably: both capabilities carry a
+`blocked_reason` beginning `blocked by design:`, which is deliberately not the
+`operation contract incomplete:` prefix used for schema gaps. Supplying risk,
+effect, and cost would not unblock them, and a catalog resync cannot.
 
 ```bash
 cfctl keys permissions --account <account-id> --json

@@ -121,26 +121,41 @@ fn cursor_guidance_preserves_plan_approval_and_explains_standing_policy_ceremony
 
 /// The shared doctrine fragments are single-sourced, so every load-bearing
 /// line must appear verbatim in both the operator skill and the Cursor rule.
+///
+/// This iterates the exported fragment list rather than a hand-copied set of
+/// substrings: a fragment added to the builders is covered the moment it
+/// exists, instead of the moment somebody remembers to assert it here.
 #[test]
 fn shared_doctrine_is_identical_across_the_skill_and_cursor_rule() {
     let root = tempfile::tempdir().expect("agent home");
     let skill = install_and_read(root.path(), AgentKind::Codex);
     let cursor = install_and_read(root.path(), AgentKind::Cursor);
-    for fragment in [
-        "cfctl resolve \"<intent>\" --json",
-        "Paid plans also require the reviewed `--max-cost CURRENCY:AMOUNT`.",
-        "`cfctl plans approve <operation-id> --yes`",
-        "fixture directories are opt-in roots",
-        "cfctl keys permissions --user --account <account-id> --json",
-        "cfctl guide --topic standing-authority --json",
-        "CFCTL_CAPABILITY_BLOCKED",
-    ] {
+    assert!(
+        !cfctl_agent::MANAGED_FRAGMENTS.is_empty(),
+        "the fragment list must not be empty or this test proves nothing"
+    );
+    for fragment in cfctl_agent::MANAGED_FRAGMENTS {
         assert!(
             skill.contains(fragment),
             "operator skill missing: {fragment}"
         );
         assert!(cursor.contains(fragment), "cursor rule missing: {fragment}");
     }
+}
+
+/// The installed front matter's contract number derives from the exported
+/// constant. Both assertions are load-bearing: the formatted one catches a
+/// builder that stopped using the constant, the literal one catches a constant
+/// bumped without intending every install to go stale.
+#[test]
+fn managed_skill_contract_header_is_single_sourced() {
+    let root = tempfile::tempdir().expect("agent home");
+    let skill = install_and_read(root.path(), AgentKind::Codex);
+    assert!(skill.contains(&format!(
+        "contract: {}",
+        cfctl_agent::MANAGED_SKILL_CONTRACT
+    )));
+    assert!(skill.contains("contract: 4"));
 }
 
 fn install_and_read(home: &std::path::Path, agent: AgentKind) -> String {

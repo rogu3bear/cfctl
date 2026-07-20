@@ -63,8 +63,10 @@ checks, `cargo deny check`, and a full-history Gitleaks scan.
 
 `deny.toml` denies yanked crates, unreviewed licenses, unknown registries and
 Git sources, and wildcard dependency requirements. Internal path dependencies
-carry the exact workspace version. Duplicate transitive versions remain
-warnings with their dependency trees; they are not hidden by blanket skips.
+carry the exact workspace version, which the source-contract check enforces by
+equality — Cargo alone would accept a stale pin, because the bumped crate still
+satisfies it. Duplicate transitive versions remain warnings with their
+dependency trees; they are not hidden by blanket skips.
 
 `.gitleaksignore` may contain only exact reviewed fingerprints. Never suppress
 a whole rule, path, commit, or entropy class to make the gate green.
@@ -72,3 +74,7 @@ a whole rule, path, commit, or entropy class to make the gate green.
 These checks are local proof. They do not prove that an account mutation,
 signature, notarization, upload, deployment, domain verification, or OAuth
 promotion occurred.
+
+Releases are unsigned by operator decision: integrity is checksum-based, so
+verify every download against the release's `SHA256SUMS`. Each binary is
+reproducible from the tagged source and carries an SPDX SBOM.
