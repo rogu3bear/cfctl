@@ -10,7 +10,6 @@ repository.workspace = true
 base64.workspace = true
 chrono.workspace = true
 directories.workspace = true
-oauth2 = { workspace = true, features = ["reqwest", "rustls-tls"] }
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
