@@ -38,6 +38,9 @@ NORTH_STAR.md
 ANCHOR.md
 LAYERS.md
 NUANCE.md
+# Live-estate map: account structure and identifiers belong in a private
+# checkout, not in a public control-plane repository.
+WEB.md
 .agent-context-stack
 .agents/
 .agent/
