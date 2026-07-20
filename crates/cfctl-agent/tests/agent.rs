@@ -115,6 +115,34 @@ fn install_migrates_the_legacy_skill_when_the_managed_skill_is_absent() {
     );
 }
 
+/// A symlinked legacy directory points into shared infrastructure that another
+/// tool owns. Migrating must install the managed skill without reaching through
+/// the link to delete a file outside the agent home.
+#[test]
+fn install_leaves_a_symlinked_legacy_skill_in_its_shared_tree() {
+    let root = tempfile::tempdir().expect("agent home");
+    let shared = tempfile::tempdir().expect("shared tree");
+    let shared_skill = shared.path().join("cloudflare");
+    std::fs::create_dir_all(&shared_skill).expect("shared skill directory");
+    std::fs::write(shared_skill.join("SKILL.md"), legacy_managed_skill()).expect("legacy skill");
+    let skills = root.path().join(".agents/skills");
+    std::fs::create_dir_all(&skills).expect("skills directory");
+    std::os::unix::fs::symlink(&shared_skill, skills.join("cloudflare")).expect("symlink");
+
+    let receipt = install_agent_skill(root.path(), AgentKind::Codex, InstallMode::Install)
+        .expect("install succeeds beside a shared legacy skill");
+
+    assert!(receipt.path.is_file(), "the managed skill must be written");
+    assert!(
+        shared_skill.join("SKILL.md").is_file(),
+        "the shared tree must not be touched through the symlink"
+    );
+    assert!(
+        skills.join("cloudflare").exists(),
+        "the operator's symlink must not be left dangling"
+    );
+}
+
 /// Removability is decided by the frozen hash, never by the mode — a file cfctl
 /// did not write is preserved under install exactly as it is under sync.
 #[test]
