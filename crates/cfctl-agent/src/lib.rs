@@ -259,6 +259,17 @@ fn legacy_codex_skill(home: &Path, agent: AgentKind) -> Result<Option<(PathBuf, 
     if !path.is_file() {
         return Ok(None);
     }
+    // A symlinked parent means the file is not in the agent home cfctl
+    // manages — it is shared infrastructure that something else owns and other
+    // tools may link to. Deleting through the link would reach outside our own
+    // tree, so leave it: the managed skill installs beside it and the operator
+    // decides the superseded copy's fate.
+    if path
+        .parent()
+        .is_some_and(|parent| parent.symlink_metadata().is_ok_and(|it| it.is_symlink()))
+    {
+        return Ok(None);
+    }
     let bytes = fs::read(&path).map_err(|source| agent_io(&path, source))?;
     let digest = format!("{:x}", Sha256::digest(&bytes));
     if digest != LEGACY_CODEX_SKILL_V2_SHA256 {
@@ -273,11 +284,12 @@ fn remove_exact_legacy_skill(path: &Path, expected: &[u8]) -> Result<()> {
         return Err(AgentError::LegacyDrift(path.display().to_string()));
     }
     fs::remove_file(path).map_err(|source| agent_io(path, source))?;
-    if let Some(parent) = path.parent()
-        && let Err(source) = fs::remove_dir(parent)
-        && source.kind() != std::io::ErrorKind::DirectoryNotEmpty
-    {
-        return Err(agent_io(parent, source));
+    // Pruning the emptied directory is housekeeping, not the contract. The
+    // migration succeeded the moment the file was removed, so a directory that
+    // will not go away — non-empty, not ours, not a directory at all — must not
+    // turn a completed migration into a failed install.
+    if let Some(parent) = path.parent() {
+        let _ = fs::remove_dir(parent);
     }
     Ok(())
 }
