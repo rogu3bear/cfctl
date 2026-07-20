@@ -381,7 +381,7 @@ fn verify_workspace_contract() -> Result<(), TaskError> {
 /// clean, resolves clean, and ships a lie about which version the workspace
 /// depends on. Only an equality check bites.
 fn verify_workspace_dependency_versions() -> Result<(), TaskError> {
-    const EXPECTED_PINS: usize = 8;
+    const EXPECTED_PINS: usize = 9;
 
     let manifest_path = repository_root()?.join("Cargo.toml");
     let manifest =
@@ -766,6 +766,9 @@ fn validate_extracted_command_refs(
                 "{path} teaches non-v2 command `cfctl {verb}` outside compat/v1"
             )));
         }
+        // Flags are checked for every verb, including the leaf verbs the tree
+        // does not model — those carry a third of the flag surface.
+        validate_flags(path, &reference)?;
         // Verbs absent from the tree (`call`, `guide`, `resolve`, and the other
         // leaf verbs) take arguments rather than subcommands, so their trailing
         // tokens are not validated.
@@ -800,6 +803,60 @@ fn validate_extracted_command_refs(
     Ok(())
 }
 
+/// Validates the long flags a document teaches against the real clap parser.
+///
+/// Flags are checked against the parser rather than a declared list on purpose.
+/// Restating 33 flags across 30 nodes would be one more hand-synced copy of
+/// something clap already knows — and a third of them sit on verbs
+/// (`call`, `guide`, `resolve`, `update`) that the command tree deliberately
+/// does not model, because they take arguments rather than subcommands.
+fn validate_flags(path: &str, reference: &CfctlReference) -> Result<(), TaskError> {
+    use clap::CommandFactory as _;
+
+    if reference.flags.is_empty() {
+        return Ok(());
+    }
+    let root = cfctl_cli::Cli::command();
+    let Some(mut command) = root.find_subcommand(reference.verb.as_str()) else {
+        return Ok(());
+    };
+    // Descend as far as the tokens actually name subcommands; the rest are
+    // arguments, and their flags belong to the deepest command reached.
+    for token in &reference.path {
+        match command.find_subcommand(token.as_str()) {
+            Some(child) => command = child,
+            None => break,
+        }
+    }
+
+    let mut known: Vec<&str> = command
+        .get_arguments()
+        .filter_map(clap::Arg::get_long)
+        .collect();
+    // Root-level globals are legal everywhere but only live on the root of an
+    // unbuilt command tree, so they have to be added explicitly.
+    known.extend(
+        root.get_arguments()
+            .filter(|argument| argument.is_global_set())
+            .filter_map(clap::Arg::get_long),
+    );
+    known.extend(["help", "version"]);
+
+    for flag in &reference.flags {
+        if !known.contains(&flag.as_str()) {
+            let command_path = if reference.path.is_empty() {
+                reference.verb.clone()
+            } else {
+                format!("{} {}", reference.verb, reference.path.join(" "))
+            };
+            return Err(TaskError::InvalidSourceContract(format!(
+                "{path} teaches unknown flag `--{flag}` for `cfctl {command_path}` outside compat/v1"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// One extracted `cfctl` command reference: the top-level verb and, when the
 /// reference is a real invocation (not loose prose), the run of following
 /// tokens that plausibly name subcommands. The tree walk decides how many of
@@ -807,6 +864,7 @@ fn validate_extracted_command_refs(
 struct CfctlReference {
     verb: String,
     path: Vec<String>,
+    flags: Vec<String>,
 }
 
 #[cfg(test)]
@@ -979,7 +1037,9 @@ fn cfctl_command_ref_with_context(command: &str, command_context: bool) -> Optio
         .position(|token| matches!(*token, "cfctl" | "./cfctl"))?;
     let mut arguments = tokens.iter().skip(command_index + 1).copied();
     let mut verb = arguments.next()?;
+    let mut flags = Vec::new();
     while verb == "--json" {
+        flags.push("json".to_owned());
         verb = arguments.next()?;
     }
     if verb.starts_with(['\"', '\'', '<', '{']) || verb == "\\" {
@@ -995,10 +1055,26 @@ fn cfctl_command_ref_with_context(command: &str, command_context: bool) -> Optio
     // chain stops at the first token that is not — a capability id trailing
     // `cfctl call` reads as a plausible token, so the tree walk, not this
     // scanner, is what decides where arguments begin.
+    // Subcommand tokens run until the first token that is not one; every
+    // long flag on the line is collected regardless of where it appears, since
+    // flags may precede, follow, or be interleaved with arguments.
     let mut path = Vec::new();
     if command_context {
-        while let Some(token) = arguments.next().and_then(plausible_subcommand_token) {
-            path.push(token);
+        let mut in_subcommand_prefix = true;
+        for token in arguments {
+            if let Some(flag) = long_flag_token(token) {
+                // The first flag ends the subcommand prefix: what follows is
+                // that flag's value, not a deeper subcommand.
+                in_subcommand_prefix = false;
+                flags.push(flag);
+                continue;
+            }
+            if in_subcommand_prefix {
+                match plausible_subcommand_token(token) {
+                    Some(sub) => path.push(sub),
+                    None => in_subcommand_prefix = false,
+                }
+            }
         }
     }
 
@@ -1034,13 +1110,28 @@ fn cfctl_command_ref_with_context(command: &str, command_context: bool) -> Optio
     {
         return None;
     }
-    Some(CfctlReference { verb, path })
+    Some(CfctlReference { verb, path, flags })
 }
 
 /// Returns the token when it is plausibly a subcommand: a lowercase word of
 /// ASCII letters, digits, and hyphens. Flags (`--json`), placeholders (`<id>`),
 /// quoted arguments, dotted state paths, and prose punctuation are rejected so
 /// the second-token check never false-positives on non-subcommand tokens.
+/// Returns the flag name when the token is a long flag, so `--max-cost` and
+/// `--max-cost=USD:5` both yield `max-cost`. A bare `--` ends option parsing
+/// and names nothing; short flags do not exist on this surface.
+fn long_flag_token(token: &str) -> Option<String> {
+    let name = token.strip_prefix("--")?;
+    let name = name.split('=').next().unwrap_or_default();
+    let name = name.trim_matches(|character: char| {
+        !character.is_ascii_lowercase() && !character.is_ascii_digit() && character != '-'
+    });
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
 fn plausible_subcommand_token(token: &str) -> Option<String> {
     let first = token.chars().next()?;
     if !first.is_ascii_lowercase() {
@@ -2624,6 +2715,36 @@ mod tests {
         let references = extract_prose_command_refs(document, true, false);
         assert_eq!(references.len(), 1, "only the body command should extract");
         assert_eq!(references[0].verb, "doctor");
+    }
+
+    #[test]
+    fn flags_are_validated_against_the_real_parser() {
+        // A flag that does not exist must fail, including on the leaf verbs the
+        // command tree does not model.
+        for teaching in [
+            "```bash\ncfctl plans approve op-1 --yolo\n```\n",
+            "```bash\ncfctl call some-capability --selektor a=b\n```\n",
+        ] {
+            let error = validate_command_refs("docs/example.md", teaching)
+                .expect_err("an undeclared flag must be rejected");
+            assert!(
+                error.to_string().contains("unknown flag"),
+                "unexpected error: {error}"
+            );
+        }
+
+        // Real flags pass, in every form docs actually use them: attached
+        // values, the global before the verb, and flags on a leaf verb.
+        let valid = concat!(
+            "```bash\n",
+            "cfctl plans approve op-1 --yes --max-cost=USD:5.00\n",
+            "cfctl --json catalog search \"dns\" --limit 5\n",
+            "cfctl call some-capability --selector zone_id=z --value-out ./secret\n",
+            "cfctl keys mint --account acct --permission group --user\n",
+            "cfctl guide --topic system\n",
+            "```\n",
+        );
+        validate_command_refs("docs/example.md", valid).expect("real flags must pass");
     }
 
     #[test]

@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 cfctl-agent = { workspace = true }
+cfctl-cli = { workspace = true }
 cfctl-core = { workspace = true }
 clap.workspace = true
 hex.workspace = true

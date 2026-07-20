@@ -26,6 +26,7 @@ repository = "https://github.com/rogu3bear/cfctl"
 cfctl-agent = { path = "crates/cfctl-agent", version = "1.2.1" }
 cfctl-auth = { path = "crates/cfctl-auth", version = "1.2.1" }
 cfctl-catalog = { path = "crates/cfctl-catalog", version = "1.2.1" }
+cfctl-cli = { path = "crates/cfctl-cli", version = "1.2.1" }
 cfctl-cloudflare = { path = "crates/cfctl-cloudflare", version = "1.2.1" }
 cfctl-core = { path = "crates/cfctl-core", version = "1.2.1" }
 cfctl-planner = { path = "crates/cfctl-planner", version = "1.2.1" }
