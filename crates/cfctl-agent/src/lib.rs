@@ -29,6 +29,10 @@ pub enum AgentError {
     },
     #[error("agent integration at {0} has local drift; use `cfctl agents sync` to replace it")]
     Drift(String),
+    #[error(
+        "superseded agent integration at {0} is not the exact artifact cfctl installed, so cfctl will not remove it; inspect it and delete it yourself once you are satisfied nothing depends on it"
+    )]
+    LegacyDrift(String),
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
@@ -205,7 +209,7 @@ pub fn install_agent_skill(
 ) -> Result<AgentInstallReceipt> {
     let path = skill_path(home, agent);
     let content = managed_skill(agent);
-    let legacy = legacy_codex_skill(home, agent, mode)?;
+    let legacy = legacy_codex_skill(home, agent)?;
     let legacy_changed = legacy.is_some();
     let existing = if path.is_file() {
         Some(fs::read_to_string(&path).map_err(|source| agent_io(&path, source))?)
@@ -234,11 +238,20 @@ pub fn install_agent_skill(
     })
 }
 
-fn legacy_codex_skill(
-    home: &Path,
-    agent: AgentKind,
-    mode: InstallMode,
-) -> Result<Option<(PathBuf, Vec<u8>)>> {
+/// Locates the superseded Codex skill so a migration can remove it.
+///
+/// Removability is decided by the frozen hash alone, not by the install mode. A
+/// file that matches `LEGACY_CODEX_SKILL_V2_SHA256` byte for byte is the exact
+/// artifact cfctl itself wrote, and calling that "local drift" made the only
+/// machines that needed migrating the only ones that could not migrate: install
+/// refused because the legacy file existed, and sync never reached them because
+/// it skips agents whose managed skill is absent — which is precisely the state
+/// a machine is in before it has been migrated.
+///
+/// Anything that is not a byte-exact match is still refused in both modes, and
+/// `remove_exact_legacy_skill` re-reads and re-compares before unlinking, so a
+/// file cfctl did not write is never deleted.
+fn legacy_codex_skill(home: &Path, agent: AgentKind) -> Result<Option<(PathBuf, Vec<u8>)>> {
     if agent != AgentKind::Codex {
         return Ok(None);
     }
@@ -248,8 +261,8 @@ fn legacy_codex_skill(
     }
     let bytes = fs::read(&path).map_err(|source| agent_io(&path, source))?;
     let digest = format!("{:x}", Sha256::digest(&bytes));
-    if mode != InstallMode::Sync || digest != LEGACY_CODEX_SKILL_V2_SHA256 {
-        return Err(AgentError::Drift(path.display().to_string()));
+    if digest != LEGACY_CODEX_SKILL_V2_SHA256 {
+        return Err(AgentError::LegacyDrift(path.display().to_string()));
     }
     Ok(Some((path, bytes)))
 }
@@ -257,7 +270,7 @@ fn legacy_codex_skill(
 fn remove_exact_legacy_skill(path: &Path, expected: &[u8]) -> Result<()> {
     let current = fs::read(path).map_err(|source| agent_io(path, source))?;
     if current != expected {
-        return Err(AgentError::Drift(path.display().to_string()));
+        return Err(AgentError::LegacyDrift(path.display().to_string()));
     }
     fs::remove_file(path).map_err(|source| agent_io(path, source))?;
     if let Some(parent) = path.parent()
@@ -353,6 +366,23 @@ pub const MANAGED_FRAGMENTS: &[&str] = &[
     FRAGMENT_STANDING_AUTHORITY,
     FRAGMENT_BLOCKED_ROUTE,
 ];
+
+/// The rendered managed documents with labels, for gates that must check what
+/// agents are actually told rather than what the repository says about itself.
+/// These live in Rust source, so the tracked-file lints do not see them.
+#[must_use]
+pub fn managed_documents() -> [(&'static str, &'static str); 2] {
+    [
+        (
+            "crates/cfctl-agent MANAGED_OPERATOR_SKILL",
+            MANAGED_OPERATOR_SKILL.as_str(),
+        ),
+        (
+            "crates/cfctl-agent MANAGED_CURSOR_RULE",
+            MANAGED_CURSOR_RULE.as_str(),
+        ),
+    ]
+}
 
 /// The managed-skill contract number carried in the installed front matter.
 /// Bump this when the installed document's contract changes; `agents doctor`

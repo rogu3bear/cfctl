@@ -41,10 +41,10 @@ inferred from model output. Generated API writes are executable only when
 their operation contract is complete; reads remain dynamically executable, and
 incomplete writes stay searchable with every missing contract field explained.
 
-Most of the catalog is therefore inventory, not capability: at the July 2026
-audit, roughly 84% of mutating operations were unexecutable because their
-contracts were incomplete, and only a governed core carried complete risk,
-effect, cost, verification, and rollback metadata. That ratio is the gate
+Most of the catalog is therefore inventory, not capability: the large majority
+of mutating operations are unexecutable because their contracts are
+incomplete, and only a governed core carries complete risk, effect, cost,
+verification, and rollback metadata. That ratio is the gate
 holding, not neglect — but it is deliberate **contract debt**, and closing it
 is per-capability review work, never a bulk default. `cfctl catalog coverage
 --json` is the measure: it reports the executable core, the blocked remainder,

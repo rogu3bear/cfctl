@@ -45,7 +45,6 @@ pub struct PathBuildIdentityV1 {
     pub state: PathBuildStateV1,
     pub path: Option<PathBuf>,
     pub build: Option<BuildInfoV1>,
-    pub legacy_version: Option<String>,
     pub detail: String,
 }
 
@@ -58,7 +57,6 @@ pub fn classify_path_build(probe: PathBuildProbeV1) -> PathBuildIdentityV1 {
             state: PathBuildStateV1::Uninspectable,
             path: Some(path),
             build: None,
-            legacy_version: None,
             detail,
         },
         PathBuildProbeV1::Missing => PathBuildIdentityV1 {
@@ -67,7 +65,6 @@ pub fn classify_path_build(probe: PathBuildProbeV1) -> PathBuildIdentityV1 {
             state: PathBuildStateV1::Missing,
             path: None,
             build: None,
-            legacy_version: None,
             detail: "cfctl is missing from PATH".to_owned(),
         },
     }
@@ -85,7 +82,6 @@ pub fn inspect_path_build(running: &BuildInfoV1) -> PathBuildIdentityV1 {
             state: PathBuildStateV1::Current,
             path: Some(path),
             build: Some(running.clone()),
-            legacy_version: None,
             detail: "PATH resolves to the running cfctl executable".to_owned(),
         };
     }

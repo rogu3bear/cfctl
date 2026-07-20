@@ -83,10 +83,55 @@ fn sync_migrates_only_the_exact_legacy_codex_skill() {
     std::fs::write(&legacy, "operator-owned drift").expect("legacy drift");
     let error = install_agent_skill(root.path(), AgentKind::Codex, InstallMode::Sync)
         .expect_err("sync must preserve unknown legacy content");
-    assert!(error.to_string().contains("local drift"));
+    assert!(error.to_string().contains("will not remove it"));
     assert_eq!(
         std::fs::read_to_string(&legacy).expect("preserved legacy drift"),
         "operator-owned drift"
+    );
+}
+
+/// The state every un-migrated machine is actually in: the superseded skill is
+/// present and the managed one is not. This was unreachable before — install
+/// refused because the legacy file existed, and the CLI's sync skips agents
+/// whose managed skill is absent, so the one command that could migrate never
+/// ran on the machines that needed it.
+#[test]
+fn install_migrates_the_legacy_skill_when_the_managed_skill_is_absent() {
+    let root = tempfile::tempdir().expect("agent home");
+    let legacy = root.path().join(".agents/skills/cloudflare/SKILL.md");
+    std::fs::create_dir_all(legacy.parent().expect("legacy parent"))
+        .expect("create legacy directory");
+    std::fs::write(&legacy, legacy_managed_skill()).expect("legacy skill");
+
+    let receipt = install_agent_skill(root.path(), AgentKind::Codex, InstallMode::Install)
+        .expect("install migrates the exact legacy skill");
+
+    assert!(receipt.changed);
+    assert!(!legacy.exists(), "the superseded skill must be removed");
+    assert!(receipt.path.is_file(), "the managed skill must be written");
+    assert_eq!(
+        std::fs::read_to_string(&receipt.path).expect("installed skill"),
+        cfctl_agent::managed_documents()[0].1
+    );
+}
+
+/// Removability is decided by the frozen hash, never by the mode — a file cfctl
+/// did not write is preserved under install exactly as it is under sync.
+#[test]
+fn install_preserves_a_legacy_skill_it_did_not_write() {
+    let root = tempfile::tempdir().expect("agent home");
+    let legacy = root.path().join(".agents/skills/cloudflare/SKILL.md");
+    std::fs::create_dir_all(legacy.parent().expect("legacy parent"))
+        .expect("create legacy directory");
+    std::fs::write(&legacy, "operator-owned content").expect("legacy drift");
+
+    let error = install_agent_skill(root.path(), AgentKind::Codex, InstallMode::Install)
+        .expect_err("install must preserve unknown legacy content");
+
+    assert!(error.to_string().contains("will not remove it"));
+    assert_eq!(
+        std::fs::read_to_string(&legacy).expect("preserved legacy content"),
+        "operator-owned content"
     );
 }
 

@@ -2916,6 +2916,7 @@ dependencies = [
 name = "xtask"
 version = "1.2.0"
 dependencies = [
+ "cfctl-agent",
  "cfctl-core",
  "clap",
  "hex",
