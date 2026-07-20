@@ -64,13 +64,12 @@ fn version_reports_structured_build_identity_without_touching_runtime_state() {
     );
     let commit = envelope["result"]["git_commit"].as_str();
     assert!(
-        commit.is_none()
-            || commit.is_some_and(|value| {
-                value.len() == 40
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            }),
+        commit.is_none_or(|value| {
+            value.len() == 40
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }),
         "{envelope}"
     );
     assert!(

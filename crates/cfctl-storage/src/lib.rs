@@ -542,7 +542,7 @@ fn unsafe_managed_document(path: &Path, reason: &str) -> StorageError {
     }
 }
 
-const LOCK_TTL: Duration = Duration::from_secs(15 * 60);
+const LOCK_TTL: Duration = Duration::from_mins(15);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PlanLockRecord {

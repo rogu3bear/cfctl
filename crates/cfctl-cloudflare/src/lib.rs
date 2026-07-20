@@ -3812,7 +3812,7 @@ fn append_schema_equality_key(
         Value::Object(values) => {
             key.push('{');
             let mut entries = values.iter().collect::<Vec<_>>();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_unstable_by_key(|(left, _)| *left);
             for (name, value) in entries {
                 append_length_prefixed_string('k', name, key);
                 append_schema_equality_key(value, key, depth + 1, remaining_steps)?;

@@ -2099,7 +2099,7 @@ async fn verify_wrangler_deployment_status(
                 .env("CLOUDFLARE_API_KEY", key);
         }
     }
-    let output = match tokio::time::timeout(Duration::from_secs(120), command.output()).await {
+    let output = match tokio::time::timeout(Duration::from_mins(2), command.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
             return json!({
@@ -2308,7 +2308,7 @@ async fn run_delegated_cli(
         }
     }
     let label = capability.path.clone();
-    let output = tokio::time::timeout(Duration::from_secs(120), command.output())
+    let output = tokio::time::timeout(Duration::from_mins(2), command.output())
         .await
         .map_err(|_| CliError::SubprocessTimeout(label.clone()))?
         .map_err(|source| cli_io(Path::new(program), source))?;
@@ -12184,13 +12184,13 @@ fn catalog_is_stale(store: &StateStore) -> bool {
         .ok()
         .and_then(|metadata| metadata.modified().ok())
         .and_then(|modified| modified.elapsed().ok())
-        .is_none_or(|age| age > Duration::from_secs(24 * 60 * 60))
+        .is_none_or(|age| age > Duration::from_hours(24))
 }
 
 fn http_client() -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_mins(2))
         .user_agent(concat!("cfctl/", env!("CARGO_PKG_VERSION")));
     // IP-allowlisted API tokens (e.g. a laptop-pinned minter) are usually
     // scoped to the machine's IPv4. When the host default-routes over IPv6,

@@ -25,7 +25,7 @@ documentation, and evidence model agree.
 
 ## Development setup
 
-Rust 1.93 is pinned by the repository. Install `cargo-deny` and Gitleaks for
+Rust 1.97 is pinned by the repository. Install `cargo-deny` and Gitleaks for
 the local proof lane, then orient through the public CLI:
 
 ```bash

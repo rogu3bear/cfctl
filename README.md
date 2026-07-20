@@ -272,7 +272,7 @@ catalog is managed under `CFCTL_HOME`.
 
 ## Development
 
-Rust 1.93 is pinned. The local proof lane is `cargo xtask verify`, which also
+Rust 1.97 is pinned. The local proof lane is `cargo xtask verify`, which also
 needs `cargo-deny` and Gitleaks. Remote CI is intentionally absent. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the pre-push gate, and the
 assembly, signing, and publishing lanes.
