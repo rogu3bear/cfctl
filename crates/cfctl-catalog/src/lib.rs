@@ -1257,8 +1257,8 @@ fn finalize_d1_read_replication_rollback_contract(
     }
 }
 
-const DNS_RECORD_DETAIL_PATH: &str = "/zones/{zone_id}/dns_records/{dns_record_id}";
-const DNS_RECORD_DETAIL_READ_CAPABILITY_ID: &str = "dns-records-for-a-zone-dns-record-details";
+const DNS_RECORD_DETAIL_PATH: &str = cfctl_core::DNS_RECORD_DETAIL_PATH;
+const DNS_RECORD_DETAIL_READ_CAPABILITY_ID: &str = cfctl_core::DNS_RECORD_DETAIL_READ_CAPABILITY_ID;
 const DNS_RECORD_RESTORE_FIELDS: [&str; 11] = [
     "comment",
     "content",
@@ -3835,6 +3835,13 @@ fn classify_operation_specific_contract(capability: &mut CapabilityV1) -> bool {
     .contains(&capability.id.as_str())
     {
         classify_api_token_lifecycle(capability);
+    } else if [
+        "account-api-tokens-update-token",
+        "user-api-tokens-update-token",
+    ]
+    .contains(&capability.id.as_str())
+    {
+        block_api_token_update_by_doctrine(capability);
     } else if r2_bucket_create_operation_supported(capability) {
         classify_r2_bucket_create(capability);
     } else if d1_database_create_operation_supported(capability) {
@@ -9079,6 +9086,28 @@ fn classify_api_token_lifecycle(capability: &mut CapabilityV1) {
                 .to_owned(),
         );
     }
+}
+
+/// Blocks generic API-token update as doctrine rather than as a schema gap.
+///
+/// The rest of the token lifecycle is governed (create/roll/delete above), so
+/// leaving update to the generic blocker would tell an agent the wrong story:
+/// that filling in risk/effect/cost would unlock it. It would not. Token
+/// mutation is reserved to the inventory-bound `keys` workflow, which reads the
+/// live permission inventory before it writes; see `docs/runbooks/cfctl.md`.
+///
+/// The reason prefix is load-bearing. `refresh_dynamic_mutation_contract` only
+/// re-evaluates a blocked capability whose reason starts with
+/// `"operation contract incomplete:"`, so a doctrine prefix is immune to being
+/// silently promoted the day a generic classifier learns to fill those fields.
+/// Contract facts are deliberately left unset — inventing them to make the gap
+/// list empty would fabricate a contract nobody reviewed.
+fn block_api_token_update_by_doctrine(capability: &mut CapabilityV1) {
+    capability.adapter_status = AdapterStatus::Blocked;
+    capability.blocked_reason = Some(
+        "blocked by design: token mutation is reserved to the inventory-bound keys workflow; a generic token update would bypass fresh permission-inventory review and hash-bound approval"
+            .to_owned(),
+    );
 }
 
 fn block_incomplete_dynamic_mutation(capability: &mut CapabilityV1) {

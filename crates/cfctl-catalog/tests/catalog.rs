@@ -2642,6 +2642,19 @@ fn account_token_mutations_have_complete_native_execution_contracts() {
         "x-api-token-group":["Account API Tokens Write"],
         "responses": cloudflare_envelope_responses()
     });
+    document["paths"]["/accounts/{account_id}/tokens/{token_id}"]["put"] = json!({
+        "operationId":"account-api-tokens-update-token",
+        "summary":"Update Token",
+        "tags":["Account Owned API Tokens"],
+        "x-api-token-group":["Account API Tokens Write"],
+        "responses": cloudflare_envelope_responses()
+    });
+    document["paths"]["/user/tokens/{token_id}"]["put"] = json!({
+        "operationId":"user-api-tokens-update-token",
+        "summary":"Update Token",
+        "tags":["User API Tokens"],
+        "responses": cloudflare_envelope_responses()
+    });
 
     let snapshot = normalize_openapi(&document).expect("token catalog");
     for id in [
@@ -2677,6 +2690,53 @@ fn account_token_mutations_have_complete_native_execution_contracts() {
             .as_deref()
             .is_some_and(|warning| warning.contains("old token value"))
     );
+
+    // Update stays blocked by doctrine, not by a schema gap: the reason has to
+    // say so, because "operation contract incomplete" would tell an agent that
+    // supplying risk/effect/cost unlocks it.
+    for id in [
+        "account-api-tokens-update-token",
+        "user-api-tokens-update-token",
+    ] {
+        let update = snapshot.get(id).expect("token update capability");
+        assert_eq!(update.adapter_status, AdapterStatus::Blocked, "{id}");
+        let reason = update.blocked_reason.as_deref().expect("blocked reason");
+        assert!(
+            reason.starts_with("blocked by design:"),
+            "{id} must not reuse the schema-gap sentinel: {reason}"
+        );
+        assert!(
+            reason.contains("inventory-bound keys workflow"),
+            "{id} must name the workflow that owns token mutation: {reason}"
+        );
+    }
+}
+
+#[test]
+fn api_token_update_stays_doctrine_blocked_and_never_repromotes() {
+    let mut document = fixture();
+    document["paths"]["/accounts/{account_id}/tokens/{token_id}"]["put"] = json!({
+        "operationId":"account-api-tokens-update-token",
+        "summary":"Update Token",
+        "tags":["Account Owned API Tokens"],
+        "x-api-token-group":["Account API Tokens Write"],
+        "responses": cloudflare_envelope_responses()
+    });
+
+    let snapshot = normalize_openapi(&document).expect("token catalog");
+    let mut capability = snapshot
+        .get("account-api-tokens-update-token")
+        .expect("token update capability")
+        .clone();
+    let reason = capability.blocked_reason.clone().expect("blocked reason");
+
+    // The contract-refresh pass is what would silently unblock this the day a
+    // generic classifier learns to fill risk/effect/cost. The doctrine prefix
+    // is what makes it skip us.
+    cfctl_catalog::refresh_dynamic_mutation_contract(&mut capability);
+
+    assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+    assert_eq!(capability.blocked_reason.as_deref(), Some(reason.as_str()));
 }
 
 #[test]

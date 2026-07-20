@@ -219,10 +219,11 @@ fn public_subcommand_tree_exactly_matches_the_clap_tree() {
             "subcommands of `{}` drifted from PUBLIC_V2_COMMAND_TREE",
             node.name
         );
+        // Recurse into every declared child, leaves included. A declared leaf
+        // asserts its clap node has no children of its own, so a command group
+        // cannot sprout beneath a node the tree calls final.
         for child in node.subcommands {
-            if !child.subcommands.is_empty() {
-                assert_node_matches(clap_child, child);
-            }
+            assert_node_matches(clap_child, child);
         }
     }
 
@@ -233,6 +234,11 @@ fn public_subcommand_tree_exactly_matches_the_clap_tree() {
 
     // Every clap verb that itself takes subcommands must be declared in the
     // tree, so a newly added command group cannot silently escape the contract.
+    // This stays top-level only on purpose: leaf verbs (`call`, `guide`,
+    // `resolve`, `doctor`, `version`, `update`) take arguments rather than
+    // subcommands and are absent from the tree by design. Nested completeness
+    // is already enforced by the per-node name equality above, in both
+    // directions, at every depth.
     let mut clap_groups = root
         .get_subcommands()
         .filter(|sub| {

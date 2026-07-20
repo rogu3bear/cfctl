@@ -1658,6 +1658,45 @@ fn pointer_names_secret_field_flags_only_secret_leaves() {
 }
 
 #[test]
+fn secret_sink_value_keys_are_a_subset_of_secret_field_names() {
+    for key in cfctl_core::SECRET_SINK_VALUE_KEYS {
+        assert!(
+            cfctl_core::SECRET_FIELD_NAMES.contains(key),
+            "{key} is extractable as a sink value but not redactable"
+        );
+    }
+    // The exclusions are doctrine, not oversight: credential bundles have
+    // dedicated extractors and worker-secret fields are write-only inputs.
+    for excluded in [
+        "accessKeyId",
+        "secretAccessKey",
+        "sessionToken",
+        "text",
+        "key_base64",
+        "key_jwk",
+    ] {
+        assert!(
+            !cfctl_core::SECRET_SINK_VALUE_KEYS.contains(&excluded),
+            "{excluded} must stay out of the generic single-scalar sink scan"
+        );
+    }
+}
+
+#[test]
+fn dns_record_detail_constants_pin_the_wire_contract() {
+    // The one place these literals survive: every other site derives from the
+    // constants, so this test is what a Cloudflare path change has to break.
+    assert_eq!(
+        cfctl_core::DNS_RECORD_DETAIL_PATH,
+        "/zones/{zone_id}/dns_records/{dns_record_id}"
+    );
+    assert_eq!(
+        cfctl_core::DNS_RECORD_DETAIL_READ_CAPABILITY_ID,
+        "dns-records-for-a-zone-dns-record-details"
+    );
+}
+
+#[test]
 fn identity_pointer_naming_a_secret_field_is_never_supported() {
     // A well-formed created-resource contract whose identity selector/pointer
     // both name a secret field (`value`) would satisfy the loose selector==leaf

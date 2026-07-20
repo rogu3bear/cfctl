@@ -370,6 +370,51 @@ fn verify_workspace_contract() -> Result<(), TaskError> {
             )));
         }
     }
+    verify_workspace_dependency_versions()
+}
+
+/// The intra-workspace version pins must equal the workspace version exactly.
+///
+/// Cargo will not catch this: a pin left at the previous version is a semver
+/// requirement the bumped crate still satisfies, so a forgotten pin builds
+/// clean, resolves clean, and ships a lie about which version the workspace
+/// depends on. Only an equality check bites.
+fn verify_workspace_dependency_versions() -> Result<(), TaskError> {
+    const EXPECTED_PINS: usize = 8;
+
+    let manifest_path = repository_root()?.join("Cargo.toml");
+    let manifest =
+        fs::read_to_string(&manifest_path).map_err(|source| io_error(&manifest_path, source))?;
+    let expected = env!("CARGO_PKG_VERSION");
+    let mut checked = 0;
+
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("cfctl-") || !trimmed.contains("path = \"crates/") {
+            continue;
+        }
+        let Some(pinned) = trimmed
+            .split_once("version = \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(version, _)| version)
+        else {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "workspace dependency has no version pin: {trimmed}"
+            )));
+        };
+        if pinned != expected {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "workspace dependency pins {pinned} but the workspace version is {expected}: {trimmed}"
+            )));
+        }
+        checked += 1;
+    }
+
+    if checked != EXPECTED_PINS {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "expected {EXPECTED_PINS} intra-workspace version pins, checked {checked}"
+        )));
+    }
     Ok(())
 }
 
@@ -686,35 +731,63 @@ fn verify_tracked_cfctl_command_references() -> Result<(), TaskError> {
         let Ok(content) = std::str::from_utf8(&bytes) else {
             continue;
         };
-        for reference in extract_cfctl_command_refs(&path, content) {
-            let verb = &reference.verb;
-            if verb != "help" && !PUBLIC_V2_SUBCOMMANDS.contains(&verb.as_str()) {
-                return Err(TaskError::InvalidSourceContract(format!(
-                    "{path} teaches non-v2 command `cfctl {verb}` outside compat/v1"
-                )));
+        validate_command_refs(&path, content)?;
+    }
+    Ok(())
+}
+
+/// Validates every `cfctl` reference in one file against the single-sourced
+/// command tree, walking the full token chain rather than stopping at the
+/// second token.
+fn validate_command_refs(path: &str, content: &str) -> Result<(), TaskError> {
+    for reference in extract_cfctl_command_refs(path, content) {
+        let verb = &reference.verb;
+        if verb != "help" && !PUBLIC_V2_SUBCOMMANDS.contains(&verb.as_str()) {
+            return Err(TaskError::InvalidSourceContract(format!(
+                "{path} teaches non-v2 command `cfctl {verb}` outside compat/v1"
+            )));
+        }
+        // Verbs absent from the tree (`call`, `guide`, `resolve`, and the other
+        // leaf verbs) take arguments rather than subcommands, so their trailing
+        // tokens are not validated.
+        let Some(mut node) = PUBLIC_V2_COMMAND_TREE
+            .iter()
+            .find(|node| node.name == verb.as_str())
+        else {
+            continue;
+        };
+        let mut walked = Vec::new();
+        for token in &reference.path {
+            // A node with no declared children is final: everything after it is
+            // a free argument, not a subcommand.
+            if node.subcommands.is_empty() {
+                break;
             }
-            // Validate one level deeper against the single-sourced command tree.
-            if let Some(sub) = reference.sub.as_deref()
-                && let Some(node) = PUBLIC_V2_COMMAND_TREE
-                    .iter()
-                    .find(|node| node.name == verb.as_str())
-                && !node.subcommands.iter().any(|child| child.name == sub)
-            {
+            let Some(child) = node
+                .subcommands
+                .iter()
+                .find(|child| child.name == token.as_str())
+            else {
+                walked.push(token.as_str());
                 return Err(TaskError::InvalidSourceContract(format!(
-                    "{path} teaches unknown subcommand `cfctl {verb} {sub}` outside compat/v1"
+                    "{path} teaches unknown subcommand `cfctl {verb} {}` outside compat/v1",
+                    walked.join(" ")
                 )));
-            }
+            };
+            walked.push(child.name);
+            node = child;
         }
     }
     Ok(())
 }
 
 /// One extracted `cfctl` command reference: the top-level verb and, when the
-/// reference is a real invocation (not loose prose), the second token when it is
-/// plausibly a subcommand.
+/// reference is a real invocation (not loose prose), the run of following
+/// tokens that plausibly name subcommands. The tree walk decides how many of
+/// those tokens are subcommands and where free arguments begin.
 struct CfctlReference {
     verb: String,
-    sub: Option<String>,
+    path: Vec<String>,
 }
 
 #[cfg(test)]
@@ -871,15 +944,19 @@ fn cfctl_command_ref_with_context(command: &str, command_context: bool) -> Optio
     let verb = verb
         .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '-')
         .to_owned();
-    // The token after the verb is only treated as a subcommand inside a real
+    // Tokens after the verb are only treated as subcommands inside a real
     // command context (a fence, a shell line, an inline command span, or a
-    // structured argv), and only when it is plausibly a subcommand token rather
-    // than a flag, placeholder, quoted argument, or prose word.
-    let sub = if command_context {
-        arguments.next().and_then(plausible_subcommand_token)
-    } else {
-        None
-    };
+    // structured argv), and only while they are plausibly subcommand tokens
+    // rather than flags, placeholders, quoted arguments, or prose words. The
+    // chain stops at the first token that is not — a capability id trailing
+    // `cfctl call` reads as a plausible token, so the tree walk, not this
+    // scanner, is what decides where arguments begin.
+    let mut path = Vec::new();
+    if command_context {
+        while let Some(token) = arguments.next().and_then(plausible_subcommand_token) {
+            path.push(token);
+        }
+    }
 
     let mut explicit_command_context = false;
     if command_index > 0 {
@@ -913,7 +990,7 @@ fn cfctl_command_ref_with_context(command: &str, command_context: bool) -> Optio
     {
         return None;
     }
-    Some(CfctlReference { verb, sub })
+    Some(CfctlReference { verb, path })
 }
 
 /// Returns the token when it is plausibly a subcommand: a lowercase word of
@@ -1044,6 +1121,24 @@ fn verify_documented_contracts() -> Result<(), TaskError> {
         "standing-authority-guide",
         &render_guide_topic_markdown(GuideTopicV1::StandingAuthority),
     )?;
+    verify_quickstart_pins_the_release_version(repository_root)?;
+    Ok(())
+}
+
+/// The install instructions must point at this version's release assets.
+///
+/// A stale download URL is not a cosmetic doc lag: it hands the reader a
+/// binary from the previous release while the page around it documents this
+/// one, and nothing else in the tree notices.
+fn verify_quickstart_pins_the_release_version(repository_root: &Path) -> Result<(), TaskError> {
+    let path = repository_root.join("QUICKSTART.md");
+    let content = fs::read_to_string(&path).map_err(|source| io_error(&path, source))?;
+    let expected = format!("download/v{}/", env!("CARGO_PKG_VERSION"));
+    if !content.contains(&expected) {
+        return Err(TaskError::InvalidSourceContract(format!(
+            "QUICKSTART.md does not pin the current release download path `{expected}`"
+        )));
+    }
     Ok(())
 }
 
@@ -2382,11 +2477,12 @@ mod tests {
         extract_cfctl_command_references, extract_cfctl_command_refs, is_declared_quarantine_path,
         is_forbidden_quarantine_consumer, parse_remote_tag_commit, release_build_driver,
         release_build_subcommand, release_tag_is_exact_version, render_linux_installer_text,
-        security_proof_commands, validate_codesign_details, validate_notary_receipt_value,
-        validate_signed_release_file_set, validated_release_targets,
+        repository_root, security_proof_commands, validate_codesign_details, validate_command_refs,
+        validate_notary_receipt_value, validate_signed_release_file_set, validated_release_targets,
         verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
-        verify_generated_guidance_section_text, verify_tracked_cfctl_command_references,
-        verify_v1_cutover_contract,
+        verify_generated_guidance_section_text, verify_quickstart_pins_the_release_version,
+        verify_tracked_cfctl_command_references, verify_v1_cutover_contract,
+        verify_workspace_dependency_versions,
     };
 
     #[test]
@@ -2432,25 +2528,72 @@ mod tests {
         );
         let pairs = extract_cfctl_command_refs("docs/example.md", markdown)
             .into_iter()
-            .map(|reference| (reference.verb, reference.sub))
+            .map(|reference| (reference.verb, reference.path))
             .collect::<Vec<_>>();
         assert_eq!(
             pairs,
             vec![
-                ("catalog".to_owned(), Some("show".to_owned())),
-                ("keys".to_owned(), Some("policy".to_owned())),
-                // `call` is not a command group, but the second token is still
-                // extracted; the verifier simply never checks it against a tree.
-                ("call".to_owned(), Some("dns-records-list".to_owned())),
-                // The subcommand is the second token; a trailing quoted argument
-                // does not disturb it.
-                ("catalog".to_owned(), Some("search".to_owned())),
+                // Extraction runs the whole plausible-token chain; separating
+                // subcommands from arguments is the tree walk's job.
+                (
+                    "catalog".to_owned(),
+                    vec!["show".to_owned(), "dns-records-list".to_owned()]
+                ),
+                (
+                    "keys".to_owned(),
+                    vec![
+                        "policy".to_owned(),
+                        "approve".to_owned(),
+                        "authority-1".to_owned()
+                    ]
+                ),
+                // `call` is not a command group, so its trailing token is
+                // extracted but never checked against a tree.
+                ("call".to_owned(), vec!["dns-records-list".to_owned()]),
+                // A trailing quoted argument stops the chain.
+                ("catalog".to_owned(), vec!["search".to_owned()]),
                 // A quoted argument in the subcommand position is not plausible.
-                ("resolve".to_owned(), None),
-                ("migrate".to_owned(), Some("v1".to_owned())),
+                ("resolve".to_owned(), Vec::new()),
+                ("migrate".to_owned(), vec!["v1".to_owned()]),
             ],
             "prose `workspace discovery` must not appear as a checked subcommand"
         );
+    }
+
+    #[test]
+    fn deep_subcommand_references_bind_to_the_full_tree() {
+        // Depth 3 is real surface (`keys policy approve`), so a typo there has
+        // to fail rather than pass because the linter stopped looking at depth 2.
+        let typo = concat!("```bash\n", "cfctl keys policy frobnicate\n", "```\n");
+        let error = validate_command_refs("docs/example.md", typo)
+            .expect_err("depth-3 typo must be rejected");
+        assert!(
+            error.to_string().contains("keys policy frobnicate"),
+            "error must name the full path: {error}"
+        );
+
+        // Arguments after a leaf are free text, not subcommands: `show` is a
+        // leaf, so a capability id following it must not be validated.
+        let arguments_after_a_leaf = concat!(
+            "```bash\n",
+            "cfctl catalog show dns-records-list\n",
+            "cfctl keys policy approve authority-1\n",
+            "cfctl call dns-records-list\n",
+            "```\n",
+        );
+        assert!(validate_command_refs("docs/example.md", arguments_after_a_leaf).is_ok());
+    }
+
+    #[test]
+    fn workspace_dependency_versions_match_the_package_version() {
+        verify_workspace_dependency_versions().expect("intra-workspace pins match the version");
+    }
+
+    #[test]
+    fn quickstart_pins_the_current_release_download_path() {
+        let repository_root = repository_root().expect("repository root");
+        verify_quickstart_pins_the_release_version(repository_root)
+            .expect("QUICKSTART pins this version");
     }
 
     #[test]
