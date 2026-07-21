@@ -296,6 +296,10 @@ pub enum CoreError {
         operation_id: String,
         reason: String,
     },
+    #[error(
+        "GraphQL analytics contract `{operation_name}` no longer matches its schema fingerprint"
+    )]
+    GraphqlSchemaFingerprintDrift { operation_name: String },
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
@@ -378,6 +382,9 @@ pub struct SelectorV1 {
 #[serde(rename_all = "snake_case")]
 pub enum ResponseBodyModeV1 {
     CloudflareJsonEnvelope,
+    JsonValue,
+    GraphqlJson,
+    NegotiatedRows,
     Empty,
     Unsupported,
 }
@@ -388,6 +395,234 @@ pub struct ResponseContractV1 {
     pub success_statuses: Vec<String>,
     pub success_media_types: Vec<String>,
     pub body_mode: ResponseBodyModeV1,
+}
+
+/// Output representations that a bounded analytics query may negotiate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormatV1 {
+    Json,
+    Ndjson,
+    Csv,
+}
+
+/// The protocol-specific validator and renderer used for an analytics read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalyticsQueryKindV1 {
+    StructuredSql,
+    LogExplorerSql,
+    GraphqlAnalytics,
+    WorkersObservability,
+}
+
+/// Timestamp wire representation at the pointers declared by a query contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampFormatV1 {
+    Rfc3339,
+    UnixSeconds,
+    UnixMilliseconds,
+}
+
+/// How a caller can continue a bounded result without an unbounded hidden loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaginationModeV1 {
+    BoundedResult,
+    OrderedKeyset,
+    TimeWindow,
+    UpstreamPage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeRangeContractV1 {
+    pub start_pointer: String,
+    pub end_pointer: String,
+    pub timestamp_format: TimestampFormatV1,
+    pub max_lookback_seconds: u64,
+    pub max_window_seconds: u64,
+}
+
+/// Hash-bound limits for one query family. The pointers are JSON pointers into
+/// the caller's typed request body; they are never arbitrary expressions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalyticsQueryContractV1 {
+    pub kind: AnalyticsQueryKindV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_pointer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_range: Option<TimeRangeContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_limit_pointer: Option<String>,
+    pub max_rows: u64,
+    pub max_bytes: u64,
+    pub max_timeout_seconds: u64,
+    pub allowed_output_formats: Vec<OutputFormatV1>,
+    pub default_output_format: OutputFormatV1,
+    pub pagination: PaginationModeV1,
+    pub read_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<String>,
+}
+
+/// A bounded Logs Engine retrieval whose R2 credentials are supplied through
+/// one out-of-band bundle and may only become the two pinned request headers.
+/// The credential values are deliberately absent from `CallInput`, plans,
+/// receipts, and catalog selectors; only this operation-specific runtime may
+/// materialize them at the HTTP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R2LogRetrievalContractV1 {
+    pub access_key_input_field: String,
+    pub secret_access_key_input_field: String,
+    pub access_key_header: String,
+    pub secret_access_key_header: String,
+    pub start_query_selector: String,
+    pub end_query_selector: String,
+    pub bucket_query_selector: String,
+    pub prefix_query_selector: String,
+    pub max_lookback_seconds: u64,
+    pub max_window_seconds: u64,
+    pub max_bytes: u64,
+    pub max_timeout_seconds: u64,
+    pub output_media_types: Vec<String>,
+    pub requires_new_mode_0600_file: bool,
+}
+
+/// A fixed Cloudflare GraphQL Analytics document. Callers supply only values
+/// named by the two maps; they can never replace or extend the document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphqlAnalyticsContractV1 {
+    pub operation_name: String,
+    pub document: String,
+    pub dataset: String,
+    #[serde(default)]
+    pub selector_variables: BTreeMap<String, String>,
+    #[serde(default)]
+    pub body_variables: BTreeMap<String, String>,
+    pub response_data_pointer: String,
+    #[serde(default)]
+    pub expected_row_fields: Vec<String>,
+    #[serde(default)]
+    pub cursor_fields: Vec<String>,
+    /// Legacy single-field cursor input retained for stored v2 catalog
+    /// compatibility. New ordered-keyset contracts bind every response cursor
+    /// field through `cursor_input_pointers`; a multi-field cursor with only
+    /// this pointer is rejected rather than silently dropping its tie-breaker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_input_pointer: Option<String>,
+    /// Response cursor field to typed caller-body JSON pointer. The complete
+    /// mapping is fingerprinted with the fixed document so continuation
+    /// receipts cannot omit a declared ordering tie-breaker.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cursor_input_pointers: BTreeMap<String, String>,
+    pub schema_fingerprint: String,
+}
+
+impl GraphqlAnalyticsContractV1 {
+    fn fingerprint_payload(&self) -> Value {
+        let mut payload = serde_json::json!({
+            "operation_name": self.operation_name,
+            "document": self.document,
+            "dataset": self.dataset,
+            "selector_variables": self.selector_variables,
+            "body_variables": self.body_variables,
+            "response_data_pointer": self.response_data_pointer,
+            "expected_row_fields": self.expected_row_fields,
+            "cursor_fields": self.cursor_fields,
+            "cursor_input_pointer": self.cursor_input_pointer,
+        });
+        if !self.cursor_input_pointers.is_empty()
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.insert(
+                "cursor_input_pointers".to_owned(),
+                serde_json::json!(self.cursor_input_pointers),
+            );
+        }
+        payload
+    }
+
+    pub fn refresh_schema_fingerprint(&mut self) -> Result<()> {
+        self.schema_fingerprint = hash_value(&self.fingerprint_payload())?;
+        Ok(())
+    }
+
+    pub fn validate_schema_fingerprint(&self) -> Result<()> {
+        let actual = hash_value(&self.fingerprint_payload())?;
+        if actual == self.schema_fingerprint {
+            Ok(())
+        } else {
+            Err(CoreError::GraphqlSchemaFingerprintDrift {
+                operation_name: self.operation_name.clone(),
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowStepV1 {
+    pub id: String,
+    pub capability_id: String,
+    pub purpose: String,
+    pub mutating: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+}
+
+/// A native composition recipe. It does not aggregate mutation authority:
+/// every mutating component still produces and consumes its own `PlanV1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowContractV1 {
+    pub purpose: String,
+    pub steps: Vec<WorkflowStepV1>,
+    pub preserves_component_approval: bool,
+    pub exports_evidence_packet: bool,
+}
+
+/// Governance carried beside one telemetry-derived security action. The
+/// caller-facing schema is intentionally separate from `request_schema`: the
+/// latter is the exact Cloudflare wire body, while this schema requires the
+/// evidence, actor, reason, expiry, and blast-radius acknowledgements that
+/// cfctl validates and records before it renders that wire body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityActionKindV1 {
+    CreateExpiring,
+    RemoveExpired,
+    AddExpiringListMember,
+    RemoveExpiredListMember,
+}
+
+/// Fixed safety invariants for a telemetry-derived enforcement lifecycle.
+/// The profile is intentionally indivisible: callers cannot disable evidence,
+/// actor, reason, or anonymous-identity protections one flag at a time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityActionSafetyProfileV1 {
+    #[default]
+    TelemetryDerivedStrict,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecurityActionContractV1 {
+    pub kind: SecurityActionKindV1,
+    pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_target_types: Vec<String>,
+    pub default_ttl_seconds: u64,
+    pub max_ttl_seconds: u64,
+    pub current_state_capability_id: String,
+    #[serde(default)]
+    pub safety_profile: SecurityActionSafetyProfileV1,
 }
 
 #[must_use]
@@ -476,6 +711,18 @@ impl Default for CostV1 {
     }
 }
 
+/// A read-only API operation whose successful execution proves that the
+/// selected account or zone can access a product surface before cfctl creates
+/// a mutation plan. A rejected probe never becomes a negative entitlement
+/// assertion because Cloudflare may use the same status for missing token
+/// permission, plan entitlement, or product configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntitlementProbeV1 {
+    pub capability_id: String,
+    pub path: String,
+    pub selector_names: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntitlementV1 {
     pub available: Option<bool>,
@@ -487,6 +734,8 @@ pub struct EntitlementV1 {
     pub requires_live_resolution: bool,
     #[serde(default)]
     pub observed_plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<EntitlementProbeV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,6 +789,25 @@ pub struct CreatedCollectionResourceContractV1 {
     pub requires_page_number_completion: bool,
 }
 
+/// Hash-bound coordinates for proving and compensating a resource created
+/// inside a parent object. Some Cloudflare APIs (notably Ruleset Engine) return
+/// the updated parent ruleset rather than the newly-created child rule. The
+/// caller-provided correlation field is therefore the only permitted way to
+/// locate exactly one child and lift its schema-proven identity into the
+/// boundary receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedNestedResourceContractV1 {
+    pub parent_path: String,
+    pub items_pointer: String,
+    pub identity_selector: String,
+    pub response_item_identity_pointer: String,
+    pub correlation_field: String,
+    pub read_capability_id: String,
+    pub delete_capability_id: String,
+    pub delete_path: String,
+    pub verified_response_fields: Vec<String>,
+}
+
 /// Hash-bound coordinates for proving an exact resource deletion through a
 /// schema-proven parent collection when the API has no detail read endpoint.
 /// The identity pointer is relative to each item in the collection response's
@@ -555,6 +823,18 @@ pub struct DeletedResourceContractV1 {
     /// `total_pages` metadata.
     #[serde(default, skip_serializing_if = "is_false")]
     pub requires_page_number_completion: bool,
+}
+
+/// Hash-bound coordinates for proving that an exact nested resource no longer
+/// exists in its parent object's complete child array.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedNestedResourceContractV1 {
+    pub parent_path: String,
+    pub collection_path: String,
+    pub items_pointer: String,
+    pub identity_selector: String,
+    pub response_item_identity_pointer: String,
+    pub read_capability_id: String,
 }
 
 /// Hash-bound coordinates for proving an exact resource update through a
@@ -585,6 +865,36 @@ pub struct SamePathReadContractV1 {
     pub verified_response_fields: Vec<String>,
 }
 
+/// Hash-bound lifecycle for a Cloudflare mutation that first returns a bulk
+/// operation identity and only materializes its collection change after that
+/// operation reaches a terminal state. The verifier may poll only the pinned
+/// status path and then read only the pinned collection; arbitrary async API
+/// traversal is deliberately not expressible through this contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsyncCollectionMutationContractV1 {
+    pub operation_status_path: String,
+    pub operation_status_capability_id: String,
+    pub operation_id_selector: String,
+    pub apply_operation_id_pointer: String,
+    pub status_operation_id_pointer: String,
+    pub status_state_pointer: String,
+    pub pending_states: Vec<String>,
+    pub completed_state: String,
+    pub failed_state: String,
+    pub max_poll_attempts: u16,
+    pub poll_interval_ms: u64,
+    pub collection_path: String,
+    pub collection_capability_id: String,
+    pub collection_metadata_path: String,
+    pub collection_metadata_capability_id: String,
+    pub collection_item_identity_pointer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_capability_id: Option<String>,
+    pub requires_cursor_completion: bool,
+}
+
 // Serde skip predicates receive a shared reference to the field value.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(value: &bool) -> bool {
@@ -603,6 +913,8 @@ pub struct CapabilityV1 {
     pub path: String,
     pub account_scope: String,
     pub selectors: Vec<SelectorV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     pub permissions: Vec<String>,
     pub mutating: bool,
     pub risk: RiskClass,
@@ -617,16 +929,32 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_collection_resource: Option<CreatedCollectionResourceContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_nested_resource: Option<CreatedNestedResourceContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_resource: Option<DeletedResourceContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_nested_resource: Option<DeletedNestedResourceContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_resource: Option<UpdatedResourceContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub same_path_read: Option<SamePathReadContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_collection_mutation: Option<AsyncCollectionMutationContractV1>,
     pub adapter_status: AdapterStatus,
     pub blocked_reason: Option<String>,
     pub request_schema: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_contract: Option<ResponseContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analytics_query: Option<AnalyticsQueryContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r2_log_retrieval: Option<R2LogRetrievalContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql: Option<GraphqlAnalyticsContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_action: Option<SecurityActionContractV1>,
 }
 
 /// Cloudflare's DNS record detail path. This is wire contract, not a local
@@ -671,6 +999,7 @@ impl CapabilityV1 {
             path: path.to_owned(),
             account_scope: infer_scope(path).to_owned(),
             selectors: Vec::new(),
+            aliases: Vec::new(),
             permissions: Vec::new(),
             mutating: !is_read,
             risk: if is_read {
@@ -706,13 +1035,21 @@ impl CapabilityV1 {
             },
             created_resource: None,
             created_collection_resource: None,
+            created_nested_resource: None,
             deleted_resource: None,
+            deleted_nested_resource: None,
             updated_resource: None,
             same_path_read: None,
+            async_collection_mutation: None,
             adapter_status: AdapterStatus::DynamicApi,
             blocked_reason: None,
             request_schema: None,
             response_contract: None,
+            analytics_query: None,
+            r2_log_retrieval: None,
+            graphql: None,
+            workflow: None,
+            security_action: None,
         }
     }
 
@@ -778,6 +1115,12 @@ impl CapabilityV1 {
                 self.rollback.strategy.as_deref().unwrap_or("<missing>")
             ));
         }
+        if self.security_action.is_some() && !self.security_action_contract_supported() {
+            gaps.push("telemetry-derived security action safety contract is malformed".to_owned());
+        }
+        if self.entitlement.probe.is_some() && !self.entitlement_probe_contract_supported() {
+            gaps.push("declared live entitlement probe is malformed".to_owned());
+        }
         let dynamic_api_contract = self.adapter_status == AdapterStatus::DynamicApi
             || (self.adapter_status == AdapterStatus::Blocked
                 && self
@@ -790,7 +1133,9 @@ impl CapabilityV1 {
         if self.entitlement.available != Some(true) {
             if let Some(blocker) = self.entitlement.blocker.as_ref() {
                 gaps.push(blocker.clone());
-            } else if self.entitlement.plans.values().any(|available| !available) {
+            } else if self.entitlement.probe.is_none()
+                && self.entitlement.plans.values().any(|available| !available)
+            {
                 gaps.push(
                     "account entitlement has not been resolved for this plan-gated operation"
                         .to_owned(),
@@ -798,6 +1143,29 @@ impl CapabilityV1 {
             }
         }
         gaps
+    }
+
+    fn entitlement_probe_contract_supported(&self) -> bool {
+        self.entitlement.probe.as_ref().is_some_and(|probe| {
+            matches!(self.account_scope.as_str(), "account" | "zone")
+                && self.entitlement.requires_live_resolution
+                && !probe.capability_id.is_empty()
+                && probe.path.starts_with('/')
+                && !probe.selector_names.is_empty()
+                && probe
+                    .selector_names
+                    .windows(2)
+                    .all(|names| names[0] < names[1])
+                && probe.selector_names.iter().all(|name| {
+                    !name.is_empty()
+                        && self.selectors.iter().any(|selector| {
+                            selector.name == *name
+                                && selector.location == "path"
+                                && selector.required
+                        })
+                        && probe.path.contains(&format!("{{{name}}}"))
+                })
+        })
     }
 
     #[must_use]
@@ -894,6 +1262,15 @@ impl CapabilityV1 {
                         .all(|selector| selector.location == "path")
                     && self.deleted_resource_contract_supported()
             }
+            "parent_object_omits_deleted_nested_resource_id" => {
+                self.method == "DELETE"
+                    && self.request_schema.is_none()
+                    && self
+                        .selectors
+                        .iter()
+                        .all(|selector| selector.location == "path")
+                    && self.deleted_nested_resource_contract_supported()
+            }
             "parent_collection_item_contains_planned_fields_after_update" => {
                 matches!(self.method.as_str(), "PATCH" | "PUT")
                     && self
@@ -969,6 +1346,49 @@ impl CapabilityV1 {
             }
             "parent_collection_contains_created_resource_id_and_planned_fields" => {
                 self.method == "POST" && self.created_collection_resource_contract_supported()
+            }
+            "worker_tail_collection_contains_created_lease_id" => {
+                self.worker_tail_created_collection_contract_supported()
+            }
+            "async_list_operation_completes_and_correlated_member_exists" => {
+                self.async_list_mutation_contract_supported(true)
+            }
+            "async_list_operation_completes_and_members_absent" => {
+                self.async_list_mutation_contract_supported(false)
+            }
+            "parent_object_contains_created_nested_resource_by_correlation" => {
+                self.method == "POST" && self.created_nested_resource_contract_supported()
+            }
+            "web_analytics_rule_list_contains_created_id_and_planned_fields" => {
+                self.id == "web-analytics-create-rule"
+                    && self.method == "POST"
+                    && self.path == "/accounts/{account_id}/rum/v2/{ruleset_id}/rule"
+                    && self.permissions == ["Account Settings Read", "Account Settings Write"]
+                    && self.created_resource_contract_supported()
+                    && self.created_resource.as_ref().is_some_and(|target| {
+                        target.detail_path
+                            == "/accounts/{account_id}/rum/v2/{ruleset_id}/rule/{rule_id}"
+                            && target.identity_selector == "rule_id"
+                            && target.response_result_identity_pointer == "/id"
+                            && target.read_capability_id == "web-analytics-list-rules"
+                            && target.delete_capability_id == "web-analytics-delete-rule"
+                    })
+            }
+            "web_analytics_rule_list_omits_deleted_id" => {
+                self.id == "web-analytics-delete-rule"
+                    && self.method == "DELETE"
+                    && self.path == "/accounts/{account_id}/rum/v2/{ruleset_id}/rule/{rule_id}"
+                    && self.request_schema.is_none()
+                    && self.permissions == ["Account Settings Read", "Account Settings Write"]
+                    && self
+                        .selectors
+                        .iter()
+                        .all(|selector| selector.location == "path")
+                    && self.same_path_read.as_ref().is_some_and(|target| {
+                        target.path == "/accounts/{account_id}/rum/v2/{ruleset_id}/rules"
+                            && target.read_capability_id == "web-analytics-list-rules"
+                            && target.verified_response_fields.is_empty()
+                    })
             }
             // Cache purge cannot be verified by readback: there is no
             // "is-this-cached?" GET. The executor asserts only that Cloudflare
@@ -1052,6 +1472,11 @@ impl CapabilityV1 {
             Some("delete_created_resource_by_returned_id") => {
                 self.delete_created_resource_rollback_supported()
             }
+            Some("remove_async_created_list_member_by_correlated_id") => {
+                self.async_list_mutation_contract_supported(true)
+                    && self.verification.strategy
+                        == "async_list_operation_completes_and_correlated_member_exists"
+            }
             Some("delete_created_empty_d1_database_by_returned_uuid_if_unchanged") => {
                 d1_database_create_rollback_contract_supported(self)
             }
@@ -1059,18 +1484,7 @@ impl CapabilityV1 {
                 kv_namespace_create_rollback_contract_supported(self)
             }
             Some("restore_global_warp_override_prior_disconnect_state") => {
-                self.id == "devices-resilience-set-global-warp-override"
-                    && self.method == "POST"
-                    && self.path == "/accounts/{account_id}/devices/resilience/disconnect"
-                    && self.account_scope == "account"
-                    && self.verification.strategy
-                        == "same_path_result_contains_planned_fields_after_mutation"
-                    && self.verification_contract_supported()
-                    && self.same_path_read.as_ref().is_some_and(|read| {
-                        read.read_capability_id
-                            == "devices-resilience-retrieve-global-warp-override"
-                            && read.verified_response_fields == ["disconnect"]
-                    })
+                self.global_warp_override_rollback_supported()
             }
             Some("restore_d1_read_replication_prior_mode") => {
                 matches!(
@@ -1129,7 +1543,119 @@ impl CapabilityV1 {
                                 ]
                     })
             }
+            Some("restore_same_path_prior_snapshot") => {
+                self.same_path_prior_snapshot_rollback_supported()
+            }
             _ => false,
+        }
+    }
+
+    fn global_warp_override_rollback_supported(&self) -> bool {
+        self.id == "devices-resilience-set-global-warp-override"
+            && self.method == "POST"
+            && self.path == "/accounts/{account_id}/devices/resilience/disconnect"
+            && self.account_scope == "account"
+            && self.verification.strategy
+                == "same_path_result_contains_planned_fields_after_mutation"
+            && self.verification_contract_supported()
+            && self.same_path_read.as_ref().is_some_and(|read| {
+                read.read_capability_id == "devices-resilience-retrieve-global-warp-override"
+                    && read.verified_response_fields == ["disconnect"]
+            })
+    }
+
+    fn same_path_prior_snapshot_rollback_supported(&self) -> bool {
+        matches!(self.method.as_str(), "PATCH" | "PUT")
+            && matches!(
+                self.verification.strategy.as_str(),
+                "same_resource_contains_planned_fields_after_update"
+                    | "same_path_result_contains_planned_fields_after_update"
+            )
+            && self.verification_contract_supported()
+            && self.same_path_readback_selectors_supported()
+            && self.same_path_read_contract_supported(true)
+    }
+
+    /// A security action is executable only when its caller schema and safety
+    /// bounds are complete and the ordinary verifier/rollback contracts can
+    /// still prove the Cloudflare-side lifecycle.
+    #[must_use]
+    pub fn security_action_contract_supported(&self) -> bool {
+        let Some(contract) = self.security_action.as_ref() else {
+            return true;
+        };
+        let schema_is_closed_object = contract.input_schema.get("type").and_then(Value::as_str)
+            == Some("object")
+            && contract
+                .input_schema
+                .get("additionalProperties")
+                .and_then(Value::as_bool)
+                == Some(false)
+            && contract
+                .input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| !required.is_empty());
+        let common = self.mutating
+            && schema_is_closed_object
+            && !contract.current_state_capability_id.is_empty()
+            && contract.safety_profile == SecurityActionSafetyProfileV1::TelemetryDerivedStrict;
+        if !common {
+            return false;
+        }
+        match contract.kind {
+            SecurityActionKindV1::CreateExpiring => {
+                self.method == "POST"
+                    && contract.default_ttl_seconds >= 300
+                    && contract.max_ttl_seconds >= contract.default_ttl_seconds
+                    && contract.max_ttl_seconds <= 604_800
+                    && contract.default_action.as_ref().is_some_and(|action| {
+                        action == "managed_challenge"
+                            && contract
+                                .allowed_actions
+                                .iter()
+                                .any(|allowed| allowed == action)
+                    })
+                    && !contract.allowed_target_types.is_empty()
+                    && self.verification_contract_supported()
+                    && self.rollback.supported
+                    && self.rollback_contract_supported()
+            }
+            SecurityActionKindV1::RemoveExpired => {
+                self.method == "DELETE"
+                    && contract.default_ttl_seconds == 0
+                    && contract.max_ttl_seconds == 0
+                    && contract.default_action.is_none()
+                    && contract.allowed_actions.is_empty()
+                    && self.verification_contract_supported()
+                    && !self.rollback.supported
+            }
+            SecurityActionKindV1::AddExpiringListMember => {
+                self.method == "POST"
+                    && contract.default_ttl_seconds >= 300
+                    && contract.max_ttl_seconds >= contract.default_ttl_seconds
+                    && contract.max_ttl_seconds <= 604_800
+                    && contract.default_action.as_deref() == Some("managed_challenge")
+                    && contract
+                        .allowed_actions
+                        .iter()
+                        .any(|action| action == "managed_challenge")
+                    && !contract.allowed_target_types.is_empty()
+                    && self.async_list_mutation_contract_supported(true)
+                    && self.verification_contract_supported()
+                    && self.rollback.supported
+                    && self.rollback_contract_supported()
+            }
+            SecurityActionKindV1::RemoveExpiredListMember => {
+                self.method == "DELETE"
+                    && contract.default_ttl_seconds == 0
+                    && contract.max_ttl_seconds == 0
+                    && contract.default_action.is_none()
+                    && contract.allowed_actions.is_empty()
+                    && self.async_list_mutation_contract_supported(false)
+                    && self.verification_contract_supported()
+                    && !self.rollback.supported
+            }
         }
     }
 
@@ -1308,6 +1834,8 @@ impl CapabilityV1 {
             && self.id != "d1-create-database"
             && (self.created_resource_contract_supported()
                 || self.created_collection_resource_contract_supported()
+                || self.created_nested_resource_contract_supported()
+                || self.worker_tail_created_collection_contract_supported()
                 || (self.id == "access-applications-add-an-application"
                     && self.created_resource_contract_supported_with_curated_fields(&[
                         "name", "type",
@@ -1436,6 +1964,144 @@ impl CapabilityV1 {
             })
     }
 
+    fn worker_tail_created_collection_contract_supported(&self) -> bool {
+        self.id == "worker-tail-logs-start-tail"
+            && self.method == "POST"
+            && self.path == "/accounts/{account_id}/workers/scripts/{script_name}/tails"
+            && self.product == "Worker Tail Logs"
+            && self.account_scope == "account"
+            && self.request_schema.is_none()
+            && self.risk == RiskClass::SecretSensitive
+            && self.effect == EffectClass::ReversibleWrite
+            && self.permissions == ["Workers Tail Read", "Workers Scripts Write"]
+            && self
+                .selectors
+                .iter()
+                .all(|selector| selector.location == "path")
+            && ["account_id", "script_name"].iter().all(|name| {
+                self.selectors.iter().any(|selector| {
+                    selector.name == *name && selector.location == "path" && selector.required
+                })
+            })
+            && self
+                .created_collection_resource
+                .as_ref()
+                .is_some_and(|target| {
+                    target.collection_path
+                        == "/accounts/{account_id}/workers/scripts/{script_name}/tails"
+                        && target.identity_selector == "id"
+                        && target.response_result_identity_pointer == "/id"
+                        && target.response_item_identity_pointer == "/id"
+                        && target.read_capability_id == "worker-tail-logs-list-tails"
+                        && target.delete_capability_id == "worker-tail-logs-delete-tail"
+                        && target.verified_response_fields.is_empty()
+                        && !target.requires_page_number_completion
+                })
+    }
+
+    fn async_list_mutation_contract_supported(&self, create: bool) -> bool {
+        const COLLECTION: &str = "/accounts/{account_id}/rules/lists/{list_id}/items";
+        const STATUS: &str = "/accounts/{account_id}/rules/lists/bulk_operations/{operation_id}";
+        let expected_id = if create {
+            "security-response-add-expiring-list-member"
+        } else {
+            "security-response-remove-expired-list-member"
+        };
+        let expected_method = if create { "POST" } else { "DELETE" };
+        self.id == expected_id
+            && self.method == expected_method
+            && self.path == COLLECTION
+            && self.product == "Lists"
+            && self.account_scope == "account"
+            && self.risk == RiskClass::IdentityOrOwnership
+            && self.effect
+                == if create {
+                    EffectClass::ReversibleWrite
+                } else {
+                    EffectClass::Destructive
+                }
+            && self.permissions == ["Account Filter Lists Edit", "Account Filter Lists Read"]
+            && self
+                .selectors
+                .iter()
+                .all(|selector| selector.location == "path")
+            && ["account_id", "list_id"].iter().all(|name| {
+                self.selectors.iter().any(|selector| {
+                    selector.name == *name && selector.location == "path" && selector.required
+                })
+            })
+            && self
+                .async_collection_mutation
+                .as_ref()
+                .is_some_and(|contract| {
+                    contract.operation_status_path == STATUS
+                        && contract.operation_status_capability_id
+                            == "lists-get-bulk-operation-status"
+                        && contract.operation_id_selector == "operation_id"
+                        && contract.apply_operation_id_pointer == "/operation_id"
+                        && contract.status_operation_id_pointer == "/id"
+                        && contract.status_state_pointer == "/status"
+                        && contract.pending_states == ["pending", "running"]
+                        && contract.completed_state == "completed"
+                        && contract.failed_state == "failed"
+                        && contract.max_poll_attempts == 30
+                        && contract.poll_interval_ms == 1_000
+                        && contract.collection_path == COLLECTION
+                        && contract.collection_capability_id == "lists-get-list-items"
+                        && contract.collection_metadata_path
+                            == "/accounts/{account_id}/rules/lists/{list_id}"
+                        && contract.collection_metadata_capability_id == "lists-get-a-list"
+                        && contract.collection_item_identity_pointer == "/id"
+                        && contract.requires_cursor_completion
+                        && if create {
+                            contract.correlation_field.as_deref() == Some("comment")
+                                && contract.remove_capability_id.as_deref()
+                                    == Some("security-response-remove-expired-list-member")
+                        } else {
+                            contract.correlation_field.is_none()
+                                && contract.remove_capability_id.is_none()
+                        }
+                })
+    }
+
+    fn created_nested_resource_contract_supported(&self) -> bool {
+        self.created_nested_resource.as_ref().is_some_and(|target| {
+            let expected_delete_path = format!(
+                "{}/{{{}}}",
+                self.path.trim_end_matches('/'),
+                target.identity_selector
+            );
+            !target.parent_path.is_empty()
+                && !target.items_pointer.is_empty()
+                && target.items_pointer.starts_with('/')
+                && !target.identity_selector.is_empty()
+                && response_identity_pointer_supported(
+                    &target.identity_selector,
+                    &target.response_item_identity_pointer,
+                )
+                && !target.correlation_field.is_empty()
+                && !target.correlation_field.contains('/')
+                && !target.read_capability_id.is_empty()
+                && !target.delete_capability_id.is_empty()
+                && target.delete_path == expected_delete_path
+                && !target.verified_response_fields.is_empty()
+                && target
+                    .verified_response_fields
+                    .binary_search(&target.correlation_field)
+                    .is_ok()
+                && self
+                    .verified_response_fields_match_request_schema(&target.verified_response_fields)
+                && target
+                    .verified_response_fields
+                    .iter()
+                    .all(|field| !field.is_empty() && !field.contains('/'))
+                && target
+                    .verified_response_fields
+                    .windows(2)
+                    .all(|fields| fields[0] < fields[1])
+        })
+    }
+
     fn deleted_resource_contract_supported(&self) -> bool {
         self.deleted_resource.as_ref().is_some_and(|target| {
             let expected_path = format!(
@@ -1444,6 +2110,26 @@ impl CapabilityV1 {
                 target.identity_selector
             );
             !target.identity_selector.is_empty()
+                && self.path == expected_path
+                && response_identity_pointer_supported(
+                    &target.identity_selector,
+                    &target.response_item_identity_pointer,
+                )
+                && !target.read_capability_id.is_empty()
+        })
+    }
+
+    fn deleted_nested_resource_contract_supported(&self) -> bool {
+        self.deleted_nested_resource.as_ref().is_some_and(|target| {
+            let expected_path = format!(
+                "{}/{{{}}}",
+                target.collection_path.trim_end_matches('/'),
+                target.identity_selector
+            );
+            !target.parent_path.is_empty()
+                && !target.collection_path.is_empty()
+                && !target.items_pointer.is_empty()
+                && target.items_pointer.starts_with('/')
                 && self.path == expected_path
                 && response_identity_pointer_supported(
                     &target.identity_selector,
@@ -1708,6 +2394,7 @@ fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
     (selector_can_be_response_id(selector) && pointer == "/id")
         || (selector.ends_with("_name") && pointer == "/name")
         || (selector == "database_id" && pointer == "/uuid")
+        || (selector == "site_id" && pointer == "/site_tag")
         || (!selector
             .chars()
             .any(|character| matches!(character, '/' | '~'))
@@ -4304,6 +4991,8 @@ fn is_sensitive_key(key: &str) -> bool {
         "global_key",
         "client_secret",
         "private_key",
+        "destination_conf",
+        "ownership_challenge",
         "authorization",
         "password",
         "cookie",

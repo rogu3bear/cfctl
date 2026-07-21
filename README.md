@@ -19,6 +19,7 @@ agent, and every command emits stable JSON for automation.
 - [Runtime policy](docs/runtime-policy.md) — what needs approval, and why
 - [Security contract](docs/v2-security.md) — secrets, hashing, invariants
 - [Architecture](docs/v2-architecture.md) — crates, boundaries, trust sequence
+- [Telemetry control plane](docs/telemetry-control-plane.md) — GraphQL, bounded queries, observability, Logpush, and security response
 - [Agent landing](docs/agent-landing.md) — first-load doctrine for agents
 - [Contributing](CONTRIBUTING.md) — dev setup, proof lane, release lanes
 

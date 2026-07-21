@@ -11,14 +11,21 @@ cfctl-auth = { workspace = true }
 cfctl-core = { workspace = true }
 async-trait.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
+hex.workspace = true
 http.workspace = true
-reqwest.workspace = true
+memchr.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

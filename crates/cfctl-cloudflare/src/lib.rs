@@ -2,22 +2,33 @@
 
 use std::{
     collections::BTreeSet,
+    fs::OpenOptions,
+    io,
     net::{Ipv4Addr, Ipv6Addr},
+    path::Path,
     time::Duration,
 };
 
 use cfctl_auth::AuthCredential;
 use cfctl_core::{
-    CapabilityV1, PlanStatus, PlanV1, ResponseBodyModeV1, ResponseContractV1, SelectorV1,
+    AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1, GraphqlAnalyticsContractV1,
+    OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1, R2LogRetrievalContractV1,
+    ResponseBodyModeV1, ResponseContractV1, RiskClass, SelectorV1, TimestampFormatV1, hash_value,
     request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 use url::Url;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 #[derive(Debug, Error)]
 pub enum CloudflareError {
@@ -53,10 +64,26 @@ pub enum CloudflareError {
     MissingRequestBody(String),
     #[error("request body does not satisfy the pinned schema: {0}")]
     InvalidRequestBody(String),
+    #[error("analytics query violates its bounded read contract: {0}")]
+    InvalidAnalyticsQuery(String),
+    #[error("R2 log retrieval violates its bounded read contract: {0}")]
+    InvalidR2LogRetrieval(String),
+    #[error("R2 log retrieval requires an out-of-band credential bundle")]
+    R2LogCredentialsRequired,
+    #[error("R2 log retrieval requires a new mode-0600 output file")]
+    R2LogOutputFileRequired,
+    #[error("GraphQL Analytics response drifted from the pinned contract at `{pointer}`")]
+    GraphqlSchemaDrift { pointer: String },
+    #[error("analytics output file `{path}` could not be created or written: {source}")]
+    OutputFile {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
     #[error("catalog response contract is unsupported by the executor: {0}")]
     UnsupportedResponseContract(String),
     #[error(
-        "Cloudflare returned HTTP {status} with response media `{received}`, which does not match the pinned application/json contract"
+        "Cloudflare returned HTTP {status} with response media `{received}`, which is not declared by the pinned success contract"
     )]
     UnexpectedResponseMediaType { status: u16, received: String },
     #[error("Cloudflare returned HTTP {status} without the pinned JSON success envelope")]
@@ -85,6 +112,10 @@ pub enum CloudflareError {
     InvalidHeaderSelector(String),
     #[error("Cloudflare reported {0} pages, above the governed pagination limit")]
     PaginationLimit(u64),
+    #[error("Cloudflare cursor pagination repeated a cursor; completion cannot be proven")]
+    PaginationCursorLoop,
+    #[error("Cloudflare cursor pagination omitted cursor metadata before completion")]
+    PaginationCursorMetadataMissing,
     #[error("Cloudflare request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("approved plan pins catalog {planned}, but the current catalog is {current}")]
@@ -110,13 +141,65 @@ pub struct CallInput {
     pub if_none_match: Option<String>,
 }
 
+/// Ephemeral credentials for the exact Logs Engine retrieval adapter. The
+/// type is intentionally not serializable so it cannot enter `CallInput`, a
+/// plan, or evidence by accident.
+#[derive(Clone)]
+pub struct R2LogRetrievalCredentials {
+    access_key_id: String,
+    secret_access_key: String,
+}
+
+impl R2LogRetrievalCredentials {
+    pub fn new(access_key_id: String, secret_access_key: String) -> Result<Self> {
+        validate_r2_credential_value("access_key_id", &access_key_id)?;
+        validate_r2_credential_value("secret_access_key", &secret_access_key)?;
+        Ok(Self {
+            access_key_id,
+            secret_access_key,
+        })
+    }
+}
+
+impl std::fmt::Debug for R2LogRetrievalCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("R2LogRetrievalCredentials")
+            .field("access_key_id", &"[REDACTED]")
+            .field("secret_access_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+fn validate_r2_credential_value(field: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 512
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(CloudflareError::InvalidR2LogRetrieval(format!(
+            "credential field `{field}` must be a non-empty, unpadded value of at most 512 bytes"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedRequest {
     pub method: String,
     pub url: Url,
     pub headers: HeaderMap,
     pub body: Option<Value>,
+    pub text_body: Option<String>,
     pub response_contract: Option<ResponseContractV1>,
+    pub analytics_query: Option<AnalyticsQueryContractV1>,
+    pub r2_log_retrieval: Option<R2LogRetrievalContractV1>,
+    pub graphql: Option<GraphqlAnalyticsContractV1>,
+    pub output_format: OutputFormatV1,
+    pub max_rows: u64,
+    pub max_bytes: u64,
+    pub timeout_seconds: u64,
+    pub query_receipt: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +221,10 @@ impl RequestBuilder {
         self.build_unchecked(capability, input)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "request construction keeps validation, typed rendering, and bounded response metadata in one fail-closed path"
+    )]
     pub fn build_unchecked(
         &self,
         capability: &CapabilityV1,
@@ -213,14 +300,493 @@ impl RequestBuilder {
             reqwest::header::IF_NONE_MATCH,
             input.if_none_match.as_ref(),
         )?;
+        let (output_format, max_rows, max_bytes, timeout_seconds) =
+            read_runtime_options(capability, input)?;
+        let (body, text_body) = match capability
+            .analytics_query
+            .as_ref()
+            .map(|contract| contract.kind)
+        {
+            Some(AnalyticsQueryKindV1::StructuredSql) => {
+                let sql = render_structured_analytics_sql(
+                    input.body.as_ref().ok_or_else(|| {
+                        CloudflareError::MissingRequestBody(capability.id.clone())
+                    })?,
+                    output_format,
+                )?;
+                url.query_pairs_mut().append_pair("query", &sql);
+                (None, None)
+            }
+            Some(AnalyticsQueryKindV1::LogExplorerSql) => {
+                let sql =
+                    render_structured_log_explorer_sql(input.body.as_ref().ok_or_else(|| {
+                        CloudflareError::MissingRequestBody(capability.id.clone())
+                    })?)?;
+                headers.insert(
+                    reqwest::header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/plain"),
+                );
+                (None, Some(sql))
+            }
+            Some(AnalyticsQueryKindV1::GraphqlAnalytics) => {
+                let graphql = capability.graphql.as_ref().ok_or_else(|| {
+                    CloudflareError::InvalidAnalyticsQuery(
+                        "GraphQL query contract is missing its fixed document".to_owned(),
+                    )
+                })?;
+                (Some(graphql_request_body(graphql, input)?), None)
+            }
+            _ => (input.body.clone(), None),
+        };
+        headers.insert(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static(output_media_type(output_format)),
+        );
         Ok(PreparedRequest {
             method: capability.method.clone(),
             url,
             headers,
-            body: input.body.clone(),
+            body,
+            text_body,
             response_contract: capability.response_contract.clone(),
+            analytics_query: capability.analytics_query.clone(),
+            r2_log_retrieval: capability.r2_log_retrieval.clone(),
+            graphql: capability.graphql.clone(),
+            output_format,
+            max_rows,
+            max_bytes,
+            timeout_seconds,
+            query_receipt: analytics_query_receipt(capability, input, output_format)
+                .or_else(|| r2_log_retrieval_receipt(capability, input)),
         })
     }
+}
+
+fn r2_log_retrieval_receipt(capability: &CapabilityV1, input: &CallInput) -> Option<Value> {
+    let contract = capability.r2_log_retrieval.as_ref()?;
+    let query = input.query.as_object()?;
+    let hash = |selector: &str| {
+        query
+            .get(selector)
+            .and_then(Value::as_str)
+            .map(|value| format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes()))))
+    };
+    Some(serde_json::json!({
+        "capability_id": capability.id,
+        "kind": "r2_log_retrieval",
+        "start": query.get(&contract.start_query_selector),
+        "end": query.get(&contract.end_query_selector),
+        "bucket_sha256": hash(&contract.bucket_query_selector),
+        "prefix_sha256": hash(&contract.prefix_query_selector),
+        "byte_limit": contract.max_bytes,
+        "timeout_seconds": contract.max_timeout_seconds,
+        "output_file_required": contract.requires_new_mode_0600_file,
+        "credential_transport": "out_of_band_fixed_headers",
+    }))
+}
+
+fn analytics_query_receipt(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    output_format: OutputFormatV1,
+) -> Option<Value> {
+    let contract = capability.analytics_query.as_ref()?;
+    let body = input.body.as_ref();
+    Some(serde_json::json!({
+        "capability_id": capability.id,
+        "kind": contract.kind,
+        "dataset": contract.dataset.clone().map(Value::String).or_else(|| {
+            contract.dataset_pointer.as_deref().and_then(|pointer| body?.pointer(pointer)).cloned()
+        }),
+        "start": contract.time_range.as_ref().and_then(|time| body?.pointer(&time.start_pointer)).cloned(),
+        "end": contract.time_range.as_ref().and_then(|time| body?.pointer(&time.end_pointer)).cloned(),
+        "row_limit": contract.row_limit_pointer.as_deref().and_then(|pointer| body?.pointer(pointer)).cloned().unwrap_or(Value::from(contract.max_rows)),
+        "byte_limit": contract.max_bytes,
+        "timeout_seconds": body.and_then(|value| value.get("timeout_seconds")).cloned().unwrap_or(Value::from(contract.max_timeout_seconds)),
+        "output_format": output_format,
+        "pagination": contract.pagination,
+        "freshness": contract.freshness,
+        "sampling": contract.sampling,
+        "read_only": contract.read_only,
+    }))
+}
+
+fn read_runtime_options(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<(OutputFormatV1, u64, u64, u64)> {
+    let Some(contract) = capability.analytics_query.as_ref() else {
+        return Ok(capability.r2_log_retrieval.as_ref().map_or(
+            (OutputFormatV1::Json, 10_000, 16 * 1024 * 1024, 30),
+            |contract| {
+                (
+                    OutputFormatV1::Json,
+                    contract.max_bytes,
+                    contract.max_bytes,
+                    contract.max_timeout_seconds,
+                )
+            },
+        ));
+    };
+    let body = input.body.as_ref().and_then(Value::as_object);
+    let output_format = body
+        .and_then(|body| body.get("format"))
+        .and_then(Value::as_str)
+        .map(parse_output_format)
+        .transpose()?
+        .unwrap_or(contract.default_output_format);
+    let max_rows = contract
+        .row_limit_pointer
+        .as_deref()
+        .and_then(|pointer| input.body.as_ref()?.pointer(pointer))
+        .and_then(Value::as_u64)
+        .unwrap_or(contract.max_rows);
+    let timeout_seconds = body
+        .and_then(|body| body.get("timeout_seconds"))
+        .and_then(Value::as_u64)
+        .unwrap_or(contract.max_timeout_seconds);
+    Ok((output_format, max_rows, contract.max_bytes, timeout_seconds))
+}
+
+fn parse_output_format(value: &str) -> Result<OutputFormatV1> {
+    match value {
+        "json" => Ok(OutputFormatV1::Json),
+        "ndjson" => Ok(OutputFormatV1::Ndjson),
+        "csv" => Ok(OutputFormatV1::Csv),
+        _ => Err(CloudflareError::InvalidAnalyticsQuery(format!(
+            "output format `{value}` is not declared"
+        ))),
+    }
+}
+
+const fn output_media_type(format: OutputFormatV1) -> &'static str {
+    match format {
+        OutputFormatV1::Json => "application/json",
+        OutputFormatV1::Ndjson => "application/x-ndjson",
+        OutputFormatV1::Csv => "text/csv",
+    }
+}
+
+fn graphql_request_body(contract: &GraphqlAnalyticsContractV1, input: &CallInput) -> Result<Value> {
+    contract.validate_schema_fingerprint()?;
+    let selectors = input.selectors.as_object().ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery(
+            "GraphQL selectors must be an object of fixed variable bindings".to_owned(),
+        )
+    })?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CloudflareError::MissingRequestBody(contract.operation_name.clone()))?;
+    let mut variables = serde_json::Map::new();
+    for (selector, variable) in &contract.selector_variables {
+        let value = selectors.get(selector).cloned().ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery(format!(
+                "GraphQL selector `{selector}` is missing"
+            ))
+        })?;
+        variables.insert(variable.clone(), value);
+    }
+    for (field, variable) in &contract.body_variables {
+        let value = body.get(field).cloned().ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery(format!(
+                "GraphQL variable field `{field}` is missing"
+            ))
+        })?;
+        variables.insert(variable.clone(), value);
+    }
+    Ok(serde_json::json!({
+        "query": contract.document,
+        "operationName": contract.operation_name,
+        "variables": variables,
+    }))
+}
+
+fn render_structured_analytics_sql(body: &Value, format: OutputFormatV1) -> Result<String> {
+    render_structured_select_sql(body, "timestamp", true, Some(format))
+}
+
+fn render_structured_log_explorer_sql(body: &Value) -> Result<String> {
+    let timestamp_field = body
+        .get("timestamp_field")
+        .and_then(Value::as_str)
+        .filter(|value| valid_sql_identifier(value))
+        .ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery(
+                "timestamp_field must be one plain SQL identifier".to_owned(),
+            )
+        })?;
+    render_structured_select_sql(body, timestamp_field, false, None)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the structured read-only SQL renderer validates each clause before assembling one statement"
+)]
+fn render_structured_select_sql(
+    body: &Value,
+    timestamp_field: &str,
+    clickhouse_time: bool,
+    format: Option<OutputFormatV1>,
+) -> Result<String> {
+    let body = body.as_object().ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery("structured SQL input must be an object".to_owned())
+    })?;
+    let dataset = body
+        .get("dataset")
+        .and_then(Value::as_str)
+        .filter(|value| valid_sql_identifier(value))
+        .ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery(
+                "dataset must be one plain SQL identifier".to_owned(),
+            )
+        })?;
+    let start = body.get("start").and_then(Value::as_str).ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery("start timestamp is missing".to_owned())
+    })?;
+    let end = body.get("end").and_then(Value::as_str).ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery("end timestamp is missing".to_owned())
+    })?;
+    let mut projections = body
+        .get("columns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|field| sql_identifier_value(field, "column"))
+        .collect::<Result<Vec<_>>>()?;
+    for aggregate in body
+        .get("aggregates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let aggregate = aggregate.as_object().ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery("aggregate must be an object".to_owned())
+        })?;
+        let function = aggregate
+            .get("function")
+            .and_then(Value::as_str)
+            .filter(|function| matches!(*function, "count" | "sum" | "avg" | "min" | "max"))
+            .ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(
+                    "aggregate function must be count, sum, avg, min, or max".to_owned(),
+                )
+            })?;
+        let expression = if function == "count" {
+            "count(*)".to_owned()
+        } else {
+            let field = aggregate
+                .get("field")
+                .and_then(Value::as_str)
+                .filter(|field| valid_sql_identifier(field))
+                .ok_or_else(|| {
+                    CloudflareError::InvalidAnalyticsQuery(format!(
+                        "aggregate `{function}` requires one plain field identifier"
+                    ))
+                })?;
+            format!("{function}({field})")
+        };
+        let alias = aggregate
+            .get("alias")
+            .and_then(Value::as_str)
+            .filter(|alias| valid_sql_identifier(alias))
+            .ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(
+                    "aggregate alias must be one plain identifier".to_owned(),
+                )
+            })?;
+        projections.push(format!("{expression} AS {alias}"));
+    }
+    if projections.is_empty() {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "at least one column or aggregate is required".to_owned(),
+        ));
+    }
+
+    let mut predicates = if clickhouse_time {
+        vec![
+            format!(
+                "{timestamp_field} >= toDateTime64('{}', 3)",
+                sql_quote(start)
+            ),
+            format!("{timestamp_field} < toDateTime64('{}', 3)", sql_quote(end)),
+        ]
+    } else {
+        vec![
+            format!("{timestamp_field} >= '{}'", sql_quote(start)),
+            format!("{timestamp_field} < '{}'", sql_quote(end)),
+        ]
+    };
+    for filter in body
+        .get("filters")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        predicates.push(render_structured_filter(filter)?);
+    }
+
+    let mut sql = format!(
+        "SELECT {} FROM {} WHERE {}",
+        projections.join(", "),
+        dataset,
+        predicates.join(" AND ")
+    );
+    let group_by = sql_identifier_array(body.get("group_by"), "group_by")?;
+    if !group_by.is_empty() {
+        sql.push_str(" GROUP BY ");
+        sql.push_str(&group_by.join(", "));
+    }
+    let order_by = body
+        .get("order_by")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|order| {
+            let order = order.as_object().ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(
+                    "order_by entries must be objects".to_owned(),
+                )
+            })?;
+            let field = order
+                .get("field")
+                .and_then(Value::as_str)
+                .filter(|field| valid_sql_identifier(field))
+                .ok_or_else(|| {
+                    CloudflareError::InvalidAnalyticsQuery(
+                        "order_by field must be one plain identifier".to_owned(),
+                    )
+                })?;
+            let direction = match order.get("direction").and_then(Value::as_str) {
+                Some("asc") => "ASC",
+                Some("desc") => "DESC",
+                _ => {
+                    return Err(CloudflareError::InvalidAnalyticsQuery(
+                        "order_by direction must be asc or desc".to_owned(),
+                    ));
+                }
+            };
+            Ok(format!("{field} {direction}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !order_by.is_empty() {
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&order_by.join(", "));
+    }
+    let limit = body.get("limit").and_then(Value::as_u64).ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery("positive row limit is missing".to_owned())
+    })?;
+    sql.push_str(" LIMIT ");
+    sql.push_str(&limit.to_string());
+    if let Some(format) = format {
+        let output = match format {
+            OutputFormatV1::Json => "JSON",
+            OutputFormatV1::Ndjson => "JSONEachRow",
+            OutputFormatV1::Csv => "CSVWithNames",
+        };
+        sql.push_str(" FORMAT ");
+        sql.push_str(output);
+    }
+    Ok(sql)
+}
+
+fn render_structured_filter(value: &Value) -> Result<String> {
+    let filter = value.as_object().ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery("filter must be an object".to_owned())
+    })?;
+    let field = filter
+        .get("field")
+        .and_then(Value::as_str)
+        .filter(|field| valid_sql_identifier(field))
+        .ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery(
+                "filter field must be one plain identifier".to_owned(),
+            )
+        })?;
+    let operator = filter.get("operator").and_then(Value::as_str);
+    let scalar_operator = match operator {
+        Some("eq") => Some("="),
+        Some("ne") => Some("!="),
+        Some("gt") => Some(">"),
+        Some("gte") => Some(">="),
+        Some("lt") => Some("<"),
+        Some("lte") => Some("<="),
+        Some("in" | "not_in") => None,
+        _ => {
+            return Err(CloudflareError::InvalidAnalyticsQuery(
+                "filter operator must be eq, ne, gt, gte, lt, lte, in, or not_in".to_owned(),
+            ));
+        }
+    };
+    let value = filter.get("value").ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery("filter value is missing".to_owned())
+    })?;
+    if let Some(operator) = scalar_operator {
+        return Ok(format!("{field} {operator} {}", sql_literal(value)?));
+    }
+    let values = value
+        .as_array()
+        .filter(|values| !values.is_empty() && values.len() <= 100)
+        .ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery(
+                "in and not_in filters require between 1 and 100 scalar values".to_owned(),
+            )
+        })?
+        .iter()
+        .map(sql_literal)
+        .collect::<Result<Vec<_>>>()?;
+    let operator = if operator == Some("in") {
+        "IN"
+    } else {
+        "NOT IN"
+    };
+    Ok(format!("{field} {operator} ({})", values.join(", ")))
+}
+
+fn sql_literal(value: &Value) -> Result<String> {
+    match value {
+        Value::String(value) => Ok(format!("'{}'", sql_quote(value))),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::Bool(value) => Ok(if *value { "true" } else { "false" }.to_owned()),
+        _ => Err(CloudflareError::InvalidAnalyticsQuery(
+            "filter values must be strings, numbers, or booleans".to_owned(),
+        )),
+    }
+}
+
+fn sql_identifier_array(value: Option<&Value>, label: &str) -> Result<Vec<String>> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|value| sql_identifier_value(value, label))
+        .collect()
+}
+
+fn sql_identifier_value(value: &Value, label: &str) -> Result<String> {
+    value
+        .as_str()
+        .filter(|value| valid_sql_identifier(value))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery(format!(
+                "{label} values must be plain identifiers"
+            ))
+        })
+}
+
+fn valid_sql_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && value.len() <= 64
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+fn sql_quote(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 fn add_declared_header_selectors(
@@ -284,6 +850,11 @@ pub struct OperationVerificationV1 {
     pub passed: bool,
     pub basis: String,
     pub readback: CloudflareResponseV1,
+    /// Exact non-secret resource identity discovered only after a governed
+    /// asynchronous verifier correlates the materialized resource. This is
+    /// never populated by ordinary readback strategies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlated_resource_id: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -314,8 +885,59 @@ impl Executor {
         input: &CallInput,
         credential: &AuthCredential,
     ) -> Result<CloudflareResponseV1> {
+        if capability.r2_log_retrieval.is_some() {
+            return Err(CloudflareError::R2LogCredentialsRequired);
+        }
         let request = self.builder.build(capability, input)?;
         self.send_paginated(&request, credential).await
+    }
+
+    /// Executes a bounded analytics read and writes only the declared output to
+    /// a newly-created mode-0600 file. The returned envelope contains a hash
+    /// receipt instead of duplicating query rows on stdout.
+    pub async fn execute_read_to_file(
+        &self,
+        capability: &CapabilityV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+        output_path: &Path,
+    ) -> Result<CloudflareResponseV1> {
+        if capability.r2_log_retrieval.is_some() {
+            return Err(CloudflareError::R2LogCredentialsRequired);
+        }
+        if capability.analytics_query.is_none() {
+            return Err(CloudflareError::InvalidAnalyticsQuery(
+                "file output is restricted to bounded analytics capabilities".to_owned(),
+            ));
+        }
+        let request = self.builder.build(capability, input)?;
+        self.send_paginated_with_output(&request, credential, Some(output_path))
+            .await
+    }
+
+    /// Executes the one pinned Logs Engine retrieval with its two ephemeral R2
+    /// headers and streams the response directly to a newly-created private
+    /// file. Neither credential can enter a serializable request or receipt.
+    pub async fn execute_r2_log_retrieval_to_file(
+        &self,
+        capability: &CapabilityV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+        r2_credentials: &R2LogRetrievalCredentials,
+        output_path: &Path,
+    ) -> Result<CloudflareResponseV1> {
+        let contract = capability
+            .r2_log_retrieval
+            .as_ref()
+            .ok_or(CloudflareError::R2LogOutputFileRequired)?;
+        if !contract.requires_new_mode_0600_file {
+            return Err(CloudflareError::InvalidR2LogRetrieval(
+                "the catalog must require a new private output file".to_owned(),
+            ));
+        }
+        let request = self.builder.build(capability, input)?;
+        self.send_r2_log_retrieval_to_file(&request, credential, r2_credentials, output_path)
+            .await
     }
 
     pub async fn execute_consumed_plan(
@@ -440,6 +1062,12 @@ impl Executor {
             return self.verify_email_routing_settings(plan, apply_response);
         }
 
+        if strategy.starts_with("async_list_operation_") {
+            return self
+                .verify_async_list_mutation(plan, apply_response, input, credential)
+                .await;
+        }
+
         if is_delete_verifier(strategy) {
             return self
                 .verify_resource_delete(plan, apply_response, input, credential)
@@ -459,6 +1087,324 @@ impl Executor {
         Err(CloudflareError::UnsupportedVerificationStrategy(
             strategy.to_owned(),
         ))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the asynchronous verifier is one bounded state machine from operation identity through complete collection proof"
+    )]
+    async fn verify_async_list_mutation(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let contract = plan
+            .capability
+            .async_collection_mutation
+            .as_ref()
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the hash-bound asynchronous collection contract is absent".to_owned(),
+                )
+            })?;
+        let operation_id = apply_response
+            .result
+            .pointer(&contract.apply_operation_id_pointer)
+            .and_then(Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "Cloudflare accepted the List mutation without a non-empty bulk operation identity"
+                        .to_owned(),
+                )
+            })?;
+        let account_id = input
+            .selectors
+            .get("account_id")
+            .and_then(Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the asynchronous List verifier requires an exact account selector".to_owned(),
+                )
+            })?;
+        let list_id = input
+            .selectors
+            .get("list_id")
+            .and_then(Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the asynchronous List verifier requires an exact list selector".to_owned(),
+                )
+            })?;
+
+        let status_capability = CapabilityV1::new(
+            &contract.operation_status_capability_id,
+            "Asynchronous List operation status verification readback",
+            "GET",
+            &contract.operation_status_path,
+        );
+        let status_request = self.builder.build(
+            &status_capability,
+            &CallInput {
+                selectors: serde_json::json!({
+                    "account_id":account_id,
+                    contract.operation_id_selector.clone():operation_id,
+                }),
+                query: serde_json::json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let mut terminal = None;
+        for attempt in 0..contract.max_poll_attempts {
+            let response = self.send(&status_request, credential).await?;
+            let returned_id = response
+                .result
+                .pointer(&contract.status_operation_id_pointer)
+                .and_then(Value::as_str);
+            if !response.success || returned_id != Some(operation_id) {
+                return Err(CloudflareError::MissingVerificationTarget(
+                    "the bulk-operation status readback did not prove the exact operation identity"
+                        .to_owned(),
+                ));
+            }
+            let status = response
+                .result
+                .pointer(&contract.status_state_pointer)
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    CloudflareError::MissingVerificationTarget(
+                        "the bulk-operation status readback omitted its bounded state".to_owned(),
+                    )
+                })?;
+            if status == contract.completed_state || status == contract.failed_state {
+                terminal = Some(response);
+                break;
+            }
+            if !contract
+                .pending_states
+                .iter()
+                .any(|pending| pending == status)
+            {
+                return Err(CloudflareError::MissingVerificationTarget(format!(
+                    "the bulk-operation status `{status}` is outside the hash-bound state machine"
+                )));
+            }
+            if attempt + 1 < contract.max_poll_attempts {
+                sleep(Duration::from_millis(contract.poll_interval_ms)).await;
+            }
+        }
+        let Some(status_readback) = terminal else {
+            let readback = async_list_receipt_response(AsyncListReceipt {
+                status: 200,
+                operation_id,
+                operation_status: "timeout",
+                cursor_complete: false,
+                match_count: 0,
+                resource_id: None,
+                resource_hash: None,
+                failure: None,
+            });
+            return Ok(OperationVerificationV1 {
+                strategy: plan.capability.verification.strategy.clone(),
+                passed: false,
+                basis: format!(
+                    "Cloudflare did not report a terminal List bulk-operation state within {} hash-bound poll attempts",
+                    contract.max_poll_attempts
+                ),
+                readback,
+                correlated_resource_id: None,
+            });
+        };
+        let terminal_status = status_readback
+            .result
+            .pointer(&contract.status_state_pointer)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the terminal bulk-operation readback omitted its validated state".to_owned(),
+                )
+            })?;
+        if terminal_status == contract.failed_state {
+            let readback = async_list_receipt_response(AsyncListReceipt {
+                status: status_readback.status,
+                operation_id,
+                operation_status: terminal_status,
+                cursor_complete: false,
+                match_count: 0,
+                resource_id: None,
+                resource_hash: None,
+                failure: status_readback.result.get("error").cloned(),
+            });
+            return Ok(OperationVerificationV1 {
+                strategy: plan.capability.verification.strategy.clone(),
+                passed: false,
+                basis: "Cloudflare reported that the exact List bulk operation failed; the collection mutation is not verified"
+                    .to_owned(),
+                readback,
+                correlated_resource_id: None,
+            });
+        }
+
+        let collection_capability = CapabilityV1::new(
+            &contract.collection_capability_id,
+            "Asynchronous List collection verification readback",
+            "GET",
+            &contract.collection_path,
+        );
+        let mut collection_request = self.builder.build(
+            &collection_capability,
+            &CallInput {
+                selectors: serde_json::json!({"account_id":account_id,"list_id":list_id}),
+                query: serde_json::json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        set_query_parameter(&mut collection_request.url, "per_page", "500");
+        let collection = self.send_paginated(&collection_request, credential).await?;
+        let cursor_complete = !contract.requires_cursor_completion
+            || collection.result_info.as_ref().is_some_and(|info| {
+                info.get("cfctl_cursor_complete").and_then(Value::as_bool) == Some(true)
+            });
+        let items = collection.result.as_array().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the List verification readback did not return an item array".to_owned(),
+            )
+        })?;
+        let create = plan.capability.verification.strategy
+            == "async_list_operation_completes_and_correlated_member_exists";
+        if create {
+            let planned = input
+                .body
+                .as_ref()
+                .and_then(Value::as_array)
+                .and_then(|items| (items.len() == 1).then(|| &items[0]))
+                .ok_or_else(|| {
+                    CloudflareError::MissingVerificationTarget(
+                        "the governed List add must contain exactly one planned item".to_owned(),
+                    )
+                })?;
+            let correlation = planned
+                .get("comment")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    CloudflareError::MissingVerificationTarget(
+                        "the governed List add omitted its correlation comment".to_owned(),
+                    )
+                })?;
+            let matching = items
+                .iter()
+                .filter(|item| item.get("comment").and_then(Value::as_str) == Some(correlation))
+                .collect::<Vec<_>>();
+            let projection_matches = matching
+                .first()
+                .and_then(|item| governed_list_item_projection(item))
+                == governed_list_item_projection(planned);
+            let resource_id = matching.first().and_then(|item| {
+                item.pointer(&contract.collection_item_identity_pointer)
+                    .and_then(Value::as_str)
+                    .filter(|identity| !identity.is_empty())
+            });
+            let passed = apply_response.success
+                && collection.success
+                && cursor_complete
+                && matching.len() == 1
+                && projection_matches
+                && resource_id.is_some();
+            let projection_hash = matching
+                .first()
+                .and_then(|item| governed_list_item_projection(item))
+                .map(|projection| hash_value(&projection))
+                .transpose()?;
+            let readback = async_list_receipt_response(AsyncListReceipt {
+                status: collection.status,
+                operation_id,
+                operation_status: terminal_status,
+                cursor_complete,
+                match_count: matching.len(),
+                resource_id,
+                resource_hash: projection_hash.as_deref(),
+                failure: None,
+            });
+            let basis = if passed {
+                "Cloudflare completed the exact bulk operation and the complete cursor-paginated List contained one schema-matching member with a correlated identity"
+                    .to_owned()
+            } else {
+                format!(
+                    "List add verification failed (apply success={}, collection success={}, cursor complete={}, correlation matches={}, projection matches={}, identity present={})",
+                    apply_response.success,
+                    collection.success,
+                    cursor_complete,
+                    matching.len(),
+                    projection_matches,
+                    resource_id.is_some()
+                )
+            };
+            return Ok(OperationVerificationV1 {
+                strategy: plan.capability.verification.strategy.clone(),
+                passed,
+                basis,
+                readback,
+                correlated_resource_id: resource_id
+                    .map(|identity| Value::String(identity.to_owned())),
+            });
+        }
+
+        let deleted_ids = governed_list_delete_ids(input)?;
+        let live_ids = items
+            .iter()
+            .map(|item| {
+                item.pointer(&contract.collection_item_identity_pointer)
+                    .and_then(Value::as_str)
+                    .filter(|identity| !identity.is_empty())
+            })
+            .collect::<Vec<_>>();
+        let identity_shape_valid = live_ids.iter().all(Option::is_some);
+        let all_absent = deleted_ids
+            .iter()
+            .all(|deleted| live_ids.iter().all(|live| *live != Some(deleted.as_str())));
+        let passed = apply_response.success
+            && collection.success
+            && cursor_complete
+            && identity_shape_valid
+            && all_absent;
+        let deleted_ids_hash = hash_value(&serde_json::json!(deleted_ids))?;
+        let readback = async_list_receipt_response(AsyncListReceipt {
+            status: collection.status,
+            operation_id,
+            operation_status: terminal_status,
+            cursor_complete,
+            match_count: deleted_ids.len(),
+            resource_id: None,
+            resource_hash: Some(&deleted_ids_hash),
+            failure: None,
+        });
+        let basis = if passed {
+            "Cloudflare completed the exact bulk delete and the complete cursor-paginated List omitted every planned member identity"
+                .to_owned()
+        } else {
+            format!(
+                "List removal verification failed (apply success={}, collection success={}, cursor complete={}, item identities valid={}, every removed identity absent={})",
+                apply_response.success,
+                collection.success,
+                cursor_complete,
+                identity_shape_valid,
+                all_absent
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback,
+            correlated_resource_id: None,
+        })
     }
 
     async fn verify_api_token(
@@ -503,6 +1449,7 @@ impl Executor {
             passed,
             basis,
             readback,
+            correlated_resource_id: None,
         })
     }
 
@@ -556,6 +1503,7 @@ impl Executor {
             passed,
             basis,
             readback: apply_response.clone(),
+            correlated_resource_id: None,
         })
     }
 
@@ -612,6 +1560,7 @@ impl Executor {
             passed,
             basis,
             readback: apply_response.clone(),
+            correlated_resource_id: None,
         })
     }
 
@@ -682,6 +1631,7 @@ impl Executor {
             passed,
             basis,
             readback,
+            correlated_resource_id: None,
         })
     }
 
@@ -726,6 +1676,7 @@ impl Executor {
             passed,
             basis,
             readback,
+            correlated_resource_id: None,
         })
     }
 
@@ -779,6 +1730,7 @@ impl Executor {
             passed,
             basis,
             readback,
+            correlated_resource_id: None,
         })
     }
 
@@ -830,6 +1782,7 @@ impl Executor {
             passed,
             basis,
             readback,
+            correlated_resource_id: None,
         })
     }
 
@@ -846,8 +1799,17 @@ impl Executor {
                 self.verify_created_resource(plan, apply_response, input, credential)
                     .await
             }
-            "parent_collection_contains_created_resource_id_and_planned_fields" => {
+            "parent_collection_contains_created_resource_id_and_planned_fields"
+            | "worker_tail_collection_contains_created_lease_id" => {
                 self.verify_created_collection_resource(plan, apply_response, input, credential)
+                    .await
+            }
+            "parent_object_contains_created_nested_resource_by_correlation" => {
+                self.verify_created_nested_resource(plan, apply_response, input, credential)
+                    .await
+            }
+            "web_analytics_rule_list_contains_created_id_and_planned_fields" => {
+                self.verify_web_analytics_rule_create(plan, apply_response, input, credential)
                     .await
             }
             strategy => Err(CloudflareError::UnsupportedVerificationStrategy(
@@ -874,6 +1836,14 @@ impl Executor {
             }
             "parent_collection_omits_deleted_resource_id" => {
                 self.verify_parent_collection_delete(plan, apply_response, input, credential)
+                    .await
+            }
+            "parent_object_omits_deleted_nested_resource_id" => {
+                self.verify_parent_object_nested_delete(plan, apply_response, input, credential)
+                    .await
+            }
+            "web_analytics_rule_list_omits_deleted_id" => {
+                self.verify_web_analytics_rule_delete(plan, apply_response, input, credential)
                     .await
             }
             strategy => Err(CloudflareError::UnsupportedVerificationStrategy(
@@ -927,6 +1897,7 @@ impl Executor {
             passed,
             basis,
             readback,
+            correlated_resource_id: None,
         })
     }
 
@@ -972,6 +1943,7 @@ impl Executor {
             passed,
             basis,
             readback,
+            correlated_resource_id: None,
         })
     }
 
@@ -1064,6 +2036,7 @@ impl Executor {
             passed,
             basis,
             readback,
+            correlated_resource_id: None,
         })
     }
 
@@ -1132,6 +2105,7 @@ impl Executor {
             passed,
             basis,
             readback,
+            correlated_resource_id: None,
         })
     }
 
@@ -1262,6 +2236,7 @@ impl Executor {
             passed,
             basis,
             readback,
+            correlated_resource_id: None,
         })
     }
 
@@ -1290,11 +2265,10 @@ impl Executor {
         let resource_id = apply_response
             .result
             .pointer(&target.response_result_identity_pointer)
-            .and_then(Value::as_str)
-            .filter(|identity| !identity.is_empty())
+            .and_then(resource_identity_value)
             .ok_or_else(|| {
                 CloudflareError::MissingVerificationTarget(
-                    "the successful creation response has no non-empty schema-proven identity"
+                    "the successful creation response has no non-empty string or integer schema-proven identity"
                         .to_owned(),
                 )
             })?;
@@ -1303,10 +2277,7 @@ impl Executor {
                 "planned create selectors are not an object".to_owned(),
             )
         })?;
-        selectors.insert(
-            target.identity_selector.clone(),
-            Value::String(resource_id.to_owned()),
-        );
+        selectors.insert(target.identity_selector.clone(), resource_id.clone());
         let mut details = CapabilityV1::new(
             &target.read_capability_id,
             "Created resource verification readback",
@@ -1327,13 +2298,13 @@ impl Executor {
         let readback_identity = readback
             .result
             .pointer(&target.response_result_identity_pointer)
-            .and_then(Value::as_str);
+            .and_then(resource_identity_value);
         let mut mismatches =
             mismatched_verifiable_planned_fields(&plan.capability, planned, &readback.result);
         extend_r2_bucket_create_mismatches(plan, input, &readback.result, &mut mismatches);
         let passed = apply_response.success
             && readback.success
-            && readback_identity == Some(resource_id)
+            && readback_identity.as_ref() == Some(&resource_id)
             && mismatches.is_empty();
         let basis = if passed {
             "the exact created-resource readback matched the returned identity and every planned field"
@@ -1344,7 +2315,7 @@ impl Executor {
                 apply_response.success,
                 readback.status,
                 readback.success,
-                readback_identity == Some(resource_id),
+                readback_identity.as_ref() == Some(&resource_id),
                 render_field_names(&mismatches)
             )
         };
@@ -1353,9 +2324,14 @@ impl Executor {
             passed,
             basis,
             readback,
+            correlated_resource_id: None,
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "collection verification keeps pagination completeness, identity shape, and planned-field proof together"
+    )]
     async fn verify_created_collection_resource(
         &self,
         plan: &PlanV1,
@@ -1372,16 +2348,23 @@ impl Executor {
                     "the hash-bound created-collection-resource contract is absent".to_owned(),
                 )
             })?;
-        let planned = input
-            .body
-            .as_ref()
-            .and_then(Value::as_object)
-            .filter(|body| !body.is_empty())
-            .ok_or_else(|| {
-                CloudflareError::MissingVerificationTarget(
-                    "planned create body is absent, empty, or not an object".to_owned(),
-                )
-            })?;
+        let worker_tail = is_worker_tail_create_capability(&plan.capability);
+        let planned = if worker_tail {
+            None
+        } else {
+            Some(
+                input
+                    .body
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .filter(|body| !body.is_empty())
+                    .ok_or_else(|| {
+                        CloudflareError::MissingVerificationTarget(
+                            "planned create body is absent, empty, or not an object".to_owned(),
+                        )
+                    })?,
+            )
+        };
         let resource_id = apply_response
             .result
             .pointer(&target.response_result_identity_pointer)
@@ -1428,9 +2411,12 @@ impl Executor {
                     == Some(resource_id)
             })
             .collect::<Vec<_>>();
-        let planned_fields_match = matching_items.first().is_some_and(|item| {
-            mismatched_verifiable_planned_fields(&plan.capability, planned, item).is_empty()
-        });
+        let planned_fields_match = worker_tail
+            || planned.is_some_and(|planned| {
+                matching_items.first().is_some_and(|item| {
+                    mismatched_verifiable_planned_fields(&plan.capability, planned, item).is_empty()
+                })
+            });
         let passed = apply_response.success
             && readback.success
             && pagination_complete
@@ -1438,8 +2424,13 @@ impl Executor {
             && matching_items.len() == 1
             && planned_fields_match;
         let basis = if passed {
-            "the complete schema-proven parent collection contained exactly one returned creation identity with every planned field"
-                .to_owned()
+            if worker_tail {
+                "the live Worker tail collection contained exactly one lease with the returned creation identity; the bearer URL remained sink-only"
+                    .to_owned()
+            } else {
+                "the complete schema-proven parent collection contained exactly one returned creation identity with every planned field"
+                    .to_owned()
+            }
         } else {
             format!(
                 "parent collection did not prove creation (apply success={}, readback HTTP {}, readback success={}, pagination complete={}, result array={}, item identities valid={}, identity matches={}, planned fields match={})",
@@ -1458,6 +2449,384 @@ impl Executor {
             passed,
             basis,
             readback,
+            correlated_resource_id: None,
+        })
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "nested-resource verification correlates apply and live parent readbacks in one proof path"
+    )]
+    async fn verify_created_nested_resource(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let target = plan
+            .capability
+            .created_nested_resource
+            .as_ref()
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the hash-bound created-nested-resource contract is absent".to_owned(),
+                )
+            })?;
+        let planned = input
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .filter(|body| !body.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "planned nested-resource create body is absent, empty, or not an object"
+                        .to_owned(),
+                )
+            })?;
+        let correlation = planned
+            .get(&target.correlation_field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "planned nested-resource correlation value is absent or empty".to_owned(),
+                )
+            })?;
+        let apply_items = apply_response
+            .result
+            .pointer(&target.items_pointer)
+            .and_then(Value::as_array);
+        let apply_matches = apply_items
+            .into_iter()
+            .flatten()
+            .filter(|item| {
+                item.get(&target.correlation_field).and_then(Value::as_str) == Some(correlation)
+            })
+            .collect::<Vec<_>>();
+        let resource_id = (apply_matches.len() == 1)
+            .then(|| {
+                apply_matches[0]
+                    .pointer(&target.response_item_identity_pointer)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+            })
+            .flatten();
+        let apply_fields_match = apply_matches.first().is_some_and(|item| {
+            mismatched_verifiable_planned_fields(&plan.capability, planned, item).is_empty()
+        });
+
+        let parent = CapabilityV1::new(
+            &target.read_capability_id,
+            "Created nested resource parent verification readback",
+            "GET",
+            &target.parent_path,
+        );
+        let request = self.builder.build(
+            &parent,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let readback_items = readback
+            .result
+            .pointer(&target.items_pointer)
+            .and_then(Value::as_array);
+        let readback_matches = readback_items
+            .into_iter()
+            .flatten()
+            .filter(|item| {
+                item.get(&target.correlation_field).and_then(Value::as_str) == Some(correlation)
+                    && item
+                        .pointer(&target.response_item_identity_pointer)
+                        .and_then(Value::as_str)
+                        == resource_id
+            })
+            .collect::<Vec<_>>();
+        let readback_fields_match = readback_matches.first().is_some_and(|item| {
+            mismatched_verifiable_planned_fields(&plan.capability, planned, item).is_empty()
+        });
+        let passed = apply_response.success
+            && readback.success
+            && resource_id.is_some()
+            && apply_matches.len() == 1
+            && apply_fields_match
+            && readback_matches.len() == 1
+            && readback_fields_match;
+        let basis = if passed {
+            format!(
+                "the apply response and live parent readback each contained exactly one nested resource correlated by `{}` with the same schema-proven identity and every planned field",
+                target.correlation_field
+            )
+        } else {
+            format!(
+                "nested resource was not proven (apply success={}, apply items={}, apply matches={}, identity present={}, apply fields match={}, readback HTTP {}, readback success={}, readback items={}, readback matches={}, readback fields match={})",
+                apply_response.success,
+                apply_items.is_some(),
+                apply_matches.len(),
+                resource_id.is_some(),
+                apply_fields_match,
+                readback.status,
+                readback.success,
+                readback_items.is_some(),
+                readback_matches.len(),
+                readback_fields_match,
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback,
+            correlated_resource_id: None,
+        })
+    }
+
+    async fn verify_parent_object_nested_delete(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let target = plan
+            .capability
+            .deleted_nested_resource
+            .as_ref()
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the hash-bound deleted-nested-resource contract is absent".to_owned(),
+                )
+            })?;
+        let resource_id = input
+            .selectors
+            .get(&target.identity_selector)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "planned nested-resource delete identity is absent or empty".to_owned(),
+                )
+            })?;
+        let mut selectors = input.selectors.as_object().cloned().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "planned nested-resource delete selectors are not an object".to_owned(),
+            )
+        })?;
+        selectors.remove(&target.identity_selector);
+        let parent = CapabilityV1::new(
+            &target.read_capability_id,
+            "Deleted nested resource parent verification readback",
+            "GET",
+            &target.parent_path,
+        );
+        let request = self.builder.build(
+            &parent,
+            &CallInput {
+                selectors: Value::Object(selectors),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let items = readback
+            .result
+            .pointer(&target.items_pointer)
+            .and_then(Value::as_array);
+        let matching = items
+            .into_iter()
+            .flatten()
+            .filter(|item| {
+                item.pointer(&target.response_item_identity_pointer)
+                    .and_then(Value::as_str)
+                    == Some(resource_id)
+            })
+            .count();
+        let passed = apply_response.success && readback.success && items.is_some() && matching == 0;
+        let basis = if passed {
+            "the live parent object omitted the exact nested resource identity after deletion"
+                .to_owned()
+        } else {
+            format!(
+                "nested-resource deletion was not proven (apply success={}, readback HTTP {}, readback success={}, child array={}, identity matches={matching})",
+                apply_response.success,
+                readback.status,
+                readback.success,
+                items.is_some(),
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback,
+            correlated_resource_id: None,
+        })
+    }
+
+    async fn verify_web_analytics_rule_create(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let target = plan.capability.created_resource.as_ref().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the hash-bound Web Analytics rule creation contract is absent".to_owned(),
+            )
+        })?;
+        let planned = input
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .filter(|body| !body.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "planned Web Analytics rule body is absent, empty, or not an object".to_owned(),
+                )
+            })?;
+        let resource_id = apply_response
+            .result
+            .pointer(&target.response_result_identity_pointer)
+            .and_then(Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "the successful Web Analytics rule response has no schema-proven identity"
+                        .to_owned(),
+                )
+            })?;
+        let list = CapabilityV1::new(
+            &target.read_capability_id,
+            "Web Analytics rule list verification readback",
+            "GET",
+            "/accounts/{account_id}/rum/v2/{ruleset_id}/rules",
+        );
+        let request = self.builder.build(
+            &list,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let rules = readback.result.pointer("/rules").and_then(Value::as_array);
+        let identity_shape_valid = rules.is_some_and(|rules| {
+            rules.iter().all(|rule| {
+                rule.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|identity| !identity.is_empty())
+            })
+        });
+        let matching = rules
+            .into_iter()
+            .flatten()
+            .filter(|rule| rule.get("id").and_then(Value::as_str) == Some(resource_id))
+            .collect::<Vec<_>>();
+        let fields_match = matching.first().is_some_and(|rule| {
+            mismatched_verifiable_planned_fields(&plan.capability, planned, rule).is_empty()
+        });
+        let passed = apply_response.success
+            && readback.success
+            && identity_shape_valid
+            && matching.len() == 1
+            && fields_match;
+        let basis = if passed {
+            "the live Web Analytics rules list contained exactly one returned creation identity with every planned field"
+                .to_owned()
+        } else {
+            format!(
+                "Web Analytics rule creation was not proven (apply success={}, readback HTTP {}, readback success={}, rules array={}, item identities valid={}, identity matches={}, planned fields match={})",
+                apply_response.success,
+                readback.status,
+                readback.success,
+                rules.is_some(),
+                identity_shape_valid,
+                matching.len(),
+                fields_match
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback,
+            correlated_resource_id: None,
+        })
+    }
+
+    async fn verify_web_analytics_rule_delete(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let resource_id = input
+            .selectors
+            .get("rule_id")
+            .and_then(Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "planned Web Analytics rule deletion identity is absent or empty".to_owned(),
+                )
+            })?;
+        let mut selectors = input.selectors.as_object().cloned().ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "planned Web Analytics rule deletion selectors are not an object".to_owned(),
+            )
+        })?;
+        selectors.remove("rule_id");
+        let list = CapabilityV1::new(
+            "web-analytics-list-rules",
+            "Web Analytics rule list deletion readback",
+            "GET",
+            "/accounts/{account_id}/rum/v2/{ruleset_id}/rules",
+        );
+        let request = self.builder.build(
+            &list,
+            &CallInput {
+                selectors: Value::Object(selectors),
+                query: Value::Object(serde_json::Map::new()),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let readback = self.send(&request, credential).await?;
+        let rules = readback.result.pointer("/rules").and_then(Value::as_array);
+        let matching = rules
+            .into_iter()
+            .flatten()
+            .filter(|rule| rule.get("id").and_then(Value::as_str) == Some(resource_id))
+            .count();
+        let passed = apply_response.success && readback.success && rules.is_some() && matching == 0;
+        let basis = if passed {
+            "the complete live Web Analytics rules list omitted the exact deleted identity"
+                .to_owned()
+        } else {
+            format!(
+                "Web Analytics rule deletion was not proven (apply success={}, readback HTTP {}, readback success={}, rules array={}, identity matches={matching})",
+                apply_response.success,
+                readback.status,
+                readback.success,
+                rules.is_some()
+            )
+        };
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis,
+            readback,
+            correlated_resource_id: None,
         })
     }
 
@@ -1466,6 +2835,15 @@ impl Executor {
         request: &PreparedRequest,
         credential: &AuthCredential,
     ) -> Result<CloudflareResponseV1> {
+        self.send_with_output(request, credential, None).await
+    }
+
+    async fn send_with_output(
+        &self,
+        request: &PreparedRequest,
+        credential: &AuthCredential,
+        output_path: Option<&Path>,
+    ) -> Result<CloudflareResponseV1> {
         let method = Method::from_bytes(request.method.as_bytes())
             .map_err(|_| CloudflareError::InvalidMethod(request.method.clone()))?;
         let mut attempt = 0;
@@ -1473,9 +2851,12 @@ impl Executor {
             let mut outgoing = self
                 .client
                 .request(method.clone(), request.url.clone())
-                .headers(request.headers.clone());
+                .headers(request.headers.clone())
+                .timeout(Duration::from_secs(request.timeout_seconds));
             outgoing = apply_credential(outgoing, credential)?;
-            if let Some(body) = &request.body {
+            if let Some(body) = &request.text_body {
+                outgoing = outgoing.body(body.clone());
+            } else if let Some(body) = &request.body {
                 outgoing = outgoing.json(body);
             }
             let response = outgoing.send().await?;
@@ -1514,37 +2895,153 @@ impl Executor {
                         expected: contract.success_statuses.join(", "),
                     });
                 }
-                match contract.body_mode {
-                    ResponseBodyModeV1::CloudflareJsonEnvelope => {
-                        if !content_type.as_deref().is_some_and(is_application_json) {
-                            return Err(CloudflareError::UnexpectedResponseMediaType {
-                                status: status_code,
-                                received: content_type.unwrap_or_else(|| "missing".to_owned()),
-                            });
-                        }
-                        let body = response.json::<Value>().await?;
-                        if body.get("success").and_then(Value::as_bool).is_none() {
-                            return Err(CloudflareError::InvalidResponseEnvelope {
-                                status: status_code,
-                            });
-                        }
-                        return Ok(parse_response(status_code, &body, etag, cf_ray));
-                    }
-                    ResponseBodyModeV1::Empty => {
-                        let body = response.bytes().await?;
-                        if !body.is_empty() {
-                            return Err(CloudflareError::UnexpectedResponseBody {
-                                status: status_code,
-                                received_bytes: body.len(),
-                            });
-                        }
-                        return Ok(parse_response(status_code, &Value::Null, etag, cf_ray));
-                    }
-                    ResponseBodyModeV1::Unsupported => {}
-                }
+                return parse_success_response(
+                    response,
+                    request,
+                    contract,
+                    status_code,
+                    content_type,
+                    etag,
+                    cf_ray,
+                    output_path,
+                )
+                .await;
             }
-            let body = response.json::<Value>().await?;
+            let (bytes, _) = read_bounded_body(response, request.max_bytes).await?;
+            let body = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "success": false,
+                    "errors": [{"message":"Cloudflare returned a non-JSON error response"}]
+                })
+            });
             return Ok(parse_response(status_code, &body, etag, cf_ray));
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "R2 retrieval keeps private header injection, retry bounds, media validation, and file streaming in one secret-safe path"
+    )]
+    async fn send_r2_log_retrieval_to_file(
+        &self,
+        request: &PreparedRequest,
+        credential: &AuthCredential,
+        r2_credentials: &R2LogRetrievalCredentials,
+        output_path: &Path,
+    ) -> Result<CloudflareResponseV1> {
+        let contract = request.r2_log_retrieval.as_ref().ok_or_else(|| {
+            CloudflareError::InvalidR2LogRetrieval(
+                "prepared request omitted its pinned retrieval contract".to_owned(),
+            )
+        })?;
+        let method = Method::from_bytes(request.method.as_bytes())
+            .map_err(|_| CloudflareError::InvalidMethod(request.method.clone()))?;
+        let access_header =
+            HeaderName::from_bytes(contract.access_key_header.as_bytes()).map_err(|_| {
+                CloudflareError::InvalidR2LogRetrieval(
+                    "the pinned access-key header name is invalid".to_owned(),
+                )
+            })?;
+        let secret_header = HeaderName::from_bytes(contract.secret_access_key_header.as_bytes())
+            .map_err(|_| {
+                CloudflareError::InvalidR2LogRetrieval(
+                    "the pinned secret-key header name is invalid".to_owned(),
+                )
+            })?;
+        let access_value = HeaderValue::from_str(&r2_credentials.access_key_id).map_err(|_| {
+            CloudflareError::InvalidR2LogRetrieval(
+                "the R2 access-key value is not a valid HTTP header value".to_owned(),
+            )
+        })?;
+        let secret_value =
+            HeaderValue::from_str(&r2_credentials.secret_access_key).map_err(|_| {
+                CloudflareError::InvalidR2LogRetrieval(
+                    "the R2 secret-key value is not a valid HTTP header value".to_owned(),
+                )
+            })?;
+        let mut attempt = 0;
+        loop {
+            let outgoing = apply_credential(
+                self.client
+                    .request(method.clone(), request.url.clone())
+                    .headers(request.headers.clone())
+                    .header(access_header.clone(), access_value.clone())
+                    .header(secret_header.clone(), secret_value.clone())
+                    .timeout(Duration::from_secs(request.timeout_seconds)),
+                credential,
+            )?;
+            let response = outgoing.send().await?;
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1)
+                .min(30);
+            if (status.as_u16() == 429 || status.is_server_error()) && attempt < self.max_retries {
+                attempt += 1;
+                sleep(Duration::from_secs(retry_after)).await;
+                continue;
+            }
+
+            let status_code = status.as_u16();
+            let etag = header_text(response.headers(), reqwest::header::ETAG);
+            let cf_ray = response
+                .headers()
+                .get(HeaderName::from_static("cf-ray"))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let content_type = header_text(response.headers(), reqwest::header::CONTENT_TYPE);
+            if !status.is_success() {
+                let (bytes, _) =
+                    read_bounded_body(response, request.max_bytes.min(1024 * 1024)).await?;
+                let body = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "success": false,
+                        "errors": [{"message":"Cloudflare returned a non-JSON retrieval error response"}]
+                    })
+                });
+                return Ok(parse_response(status_code, &body, etag, cf_ray));
+            }
+            let response_contract = request.response_contract.as_ref().ok_or_else(|| {
+                CloudflareError::InvalidR2LogRetrieval(
+                    "retrieval response contract is missing".to_owned(),
+                )
+            })?;
+            if !response_contract.success_statuses.is_empty()
+                && !response_contract
+                    .success_statuses
+                    .iter()
+                    .any(|expected| response_status_matches(expected, status_code))
+            {
+                return Err(CloudflareError::UnexpectedSuccessStatus {
+                    status: status_code,
+                    expected: response_contract.success_statuses.join(", "),
+                });
+            }
+            require_declared_media_type(status_code, content_type.as_deref(), response_contract)?;
+            if !contract.output_media_types.iter().any(|expected| {
+                content_type
+                    .as_deref()
+                    .and_then(normalized_media_type)
+                    .zip(normalized_media_type(expected))
+                    .is_some_and(|(received, expected)| received.eq_ignore_ascii_case(expected))
+            }) {
+                return Err(CloudflareError::UnexpectedResponseMediaType {
+                    status: status_code,
+                    received: content_type.unwrap_or_else(|| "missing".to_owned()),
+                });
+            }
+            return stream_r2_log_response(
+                response,
+                request,
+                status_code,
+                etag,
+                cf_ray,
+                output_path,
+            )
+            .await;
         }
     }
 
@@ -1553,39 +3050,896 @@ impl Executor {
         request: &PreparedRequest,
         credential: &AuthCredential,
     ) -> Result<CloudflareResponseV1> {
-        let mut combined = self.send(request, credential).await?;
+        self.send_paginated_with_output(request, credential, None)
+            .await
+    }
+
+    async fn send_paginated_with_output(
+        &self,
+        request: &PreparedRequest,
+        credential: &AuthCredential,
+        output_path: Option<&Path>,
+    ) -> Result<CloudflareResponseV1> {
+        let mut combined = self
+            .send_with_output(request, credential, output_path)
+            .await?;
+        if output_path.is_some() {
+            return Ok(combined);
+        }
         if !combined.success || !request.method.eq_ignore_ascii_case("GET") {
             return Ok(combined);
         }
-        let Some((current_page, total_pages)) = pagination_bounds(combined.result_info.as_ref())
-        else {
+        if let Some((current_page, total_pages)) = pagination_bounds(combined.result_info.as_ref())
+        {
+            if total_pages > 1_000 {
+                return Err(CloudflareError::PaginationLimit(total_pages));
+            }
+            let Some(results) = combined.result.as_array_mut() else {
+                return Ok(combined);
+            };
+            for page in (current_page + 1)..=total_pages {
+                let mut page_request = request.clone();
+                set_query_parameter(&mut page_request.url, "page", &page.to_string());
+                let response = self.send(&page_request, credential).await?;
+                if !response.success {
+                    return Ok(response);
+                }
+                if let Some(page_results) = response.result.as_array() {
+                    results.extend(page_results.iter().cloned());
+                }
+                combined.etag = response.etag;
+                combined.cf_ray = response.cf_ray;
+            }
+            if let Some(result_info) = combined.result_info.as_mut().and_then(Value::as_object_mut)
+            {
+                result_info.insert("page".to_owned(), Value::from(total_pages));
+                result_info.insert("count".to_owned(), Value::from(results.len()));
+            }
             return Ok(combined);
-        };
-        if total_pages > 1_000 {
-            return Err(CloudflareError::PaginationLimit(total_pages));
         }
+
+        let mut next_cursor = match cursor_after(combined.result_info.as_ref()) {
+            CursorState::NotPresent => return Ok(combined),
+            CursorState::Complete => None,
+            CursorState::Next(cursor) => Some(cursor),
+        };
         let Some(results) = combined.result.as_array_mut() else {
             return Ok(combined);
         };
-        for page in (current_page + 1)..=total_pages {
+        let mut observed = BTreeSet::new();
+        let mut pages = 1_u64;
+        while let Some(cursor) = next_cursor {
+            if pages >= 1_000 {
+                return Err(CloudflareError::PaginationLimit(pages + 1));
+            }
+            if !observed.insert(cursor.clone()) {
+                return Err(CloudflareError::PaginationCursorLoop);
+            }
             let mut page_request = request.clone();
-            set_query_parameter(&mut page_request.url, "page", &page.to_string());
+            set_query_parameter(&mut page_request.url, "cursor", &cursor);
             let response = self.send(&page_request, credential).await?;
             if !response.success {
                 return Ok(response);
             }
-            if let Some(page_results) = response.result.as_array() {
-                results.extend(page_results.iter().cloned());
-            }
+            let Some(page_results) = response.result.as_array() else {
+                return Err(CloudflareError::InvalidResponseEnvelope {
+                    status: response.status,
+                });
+            };
+            results.extend(page_results.iter().cloned());
+            pages += 1;
+            next_cursor = match cursor_after(response.result_info.as_ref()) {
+                CursorState::NotPresent => {
+                    return Err(CloudflareError::PaginationCursorMetadataMissing);
+                }
+                CursorState::Complete => None,
+                CursorState::Next(cursor) => Some(cursor),
+            };
             combined.etag = response.etag;
             combined.cf_ray = response.cf_ray;
+            combined.result_info = response.result_info;
         }
         if let Some(result_info) = combined.result_info.as_mut().and_then(Value::as_object_mut) {
-            result_info.insert("page".to_owned(), Value::from(total_pages));
             result_info.insert("count".to_owned(), Value::from(results.len()));
+            result_info.insert("cfctl_cursor_complete".to_owned(), Value::Bool(true));
+            result_info.insert("cfctl_pages".to_owned(), Value::from(pages));
         }
         Ok(combined)
     }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "response parsing receives the immutable request contract plus exact upstream metadata without hidden shared state"
+)]
+async fn parse_success_response(
+    response: reqwest::Response,
+    request: &PreparedRequest,
+    contract: &ResponseContractV1,
+    status: u16,
+    content_type: Option<String>,
+    etag: Option<String>,
+    cf_ray: Option<String>,
+    output_path: Option<&Path>,
+) -> Result<CloudflareResponseV1> {
+    if contract.body_mode != ResponseBodyModeV1::Empty {
+        require_declared_media_type(status, content_type.as_deref(), contract)?;
+    }
+    match contract.body_mode {
+        ResponseBodyModeV1::CloudflareJsonEnvelope => {
+            require_json_media(status, content_type.as_deref())?;
+            let (bytes, truncated) = read_bounded_body(response, request.max_bytes).await?;
+            if truncated {
+                if request.analytics_query.is_some() {
+                    return Ok(partial_output_response(
+                        status,
+                        Value::Null,
+                        request,
+                        0,
+                        bytes.len() as u64,
+                        true,
+                        true,
+                        "analytics JSON envelope exceeded its byte limit",
+                        etag,
+                        cf_ray,
+                    ));
+                }
+                return Err(CloudflareError::InvalidResponseEnvelope { status });
+            }
+            let body = parse_json_bytes(&bytes, status)?;
+            if body.get("success").and_then(Value::as_bool).is_none() {
+                return Err(CloudflareError::InvalidResponseEnvelope { status });
+            }
+            let parsed = parse_response(status, &body, etag, cf_ray);
+            if request.analytics_query.is_some() {
+                bound_enveloped_analytics_response(parsed, request, bytes.len() as u64, output_path)
+                    .await
+            } else {
+                Ok(parsed)
+            }
+        }
+        ResponseBodyModeV1::JsonValue => {
+            require_json_media(status, content_type.as_deref())?;
+            parse_bare_json_response(response, request, status, etag, cf_ray, output_path).await
+        }
+        ResponseBodyModeV1::GraphqlJson => {
+            require_json_media(status, content_type.as_deref())?;
+            parse_graphql_response(response, request, status, etag, cf_ray, output_path).await
+        }
+        ResponseBodyModeV1::NegotiatedRows => {
+            let media = content_type
+                .as_deref()
+                .and_then(normalized_media_type)
+                .unwrap_or("missing");
+            if is_application_json(media) {
+                parse_bare_json_response(response, request, status, etag, cf_ray, output_path).await
+            } else if is_ndjson_media(media) {
+                parse_ndjson_response(response, request, status, etag, cf_ray, output_path).await
+            } else if media.eq_ignore_ascii_case("text/csv") {
+                parse_csv_response(response, request, status, etag, cf_ray, output_path).await
+            } else {
+                Err(CloudflareError::UnexpectedResponseMediaType {
+                    status,
+                    received: content_type.unwrap_or_else(|| "missing".to_owned()),
+                })
+            }
+        }
+        ResponseBodyModeV1::Empty => {
+            let (body, _) = read_bounded_body(response, request.max_bytes).await?;
+            if !body.is_empty() {
+                return Err(CloudflareError::UnexpectedResponseBody {
+                    status,
+                    received_bytes: body.len(),
+                });
+            }
+            Ok(parse_response(status, &Value::Null, etag, cf_ray))
+        }
+        ResponseBodyModeV1::Unsupported => Err(CloudflareError::UnsupportedResponseContract(
+            contract.success_media_types.join(", "),
+        )),
+    }
+}
+
+async fn bound_enveloped_analytics_response(
+    mut response: CloudflareResponseV1,
+    request: &PreparedRequest,
+    bytes: u64,
+    output_path: Option<&Path>,
+) -> Result<CloudflareResponseV1> {
+    let mut truncated = false;
+    let max_rows = bounded_usize(request.max_rows);
+    let rows = if let Some(rows) = response.result.as_array_mut() {
+        if rows.len() > max_rows {
+            rows.truncate(max_rows);
+            truncated = true;
+        }
+        rows.len() as u64
+    } else {
+        u64::from(!response.result.is_null())
+    };
+    if let Some(path) = output_path {
+        let canonical =
+            serde_json::to_vec(&response.result).map_err(cfctl_core::CoreError::Serialization)?;
+        response.result =
+            file_receipt(path, &canonical, rows, response.success && !truncated).await?;
+    }
+    response.result_info = Some(output_result_info(
+        request,
+        rows,
+        bytes,
+        truncated,
+        !response.success,
+    ));
+    Ok(response)
+}
+
+fn require_declared_media_type(
+    status: u16,
+    content_type: Option<&str>,
+    contract: &ResponseContractV1,
+) -> Result<()> {
+    let received = content_type
+        .and_then(normalized_media_type)
+        .unwrap_or("missing");
+    if contract.success_media_types.iter().any(|declared| {
+        normalized_media_type(declared)
+            .is_some_and(|declared| declared.eq_ignore_ascii_case(received))
+    }) {
+        return Ok(());
+    }
+    Err(CloudflareError::UnexpectedResponseMediaType {
+        status,
+        received: content_type.unwrap_or("missing").to_owned(),
+    })
+}
+
+fn require_json_media(status: u16, content_type: Option<&str>) -> Result<()> {
+    if content_type.is_some_and(is_application_json) {
+        return Ok(());
+    }
+    Err(CloudflareError::UnexpectedResponseMediaType {
+        status,
+        received: content_type.unwrap_or("missing").to_owned(),
+    })
+}
+
+fn normalized_media_type(content_type: &str) -> Option<&str> {
+    content_type.split(';').next().map(str::trim)
+}
+
+fn is_ndjson_media(content_type: &str) -> bool {
+    matches!(
+        normalized_media_type(content_type),
+        Some(media)
+            if media.eq_ignore_ascii_case("application/x-ndjson")
+                || media.eq_ignore_ascii_case("application/ndjson")
+    )
+}
+
+async fn read_bounded_body(response: reqwest::Response, max_bytes: u64) -> Result<(Vec<u8>, bool)> {
+    let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::with_capacity(limit.min(64 * 1024));
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = limit.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((body, truncated))
+}
+
+fn parse_json_bytes(bytes: &[u8], status: u16) -> Result<Value> {
+    serde_json::from_slice(bytes).map_err(|_| CloudflareError::InvalidResponseEnvelope { status })
+}
+
+fn bounded_usize(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+async fn parse_bare_json_response(
+    response: reqwest::Response,
+    request: &PreparedRequest,
+    status: u16,
+    etag: Option<String>,
+    cf_ray: Option<String>,
+    output_path: Option<&Path>,
+) -> Result<CloudflareResponseV1> {
+    let (bytes, byte_truncated) = read_bounded_body(response, request.max_bytes).await?;
+    if byte_truncated {
+        return Ok(partial_output_response(
+            status,
+            Value::Null,
+            request,
+            0,
+            bytes.len() as u64,
+            true,
+            true,
+            "analytics JSON exceeded its byte limit",
+            etag,
+            cf_ray,
+        ));
+    }
+    let mut value = parse_json_bytes(&bytes, status)?;
+    let mut truncated = false;
+    let max_rows = bounded_usize(request.max_rows);
+    let rows = if let Some(rows) = value.as_array_mut() {
+        if rows.len() > max_rows {
+            rows.truncate(max_rows);
+            truncated = true;
+        }
+        rows.len() as u64
+    } else {
+        u64::from(!value.is_null())
+    };
+    let result = if let Some(path) = output_path {
+        let canonical = serde_json::to_vec(&value).map_err(cfctl_core::CoreError::Serialization)?;
+        file_receipt(path, &canonical, rows, !truncated).await?
+    } else {
+        value
+    };
+    Ok(CloudflareResponseV1 {
+        status,
+        success: true,
+        result,
+        errors: Vec::new(),
+        result_info: Some(output_result_info(
+            request,
+            rows,
+            bytes.len() as u64,
+            truncated,
+            false,
+        )),
+        etag,
+        cf_ray,
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "GraphQL parsing validates fingerprint, errors, data shape, rows, continuation, and output receipt as one drift boundary"
+)]
+async fn parse_graphql_response(
+    response: reqwest::Response,
+    request: &PreparedRequest,
+    status: u16,
+    etag: Option<String>,
+    cf_ray: Option<String>,
+    output_path: Option<&Path>,
+) -> Result<CloudflareResponseV1> {
+    let (bytes, truncated) = read_bounded_body(response, request.max_bytes).await?;
+    if truncated {
+        return Ok(partial_output_response(
+            status,
+            Value::Null,
+            request,
+            0,
+            bytes.len() as u64,
+            true,
+            true,
+            "GraphQL Analytics response exceeded its byte limit",
+            etag,
+            cf_ray,
+        ));
+    }
+    let body = parse_json_bytes(&bytes, status)?;
+    let graphql = request.graphql.as_ref().ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery(
+            "GraphQL response has no pinned schema contract".to_owned(),
+        )
+    })?;
+    graphql.validate_schema_fingerprint()?;
+    let upstream_errors = body
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|error| CloudflareApiErrorV1 {
+            code: None,
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Cloudflare GraphQL returned an unspecified error")
+                .to_owned(),
+        })
+        .collect::<Vec<_>>();
+    if !upstream_errors.is_empty() {
+        return Ok(CloudflareResponseV1 {
+            status,
+            success: false,
+            result: Value::Null,
+            errors: upstream_errors,
+            result_info: Some(output_result_info(
+                request,
+                0,
+                bytes.len() as u64,
+                false,
+                false,
+            )),
+            etag,
+            cf_ray,
+        });
+    }
+    let mut result = body
+        .get("data")
+        .and_then(|data| data.pointer(&graphql.response_data_pointer))
+        .cloned()
+        .ok_or_else(|| CloudflareError::GraphqlSchemaDrift {
+            pointer: format!("/data{}", graphql.response_data_pointer),
+        })?;
+    let rows = graphql_rows(&result);
+    for row in &rows {
+        for field in &graphql.expected_row_fields {
+            if row.get(field).is_none() {
+                return Err(CloudflareError::GraphqlSchemaDrift {
+                    pointer: format!("/data{}/0/{field}", graphql.response_data_pointer),
+                });
+            }
+        }
+    }
+    let continuation = graphql_continuation(request, graphql, &rows)?;
+    let mut row_count = rows.len() as u64;
+    let mut row_truncated = false;
+    let max_rows = bounded_usize(request.max_rows);
+    if let Some(values) = result.as_array_mut()
+        && values.len() > max_rows
+    {
+        values.truncate(max_rows);
+        row_count = values.len() as u64;
+        row_truncated = true;
+    }
+    let result = if let Some(path) = output_path {
+        let canonical =
+            serde_json::to_vec(&result).map_err(cfctl_core::CoreError::Serialization)?;
+        file_receipt(path, &canonical, row_count, !row_truncated).await?
+    } else {
+        result
+    };
+    let mut result_info =
+        output_result_info(request, row_count, bytes.len() as u64, row_truncated, false);
+    if let Some(continuation) = continuation
+        && let Some(info) = result_info.as_object_mut()
+    {
+        info.insert("continuation".to_owned(), continuation);
+    }
+    Ok(CloudflareResponseV1 {
+        status,
+        success: true,
+        result,
+        errors: Vec::new(),
+        result_info: Some(result_info),
+        etag,
+        cf_ray,
+    })
+}
+
+fn graphql_continuation(
+    request: &PreparedRequest,
+    graphql: &GraphqlAnalyticsContractV1,
+    rows: &[&Value],
+) -> Result<Option<Value>> {
+    if request
+        .analytics_query
+        .as_ref()
+        .is_none_or(|query| query.pagination != PaginationModeV1::OrderedKeyset)
+    {
+        return Ok(None);
+    }
+    let Some(last) = rows.last() else {
+        return Ok(None);
+    };
+    let bindings = graphql_cursor_bindings(graphql)?;
+    let mut cursor = serde_json::Map::new();
+    let mut next_body_patch = serde_json::Map::new();
+    for (field, pointer) in bindings {
+        let value =
+            last.get(field)
+                .cloned()
+                .ok_or_else(|| CloudflareError::GraphqlSchemaDrift {
+                    pointer: format!("/cursor/{field}"),
+                })?;
+        if value.is_null() {
+            return Err(CloudflareError::GraphqlSchemaDrift {
+                pointer: format!("/cursor/{field}"),
+            });
+        }
+        let input_field = top_level_cursor_input_field(pointer)?;
+        cursor.insert(field.to_owned(), value.clone());
+        next_body_patch.insert(input_field.to_owned(), value);
+    }
+    Ok(Some(serde_json::json!({
+        "mode": "ordered_keyset",
+        "cursor": cursor,
+        "next_body_patch": next_body_patch,
+        "more_possible": rows.len() >= bounded_usize(request.max_rows),
+    })))
+}
+
+fn graphql_rows(value: &Value) -> Vec<&Value> {
+    value
+        .as_array()
+        .map_or_else(|| vec![value], |rows| rows.iter().collect())
+}
+
+async fn parse_ndjson_response(
+    response: reqwest::Response,
+    request: &PreparedRequest,
+    status: u16,
+    etag: Option<String>,
+    cf_ray: Option<String>,
+    output_path: Option<&Path>,
+) -> Result<CloudflareResponseV1> {
+    let mut stream = response.bytes_stream();
+    let mut pending = Vec::new();
+    let mut rows = Vec::new();
+    let mut raw_bytes = 0_u64;
+    let mut truncated = false;
+    let mut partial = false;
+    let max_rows = bounded_usize(request.max_rows);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = bounded_usize(request.max_bytes.saturating_sub(raw_bytes));
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let accepted = chunk.len().min(remaining);
+        pending.extend_from_slice(&chunk[..accepted]);
+        raw_bytes += accepted as u64;
+        if accepted < chunk.len() {
+            truncated = true;
+        }
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let mut line = pending.drain(..=newline).collect::<Vec<_>>();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(row) = serde_json::from_slice::<Value>(&line) {
+                rows.push(row);
+            } else {
+                partial = true;
+                break;
+            }
+            if rows.len() >= max_rows {
+                truncated = true;
+                break;
+            }
+        }
+        if partial || truncated {
+            break;
+        }
+    }
+    if !partial && !truncated && !pending.is_empty() {
+        if pending.last() == Some(&b'\r') {
+            pending.pop();
+        }
+        if !pending.is_empty() {
+            match serde_json::from_slice::<Value>(&pending) {
+                Ok(row) => rows.push(row),
+                Err(_) => partial = true,
+            }
+        }
+    }
+    if rows.len() > max_rows {
+        rows.truncate(max_rows);
+        truncated = true;
+    }
+    let row_count = rows.len() as u64;
+    let result = if let Some(path) = output_path {
+        let mut canonical = Vec::new();
+        for row in &rows {
+            serde_json::to_writer(&mut canonical, row)
+                .map_err(cfctl_core::CoreError::Serialization)?;
+            canonical.push(b'\n');
+        }
+        file_receipt(path, &canonical, row_count, !partial && !truncated).await?
+    } else {
+        Value::Array(rows)
+    };
+    let mut errors = Vec::new();
+    if partial {
+        errors.push(CloudflareApiErrorV1 {
+            code: None,
+            message: "analytics stream ended after an invalid NDJSON record".to_owned(),
+        });
+    }
+    Ok(CloudflareResponseV1 {
+        status,
+        success: !partial,
+        result,
+        errors,
+        result_info: Some(output_result_info(
+            request, row_count, raw_bytes, truncated, partial,
+        )),
+        etag,
+        cf_ray,
+    })
+}
+
+async fn parse_csv_response(
+    response: reqwest::Response,
+    request: &PreparedRequest,
+    status: u16,
+    etag: Option<String>,
+    cf_ray: Option<String>,
+    output_path: Option<&Path>,
+) -> Result<CloudflareResponseV1> {
+    let (bytes, byte_truncated) = read_bounded_body(response, request.max_bytes).await?;
+    let (rows, malformed) = csv_record_count(&bytes, request.max_rows);
+    let truncated = byte_truncated || rows >= request.max_rows;
+    let result = if let Some(path) = output_path {
+        file_receipt(path, &bytes, rows, !truncated && !malformed).await?
+    } else {
+        Value::String(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let errors = malformed
+        .then(|| CloudflareApiErrorV1 {
+            code: None,
+            message: "analytics CSV ended inside a quoted record".to_owned(),
+        })
+        .into_iter()
+        .collect();
+    Ok(CloudflareResponseV1 {
+        status,
+        success: !malformed,
+        result,
+        errors,
+        result_info: Some(output_result_info(
+            request,
+            rows,
+            bytes.len() as u64,
+            truncated,
+            malformed,
+        )),
+        etag,
+        cf_ray,
+    })
+}
+
+fn csv_record_count(bytes: &[u8], max_rows: u64) -> (u64, bool) {
+    let mut quoted = false;
+    let mut records = 0_u64;
+    let mut index = 0;
+    while index < bytes.len() && records <= max_rows {
+        match bytes[index] {
+            b'"' if quoted && bytes.get(index + 1) == Some(&b'"') => index += 1,
+            b'"' => quoted = !quoted,
+            b'\n' if !quoted => records += 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    let records = if records > 0 {
+        records.saturating_sub(1)
+    } else {
+        0
+    };
+    (records.min(max_rows), quoted)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a partial receipt records every bounded output and upstream identity field explicitly"
+)]
+fn partial_output_response(
+    status: u16,
+    result: Value,
+    request: &PreparedRequest,
+    rows: u64,
+    bytes: u64,
+    truncated: bool,
+    partial: bool,
+    message: &str,
+    etag: Option<String>,
+    cf_ray: Option<String>,
+) -> CloudflareResponseV1 {
+    CloudflareResponseV1 {
+        status,
+        success: false,
+        result,
+        errors: vec![CloudflareApiErrorV1 {
+            code: None,
+            message: message.to_owned(),
+        }],
+        result_info: Some(output_result_info(request, rows, bytes, truncated, partial)),
+        etag,
+        cf_ray,
+    }
+}
+
+fn output_result_info(
+    request: &PreparedRequest,
+    rows: u64,
+    bytes: u64,
+    truncated: bool,
+    partial: bool,
+) -> Value {
+    let row_limit = if request.r2_log_retrieval.is_none() {
+        Value::from(request.max_rows)
+    } else {
+        Value::Null
+    };
+    let coverage = request.analytics_query.as_ref().map(|contract| {
+        let limit_reached = rows >= request.max_rows;
+        let classification = if partial || truncated {
+            "partial_response"
+        } else if contract.sampling.is_some() {
+            "bounded_sample"
+        } else if limit_reached {
+            "bounded_result_at_limit"
+        } else {
+            "bounded_response"
+        };
+        serde_json::json!({
+            "classification": classification,
+            "limit_reached": limit_reached,
+            "dataset_completeness": "not_proven",
+        })
+    });
+    serde_json::json!({
+        "query": request.query_receipt,
+        "coverage": coverage,
+        "output": {
+            "format": request.output_format,
+            "rows": rows,
+            "bytes": bytes,
+            "row_limit": row_limit,
+            "byte_limit": request.max_bytes,
+            "truncated": truncated,
+            "partial": partial,
+        }
+    })
+}
+
+async fn stream_r2_log_response(
+    response: reqwest::Response,
+    request: &PreparedRequest,
+    status: u16,
+    etag: Option<String>,
+    cf_ray: Option<String>,
+    output_path: &Path,
+) -> Result<CloudflareResponseV1> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(output_path)
+        .map_err(|source| CloudflareError::OutputFile {
+            path: output_path.display().to_string(),
+            source,
+        })?;
+    let mut file = tokio::fs::File::from_std(file);
+    let mut stream = response.bytes_stream();
+    let mut hasher = Sha256::new();
+    let mut bytes_written = 0_u64;
+    let mut newline_count = 0_u64;
+    let mut last_byte = None;
+    let mut truncated = false;
+    let mut partial = false;
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            partial = true;
+            break;
+        };
+        let remaining = bounded_usize(request.max_bytes.saturating_sub(bytes_written));
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let accepted = chunk.len().min(remaining);
+        let bytes = &chunk[..accepted];
+        file.write_all(bytes)
+            .await
+            .map_err(|source| CloudflareError::OutputFile {
+                path: output_path.display().to_string(),
+                source,
+            })?;
+        hasher.update(bytes);
+        bytes_written += accepted as u64;
+        newline_count = newline_count.saturating_add(
+            u64::try_from(memchr::memchr_iter(b'\n', bytes).count()).unwrap_or(u64::MAX),
+        );
+        last_byte = bytes.last().copied().or(last_byte);
+        if accepted < chunk.len() {
+            truncated = true;
+            break;
+        }
+    }
+    file.flush()
+        .await
+        .map_err(|source| CloudflareError::OutputFile {
+            path: output_path.display().to_string(),
+            source,
+        })?;
+    let rows =
+        newline_count + u64::from(bytes_written > 0 && last_byte.is_some_and(|byte| byte != b'\n'));
+    let complete = !partial && !truncated;
+    let digest = hex::encode(hasher.finalize());
+    let result = serde_json::json!({
+        "output_file": {
+            "path": output_path,
+            "sha256": format!("sha256:{digest}"),
+            "rows": rows,
+            "bytes": bytes_written,
+            "complete": complete,
+        }
+    });
+    let mut errors = Vec::new();
+    if truncated {
+        errors.push(CloudflareApiErrorV1 {
+            code: None,
+            message:
+                "R2 log retrieval reached its governed byte limit; the file receipt is partial"
+                    .to_owned(),
+        });
+    }
+    if partial {
+        errors.push(CloudflareApiErrorV1 {
+            code: None,
+            message: "R2 log retrieval stream failed after a partial file was written".to_owned(),
+        });
+    }
+    Ok(CloudflareResponseV1 {
+        status,
+        success: complete,
+        result,
+        errors,
+        result_info: Some(output_result_info(
+            request,
+            rows,
+            bytes_written,
+            truncated,
+            partial,
+        )),
+        etag,
+        cf_ray,
+    })
+}
+
+async fn file_receipt(path: &Path, bytes: &[u8], rows: u64, complete: bool) -> Result<Value> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(path)
+        .map_err(|source| CloudflareError::OutputFile {
+            path: path.display().to_string(),
+            source,
+        })?;
+    let mut file = tokio::fs::File::from_std(file);
+    file.write_all(bytes)
+        .await
+        .map_err(|source| CloudflareError::OutputFile {
+            path: path.display().to_string(),
+            source,
+        })?;
+    file.flush()
+        .await
+        .map_err(|source| CloudflareError::OutputFile {
+            path: path.display().to_string(),
+            source,
+        })?;
+    let digest = hex::encode(Sha256::digest(bytes));
+    Ok(serde_json::json!({
+        "output_file": {
+            "path": path,
+            "sha256": format!("sha256:{digest}"),
+            "rows": rows,
+            "bytes": bytes.len(),
+            "complete": complete,
+        }
+    }))
 }
 
 fn add_conditional_header(
@@ -1607,6 +3961,114 @@ fn pagination_bounds(result_info: Option<&Value>) -> Option<(u64, u64)> {
     let current = result_info.get("page").and_then(Value::as_u64).unwrap_or(1);
     let total = result_info.get("total_pages").and_then(Value::as_u64)?;
     (total > current).then_some((current, total))
+}
+
+enum CursorState {
+    NotPresent,
+    Complete,
+    Next(String),
+}
+
+fn cursor_after(result_info: Option<&Value>) -> CursorState {
+    let Some(cursors) = result_info
+        .and_then(|info| info.get("cursors"))
+        .and_then(Value::as_object)
+    else {
+        return CursorState::NotPresent;
+    };
+    cursors
+        .get("after")
+        .and_then(Value::as_str)
+        .filter(|cursor| !cursor.is_empty())
+        .map_or(CursorState::Complete, |cursor| {
+            CursorState::Next(cursor.to_owned())
+        })
+}
+
+fn governed_list_item_projection(item: &Value) -> Option<Value> {
+    let object = item.as_object()?;
+    let comment = object
+        .get("comment")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    let mut targets = Vec::new();
+    if let Some(ip) = object.get("ip").and_then(Value::as_str) {
+        targets.push(serde_json::json!({"comment":comment,"ip":ip}));
+    }
+    if let Some(asn) = object.get("asn").and_then(Value::as_u64) {
+        targets.push(serde_json::json!({"asn":asn,"comment":comment}));
+    }
+    if let Some(hostname) = item
+        .pointer("/hostname/url_hostname")
+        .and_then(Value::as_str)
+    {
+        targets.push(serde_json::json!({
+            "comment":comment,
+            "hostname":{"url_hostname":hostname},
+        }));
+    }
+    (targets.len() == 1).then(|| targets.remove(0))
+}
+
+fn governed_list_delete_ids(input: &CallInput) -> Result<Vec<String>> {
+    let items = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("items"))
+        .and_then(Value::as_array)
+        .filter(|items| items.len() == 1)
+        .ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "the governed List removal must contain exactly one member identity".to_owned(),
+            )
+        })?;
+    items
+        .iter()
+        .map(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .filter(|identity| !identity.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    CloudflareError::MissingVerificationTarget(
+                        "the governed List removal contains an invalid member identity".to_owned(),
+                    )
+                })
+        })
+        .collect()
+}
+
+struct AsyncListReceipt<'a> {
+    status: u16,
+    operation_id: &'a str,
+    operation_status: &'a str,
+    cursor_complete: bool,
+    match_count: usize,
+    resource_id: Option<&'a str>,
+    resource_hash: Option<&'a str>,
+    failure: Option<Value>,
+}
+
+fn async_list_receipt_response(receipt: AsyncListReceipt<'_>) -> CloudflareResponseV1 {
+    CloudflareResponseV1 {
+        status: receipt.status,
+        success: true,
+        result: serde_json::json!({
+            "schema_version":1,
+            "operation_id":receipt.operation_id,
+            "operation_status":receipt.operation_status,
+            "cursor_complete":receipt.cursor_complete,
+            "match_count":receipt.match_count,
+            "resource_id":receipt.resource_id,
+            "resource_hash":receipt.resource_hash,
+            "failure_hash":receipt.failure.as_ref().and_then(|value| hash_value(value).ok()),
+            "redaction":"list member target and audit comment omitted; only hashes and Cloudflare identities are retained",
+        }),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    }
 }
 
 fn collection_pagination_complete(required: bool, readback: &CloudflareResponseV1) -> bool {
@@ -2377,10 +4839,15 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
     if strategy == "access_service_token_reports_refreshed_expiration" {
         return validate_access_service_token_refresh_target(capability, input);
     }
+    if strategy.starts_with("async_list_operation_") {
+        return validate_async_list_mutation_target(capability, input);
+    }
     let body_label = match strategy {
         "created_resource_contains_planned_fields_by_returned_id"
         | "created_access_application_contains_planned_fields_by_returned_id"
         | "parent_collection_contains_created_resource_id_and_planned_fields"
+        | "parent_object_contains_created_nested_resource_by_correlation"
+        | "web_analytics_rule_list_contains_created_id_and_planned_fields"
         | "dns_record_details_match_created_id_and_planned_fields" => Some("create"),
         "same_resource_contains_planned_fields_after_update"
         | "same_path_result_contains_planned_fields_after_update"
@@ -2410,22 +4877,84 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
         | "same_path_result_contains_planned_fields_after_mutation" => {
             validate_same_path_update_target(capability, input)
         }
-        "created_resource_contains_planned_fields_by_returned_id" => {
+        "created_resource_contains_planned_fields_by_returned_id"
+        | "web_analytics_rule_list_contains_created_id_and_planned_fields" => {
             validate_created_resource_target(capability, input)
         }
         "created_access_application_contains_planned_fields_by_returned_id" => {
             validate_access_application_create_target(capability, input)
         }
-        "parent_collection_contains_created_resource_id_and_planned_fields" => {
+        "parent_collection_contains_created_resource_id_and_planned_fields"
+        | "worker_tail_collection_contains_created_lease_id" => {
             validate_created_collection_resource_target(capability, input)
+        }
+        "parent_object_contains_created_nested_resource_by_correlation" => {
+            validate_created_nested_resource_target(capability, input)
         }
         "parent_collection_omits_deleted_resource_id" => {
             validate_deleted_resource_target(capability, input)
+        }
+        "parent_object_omits_deleted_nested_resource_id" => {
+            validate_deleted_nested_resource_target(capability, input)
+        }
+        "web_analytics_rule_list_omits_deleted_id" => {
+            validate_web_analytics_rule_delete_target(capability, input)
         }
         "parent_collection_item_contains_planned_fields_after_update" => {
             validate_updated_resource_target(capability, input)
         }
         _ => Ok(()),
+    }
+}
+
+fn validate_async_list_mutation_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    let selectors = input.selectors.as_object().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the governed List selectors are not an object".to_owned(),
+        )
+    })?;
+    if selectors.len() != 2
+        || ["account_id", "list_id"].iter().any(|name| {
+            selectors
+                .get(*name)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        })
+        || !clean_verification_query(input)
+        || capability.async_collection_mutation.is_none()
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the governed List operation is broader than its exact account, list, and body-only contract"
+                .to_owned(),
+        ));
+    }
+    match capability.verification.strategy.as_str() {
+        "async_list_operation_completes_and_correlated_member_exists" => {
+            let item = input
+                .body
+                .as_ref()
+                .and_then(Value::as_array)
+                .filter(|items| items.len() == 1)
+                .and_then(|items| items.first())
+                .ok_or_else(|| {
+                    CloudflareError::MissingVerificationTarget(
+                        "the governed List add must carry exactly one item".to_owned(),
+                    )
+                })?;
+            if governed_list_item_projection(item).is_none() {
+                return Err(CloudflareError::MissingVerificationTarget(
+                    "the governed List add item lacks one exact IP, ASN, or hostname plus its correlation comment"
+                        .to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        "async_list_operation_completes_and_members_absent" => {
+            governed_list_delete_ids(input).map(|_| ())
+        }
+        strategy => Err(CloudflareError::UnsupportedVerificationStrategy(
+            strategy.to_owned(),
+        )),
     }
 }
 
@@ -2864,6 +5393,18 @@ fn selector_can_be_response_id(selector: &str) -> bool {
         || selector.ends_with("_identifier")
 }
 
+/// Returns a resource identity in the exact JSON scalar type Cloudflare used.
+/// Most APIs return string IDs, while Logpush returns an integer job ID. The
+/// type is retained so a verification readback and a later compensation plan
+/// satisfy the selector schema instead of stringifying an integer path value.
+fn resource_identity_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(identity) if !identity.is_empty() => Some(value.clone()),
+        Value::Number(identity) if identity.is_u64() || identity.is_i64() => Some(value.clone()),
+        _ => None,
+    }
+}
+
 // Kept in sync with `cfctl_core::response_identity_pointer_supported` — the
 // classifier gate (core) and the executor verify gate (here) must accept the
 // same identity pointers, or a capability the catalog marks `dynamic_api` fails
@@ -2880,6 +5421,7 @@ fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
     (selector_can_be_response_id(selector) && pointer == "/id")
         || (selector.ends_with("_name") && pointer == "/name")
         || (selector == "database_id" && pointer == "/uuid")
+        || (selector == "site_id" && pointer == "/site_tag")
         || (!selector
             .chars()
             .any(|character| matches!(character, '/' | '~'))
@@ -2924,6 +5466,24 @@ fn validate_created_collection_resource_target(
                 "the hash-bound created-collection-resource contract is absent".to_owned(),
             )
         })?;
+    if is_worker_tail_create_capability(capability) {
+        if target.collection_path != capability.path
+            || target.identity_selector != "id"
+            || target.response_result_identity_pointer != "/id"
+            || target.response_item_identity_pointer != "/id"
+            || target.read_capability_id != "worker-tail-logs-list-tails"
+            || target.delete_capability_id != "worker-tail-logs-delete-tail"
+            || !target.verified_response_fields.is_empty()
+            || target.requires_page_number_completion
+            || input.body.is_some()
+            || !clean_verification_query(input)
+        {
+            return Err(CloudflareError::MissingVerificationTarget(
+                "the hash-bound Worker tail lease verification target is malformed".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
     if target.collection_path != capability.path
         || target.identity_selector.is_empty()
         || target.response_result_identity_pointer != target.response_item_identity_pointer
@@ -3012,6 +5572,143 @@ fn validate_deleted_resource_target(capability: &CapabilityV1, input: &CallInput
     Ok(())
 }
 
+fn validate_created_nested_resource_target(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let target = capability.created_nested_resource.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the hash-bound created-nested-resource contract is absent".to_owned(),
+        )
+    })?;
+    let expected_delete_path = format!(
+        "{}/{{{}}}",
+        capability.path.trim_end_matches('/'),
+        target.identity_selector
+    );
+    if target.parent_path.is_empty()
+        || target.items_pointer.is_empty()
+        || !target.items_pointer.starts_with('/')
+        || target.identity_selector.is_empty()
+        || !response_identity_pointer_supported(
+            &target.identity_selector,
+            &target.response_item_identity_pointer,
+        )
+        || target.correlation_field.is_empty()
+        || target.read_capability_id.is_empty()
+        || target.delete_capability_id.is_empty()
+        || target.delete_path != expected_delete_path
+        || target.verified_response_fields.is_empty()
+        || target
+            .verified_response_fields
+            .binary_search(&target.correlation_field)
+            .is_err()
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the hash-bound created-nested-resource contract is malformed".to_owned(),
+        ));
+    }
+    if !clean_verification_query(input) {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned nested-resource create contains query controls outside the hash-bound parent readback contract"
+                .to_owned(),
+        ));
+    }
+    let planned = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|body| !body.is_empty())
+        .ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "planned nested-resource create body is absent, empty, or not an object".to_owned(),
+            )
+        })?;
+    if planned
+        .get(&target.correlation_field)
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+        || planned.keys().any(|field| {
+            !planned_field_is_bound_to_readback(capability, &target.verified_response_fields, field)
+        })
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the planned nested-resource create is missing its correlation value or contains a field outside the hash-bound readback fields"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_deleted_nested_resource_target(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let target = capability.deleted_nested_resource.as_ref().ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "the hash-bound deleted-nested-resource contract is absent".to_owned(),
+        )
+    })?;
+    let expected_path = format!(
+        "{}/{{{}}}",
+        target.collection_path.trim_end_matches('/'),
+        target.identity_selector
+    );
+    if target.parent_path.is_empty()
+        || target.collection_path.is_empty()
+        || target.items_pointer.is_empty()
+        || !target.items_pointer.starts_with('/')
+        || capability.path != expected_path
+        || !response_identity_pointer_supported(
+            &target.identity_selector,
+            &target.response_item_identity_pointer,
+        )
+        || target.read_capability_id.is_empty()
+        || input
+            .selectors
+            .get(&target.identity_selector)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || input.body.is_some()
+        || !clean_verification_query(input)
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the hash-bound deleted-nested-resource target is malformed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_web_analytics_rule_delete_target(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    if capability.id != "web-analytics-delete-rule"
+        || input
+            .selectors
+            .get("account_id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || input
+            .selectors
+            .get("ruleset_id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || input
+            .selectors
+            .get("rule_id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || input.body.is_some()
+        || !clean_verification_query(input)
+    {
+        return Err(CloudflareError::MissingVerificationTarget(
+            "the hash-bound Web Analytics rule deletion target is malformed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_updated_resource_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
     let target = capability.updated_resource.as_ref().ok_or_else(|| {
         CloudflareError::MissingVerificationTarget(
@@ -3089,7 +5786,22 @@ fn is_create_verifier(strategy: &str) -> bool {
         "created_resource_contains_planned_fields_by_returned_id"
             | "created_access_application_contains_planned_fields_by_returned_id"
             | "parent_collection_contains_created_resource_id_and_planned_fields"
+            | "worker_tail_collection_contains_created_lease_id"
+            | "parent_object_contains_created_nested_resource_by_correlation"
+            | "web_analytics_rule_list_contains_created_id_and_planned_fields"
     )
+}
+
+fn is_worker_tail_create_capability(capability: &CapabilityV1) -> bool {
+    capability.id == "worker-tail-logs-start-tail"
+        && capability.method == "POST"
+        && capability.path == "/accounts/{account_id}/workers/scripts/{script_name}/tails"
+        && capability.product == "Worker Tail Logs"
+        && capability.account_scope == "account"
+        && capability.request_schema.is_none()
+        && capability.risk == RiskClass::SecretSensitive
+        && capability.permissions == ["Workers Tail Read", "Workers Scripts Write"]
+        && capability.verification.strategy == "worker_tail_collection_contains_created_lease_id"
 }
 
 fn is_delete_verifier(strategy: &str) -> bool {
@@ -3098,6 +5810,8 @@ fn is_delete_verifier(strategy: &str) -> bool {
         "same_resource_returns_not_found_after_delete"
             | "worker_script_settings_returns_not_found_after_delete"
             | "parent_collection_omits_deleted_resource_id"
+            | "parent_object_omits_deleted_nested_resource_id"
+            | "web_analytics_rule_list_omits_deleted_id"
     )
 }
 
@@ -3105,7 +5819,9 @@ pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -
     validate_response_contract(capability)?;
     validate_selector_contract(capability, &input.selectors)?;
     validate_query_contract(capability, &input.query)?;
-    validate_request_body(capability, input.body.as_ref())
+    validate_request_body(capability, input.body.as_ref())?;
+    validate_analytics_query_contract(capability, input)?;
+    validate_r2_log_retrieval_contract(capability, input)
 }
 
 fn validate_response_contract(capability: &CapabilityV1) -> Result<()> {
@@ -3119,6 +5835,585 @@ fn validate_response_contract(capability: &CapabilityV1) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fail-closed validator binds shared bounds and every typed analytics adapter before execution"
+)]
+fn validate_analytics_query_contract(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    let Some(contract) = capability.analytics_query.as_ref() else {
+        if capability.graphql.is_some() {
+            return Err(CloudflareError::InvalidAnalyticsQuery(
+                "a GraphQL document must be paired with a bounded analytics query contract"
+                    .to_owned(),
+            ));
+        }
+        return Ok(());
+    };
+    if !contract.read_only || capability.mutating {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "analytics query capabilities must be explicitly read-only".to_owned(),
+        ));
+    }
+    if contract.max_rows == 0 || contract.max_bytes == 0 || contract.max_timeout_seconds == 0 {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "row, byte, and timeout bounds must all be positive".to_owned(),
+        ));
+    }
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery(
+                "bounded analytics input must be an object".to_owned(),
+            )
+        })?;
+
+    if let Some(pointer) = contract.dataset_pointer.as_deref() {
+        let dataset = input
+            .body
+            .as_ref()
+            .and_then(|body| body.pointer(pointer))
+            .ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(format!("dataset is missing at `{pointer}`"))
+            })?;
+        if let Some(expected) = contract.dataset.as_deref() {
+            if dataset.as_str() != Some(expected) {
+                return Err(CloudflareError::InvalidAnalyticsQuery(format!(
+                    "dataset must be the fixed `{expected}` dataset"
+                )));
+            }
+        } else if matches!(
+            contract.kind,
+            AnalyticsQueryKindV1::StructuredSql | AnalyticsQueryKindV1::LogExplorerSql
+        ) && !dataset.as_str().is_some_and(valid_sql_identifier)
+        {
+            return Err(CloudflareError::InvalidAnalyticsQuery(
+                "dataset must be one plain identifier".to_owned(),
+            ));
+        } else if contract.kind == AnalyticsQueryKindV1::WorkersObservability
+            && !dataset_is_bounded(dataset)
+        {
+            return Err(CloudflareError::InvalidAnalyticsQuery(
+                "observability datasets must be a non-empty bounded string or string list"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    if let Some(time) = contract.time_range.as_ref() {
+        let start = input
+            .body
+            .as_ref()
+            .and_then(|body| body.pointer(&time.start_pointer))
+            .ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(format!(
+                    "start time is missing at `{}`",
+                    time.start_pointer
+                ))
+            })?;
+        let end = input
+            .body
+            .as_ref()
+            .and_then(|body| body.pointer(&time.end_pointer))
+            .ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(format!(
+                    "end time is missing at `{}`",
+                    time.end_pointer
+                ))
+            })?;
+        let start = analytics_timestamp(start, time.timestamp_format)?;
+        let end = analytics_timestamp(end, time.timestamp_format)?;
+        let now = Utc::now();
+        if end <= start {
+            return Err(CloudflareError::InvalidAnalyticsQuery(
+                "end time must be after start time".to_owned(),
+            ));
+        }
+        let window = (end - start).num_seconds();
+        if window > i64::try_from(time.max_window_seconds).unwrap_or(i64::MAX) {
+            return Err(CloudflareError::InvalidAnalyticsQuery(format!(
+                "time window exceeds the {} second maximum",
+                time.max_window_seconds
+            )));
+        }
+        if (now - start).num_seconds()
+            > i64::try_from(time.max_lookback_seconds).unwrap_or(i64::MAX)
+        {
+            return Err(CloudflareError::InvalidAnalyticsQuery(format!(
+                "start time exceeds the {} second maximum lookback",
+                time.max_lookback_seconds
+            )));
+        }
+        if (end - now).num_seconds() > 300 {
+            return Err(CloudflareError::InvalidAnalyticsQuery(
+                "end time cannot be more than five minutes in the future".to_owned(),
+            ));
+        }
+    }
+
+    if let Some(pointer) = contract.row_limit_pointer.as_deref() {
+        let rows = input
+            .body
+            .as_ref()
+            .and_then(|body| body.pointer(pointer))
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(format!(
+                    "row limit is missing or invalid at `{pointer}`"
+                ))
+            })?;
+        if rows == 0 || rows > contract.max_rows {
+            return Err(CloudflareError::InvalidAnalyticsQuery(format!(
+                "row limit must be between 1 and {}",
+                contract.max_rows
+            )));
+        }
+    }
+    let output_format = body
+        .get("format")
+        .and_then(Value::as_str)
+        .map(parse_output_format)
+        .transpose()?
+        .unwrap_or(contract.default_output_format);
+    if !contract.allowed_output_formats.contains(&output_format) {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "requested output format is outside the capability contract".to_owned(),
+        ));
+    }
+    let timeout = body
+        .get("timeout_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(contract.max_timeout_seconds);
+    if timeout == 0 || timeout > contract.max_timeout_seconds {
+        return Err(CloudflareError::InvalidAnalyticsQuery(format!(
+            "timeout must be between 1 and {} seconds",
+            contract.max_timeout_seconds
+        )));
+    }
+
+    match contract.kind {
+        AnalyticsQueryKindV1::StructuredSql => {
+            if !capability.method.eq_ignore_ascii_case("GET")
+                || capability.path != "/accounts/{account_id}/analytics_engine/sql"
+                || capability.graphql.is_some()
+                || capability
+                    .selectors
+                    .iter()
+                    .any(|selector| selector.location == "query" && selector.name == "query")
+            {
+                return Err(CloudflareError::InvalidAnalyticsQuery(
+                    "structured SQL must use the fixed Analytics Engine GET adapter without a raw query selector"
+                        .to_owned(),
+                ));
+            }
+            render_structured_analytics_sql(
+                input.body.as_ref().ok_or_else(|| {
+                    CloudflareError::InvalidAnalyticsQuery(
+                        "structured SQL input body is missing".to_owned(),
+                    )
+                })?,
+                output_format,
+            )?;
+        }
+        AnalyticsQueryKindV1::LogExplorerSql => {
+            let fixed_path = matches!(
+                capability.path.as_str(),
+                "/accounts/{account_id}/logs/explorer/query/sql"
+                    | "/zones/{zone_id}/logs/explorer/query/sql"
+            );
+            if !capability.method.eq_ignore_ascii_case("POST")
+                || !fixed_path
+                || capability.graphql.is_some()
+                || output_format != OutputFormatV1::Json
+                || capability
+                    .selectors
+                    .iter()
+                    .any(|selector| selector.location == "query" && selector.name == "query")
+                || capability
+                    .response_contract
+                    .as_ref()
+                    .is_none_or(|response| {
+                        response.body_mode != ResponseBodyModeV1::CloudflareJsonEnvelope
+                    })
+            {
+                return Err(CloudflareError::InvalidAnalyticsQuery(
+                    "Log Explorer SQL must use a fixed account or zone POST adapter with a compiler-rendered text body"
+                        .to_owned(),
+                ));
+            }
+            render_structured_log_explorer_sql(input.body.as_ref().ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(
+                    "structured Log Explorer input body is missing".to_owned(),
+                )
+            })?)?;
+        }
+        AnalyticsQueryKindV1::GraphqlAnalytics => {
+            if !capability.method.eq_ignore_ascii_case("POST")
+                || capability.path != "/graphql"
+                || output_format != OutputFormatV1::Json
+                || capability
+                    .response_contract
+                    .as_ref()
+                    .is_none_or(|response| response.body_mode != ResponseBodyModeV1::GraphqlJson)
+            {
+                return Err(CloudflareError::InvalidAnalyticsQuery(
+                    "GraphQL analytics must use the fixed POST /graphql JSON adapter".to_owned(),
+                ));
+            }
+            let graphql = capability.graphql.as_ref().ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(
+                    "GraphQL analytics is missing its fixed document contract".to_owned(),
+                )
+            })?;
+            graphql.validate_schema_fingerprint()?;
+            let document = graphql.document.trim_start();
+            if !document.starts_with("query ")
+                || document.contains("mutation ")
+                || document.contains("subscription ")
+                || graphql.dataset != contract.dataset.as_deref().unwrap_or_default()
+            {
+                return Err(CloudflareError::InvalidAnalyticsQuery(
+                    "only the fingerprinted read-only GraphQL query document is permitted"
+                        .to_owned(),
+                ));
+            }
+            validate_graphql_pagination_contract(contract, graphql, input)?;
+        }
+        AnalyticsQueryKindV1::WorkersObservability => {
+            if !capability.method.eq_ignore_ascii_case("POST") || capability.graphql.is_some() {
+                return Err(CloudflareError::InvalidAnalyticsQuery(
+                    "Workers observability reads must use their fixed POST query adapter"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the private retrieval validator binds capability identity, selectors, media, time, byte, and timeout limits together"
+)]
+fn validate_r2_log_retrieval_contract(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    let Some(contract) = capability.r2_log_retrieval.as_ref() else {
+        return Ok(());
+    };
+    let identity_supported = capability.id == "logpull-retrieve-logs"
+        && capability.method == "GET"
+        && capability.path == "/accounts/{account_id}/logs/retrieve"
+        && capability.product == "Logpull"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.permissions == ["Logs Read"]
+        && capability.analytics_query.is_none()
+        && capability.graphql.is_none()
+        && capability.request_schema.is_none()
+        && capability
+            .selectors
+            .iter()
+            .all(|selector| selector.location != "header")
+        && contract.access_key_input_field == "access_key_id"
+        && contract.secret_access_key_input_field == "secret_access_key"
+        && contract
+            .access_key_header
+            .eq_ignore_ascii_case("R2-Access-Key-Id")
+        && contract
+            .secret_access_key_header
+            .eq_ignore_ascii_case("R2-Secret-Access-Key")
+        && contract.start_query_selector == "start"
+        && contract.end_query_selector == "end"
+        && contract.bucket_query_selector == "bucket"
+        && contract.prefix_query_selector == "prefix"
+        && contract.requires_new_mode_0600_file
+        && contract.max_lookback_seconds > 0
+        && contract.max_window_seconds > 0
+        && contract.max_window_seconds <= 24 * 60 * 60
+        && contract.max_bytes > 0
+        && contract.max_bytes <= 1024 * 1024 * 1024
+        && contract.max_timeout_seconds > 0
+        && contract.max_timeout_seconds <= 300
+        && contract.output_media_types == ["application/json"]
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+                    && response.body_mode == ResponseBodyModeV1::JsonValue
+            });
+    if !identity_supported {
+        return Err(CloudflareError::InvalidR2LogRetrieval(
+            "catalog identity or credential, range, output, permission, and response bounds drifted"
+                .to_owned(),
+        ));
+    }
+    if input.body.is_some() {
+        return Err(CloudflareError::InvalidR2LogRetrieval(
+            "retrieval accepts selectors and query controls only, not a request body".to_owned(),
+        ));
+    }
+    let query = input.query.as_object().ok_or_else(|| {
+        CloudflareError::InvalidR2LogRetrieval("query controls must be an object".to_owned())
+    })?;
+    let query_string = |name: &str| -> Result<&str> {
+        query.get(name).and_then(Value::as_str).ok_or_else(|| {
+            CloudflareError::InvalidR2LogRetrieval(format!(
+                "required query control `{name}` must be a string"
+            ))
+        })
+    };
+    let start_text = query_string(&contract.start_query_selector)?;
+    let end_text = query_string(&contract.end_query_selector)?;
+    let start = DateTime::parse_from_rfc3339(start_text)
+        .map_err(|_| {
+            CloudflareError::InvalidR2LogRetrieval("start must be an RFC3339 timestamp".to_owned())
+        })?
+        .with_timezone(&Utc);
+    let end = DateTime::parse_from_rfc3339(end_text)
+        .map_err(|_| {
+            CloudflareError::InvalidR2LogRetrieval("end must be an RFC3339 timestamp".to_owned())
+        })?
+        .with_timezone(&Utc);
+    let now = Utc::now();
+    if end <= start {
+        return Err(CloudflareError::InvalidR2LogRetrieval(
+            "end time must be after start time".to_owned(),
+        ));
+    }
+    if (end - start).num_seconds() > i64::try_from(contract.max_window_seconds).unwrap_or(i64::MAX)
+    {
+        return Err(CloudflareError::InvalidR2LogRetrieval(format!(
+            "time window exceeds the {} second maximum",
+            contract.max_window_seconds
+        )));
+    }
+    if (now - start).num_seconds()
+        > i64::try_from(contract.max_lookback_seconds).unwrap_or(i64::MAX)
+    {
+        return Err(CloudflareError::InvalidR2LogRetrieval(format!(
+            "start time exceeds the {} second maximum lookback",
+            contract.max_lookback_seconds
+        )));
+    }
+    if (end - now).num_seconds() > 300 {
+        return Err(CloudflareError::InvalidR2LogRetrieval(
+            "end time cannot be more than five minutes in the future".to_owned(),
+        ));
+    }
+    let bucket = query_string(&contract.bucket_query_selector)?;
+    if !valid_r2_bucket_name(bucket) {
+        return Err(CloudflareError::InvalidR2LogRetrieval(
+            "bucket must be a 3-63 character lowercase R2 bucket name".to_owned(),
+        ));
+    }
+    if let Some(prefix) = query
+        .get(&contract.prefix_query_selector)
+        .and_then(Value::as_str)
+        && (prefix.is_empty() || prefix.len() > 1024 || prefix.chars().any(char::is_control))
+    {
+        return Err(CloudflareError::InvalidR2LogRetrieval(
+            "prefix must be a non-empty control-free value of at most 1024 bytes".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_r2_bucket_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (3..=63).contains(&bytes.len())
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+fn top_level_cursor_input_field(pointer: &str) -> Result<&str> {
+    let field = pointer
+        .strip_prefix('/')
+        .filter(|field| !field.is_empty() && !field.contains('/') && !field.contains('~'));
+    field.ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery(
+            "GraphQL cursor inputs must be unescaped top-level body pointers".to_owned(),
+        )
+    })
+}
+
+fn graphql_cursor_bindings(graphql: &GraphqlAnalyticsContractV1) -> Result<Vec<(&str, &str)>> {
+    if graphql.cursor_fields.is_empty() {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "ordered-keyset GraphQL pagination requires response cursor fields".to_owned(),
+        ));
+    }
+    if graphql.cursor_input_pointers.is_empty() {
+        if graphql.cursor_fields.len() != 1 {
+            return Err(CloudflareError::InvalidAnalyticsQuery(
+                "a multi-field GraphQL cursor requires one pinned input pointer per response field"
+                    .to_owned(),
+            ));
+        }
+        let pointer = graphql.cursor_input_pointer.as_deref().ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery(
+                "ordered-keyset GraphQL pagination requires a pinned cursor input".to_owned(),
+            )
+        })?;
+        top_level_cursor_input_field(pointer)?;
+        return Ok(vec![(graphql.cursor_fields[0].as_str(), pointer)]);
+    }
+    if graphql.cursor_input_pointer.is_some()
+        || graphql.cursor_input_pointers.len() != graphql.cursor_fields.len()
+    {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "GraphQL cursor bindings must map every response field exactly once".to_owned(),
+        ));
+    }
+    let mut pointers = BTreeSet::new();
+    graphql
+        .cursor_fields
+        .iter()
+        .map(|field| {
+            let pointer = graphql.cursor_input_pointers.get(field).ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(format!(
+                    "GraphQL cursor field `{field}` has no pinned body input"
+                ))
+            })?;
+            top_level_cursor_input_field(pointer)?;
+            if !pointers.insert(pointer.as_str()) {
+                return Err(CloudflareError::InvalidAnalyticsQuery(
+                    "GraphQL cursor input pointers must be unique".to_owned(),
+                ));
+            }
+            Ok((field.as_str(), pointer.as_str()))
+        })
+        .collect()
+}
+
+fn validate_graphql_pagination_contract(
+    query: &AnalyticsQueryContractV1,
+    graphql: &GraphqlAnalyticsContractV1,
+    input: &CallInput,
+) -> Result<()> {
+    if query.pagination != PaginationModeV1::OrderedKeyset {
+        if graphql.cursor_input_pointer.is_some()
+            || !graphql.cursor_input_pointers.is_empty()
+            || !graphql.cursor_fields.is_empty()
+        {
+            return Err(CloudflareError::InvalidAnalyticsQuery(
+                "GraphQL cursor fields and inputs are only valid for ordered-keyset pagination"
+                    .to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let bindings = graphql_cursor_bindings(graphql)?;
+    let time = query.time_range.as_ref().ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery(
+            "ordered-keyset GraphQL pagination requires a bounded time range".to_owned(),
+        )
+    })?;
+    let body = input.body.as_ref().ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery("GraphQL input body is missing".to_owned())
+    })?;
+    let start = body.pointer(&time.start_pointer).ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery("GraphQL start time is missing".to_owned())
+    })?;
+    let end = body.pointer(&time.end_pointer).ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery("GraphQL end time is missing".to_owned())
+    })?;
+    for (_, pointer) in &bindings {
+        let input_field = top_level_cursor_input_field(pointer)?;
+        if body.pointer(pointer).is_none() {
+            return Err(CloudflareError::InvalidAnalyticsQuery(format!(
+                "GraphQL continuation cursor is missing at `{pointer}`"
+            )));
+        }
+        if graphql
+            .body_variables
+            .get(input_field)
+            .is_none_or(|variable| !graphql.document.contains(&format!("${variable}")))
+        {
+            return Err(CloudflareError::InvalidAnalyticsQuery(format!(
+                "GraphQL cursor input `{pointer}` is not bound by the fixed document"
+            )));
+        }
+    }
+    let time_cursor_pointer = bindings
+        .first()
+        .map(|(_, pointer)| *pointer)
+        .ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery(
+                "GraphQL continuation has no time cursor binding".to_owned(),
+            )
+        })?;
+    let cursor = body.pointer(time_cursor_pointer).ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery(
+            "GraphQL continuation time cursor is missing".to_owned(),
+        )
+    })?;
+    let start = analytics_timestamp(start, time.timestamp_format)?;
+    let end = analytics_timestamp(end, time.timestamp_format)?;
+    let cursor = analytics_timestamp(cursor, time.timestamp_format)?;
+    if cursor < start || cursor >= end {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "GraphQL continuation cursor must be within the requested time range".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn dataset_is_bounded(value: &Value) -> bool {
+    value.as_str().is_some_and(|value| !value.is_empty())
+        || value.as_array().is_some_and(|values| {
+            !values.is_empty()
+                && values.len() <= 20
+                && values
+                    .iter()
+                    .all(|value| value.as_str().is_some_and(|value| !value.is_empty()))
+        })
+}
+
+fn analytics_timestamp(value: &Value, format: TimestampFormatV1) -> Result<DateTime<Utc>> {
+    match format {
+        TimestampFormatV1::Rfc3339 => value
+            .as_str()
+            .ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(
+                    "time values must use RFC 3339 strings".to_owned(),
+                )
+            })?
+            .parse::<DateTime<Utc>>()
+            .map_err(|_| {
+                CloudflareError::InvalidAnalyticsQuery(
+                    "time values must be valid RFC 3339 timestamps".to_owned(),
+                )
+            }),
+        TimestampFormatV1::UnixSeconds | TimestampFormatV1::UnixMilliseconds => {
+            let value = value.as_i64().ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(
+                    "time values must be signed Unix timestamps".to_owned(),
+                )
+            })?;
+            let (seconds, nanos) = if format == TimestampFormatV1::UnixMilliseconds {
+                (
+                    value.div_euclid(1_000),
+                    u32::try_from(value.rem_euclid(1_000)).unwrap_or_default() * 1_000_000,
+                )
+            } else {
+                (value, 0)
+            };
+            DateTime::from_timestamp(seconds, nanos).ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery("time value is out of range".to_owned())
+            })
+        }
+    }
 }
 
 fn validate_selector_contract(capability: &CapabilityV1, selectors: &Value) -> Result<()> {

@@ -39,6 +39,19 @@ CLI, tunnels, and Access:
 Product APIs:
 
 - GraphQL Analytics API: https://developers.cloudflare.com/analytics/graphql-api/
+- GraphQL discovery and schema introspection: https://developers.cloudflare.com/analytics/graphql-api/features/discovery/introspection/
+- GraphQL dataset settings and limits: https://developers.cloudflare.com/analytics/graphql-api/features/discovery/settings/
+- GraphQL filtering: https://developers.cloudflare.com/analytics/graphql-api/features/filtering/
+- GraphQL sorting: https://developers.cloudflare.com/analytics/graphql-api/features/sorting/
+- GraphQL pagination: https://developers.cloudflare.com/analytics/graphql-api/features/pagination/
+- GraphQL adaptive sampling: https://developers.cloudflare.com/analytics/faq/graphql-api-inconsistent-results/
+- Security Events semantics and sampled-log limits: https://developers.cloudflare.com/waf/analytics/security-events/
+- Analytics Engine SQL API: https://developers.cloudflare.com/analytics/analytics-engine/sql-api/
+- Web Analytics API: https://developers.cloudflare.com/api/resources/rum/
+- Workers observability: https://developers.cloudflare.com/workers/observability/
+- Workers Tail API: https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/tail/
+- Log Explorer: https://developers.cloudflare.com/log-explorer/
+- Logs Engine R2 retrieval: https://developers.cloudflare.com/logs/r2-log-retrieval/
 - Registrar API: https://developers.cloudflare.com/registrar/registrar-api/
 - API Gateway and API Shield: https://developers.cloudflare.com/api/resources/api_gateway/
 - Images API: https://developers.cloudflare.com/api/resources/images/
@@ -46,6 +59,9 @@ Product APIs:
 - Calls API: https://developers.cloudflare.com/api/resources/calls/
 - Waiting Rooms API: https://developers.cloudflare.com/api/resources/waiting_rooms/
 - Logpush API: https://developers.cloudflare.com/api/resources/logpush/
+- Cloudflare Lists API: https://developers.cloudflare.com/api/resources/rules/
+- WAF custom rules: https://developers.cloudflare.com/waf/custom-rules/
+- Ruleset Engine API: https://developers.cloudflare.com/ruleset-engine/rulesets-api/
 - SSL API: https://developers.cloudflare.com/api/resources/ssl/
 - Ruleset phases: https://developers.cloudflare.com/ruleset-engine/reference/phases-list/
 - WAF phases: https://developers.cloudflare.com/waf/reference/phases/

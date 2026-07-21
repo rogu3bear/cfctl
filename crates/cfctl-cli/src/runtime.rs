@@ -21,18 +21,18 @@ use cfctl_auth::{
 use cfctl_catalog::{
     CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1, attach_official_product_knowledge,
     fetch_official, fetch_official_text_feeds, ingest_cli_help, ingest_governed_ui_capabilities,
-    refresh_dynamic_mutation_contract,
+    ingest_telemetry_capabilities, refresh_dynamic_mutation_contract,
 };
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, Executor, OperationVerificationV1,
-    validate_request_contract,
+    R2LogRetrievalCredentials, validate_request_contract,
 };
 use cfctl_core::{
     AdapterStatus, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1, EffectClass, ErrorV1,
     EvidenceClass, EvidenceV1, GuideActionV1, GuideContractStateV1, GuideTopicDocumentV1,
     GuideTopicV1, MoneyV1, PlanStatus, PlanV1, PolicyDisposition, ResultEnvelopeV2, RiskClass,
-    StandingAuthorityV1, TransactionStageV1, VerificationState, guide_stages, guide_topic_document,
-    hash_value, redact_json, render_guide_topic_document_markdown,
+    SecurityActionKindV1, StandingAuthorityV1, TransactionStageV1, VerificationState, guide_stages,
+    guide_topic_document, hash_value, redact_json, render_guide_topic_document_markdown,
 };
 use cfctl_planner::{ImpactContext, PolicyEngine};
 use cfctl_storage::{RuntimePaths, StateStore};
@@ -379,6 +379,79 @@ fn live_read_failure_guidance(status: u16) -> (&'static str, String) {
     }
 }
 
+fn live_read_availability(capability: &CapabilityV1, response: &CloudflareResponseV1) -> Value {
+    let permission_owner =
+        if capability.path.starts_with("/user") || capability.account_scope == "user" {
+            "user_owned"
+        } else {
+            "account_owned"
+        };
+    let analytics_rows = capability.analytics_query.as_ref().and_then(|_| {
+        response
+            .result_info
+            .as_ref()
+            .and_then(|info| info.pointer("/output/rows"))
+            .and_then(Value::as_u64)
+    });
+    let (state, data_state, distinction_proven, next_action) = if response.success {
+        if analytics_rows == Some(0) {
+            (
+                "available",
+                "no_data_in_bounded_query_window",
+                true,
+                "Widen the governed time window within the capability limit or verify dataset freshness and retention; cfctl does not reinterpret an empty result as an authorization failure.",
+            )
+        } else {
+            (
+                "available",
+                "data_returned_or_not_applicable",
+                true,
+                "Inspect the content-addressed live-read receipt and any freshness, sampling, pagination, or truncation metadata.",
+            )
+        }
+    } else if capability.entitlement.available == Some(false) {
+        (
+            "unavailable_current_plan",
+            "not_observed",
+            true,
+            "Review the capability entitlement source and use an eligible account or plan; do not retry as a permission workaround.",
+        )
+    } else if matches!(response.status, 401 | 403) {
+        (
+            "authorization_or_entitlement_unresolved",
+            "not_observed",
+            false,
+            "Compare the active token against required_permissions. If those permissions are present, inspect the capability entitlement source or a governed product-specific entitlement read; cfctl does not guess which boundary Cloudflare rejected.",
+        )
+    } else if response.status == 404 {
+        (
+            "resource_or_configuration_absent",
+            "not_observed",
+            true,
+            "Verify the exact account, zone, and resource selectors. A 404 is not treated as an empty analytics result.",
+        )
+    } else {
+        (
+            "upstream_error",
+            "not_observed",
+            true,
+            "Inspect the redacted Cloudflare errors and retry only when the status-specific guidance permits it.",
+        )
+    };
+    json!({
+        "schema_version": 1,
+        "state": state,
+        "data_state": data_state,
+        "authorization_entitlement_distinction_proven": distinction_proven,
+        "permission_owner": permission_owner,
+        "required_permissions": &capability.permissions,
+        "entitlement": &capability.entitlement,
+        "freshness": capability.analytics_query.as_ref().and_then(|query| query.freshness.as_deref()),
+        "sampling": capability.analytics_query.as_ref().and_then(|query| query.sampling.as_deref()),
+        "next_action": next_action,
+    })
+}
+
 pub type Result<T> = std::result::Result<T, CliError>;
 
 pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
@@ -396,12 +469,12 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
     let store = StateStore::open(RuntimePaths::discover()?)?;
     match command {
         Command::Auth(arguments) => auth_command(&store, arguments.command).await,
-        Command::Keys(arguments) => keys_command(&store, arguments.command).await,
+        Command::Keys(arguments) => Box::pin(keys_command(&store, arguments.command)).await,
         Command::Catalog(arguments) => catalog_command(&store, arguments.command).await,
-        Command::Call(arguments) => call_command(&store, arguments).await,
+        Command::Call(arguments) => Box::pin(call_command(&store, arguments)).await,
         Command::Resolve(arguments) => resolve_command(&store, arguments).await,
         Command::Guide(arguments) => guide_command(&store, &arguments).await,
-        Command::Plans(arguments) => plans_command(&store, arguments.command).await,
+        Command::Plans(arguments) => Box::pin(plans_command(&store, arguments.command)).await,
         Command::Workspace(arguments) => workspace_command(&store, arguments.command),
         Command::Agents(arguments) => agents_command(&store, arguments.command),
         Command::Docs(arguments) => docs_command(&store, arguments.command).await,
@@ -917,6 +990,7 @@ async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2> {
     let client = http_client()?;
     let (mut catalog, feeds) =
         tokio::try_join!(fetch_official(&client), fetch_official_text_feeds(&client))?;
+    ingest_telemetry_capabilities(&mut catalog)?;
     attach_official_product_knowledge(&mut catalog, &feeds)?;
     for (program, version_argument) in [("wrangler", "--version"), ("cloudflared", "version")] {
         if which::which(program).is_ok() {
@@ -1028,6 +1102,10 @@ fn guide_topic_envelope(topic: GuideTopicArg) -> Result<ResultEnvelopeV2> {
     ))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the public call boundary must visibly sequence catalog validation, selectors, authorization, governed reads, and immutable mutation planning"
+)]
 async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultEnvelopeV2> {
     let catalog = ensure_catalog(store).await?;
     let capability = catalog
@@ -1040,8 +1118,46 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
                 .to_owned(),
         ));
     }
+    let is_r2_log_retrieval = capability.r2_log_retrieval.is_some();
+    if arguments.credential_in.is_some() && !is_r2_log_retrieval {
+        return Err(CliError::Input(
+            "`--credential-in` is accepted only by the governed R2 log retrieval capability"
+                .to_owned(),
+        ));
+    }
+    if is_r2_log_retrieval && arguments.credential_in.is_none() {
+        return Err(CliError::Input(
+            "R2 log retrieval requires `--credential-in <mode-0600-json-path>`; credentials are never accepted as selectors or argv values"
+                .to_owned(),
+        ));
+    }
+    if is_r2_log_retrieval && arguments.out.is_none() {
+        return Err(CliError::Input(
+            "R2 log retrieval requires `--out <new-path>`; retained logs are never written to stdout or evidence"
+                .to_owned(),
+        ));
+    }
+    if is_r2_log_retrieval && arguments.value_out.is_some() {
+        return Err(CliError::Input(
+            "R2 log retrieval uses `--out` for retrieved logs; `--value-out` is reserved for one-time secret-producing mutations"
+                .to_owned(),
+        ));
+    }
+    if arguments.out.is_some() && capability.analytics_query.is_none() && !is_r2_log_retrieval {
+        return Err(CliError::Input(
+            "`--out` is restricted to bounded analytics and governed R2 log retrieval capabilities"
+                .to_owned(),
+        ));
+    }
+    if arguments.out.is_some() && capability.mutating {
+        return Err(CliError::Input(
+            "mutations cannot stream results with `--out`; create and review a plan instead"
+                .to_owned(),
+        ));
+    }
     let mut prepared = call_input(&capability, &arguments)?;
     prepare_r2_temporary_credentials_input(&capability, &mut prepared.input)?;
+    let security_action = prepare_security_action_input(&capability, &mut prepared.input)?;
     preflight_call_input(&capability, &prepared.input, prepared.secret_body.as_ref())?;
     if !capability.mutating {
         if prepared.secret_body.is_some() {
@@ -1049,6 +1165,11 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
                 "read operations cannot accept secret request bodies".to_owned(),
             ));
         }
+        let r2_credentials = arguments
+            .credential_in
+            .as_deref()
+            .map(read_r2_log_retrieval_credentials)
+            .transpose()?;
         return execute_read(
             store,
             &catalog,
@@ -1056,12 +1177,17 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
             &prepared.input,
             arguments.profile.as_deref(),
             arguments.account.as_deref(),
+            arguments.out.as_deref(),
+            r2_credentials.as_ref(),
         )
         .await;
     }
     let secrets = platform_secrets(store);
     let mut secret_ref = None;
     let mut adapter_targets = Map::new();
+    if let Some(security_action) = security_action {
+        adapter_targets.insert("security_action".to_owned(), security_action);
+    }
     if let Some(secret_body) = &prepared.secret_body {
         let reference = format!("plan-input/{}", uuid::Uuid::new_v4());
         let content_hash = hash_value(secret_body)?;
@@ -1096,6 +1222,1960 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         secrets.delete(&reference)?;
     }
     result
+}
+
+const SECURITY_IP_RULE_CREATE_ID: &str = "security-response-create-expiring-ip-access-rule";
+const SECURITY_IP_RULE_REMOVE_ID: &str = "security-response-remove-expired-ip-access-rule";
+const SECURITY_IP_RULE_STATE_CAPABILITY_ID: &str =
+    "ip-access-rules-for-a-zone-list-ip-access-rules";
+const SECURITY_IP_RULE_COLLECTION_PATH: &str = "/zones/{zone_id}/firewall/access_rules/rules";
+const SECURITY_WAF_RULE_CREATE_ID: &str = "security-response-create-expiring-waf-rule";
+const SECURITY_WAF_RULE_REMOVE_ID: &str = "security-response-remove-expired-waf-rule";
+const SECURITY_WAF_RULE_STATE_CAPABILITY_ID: &str = "getZoneRuleset";
+const SECURITY_WAF_RULE_PARENT_PATH: &str = "/zones/{zone_id}/rulesets/{ruleset_id}";
+const SECURITY_LIST_MEMBER_CREATE_ID: &str = "security-response-add-expiring-list-member";
+const SECURITY_LIST_MEMBER_REMOVE_ID: &str = "security-response-remove-expired-list-member";
+const SECURITY_LIST_MEMBER_STATE_CAPABILITY_ID: &str = "lists-get-list-items";
+const SECURITY_LIST_METADATA_CAPABILITY_ID: &str = "lists-get-a-list";
+const SECURITY_LIST_MEMBER_COLLECTION_PATH: &str =
+    "/accounts/{account_id}/rules/lists/{list_id}/items";
+const SECURITY_LIST_METADATA_PATH: &str = "/accounts/{account_id}/rules/lists/{list_id}";
+const SECURITY_ACTION_STATE_PRECONDITION: &str = "security_action_state";
+
+fn validate_security_action_governance_input(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let contract = capability.security_action.as_ref().ok_or_else(|| {
+        CliError::Input("security action capability omitted its governance contract".to_owned())
+    })?;
+    if !capability.security_action_contract_supported() {
+        return Err(CliError::Input(
+            "security action capability drifted from its governed safety contract".to_owned(),
+        ));
+    }
+    let mut governance_capability = capability.clone();
+    governance_capability.request_schema = Some(contract.input_schema.clone());
+    validate_request_contract(&governance_capability, input)?;
+    Ok(())
+}
+
+fn security_action_string<'a>(body: &'a Map<String, Value>, field: &str) -> Result<&'a str> {
+    body.get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "security action requires non-empty string field `{field}`"
+            ))
+        })
+}
+
+fn ip_is_protected(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(address) => {
+            let octets = address.octets();
+            address.is_unspecified()
+                || address.is_loopback()
+                || address.is_private()
+                || address.is_link_local()
+                || address.is_multicast()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 198 && matches!(octets[1], 18 | 19))
+        }
+        std::net::IpAddr::V6(address) => {
+            let segments = address.segments();
+            address.is_unspecified()
+                || address.is_loopback()
+                || address.is_multicast()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || segments[0] == 0x2001 && segments[1] == 0x0db8
+        }
+    }
+}
+
+fn normalize_public_ip(value: &str) -> Result<std::net::IpAddr> {
+    let address = value.parse::<std::net::IpAddr>().map_err(|_| {
+        CliError::Input("security action target is not a valid IP address".to_owned())
+    })?;
+    if ip_is_protected(address) {
+        return Err(CliError::Input(
+            "security action refuses private, local, documentation, multicast, or reserved IP targets"
+                .to_owned(),
+        ));
+    }
+    Ok(address)
+}
+
+fn normalize_bounded_ipv4_prefix(value: &str) -> Result<(String, u32, u8)> {
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| CliError::Input("IP range targets require CIDR notation".to_owned()))?;
+    let address = address
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| CliError::Input("IP range target must be an IPv4 CIDR".to_owned()))?;
+    if ip_is_protected(std::net::IpAddr::V4(address)) {
+        return Err(CliError::Input(
+            "security action refuses private, local, documentation, multicast, or reserved IP ranges"
+                .to_owned(),
+        ));
+    }
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| CliError::Input("IP range prefix must be an integer".to_owned()))?;
+    if !(24..=32).contains(&prefix) {
+        return Err(CliError::Input(
+            "security action limits IPv4 ranges to /24 or narrower; broader prefixes require a separately reviewed WAF rule"
+                .to_owned(),
+        ));
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    let network = u32::from(address) & mask;
+    Ok((
+        format!("{}/{prefix}", std::net::Ipv4Addr::from(network)),
+        network,
+        prefix,
+    ))
+}
+
+type NormalizedSecurityTarget = (String, String, String, bool, Option<(u32, u8)>);
+type OperatorSecurityTarget = (String, String, Option<(u32, u8)>);
+type NormalizedListSecurityTarget = (Value, Value, String, bool, Option<OperatorSecurityTarget>);
+type NormalizedWafSecurityTarget = (String, Value, String, bool, Option<OperatorSecurityTarget>);
+
+fn normalize_security_target(target: &Map<String, Value>) -> Result<NormalizedSecurityTarget> {
+    let target_type = security_action_string(target, "type")?;
+    let value = security_action_string(target, "value")?;
+    match target_type {
+        "ip" => {
+            let address = normalize_public_ip(value)?;
+            let wire_type = if address.is_ipv4() { "ip" } else { "ip6" };
+            Ok((
+                wire_type.to_owned(),
+                address.to_string(),
+                "one exact public IP address".to_owned(),
+                false,
+                None,
+            ))
+        }
+        "ip_range" => {
+            let (value, network, prefix) = normalize_bounded_ipv4_prefix(value)?;
+            let addresses = 1_u64 << (32 - u32::from(prefix));
+            Ok((
+                "ip_range".to_owned(),
+                value,
+                format!("one IPv4 /{prefix} prefix ({addresses} addresses)"),
+                true,
+                Some((network, prefix)),
+            ))
+        }
+        "asn" => {
+            let numeric = value
+                .trim()
+                .trim_start_matches("AS")
+                .trim_start_matches("as")
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    CliError::Input("ASN target must be a positive AS number".to_owned())
+                })?;
+            Ok((
+                "asn".to_owned(),
+                format!("AS{numeric}"),
+                "all traffic attributed by Cloudflare to one ASN".to_owned(),
+                true,
+                None,
+            ))
+        }
+        "country" => {
+            let country = value.to_ascii_uppercase();
+            if country.len() != 2 || !country.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                return Err(CliError::Input(
+                    "country target must be a two-letter ISO country code".to_owned(),
+                ));
+            }
+            Ok((
+                "country".to_owned(),
+                country,
+                "all traffic classified by Cloudflare to one country".to_owned(),
+                true,
+                None,
+            ))
+        }
+        _ => Err(CliError::Input(
+            "security action target type must be `ip`, `ip_range`, `asn`, or `country`".to_owned(),
+        )),
+    }
+}
+
+fn validate_operator_not_targeted(
+    operator_ip: &str,
+    target_type: &str,
+    target_value: &str,
+    target_prefix: Option<(u32, u8)>,
+) -> Result<()> {
+    let operator = normalize_public_ip(operator_ip)?;
+    let self_targeted = match (target_type, operator) {
+        ("ip" | "ip6", address) => address.to_string() == target_value,
+        ("ip_range", std::net::IpAddr::V4(address)) => {
+            target_prefix.is_some_and(|(network, prefix)| {
+                let mask = u32::MAX << (32 - u32::from(prefix));
+                u32::from(address) & mask == network
+            })
+        }
+        _ => false,
+    };
+    if self_targeted {
+        return Err(CliError::Input(
+            "security action would directly target the declared operator IP; the plan was not created"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn security_expiry(
+    supplied: Option<&str>,
+    default_ttl_seconds: u64,
+    max_ttl_seconds: u64,
+) -> Result<(chrono::DateTime<Utc>, u64)> {
+    let now = Utc::now();
+    let expiry = supplied.map_or_else(
+        || {
+            i64::try_from(default_ttl_seconds)
+                .ok()
+                .map(|seconds| now + ChronoDuration::seconds(seconds))
+                .ok_or_else(|| CliError::Input("security action TTL is invalid".to_owned()))
+        },
+        |value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .map_err(|_| {
+                    CliError::Input("security action `expires_at` must be RFC3339".to_owned())
+                })
+        },
+    )?;
+    let ttl = (expiry - now).num_seconds();
+    if ttl < 300 {
+        return Err(CliError::Input(
+            "security action expiry must be at least five minutes in the future".to_owned(),
+        ));
+    }
+    let ttl = u64::try_from(ttl)
+        .map_err(|_| CliError::Input("security action expiry must be in the future".to_owned()))?;
+    if ttl > max_ttl_seconds {
+        return Err(CliError::Input(format!(
+            "security action expiry exceeds the governed maximum of {max_ttl_seconds} seconds"
+        )));
+    }
+    Ok((expiry, ttl))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the security-action normalizer keeps all scope, expiry, self-block, and audit invariants visible in one fail-closed review boundary"
+)]
+fn prepare_security_action_create(
+    capability: &CapabilityV1,
+    input: &mut CallInput,
+) -> Result<Value> {
+    let contract = capability
+        .security_action
+        .as_ref()
+        .ok_or_else(|| CliError::Input("security action contract is missing".to_owned()))?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| CliError::Input("security action body must be an object".to_owned()))?;
+    let actor = security_action_string(&body, "actor")?.to_owned();
+    let evidence_ref = security_action_string(&body, "evidence_ref")?.to_owned();
+    let reason = security_action_string(&body, "reason")?.trim().to_owned();
+    if reason.chars().any(char::is_control) {
+        return Err(CliError::Input(
+            "security action reason cannot contain control characters".to_owned(),
+        ));
+    }
+    let action = body
+        .get("action")
+        .and_then(Value::as_str)
+        .or(contract.default_action.as_deref())
+        .ok_or_else(|| CliError::Input("security action has no default action".to_owned()))?;
+    if !contract
+        .allowed_actions
+        .iter()
+        .any(|allowed| allowed == action)
+    {
+        return Err(CliError::Input(format!(
+            "security action `{action}` is outside the governed allowlist"
+        )));
+    }
+    let target = body
+        .get("target")
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("security action target must be an object".to_owned()))?;
+    let (target_type, target_value, blast_radius, broad, target_prefix) =
+        normalize_security_target(target)?;
+    let (expires_at, ttl_seconds) = security_expiry(
+        body.get("expires_at").and_then(Value::as_str),
+        contract.default_ttl_seconds,
+        contract.max_ttl_seconds,
+    )?;
+    if broad {
+        if body.get("confirm_broad_scope").and_then(Value::as_bool) != Some(true) {
+            return Err(CliError::Input(
+                "IP range, ASN, and country targets require `confirm_broad_scope: true` after reviewing the blast radius"
+                    .to_owned(),
+            ));
+        }
+        if action != "managed_challenge" || ttl_seconds > 3_600 {
+            return Err(CliError::Input(
+                "broad targets are limited to Managed Challenge for at most one hour; use a narrower target or a separately reviewed WAF design"
+                    .to_owned(),
+            ));
+        }
+    }
+    if action == "block" {
+        if body.get("confirm_block").and_then(Value::as_bool) != Some(true) {
+            return Err(CliError::Input(
+                "a block requires `confirm_block: true`; Managed Challenge is the default when confidence is incomplete"
+                    .to_owned(),
+            ));
+        }
+        let operator_ip = security_action_string(&body, "operator_ip")?;
+        validate_operator_not_targeted(operator_ip, &target_type, &target_value, target_prefix)?;
+        if ttl_seconds > 86_400 {
+            return Err(CliError::Input(
+                "blocks are limited to 24 hours; permanent blocks require a different explicitly escalated capability"
+                    .to_owned(),
+            ));
+        }
+    }
+    let expires_at = expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let notes = serde_json::to_string(&json!({
+        "cfctl_security_v1":{
+            "actor":actor,
+            "evidence_ref":evidence_ref,
+            "expires_at":expires_at,
+            "reason":reason,
+        }
+    }))?;
+    if notes.len() > 500 {
+        return Err(CliError::Input(
+            "security action audit note exceeds the Cloudflare-safe 500-byte bound".to_owned(),
+        ));
+    }
+    input.body = Some(json!({
+        "configuration":{"target":target_type,"value":target_value},
+        "mode":action,
+        "notes":notes,
+    }));
+    Ok(json!({
+        "schema_version":1,
+        "kind":"create_expiring",
+        "action":action,
+        "actor":actor,
+        "evidence_ref":evidence_ref,
+        "expires_at":expires_at,
+        "reason":reason,
+        "target":{"type":target_type,"value":target_value},
+        "blast_radius":blast_radius,
+        "ttl_seconds":ttl_seconds,
+        "managed_challenge_default":true,
+        "permanent_action":false,
+        "anonymous_identity_inferred":false,
+        "self_block_checked":action == "block",
+        "wire_note_hash":hash_value(&Value::String(notes))?,
+    }))
+}
+
+fn normalize_list_security_target(
+    target: &Map<String, Value>,
+) -> Result<NormalizedListSecurityTarget> {
+    let target_type = security_action_string(target, "type")?;
+    let raw = security_action_string(target, "value")?;
+    match target_type {
+        "ip" => {
+            let address = normalize_public_ip(raw)?;
+            let value = address.to_string();
+            Ok((
+                json!({"ip":value}),
+                json!({"type":"ip","value":value}),
+                "one exact public IP address".to_owned(),
+                false,
+                Some((
+                    if address.is_ipv4() { "ip" } else { "ip6" }.to_owned(),
+                    value,
+                    None,
+                )),
+            ))
+        }
+        "ip_range" => {
+            let (value, network, prefix) = normalize_bounded_ipv4_prefix(raw)?;
+            let addresses = 1_u64 << (32 - u32::from(prefix));
+            Ok((
+                json!({"ip":value}),
+                json!({"type":"ip_range","value":value}),
+                format!("one IPv4 /{prefix} prefix ({addresses} addresses)"),
+                true,
+                Some(("ip_range".to_owned(), value, Some((network, prefix)))),
+            ))
+        }
+        "asn" => {
+            let numeric = raw
+                .trim()
+                .trim_start_matches("AS")
+                .trim_start_matches("as")
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    CliError::Input("ASN target must be a positive AS number".to_owned())
+                })?;
+            Ok((
+                json!({"asn":numeric}),
+                json!({"type":"asn","value":format!("AS{numeric}")}),
+                "all traffic attributed by Cloudflare to one ASN".to_owned(),
+                true,
+                None,
+            ))
+        }
+        "hostname" => {
+            let hostname = match url::Host::parse(raw).map_err(|_| {
+                CliError::Input("hostname target must be one valid exact hostname".to_owned())
+            })? {
+                url::Host::Domain(hostname) => hostname.to_ascii_lowercase(),
+                _ => {
+                    return Err(CliError::Input(
+                        "hostname targets cannot be IP literals; use target type `ip`".to_owned(),
+                    ));
+                }
+            };
+            if hostname.len() > 253
+                || hostname.starts_with('.')
+                || hostname.ends_with('.')
+                || hostname.contains('*')
+            {
+                return Err(CliError::Input(
+                    "hostname target must be one normalized exact DNS hostname".to_owned(),
+                ));
+            }
+            Ok((
+                json!({"hostname":{"url_hostname":hostname}}),
+                json!({"type":"hostname","value":hostname}),
+                "all requests matching one exact hostname in every reviewed list consumer"
+                    .to_owned(),
+                false,
+                None,
+            ))
+        }
+        _ => Err(CliError::Input(
+            "List security target type must be `ip`, `ip_range`, `asn`, or `hostname`".to_owned(),
+        )),
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "list-backed enforcement requires one auditable boundary for consumer scope, target normalization, expiry, self-block, and receipt construction"
+)]
+fn prepare_list_security_action_create(
+    capability: &CapabilityV1,
+    input: &mut CallInput,
+) -> Result<Value> {
+    let contract = capability
+        .security_action
+        .as_ref()
+        .ok_or_else(|| CliError::Input("List security action contract is missing".to_owned()))?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| CliError::Input("List security action body must be an object".to_owned()))?;
+    let actor = security_action_string(&body, "actor")?.to_owned();
+    let evidence_ref = security_action_string(&body, "evidence_ref")?.to_owned();
+    let reason = security_action_string(&body, "reason")?.trim().to_owned();
+    if reason.chars().any(char::is_control) {
+        return Err(CliError::Input(
+            "List security action reason cannot contain control characters".to_owned(),
+        ));
+    }
+    if body.get("confirm_consumer_scope").and_then(Value::as_bool) != Some(true) {
+        return Err(CliError::Input(
+            "List membership can affect every referencing rule; review those consumers and set `confirm_consumer_scope: true`"
+                .to_owned(),
+        ));
+    }
+    let action = body
+        .get("action")
+        .and_then(Value::as_str)
+        .or(contract.default_action.as_deref())
+        .ok_or_else(|| CliError::Input("List security action has no default action".to_owned()))?;
+    if !contract
+        .allowed_actions
+        .iter()
+        .any(|allowed| allowed == action)
+    {
+        return Err(CliError::Input(format!(
+            "List consumer action `{action}` is outside the governed allowlist"
+        )));
+    }
+    let target = body
+        .get("target")
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("List security target must be an object".to_owned()))?;
+    let (wire_target, normalized_target, blast_radius, broad, operator_target) =
+        normalize_list_security_target(target)?;
+    let (expires_at, ttl_seconds) = security_expiry(
+        body.get("expires_at").and_then(Value::as_str),
+        contract.default_ttl_seconds,
+        contract.max_ttl_seconds,
+    )?;
+    if broad {
+        if body.get("confirm_broad_scope").and_then(Value::as_bool) != Some(true) {
+            return Err(CliError::Input(
+                "prefix and ASN List targets require `confirm_broad_scope: true` after reviewing every consumer"
+                    .to_owned(),
+            ));
+        }
+        if action != "managed_challenge" || ttl_seconds > 3_600 {
+            return Err(CliError::Input(
+                "broad List targets are limited to an expected Managed Challenge action for at most one hour"
+                    .to_owned(),
+            ));
+        }
+    }
+    if action == "block" {
+        if body.get("confirm_block").and_then(Value::as_bool) != Some(true) {
+            return Err(CliError::Input(
+                "an expected block consumer requires `confirm_block: true`; Managed Challenge is the default"
+                    .to_owned(),
+            ));
+        }
+        let Some((wire_type, target_value, prefix)) = operator_target.as_ref() else {
+            return Err(CliError::Input(
+                "governed List block use is limited to one exact public IP; prefixes, ASNs, and hostnames use Managed Challenge"
+                    .to_owned(),
+            ));
+        };
+        if wire_type == "ip_range" {
+            return Err(CliError::Input(
+                "governed List block use is limited to one exact public IP; prefixes use Managed Challenge"
+                    .to_owned(),
+            ));
+        }
+        let operator_ip = security_action_string(&body, "operator_ip")?;
+        validate_operator_not_targeted(operator_ip, wire_type, target_value, *prefix)?;
+        if ttl_seconds > 86_400 {
+            return Err(CliError::Input(
+                "List-backed blocks are limited to 24 hours; permanent blocks require separate escalation"
+                    .to_owned(),
+            ));
+        }
+    }
+    let expires_at = expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let target_hash = hash_value(&normalized_target)?;
+    let audit = json!({
+        "cfctl_list_security_v1":{
+            "actor":actor,
+            "evidence_ref":evidence_ref,
+            "expected_consumer_action":action,
+            "expires_at":expires_at,
+            "reason":reason,
+            "target_hash":target_hash,
+        }
+    });
+    let comment = serde_json::to_string(&audit)?;
+    if comment.len() > 500 {
+        return Err(CliError::Input(
+            "List security audit comment exceeds the Cloudflare-safe 500-byte bound".to_owned(),
+        ));
+    }
+    let mut wire = wire_target.as_object().cloned().ok_or_else(|| {
+        CliError::Input("normalized List target did not produce one wire item".to_owned())
+    })?;
+    wire.insert("comment".to_owned(), Value::String(comment.clone()));
+    input.body = Some(Value::Array(vec![Value::Object(wire)]));
+    Ok(json!({
+        "schema_version":1,
+        "kind":"add_expiring_list_member",
+        "actor":actor,
+        "evidence_ref":evidence_ref,
+        "expires_at":expires_at,
+        "reason":reason,
+        "target":normalized_target,
+        "target_hash":target_hash,
+        "expected_consumer_action":action,
+        "blast_radius":blast_radius,
+        "ttl_seconds":ttl_seconds,
+        "consumer_scope_confirmed":true,
+        "managed_challenge_default":true,
+        "permanent_action":false,
+        "anonymous_identity_inferred":false,
+        "self_block_checked":action == "block",
+        "wire_comment_hash":hash_value(&Value::String(comment))?,
+    }))
+}
+
+fn prepare_list_security_action_remove(input: &mut CallInput) -> Result<Value> {
+    let member_id = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("member_id"))
+        .and_then(Value::as_str)
+        .filter(|identity| identity.len() == 32)
+        .ok_or_else(|| {
+            CliError::Input(
+                "expired List member removal requires one 32-character member_id".to_owned(),
+            )
+        })?
+        .to_owned();
+    let mut receipt = prepare_security_action_remove(input, "remove_expired_list_member")?;
+    input.body = Some(json!({"items":[{"id":member_id}]}));
+    let receipt_object = receipt.as_object_mut().ok_or_else(|| {
+        CliError::Input("security action removal did not produce an object receipt".to_owned())
+    })?;
+    receipt_object.insert("member_id".to_owned(), Value::String(member_id));
+    Ok(receipt)
+}
+
+fn rule_string_literal(value: &str) -> Result<String> {
+    serde_json::to_string(value).map_err(CliError::from)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the closed WAF target matrix keeps every accepted target form and its blast-radius semantics together for auditability"
+)]
+fn normalize_waf_security_target(
+    target: &Map<String, Value>,
+) -> Result<NormalizedWafSecurityTarget> {
+    let target_type = security_action_string(target, "type")?;
+    let raw = security_action_string(target, "value")?;
+    match target_type {
+        "ip" => {
+            let address = normalize_public_ip(raw)?;
+            let value = address.to_string();
+            Ok((
+                format!("ip.src eq {value}"),
+                json!({"type":"ip","value":value}),
+                "one exact public IP address".to_owned(),
+                false,
+                Some((
+                    if address.is_ipv4() { "ip" } else { "ip6" }.to_owned(),
+                    value,
+                    None,
+                )),
+            ))
+        }
+        "ip_range" => {
+            let (value, network, prefix) = normalize_bounded_ipv4_prefix(raw)?;
+            let addresses = 1_u64 << (32 - u32::from(prefix));
+            Ok((
+                format!("ip.src in {{{value}}}"),
+                json!({"type":"ip_range","value":value}),
+                format!("one IPv4 /{prefix} prefix ({addresses} addresses)"),
+                true,
+                Some((
+                    "ip_range".to_owned(),
+                    value,
+                    Some((network, prefix)),
+                )),
+            ))
+        }
+        "asn" => {
+            let numeric = raw
+                .trim()
+                .trim_start_matches("AS")
+                .trim_start_matches("as")
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| CliError::Input("ASN target must be a positive AS number".to_owned()))?;
+            Ok((
+                format!("ip.src.asnum eq {numeric}"),
+                json!({"type":"asn","value":format!("AS{numeric}")}),
+                "all traffic attributed by Cloudflare to one ASN".to_owned(),
+                true,
+                None,
+            ))
+        }
+        "country" => {
+            let country = raw.to_ascii_uppercase();
+            if country.len() != 2 || !country.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                return Err(CliError::Input(
+                    "country target must be a two-letter ISO country code".to_owned(),
+                ));
+            }
+            Ok((
+                format!("ip.src.country eq {}", rule_string_literal(&country)?),
+                json!({"type":"country","value":country}),
+                "all traffic classified by Cloudflare to one country".to_owned(),
+                true,
+                None,
+            ))
+        }
+        "hostname" => {
+            let hostname = match url::Host::parse(raw).map_err(|_| {
+                CliError::Input("hostname target must be one valid exact hostname".to_owned())
+            })? {
+                url::Host::Domain(hostname) => hostname.to_ascii_lowercase(),
+                _ => {
+                    return Err(CliError::Input(
+                        "hostname targets cannot be IP literals; use target type `ip`".to_owned(),
+                    ));
+                }
+            };
+            if hostname.len() > 253 || hostname.starts_with('.') || hostname.ends_with('.') {
+                return Err(CliError::Input(
+                    "hostname target must be one normalized DNS hostname".to_owned(),
+                ));
+            }
+            Ok((
+                format!("http.host eq {}", rule_string_literal(&hostname)?),
+                json!({"type":"hostname","value":hostname}),
+                "all requests to one exact hostname in the selected zone".to_owned(),
+                false,
+                None,
+            ))
+        }
+        "path" => {
+            if !raw.starts_with('/')
+                || raw.len() > 2_048
+                || raw.chars().any(char::is_control)
+                || raw.contains('?')
+                || raw.contains('#')
+            {
+                return Err(CliError::Input(
+                    "path target must be one exact URI path beginning with `/`, without query, fragment, or control characters"
+                        .to_owned(),
+                ));
+            }
+            Ok((
+                format!("http.request.uri.path eq {}", rule_string_literal(raw)?),
+                json!({"type":"path","value":raw}),
+                "all requests to one exact path across the selected zone".to_owned(),
+                false,
+                None,
+            ))
+        }
+        "ja4" => {
+            let fingerprint = raw.to_ascii_lowercase();
+            if !(20..=64).contains(&fingerprint.len())
+                || !fingerprint
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            {
+                return Err(CliError::Input(
+                    "JA4 target must be a 20-64 character lowercase alphanumeric/underscore fingerprint"
+                        .to_owned(),
+                ));
+            }
+            Ok((
+                format!(
+                    "cf.bot_management.ja4 eq {}",
+                    rule_string_literal(&fingerprint)?
+                ),
+                json!({"type":"ja4","value":fingerprint}),
+                "all requests with one exact JA4 fingerprint; Cloudflare requires Enterprise Bot Management"
+                    .to_owned(),
+                false,
+                None,
+            ))
+        }
+        _ => Err(CliError::Input(
+            "WAF security target type must be `ip`, `ip_range`, `asn`, `country`, `hostname`, `path`, or `ja4`"
+                .to_owned(),
+        )),
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "WAF enforcement planning keeps evidence, target, action, scope, expiry, self-block, and escalation checks in one fail-closed review boundary"
+)]
+fn prepare_waf_security_action_create(
+    capability: &CapabilityV1,
+    input: &mut CallInput,
+) -> Result<Value> {
+    let contract = capability
+        .security_action
+        .as_ref()
+        .ok_or_else(|| CliError::Input("WAF security action contract is missing".to_owned()))?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| CliError::Input("WAF security action body must be an object".to_owned()))?;
+    let actor = security_action_string(&body, "actor")?.to_owned();
+    let evidence_ref = security_action_string(&body, "evidence_ref")?.to_owned();
+    let reason = security_action_string(&body, "reason")?.trim().to_owned();
+    if reason.chars().any(char::is_control) {
+        return Err(CliError::Input(
+            "security action reason cannot contain control characters".to_owned(),
+        ));
+    }
+    let action = body
+        .get("action")
+        .and_then(Value::as_str)
+        .or(contract.default_action.as_deref())
+        .ok_or_else(|| CliError::Input("WAF security action has no default action".to_owned()))?;
+    if !contract
+        .allowed_actions
+        .iter()
+        .any(|allowed| allowed == action)
+    {
+        return Err(CliError::Input(format!(
+            "WAF security action `{action}` is outside the governed allowlist"
+        )));
+    }
+    let target = body
+        .get("target")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input("WAF security action target must be an object".to_owned())
+        })?;
+    let (expression, normalized_target, blast_radius, broad, operator_target) =
+        normalize_waf_security_target(target)?;
+    let (expires_at, ttl_seconds) = security_expiry(
+        body.get("expires_at").and_then(Value::as_str),
+        contract.default_ttl_seconds,
+        contract.max_ttl_seconds,
+    )?;
+    if broad {
+        if body.get("confirm_broad_scope").and_then(Value::as_bool) != Some(true) {
+            return Err(CliError::Input(
+                "IP range, ASN, and country WAF targets require `confirm_broad_scope: true` after reviewing the blast radius"
+                    .to_owned(),
+            ));
+        }
+        if action != "managed_challenge" || ttl_seconds > 3_600 {
+            return Err(CliError::Input(
+                "broad WAF targets are limited to Managed Challenge for at most one hour"
+                    .to_owned(),
+            ));
+        }
+    }
+    if action == "block" {
+        if body.get("confirm_block").and_then(Value::as_bool) != Some(true) {
+            return Err(CliError::Input(
+                "a WAF block requires `confirm_block: true`; Managed Challenge is the default when confidence is incomplete"
+                    .to_owned(),
+            ));
+        }
+        let Some((wire_type, target_value, prefix)) = operator_target.as_ref() else {
+            return Err(CliError::Input(
+                "governed WAF block is limited to one exact public IP; hostname, path, fingerprint, ASN, country, and prefix blocks require a separately reviewed policy design"
+                    .to_owned(),
+            ));
+        };
+        if wire_type == "ip_range" {
+            return Err(CliError::Input(
+                "governed WAF block is limited to one exact public IP; prefixes use Managed Challenge"
+                    .to_owned(),
+            ));
+        }
+        let operator_ip = security_action_string(&body, "operator_ip")?;
+        validate_operator_not_targeted(operator_ip, wire_type, target_value, *prefix)?;
+        if ttl_seconds > 86_400 {
+            return Err(CliError::Input(
+                "WAF blocks are limited to 24 hours; permanent blocks require separate escalation"
+                    .to_owned(),
+            ));
+        }
+    }
+    if action == "skip"
+        && (body.get("confirm_skip").and_then(Value::as_bool) != Some(true)
+            || body.get("confirm_broad_scope").and_then(Value::as_bool) != Some(true)
+            || ttl_seconds > 3_600)
+    {
+        return Err(CliError::Input(
+                "skip requires `confirm_skip: true`, `confirm_broad_scope: true`, and an expiry within one hour; cfctl only skips the managed WAF phase"
+                    .to_owned(),
+            ));
+    }
+    if normalized_target.get("type").and_then(Value::as_str) == Some("ja4")
+        && body
+            .get("confirm_enterprise_bot_management")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(CliError::Input(
+            "JA4 targeting requires `confirm_enterprise_bot_management: true`; Cloudflare documents this field as Enterprise with Bot Management"
+                .to_owned(),
+        ));
+    }
+    let expires_at = expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let audit = json!({
+        "cfctl_security_v1":{
+            "actor":actor,
+            "evidence_ref":evidence_ref,
+            "expires_at":expires_at,
+            "reason":reason,
+            "target":normalized_target,
+        }
+    });
+    let description = serde_json::to_string(&audit)?;
+    if description.len() > 500 {
+        return Err(CliError::Input(
+            "WAF security action audit description exceeds the 500-byte governed bound".to_owned(),
+        ));
+    }
+    let correlation_hash = hash_value(&json!({
+        "action":action,
+        "actor":actor,
+        "evidence_ref":evidence_ref,
+        "expires_at":expires_at,
+        "reason":reason,
+        "target":normalized_target,
+    }))?;
+    let ref_suffix = correlation_hash
+        .strip_prefix("sha256:")
+        .and_then(|hash| hash.get(..24))
+        .ok_or_else(|| {
+            CliError::Input("WAF security action correlation hash is invalid".to_owned())
+        })?;
+    let reference = format!("cfctl_security_{ref_suffix}");
+    let mut wire = serde_json::Map::from_iter([
+        ("action".to_owned(), Value::String(action.to_owned())),
+        ("description".to_owned(), Value::String(description.clone())),
+        ("enabled".to_owned(), Value::Bool(true)),
+        ("expression".to_owned(), Value::String(expression.clone())),
+        ("ref".to_owned(), Value::String(reference.clone())),
+    ]);
+    if action == "skip" {
+        wire.insert(
+            "action_parameters".to_owned(),
+            json!({"phases":["http_request_firewall_managed"]}),
+        );
+    }
+    input.body = Some(Value::Object(wire));
+    Ok(json!({
+        "schema_version":1,
+        "kind":"create_expiring_waf",
+        "action":action,
+        "actor":actor,
+        "evidence_ref":evidence_ref,
+        "expires_at":expires_at,
+        "reason":reason,
+        "target":normalized_target,
+        "expression":expression,
+        "correlation_ref":reference,
+        "blast_radius":blast_radius,
+        "ttl_seconds":ttl_seconds,
+        "managed_challenge_default":true,
+        "permanent_action":false,
+        "anonymous_identity_inferred":false,
+        "self_block_checked":action == "block",
+        "skip_scope":(action == "skip").then_some("http_request_firewall_managed"),
+        "wire_description_hash":hash_value(&Value::String(description))?,
+    }))
+}
+
+fn prepare_security_action_remove(input: &mut CallInput, kind: &str) -> Result<Value> {
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| {
+            CliError::Input("expired-action removal body must be an object".to_owned())
+        })?;
+    let actor = security_action_string(&body, "actor")?.to_owned();
+    let evidence_ref = security_action_string(&body, "evidence_ref")?.to_owned();
+    let expires_at = security_action_string(&body, "expires_at")?.to_owned();
+    let reason = security_action_string(&body, "reason")?.trim().to_owned();
+    let source_operation_id = security_action_string(&body, "source_operation_id")?.to_owned();
+    let expiry = chrono::DateTime::parse_from_rfc3339(&expires_at)
+        .map_err(|_| CliError::Input("removal `expires_at` must be RFC3339".to_owned()))?
+        .with_timezone(&Utc);
+    if expiry > Utc::now() {
+        return Err(CliError::Input(
+            "the security action has not reached its removal deadline; use the source operation's exact rollback only when early removal is intentionally required"
+                .to_owned(),
+        ));
+    }
+    input.body = None;
+    Ok(json!({
+        "schema_version":1,
+        "kind":kind,
+        "actor":actor,
+        "evidence_ref":evidence_ref,
+        "expires_at":expiry.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "reason":reason,
+        "source_operation_id":source_operation_id,
+        "anonymous_identity_inferred":false,
+    }))
+}
+
+fn prepare_security_action_input(
+    capability: &CapabilityV1,
+    input: &mut CallInput,
+) -> Result<Option<Value>> {
+    let Some(contract) = capability.security_action.as_ref() else {
+        return Ok(None);
+    };
+    validate_security_action_governance_input(capability, input)?;
+    let receipt = match (capability.id.as_str(), contract.kind) {
+        (SECURITY_IP_RULE_CREATE_ID, SecurityActionKindV1::CreateExpiring) => {
+            prepare_security_action_create(capability, input)?
+        }
+        (SECURITY_IP_RULE_REMOVE_ID, SecurityActionKindV1::RemoveExpired) => {
+            prepare_security_action_remove(input, "remove_expired")?
+        }
+        (SECURITY_WAF_RULE_CREATE_ID, SecurityActionKindV1::CreateExpiring) => {
+            prepare_waf_security_action_create(capability, input)?
+        }
+        (SECURITY_WAF_RULE_REMOVE_ID, SecurityActionKindV1::RemoveExpired) => {
+            prepare_security_action_remove(input, "remove_expired_waf")?
+        }
+        (SECURITY_LIST_MEMBER_CREATE_ID, SecurityActionKindV1::AddExpiringListMember) => {
+            prepare_list_security_action_create(capability, input)?
+        }
+        (SECURITY_LIST_MEMBER_REMOVE_ID, SecurityActionKindV1::RemoveExpiredListMember) => {
+            prepare_list_security_action_remove(input)?
+        }
+        _ => {
+            return Err(CliError::Input(
+                "security action renderer is not implemented for this exact capability identity"
+                    .to_owned(),
+            ));
+        }
+    };
+    Ok(Some(receipt))
+}
+
+fn security_action_adapter_target(adapter_targets: &Value) -> Option<&Value> {
+    adapter_targets
+        .get("security_action")
+        .filter(|value| value.is_object())
+}
+
+fn should_bind_security_action_state(capability: &CapabilityV1, adapter_targets: &Value) -> bool {
+    capability.security_action_contract_supported()
+        && matches!(
+            capability.id.as_str(),
+            SECURITY_IP_RULE_CREATE_ID
+                | SECURITY_IP_RULE_REMOVE_ID
+                | SECURITY_WAF_RULE_CREATE_ID
+                | SECURITY_WAF_RULE_REMOVE_ID
+                | SECURITY_LIST_MEMBER_CREATE_ID
+                | SECURITY_LIST_MEMBER_REMOVE_ID
+        )
+        && security_action_adapter_target(adapter_targets).is_some()
+}
+
+fn security_collection_complete(response: &CloudflareResponseV1) -> bool {
+    response.result_info.as_ref().is_some_and(|result_info| {
+        let page = result_info.get("page").and_then(Value::as_u64);
+        let total_pages = result_info.get("total_pages").and_then(Value::as_u64);
+        (page.is_some() && page == total_pages)
+            || result_info
+                .get("cfctl_cursor_complete")
+                .and_then(Value::as_bool)
+                == Some(true)
+    })
+}
+
+fn security_rule_planned_body(plan: &PlanV1) -> Result<Value> {
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    input.body.ok_or_else(|| {
+        CliError::Input(
+            "source security action plan omitted its exact Cloudflare rule body".to_owned(),
+        )
+    })
+}
+
+fn validate_security_action_removal_source(
+    store: &StateStore,
+    metadata: &Value,
+    zone_id: &str,
+    rule_id: &str,
+) -> Result<Value> {
+    let operation_id = metadata
+        .get("source_operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("expired-action removal omitted its source operation ID".to_owned())
+        })?;
+    let plan = load_validated_plan(store, operation_id)?;
+    if plan.status != PlanStatus::Verified
+        || plan.capability.id != SECURITY_IP_RULE_CREATE_ID
+        || plan
+            .targets
+            .pointer("/selectors/zone_id")
+            .and_then(Value::as_str)
+            != Some(zone_id)
+        || plan
+            .targets
+            .pointer("/adapter/security_action/evidence_ref")
+            .and_then(Value::as_str)
+            != metadata.get("evidence_ref").and_then(Value::as_str)
+        || plan
+            .targets
+            .pointer("/adapter/security_action/expires_at")
+            .and_then(Value::as_str)
+            != metadata.get("expires_at").and_then(Value::as_str)
+    {
+        return Err(CliError::Input(
+            "expired-action removal is not bound to a verified source security-action plan with the same zone, evidence, and deadline"
+                .to_owned(),
+        ));
+    }
+    let boundary_rule_id = plan
+        .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+        .and_then(|artifact| artifact.get("resource_id"))
+        .and_then(Value::as_str);
+    if boundary_rule_id != Some(rule_id) {
+        return Err(CliError::Input(
+            "expired-action rule ID does not match the hash-bound identity returned by its source plan"
+                .to_owned(),
+        ));
+    }
+    security_rule_planned_body(&plan)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "IP access-rule verification deliberately captures current state, audit lineage, expiry, conflicts, and removal guidance in one receipt"
+)]
+fn security_action_state_receipt(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    adapter_targets: &Value,
+    account_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the security-action current-state read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    if !security_collection_complete(response) {
+        return Err(CliError::Input(
+            "security-action current-state read did not prove complete pagination; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    let rules = response.result.as_array().ok_or_else(|| {
+        CliError::Input(
+            "security-action current-state read did not return a rule collection".to_owned(),
+        )
+    })?;
+    let metadata = security_action_adapter_target(adapter_targets).ok_or_else(|| {
+        CliError::Input("security-action governance receipt is missing".to_owned())
+    })?;
+    let zone_id = input
+        .selectors
+        .get("zone_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Input("security action requires `zone_id`".to_owned()))?;
+    let kind = metadata
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("security-action governance receipt omitted its kind".to_owned())
+        })?;
+    let state = match kind {
+        "create_expiring" => {
+            let target = metadata.get("target").ok_or_else(|| {
+                CliError::Input("security-action governance receipt omitted its target".to_owned())
+            })?;
+            let conflicts = rules
+                .iter()
+                .filter(|rule| rule.get("configuration") == Some(target))
+                .map(|rule| {
+                    json!({
+                        "id":rule.get("id").cloned().unwrap_or(Value::Null),
+                        "mode":rule.get("mode").cloned().unwrap_or(Value::Null),
+                        "notes_hash":rule.get("notes").map(hash_value).transpose().unwrap_or(None),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !conflicts.is_empty() {
+                return Err(CliError::Input(format!(
+                    "security action target already has {} matching rule(s); inspect and resolve the duplicate or conflict before creating another action",
+                    conflicts.len()
+                )));
+            }
+            json!({
+                "matching_rule_count":0,
+                "target":target,
+                "action":metadata.get("action").cloned().unwrap_or(Value::Null),
+            })
+        }
+        "remove_expired" => {
+            let rule_id = input
+                .selectors
+                .get("rule_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    CliError::Input("expired-action removal requires `rule_id`".to_owned())
+                })?;
+            let planned_rule =
+                validate_security_action_removal_source(store, metadata, zone_id, rule_id)?;
+            let matching = rules
+                .iter()
+                .filter(|rule| rule.get("id").and_then(Value::as_str) == Some(rule_id))
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                return Err(CliError::Input(format!(
+                    "expired-action removal requires exactly one live rule with the source identity; found {}",
+                    matching.len()
+                )));
+            }
+            let live_projection = json!({
+                "configuration":matching[0].get("configuration").cloned().unwrap_or(Value::Null),
+                "mode":matching[0].get("mode").cloned().unwrap_or(Value::Null),
+                "notes":matching[0].get("notes").cloned().unwrap_or(Value::Null),
+            });
+            if live_projection != planned_rule {
+                return Err(CliError::Input(
+                    "expired security rule drifted from the exact body verified by its source operation; inspect it before removal"
+                        .to_owned(),
+                ));
+            }
+            json!({
+                "matching_rule_count":1,
+                "rule_id":rule_id,
+                "live_rule_hash":hash_value(&live_projection)?,
+                "source_operation_id":metadata.get("source_operation_id").cloned().unwrap_or(Value::Null),
+            })
+        }
+        _ => {
+            return Err(CliError::Input(
+                "security-action governance receipt has an unsupported kind".to_owned(),
+            ));
+        }
+    };
+    Ok(json!({
+        "schema_version":1,
+        "source_capability_id":SECURITY_IP_RULE_STATE_CAPABILITY_ID,
+        "source_path":SECURITY_IP_RULE_COLLECTION_PATH,
+        "target_capability_id":capability.id,
+        "target_method":capability.method,
+        "target_path":capability.path,
+        "account_id":account_id,
+        "zone_id":zone_id,
+        "kind":kind,
+        "evidence_ref":metadata.get("evidence_ref").cloned().unwrap_or(Value::Null),
+        "expires_at":metadata.get("expires_at").cloned().unwrap_or(Value::Null),
+        "state":state,
+    }))
+}
+
+fn validate_waf_security_action_removal_source(
+    store: &StateStore,
+    metadata: &Value,
+    zone_id: &str,
+    ruleset_id: &str,
+    rule_id: &str,
+) -> Result<Value> {
+    let operation_id = metadata
+        .get("source_operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("expired WAF action omitted its source operation ID".to_owned())
+        })?;
+    let plan = load_validated_plan(store, operation_id)?;
+    if plan.status != PlanStatus::Verified
+        || plan.capability.id != SECURITY_WAF_RULE_CREATE_ID
+        || plan
+            .targets
+            .pointer("/selectors/zone_id")
+            .and_then(Value::as_str)
+            != Some(zone_id)
+        || plan
+            .targets
+            .pointer("/selectors/ruleset_id")
+            .and_then(Value::as_str)
+            != Some(ruleset_id)
+        || plan
+            .targets
+            .pointer("/adapter/security_action/evidence_ref")
+            .and_then(Value::as_str)
+            != metadata.get("evidence_ref").and_then(Value::as_str)
+        || plan
+            .targets
+            .pointer("/adapter/security_action/expires_at")
+            .and_then(Value::as_str)
+            != metadata.get("expires_at").and_then(Value::as_str)
+    {
+        return Err(CliError::Input(
+            "expired WAF removal is not bound to a verified source security-action plan with the same zone, ruleset, evidence, and deadline"
+                .to_owned(),
+        ));
+    }
+    let boundary_rule_id = plan
+        .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+        .and_then(|artifact| artifact.get("resource_id"))
+        .and_then(Value::as_str);
+    if boundary_rule_id != Some(rule_id) {
+        return Err(CliError::Input(
+            "expired WAF rule ID does not match the correlated identity in its source plan receipt"
+                .to_owned(),
+        ));
+    }
+    security_rule_planned_body(&plan)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "WAF verification deliberately binds ruleset state, normalized target, audit lineage, expiry, conflicts, and rollback guidance in one receipt"
+)]
+fn waf_security_action_state_receipt(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    adapter_targets: &Value,
+    account_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || response.status != 200 {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the WAF current-state read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    let rules = response
+        .result
+        .get("rules")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliError::Input(
+                "WAF current-state read did not return the complete ruleset rule array".to_owned(),
+            )
+        })?;
+    let metadata = security_action_adapter_target(adapter_targets).ok_or_else(|| {
+        CliError::Input("WAF security-action governance receipt is missing".to_owned())
+    })?;
+    let zone_id = input
+        .selectors
+        .get("zone_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Input("WAF security action requires `zone_id`".to_owned()))?;
+    let ruleset_id = input
+        .selectors
+        .get("ruleset_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Input("WAF security action requires `ruleset_id`".to_owned()))?;
+    let kind = metadata
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("WAF security-action governance receipt omitted its kind".to_owned())
+        })?;
+    let state = match kind {
+        "create_expiring_waf" => {
+            let correlation = metadata
+                .get("correlation_ref")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "WAF security-action receipt omitted its correlation reference".to_owned(),
+                    )
+                })?;
+            let expression = metadata
+                .get("expression")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "WAF security-action receipt omitted its compiled expression".to_owned(),
+                    )
+                })?;
+            let conflicts = rules
+                .iter()
+                .filter(|rule| {
+                    rule.get("ref").and_then(Value::as_str) == Some(correlation)
+                        || rule.get("expression").and_then(Value::as_str) == Some(expression)
+                })
+                .map(|rule| {
+                    json!({
+                        "id":rule.get("id").cloned().unwrap_or(Value::Null),
+                        "action":rule.get("action").cloned().unwrap_or(Value::Null),
+                        "ref":rule.get("ref").cloned().unwrap_or(Value::Null),
+                        "expression_hash":rule.get("expression").map(hash_value).transpose().unwrap_or(None),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !conflicts.is_empty() {
+                return Err(CliError::Input(format!(
+                    "WAF target already has {} correlated or expression-equivalent rule(s); inspect and resolve the duplicate or conflict before creating another action",
+                    conflicts.len()
+                )));
+            }
+            json!({
+                "matching_rule_count":0,
+                "correlation_ref":correlation,
+                "expression_hash":hash_value(&Value::String(expression.to_owned()))?,
+                "action":metadata.get("action").cloned().unwrap_or(Value::Null),
+                "ruleset_rule_count":rules.len(),
+            })
+        }
+        "remove_expired_waf" => {
+            let rule_id = input
+                .selectors
+                .get("rule_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    CliError::Input("expired WAF removal requires `rule_id`".to_owned())
+                })?;
+            let planned_rule = validate_waf_security_action_removal_source(
+                store, metadata, zone_id, ruleset_id, rule_id,
+            )?;
+            let matching = rules
+                .iter()
+                .filter(|rule| rule.get("id").and_then(Value::as_str) == Some(rule_id))
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                return Err(CliError::Input(format!(
+                    "expired WAF removal requires exactly one live rule with the source identity; found {}",
+                    matching.len()
+                )));
+            }
+            let planned = planned_rule.as_object().ok_or_else(|| {
+                CliError::Input("verified source WAF body is not an object".to_owned())
+            })?;
+            let live_projection = Value::Object(
+                planned
+                    .keys()
+                    .map(|key| {
+                        (
+                            key.clone(),
+                            matching[0].get(key).cloned().unwrap_or(Value::Null),
+                        )
+                    })
+                    .collect(),
+            );
+            if live_projection != planned_rule {
+                return Err(CliError::Input(
+                    "expired WAF rule drifted from the exact body verified by its source operation; inspect it before removal"
+                        .to_owned(),
+                ));
+            }
+            json!({
+                "matching_rule_count":1,
+                "rule_id":rule_id,
+                "live_rule_hash":hash_value(&live_projection)?,
+                "source_operation_id":metadata.get("source_operation_id").cloned().unwrap_or(Value::Null),
+            })
+        }
+        _ => {
+            return Err(CliError::Input(
+                "WAF security-action governance receipt has an unsupported kind".to_owned(),
+            ));
+        }
+    };
+    Ok(json!({
+        "schema_version":1,
+        "source_capability_id":SECURITY_WAF_RULE_STATE_CAPABILITY_ID,
+        "source_path":SECURITY_WAF_RULE_PARENT_PATH,
+        "target_capability_id":capability.id,
+        "target_method":capability.method,
+        "target_path":capability.path,
+        "account_id":account_id,
+        "zone_id":zone_id,
+        "ruleset_id":ruleset_id,
+        "kind":kind,
+        "evidence_ref":metadata.get("evidence_ref").cloned().unwrap_or(Value::Null),
+        "expires_at":metadata.get("expires_at").cloned().unwrap_or(Value::Null),
+        "state":state,
+    }))
+}
+
+fn list_item_target_projection(item: &Value) -> Option<Value> {
+    let mut targets = Vec::new();
+    if let Some(ip) = item.get("ip").and_then(Value::as_str) {
+        targets.push(json!({"ip":ip}));
+    }
+    if let Some(asn) = item.get("asn").and_then(Value::as_u64) {
+        targets.push(json!({"asn":asn}));
+    }
+    if let Some(hostname) = item
+        .pointer("/hostname/url_hostname")
+        .and_then(Value::as_str)
+    {
+        targets.push(json!({"hostname":{"url_hostname":hostname}}));
+    }
+    (targets.len() == 1).then(|| targets.remove(0))
+}
+
+fn list_item_verification_projection(item: &Value) -> Option<Value> {
+    let comment = item
+        .get("comment")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    let mut projection = list_item_target_projection(item)?.as_object()?.clone();
+    projection.insert("comment".to_owned(), Value::String(comment.to_owned()));
+    Some(Value::Object(projection))
+}
+
+fn validated_list_member_removal_source(
+    store: &StateStore,
+    metadata: &Value,
+    account_id: &str,
+    list_id: &str,
+    member_id: &str,
+) -> Result<Value> {
+    let operation_id = metadata
+        .get("source_operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "expired List member removal omitted its source operation ID".to_owned(),
+            )
+        })?;
+    let plan = load_validated_plan(store, operation_id)?;
+    let verification_passed = plan
+        .transaction_artifact(TransactionStageV1::VerificationResponsePersisted)
+        .and_then(|artifact| artifact.get("state"))
+        .and_then(Value::as_str)
+        == Some("passed");
+    if !(plan.status == PlanStatus::Verified
+        || (plan.status == PlanStatus::RectificationRequired && verification_passed))
+        || plan.capability.id != SECURITY_LIST_MEMBER_CREATE_ID
+        || plan
+            .targets
+            .pointer("/selectors/account_id")
+            .and_then(Value::as_str)
+            != Some(account_id)
+        || plan
+            .targets
+            .pointer("/selectors/list_id")
+            .and_then(Value::as_str)
+            != Some(list_id)
+        || plan
+            .targets
+            .pointer("/adapter/security_action/evidence_ref")
+            .and_then(Value::as_str)
+            != metadata.get("evidence_ref").and_then(Value::as_str)
+        || plan
+            .targets
+            .pointer("/adapter/security_action/expires_at")
+            .and_then(Value::as_str)
+            != metadata.get("expires_at").and_then(Value::as_str)
+    {
+        return Err(CliError::Input(
+            "expired List member removal is not bound to a verified source add with the same account, list, evidence, and deadline"
+                .to_owned(),
+        ));
+    }
+    let verified_member_id = plan
+        .transaction_artifact(TransactionStageV1::VerificationResponsePersisted)
+        .and_then(|artifact| artifact.get("resource_id"))
+        .and_then(Value::as_str);
+    if verified_member_id != Some(member_id) {
+        return Err(CliError::Input(
+            "List member ID does not match the correlated identity in the source verification receipt"
+                .to_owned(),
+        ));
+    }
+    let source_input: CallInput = serde_json::from_value(plan.input.clone())?;
+    source_input
+        .body
+        .as_ref()
+        .and_then(Value::as_array)
+        .filter(|items| items.len() == 1)
+        .and_then(|items| items.first())
+        .and_then(list_item_verification_projection)
+        .ok_or_else(|| {
+            CliError::Input(
+                "verified source List plan omitted its exact one-member wire projection".to_owned(),
+            )
+        })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "list-member verification deliberately binds list and member state, consumer scope, expiry, duplicate detection, and removal guidance"
+)]
+fn list_security_action_state_receipt(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    adapter_targets: &Value,
+    account_id: &str,
+    metadata_response: &CloudflareResponseV1,
+    items_response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !metadata_response.success || metadata_response.status != 200 {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the List metadata read with HTTP {}; the mutation boundary was not crossed",
+            metadata_response.status
+        )));
+    }
+    if !items_response.success || items_response.status != 200 {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the List member read with HTTP {}; the mutation boundary was not crossed",
+            items_response.status
+        )));
+    }
+    if !security_collection_complete(items_response) {
+        return Err(CliError::Input(
+            "List member current-state read did not prove complete cursor pagination; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    let list_kind = metadata_response
+        .result
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|kind| matches!(*kind, "ip" | "asn" | "hostname"))
+        .ok_or_else(|| {
+            CliError::Input(
+                "List metadata did not report one governed IP, ASN, or hostname kind".to_owned(),
+            )
+        })?;
+    let items = items_response.result.as_array().ok_or_else(|| {
+        CliError::Input("List member current-state read did not return an item array".to_owned())
+    })?;
+    let metadata = security_action_adapter_target(adapter_targets).ok_or_else(|| {
+        CliError::Input("List security-action governance receipt is missing".to_owned())
+    })?;
+    let list_id = input
+        .selectors
+        .get("list_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Input("List security action requires `list_id`".to_owned()))?;
+    let kind = metadata
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("List security-action receipt omitted its kind".to_owned())
+        })?;
+    let state = match kind {
+        "add_expiring_list_member" => {
+            let planned = input
+                .body
+                .as_ref()
+                .and_then(Value::as_array)
+                .filter(|items| items.len() == 1)
+                .and_then(|items| items.first())
+                .ok_or_else(|| {
+                    CliError::Input("List add plan does not contain one wire item".to_owned())
+                })?;
+            let target = metadata.get("target").ok_or_else(|| {
+                CliError::Input("List security-action receipt omitted its target".to_owned())
+            })?;
+            let expected_kind = match target.get("type").and_then(Value::as_str) {
+                Some("ip" | "ip_range") => "ip",
+                Some("asn") => "asn",
+                Some("hostname") => "hostname",
+                _ => {
+                    return Err(CliError::Input(
+                        "List security target type is outside the governed kind mapping".to_owned(),
+                    ));
+                }
+            };
+            if list_kind != expected_kind {
+                return Err(CliError::Input(format!(
+                    "target type requires a `{expected_kind}` List, but the selected List reports kind `{list_kind}`"
+                )));
+            }
+            let planned_target = list_item_target_projection(planned).ok_or_else(|| {
+                CliError::Input("List add plan has no exact target projection".to_owned())
+            })?;
+            let planned_comment = planned.get("comment").and_then(Value::as_str);
+            let conflicts = items
+                .iter()
+                .filter(|item| {
+                    list_item_target_projection(item).as_ref() == Some(&planned_target)
+                        || (planned_comment.is_some()
+                            && item.get("comment").and_then(Value::as_str) == planned_comment)
+                })
+                .count();
+            if conflicts != 0 {
+                return Err(CliError::Input(format!(
+                    "selected List already has {conflicts} target-equivalent or correlation-equivalent member(s); resolve the duplicate before adding another"
+                )));
+            }
+            json!({
+                "matching_member_count":0,
+                "target_hash":hash_value(&planned_target)?,
+                "expected_consumer_action":metadata.get("expected_consumer_action").cloned().unwrap_or(Value::Null),
+                "consumer_scope_confirmed":metadata.get("consumer_scope_confirmed").cloned().unwrap_or(Value::Null),
+            })
+        }
+        "remove_expired_list_member" => {
+            let member_id = metadata
+                .get("member_id")
+                .and_then(Value::as_str)
+                .filter(|identity| !identity.is_empty())
+                .ok_or_else(|| {
+                    CliError::Input("expired List removal omitted its member identity".to_owned())
+                })?;
+            let planned = validated_list_member_removal_source(
+                store, metadata, account_id, list_id, member_id,
+            )?;
+            let matching = items
+                .iter()
+                .filter(|item| item.get("id").and_then(Value::as_str) == Some(member_id))
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                return Err(CliError::Input(format!(
+                    "expired List removal requires exactly one live member with the source identity; found {}",
+                    matching.len()
+                )));
+            }
+            let live = list_item_verification_projection(matching[0]).ok_or_else(|| {
+                CliError::Input("live List member has an invalid target/comment shape".to_owned())
+            })?;
+            if live != planned {
+                return Err(CliError::Input(
+                    "expired List member drifted from the exact target and audit comment verified by its source operation"
+                        .to_owned(),
+                ));
+            }
+            json!({
+                "matching_member_count":1,
+                "member_id":member_id,
+                "live_member_hash":hash_value(&live)?,
+                "source_operation_id":metadata.get("source_operation_id").cloned().unwrap_or(Value::Null),
+            })
+        }
+        _ => {
+            return Err(CliError::Input(
+                "List security-action receipt has an unsupported kind".to_owned(),
+            ));
+        }
+    };
+    Ok(json!({
+        "schema_version":1,
+        "source_capability_ids":[SECURITY_LIST_METADATA_CAPABILITY_ID,SECURITY_LIST_MEMBER_STATE_CAPABILITY_ID],
+        "source_paths":[SECURITY_LIST_METADATA_PATH,SECURITY_LIST_MEMBER_COLLECTION_PATH],
+        "target_capability_id":capability.id,
+        "target_method":capability.method,
+        "target_path":capability.path,
+        "account_id":account_id,
+        "list_id":list_id,
+        "list_kind":list_kind,
+        "list_item_count":items.len(),
+        "kind":kind,
+        "evidence_ref":metadata.get("evidence_ref").cloned().unwrap_or(Value::Null),
+        "expires_at":metadata.get("expires_at").cloned().unwrap_or(Value::Null),
+        "state":state,
+        "redaction":"raw List target values and audit comments are represented only by hashes",
+    }))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "security-action current-state reads form one fail-closed dispatcher whose branches produce the evidence bound into immutable plans"
+)]
+async fn read_live_security_action_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    adapter_targets: &Value,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !should_bind_security_action_state(capability, adapter_targets) {
+        return Err(CliError::Input(
+            "security action drifted from its governed current-state contract".to_owned(),
+        ));
+    }
+    if matches!(
+        capability.id.as_str(),
+        SECURITY_LIST_MEMBER_CREATE_ID | SECURITY_LIST_MEMBER_REMOVE_ID
+    ) {
+        let metadata_source = catalog
+            .get(SECURITY_LIST_METADATA_CAPABILITY_ID)
+            .ok_or_else(|| capability_missing(SECURITY_LIST_METADATA_CAPABILITY_ID))?;
+        let items_source = catalog
+            .get(SECURITY_LIST_MEMBER_STATE_CAPABILITY_ID)
+            .ok_or_else(|| capability_missing(SECURITY_LIST_MEMBER_STATE_CAPABILITY_ID))?;
+        if metadata_source.method != "GET"
+            || metadata_source.path != SECURITY_LIST_METADATA_PATH
+            || metadata_source.mutating
+            || items_source.method != "GET"
+            || items_source.path != SECURITY_LIST_MEMBER_COLLECTION_PATH
+            || items_source.mutating
+            || !matches!(
+                metadata_source.adapter_status,
+                AdapterStatus::Native | AdapterStatus::DynamicApi
+            )
+            || !matches!(
+                items_source.adapter_status,
+                AdapterStatus::Native | AdapterStatus::DynamicApi
+            )
+        {
+            return Err(CliError::Input(
+                "List security-action state sources drifted from the governed metadata plus complete-member reads"
+                    .to_owned(),
+            ));
+        }
+        let selectors = json!({
+            "account_id":input.selectors.get("account_id").cloned().unwrap_or(Value::Null),
+            "list_id":input.selectors.get("list_id").cloned().unwrap_or(Value::Null),
+        });
+        let executor = Executor::new(http_client()?, API_BASE_URL)?;
+        let metadata_response = executor
+            .execute_read(
+                metadata_source,
+                &CallInput {
+                    selectors: selectors.clone(),
+                    query: json!({}),
+                    body: None,
+                    ..CallInput::default()
+                },
+                credential,
+            )
+            .await?;
+        let items_response = executor
+            .execute_read(
+                items_source,
+                &CallInput {
+                    selectors,
+                    query: json!({"per_page":500}),
+                    body: None,
+                    ..CallInput::default()
+                },
+                credential,
+            )
+            .await?;
+        let receipt = list_security_action_state_receipt(
+            store,
+            capability,
+            input,
+            adapter_targets,
+            account_id,
+            &metadata_response,
+            &items_response,
+        )?;
+        let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+        return Ok((receipt, evidence));
+    }
+    if matches!(
+        capability.id.as_str(),
+        SECURITY_WAF_RULE_CREATE_ID | SECURITY_WAF_RULE_REMOVE_ID
+    ) {
+        let source = catalog
+            .get(SECURITY_WAF_RULE_STATE_CAPABILITY_ID)
+            .ok_or_else(|| capability_missing(SECURITY_WAF_RULE_STATE_CAPABILITY_ID))?;
+        if source.method != "GET"
+            || source.path != SECURITY_WAF_RULE_PARENT_PATH
+            || source.mutating
+            || !matches!(
+                source.adapter_status,
+                AdapterStatus::Native | AdapterStatus::DynamicApi
+            )
+        {
+            return Err(CliError::Input(
+                "WAF state source capability drifted from the governed exact-ruleset read"
+                    .to_owned(),
+            ));
+        }
+        let response = Executor::new(http_client()?, API_BASE_URL)?
+            .execute_read(
+                source,
+                &CallInput {
+                    selectors: json!({
+                        "zone_id":input.selectors.get("zone_id").cloned().unwrap_or(Value::Null),
+                        "ruleset_id":input.selectors.get("ruleset_id").cloned().unwrap_or(Value::Null),
+                    }),
+                    query: json!({}),
+                    body: None,
+                    ..CallInput::default()
+                },
+                credential,
+            )
+            .await?;
+        let receipt = waf_security_action_state_receipt(
+            store,
+            capability,
+            input,
+            adapter_targets,
+            account_id,
+            &response,
+        )?;
+        let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+        return Ok((receipt, evidence));
+    }
+    let source = catalog
+        .get(SECURITY_IP_RULE_STATE_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(SECURITY_IP_RULE_STATE_CAPABILITY_ID))?;
+    if source.method != "GET"
+        || source.path != SECURITY_IP_RULE_COLLECTION_PATH
+        || source.mutating
+        || !matches!(
+            source.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+    {
+        return Err(CliError::Input(
+            "security-action state source capability drifted from the governed complete rule-list read"
+                .to_owned(),
+        ));
+    }
+    let metadata = security_action_adapter_target(adapter_targets).ok_or_else(|| {
+        CliError::Input("security-action governance receipt is missing".to_owned())
+    })?;
+    let query = match metadata.get("kind").and_then(Value::as_str) {
+        Some("create_expiring") => json!({
+            "configuration.value":metadata.pointer("/target/value").cloned().unwrap_or(Value::Null),
+            "match":"all",
+            "per_page":50,
+        }),
+        Some("remove_expired") => json!({
+            "notes":metadata.get("evidence_ref").cloned().unwrap_or(Value::Null),
+            "match":"all",
+            "per_page":50,
+        }),
+        _ => {
+            return Err(CliError::Input(
+                "security-action governance receipt has an unsupported kind".to_owned(),
+            ));
+        }
+    };
+    let response = Executor::new(http_client()?, API_BASE_URL)?
+        .execute_read(
+            source,
+            &CallInput {
+                selectors: json!({
+                    "zone_id":input.selectors.get("zone_id").cloned().unwrap_or(Value::Null),
+                }),
+                query,
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt = security_action_state_receipt(
+        store,
+        capability,
+        input,
+        adapter_targets,
+        account_id,
+        &response,
+    )?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
 }
 
 fn preflight_call_input(
@@ -1717,6 +3797,10 @@ fn validate_warp_connector_vip_addresses(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "read execution receives explicit catalog, selector, credential, private retrieval, and file-output inputs so no authority or destination is hidden in ambient state"
+)]
 async fn execute_read(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -1724,7 +3808,12 @@ async fn execute_read(
     input: &CallInput,
     requested_profile: Option<&str>,
     requested_account: Option<&str>,
+    output_path: Option<&Path>,
+    r2_credentials: Option<&R2LogRetrievalCredentials>,
 ) -> Result<ResultEnvelopeV2> {
+    if capability.workflow.is_some() {
+        return execute_native_workflow(store, catalog, capability);
+    }
     match capability.adapter_status {
         AdapterStatus::DelegatedCli => {
             return execute_delegated_read(
@@ -1764,10 +3853,35 @@ async fn execute_read(
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
-    let response = executor
-        .execute_read(capability, input, &credential)
-        .await?;
-    let sanitized = serde_json::to_value(&response)?;
+    let response = if capability.r2_log_retrieval.is_some() {
+        let output_path = output_path.ok_or(CloudflareError::R2LogOutputFileRequired)?;
+        let r2_credentials = r2_credentials.ok_or(CloudflareError::R2LogCredentialsRequired)?;
+        executor
+            .execute_r2_log_retrieval_to_file(
+                capability,
+                input,
+                &credential,
+                r2_credentials,
+                output_path,
+            )
+            .await?
+    } else if let Some(output_path) = output_path {
+        executor
+            .execute_read_to_file(capability, input, &credential, output_path)
+            .await?
+    } else {
+        executor
+            .execute_read(capability, input, &credential)
+            .await?
+    };
+    let mut sanitized =
+        redact_response_for_capability(capability, &serde_json::to_value(&response)?);
+    if let Some(object) = sanitized.as_object_mut() {
+        object.insert(
+            "availability".to_owned(),
+            live_read_availability(capability, &response),
+        );
+    }
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &sanitized)?;
     let mut envelope = ResultEnvelopeV2::success("call", sanitized).with_evidence(evidence);
     envelope.capability_id = Some(capability.id.clone());
@@ -1794,6 +3908,54 @@ async fn execute_read(
             next_step: Some(next_step),
         });
     }
+    Ok(envelope)
+}
+
+fn execute_native_workflow(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+) -> Result<ResultEnvelopeV2> {
+    let workflow = capability.workflow.as_ref().ok_or_else(|| {
+        CliError::Input("native workflow capability is missing its recipe".to_owned())
+    })?;
+    let steps = workflow
+        .steps
+        .iter()
+        .map(|step| {
+            let component = catalog.get(&step.capability_id);
+            json!({
+                "id": step.id,
+                "capability_id": step.capability_id,
+                "purpose": step.purpose,
+                "mutating": step.mutating,
+                "depends_on": step.depends_on,
+                "available": component.is_some(),
+                "adapter_status": component.map(|capability| capability.adapter_status),
+                "blocked_reason": component.and_then(|capability| capability.blocked_reason.clone()),
+                "contract_gaps": component.map(CapabilityV1::mutation_contract_gaps).unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let receipt = json!({
+        "workflow_id": capability.id,
+        "catalog_hash": catalog.schema_hash,
+        "purpose": workflow.purpose,
+        "preserves_component_approval": workflow.preserves_component_approval,
+        "exports_evidence_packet": workflow.exports_evidence_packet,
+        "performed": false,
+        "steps": steps,
+        "next_action": "Inspect each component with `cfctl guide <capability-id>`; every mutating component must be planned, approved, run, and verified separately."
+    });
+    let evidence = store.write_evidence(EvidenceClass::AgentAction, &receipt)?;
+    let mut envelope = ResultEnvelopeV2::success("call", receipt).with_evidence(evidence);
+    envelope.capability_id = Some(capability.id.clone());
+    envelope.performed = false;
+    envelope.verification.state = VerificationState::NotApplicable;
+    envelope.verification.basis = Some(
+        "native workflow composition only; no Cloudflare boundary or mutation was crossed"
+            .to_owned(),
+    );
     Ok(envelope)
 }
 
@@ -2430,6 +4592,8 @@ const DNS_RECORD_DETAIL_READ_CAPABILITY_ID: &str = cfctl_core::DNS_RECORD_DETAIL
 const DNS_RECORD_DETAIL_PATH: &str = cfctl_core::DNS_RECORD_DETAIL_PATH;
 const DNS_RECORD_STATE_PRECONDITION: &str = "dns_record_state";
 const DNS_RECORD_RESTORE_CAPABILITY_ID: &str = "dns-records-for-a-zone-update-dns-record";
+const SAME_PATH_PRIOR_STATE_PRECONDITION: &str = "same_path_prior_state";
+const SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY: &str = "restore_same_path_prior_snapshot";
 const OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID: &str = "oauth-clients-get";
 const OAUTH_CLIENT_DETAIL_PATH: &str = "/accounts/{account_id}/oauth_clients/{oauth_client_id}";
 const OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION: &str = "oauth_client_key_overlap";
@@ -2995,6 +5159,205 @@ fn dns_record_routing_contract_supported(capability: &CapabilityV1) -> bool {
                         })
                 })
         })
+}
+
+fn should_bind_same_path_prior_state(capability: &CapabilityV1) -> bool {
+    capability.mutating
+        && matches!(capability.method.as_str(), "PATCH" | "PUT")
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.rollback.strategy.as_deref() == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
+        && capability.rollback_contract_supported()
+}
+
+fn same_path_read_source_contract_supported(
+    capability: &CapabilityV1,
+    source: &CapabilityV1,
+) -> bool {
+    let Some(target) = capability.same_path_read.as_ref() else {
+        return false;
+    };
+    if source.id != target.read_capability_id
+        || source.method != "GET"
+        || source.path != target.path
+        || source.mutating
+        || !matches!(
+            source.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        || source.request_schema.is_some()
+        || source.response_contract.as_ref().is_none_or(|contract| {
+            contract.body_mode != cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                || contract.success_statuses != ["200"]
+                || contract.success_media_types != ["application/json"]
+        })
+    {
+        return false;
+    }
+    let mutation_paths = capability
+        .selectors
+        .iter()
+        .filter(|selector| selector.location == "path" && selector.required)
+        .map(|selector| selector.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let source_paths = source
+        .selectors
+        .iter()
+        .filter(|selector| selector.location == "path" && selector.required)
+        .map(|selector| selector.name.as_str())
+        .collect::<BTreeSet<_>>();
+    mutation_paths == source_paths
+        && source
+            .selectors
+            .iter()
+            .all(|selector| selector.location == "path" || !selector.required)
+}
+
+fn same_path_prior_state_fields(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<Vec<String>> {
+    let target = capability.same_path_read.as_ref().ok_or_else(|| {
+        CliError::Input(
+            "same-path prior-state mutation omitted its hash-bound readback contract".to_owned(),
+        )
+    })?;
+    let planned = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input(
+                "same-path prior-state mutation requires a validated object body".to_owned(),
+            )
+        })?;
+    let mut fields = planned
+        .keys()
+        .filter(|field| !capability.request_object_field_is_verification_omitted(field))
+        .cloned()
+        .collect::<Vec<_>>();
+    fields.sort();
+    if fields.is_empty()
+        || fields.iter().any(|field| {
+            target
+                .verified_response_fields
+                .binary_search(field)
+                .is_err()
+        })
+    {
+        return Err(CliError::Input(
+            "same-path prior-state mutation has no fully observable planned fields".to_owned(),
+        ));
+    }
+    Ok(fields)
+}
+
+fn project_same_path_prior_state(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    result: &Value,
+) -> Result<Value> {
+    let mut prior = serde_json::Map::new();
+    for field in same_path_prior_state_fields(capability, input)? {
+        let response_field = capability
+            .request_object_field_verification_response_field(&field)
+            .unwrap_or_else(|| field.clone());
+        let value = result.get(&response_field).cloned().ok_or_else(|| {
+            CliError::Input(format!(
+                "same-path state read omitted restorable field `{response_field}`; the mutation boundary was not crossed"
+            ))
+        })?;
+        prior.insert(field, value);
+    }
+    let prior = Value::Object(prior);
+    let mut restore_input = input.clone();
+    restore_input.query = json!({});
+    restore_input.body = Some(prior.clone());
+    preflight_call_input(capability, &restore_input, None).map_err(|error| {
+        CliError::Input(format!(
+            "live same-path state is outside the exact restorable request contract; the mutation boundary was not crossed: {error}"
+        ))
+    })?;
+    Ok(prior)
+}
+
+fn apply_same_path_prior_state_response(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the same-path state read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    let target = capability.same_path_read.as_ref().ok_or_else(|| {
+        CliError::Input(
+            "same-path prior-state mutation omitted its hash-bound readback contract".to_owned(),
+        )
+    })?;
+    let prior_state = project_same_path_prior_state(capability, input, &response.result)?;
+    Ok(json!({
+        "schema_version": 1,
+        "source_capability_id": target.read_capability_id,
+        "source_path": target.path,
+        "target_capability_id": capability.id,
+        "target_method": capability.method,
+        "target_path": capability.path,
+        "target_scope": capability.account_scope,
+        "account_id": account_id,
+        "selectors": input.selectors,
+        "prior_state": prior_state,
+    }))
+}
+
+async fn read_live_same_path_prior_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !should_bind_same_path_prior_state(capability) {
+        return Err(CliError::Input(
+            "mutation drifted from its governed same-path prior-state contract".to_owned(),
+        ));
+    }
+    let target = capability.same_path_read.as_ref().ok_or_else(|| {
+        CliError::Input(
+            "same-path prior-state mutation omitted its hash-bound readback contract".to_owned(),
+        )
+    })?;
+    let source = catalog
+        .get(&target.read_capability_id)
+        .ok_or_else(|| capability_missing(&target.read_capability_id))?;
+    if !same_path_read_source_contract_supported(capability, source) {
+        return Err(CliError::Input(
+            "same-path state source capability drifted from the governed exact-resource read"
+                .to_owned(),
+        ));
+    }
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt = apply_same_path_prior_state_response(capability, input, account_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
 }
 
 fn apply_dns_record_state_response(
@@ -3976,6 +6339,20 @@ fn should_resolve_zone_entitlement(capability: &CapabilityV1) -> bool {
         && capability.mutation_contract_gaps() == [ENTITLEMENT_UNRESOLVED_GAP]
 }
 
+fn should_resolve_entitlement_probe(capability: &CapabilityV1) -> bool {
+    let dynamic_contract = capability.adapter_status == AdapterStatus::DynamicApi
+        || (capability.adapter_status == AdapterStatus::Blocked
+            && capability
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("operation contract incomplete:")));
+    dynamic_contract
+        && capability.entitlement.requires_live_resolution
+        && capability.entitlement.probe.is_some()
+        && capability.entitlement.available != Some(true)
+        && capability.mutation_contract_gaps().is_empty()
+}
+
 fn should_bind_zone_account(capability: &CapabilityV1) -> bool {
     capability.mutating
         && capability.account_scope == "zone"
@@ -3985,7 +6362,8 @@ fn should_bind_zone_account(capability: &CapabilityV1) -> bool {
                 | AdapterStatus::DynamicApi
                 | AdapterStatus::DelegatedCli
                 | AdapterStatus::GovernedUi
-        ) || should_resolve_zone_entitlement(capability))
+        ) || should_resolve_zone_entitlement(capability)
+            || should_resolve_entitlement_probe(capability))
 }
 
 fn zone_target(capability: &CapabilityV1, input: &CallInput) -> Result<String> {
@@ -4149,6 +6527,114 @@ async fn read_live_zone_entitlement(
     Ok((receipt, evidence))
 }
 
+fn entitlement_probe_selectors(capability: &CapabilityV1, input: &CallInput) -> Result<Value> {
+    let probe =
+        capability.entitlement.probe.as_ref().ok_or_else(|| {
+            CliError::Input("live entitlement probe contract is absent".to_owned())
+        })?;
+    let input_selectors = input.selectors.as_object().ok_or_else(|| {
+        CliError::Input("live entitlement probe selectors are not an object".to_owned())
+    })?;
+    let mut selectors = Map::new();
+    for name in &probe.selector_names {
+        let value = input_selectors
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(format!(
+                    "live entitlement probe requires string selector `{name}`"
+                ))
+            })?;
+        selectors.insert(name.clone(), Value::String(value.to_owned()));
+    }
+    Ok(Value::Object(selectors))
+}
+
+fn apply_entitlement_probe_response(
+    capability: &mut CapabilityV1,
+    selectors: &Value,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    let probe =
+        capability.entitlement.probe.as_ref().ok_or_else(|| {
+            CliError::Input("live entitlement probe contract is absent".to_owned())
+        })?;
+    if !response.success || !(200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the declared product entitlement probe with HTTP {}; token authorization, product entitlement, and account configuration remain unresolved, and the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    let probe_capability_id = probe.capability_id.clone();
+    let probe_path = probe.path.clone();
+    let selector_hash = hash_value(selectors)?;
+    capability.entitlement.available = Some(true);
+    capability.entitlement.blocker = None;
+    capability.entitlement.observed_plan = None;
+    capability.entitlement.source = Some(format!(
+        "live Cloudflare read capability `{probe_capability_id}` returned a successful response"
+    ));
+    refresh_dynamic_mutation_contract(capability);
+    Ok(json!({
+        "schema_version":1,
+        "source_capability_id":probe_capability_id,
+        "source_path":probe_path,
+        "target_scope":capability.account_scope,
+        "target_selectors_hash":selector_hash,
+        "http_status":response.status,
+        "available":true,
+        "negative_inference":false,
+        "basis":"a successful read proves current API access; a rejected read would not distinguish authorization, entitlement, or product configuration"
+    }))
+}
+
+async fn read_live_entitlement_probe(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &mut CapabilityV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    let probe =
+        capability.entitlement.probe.as_ref().ok_or_else(|| {
+            CliError::Input("live entitlement probe contract is absent".to_owned())
+        })?;
+    let source_capability = catalog
+        .get(&probe.capability_id)
+        .ok_or_else(|| capability_missing(&probe.capability_id))?;
+    if source_capability.method != "GET"
+        || source_capability.path != probe.path
+        || source_capability.mutating
+        || !matches!(
+            source_capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+    {
+        return Err(CliError::Input(
+            "declared product entitlement probe drifted from its governed read capability"
+                .to_owned(),
+        ));
+    }
+    let selectors = entitlement_probe_selectors(capability, input)?;
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source_capability,
+            &CallInput {
+                selectors: selectors.clone(),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt = apply_entitlement_probe_response(capability, &selectors, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
+
 fn apply_zone_account_response(
     zone_id: &str,
     expected_account_id: &str,
@@ -4241,7 +6727,8 @@ async fn read_live_zone_account(
 }
 
 fn plan_requires_live_credential(capability: &CapabilityV1, adapter_targets: &Value) -> bool {
-    should_resolve_zone_entitlement(capability)
+    should_resolve_entitlement_probe(capability)
+        || should_resolve_zone_entitlement(capability)
         || should_bind_zone_account(capability)
         || should_bind_global_warp_override_state(capability)
         || should_bind_d1_read_replication_state(capability)
@@ -4251,10 +6738,16 @@ fn plan_requires_live_credential(capability: &CapabilityV1, adapter_targets: &Va
         || should_bind_warp_connector_configuration_state(capability)
         || should_bind_web_analytics_rum_state(capability)
         || should_bind_dns_record_state(capability)
+        || should_bind_same_path_prior_state(capability)
+        || should_bind_security_action_state(capability, adapter_targets)
         || should_bind_oauth_client_secret_state(capability)
         || should_bind_r2_parent_token(capability)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "plan creation keeps current-state evidence, normalization, risk, cost, permission, entitlement, verification, rollback, and immutable hashing together"
+)]
 async fn create_plan(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -4276,6 +6769,7 @@ async fn create_plan(
                     .to_owned(),
             )
     })?;
+    let resolve_entitlement_probe = should_resolve_entitlement_probe(&capability);
     let resolve_entitlement = should_resolve_zone_entitlement(&capability);
     let credential = if plan_requires_live_credential(&capability, &adapter_targets) {
         Some(fresh_credential(profile, &platform_secrets(store)).await?)
@@ -4306,7 +6800,15 @@ async fn create_plan(
     } else {
         None
     };
-    let entitlement_precondition = if resolve_entitlement {
+    let entitlement_precondition = if resolve_entitlement_probe {
+        let credential = credential.as_ref().ok_or_else(|| {
+            CliError::Input("live entitlement-probe credential was not resolved".to_owned())
+        })?;
+        Some(
+            read_live_entitlement_probe(store, catalog, &mut capability, &input, credential)
+                .await?,
+        )
+    } else if resolve_entitlement {
         let credential = credential.as_ref().ok_or_else(|| {
             CliError::Input("live zone precondition credential was not resolved".to_owned())
         })?;
@@ -4851,6 +7353,55 @@ async fn prepare_oauth_client_secret_state_precondition(
         .map(Some)
 }
 
+async fn prepare_same_path_prior_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !should_bind_same_path_prior_state(capability) {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input("same-path prior-state precondition credential was not resolved".to_owned())
+    })?;
+    read_live_same_path_prior_state(store, catalog, capability, input, account_id, credential)
+        .await
+        .map(Some)
+}
+
+async fn prepare_security_action_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    adapter_targets: &Value,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !should_bind_security_action_state(capability, adapter_targets) {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input(
+            "security-action current-state precondition credential was not resolved".to_owned(),
+        )
+    })?;
+    read_live_security_action_state(
+        store,
+        catalog,
+        capability,
+        input,
+        adapter_targets,
+        account_id,
+        credential,
+    )
+    .await
+    .map(Some)
+}
+
 async fn prepare_live_plan_preconditions(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -4910,6 +7461,20 @@ async fn prepare_live_plan_preconditions(
             store, catalog, capability, input, account_id, credential,
         )
         .await?,
+        same_path_prior_state: prepare_same_path_prior_state_precondition(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await?,
+        security_action_state: prepare_security_action_state_precondition(
+            store,
+            catalog,
+            capability,
+            input,
+            adapter_targets,
+            account_id,
+            credential,
+        )
+        .await?,
         oauth_client_secret_state: prepare_oauth_client_secret_state_precondition(
             store, catalog, capability, input, account_id, credential,
         )
@@ -4934,6 +7499,8 @@ struct LivePlanPreconditions {
     warp_connector_configuration_state: Option<(Value, EvidenceV1)>,
     web_analytics_rum_state: Option<(Value, EvidenceV1)>,
     dns_record_state: Option<(Value, EvidenceV1)>,
+    same_path_prior_state: Option<(Value, EvidenceV1)>,
+    security_action_state: Option<(Value, EvidenceV1)>,
     oauth_client_secret_state: Option<(Value, EvidenceV1)>,
 }
 
@@ -4973,6 +7540,12 @@ fn plan_targets(
     }
     if let Some((receipt, _)) = &live_preconditions.dns_record_state {
         targets["live_preconditions"][DNS_RECORD_STATE_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.same_path_prior_state {
+        targets["live_preconditions"][SAME_PATH_PRIOR_STATE_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.security_action_state {
+        targets["live_preconditions"][SECURITY_ACTION_STATE_PRECONDITION] = receipt.clone();
     }
     if let Some((receipt, _)) = &live_preconditions.oauth_client_secret_state {
         targets["live_preconditions"][OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION] = receipt.clone();
@@ -5021,6 +7594,14 @@ fn bind_live_plan_preconditions(
         (
             DNS_RECORD_STATE_PRECONDITION,
             &live_preconditions.dns_record_state,
+        ),
+        (
+            SAME_PATH_PRIOR_STATE_PRECONDITION,
+            &live_preconditions.same_path_prior_state,
+        ),
+        (
+            SECURITY_ACTION_STATE_PRECONDITION,
+            &live_preconditions.security_action_state,
         ),
         (
             OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION,
@@ -5117,6 +7698,18 @@ fn planned_cloudflare_diff(
     if let Some((receipt, _)) = &live_preconditions.dns_record_state {
         diff["observed_before"] = receipt.get("prior_record").cloned().unwrap_or(Value::Null);
         diff["planned_after"] = input.body.clone().unwrap_or(Value::Null);
+    }
+    if let Some((receipt, _)) = &live_preconditions.same_path_prior_state {
+        diff["observed_before"] = receipt.get("prior_state").cloned().unwrap_or(Value::Null);
+        diff["planned_after"] = input.body.clone().unwrap_or(Value::Null);
+    }
+    if let Some((receipt, _)) = &live_preconditions.security_action_state {
+        diff["security_current_state"] = receipt.get("state").cloned().unwrap_or(Value::Null);
+        diff["security_governance"] = plan
+            .targets
+            .pointer("/adapter/security_action")
+            .cloned()
+            .unwrap_or(Value::Null);
     }
     if let Some((receipt, _)) = &live_preconditions.oauth_client_secret_state {
         let observed_before = receipt
@@ -5238,6 +7831,8 @@ fn prepend_prepared_plan_evidence(
         live_preconditions.warp_connector_configuration_state,
         live_preconditions.web_analytics_rum_state,
         live_preconditions.dns_record_state,
+        live_preconditions.same_path_prior_state,
+        live_preconditions.security_action_state,
         live_preconditions.r2_parent_token,
     ]
     .into_iter()
@@ -6023,9 +8618,9 @@ async fn plans_command(store: &StateStore, command: PlansCommand) -> Result<Resu
             show_plan(store, &selector)
         }
         PlansCommand::Approve(arguments) => approve_plan(store, &arguments),
-        PlansCommand::Run(selector) => run_plan(store, &selector).await,
-        PlansCommand::Resume(selector) => resume_plan(store, &selector).await,
-        PlansCommand::Rectify(selector) => rectify_plan(store, &selector).await,
+        PlansCommand::Run(selector) => Box::pin(run_plan(store, &selector)).await,
+        PlansCommand::Resume(selector) => Box::pin(resume_plan(store, &selector)).await,
+        PlansCommand::Rectify(selector) => Box::pin(rectify_plan(store, &selector)).await,
         PlansCommand::Cancel(selector) => cancel_plan(store, &selector),
     }
 }
@@ -6607,6 +9202,8 @@ struct LivePreconditionEvidence {
     warp_connector_configuration_state: Option<EvidenceV1>,
     web_analytics_rum_state: Option<EvidenceV1>,
     dns_record_state: Option<EvidenceV1>,
+    same_path_prior_state: Option<EvidenceV1>,
+    security_action_state: Option<EvidenceV1>,
     oauth_client_secret_state: Option<EvidenceV1>,
     r2_parent_token: Option<EvidenceV1>,
 }
@@ -6667,6 +9264,14 @@ async fn validate_live_plan_precondition_evidence(
         )
         .await?,
         dns_record_state: validate_live_dns_record_state_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        same_path_prior_state: validate_live_same_path_prior_state_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        security_action_state: validate_live_security_action_state_precondition(
             store, catalog, plan, input, credential,
         )
         .await?,
@@ -6748,6 +9353,8 @@ fn prepend_live_precondition_evidence(
         evidence.r2_parent_token,
         evidence.oauth_client_secret_state,
         evidence.dns_record_state,
+        evidence.same_path_prior_state,
+        evidence.security_action_state,
         evidence.web_analytics_rum_state,
         evidence.warp_connector_configuration_state,
         evidence.cloudflare_tunnel_configuration_state,
@@ -7964,6 +10571,285 @@ fn dns_record_prior_snapshot(plan: &PlanV1) -> Result<Value> {
     validate_dns_record_prior_state_receipt(plan, receipt)
 }
 
+fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Result<Value> {
+    let target = plan.capability.same_path_read.as_ref().ok_or_else(|| {
+        CliError::Input(
+            "same-path rollback plan omitted its hash-bound readback contract".to_owned(),
+        )
+    })?;
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let exact_identity = receipt.as_object().is_some_and(|object| object.len() == 10)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("source_capability_id").and_then(Value::as_str)
+            == Some(target.read_capability_id.as_str())
+        && receipt.get("source_path").and_then(Value::as_str) == Some(target.path.as_str())
+        && receipt.get("target_capability_id").and_then(Value::as_str)
+            == Some(plan.capability.id.as_str())
+        && receipt.get("target_method").and_then(Value::as_str)
+            == Some(plan.capability.method.as_str())
+        && receipt.get("target_path").and_then(Value::as_str)
+            == Some(plan.capability.path.as_str())
+        && receipt.get("target_scope").and_then(Value::as_str)
+            == Some(plan.capability.account_scope.as_str())
+        && receipt.get("account_id").and_then(Value::as_str) == Some(plan.account_id.as_str())
+        && receipt.get("selectors") == Some(&input.selectors);
+    let prior_state = receipt
+        .get("prior_state")
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| {
+            CliError::Input(
+                "same-path prior-state receipt omitted its restorable object snapshot; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let expected_fields = same_path_prior_state_fields(&plan.capability, &input)?;
+    let observed_fields = prior_state.keys().cloned().collect::<Vec<_>>();
+    if !exact_identity || observed_fields != expected_fields {
+        return Err(CliError::Input(
+            "same-path prior-state receipt has an invalid source, target, selector, or field set; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let prior_state = Value::Object(prior_state);
+    let mut restore_input = input;
+    restore_input.query = json!({});
+    restore_input.body = Some(prior_state.clone());
+    preflight_call_input(&plan.capability, &restore_input, None).map_err(|error| {
+        CliError::Input(format!(
+            "same-path prior-state receipt is outside the exact restorable request contract; create a new plan: {error}"
+        ))
+    })?;
+    Ok(prior_state)
+}
+
+fn required_same_path_prior_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    if plan.capability.rollback.strategy.as_deref() != Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
+    {
+        return Ok(None);
+    }
+    if !should_bind_same_path_prior_state(&plan.capability) {
+        return Err(CliError::Input(
+            "plan is inconsistent with its hash-bound same-path prior-state contract; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(SAME_PATH_PRIOR_STATE_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the same-path prior-state contract; create a new plan".to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/same_path_prior_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the hash-bound same-path prior-state receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    validate_same_path_prior_state_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "plan same-path prior-state receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+fn same_path_prior_snapshot(plan: &PlanV1) -> Result<Value> {
+    required_same_path_prior_state_precondition(plan)?.ok_or_else(|| {
+        CliError::Input(
+            "same-path compensation requires a hash-bound prior-state precondition".to_owned(),
+        )
+    })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/same_path_prior_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "same-path compensation requires a hash-bound prior-state receipt".to_owned(),
+            )
+        })?;
+    validate_same_path_prior_state_receipt(plan, receipt)
+}
+
+async fn validate_live_same_path_prior_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_same_path_prior_state_precondition(plan)? else {
+        return Ok(None);
+    };
+    let (receipt, evidence) = read_live_same_path_prior_state(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live same-path state drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
+}
+
+fn validate_security_action_state_receipt(plan: &PlanV1, receipt: &Value) -> Result<()> {
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let metadata = plan
+        .targets
+        .pointer("/adapter/security_action")
+        .ok_or_else(|| {
+            CliError::Input(
+                "security-action plan omitted its hash-bound governance receipt".to_owned(),
+            )
+        })?;
+    let zone_id = input
+        .selectors
+        .get("zone_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("security-action plan omitted its zone selector".to_owned())
+        })?;
+    let identity_matches = receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("source_capability_id").and_then(Value::as_str)
+            == Some(SECURITY_IP_RULE_STATE_CAPABILITY_ID)
+        && receipt.get("source_path").and_then(Value::as_str)
+            == Some(SECURITY_IP_RULE_COLLECTION_PATH)
+        && receipt.get("target_capability_id").and_then(Value::as_str)
+            == Some(plan.capability.id.as_str())
+        && receipt.get("target_method").and_then(Value::as_str)
+            == Some(plan.capability.method.as_str())
+        && receipt.get("target_path").and_then(Value::as_str)
+            == Some(plan.capability.path.as_str())
+        && receipt.get("account_id").and_then(Value::as_str) == Some(plan.account_id.as_str())
+        && receipt.get("zone_id").and_then(Value::as_str) == Some(zone_id)
+        && receipt.get("kind") == metadata.get("kind")
+        && receipt.get("evidence_ref") == metadata.get("evidence_ref")
+        && receipt.get("expires_at") == metadata.get("expires_at");
+    let state_matches = match metadata.get("kind").and_then(Value::as_str) {
+        Some("create_expiring") => {
+            receipt
+                .pointer("/state/matching_rule_count")
+                .and_then(Value::as_u64)
+                == Some(0)
+                && receipt.pointer("/state/target") == metadata.get("target")
+                && receipt.pointer("/state/action") == metadata.get("action")
+        }
+        Some("remove_expired") => {
+            receipt
+                .pointer("/state/matching_rule_count")
+                .and_then(Value::as_u64)
+                == Some(1)
+                && receipt.pointer("/state/rule_id") == input.selectors.get("rule_id")
+                && receipt.pointer("/state/source_operation_id")
+                    == metadata.get("source_operation_id")
+                && receipt
+                    .pointer("/state/live_rule_hash")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.starts_with("sha256:"))
+        }
+        _ => false,
+    };
+    if !identity_matches || !state_matches {
+        return Err(CliError::Input(
+            "security-action current-state receipt has an invalid source, target, governance binding, or duplicate/removal state; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn required_security_action_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    if plan.capability.security_action.is_none() {
+        return Ok(None);
+    }
+    let adapter = plan.targets.pointer("/adapter").ok_or_else(|| {
+        CliError::Input(
+            "security-action plan omitted adapter targets; create a new plan".to_owned(),
+        )
+    })?;
+    if !should_bind_security_action_state(&plan.capability, adapter) {
+        return Err(CliError::Input(
+            "security-action plan is inconsistent with its live current-state contract; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(SECURITY_ACTION_STATE_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "security-action plan predates the live duplicate/removal-state contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/security_action_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "security-action plan omitted its hash-bound current-state receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    validate_security_action_state_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "security-action current-state receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+async fn validate_live_security_action_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_security_action_state_precondition(plan)? else {
+        return Ok(None);
+    };
+    let adapter = plan.targets.pointer("/adapter").ok_or_else(|| {
+        CliError::Input("security-action plan omitted adapter targets".to_owned())
+    })?;
+    let (receipt, evidence) = read_live_security_action_state(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        adapter,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live security-action duplicate or removal state drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
+}
+
 async fn validate_live_zone_account_precondition(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -8024,8 +10910,11 @@ async fn validate_live_entitlement_precondition(
         return Ok(None);
     };
     let mut capability = plan.capability.clone();
-    let (receipt, evidence) =
-        read_live_zone_entitlement(store, catalog, &mut capability, input, credential).await?;
+    let (receipt, evidence) = if capability.entitlement.probe.is_some() {
+        read_live_entitlement_probe(store, catalog, &mut capability, input, credential).await?
+    } else {
+        read_live_zone_entitlement(store, catalog, &mut capability, input, credential).await?
+    };
     validate_entitlement_receipt_precondition(expected_hash, &capability, &receipt)?;
     Ok(Some(evidence))
 }
@@ -8034,11 +10923,12 @@ fn required_entitlement_precondition(plan: &PlanV1) -> Result<Option<&str>> {
     if !plan.capability.entitlement.requires_live_resolution {
         return Ok(None);
     }
-    if plan.capability.account_scope != "zone"
-        || plan.capability.entitlement.available != Some(true)
-    {
+    let scope_supported = plan.capability.account_scope == "zone"
+        || (plan.capability.account_scope == "account"
+            && plan.capability.entitlement.probe.is_some());
+    if !scope_supported || plan.capability.entitlement.available != Some(true) {
         return Err(CliError::Input(
-            "plan entitlement precondition is inconsistent with its hash-bound zone capability; create a new plan"
+            "plan entitlement precondition is inconsistent with its hash-bound capability; create a new plan"
                 .to_owned(),
         ));
     }
@@ -8061,7 +10951,7 @@ fn validate_entitlement_receipt_precondition(
     let actual_hash = hash_value(receipt)?;
     if actual_hash != expected_hash || capability.entitlement.available != Some(true) {
         return Err(CliError::Input(
-            "live zone entitlement drifted after planning; the mutation boundary was not crossed and a new plan is required"
+            "live entitlement drifted after planning; the mutation boundary was not crossed and a new plan is required"
                 .to_owned(),
         ));
     }
@@ -8277,10 +11167,8 @@ fn process_api_boundary_response(
     response: &CloudflareResponseV1,
     secrets: &dyn SecretStore,
 ) -> Result<ApiBoundaryResponseOutcome> {
-    let mut response_value = serde_json::to_value(response)?;
-    if should_redact_secret_response(&plan.capability) {
-        response_value = redact_secret_result(&response_value);
-    }
+    let response_value =
+        redact_response_for_capability(&plan.capability, &serde_json::to_value(response)?);
     let mut failures = Vec::new();
     let apply_evidence = match store.write_evidence(EvidenceClass::Apply, &response_value) {
         Ok(evidence) => Some(evidence),
@@ -8392,13 +11280,21 @@ fn process_api_transport_failure(
 
 fn api_plan_result_envelope(
     plan: &PlanV1,
-    result: Value,
+    mut result: Value,
     apply_evidence: EvidenceV1,
     lineage_evidence: Option<EvidenceV1>,
     verification: ApiVerificationOutcome,
     performed: bool,
     finalization_error: Option<&CliError>,
 ) -> ResultEnvelopeV2 {
+    if let Some(resource_id) = verification.correlated_resource_id.as_ref()
+        && let Some(object) = result.as_object_mut()
+    {
+        object.insert(
+            "cfctl_correlated_resource_id".to_owned(),
+            resource_id.clone(),
+        );
+    }
     if let Some(error) = finalization_error {
         let mut envelope = post_boundary_failure_envelope(
             plan,
@@ -8444,6 +11340,7 @@ struct ApiVerificationOutcome {
     basis: String,
     evidence: Option<EvidenceV1>,
     error: Option<ErrorV1>,
+    correlated_resource_id: Option<Value>,
 }
 
 fn blocked_capability_envelope(
@@ -8508,6 +11405,38 @@ fn boundary_response_artifact(
     response: &CloudflareResponseV1,
     apply_evidence: Option<&EvidenceV1>,
 ) -> Value {
+    let nested_resource_id = plan
+        .capability
+        .created_nested_resource
+        .as_ref()
+        .and_then(|target| {
+            let correlation = plan
+                .input
+                .pointer(&format!("/body/{}", target.correlation_field))
+                .and_then(Value::as_str)?;
+            let items = response
+                .result
+                .pointer(&target.items_pointer)
+                .and_then(Value::as_array)?;
+            let matching = items
+                .iter()
+                .filter(|item| {
+                    item.get(&target.correlation_field).and_then(Value::as_str) == Some(correlation)
+                })
+                .collect::<Vec<_>>();
+            (matching.len() == 1)
+                .then(|| {
+                    matching[0]
+                        .pointer(&target.response_item_identity_pointer)
+                        .filter(|identity| {
+                            identity.as_str().is_some_and(|value| !value.is_empty())
+                                || identity.as_u64().is_some()
+                                || identity.as_i64().is_some()
+                        })
+                        .cloned()
+                })
+                .flatten()
+        });
     let identity_pointer = plan
         .capability
         .created_resource
@@ -8523,13 +11452,20 @@ fn boundary_response_artifact(
     // Fail closed: never lift a secret field into the journal's `resource_id`.
     // The core contract gate already refuses a secret-named identity pointer, so
     // this is belt-and-suspenders against a pointer that slipped through.
-    let resource_id = if cfctl_core::pointer_names_secret_field(identity_pointer) {
+    let resource_id = if nested_resource_id.is_some() {
+        nested_resource_id
+    } else if cfctl_core::pointer_names_secret_field(identity_pointer) {
         None
     } else {
         response
             .result
             .pointer(identity_pointer)
-            .and_then(Value::as_str)
+            .filter(|identity| {
+                identity.as_str().is_some_and(|value| !value.is_empty())
+                    || identity.as_u64().is_some()
+                    || identity.as_i64().is_some()
+            })
+            .cloned()
     };
     json!({
         "apply_evidence_hash": apply_evidence.map(|evidence| evidence.content_hash.as_str()),
@@ -8726,6 +11662,7 @@ fn verification_response_artifact(outcome: &ApiVerificationOutcome) -> Result<Va
         "state": outcome.state.as_str(),
         "basis_hash": hash_value(&json!(outcome.basis))?,
         "evidence_hash": outcome.evidence.as_ref().map(|evidence| evidence.content_hash.as_str()),
+        "resource_id":outcome.correlated_resource_id,
     }))
 }
 
@@ -8744,6 +11681,7 @@ async fn verify_api_plan(
             basis: "Cloudflare rejected the mutation before verification".to_owned(),
             evidence: None,
             error: None,
+            correlated_resource_id: None,
         });
     }
     persist_transaction_stage(
@@ -8758,6 +11696,7 @@ async fn verify_api_plan(
             basis: non_readback_verification_basis(&plan.capability),
             evidence: None,
             error: None,
+            correlated_resource_id: None,
         };
         persist_transaction_stage_with_artifact(
             store,
@@ -8816,7 +11755,7 @@ fn verification_outcome(
     if should_redact_secret_response(&plan.capability)
         && let Some(readback) = verification_value.get("readback")
     {
-        let redacted = redact_secret_result(readback);
+        let redacted = redact_response_for_capability(&plan.capability, readback);
         if let Some(object) = verification_value.as_object_mut() {
             object.insert("readback".to_owned(), redacted);
         }
@@ -8836,6 +11775,7 @@ fn verification_outcome(
         basis: verification.basis,
         evidence,
         error,
+        correlated_resource_id: verification.correlated_resource_id,
     })
 }
 
@@ -8866,13 +11806,14 @@ fn verification_error_outcome(
                 plan.operation_id
             )),
         }),
+        correlated_resource_id: None,
     })
 }
 
 async fn resume_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
     let plan = load_validated_plan(store, &selector.operation_id)?;
     match plan.status {
-        PlanStatus::Draft | PlanStatus::Approved => run_plan(store, selector).await,
+        PlanStatus::Draft | PlanStatus::Approved => Box::pin(run_plan(store, selector)).await,
         PlanStatus::Consumed | PlanStatus::Running => Err(CliError::Input(
             "the operation may have crossed the Cloudflare boundary; replay is blocked until rectification proves current state"
                 .to_owned(),
@@ -8891,6 +11832,7 @@ struct CompensationRequest {
     expected_path: String,
     input: CallInput,
     requested_account: Option<String>,
+    adapter_targets: Value,
 }
 
 struct CompensationTarget {
@@ -8930,6 +11872,7 @@ fn global_warp_override_compensation_request(plan: &PlanV1) -> Result<Compensati
             ..CallInput::default()
         },
         requested_account: Some(plan.account_id.clone()),
+        adapter_targets: json!({}),
     })
 }
 
@@ -8960,6 +11903,7 @@ fn d1_read_replication_compensation_request(plan: &PlanV1) -> Result<Compensatio
             ..CallInput::default()
         },
         requested_account: Some(plan.account_id.clone()),
+        adapter_targets: json!({}),
     })
 }
 
@@ -8993,6 +11937,7 @@ fn cloudflare_tunnel_configuration_compensation_request(
             ..CallInput::default()
         },
         requested_account: Some(plan.account_id.clone()),
+        adapter_targets: json!({}),
     })
 }
 
@@ -9021,6 +11966,7 @@ fn warp_connector_configuration_compensation_request(plan: &PlanV1) -> Result<Co
             ..CallInput::default()
         },
         requested_account: Some(plan.account_id.clone()),
+        adapter_targets: json!({}),
     })
 }
 
@@ -9046,6 +11992,7 @@ fn web_analytics_rum_compensation_request(plan: &PlanV1) -> Result<CompensationR
             ..CallInput::default()
         },
         requested_account: Some(plan.account_id.clone()),
+        adapter_targets: json!({}),
     })
 }
 
@@ -9084,19 +12031,112 @@ fn dns_record_compensation_request(plan: &PlanV1) -> Result<CompensationRequest>
             ..CallInput::default()
         },
         requested_account: Some(plan.account_id.clone()),
+        adapter_targets: json!({}),
     })
 }
 
-fn compensation_resource_id(artifact: &Value) -> Result<&str> {
-    artifact
-        .get("resource_id")
+fn same_path_prior_state_compensation_request(plan: &PlanV1) -> Result<CompensationRequest> {
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    Ok(CompensationRequest {
+        capability_id: plan.capability.id.clone(),
+        expected_method: plan.capability.method.clone(),
+        expected_path: plan.capability.path.clone(),
+        input: CallInput {
+            selectors: input.selectors,
+            query: json!({}),
+            body: Some(same_path_prior_snapshot(plan)?),
+            ..CallInput::default()
+        },
+        requested_account: Some(plan.account_id.clone()),
+        adapter_targets: json!({}),
+    })
+}
+
+fn async_list_member_compensation_request(plan: &PlanV1) -> Result<CompensationRequest> {
+    let member_id = plan
+        .transaction_artifact(TransactionStageV1::VerificationResponsePersisted)
+        .and_then(|artifact| artifact.get("resource_id"))
         .and_then(Value::as_str)
+        .filter(|identity| identity.len() == 32)
         .ok_or_else(|| {
             CliError::Input(
-                "the creation response is recorded, but its hash-bound receipt has no resource id; inspect live resource state before compensating"
+                "the List add crossed the boundary, but no exact correlated member identity is present in its verification receipt; inspect live List state before compensating"
+                    .to_owned(),
+            )
+        })?;
+    let account_id = plan
+        .targets
+        .pointer("/selectors/account_id")
+        .and_then(Value::as_str)
+        .filter(|identity| !identity.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("List compensation omitted its account selector".to_owned())
+        })?;
+    let list_id = plan
+        .targets
+        .pointer("/selectors/list_id")
+        .and_then(Value::as_str)
+        .filter(|identity| !identity.is_empty())
+        .ok_or_else(|| CliError::Input("List compensation omitted its list selector".to_owned()))?;
+    let source = plan
+        .targets
+        .pointer("/adapter/security_action")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input(
+                "List compensation omitted its hash-bound security-action receipt".to_owned(),
+            )
+        })?;
+    let security_action = json!({
+        "schema_version":1,
+        "kind":"remove_expired_list_member",
+        "actor":source.get("actor").cloned().unwrap_or(Value::String("cfctl-compensation".to_owned())),
+        "evidence_ref":source.get("evidence_ref").cloned().unwrap_or(Value::Null),
+        "expires_at":source.get("expires_at").cloned().unwrap_or(Value::Null),
+        "reason":"explicit rollback of the exact correlated List member",
+        "source_operation_id":plan.operation_id,
+        "member_id":member_id,
+        "rollback_override":true,
+        "anonymous_identity_inferred":false,
+    });
+    Ok(CompensationRequest {
+        capability_id: SECURITY_LIST_MEMBER_REMOVE_ID.to_owned(),
+        expected_method: "DELETE".to_owned(),
+        expected_path: SECURITY_LIST_MEMBER_COLLECTION_PATH.to_owned(),
+        input: CallInput {
+            selectors: json!({"account_id":account_id,"list_id":list_id}),
+            query: json!({}),
+            body: Some(json!({"items":[{"id":member_id}]})),
+            ..CallInput::default()
+        },
+        requested_account: Some(plan.account_id.clone()),
+        adapter_targets: json!({"security_action":security_action}),
+    })
+}
+
+fn compensation_resource_id(artifact: &Value) -> Result<&Value> {
+    artifact
+        .get("resource_id")
+        .filter(|identity| {
+            identity.as_str().is_some_and(|value| !value.is_empty())
+                || identity.as_u64().is_some()
+                || identity.as_i64().is_some()
+        })
+        .ok_or_else(|| {
+            CliError::Input(
+                "the creation response is recorded, but its hash-bound receipt has no string or integer resource id; inspect live resource state before compensating"
                     .to_owned(),
             )
         })
+}
+
+fn string_compensation_resource_id<'a>(plan: &PlanV1, resource_id: &'a Value) -> Result<&'a str> {
+    resource_id.as_str().filter(|value| !value.is_empty()).ok_or_else(|| {
+        CliError::Input(format!(
+            "the `{}` compensation contract requires a string resource identity, but the hash-bound creation receipt has a different scalar type",
+            plan.capability.id
+        ))
+    })
 }
 
 fn operation_specific_compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
@@ -9112,6 +12152,10 @@ fn operation_specific_compensation_request(plan: &PlanV1) -> Result<Option<Compe
         web_analytics_rum_compensation_request(plan)?
     } else if is_dns_record_update_mutation(&plan.capability) {
         dns_record_compensation_request(plan)?
+    } else if should_bind_same_path_prior_state(&plan.capability) {
+        same_path_prior_state_compensation_request(plan)?
+    } else if plan.capability.id == SECURITY_LIST_MEMBER_CREATE_ID {
+        async_list_member_compensation_request(plan)?
     } else {
         return Ok(None);
     };
@@ -9152,12 +12196,13 @@ fn compensation_request(plan: &PlanV1) -> Result<Option<CompensationRequest>> {
             ..CallInput::default()
         },
         requested_account: Some(plan.account_id.clone()),
+        adapter_targets: json!({}),
     }))
 }
 
 fn created_resource_compensation_target(
     plan: &PlanV1,
-    resource_id: &str,
+    resource_id: &Value,
 ) -> Result<Option<CompensationTarget>> {
     let (capability_id, expected_method, expected_path, selectors, body) = match plan
         .capability
@@ -9168,17 +12213,18 @@ fn created_resource_compensation_target(
             "account-api-tokens-delete-token".to_owned(),
             "DELETE".to_owned(),
             "/accounts/{account_id}/tokens/{token_id}".to_owned(),
-            json!({"account_id": plan.account_id, "token_id": resource_id}),
+            json!({"account_id": plan.account_id, "token_id": string_compensation_resource_id(plan, resource_id)?}),
             None,
         ),
         "user-api-tokens-create-token" => (
             "user-api-tokens-delete-token".to_owned(),
             "DELETE".to_owned(),
             "/user/tokens/{token_id}".to_owned(),
-            json!({"token_id": resource_id}),
+            json!({"token_id": string_compensation_resource_id(plan, resource_id)?}),
             None,
         ),
         "dns-records-for-a-zone-create-dns-record" => {
+            let resource_id = string_compensation_resource_id(plan, resource_id)?;
             let input: CallInput = serde_json::from_value(plan.input.clone())?;
             let zone_id = input
                 .selectors
@@ -9243,7 +12289,7 @@ fn created_resource_compensation_target(
 
 fn generic_created_resource_compensation(
     plan: &PlanV1,
-    resource_id: &str,
+    resource_id: &Value,
 ) -> Result<(String, String, Value)> {
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
     let mut selectors = input.selectors.as_object().cloned().ok_or_else(|| {
@@ -9270,16 +12316,19 @@ fn generic_created_resource_compensation(
                 target.identity_selector
             ),
         )
+    } else if let Some(target) = plan.capability.created_nested_resource.as_ref() {
+        (
+            target.identity_selector.as_str(),
+            target.delete_capability_id.clone(),
+            target.delete_path.clone(),
+        )
     } else {
         return Err(CliError::Input(
                 "the rollback strategy names created-resource deletion, but the hash-bound resource target is absent"
                     .to_owned(),
             ));
     };
-    selectors.insert(
-        identity_selector.to_owned(),
-        Value::String(resource_id.to_owned()),
-    );
+    selectors.insert(identity_selector.to_owned(), resource_id.clone());
     Ok((
         delete_capability_id,
         expected_path,
@@ -9301,6 +12350,10 @@ fn bind_required_empty_compensation_body(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "rectification must keep transaction-journal, boundary, verification, compensation, and terminal-state decisions visible as one recovery state machine"
+)]
 async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
     let _plan_lock = store.lock_plan(&selector.operation_id)?;
     let plan = load_validated_plan(store, &selector.operation_id)?;
@@ -9324,6 +12377,43 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
             .iter()
             .find(|checkpoint| checkpoint.stage == TransactionStageV1::BoundaryResponsePersisted)
             .and_then(|checkpoint| checkpoint.artifact_hash.as_deref());
+        let mut compensation_targets = request
+            .adapter_targets
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        compensation_targets.insert(
+            "compensates_operation_id".to_owned(),
+            Value::String(plan.operation_id.clone()),
+        );
+        compensation_targets.insert(
+            "compensates_capability_id".to_owned(),
+            Value::String(plan.capability.id.clone()),
+        );
+        compensation_targets.insert(
+            "compensation_strategy".to_owned(),
+            serde_json::to_value(&plan.capability.rollback.strategy)?,
+        );
+        compensation_targets.insert(
+            "source_receipt_hash".to_owned(),
+            serde_json::to_value(source_receipt_hash)?,
+        );
+        compensation_targets.insert(
+            "source_precondition_hash".to_owned(),
+            serde_json::to_value(
+                plan.precondition_hashes
+                    .get("global_warp_override_state")
+                    .or_else(|| {
+                        plan.precondition_hashes
+                            .get(D1_READ_REPLICATION_PRECONDITION)
+                    })
+                    .or_else(|| plan.precondition_hashes.get(DNS_RECORD_STATE_PRECONDITION))
+                    .or_else(|| {
+                        plan.precondition_hashes
+                            .get(SECURITY_ACTION_STATE_PRECONDITION)
+                    }),
+            )?,
+        );
         let mut envelope = create_plan(
             store,
             &catalog,
@@ -9331,17 +12421,7 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
             request.input,
             Some(&plan.profile_id),
             request.requested_account.as_deref(),
-            json!({
-                "compensates_operation_id": plan.operation_id,
-                "compensates_capability_id": plan.capability.id,
-                "compensation_strategy": plan.capability.rollback.strategy,
-                "source_receipt_hash": source_receipt_hash,
-                "source_precondition_hash": plan
-                    .precondition_hashes
-                    .get("global_warp_override_state")
-                    .or_else(|| plan.precondition_hashes.get(D1_READ_REPLICATION_PRECONDITION))
-                    .or_else(|| plan.precondition_hashes.get(DNS_RECORD_STATE_PRECONDITION)),
-            }),
+            Value::Object(compensation_targets),
         )
         .await?;
         "plans rectify".clone_into(&mut envelope.command);
@@ -9382,19 +12462,29 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
 
 async fn keys_command(store: &StateStore, command: KeysCommand) -> Result<ResultEnvelopeV2> {
     match command {
-        KeysCommand::Permissions(arguments) => key_permissions(store, &arguments).await,
+        KeysCommand::Permissions(arguments) => Box::pin(key_permissions(store, &arguments)).await,
         KeysCommand::Mint(arguments) => {
             preflight_standing_authority(store, arguments.under_policy.as_deref())?;
-            let plan = key_mint(store, &arguments).await?;
-            finish_standing_run(store, plan, arguments.under_policy.as_deref()).await
+            let plan = Box::pin(key_mint(store, &arguments)).await?;
+            Box::pin(finish_standing_run(
+                store,
+                plan,
+                arguments.under_policy.as_deref(),
+            ))
+            .await
         }
         KeysCommand::Rotate(arguments) => key_rotate(store, &arguments).await,
         KeysCommand::Revoke(arguments) => {
             preflight_standing_authority(store, arguments.under_policy.as_deref())?;
             let plan = key_revoke(store, &arguments).await?;
-            finish_standing_run(store, plan, arguments.under_policy.as_deref()).await
+            Box::pin(finish_standing_run(
+                store,
+                plan,
+                arguments.under_policy.as_deref(),
+            ))
+            .await
         }
-        KeysCommand::Policy(arguments) => key_policy(store, arguments.command).await,
+        KeysCommand::Policy(arguments) => Box::pin(key_policy(store, arguments.command)).await,
     }
 }
 
@@ -9425,12 +12515,17 @@ async fn finish_standing_run(
             "a standing run requires the plan envelope to carry an operation id".to_owned(),
         ));
     };
-    run_plan_under_standing_authority(store, &operation_id, authority_id).await
+    Box::pin(run_plan_under_standing_authority(
+        store,
+        &operation_id,
+        authority_id,
+    ))
+    .await
 }
 
 async fn key_policy(store: &StateStore, command: KeyPolicyCommand) -> Result<ResultEnvelopeV2> {
     match command {
-        KeyPolicyCommand::Create(arguments) => key_policy_create(store, &arguments).await,
+        KeyPolicyCommand::Create(arguments) => Box::pin(key_policy_create(store, &arguments)).await,
         KeyPolicyCommand::List => key_policy_list(store),
         KeyPolicyCommand::Approve(arguments) => key_policy_approve(store, &arguments),
         KeyPolicyCommand::Revoke(selector) => key_policy_revoke(store, &selector),
@@ -9457,14 +12552,14 @@ async fn key_policy_create(
             "`--max-child-ttl-hours` and `--max-runs-per-day` must both be at least 1".to_owned(),
         ));
     }
-    let inventory = key_permissions(
+    let inventory = Box::pin(key_permissions(
         store,
         &KeyPermissionArgs {
             profile: None,
             account: arguments.account.clone(),
             user: false,
         },
-    )
+    ))
     .await?;
     if !inventory.ok
         || !inventory.performed
@@ -9637,7 +12732,7 @@ async fn key_permissions(
     store: &StateStore,
     arguments: &KeyPermissionArgs,
 ) -> Result<ResultEnvelopeV2> {
-    let envelope = call_command(store, permission_inventory_call(arguments)).await?;
+    let envelope = Box::pin(call_command(store, permission_inventory_call(arguments))).await?;
     Ok(permission_inventory_envelope(envelope))
 }
 
@@ -9662,6 +12757,8 @@ fn permission_inventory_call(arguments: &KeyPermissionArgs) -> CallArgs {
         if_match: None,
         if_none_match: None,
         value_out: None,
+        credential_in: None,
+        out: None,
     }
 }
 
@@ -9711,14 +12808,14 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
     // wrong problem, after spending a live call to find it. The same resolution
     // runs again inside the binding partition below; it is idempotent.
     resolve_mint_token_scope(arguments, account)?;
-    let inventory = key_permissions(
+    let inventory = Box::pin(key_permissions(
         store,
         &KeyPermissionArgs {
             profile: arguments.profile.clone(),
             account: account.to_owned(),
             user: arguments.user,
         },
-    )
+    ))
     .await?;
     if !inventory.ok || !inventory.performed || inventory.account_id.as_deref() != Some(account) {
         return Err(CliError::Input(
@@ -10693,6 +13790,8 @@ fn is_live_plan_precondition_hash(name: &str) -> bool {
             | WARP_CONNECTOR_CONFIGURATION_STATE_PRECONDITION
             | WEB_ANALYTICS_RUM_STATE_PRECONDITION
             | DNS_RECORD_STATE_PRECONDITION
+            | SAME_PATH_PRIOR_STATE_PRECONDITION
+            | SECURITY_ACTION_STATE_PRECONDITION
             | R2_PARENT_TOKEN_PRECONDITION
     )
 }
@@ -10959,7 +14058,11 @@ async fn resolve_command(store: &StateStore, arguments: ResolveArgs) -> Result<R
     // failure surface. `None` means a capability was actionably resolved.
     envelope.ok = error.is_none();
     if envelope.ok {
-        envelope.capability_id = ranked.first().map(|(capability, _)| capability.id.clone());
+        envelope.capability_id = envelope
+            .result
+            .pointer("/resolved/capability_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
     }
     envelope.error = error;
     Ok(envelope)
@@ -10970,6 +14073,10 @@ async fn resolve_command(store: &StateStore, arguments: ResolveArgs) -> Result<R
 /// closed (not actionable) and carries the canonical envelope-level `next_step`;
 /// `None` means an actionable capability was resolved. Deterministic and
 /// side-effect-free so the fail-closed gating is unit-testable without a store.
+#[expect(
+    clippy::too_many_lines,
+    reason = "resolution keeps ambiguity, broad telemetry overviews, selector discrimination, and dangerous-mutation fail-closed behavior in one deterministic decision boundary"
+)]
 fn resolve_result(
     intent: &str,
     ranked: &[(&CapabilityV1, usize)],
@@ -10982,6 +14089,48 @@ fn resolve_result(
         .take(limit)
         .map(|(capability, score)| resolve_candidate_json(capability, *score))
         .collect();
+
+    if is_broad_telemetry_intent(intent) {
+        let reads = ranked
+            .iter()
+            .filter(|(capability, _)| !capability.mutating && capability.workflow.is_none())
+            .take(limit)
+            .map(|(capability, score)| resolve_candidate_json(capability, *score))
+            .collect::<Vec<_>>();
+        let workflows = ranked
+            .iter()
+            .filter(|(capability, _)| capability.workflow.is_some())
+            .take(limit)
+            .map(|(capability, score)| resolve_candidate_json(capability, *score))
+            .collect::<Vec<_>>();
+        let mutations = ranked
+            .iter()
+            .filter(|(capability, _)| capability.mutating)
+            .take(limit)
+            .map(|(capability, score)| resolve_candidate_json(capability, *score))
+            .collect::<Vec<_>>();
+        return (
+            json!({
+                "intent": intent,
+                "matched": candidates,
+                "resolved": {
+                    "kind": "telemetry_domain_overview",
+                    "domains": ["analytics", "logs_observability", "security_response", "data_governance"],
+                    "ranked_reads": reads,
+                    "governed_workflows": workflows,
+                    "mutation_candidates": mutations,
+                    "mutation_selection": "withheld_until_a_specific_capability_is_resolved_and_guided",
+                    "discovery_argv": {
+                        "coverage": ["cfctl", "catalog", "coverage", "--json"],
+                        "search": ["cfctl", "catalog", "search", intent, "--json"]
+                    }
+                },
+                "ambiguous": false,
+                "guidance": "Broad telemetry language returns a domain overview. Choose and inspect one typed capability; cfctl never selects an enforcement or configuration mutation from this overview.",
+            }),
+            None,
+        );
+    }
 
     // No positive-scoring capability: fail closed with discovery guidance.
     let Some((top_capability, top_score)) = ranked.first().map(|(cap, score)| (*cap, *score))
@@ -11056,6 +14205,28 @@ fn resolve_result(
         "guidance": guidance,
     });
     (result, None)
+}
+
+fn is_broad_telemetry_intent(intent: &str) -> bool {
+    let terms = intent
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<BTreeSet<_>>();
+    let has_domain = ["telemetry", "analytics", "observability", "logs"]
+        .iter()
+        .any(|term| terms.contains(*term));
+    let has_specific_discriminator = [
+        "access", "bot", "browser", "cache", "ddos", "dns", "engine", "firewall", "graphql",
+        "hostname", "ip", "logpull", "logpush", "pages", "rate", "rum", "security", "tail",
+        "trace", "waf", "web", "worker", "zero",
+    ]
+    .iter()
+    .any(|term| terms.contains(*term));
+    let asks_for_overview = ["audit", "coverage", "discover", "overview"]
+        .iter()
+        .any(|term| terms.contains(*term));
+    has_domain && !has_specific_discriminator && (asks_for_overview || terms.len() <= 4)
 }
 
 /// Build the `resolved` object for a confident top match: capability metadata,
@@ -11241,6 +14412,7 @@ fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
     if is_secret_output_capability(capability) {
         let sink = if is_access_service_token_create_capability(capability)
             || is_r2_temporary_credentials_operation_identity(capability)
+            || is_worker_tail_create_capability(capability)
         {
             "<new-mode-0600-json-path>"
         } else {
@@ -11295,7 +14467,12 @@ fn guide_next_action(
         gaps.join(" ")
     )
     .to_ascii_lowercase();
-    let (summary, argv) = if should_resolve_zone_entitlement(capability) {
+    let (summary, argv) = if should_resolve_entitlement_probe(capability) {
+        (
+            "Run the exact call to perform the declared read-only product probe. A successful read is hash-bound and rechecked before execution; a rejected read leaves authorization, plan entitlement, and account configuration explicitly unresolved.",
+            call_argv.unwrap_or_default().to_vec(),
+        )
+    } else if should_resolve_zone_entitlement(capability) {
         (
             "Run the exact call to perform the governed live zone-subscription read. cfctl creates a plan only when the active plan is allowed by the official matrix, then binds and rechecks that entitlement before execution.",
             call_argv.unwrap_or_default().to_vec(),
@@ -11371,6 +14548,7 @@ fn guide_next_action(
 enum GuideLiveRead {
     ZoneAccount,
     ZoneEntitlement,
+    ProductEntitlementProbe,
     GlobalWarpOverrideState,
     D1ReadReplicationState,
     CloudflareTunnelConfigurationState,
@@ -11389,6 +14567,10 @@ fn guide_live_reads(capability: &CapabilityV1) -> Vec<GuideLiveRead> {
         (
             should_resolve_zone_entitlement(capability),
             GuideLiveRead::ZoneEntitlement,
+        ),
+        (
+            should_resolve_entitlement_probe(capability),
+            GuideLiveRead::ProductEntitlementProbe,
         ),
         (
             should_bind_global_warp_override_state(capability),
@@ -11442,7 +14624,10 @@ fn guide_stage_contract_state(
         GuideStage::SelectAccount if live_reads.contains(&GuideLiveRead::ZoneAccount) => {
             GuideContractStateV1::LiveReadRequired
         }
-        GuideStage::CheckEntitlement if live_reads.contains(&GuideLiveRead::ZoneEntitlement) => {
+        GuideStage::CheckEntitlement
+            if live_reads.contains(&GuideLiveRead::ZoneEntitlement)
+                || live_reads.contains(&GuideLiveRead::ProductEntitlementProbe) =>
+        {
             GuideContractStateV1::LiveReadRequired
         }
         GuideStage::InspectCurrentState
@@ -11522,6 +14707,13 @@ fn guide_live_read_summary(
                 "Read the exact live zone subscription and evaluate its active plan against the official availability matrix.",
             )
         }
+        GuideStage::CheckEntitlement
+            if live_reads.contains(&GuideLiveRead::ProductEntitlementProbe) =>
+        {
+            Some(
+                "Run the declared read-only product capability. A successful response proves present API access; a rejection remains ambiguous between token permission, plan entitlement, and account configuration.",
+            )
+        }
         GuideStage::InspectCurrentState
             if live_reads.contains(&GuideLiveRead::GlobalWarpOverrideState) =>
         {
@@ -11571,7 +14763,10 @@ fn guide_stage_uses_live_read(stage: cfctl_core::GuideStage, live_reads: &[Guide
 
     match stage {
         GuideStage::SelectAccount => live_reads.contains(&GuideLiveRead::ZoneAccount),
-        GuideStage::CheckEntitlement => live_reads.contains(&GuideLiveRead::ZoneEntitlement),
+        GuideStage::CheckEntitlement => {
+            live_reads.contains(&GuideLiveRead::ZoneEntitlement)
+                || live_reads.contains(&GuideLiveRead::ProductEntitlementProbe)
+        }
         GuideStage::InspectCurrentState => live_reads.iter().any(|read| {
             matches!(
                 read,
@@ -11983,6 +15178,24 @@ fn sink_secret_result(plan: &PlanV1, result: &Value) -> Result<PathBuf> {
 }
 
 fn secret_sink_payload(capability: &CapabilityV1, result: &Value) -> Result<Vec<u8>> {
+    if is_worker_tail_create_capability(capability) {
+        let required = |field: &'static str| {
+            result
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    CliError::Input(format!(
+                        "Cloudflare reported Worker tail creation success without non-empty `{field}`; no lease sink was created and the operation requires rectification"
+                    ))
+                })
+        };
+        return Ok(serde_json::to_vec(&json!({
+            "expires_at": required("expires_at")?,
+            "id": required("id")?,
+            "url": required("url")?,
+        }))?);
+    }
     if is_r2_temporary_credentials_operation_identity(capability) {
         let required = |field: &'static str| {
             result
@@ -12068,6 +15281,8 @@ fn is_access_service_token_create_capability(capability: &CapabilityV1) -> bool 
 fn secret_sink_format(capability: &CapabilityV1) -> Option<&'static str> {
     if !is_secret_output_capability(capability) {
         None
+    } else if is_worker_tail_create_capability(capability) {
+        Some("worker_tail_lease_json")
     } else if is_r2_temporary_credentials_operation_identity(capability) {
         Some("r2_temporary_credentials_json")
     } else if is_access_service_token_create_capability(capability) {
@@ -12100,6 +15315,26 @@ fn should_redact_secret_response(capability: &CapabilityV1) -> bool {
     capability.risk == RiskClass::SecretSensitive
         || is_access_service_token_create_capability(capability)
         || is_r2_temporary_credentials_operation_identity(capability)
+}
+
+fn is_worker_tail_create_capability(capability: &CapabilityV1) -> bool {
+    capability.id == "worker-tail-logs-start-tail"
+        && capability.method == "POST"
+        && capability.path == "/accounts/{account_id}/workers/scripts/{script_name}/tails"
+        && capability.product == "Worker Tail Logs"
+        && capability.account_scope == "account"
+        && capability.permissions == ["Workers Tail Read", "Workers Scripts Write"]
+        && capability.verification.strategy == "worker_tail_collection_contains_created_lease_id"
+}
+
+fn is_worker_tail_response_capability(capability: &CapabilityV1) -> bool {
+    is_worker_tail_create_capability(capability)
+        || (capability.id == "worker-tail-logs-list-tails"
+            && capability.method == "GET"
+            && capability.path == "/accounts/{account_id}/workers/scripts/{script_name}/tails"
+            && capability.product == "Worker Tail Logs"
+            && capability.account_scope == "account"
+            && capability.permissions == ["Workers Tail Read"])
 }
 
 fn is_worker_script_secret_input_only_capability(capability: &CapabilityV1) -> bool {
@@ -12149,6 +15384,43 @@ fn redact_secret_result(value: &Value) -> Value {
         return Value::Object(redacted);
     }
     redact_secret_payload(value, true)
+}
+
+fn redact_response_for_capability(capability: &CapabilityV1, value: &Value) -> Value {
+    let redacted = if should_redact_secret_response(capability) {
+        redact_secret_result(value)
+    } else {
+        value.clone()
+    };
+    if is_worker_tail_response_capability(capability) {
+        redact_field_recursively(&redacted, "url")
+    } else {
+        redacted
+    }
+}
+
+fn redact_field_recursively(value: &Value, field: &str) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, item)| {
+                    if key == field {
+                        (key.clone(), Value::String("[SUNK]".to_owned()))
+                    } else {
+                        (key.clone(), redact_field_recursively(item, field))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|item| redact_field_recursively(item, field))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
 }
 
 fn redact_secret_payload(value: &Value, root: bool) -> Value {
@@ -12265,10 +15537,14 @@ fn read_import_secret(from_stdin: bool, value_in: Option<&Path>, label: &str) ->
 /// other permission bit fails closed, mirroring the mode-0600 sink that
 /// `--value-out` writes.
 fn read_secret_file(path: &Path) -> Result<String> {
+    read_private_secret_file(path, "--value-in")
+}
+
+fn read_private_secret_file(path: &Path, option: &str) -> Result<String> {
     let metadata = fs::metadata(path).map_err(|source| cli_io(path, source))?;
     if !metadata.is_file() {
         return Err(CliError::Input(format!(
-            "`--value-in` path is not a regular file: {}",
+            "`{option}` path is not a regular file: {}",
             path.display()
         )));
     }
@@ -12278,7 +15554,7 @@ fn read_secret_file(path: &Path) -> Result<String> {
         let mode = metadata.permissions().mode();
         if mode & 0o077 != 0 {
             return Err(CliError::Input(format!(
-                "`--value-in` file {} must not be readable by group or others; run `chmod 600 {}` (current mode {:04o})",
+                "`{option}` file {} must not be readable by group or others; run `chmod 600 {}` (current mode {:04o})",
                 path.display(),
                 path.display(),
                 mode & 0o7777
@@ -12286,6 +15562,41 @@ fn read_secret_file(path: &Path) -> Result<String> {
         }
     }
     fs::read_to_string(path).map_err(|source| cli_io(path, source))
+}
+
+fn read_r2_log_retrieval_credentials(path: &Path) -> Result<R2LogRetrievalCredentials> {
+    let content = read_private_secret_file(path, "--credential-in")?;
+    let value: Value = serde_json::from_str(&content).map_err(|_| {
+        CliError::Input(
+            "`--credential-in` must contain one valid JSON object; credential contents were not logged"
+                .to_owned(),
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        CliError::Input("`--credential-in` must contain one JSON object".to_owned())
+    })?;
+    let expected = BTreeSet::from(["access_key_id", "secret_access_key"]);
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(CliError::Input(
+            "`--credential-in` must contain exactly `access_key_id` and `secret_access_key`; unknown or missing fields are rejected"
+                .to_owned(),
+        ));
+    }
+    let access_key_id = object
+        .get("access_key_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("credential field `access_key_id` must be a string".to_owned())
+        })?;
+    let secret_access_key = object
+        .get("secret_access_key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("credential field `secret_access_key` must be a string".to_owned())
+        })?;
+    R2LogRetrievalCredentials::new(access_key_id.to_owned(), secret_access_key.to_owned())
+        .map_err(CliError::from)
 }
 
 fn docs_file(store: &StateStore) -> PathBuf {
@@ -12360,26 +15671,32 @@ mod tests {
     use super::{
         CallInput, DNS_RECORD_DETAIL_PATH, DNS_RECORD_DETAIL_READ_CAPABILITY_ID,
         DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
-        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, TokenPolicyBinding,
-        admit_standing_plan, apply_cloudflare_tunnel_configuration_state_response,
+        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, SECURITY_IP_RULE_COLLECTION_PATH,
+        SECURITY_IP_RULE_CREATE_ID, SECURITY_IP_RULE_STATE_CAPABILITY_ID,
+        SECURITY_LIST_MEMBER_COLLECTION_PATH, SECURITY_LIST_MEMBER_CREATE_ID,
+        SECURITY_LIST_MEMBER_REMOVE_ID, SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
+        SECURITY_WAF_RULE_STATE_CAPABILITY_ID, TokenPolicyBinding, admit_standing_plan,
+        apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
-        apply_dns_record_state_response, apply_global_warp_override_state_response,
-        apply_kv_empty_namespace_state_response, apply_oauth_client_secret_state_response,
-        apply_r2_parent_token_response, apply_warp_connector_configuration_state_response,
-        apply_web_analytics_rum_state_response, apply_zone_account_response,
-        apply_zone_entitlement_response, approve_plan, bind_required_empty_compensation_body,
-        blocked_capability_envelope, boundary_response_artifact, build_mint_policy_body,
-        call_command, cancel_plan, capability_call_argv, compensation_request, execute_read,
+        apply_dns_record_state_response, apply_entitlement_probe_response,
+        apply_global_warp_override_state_response, apply_kv_empty_namespace_state_response,
+        apply_oauth_client_secret_state_response, apply_r2_parent_token_response,
+        apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
+        apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
+        bind_required_empty_compensation_body, blocked_capability_envelope,
+        boundary_response_artifact, build_mint_policy_body, call_command, cancel_plan,
+        capability_call_argv, compensation_request, entitlement_probe_selectors, execute_read,
         find_secret_value, force_ipv4_from, guide_document, guide_stage_commands, http_client,
         is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
-        key_policy_list, key_policy_revoke, non_readback_verification_basis,
-        permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
-        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
-        plan_state_next_step, plan_status_label, preflight_call_input,
-        preflight_standing_authority, prepare_r2_temporary_credentials_input,
-        preserve_previous_catalog, query_object_from_pairs, read_import_secret, read_secret_file,
-        reconcile_standing_lineage_from_plan, rectify_plan, redact_secret_payload,
-        redact_secret_result, request_body_contains_secret,
+        key_policy_list, key_policy_revoke, list_security_action_state_receipt,
+        non_readback_verification_basis, permission_inventory_call, permission_inventory_envelope,
+        persist_prepared_plan, persist_secret_lifecycle,
+        persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
+        preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
+        prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
+        read_import_secret, read_r2_log_retrieval_credentials, read_secret_file,
+        reconcile_standing_lineage_from_plan, rectify_plan, redact_response_for_capability,
+        redact_secret_payload, redact_secret_result, request_body_contains_secret,
         required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
@@ -12393,16 +15710,17 @@ mod tests {
         should_bind_dns_record_state, should_bind_global_warp_override_state,
         should_bind_kv_empty_namespace_state, should_bind_oauth_client_secret_state,
         should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
-        should_bind_zone_account, should_redact_secret_response, should_resolve_zone_entitlement,
-        sink_secret_result, store_imported_api_token, validate_api_token_creation_contract,
-        validate_current_permission_groups, validate_entitlement_receipt_precondition,
+        should_bind_zone_account, should_redact_secret_response, should_resolve_entitlement_probe,
+        should_resolve_zone_entitlement, sink_secret_result, store_imported_api_token,
+        validate_api_token_creation_contract, validate_current_permission_groups,
+        validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
-        validate_permission_group_resource_scope, validate_selected_permission_groups,
-        validate_standing_authority_group_scopes, validate_standing_authority_permission_inventory,
-        validate_token_policy_body, validate_worker_script_secret_semantics,
-        validate_zone_account_receipt_precondition, validate_zone_id,
-        validated_standing_lineage_token_id, verification_outcome, workspace_resource_keys,
-        wrangler_config_directory, wrangler_deploy_version_id,
+        validate_permission_group_resource_scope, validate_request_contract,
+        validate_selected_permission_groups, validate_standing_authority_group_scopes,
+        validate_standing_authority_permission_inventory, validate_token_policy_body,
+        validate_worker_script_secret_semantics, validate_zone_account_receipt_precondition,
+        validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
+        workspace_resource_keys, wrangler_config_directory, wrangler_deploy_version_id,
         wrangler_status_has_promoted_version, zone_target,
     };
     use crate::profiles::ProfilesConfig;
@@ -12414,11 +15732,15 @@ mod tests {
     use cfctl_catalog::CatalogSnapshot;
     use cfctl_cloudflare::{CloudflareApiErrorV1, CloudflareResponseV1, OperationVerificationV1};
     use cfctl_core::{
-        AdapterStatus, CapabilityV1, CostV1, CreatedCollectionResourceContractV1,
-        CreatedResourceContractV1, EffectClass, EvidenceClass, EvidenceV1, PlanStatus, PlanV1,
-        QuerySerializationV1, ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES,
-        SamePathReadContractV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
-        StandingAuthorityV1, TransactionStageV1, VerificationState, hash_value,
+        AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
+        AsyncCollectionMutationContractV1, CapabilityV1, CostV1,
+        CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
+        CreatedResourceContractV1, EffectClass, EntitlementProbeV1, EvidenceClass, EvidenceV1,
+        OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1, QuerySerializationV1,
+        ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1,
+        SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
+        SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
+        TransactionStageV1, VerificationState, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -12433,6 +15755,771 @@ mod tests {
 
     fn guide_json(capability: &CapabilityV1) -> Value {
         serde_json::to_value(guide_document(capability)).expect("typed capability guide JSON")
+    }
+
+    fn security_action_create_capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            SECURITY_IP_RULE_CREATE_ID,
+            "Create expiring security action",
+            "POST",
+            SECURITY_IP_RULE_COLLECTION_PATH,
+        );
+        capability.product = "IP Access rules for a zone".to_owned();
+        capability.permissions = vec![
+            "Firewall Services Read".to_owned(),
+            "Firewall Services Write".to_owned(),
+        ];
+        capability.selectors = vec![SelectorV1 {
+            name: "zone_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        }];
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":["configuration","mode","notes"],
+            "properties":{
+                "configuration":{"type":"object"},
+                "mode":{"type":"string","enum":["managed_challenge","block"]},
+                "notes":{"type":"string","maxLength":500}
+            },
+            "x-cfctl-body-required":true
+        }));
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.verification.strategy =
+            "parent_collection_contains_created_resource_id_and_planned_fields".to_owned();
+        capability.created_collection_resource = Some(CreatedCollectionResourceContractV1 {
+            collection_path: SECURITY_IP_RULE_COLLECTION_PATH.to_owned(),
+            identity_selector: "rule_id".to_owned(),
+            response_result_identity_pointer: "/id".to_owned(),
+            response_item_identity_pointer: "/id".to_owned(),
+            read_capability_id: SECURITY_IP_RULE_STATE_CAPABILITY_ID.to_owned(),
+            delete_capability_id: "ip-access-rules-for-a-zone-delete-an-ip-access-rule".to_owned(),
+            verified_response_fields: vec![
+                "configuration".to_owned(),
+                "mode".to_owned(),
+                "notes".to_owned(),
+            ],
+            requires_page_number_completion: true,
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.security_action = Some(SecurityActionContractV1 {
+            kind: SecurityActionKindV1::CreateExpiring,
+            input_schema: json!({
+                "type":"object",
+                "additionalProperties":false,
+                "required":["actor","evidence_ref","reason","target"],
+                "properties":{
+                    "action":{"type":"string","enum":["managed_challenge","block"]},
+                    "actor":{"type":"string","minLength":1,"maxLength":80},
+                    "evidence_ref":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+                    "expires_at":{"type":"string","format":"date-time"},
+                    "reason":{"type":"string","minLength":4,"maxLength":160},
+                    "target":{"type":"object","additionalProperties":false,"required":["type","value"],"properties":{"type":{"type":"string","enum":["ip","ip_range","asn","country"]},"value":{"type":"string"}}},
+                    "operator_ip":{"type":"string"},
+                    "confirm_broad_scope":{"type":"boolean"},
+                    "confirm_block":{"type":"boolean"}
+                },
+                "x-cfctl-body-required":true
+            }),
+            default_action: Some("managed_challenge".to_owned()),
+            allowed_actions: vec!["managed_challenge".to_owned(), "block".to_owned()],
+            allowed_target_types: vec![
+                "asn".to_owned(),
+                "country".to_owned(),
+                "ip".to_owned(),
+                "ip_range".to_owned(),
+            ],
+            default_ttl_seconds: 86_400,
+            max_ttl_seconds: 604_800,
+            current_state_capability_id: SECURITY_IP_RULE_STATE_CAPABILITY_ID.to_owned(),
+            safety_profile: SecurityActionSafetyProfileV1::TelemetryDerivedStrict,
+        });
+        capability
+    }
+
+    fn list_security_action_create_capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            SECURITY_LIST_MEMBER_CREATE_ID,
+            "Add expiring List member",
+            "POST",
+            SECURITY_LIST_MEMBER_COLLECTION_PATH,
+        );
+        capability.product = "Lists".to_owned();
+        capability.account_scope = "account".to_owned();
+        capability.permissions = vec![
+            "Account Filter Lists Edit".to_owned(),
+            "Account Filter Lists Read".to_owned(),
+        ];
+        capability.selectors = ["account_id", "list_id"]
+            .into_iter()
+            .map(|name| SelectorV1 {
+                name: name.to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            })
+            .collect();
+        capability.request_schema = Some(json!({
+            "type":"array",
+            "minItems":1,
+            "maxItems":1,
+            "items":{"type":"object"},
+            "x-cfctl-body-required":true
+        }));
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.verification.strategy =
+            "async_list_operation_completes_and_correlated_member_exists".to_owned();
+        capability.async_collection_mutation = Some(AsyncCollectionMutationContractV1 {
+            operation_status_path:
+                "/accounts/{account_id}/rules/lists/bulk_operations/{operation_id}".to_owned(),
+            operation_status_capability_id: "lists-get-bulk-operation-status".to_owned(),
+            operation_id_selector: "operation_id".to_owned(),
+            apply_operation_id_pointer: "/operation_id".to_owned(),
+            status_operation_id_pointer: "/id".to_owned(),
+            status_state_pointer: "/status".to_owned(),
+            pending_states: vec!["pending".to_owned(), "running".to_owned()],
+            completed_state: "completed".to_owned(),
+            failed_state: "failed".to_owned(),
+            max_poll_attempts: 30,
+            poll_interval_ms: 1_000,
+            collection_path: SECURITY_LIST_MEMBER_COLLECTION_PATH.to_owned(),
+            collection_capability_id: "lists-get-list-items".to_owned(),
+            collection_metadata_path: "/accounts/{account_id}/rules/lists/{list_id}".to_owned(),
+            collection_metadata_capability_id: "lists-get-a-list".to_owned(),
+            collection_item_identity_pointer: "/id".to_owned(),
+            correlation_field: Some("comment".to_owned()),
+            remove_capability_id: Some(SECURITY_LIST_MEMBER_REMOVE_ID.to_owned()),
+            requires_cursor_completion: true,
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy =
+            Some("remove_async_created_list_member_by_correlated_id".to_owned());
+        capability.security_action = Some(SecurityActionContractV1 {
+            kind: SecurityActionKindV1::AddExpiringListMember,
+            input_schema: json!({
+                "type":"object",
+                "additionalProperties":false,
+                "required":["actor","confirm_consumer_scope","evidence_ref","reason","target"],
+                "properties":{
+                    "action":{"type":"string","enum":["managed_challenge","block"]},
+                    "actor":{"type":"string","minLength":1,"maxLength":80},
+                    "confirm_block":{"type":"boolean"},
+                    "confirm_broad_scope":{"type":"boolean"},
+                    "confirm_consumer_scope":{"type":"boolean"},
+                    "evidence_ref":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+                    "expires_at":{"type":"string","format":"date-time"},
+                    "operator_ip":{"type":"string"},
+                    "reason":{"type":"string","minLength":4,"maxLength":160},
+                    "target":{"type":"object","additionalProperties":false,"required":["type","value"],"properties":{"type":{"type":"string","enum":["asn","hostname","ip","ip_range"]},"value":{"type":"string"}}}
+                },
+                "x-cfctl-body-required":true
+            }),
+            default_action: Some("managed_challenge".to_owned()),
+            allowed_actions: vec!["managed_challenge".to_owned(), "block".to_owned()],
+            allowed_target_types: vec![
+                "asn".to_owned(),
+                "hostname".to_owned(),
+                "ip".to_owned(),
+                "ip_range".to_owned(),
+            ],
+            default_ttl_seconds: 86_400,
+            max_ttl_seconds: 604_800,
+            current_state_capability_id: "lists-get-list-items".to_owned(),
+            safety_profile: SecurityActionSafetyProfileV1::TelemetryDerivedStrict,
+        });
+        capability
+    }
+
+    #[test]
+    fn list_security_action_requires_consumer_review_and_renders_one_correlated_item() {
+        let capability = list_security_action_create_capability();
+        assert!(capability.security_action_contract_supported());
+        let mut input = CallInput {
+            selectors: json!({
+                "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "list_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            }),
+            body: Some(json!({
+                "actor":"operator@example.test",
+                "confirm_consumer_scope":true,
+                "evidence_ref":format!("sha256:{}", "a".repeat(64)),
+                "reason":"Repeated malicious requests in a bounded telemetry window",
+                "target":{"type":"hostname","value":"Example.COM"}
+            })),
+            ..CallInput::default()
+        };
+        let receipt = prepare_security_action_input(&capability, &mut input)
+            .expect("safe List action")
+            .expect("governance receipt");
+        assert_eq!(receipt["kind"], "add_expiring_list_member");
+        assert_eq!(receipt["expected_consumer_action"], "managed_challenge");
+        assert_eq!(receipt["target"]["value"], "example.com");
+        let wire = input
+            .body
+            .as_ref()
+            .and_then(Value::as_array)
+            .expect("wire array");
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0]["hostname"]["url_hostname"], "example.com");
+        assert!(wire[0]["comment"].as_str().is_some_and(|comment| {
+            comment.contains("cfctl_list_security_v1") && !comment.contains("example.com")
+        }));
+
+        let mut unreviewed = CallInput {
+            selectors: input.selectors.clone(),
+            body: Some(json!({
+                "actor":"operator@example.test",
+                "evidence_ref":format!("sha256:{}", "b".repeat(64)),
+                "reason":"Suspicious source",
+                "target":{"type":"ip","value":"1.1.1.1"}
+            })),
+            ..CallInput::default()
+        };
+        assert!(
+            prepare_security_action_input(&capability, &mut unreviewed)
+                .expect_err("consumer scope must be explicit")
+                .to_string()
+                .contains("confirm_consumer_scope")
+        );
+
+        let mut self_block = CallInput {
+            selectors: input.selectors,
+            body: Some(json!({
+                "action":"block",
+                "actor":"operator@example.test",
+                "confirm_block":true,
+                "confirm_consumer_scope":true,
+                "evidence_ref":format!("sha256:{}", "c".repeat(64)),
+                "operator_ip":"1.1.1.1",
+                "reason":"Confirmed malicious source",
+                "target":{"type":"ip","value":"1.1.1.1"}
+            })),
+            ..CallInput::default()
+        };
+        assert!(
+            prepare_security_action_input(&capability, &mut self_block)
+                .expect_err("self block must fail")
+                .to_string()
+                .contains("operator IP")
+        );
+    }
+
+    #[test]
+    fn list_security_preflight_rejects_live_duplicates_and_proves_cursor_completion() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = list_security_action_create_capability();
+        let mut input = CallInput {
+            selectors: json!({
+                "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "list_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            }),
+            body: Some(json!({
+                "actor":"operator@example.test",
+                "confirm_consumer_scope":true,
+                "evidence_ref":format!("sha256:{}", "e".repeat(64)),
+                "reason":"Repeated malicious requests in a bounded telemetry window",
+                "target":{"type":"ip","value":"1.1.1.1"}
+            })),
+            ..CallInput::default()
+        };
+        let receipt = prepare_security_action_input(&capability, &mut input)
+            .expect("safe List action")
+            .expect("governance receipt");
+        let adapter_targets = json!({"security_action":receipt});
+        let metadata = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({"id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","kind":"ip"}),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let duplicate = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!([{
+                "id":"cccccccccccccccccccccccccccccccc",
+                "comment":"preexisting",
+                "ip":"1.1.1.1"
+            }]),
+            errors: Vec::new(),
+            result_info: Some(json!({"cfctl_cursor_complete":true})),
+            etag: None,
+            cf_ray: None,
+        };
+        assert!(
+            list_security_action_state_receipt(
+                &store,
+                &capability,
+                &input,
+                &adapter_targets,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &metadata,
+                &duplicate,
+            )
+            .expect_err("duplicate target must fail")
+            .to_string()
+            .contains("already has 1")
+        );
+
+        let empty = CloudflareResponseV1 {
+            result: json!([]),
+            ..duplicate
+        };
+        let state = list_security_action_state_receipt(
+            &store,
+            &capability,
+            &input,
+            &adapter_targets,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &metadata,
+            &empty,
+        )
+        .expect("complete empty List state");
+        assert_eq!(state["state"]["matching_member_count"], 0);
+        assert_eq!(state["list_kind"], "ip");
+        assert!(!state.to_string().contains("1.1.1.1"));
+    }
+
+    #[test]
+    fn list_rectification_uses_only_correlated_verification_identity() {
+        let capability = list_security_action_create_capability();
+        let evidence_ref = format!("sha256:{}", "d".repeat(64));
+        let expires_at = (Utc::now() + ChronoDuration::hours(1)).to_rfc3339();
+        let security_action = json!({
+            "schema_version":1,
+            "kind":"add_expiring_list_member",
+            "actor":"operator@example.test",
+            "evidence_ref":evidence_ref,
+            "expires_at":expires_at,
+            "reason":"Bounded suspicious source",
+        });
+        let selectors = json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "list_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        });
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "catalog-sha",
+            capability,
+            json!({"selectors":selectors,"adapter":{"security_action":security_action}}),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors,
+            query: json!({}),
+            body: Some(json!([{
+                "comment":"correlated-audit-comment",
+                "ip":"1.1.1.1"
+            }])),
+            ..CallInput::default()
+        })
+        .expect("input");
+        plan.refresh_hash()
+            .expect("refresh hash after binding input");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"success":true,"operation_id":"bulk-1"}),
+        )
+        .expect("boundary");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::SecretSinkPersisted,
+            json!({"completed":true}),
+        )
+        .expect("sink checkpoint");
+        plan.record_transaction_stage(TransactionStageV1::VerificationAttemptPersisted)
+            .expect("verification attempt");
+        let member_id = "cccccccccccccccccccccccccccccccc";
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::VerificationResponsePersisted,
+            json!({"state":"passed","resource_id":member_id}),
+        )
+        .expect("verification response");
+        plan.status = PlanStatus::RectificationRequired;
+
+        let request = compensation_request(&plan)
+            .expect("request resolves")
+            .expect("correlated compensation");
+        assert_eq!(request.capability_id, SECURITY_LIST_MEMBER_REMOVE_ID);
+        assert_eq!(request.expected_method, "DELETE");
+        assert_eq!(
+            request.input.body,
+            Some(json!({"items":[{"id":member_id}]}))
+        );
+        assert_eq!(
+            request
+                .adapter_targets
+                .pointer("/security_action/member_id"),
+            Some(&json!(member_id))
+        );
+        assert_eq!(
+            request
+                .adapter_targets
+                .pointer("/security_action/source_operation_id"),
+            Some(&json!(plan.operation_id))
+        );
+    }
+
+    fn waf_security_action_create_capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            SECURITY_WAF_RULE_CREATE_ID,
+            "Create expiring WAF action",
+            "POST",
+            "/zones/{zone_id}/rulesets/{ruleset_id}/rules",
+        );
+        capability.product = "WAF custom rules".to_owned();
+        capability.permissions = vec!["Zone WAF Read".to_owned(), "Zone WAF Write".to_owned()];
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":["action","description","enabled","expression","ref"],
+            "properties":{
+                "action":{"type":"string","enum":["block","js_challenge","log","managed_challenge","skip"]},
+                "action_parameters":{"type":"object"},
+                "description":{"type":"string"},
+                "enabled":{"type":"boolean","const":true},
+                "expression":{"type":"string"},
+                "ref":{"type":"string"}
+            },
+            "x-cfctl-body-required":true
+        }));
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.cost.known = true;
+        capability.cost.maximum = Some(0.0);
+        capability.verification.required = true;
+        capability.verification.strategy =
+            "parent_object_contains_created_nested_resource_by_correlation".to_owned();
+        capability.created_nested_resource = Some(CreatedNestedResourceContractV1 {
+            parent_path: SECURITY_WAF_RULE_PARENT_PATH.to_owned(),
+            items_pointer: "/rules".to_owned(),
+            identity_selector: "rule_id".to_owned(),
+            response_item_identity_pointer: "/id".to_owned(),
+            correlation_field: "ref".to_owned(),
+            read_capability_id: SECURITY_WAF_RULE_STATE_CAPABILITY_ID.to_owned(),
+            delete_capability_id: "deleteZoneRulesetRule".to_owned(),
+            delete_path: "/zones/{zone_id}/rulesets/{ruleset_id}/rules/{rule_id}".to_owned(),
+            verified_response_fields: vec![
+                "action".to_owned(),
+                "action_parameters".to_owned(),
+                "description".to_owned(),
+                "enabled".to_owned(),
+                "expression".to_owned(),
+                "ref".to_owned(),
+            ],
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.security_action = Some(SecurityActionContractV1 {
+            kind: SecurityActionKindV1::CreateExpiring,
+            input_schema: json!({
+                "type":"object",
+                "additionalProperties":false,
+                "required":["actor","evidence_ref","reason","target"],
+                "properties":{
+                    "action":{"type":"string","enum":["block","js_challenge","log","managed_challenge","skip"]},
+                    "actor":{"type":"string"},
+                    "evidence_ref":{"type":"string"},
+                    "expires_at":{"type":"string"},
+                    "reason":{"type":"string"},
+                    "target":{"type":"object","additionalProperties":false,"required":["type","value"],"properties":{"type":{"type":"string"},"value":{"type":"string"}}},
+                    "operator_ip":{"type":"string"},
+                    "confirm_broad_scope":{"type":"boolean"},
+                    "confirm_block":{"type":"boolean"},
+                    "confirm_skip":{"type":"boolean"},
+                    "confirm_enterprise_bot_management":{"type":"boolean"}
+                },
+                "x-cfctl-body-required":true
+            }),
+            default_action: Some("managed_challenge".to_owned()),
+            allowed_actions: vec![
+                "block".to_owned(),
+                "js_challenge".to_owned(),
+                "log".to_owned(),
+                "managed_challenge".to_owned(),
+                "skip".to_owned(),
+            ],
+            allowed_target_types: vec![
+                "asn".to_owned(),
+                "country".to_owned(),
+                "hostname".to_owned(),
+                "ip".to_owned(),
+                "ip_range".to_owned(),
+                "ja4".to_owned(),
+                "path".to_owned(),
+            ],
+            default_ttl_seconds: 86_400,
+            max_ttl_seconds: 604_800,
+            current_state_capability_id: SECURITY_WAF_RULE_STATE_CAPABILITY_ID.to_owned(),
+            safety_profile: SecurityActionSafetyProfileV1::TelemetryDerivedStrict,
+        });
+        capability
+    }
+
+    #[test]
+    fn security_action_defaults_to_expiring_managed_challenge_and_compiles_exact_wire_body() {
+        let capability = security_action_create_capability();
+        let mut input = CallInput {
+            selectors: json!({"zone_id":"zone-a"}),
+            body: Some(json!({
+                "actor":"operator@example.test",
+                "evidence_ref":format!("sha256:{}", "a".repeat(64)),
+                "reason":"Repeated malicious requests in a bounded telemetry window",
+                "target":{"type":"ip","value":"1.1.1.1"}
+            })),
+            ..CallInput::default()
+        };
+        let receipt = prepare_security_action_input(&capability, &mut input)
+            .expect("safe action")
+            .expect("governance receipt");
+        assert_eq!(
+            input.body.as_ref().and_then(|body| body.get("mode")),
+            Some(&json!("managed_challenge"))
+        );
+        assert_eq!(
+            input
+                .body
+                .as_ref()
+                .and_then(|body| body.pointer("/configuration/value")),
+            Some(&json!("1.1.1.1"))
+        );
+        assert_eq!(receipt.get("permanent_action"), Some(&json!(false)));
+        assert_eq!(
+            receipt.get("anonymous_identity_inferred"),
+            Some(&json!(false))
+        );
+        assert!(receipt.get("expires_at").and_then(Value::as_str).is_some());
+        validate_request_contract(&capability, &input).expect("compiled wire body");
+    }
+
+    #[test]
+    fn security_action_rejects_self_block_broad_unconfirmed_scope_and_reserved_targets() {
+        let capability = security_action_create_capability();
+        let body = |target: Value| {
+            json!({
+                "action":"block",
+                "actor":"operator@example.test",
+                "evidence_ref":format!("sha256:{}", "b".repeat(64)),
+                "reason":"Confirmed source abuse",
+                "target":target,
+                "operator_ip":"1.1.1.1",
+                "confirm_block":true
+            })
+        };
+        let mut self_block = CallInput {
+            selectors: json!({"zone_id":"zone-a"}),
+            body: Some(body(json!({"type":"ip","value":"1.1.1.1"}))),
+            ..CallInput::default()
+        };
+        assert!(prepare_security_action_input(&capability, &mut self_block).is_err());
+
+        let mut broad = CallInput {
+            selectors: json!({"zone_id":"zone-a"}),
+            body: Some(json!({
+                "actor":"operator@example.test",
+                "evidence_ref":format!("sha256:{}", "c".repeat(64)),
+                "reason":"Suspicious ASN classification",
+                "target":{"type":"asn","value":"AS13335"}
+            })),
+            ..CallInput::default()
+        };
+        assert!(prepare_security_action_input(&capability, &mut broad).is_err());
+
+        let mut reserved = CallInput {
+            selectors: json!({"zone_id":"zone-a"}),
+            body: Some(json!({
+                "actor":"operator@example.test",
+                "evidence_ref":format!("sha256:{}", "d".repeat(64)),
+                "reason":"Invalid private target",
+                "target":{"type":"ip","value":"127.0.0.1"}
+            })),
+            ..CallInput::default()
+        };
+        assert!(prepare_security_action_input(&capability, &mut reserved).is_err());
+    }
+
+    #[test]
+    fn waf_security_action_compiles_typed_target_and_rejects_unsafe_escalation() {
+        let capability = waf_security_action_create_capability();
+        assert!(
+            capability.security_action_contract_supported(),
+            "{:?}",
+            capability.mutation_contract_gaps()
+        );
+        let mut input = CallInput {
+            selectors: json!({"zone_id":"zone","ruleset_id":"ruleset"}),
+            body: Some(json!({
+                "actor":"operator@example.com",
+                "evidence_ref":format!("sha256:{}", "a".repeat(64)),
+                "reason":"suspicious repeated source",
+                "target":{"type":"hostname","value":"EXAMPLE.COM"}
+            })),
+            ..CallInput::default()
+        };
+        let receipt = prepare_security_action_input(&capability, &mut input)
+            .expect("bounded WAF action")
+            .expect("security receipt");
+        assert_eq!(receipt["kind"], "create_expiring_waf");
+        assert_eq!(receipt["action"], "managed_challenge");
+        assert_eq!(receipt["target"]["value"], "example.com");
+        assert_eq!(
+            input.body.as_ref().and_then(|body| body.get("expression")),
+            Some(&json!("http.host eq \"example.com\""))
+        );
+        assert!(
+            input
+                .body
+                .as_ref()
+                .and_then(|body| body.get("ref"))
+                .and_then(Value::as_str)
+                .is_some_and(|reference| {
+                    reference.starts_with("cfctl_security_") && reference.len() == 39
+                })
+        );
+
+        let mut unsafe_block = CallInput {
+            selectors: json!({"zone_id":"zone","ruleset_id":"ruleset"}),
+            body: Some(json!({
+                "action":"block",
+                "actor":"operator@example.com",
+                "evidence_ref":format!("sha256:{}", "b".repeat(64)),
+                "reason":"broad host block",
+                "target":{"type":"hostname","value":"example.com"},
+                "operator_ip":"8.8.8.8",
+                "confirm_block":true
+            })),
+            ..CallInput::default()
+        };
+        assert!(prepare_security_action_input(&capability, &mut unsafe_block).is_err());
+
+        let mut unsafe_skip = CallInput {
+            selectors: json!({"zone_id":"zone","ruleset_id":"ruleset"}),
+            body: Some(json!({
+                "action":"skip",
+                "actor":"operator@example.com",
+                "evidence_ref":format!("sha256:{}", "c".repeat(64)),
+                "reason":"skip managed WAF",
+                "target":{"type":"ip","value":"8.8.4.4"}
+            })),
+            ..CallInput::default()
+        };
+        assert!(prepare_security_action_input(&capability, &mut unsafe_skip).is_err());
+
+        let mut ja4_without_entitlement_ack = CallInput {
+            selectors: json!({"zone_id":"zone","ruleset_id":"ruleset"}),
+            body: Some(json!({
+                "actor":"operator@example.com",
+                "evidence_ref":format!("sha256:{}", "d".repeat(64)),
+                "reason":"suspicious JA4 fingerprint",
+                "target":{"type":"ja4","value":"t13d1516h2_8daaf6152771_02713d6af862"}
+            })),
+            ..CallInput::default()
+        };
+        assert!(
+            prepare_security_action_input(&capability, &mut ja4_without_entitlement_ack).is_err()
+        );
+    }
+
+    #[test]
+    fn waf_nested_creation_receipt_lifts_only_correlated_id_and_derives_exact_removal() {
+        let capability = waf_security_action_create_capability();
+        let reference = "cfctl_security_0123456789abcdef01234567";
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors: json!({"zone_id":"zone-a", "ruleset_id":"ruleset-a"}),
+            body: Some(json!({
+                "action":"managed_challenge",
+                "description":"bounded action",
+                "enabled":true,
+                "expression":"ip.src eq 1.1.1.1",
+                "ref":reference
+            })),
+            ..CallInput::default()
+        })
+        .expect("call input");
+        plan.refresh_hash().expect("bind call input");
+        plan.approve(true, None).expect("approve");
+        plan.mark_consumed().expect("consume");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("attempt");
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "id":"ruleset-a",
+                "rules":[{
+                    "id":"rule-a",
+                    "action":"managed_challenge",
+                    "description":"bounded action",
+                    "enabled":true,
+                    "expression":"ip.src eq 1.1.1.1",
+                    "ref":reference
+                }]
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let apply_evidence = EvidenceV1::new(
+            EvidenceClass::Apply,
+            "sha256:waf-create-apply-receipt",
+            "/tmp/waf-create-apply-receipt.json",
+        );
+        let artifact = boundary_response_artifact(&plan, &response, Some(&apply_evidence));
+        assert_eq!(artifact["resource_id"], "rule-a");
+        assert!(!artifact.to_string().contains(reference));
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            artifact,
+        )
+        .expect("response receipt");
+        plan.status = PlanStatus::RectificationRequired;
+
+        let request = compensation_request(&plan)
+            .expect("request resolves")
+            .expect("compensation is supported");
+
+        assert_eq!(request.capability_id, "deleteZoneRulesetRule");
+        assert_eq!(request.expected_method, "DELETE");
+        assert_eq!(
+            request.expected_path,
+            "/zones/{zone_id}/rulesets/{ruleset_id}/rules/{rule_id}"
+        );
+        assert_eq!(
+            request.input.selectors,
+            json!({
+                "zone_id":"zone-a",
+                "ruleset_id":"ruleset-a",
+                "rule_id":"rule-a"
+            })
+        );
+        assert_eq!(request.input.query, json!({}));
+        assert!(request.input.body.is_none());
+        assert_eq!(request.requested_account.as_deref(), Some("account-a"));
     }
 
     #[test]
@@ -12791,6 +16878,8 @@ mod tests {
             warp_connector_configuration_state: None,
             web_analytics_rum_state: None,
             dns_record_state: None,
+            same_path_prior_state: None,
+            security_action_state: None,
             oauth_client_secret_state: None,
         };
 
@@ -13769,7 +17858,11 @@ mod tests {
             "POST",
             "oauth_client_reports_rotated_secret_after_value_roll",
         );
-        assert!(capability.mutation_contract_gaps().is_empty());
+        assert!(
+            capability.mutation_contract_gaps().is_empty(),
+            "{:?}",
+            capability.mutation_contract_gaps()
+        );
         let mut catalog = CatalogSnapshot {
             schema_version: 1,
             generated_at: Utc::now(),
@@ -13836,6 +17929,8 @@ mod tests {
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
                 dns_record_state: None,
+                same_path_prior_state: None,
+                security_action_state: None,
                 oauth_client_secret_state: Some((receipt.clone(), evidence)),
             },
         )
@@ -14794,6 +18889,8 @@ mod tests {
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
                 dns_record_state: None,
+                same_path_prior_state: None,
+                security_action_state: None,
                 oauth_client_secret_state: None,
             },
         )
@@ -14881,6 +18978,8 @@ mod tests {
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
                 dns_record_state: None,
+                same_path_prior_state: None,
+                security_action_state: None,
                 oauth_client_secret_state: None,
             },
         )
@@ -14973,6 +19072,8 @@ mod tests {
                 warp_connector_configuration_state: None,
                 web_analytics_rum_state: None,
                 dns_record_state: None,
+                same_path_prior_state: None,
+                security_action_state: None,
                 oauth_client_secret_state: None,
             },
         )
@@ -15061,6 +19162,8 @@ mod tests {
                 warp_connector_configuration_state: Some((receipt.clone(), evidence)),
                 web_analytics_rum_state: None,
                 dns_record_state: None,
+                same_path_prior_state: None,
+                security_action_state: None,
                 oauth_client_secret_state: None,
             },
         )
@@ -15143,6 +19246,8 @@ mod tests {
                 kv_empty_namespace_state: None,
                 web_analytics_rum_state: Some((receipt.clone(), evidence)),
                 dns_record_state: None,
+                same_path_prior_state: None,
+                security_action_state: None,
                 oauth_client_secret_state: None,
             },
         )
@@ -15241,6 +19346,8 @@ mod tests {
                 d1_empty_database_state: None,
                 kv_empty_namespace_state: None,
                 dns_record_state: Some((receipt.clone(), receipt_evidence)),
+                same_path_prior_state: None,
+                security_action_state: None,
                 oauth_client_secret_state: None,
             },
         )
@@ -16076,6 +20183,67 @@ mod tests {
         )
         .expect_err("unmapped plan");
         assert!(unmapped.to_string().contains("cannot be mapped"));
+    }
+
+    #[test]
+    fn declared_product_read_probe_resolves_entitlement_without_negative_inference() {
+        let mut capability = security_action_create_capability();
+        capability.cost = CostV1::default();
+        capability.entitlement.requires_live_resolution = true;
+        capability.entitlement.plans =
+            BTreeMap::from([("free".to_owned(), false), ("enterprise".to_owned(), true)]);
+        capability.entitlement.probe = Some(EntitlementProbeV1 {
+            capability_id: SECURITY_IP_RULE_STATE_CAPABILITY_ID.to_owned(),
+            path: SECURITY_IP_RULE_COLLECTION_PATH.to_owned(),
+            selector_names: vec!["zone_id".to_owned()],
+        });
+        let input = CallInput {
+            selectors: json!({"zone_id":"zone-a"}),
+            ..CallInput::default()
+        };
+        assert!(
+            capability.mutation_contract_gaps().is_empty(),
+            "{:?}",
+            capability.mutation_contract_gaps()
+        );
+        assert!(should_resolve_entitlement_probe(&capability));
+        let selectors = entitlement_probe_selectors(&capability, &input).expect("selectors");
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!([]),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+
+        let receipt = apply_entitlement_probe_response(&mut capability, &selectors, &response)
+            .expect("probe receipt");
+
+        assert_eq!(capability.entitlement.available, Some(true));
+        assert!(!should_resolve_entitlement_probe(&capability));
+        assert_eq!(receipt["available"], true);
+        assert_eq!(receipt["negative_inference"], false);
+        assert!(receipt["target_selectors_hash"].as_str().is_some());
+        assert!(!receipt.to_string().contains("zone-a"));
+
+        capability.entitlement.available = None;
+        let rejected = CloudflareResponseV1 {
+            status: 403,
+            success: false,
+            result: Value::Null,
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let error = apply_entitlement_probe_response(&mut capability, &selectors, &rejected)
+            .expect_err("a rejected read cannot prove entitlement")
+            .to_string();
+        assert!(error.contains("authorization"));
+        assert!(error.contains("entitlement"));
+        assert_eq!(capability.entitlement.available, None);
     }
 
     #[test]
@@ -17327,9 +21495,18 @@ mod tests {
         let catalog = test_catalog();
         let input = CallInput::default();
 
-        let error = execute_read(&store, &catalog, &capability, &input, None, None)
-            .await
-            .expect_err("live read must not use ambient global-key current profile");
+        let error = execute_read(
+            &store,
+            &catalog,
+            &capability,
+            &input,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("live read must not use ambient global-key current profile");
         assert!(
             error.to_string().contains("never selected implicitly"),
             "{error}"
@@ -17343,6 +21520,8 @@ mod tests {
             &capability,
             &input,
             Some("emergency"),
+            None,
+            None,
             None,
         )
         .await;
@@ -17367,7 +21546,7 @@ mod tests {
             .save(&store)
             .expect("save emergency as current");
 
-        let error = call_command(
+        let error = Box::pin(call_command(
             &store,
             CallArgs {
                 capability_id: "accounts-list".to_owned(),
@@ -17380,8 +21559,10 @@ mod tests {
                 if_match: None,
                 if_none_match: None,
                 value_out: None,
+                credential_in: None,
+                out: None,
             },
-        )
+        ))
         .await
         .expect_err("call without --profile must fail closed on ambient global-key");
         assert!(
@@ -18145,6 +22326,7 @@ mod tests {
                 basis: "live readback matched".to_owned(),
                 evidence: Some(verification_evidence),
                 error: None,
+                correlated_resource_id: None,
             },
             true,
             Some(&finalization_error),
@@ -18440,6 +22622,7 @@ mod tests {
                     etag: None,
                     cf_ray: None,
                 },
+                correlated_resource_id: None,
             },
         )
         .expect("verification outcome records evidence");
@@ -18562,12 +22745,12 @@ mod tests {
             .save_plan(&plan)
             .expect("persist successful boundary receipt");
 
-        let first = rectify_plan(
+        let first = Box::pin(rectify_plan(
             &store,
             &PlanSelector {
                 operation_id: operation_id.clone(),
             },
-        )
+        ))
         .await
         .expect("rectify reconciles without replaying the source mutation");
         assert!(
@@ -18577,12 +22760,12 @@ mod tests {
                 .any(|evidence| evidence.class == EvidenceClass::StandingApply),
             "rectify must return the receipt for its authority-lineage mutation"
         );
-        rectify_plan(
+        Box::pin(rectify_plan(
             &store,
             &PlanSelector {
                 operation_id: operation_id.clone(),
             },
-        )
+        ))
         .await
         .expect("repeated rectification is idempotent");
 
@@ -18616,12 +22799,12 @@ mod tests {
             .lock_plan(&operation_id)
             .expect("running invocation owns the plan");
 
-        let error = rectify_plan(
+        let error = Box::pin(rectify_plan(
             &rectify_store,
             &PlanSelector {
                 operation_id: operation_id.clone(),
             },
-        )
+        ))
         .await
         .expect_err("rectification cannot race an in-flight run");
 
@@ -18635,7 +22818,7 @@ mod tests {
             "rectification must not publish lineage while the source run owns the plan"
         );
         drop(plan_guard);
-        rectify_plan(&rectify_store, &PlanSelector { operation_id })
+        Box::pin(rectify_plan(&rectify_store, &PlanSelector { operation_id }))
             .await
             .expect("rectification proceeds after the source plan lock is released");
         assert_eq!(
@@ -18752,6 +22935,44 @@ mod tests {
         let leaky = read_secret_file(&path).expect_err("group-readable rejected");
         let leaky = leaky.to_string();
         assert!(leaky.contains("group or others"), "{leaky}");
+        assert!(leaky.contains("chmod 600"), "{leaky}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r2_log_retrieval_credentials_require_a_closed_private_json_bundle() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("r2-credentials.json");
+        std::fs::write(
+            &path,
+            r#"{"access_key_id":"r2-access-test","secret_access_key":"r2-secret-test"}"#,
+        )
+        .expect("write credential bundle");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+        let credentials = read_r2_log_retrieval_credentials(&path).expect("closed private bundle");
+        let debug = format!("{credentials:?}");
+        assert!(!debug.contains("r2-access-test"));
+        assert!(!debug.contains("r2-secret-test"));
+        assert!(debug.contains("[REDACTED]"));
+
+        std::fs::write(
+            &path,
+            r#"{"access_key_id":"r2-access-test","secret_access_key":"r2-secret-test","header":"arbitrary"}"#,
+        )
+        .expect("write extra field");
+        let extra = read_r2_log_retrieval_credentials(&path)
+            .expect_err("unknown credential fields fail closed")
+            .to_string();
+        assert!(extra.contains("exactly"), "{extra}");
+        assert!(!extra.contains("r2-secret-test"));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod 640");
+        let leaky = read_r2_log_retrieval_credentials(&path)
+            .expect_err("group-readable bundle rejected")
+            .to_string();
+        assert!(leaky.contains("--credential-in"), "{leaky}");
         assert!(leaky.contains("chmod 600"), "{leaky}");
     }
 
@@ -18994,6 +23215,7 @@ mod tests {
                 etag: None,
                 cf_ray: None,
             },
+            correlated_resource_id: None,
         };
         let outcome =
             verification_outcome(&store, &mut plan, verification).expect("verification outcome");
@@ -19287,6 +23509,136 @@ mod tests {
                 "account-a",
                 "catalog-sha",
                 r2_temporary_credentials_capability(),
+                json!({"adapter":{"value_out":path}}),
+            )
+            .expect("plan");
+            assert!(sink_secret_result(&plan, &result).is_err());
+            assert!(!path.exists());
+        }
+    }
+
+    fn worker_tail_create_capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            "worker-tail-logs-start-tail",
+            "Start Tail",
+            "POST",
+            "/accounts/{account_id}/workers/scripts/{script_name}/tails",
+        );
+        capability.product = "Worker Tail Logs".to_owned();
+        capability.account_scope = "account".to_owned();
+        capability.permissions = vec![
+            "Workers Tail Read".to_owned(),
+            "Workers Scripts Write".to_owned(),
+        ];
+        capability.risk = RiskClass::SecretSensitive;
+        capability.verification.strategy =
+            "worker_tail_collection_contains_created_lease_id".to_owned();
+        capability
+    }
+
+    #[test]
+    fn worker_tail_lease_uses_complete_json_sink_and_capability_scoped_url_redaction() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("worker-tail-lease.json");
+        let capability = worker_tail_create_capability();
+        let plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({"adapter":{"value_out":path}}),
+        )
+        .expect("plan");
+        let result = json!({
+            "id":"tail-lease-1",
+            "expires_at":"2026-07-21T18:00:00Z",
+            "url":"wss://tail.example.invalid/bearer-must-not-leak",
+            "extra":"not-sink-authorized"
+        });
+
+        sink_secret_result(&plan, &result).expect("complete tail lease sink");
+        let payload: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("tail lease contents"))
+                .expect("tail lease JSON");
+        assert_eq!(
+            payload,
+            json!({
+                "expires_at":"2026-07-21T18:00:00Z",
+                "id":"tail-lease-1",
+                "url":"wss://tail.example.invalid/bearer-must-not-leak"
+            })
+        );
+        assert!(!payload.to_string().contains("not-sink-authorized"));
+        assert_eq!(
+            secret_sink_format(&plan.capability),
+            Some("worker_tail_lease_json")
+        );
+        assert_eq!(
+            capability_call_argv(&plan.capability)
+                .iter()
+                .find(|argument| argument.contains("0600"))
+                .map(String::as_str),
+            Some("<new-mode-0600-json-path>")
+        );
+
+        let redacted_create = redact_response_for_capability(
+            &plan.capability,
+            &json!({"success":true,"result":result}),
+        );
+        assert_eq!(redacted_create["result"]["id"], "tail-lease-1");
+        assert_eq!(redacted_create["result"]["url"], "[SUNK]");
+        assert!(!redacted_create.to_string().contains("bearer-must-not-leak"));
+
+        let mut list = CapabilityV1::new(
+            "worker-tail-logs-list-tails",
+            "List Tails",
+            "GET",
+            "/accounts/{account_id}/workers/scripts/{script_name}/tails",
+        );
+        list.product = "Worker Tail Logs".to_owned();
+        list.account_scope = "account".to_owned();
+        list.permissions = vec!["Workers Tail Read".to_owned()];
+        let redacted_list = redact_response_for_capability(
+            &list,
+            &json!({"result":[{"id":"tail-lease-1","url":"wss://private"}]}),
+        );
+        assert_eq!(redacted_list["result"][0]["url"], "[SUNK]");
+
+        let ordinary = CapabilityV1::new("zones-get", "Get zone", "GET", "/zones/{zone_id}");
+        let ordinary_response = json!({"result":{"url":"https://example.com"}});
+        assert_eq!(
+            redact_response_for_capability(&ordinary, &ordinary_response),
+            ordinary_response,
+            "URL redaction must remain scoped to the exact tail operations"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("tail sink metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn worker_tail_lease_rejects_incomplete_sink_payloads_before_file_creation() {
+        for result in [
+            json!({"id":"tail","expires_at":"2026-07-21T18:00:00Z"}),
+            json!({"id":"tail","url":"wss://private"}),
+            json!({"expires_at":"2026-07-21T18:00:00Z","url":"wss://private"}),
+        ] {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = directory.path().join("worker-tail-lease.json");
+            let plan = PlanV1::draft(
+                "profile-a",
+                "account-a",
+                "catalog-sha",
+                worker_tail_create_capability(),
                 json!({"adapter":{"value_out":path}}),
             )
             .expect("plan");
@@ -20192,6 +24544,69 @@ mod tests {
         assert_eq!(super::live_read_failure_guidance(418).0, "CFCTL_LIVE_ERROR");
     }
 
+    #[test]
+    fn live_read_availability_distinguishes_empty_data_from_denied_access() {
+        let mut capability =
+            resolver_read_capability("telemetry-read", "Read bounded telemetry", "Telemetry");
+        capability.permissions = vec!["Account Analytics Read".to_owned()];
+        capability.analytics_query = Some(AnalyticsQueryContractV1 {
+            kind: AnalyticsQueryKindV1::WorkersObservability,
+            dataset: Some("workers_invocations".to_owned()),
+            dataset_pointer: None,
+            time_range: None,
+            row_limit_pointer: None,
+            max_rows: 1_000,
+            max_bytes: 1_048_576,
+            max_timeout_seconds: 30,
+            allowed_output_formats: vec![OutputFormatV1::Json],
+            default_output_format: OutputFormatV1::Json,
+            pagination: PaginationModeV1::BoundedResult,
+            read_only: true,
+            freshness: Some("upstream_dataset_dependent".to_owned()),
+            sampling: Some("upstream_dataset_dependent".to_owned()),
+        });
+        let no_data = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!([]),
+            errors: Vec::new(),
+            result_info: Some(json!({"output": {"rows": 0}})),
+            etag: None,
+            cf_ray: None,
+        };
+        let receipt = super::live_read_availability(&capability, &no_data);
+        assert_eq!(receipt["state"], "available");
+        assert_eq!(receipt["data_state"], "no_data_in_bounded_query_window");
+        assert_eq!(
+            receipt["authorization_entitlement_distinction_proven"],
+            true
+        );
+        assert_eq!(receipt["permission_owner"], "account_owned");
+
+        let denied = CloudflareResponseV1 {
+            status: 403,
+            success: false,
+            result: Value::Null,
+            errors: vec![CloudflareApiErrorV1 {
+                code: Some(10000),
+                message: "redacted authorization failure".to_owned(),
+            }],
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let receipt = super::live_read_availability(&capability, &denied);
+        assert_eq!(receipt["state"], "authorization_or_entitlement_unresolved");
+        assert_eq!(
+            receipt["authorization_entitlement_distinction_proven"],
+            false
+        );
+        assert_eq!(
+            receipt["required_permissions"],
+            json!(["Account Analytics Read"])
+        );
+    }
+
     fn resolver_read_capability(id: &str, title: &str, product: &str) -> CapabilityV1 {
         let mut capability = CapabilityV1::new(id, title, "GET", "/accounts/{account_id}/things");
         capability.adapter_status = AdapterStatus::DynamicApi;
@@ -20239,6 +24654,36 @@ mod tests {
         assert_eq!(result["ambiguous"], serde_json::Value::Bool(true));
         assert_eq!(result["resolved"], serde_json::Value::Null);
         assert!(result["disambiguation"]["search_argv"].is_array());
+    }
+
+    #[test]
+    fn broad_telemetry_intent_returns_an_overview_and_withholds_mutation_commands() {
+        let read = resolver_read_capability(
+            "graphql-analytics-zone-http-requests",
+            "Query zone HTTP analytics",
+            "GraphQL Analytics",
+        );
+        let mutation = resolver_mutation_capability();
+        let ranked = vec![(&mutation, 20usize), (&read, 18usize)];
+        let (result, error) = super::resolve_result("telemetry overview", &ranked, None, 5);
+        assert!(error.is_none());
+        assert_eq!(result["resolved"]["kind"], "telemetry_domain_overview");
+        assert_eq!(result["ambiguous"], false);
+        assert_eq!(
+            result["resolved"]["mutation_selection"],
+            "withheld_until_a_specific_capability_is_resolved_and_guided"
+        );
+        assert_eq!(
+            result["resolved"]["mutation_candidates"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(!result.to_string().contains("draft_argv"));
+        assert!(super::is_broad_telemetry_intent("show analytics"));
+        assert!(!super::is_broad_telemetry_intent(
+            "configure Worker observability sampling"
+        ));
     }
 
     #[test]

@@ -7,11 +7,17 @@ use std::{
 };
 
 use cfctl_core::{
-    AdapterStatus, BillingModelV1, CapabilityV1, CostExposureV1,
-    CreatedCollectionResourceContractV1, CreatedResourceContractV1, DeletedResourceContractV1,
-    EffectClass, KnowledgeReferenceV1, Maturity, QuerySerializationV1, ResponseBodyModeV1,
-    ResponseContractV1, RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1,
-    UpdatedResourceContractV1, hash_value, request_header_is_reserved,
+    AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
+    AsyncCollectionMutationContractV1, BillingModelV1, CapabilityV1, CostExposureV1, CostV1,
+    CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
+    CreatedResourceContractV1, DeletedNestedResourceContractV1, DeletedResourceContractV1,
+    EffectClass, EntitlementProbeV1, EntitlementV1, GraphqlAnalyticsContractV1,
+    KnowledgeReferenceV1, Maturity, OutputFormatV1, PaginationModeV1, QuerySerializationV1,
+    R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1, RiskClass,
+    SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
+    TimestampFormatV1, UpdatedResourceContractV1, WorkflowContractV1, WorkflowStepV1, hash_value,
+    request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -219,6 +225,8 @@ impl CatalogSnapshot {
                     && contract_gaps.is_empty(),
             );
         }
+        let telemetry_ledger = telemetry_coverage_ledger(self);
+        let telemetry_targeted = TelemetryCoverageSummaryV1::from_entries(&telemetry_ledger);
         CatalogCoverageV1 {
             schema_hash: self.schema_hash.clone(),
             total: self.capabilities.len(),
@@ -236,6 +244,8 @@ impl CatalogSnapshot {
             mutation_contract_gap_counts,
             adapter_statuses,
             sources,
+            telemetry_targeted,
+            telemetry_ledger,
         }
     }
 
@@ -256,7 +266,7 @@ impl CatalogSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CatalogCoverageV1 {
     pub schema_hash: String,
     pub total: usize,
@@ -274,6 +284,690 @@ pub struct CatalogCoverageV1 {
     pub mutation_contract_gap_counts: BTreeMap<String, usize>,
     pub adapter_statuses: BTreeMap<String, usize>,
     pub sources: BTreeMap<String, usize>,
+    pub telemetry_targeted: TelemetryCoverageSummaryV1,
+    pub telemetry_ledger: Vec<TelemetryCoverageEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryCoverageSummaryV1 {
+    pub total: usize,
+    pub executable: usize,
+    pub blocked: usize,
+    pub reads: usize,
+    pub mutations: usize,
+    pub complete_mutations: usize,
+    pub upstream_absent: usize,
+}
+
+impl TelemetryCoverageSummaryV1 {
+    fn from_entries(entries: &[TelemetryCoverageEntryV1]) -> Self {
+        Self {
+            total: entries.len(),
+            executable: entries
+                .iter()
+                .filter(|entry| entry.adapter_status != AdapterStatus::Blocked)
+                .count(),
+            blocked: entries
+                .iter()
+                .filter(|entry| entry.adapter_status == AdapterStatus::Blocked)
+                .count(),
+            reads: entries
+                .iter()
+                .filter(|entry| entry.operation_kind == "read")
+                .count(),
+            mutations: entries
+                .iter()
+                .filter(|entry| entry.operation_kind == "mutation")
+                .count(),
+            complete_mutations: entries
+                .iter()
+                .filter(|entry| {
+                    entry.operation_kind == "mutation"
+                        && entry.contract_state == "plan_apply_verify_contract_complete"
+                })
+                .count(),
+            upstream_absent: entries
+                .iter()
+                .filter(|entry| entry.capability_id.is_none())
+                .count(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TelemetryCoverageEntryV1 {
+    pub domain: String,
+    pub product: String,
+    pub api_operation_or_dataset: String,
+    pub capability_id: Option<String>,
+    pub operation_kind: String,
+    pub adapter_status: AdapterStatus,
+    pub contract_state: String,
+    pub permission_owner: String,
+    pub permission_mode: String,
+    pub required_permissions: Vec<String>,
+    pub entitlement: EntitlementV1,
+    pub cost: CostV1,
+    pub verification_method: String,
+    pub rollback_method: Option<String>,
+    pub fixture_coverage: String,
+    pub live_read_proof_status: String,
+    pub live_mutation_drill_status: String,
+    pub remaining_blocker: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct TelemetryCoverageSpec {
+    domain: &'static str,
+    product: &'static str,
+    authority: &'static str,
+    capability_id: Option<&'static str>,
+    operation_kind: &'static str,
+    fixture_coverage: &'static str,
+    upstream_blocker: Option<&'static str>,
+}
+
+fn telemetry_coverage_ledger(snapshot: &CatalogSnapshot) -> Vec<TelemetryCoverageEntryV1> {
+    telemetry_coverage_specs()
+        .iter()
+        .map(|spec| telemetry_coverage_entry(snapshot, *spec))
+        .collect()
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the coverage row is a single auditable projection of one capability contract"
+)]
+fn telemetry_coverage_entry(
+    snapshot: &CatalogSnapshot,
+    spec: TelemetryCoverageSpec,
+) -> TelemetryCoverageEntryV1 {
+    let capability = spec
+        .capability_id
+        .and_then(|capability_id| snapshot.get(capability_id));
+    let adapter_status = capability.map_or(AdapterStatus::Blocked, |capability| {
+        capability.adapter_status
+    });
+    let contract_state = match capability {
+        None if spec.capability_id.is_none() => "upstream_api_absent",
+        None => "capability_missing_from_current_catalog",
+        Some(capability) if capability.adapter_status == AdapterStatus::Blocked => {
+            "blocked_with_typed_diagnostic"
+        }
+        Some(capability)
+            if capability.mutating && capability.mutation_contract_gaps().is_empty() =>
+        {
+            "plan_apply_verify_contract_complete"
+        }
+        Some(capability)
+            if capability.analytics_query.is_some() || capability.r2_log_retrieval.is_some() =>
+        {
+            "bounded_query_contract_complete"
+        }
+        Some(capability) if capability.workflow.is_some() => "governed_composition_recipe",
+        Some(_) => "typed_read_contract_complete",
+    }
+    .to_owned();
+    let permission_owner = capability.map_or_else(
+        || "not_applicable".to_owned(),
+        |capability| {
+            if capability.path.starts_with("/user") || capability.account_scope == "user" {
+                "user_owned".to_owned()
+            } else {
+                "account_owned".to_owned()
+            }
+        },
+    );
+    let required_permissions = capability
+        .map(|capability| capability.permissions.clone())
+        .unwrap_or_default();
+    let has_read = required_permissions
+        .iter()
+        .any(|permission| permission.ends_with(" Read"));
+    let has_write = required_permissions
+        .iter()
+        .any(|permission| permission.ends_with(" Write") || permission.ends_with(" Edit"));
+    let permission_mode = if required_permissions.is_empty() {
+        "not_declared_upstream"
+    } else if has_read && has_write {
+        "all_of_for_governed_lifecycle"
+    } else if required_permissions.len() > 1 {
+        "any_of_upstream"
+    } else {
+        "all_of"
+    }
+    .to_owned();
+    let entitlement = capability.map_or_else(
+        || EntitlementV1 {
+            available: None,
+            plans: BTreeMap::new(),
+            blocker: spec.upstream_blocker.map(str::to_owned),
+            source: None,
+            requires_live_resolution: false,
+            observed_plan: None,
+            probe: None,
+        },
+        |capability| capability.entitlement.clone(),
+    );
+    let cost = capability.map_or_else(
+        || CostV1 {
+            incremental: false,
+            currency: None,
+            maximum: None,
+            basis: Some("no public operation exists from which to derive cost".to_owned()),
+            known: false,
+            billing_model: BillingModelV1::Unknown,
+            exposure: CostExposureV1::None,
+            references: Vec::new(),
+        },
+        |capability| capability.cost.clone(),
+    );
+    let verification_method = capability.map_or_else(
+        || "unavailable".to_owned(),
+        |capability| {
+            if capability.mutating {
+                capability.verification.strategy.clone()
+            } else if capability.analytics_query.is_some() {
+                "bounded_result_envelope_and_content_addressed_read_receipt".to_owned()
+            } else if capability.r2_log_retrieval.is_some() {
+                "bounded_private_file_hash_receipt".to_owned()
+            } else {
+                "content_addressed_live_read_receipt".to_owned()
+            }
+        },
+    );
+    let rollback_method = capability.and_then(|capability| {
+        capability
+            .rollback
+            .strategy
+            .clone()
+            .or_else(|| capability.rollback.warning.clone())
+    });
+    let remaining_blocker = capability
+        .and_then(|capability| capability.blocked_reason.clone())
+        .or_else(|| spec.upstream_blocker.map(str::to_owned))
+        .or_else(|| {
+            (capability.is_none() && spec.capability_id.is_some()).then(|| {
+                "operation is absent from the current generated Cloudflare catalog".to_owned()
+            })
+        });
+    TelemetryCoverageEntryV1 {
+        domain: spec.domain.to_owned(),
+        product: spec.product.to_owned(),
+        api_operation_or_dataset: spec.authority.to_owned(),
+        capability_id: spec.capability_id.map(str::to_owned),
+        operation_kind: spec.operation_kind.to_owned(),
+        adapter_status,
+        contract_state,
+        permission_owner,
+        permission_mode,
+        required_permissions,
+        entitlement,
+        cost,
+        verification_method,
+        rollback_method,
+        fixture_coverage: spec.fixture_coverage.to_owned(),
+        live_read_proof_status: if spec.operation_kind == "read" {
+            "not_recorded_in_catalog_snapshot; inspect evidence receipts".to_owned()
+        } else {
+            "not_applicable".to_owned()
+        },
+        live_mutation_drill_status: if spec.operation_kind == "mutation" {
+            "not_authorized".to_owned()
+        } else {
+            "not_applicable".to_owned()
+        },
+        remaining_blocker,
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the explicit telemetry coverage matrix is intentionally reviewable as one ordered ledger"
+)]
+fn telemetry_coverage_specs() -> Vec<TelemetryCoverageSpec> {
+    vec![
+        telemetry_spec(
+            "analytics",
+            "Web Analytics",
+            "GET account RUM sites",
+            Some("web-analytics-list-sites"),
+            "read",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "Web Analytics",
+            "POST account RUM site",
+            Some("web-analytics-create-site"),
+            "mutation",
+            "mutation_contract_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "Web Analytics",
+            "PUT account RUM site",
+            Some("web-analytics-update-site"),
+            "mutation",
+            "mutation_contract_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "Browser Insights and RUM",
+            "GET zone RUM status",
+            Some("web-analytics-get-rum-status"),
+            "read",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "Browser Insights and RUM",
+            "PATCH zone RUM status",
+            Some("web-analytics-toggle-rum"),
+            "mutation",
+            "mutation_contract_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "Web Analytics rules",
+            "POST RUM ruleset rule",
+            Some("web-analytics-create-rule"),
+            "mutation",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "GraphQL HTTP analytics",
+            "httpRequestsAdaptiveGroups zone",
+            Some("graphql-analytics-zone-http-requests"),
+            "read",
+            "graphql_contract_and_response_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "GraphQL HTTP analytics",
+            "httpRequestsAdaptiveGroups selected account zones",
+            Some("graphql-analytics-account-http-requests"),
+            "read",
+            "graphql_contract_and_response_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "Analytics Engine",
+            "GET bounded Analytics Engine SQL",
+            Some("analytics-engine-sql-query-get"),
+            "read",
+            "json_ndjson_csv_streaming_fixtures",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "Workers Analytics",
+            "POST Workers observability telemetry query",
+            Some("telemetry.query"),
+            "read",
+            "bounded_query_contract_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "DNS analytics",
+            "GET zone DNS analytics table",
+            Some("dns-analytics-table"),
+            "read",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "Cache analytics",
+            "httpRequestsAdaptiveGroups cache dimensions",
+            Some("graphql-analytics-zone-http-requests"),
+            "read",
+            "graphql_contract_and_response_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "Load Balancing health",
+            "GET account pool health",
+            Some("account-load-balancer-pools-pool-health-details"),
+            "read",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "Rate-limit analytics",
+            "GET deprecated zone rate-limit analytics",
+            Some("rate-limit-analytics-get-zone-analytics"),
+            "read",
+            "openapi_contract",
+            Some(
+                "the legacy rate-limiting analytics API is deprecated in favor of Ruleset Engine telemetry",
+            ),
+        ),
+        telemetry_spec(
+            "analytics",
+            "Network analytics",
+            "GET Spectrum analytics by time",
+            Some("spectrum-analytics-(-by-time)-get-analytics-by-time"),
+            "read",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "Pages analytics",
+            "public Pages analytics API",
+            None,
+            "read",
+            "not_applicable",
+            Some(
+                "Cloudflare does not expose a public Pages analytics results API in the current schema",
+            ),
+        ),
+        telemetry_spec(
+            "logs_observability",
+            "Log Explorer",
+            "POST account Log Explorer typed SQL",
+            Some("accounts-logs-explorer-query-post"),
+            "read",
+            "typed_sql_and_envelope_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "logs_observability",
+            "Log Explorer",
+            "POST zone Log Explorer typed SQL",
+            Some("zones-logs-explorer-query-post"),
+            "read",
+            "typed_sql_and_envelope_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "logs_observability",
+            "Workers logs and traces",
+            "POST Workers observability telemetry query",
+            Some("telemetry.query"),
+            "read",
+            "bounded_query_contract_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "logs_observability",
+            "Workers observability settings",
+            "PATCH Worker script settings",
+            Some("workers-observability-settings-update"),
+            "mutation",
+            "mutation_contract_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "logs_observability",
+            "Worker tail sessions",
+            "POST leased Worker tail with sink-only URL",
+            Some("worker-tail-logs-start-tail"),
+            "mutation",
+            "secret_sink_and_exact_delete_lifecycle_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "logs_observability",
+            "Logpush",
+            "GET account Logpush jobs",
+            Some("get-accounts-account_id-logpush-jobs"),
+            "read",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "logs_observability",
+            "Logpush",
+            "POST account Logpush job",
+            Some("post-accounts-account_id-logpush-jobs"),
+            "mutation",
+            "mutation_contract_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "logs_observability",
+            "Logpush",
+            "PATCH-safe account Logpush job",
+            Some("logpush-account-job-settings-update"),
+            "mutation",
+            "mutation_contract_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "logs_observability",
+            "Logpush R2 destinations",
+            "POST zone Logpush job with validated destination",
+            Some("post-zones-zone_id-logpush-jobs"),
+            "mutation",
+            "mutation_contract_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "logs_observability",
+            "Logpull",
+            "GET bounded R2 log retrieval with out-of-band credentials",
+            Some("logpull-retrieve-logs"),
+            "read",
+            "credential_header_injection_and_private_stream_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "logs_observability",
+            "Audit logs",
+            "GET account audit logs v2",
+            Some("audit-logs-v2-get-account-audit-logs"),
+            "read",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "logs_observability",
+            "Access and Zero Trust logs",
+            "Log Explorer access_requests dataset",
+            Some("accounts-logs-explorer-query-post"),
+            "read",
+            "typed_sql_and_envelope_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "security_response",
+            "Security Events",
+            "firewallEventsAdaptive",
+            Some("graphql-analytics-zone-firewall-events"),
+            "read",
+            "graphql_bounded_sample_and_response_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "security_response",
+            "WAF and custom rulesets",
+            "POST empty custom zone ruleset",
+            Some("security-response-create-empty-custom-ruleset"),
+            "mutation",
+            "narrowed_create_read_delete_lifecycle_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "security_response",
+            "WAF individual rules",
+            "POST evidence-bound expiring zone ruleset rule",
+            Some("security-response-create-expiring-waf-rule"),
+            "mutation",
+            "security_action_nested_resource_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "security_response",
+            "WAF individual rules",
+            "DELETE verified expired zone ruleset rule",
+            Some("security-response-remove-expired-waf-rule"),
+            "mutation",
+            "security_action_nested_resource_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "security_response",
+            "Managed rules",
+            "GET zone entrypoint ruleset",
+            Some("getZoneEntrypointRuleset"),
+            "read",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "security_response",
+            "Legacy rate limits",
+            "POST zone rate limit",
+            Some("rate-limits-for-a-zone-create-a-rate-limit"),
+            "mutation",
+            "mutation_contract_fixture",
+            Some("Cloudflare deprecates this API in favor of Ruleset Engine rate limiting"),
+        ),
+        telemetry_spec(
+            "security_response",
+            "Cloudflare Lists",
+            "POST account list",
+            Some("lists-create-a-list"),
+            "mutation",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "security_response",
+            "Cloudflare List members",
+            "POST one evidence-bound asynchronous expiring list item",
+            Some("security-response-add-expiring-list-member"),
+            "mutation",
+            "async_operation_correlation_cursor_and_security_action_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "security_response",
+            "Cloudflare List members",
+            "DELETE one correlated expired list item",
+            Some("security-response-remove-expired-list-member"),
+            "mutation",
+            "async_operation_absence_cursor_and_expiry_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "security_response",
+            "Expiring IP enforcement",
+            "POST evidence-bound zone IP Access rule",
+            Some("security-response-create-expiring-ip-access-rule"),
+            "mutation",
+            "security_action_contract_and_runtime_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "security_response",
+            "Expiring IP enforcement",
+            "DELETE verified expired zone IP Access rule",
+            Some("security-response-remove-expired-ip-access-rule"),
+            "mutation",
+            "security_action_contract_and_runtime_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "security_response",
+            "Bot Management",
+            "GET zone bot configuration",
+            Some("bot-management-for-a-zone-get-config"),
+            "read",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "security_response",
+            "DDoS visibility",
+            "firewallEventsAdaptive DDoS sources",
+            Some("graphql-analytics-zone-firewall-events"),
+            "read",
+            "graphql_bounded_sample_and_response_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "security_response",
+            "Availability and security alerts",
+            "POST notification policy",
+            Some("notification-policies-create-a-notification-policy"),
+            "mutation",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "data_governance",
+            "Dataset retention and limits",
+            "GraphQL zone dataset settings",
+            Some("graphql-analytics-zone-dataset-settings"),
+            "read",
+            "graphql_contract_and_response_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "data_governance",
+            "Logpush fields and filters",
+            "GET zone Logpush dataset fields",
+            Some("get-zones-zone_id-logpush-datasets-dataset_id-fields"),
+            "read",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "data_governance",
+            "Log Explorer dataset schema",
+            "GET account available datasets",
+            Some("accounts-logs-explorer-datasets-available-list"),
+            "read",
+            "openapi_contract",
+            None,
+        ),
+        telemetry_spec(
+            "data_governance",
+            "Dataset localization",
+            "public telemetry dataset localization control",
+            None,
+            "read",
+            "not_applicable",
+            Some(
+                "no universal public localization API exists; product-specific controls must remain explicit",
+            ),
+        ),
+    ]
+}
+
+const fn telemetry_spec(
+    domain: &'static str,
+    product: &'static str,
+    authority: &'static str,
+    capability_id: Option<&'static str>,
+    operation_kind: &'static str,
+    fixture_coverage: &'static str,
+    upstream_blocker: Option<&'static str>,
+) -> TelemetryCoverageSpec {
+    TelemetryCoverageSpec {
+        domain,
+        product,
+        authority,
+        capability_id,
+        operation_kind,
+        fixture_coverage,
+        upstream_blocker,
+    }
 }
 
 pub struct CatalogIndex {
@@ -398,7 +1092,8 @@ pub fn attach_official_product_knowledge(
                 .values()
                 .any(|available| !available);
             capability.entitlement.requires_live_resolution =
-                plan_gated && supports_live_zone_entitlement_resolution(capability);
+                capability.entitlement.probe.is_some()
+                    || (plan_gated && supports_live_zone_entitlement_resolution(capability));
             capability.entitlement.blocker =
                 if plan_gated && !capability.entitlement.requires_live_resolution {
                     Some(unsupported_entitlement_resolution_reason(capability))
@@ -986,7 +1681,8 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
                 .map(str::to_owned)
                 .collect();
             capability.request_schema = request_schema_contract(document, operation);
-            capability.response_contract = success_response_contract(document, operation)?;
+            capability.response_contract =
+                success_response_contract(document, operation, capability.mutating)?;
             capability.entitlement.plans = operation_object
                 .get("x-cfPlanAvailability")
                 .and_then(Value::as_object)
@@ -1020,6 +1716,3426 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
     };
     snapshot.refresh_hash()?;
     Ok(snapshot)
+}
+
+/// Overlays the small set of telemetry contracts that cannot be generated
+/// honestly from Cloudflare's REST `OpenAPI` alone. REST operations are only
+/// promoted when their current operation identity still matches; GraphQL and
+/// native workflows are additive, fixed-document capabilities.
+pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
+    finalize_analytics_engine_query(snapshot);
+    finalize_log_explorer_queries(snapshot);
+    finalize_logpull_retrieval(snapshot);
+    finalize_workers_observability_reads(snapshot);
+    finalize_telemetry_mutations(snapshot);
+    for capability in graphql_analytics_capabilities()? {
+        snapshot
+            .capabilities
+            .insert(capability.id.clone(), capability);
+    }
+    for capability in telemetry_workflow_capabilities() {
+        snapshot
+            .capabilities
+            .insert(capability.id.clone(), capability);
+    }
+    snapshot.refresh_hash()
+}
+
+const LOGPULL_RETRIEVE_ID: &str = "logpull-retrieve-logs";
+const LOGPULL_RETRIEVE_PATH: &str = "/accounts/{account_id}/logs/retrieve";
+
+/// Graduates only Cloudflare's exact Logs Engine retrieval operation from the
+/// generic reserved-header blocker. The public selector surface loses both R2
+/// credential headers; the executor can recreate them only from the typed,
+/// out-of-band bundle described by `R2LogRetrievalContractV1` and must stream
+/// the bounded response to a new private file.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the private Logpull overlay keeps its bounded query, credential, cost, and receipt contract together"
+)]
+fn finalize_logpull_retrieval(snapshot: &mut CatalogSnapshot) {
+    let Some(capability) = snapshot.capabilities.get_mut(LOGPULL_RETRIEVE_ID) else {
+        return;
+    };
+    let selector_shape = [
+        ("account_id", "path", true),
+        ("R2-Access-Key-Id", "header", true),
+        ("R2-Secret-Access-Key", "header", true),
+        ("start", "query", true),
+        ("end", "query", true),
+        ("bucket", "query", true),
+        ("prefix", "query", false),
+    ];
+    let identity_supported = capability.method == "GET"
+        && capability.path == LOGPULL_RETRIEVE_PATH
+        && capability.product == "Logpull"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && capability.selectors.len() == selector_shape.len()
+        && selector_shape.iter().all(|(name, location, required)| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == *location
+                    && selector.required == *required
+                    && selector.value_type == "string"
+            })
+        })
+        && capability.permissions == ["Logs Write", "Logs Read"]
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+                    && response.body_mode == ResponseBodyModeV1::JsonValue
+            });
+    if !identity_supported {
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "schema drift: Logs Engine retrieval no longer matches the pinned account, R2 credential-header, RFC3339 range, bucket, and JSON stream contract"
+                .to_owned(),
+        );
+        return;
+    }
+
+    capability
+        .selectors
+        .retain(|selector| selector.location != "header");
+    capability.permissions = vec!["Logs Read".to_owned()];
+    capability.aliases = vec![
+        "Logpull".to_owned(),
+        "Logs Engine".to_owned(),
+        "retrieve R2 logs".to_owned(),
+        "export retained logs by time range".to_owned(),
+    ];
+    capability.description = Some(
+        "Streams one explicit RFC3339 time window from one R2 log bucket to a new mode-0600 file. R2 credentials come only from a closed out-of-band bundle, never selectors, argv, stdout, plans, logs, or evidence. The receipt reports the time bounds, hashed bucket/prefix, byte bound, bytes written, completeness, and content hash."
+            .to_owned(),
+    );
+    capability.r2_log_retrieval = Some(R2LogRetrievalContractV1 {
+        access_key_input_field: "access_key_id".to_owned(),
+        secret_access_key_input_field: "secret_access_key".to_owned(),
+        access_key_header: "R2-Access-Key-Id".to_owned(),
+        secret_access_key_header: "R2-Secret-Access-Key".to_owned(),
+        start_query_selector: "start".to_owned(),
+        end_query_selector: "end".to_owned(),
+        bucket_query_selector: "bucket".to_owned(),
+        prefix_query_selector: "prefix".to_owned(),
+        // R2 has no product retention ceiling, so cfctl uses a generous but
+        // finite lookback and a deliberately narrow per-call window.
+        max_lookback_seconds: 10 * 365 * 24 * 60 * 60,
+        max_window_seconds: 60 * 60,
+        max_bytes: 256 * 1024 * 1024,
+        max_timeout_seconds: 120,
+        output_media_types: vec!["application/json".to_owned()],
+        requires_new_mode_0600_file: true,
+    });
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    capability.blocked_reason = None;
+    capability.entitlement.available = None;
+    capability.entitlement.requires_live_resolution = true;
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/logs/r2-log-retrieval/".to_owned());
+    capability.cost.incremental = true;
+    capability.cost.known = false;
+    capability.cost.maximum = None;
+    capability.cost.currency = None;
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "the retrieval is bounded to 256 MiB but R2 Class B retrieval and storage charges depend on the account and cannot be converted to a universal currency ceiling before the read"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        official_reference(
+            "Logs Engine R2 retrieval",
+            "https://developers.cloudflare.com/logs/r2-log-retrieval/",
+        ),
+        official_reference(
+            "R2 pricing",
+            "https://developers.cloudflare.com/r2/pricing/",
+        ),
+    ];
+    capability.verification.required = false;
+    "bounded_file_hash_receipt".clone_into(&mut capability.verification.strategy);
+    capability.rollback.warning = None;
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the account and zone Log Explorer overlays share one symmetric contract definition"
+)]
+fn finalize_log_explorer_queries(snapshot: &mut CatalogSnapshot) {
+    for id in [
+        "accounts-logs-explorer-query-get",
+        "zones-logs-explorer-query-get",
+    ] {
+        if let Some(capability) = snapshot.capabilities.get_mut(id) {
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(
+                "blocked by design: raw Log Explorer SQL query parameters are not a public cfctl surface; use the typed POST capability for the same scope"
+                    .to_owned(),
+            );
+        }
+    }
+
+    for (id, path, scope) in [
+        (
+            "accounts-logs-explorer-query-post",
+            "/accounts/{account_id}/logs/explorer/query/sql",
+            "account",
+        ),
+        (
+            "zones-logs-explorer-query-post",
+            "/zones/{zone_id}/logs/explorer/query/sql",
+            "zone",
+        ),
+    ] {
+        let Some(capability) = snapshot.capabilities.get_mut(id) else {
+            continue;
+        };
+        let identity_supported = capability.method == "POST"
+            && capability.path == path
+            && capability
+                .permissions
+                .iter()
+                .any(|permission| permission == "Logs Read")
+            && capability
+                .response_contract
+                .as_ref()
+                .is_some_and(|response| {
+                    response.success_statuses == ["200"]
+                        && response
+                            .success_media_types
+                            .iter()
+                            .any(|media| media == "application/json")
+                        && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                });
+        if !identity_supported {
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(format!(
+                "schema drift: {scope} Log Explorer SQL no longer matches the governed POST, Logs Read, and JSON response contract"
+            ));
+            continue;
+        }
+        capability
+            .selectors
+            .retain(|selector| selector.location != "query");
+        capability.permissions = vec!["Logs Read".to_owned()];
+        capability.aliases = vec![
+            "Log Explorer".to_owned(),
+            format!("query {scope} logs"),
+            "Access logs Zero Trust logs audit logs security events".to_owned(),
+            "bounded log SQL".to_owned(),
+        ];
+        capability.description = Some(format!(
+            "Runs a compiler-rendered, single-statement SELECT over one {scope}-scoped Log Explorer dataset with an explicit timestamp field, time window, row, byte, and timeout bound. Raw SQL is never accepted."
+        ));
+        capability.request_schema = Some(structured_log_explorer_schema());
+        capability.analytics_query = Some(AnalyticsQueryContractV1 {
+            kind: AnalyticsQueryKindV1::LogExplorerSql,
+            dataset: None,
+            dataset_pointer: Some("/dataset".to_owned()),
+            time_range: Some(TimeRangeContractV1 {
+                start_pointer: "/start".to_owned(),
+                end_pointer: "/end".to_owned(),
+                timestamp_format: TimestampFormatV1::Rfc3339,
+                max_lookback_seconds: 30 * 24 * 60 * 60,
+                max_window_seconds: 24 * 60 * 60,
+            }),
+            row_limit_pointer: Some("/limit".to_owned()),
+            max_rows: 5_000,
+            max_bytes: 32 * 1024 * 1024,
+            max_timeout_seconds: 30,
+            allowed_output_formats: vec![OutputFormatV1::Json],
+            default_output_format: OutputFormatV1::Json,
+            pagination: PaginationModeV1::TimeWindow,
+            read_only: true,
+            freshness: Some(
+                "dataset ingestion freshness is returned as upstream data, never inferred by cfctl"
+                    .to_owned(),
+            ),
+            sampling: Some(
+                "Log Explorer queries operate on retained ingested logs; missing records are not interpreted as unsampled truth"
+                    .to_owned(),
+            ),
+        });
+        capability.mutating = false;
+        capability.risk = RiskClass::Read;
+        capability.effect = EffectClass::ReadOnly;
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
+        capability.entitlement.available = None;
+        capability.entitlement.requires_live_resolution = true;
+        capability.entitlement.source =
+            Some("https://developers.cloudflare.com/log-explorer/pricing/".to_owned());
+        capability.cost.known = true;
+        capability.cost.incremental = false;
+        capability.cost.maximum = Some(0.0);
+        capability.cost.billing_model = BillingModelV1::UsageBased;
+        capability.cost.exposure = CostExposureV1::DownstreamUsage;
+        capability.cost.basis = Some(
+            "queries have no additional charge; Log Explorer ingestion and retained storage are paid usage and require a live entitlement check"
+                .to_owned(),
+        );
+        capability.cost.references = vec![official_reference(
+            "Log Explorer pricing and availability",
+            "https://developers.cloudflare.com/log-explorer/pricing/",
+        )];
+        capability.verification.required = false;
+        "not_applicable".clone_into(&mut capability.verification.strategy);
+        capability.rollback.warning = None;
+    }
+}
+
+fn structured_log_explorer_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["dataset","timestamp_field","start","end","columns","limit","timeout_seconds"],
+        "properties":{
+            "dataset":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"},
+            "timestamp_field":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"},
+            "start":{"type":"string","format":"date-time"},
+            "end":{"type":"string","format":"date-time"},
+            "columns":{"type":"array","minItems":1,"maxItems":50,"uniqueItems":true,"items":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"}},
+            "aggregates":{"type":"array","maxItems":20,"items":{"type":"object","additionalProperties":false,"required":["function","alias"],"properties":{"function":{"type":"string","enum":["count","sum","avg","min","max"]},"field":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"},"alias":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"}}}},
+            "filters":{"type":"array","maxItems":20,"items":{"type":"object","additionalProperties":false,"required":["field","operator","value"],"properties":{"field":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"},"operator":{"type":"string","enum":["eq","ne","gt","gte","lt","lte","in","not_in"]},"value":{}}}},
+            "group_by":{"type":"array","maxItems":20,"uniqueItems":true,"items":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"}},
+            "order_by":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["field","direction"],"properties":{"field":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"},"direction":{"type":"string","enum":["asc","desc"]}}}},
+            "limit":{"type":"integer","minimum":1,"maximum":5000},
+            "timeout_seconds":{"type":"integer","minimum":1,"maximum":30}
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn finalize_telemetry_mutations(snapshot: &mut CatalogSnapshot) {
+    finalize_web_analytics_site_lifecycle(snapshot);
+    finalize_web_analytics_rule_lifecycle(snapshot);
+    finalize_workers_observability_settings(snapshot);
+    finalize_worker_tail_lifecycle(snapshot);
+    finalize_logpush_lifecycle(snapshot);
+    finalize_security_response_lifecycle(snapshot);
+    finalize_custom_waf_ruleset_lifecycle(snapshot);
+    finalize_waf_security_response_lifecycle(snapshot);
+    finalize_rate_limit_lifecycle(snapshot);
+    finalize_notification_policy_lifecycle(snapshot);
+    finalize_list_container_lifecycle(snapshot);
+    finalize_list_member_lifecycle(snapshot);
+}
+
+const WORKER_TAIL_CREATE_ID: &str = "worker-tail-logs-start-tail";
+const WORKER_TAIL_LIST_ID: &str = "worker-tail-logs-list-tails";
+const WORKER_TAIL_DELETE_ID: &str = "worker-tail-logs-delete-tail";
+const WORKER_TAIL_COLLECTION_PATH: &str =
+    "/accounts/{account_id}/workers/scripts/{script_name}/tails";
+const WORKER_TAIL_DETAIL_PATH: &str =
+    "/accounts/{account_id}/workers/scripts/{script_name}/tails/{id}";
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the bounded Worker tail lifecycle is reviewed as one create, verify, sink, and delete contract"
+)]
+fn finalize_worker_tail_lifecycle(snapshot: &mut CatalogSnapshot) {
+    let identity_ok = snapshot
+        .capabilities
+        .get(WORKER_TAIL_CREATE_ID)
+        .is_some_and(|capability| {
+            capability.method == "POST"
+                && capability.path == WORKER_TAIL_COLLECTION_PATH
+                && capability.request_schema.is_none()
+        })
+        && snapshot
+            .capabilities
+            .get(WORKER_TAIL_LIST_ID)
+            .is_some_and(|capability| {
+                capability.method == "GET"
+                    && capability.path == WORKER_TAIL_COLLECTION_PATH
+                    && !capability.mutating
+            })
+        && snapshot
+            .capabilities
+            .get(WORKER_TAIL_DELETE_ID)
+            .is_some_and(|capability| {
+                capability.method == "DELETE" && capability.path == WORKER_TAIL_DETAIL_PATH
+            });
+    if !identity_ok {
+        if let Some(capability) = snapshot.capabilities.get_mut(WORKER_TAIL_CREATE_ID) {
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(
+                "schema drift: Worker tail create/list/delete no longer matches the governed leased-session lifecycle"
+                    .to_owned(),
+            );
+        }
+        return;
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(WORKER_TAIL_LIST_ID) {
+        capability.permissions = vec!["Workers Tail Read".to_owned()];
+        capability.aliases = vec![
+            "inspect active Worker tail sessions".to_owned(),
+            "Worker log tail leases".to_owned(),
+        ];
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(WORKER_TAIL_DELETE_ID) {
+        capability.permissions = vec![
+            "Workers Tail Read".to_owned(),
+            "Workers Scripts Write".to_owned(),
+        ];
+        capability.request_schema = None;
+        capability.risk = RiskClass::Destructive;
+        capability.effect = EffectClass::Destructive;
+        attach_live_read_entitlement_probe(
+            capability,
+            WORKER_TAIL_LIST_ID,
+            WORKER_TAIL_COLLECTION_PATH,
+        );
+        capability.entitlement.source = Some(
+            "https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/tail/"
+                .to_owned(),
+        );
+        zero_cost_mutation(
+            capability,
+            "ending one exact tail lease has no direct operation charge and stops its bounded log stream",
+            official_reference(
+                "Workers Tail API",
+                "https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/tail/",
+            ),
+        );
+        capability.verification.required = true;
+        "parent_collection_omits_deleted_resource_id"
+            .clone_into(&mut capability.verification.strategy);
+        capability.deleted_resource = Some(DeletedResourceContractV1 {
+            collection_path: WORKER_TAIL_COLLECTION_PATH.to_owned(),
+            identity_selector: "id".to_owned(),
+            response_item_identity_pointer: "/id".to_owned(),
+            read_capability_id: WORKER_TAIL_LIST_ID.to_owned(),
+            requires_page_number_completion: false,
+        });
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "ending a tail lease is irreversible for that session; a replacement requires a separately reviewed start-tail plan and yields a new secret URL"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(WORKER_TAIL_CREATE_ID) {
+        capability.permissions = vec![
+            "Workers Tail Read".to_owned(),
+            "Workers Scripts Write".to_owned(),
+        ];
+        capability.aliases = vec![
+            "bounded Worker tail session".to_owned(),
+            "tail Worker logs".to_owned(),
+            "stream Worker exceptions".to_owned(),
+            "inspect Worker invocations live".to_owned(),
+        ];
+        capability.description = Some(
+            "Creates one Cloudflare-expiring Worker tail lease, sinks its bearer WebSocket URL only to a new mode-0600 JSON file, verifies the returned lease ID in the live tail collection, and binds exact deletion as compensation. The URL is never printed or written to evidence."
+                .to_owned(),
+        );
+        capability.risk = RiskClass::SecretSensitive;
+        capability.effect = EffectClass::ReversibleWrite;
+        attach_live_read_entitlement_probe(
+            capability,
+            WORKER_TAIL_LIST_ID,
+            WORKER_TAIL_COLLECTION_PATH,
+        );
+        capability.entitlement.source = Some(
+            "https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/tail/"
+                .to_owned(),
+        );
+        zero_cost_mutation(
+            capability,
+            "creating one Cloudflare-expiring tail lease has no direct operation charge; the session is bounded by the upstream expiry and exact-delete compensation",
+            official_reference(
+                "Workers Tail API",
+                "https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/tail/",
+            ),
+        );
+        capability.verification.required = true;
+        "worker_tail_collection_contains_created_lease_id"
+            .clone_into(&mut capability.verification.strategy);
+        capability.created_collection_resource = Some(CreatedCollectionResourceContractV1 {
+            collection_path: WORKER_TAIL_COLLECTION_PATH.to_owned(),
+            identity_selector: "id".to_owned(),
+            response_result_identity_pointer: "/id".to_owned(),
+            response_item_identity_pointer: "/id".to_owned(),
+            read_capability_id: WORKER_TAIL_LIST_ID.to_owned(),
+            delete_capability_id: WORKER_TAIL_DELETE_ID.to_owned(),
+            verified_response_fields: Vec::new(),
+            requires_page_number_completion: false,
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.rollback.warning = Some(
+            "compensation creates a separate exact tail-delete plan from the returned lease ID; the secret URL remains sink-only"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
+
+const CUSTOM_WAF_RULESET_SOURCE_CREATE_ID: &str = "createZoneRuleset";
+const CUSTOM_WAF_RULESET_CREATE_ID: &str = "security-response-create-empty-custom-ruleset";
+const CUSTOM_WAF_RULESET_LIST_ID: &str = "listZoneRulesets";
+const CUSTOM_WAF_RULESET_READ_ID: &str = "getZoneRuleset";
+const CUSTOM_WAF_RULESET_DELETE_ID: &str = "deleteZoneRuleset";
+const CUSTOM_WAF_RULESET_COLLECTION_PATH: &str = "/zones/{zone_id}/rulesets";
+const CUSTOM_WAF_RULESET_DETAIL_PATH: &str = "/zones/{zone_id}/rulesets/{ruleset_id}";
+
+fn empty_custom_waf_ruleset_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["description","kind","name","phase","rules"],
+        "properties":{
+            "description":{"type":"string","maxLength":500},
+            "kind":{"type":"string","const":"custom"},
+            "name":{"type":"string","minLength":1,"maxLength":100},
+            "phase":{"type":"string","const":"http_request_firewall_custom"},
+            "rules":{"type":"array","maxItems":0,"items":{}}
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the safe empty-ruleset create and exact delete lifecycle is one auditable overlay"
+)]
+fn finalize_custom_waf_ruleset_lifecycle(snapshot: &mut CatalogSnapshot) {
+    let identity_ok = snapshot
+        .capabilities
+        .get(CUSTOM_WAF_RULESET_SOURCE_CREATE_ID)
+        .is_some_and(|capability| {
+            capability.method == "POST" && capability.path == CUSTOM_WAF_RULESET_COLLECTION_PATH
+        })
+        && snapshot
+            .capabilities
+            .get(CUSTOM_WAF_RULESET_LIST_ID)
+            .is_some_and(|capability| {
+                capability.method == "GET"
+                    && capability.path == CUSTOM_WAF_RULESET_COLLECTION_PATH
+                    && !capability.mutating
+            })
+        && snapshot
+            .capabilities
+            .get(CUSTOM_WAF_RULESET_READ_ID)
+            .is_some_and(|capability| {
+                capability.method == "GET"
+                    && capability.path == CUSTOM_WAF_RULESET_DETAIL_PATH
+                    && !capability.mutating
+            })
+        && snapshot
+            .capabilities
+            .get(CUSTOM_WAF_RULESET_DELETE_ID)
+            .is_some_and(|capability| {
+                capability.method == "DELETE" && capability.path == CUSTOM_WAF_RULESET_DETAIL_PATH
+            });
+    if !identity_ok {
+        return;
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(CUSTOM_WAF_RULESET_DELETE_ID) {
+        capability.permissions = vec!["Zone WAF Read".to_owned(), "Zone WAF Write".to_owned()];
+        capability.request_schema = None;
+        capability.risk = RiskClass::Destructive;
+        capability.effect = EffectClass::Destructive;
+        attach_live_read_entitlement_probe(
+            capability,
+            CUSTOM_WAF_RULESET_LIST_ID,
+            CUSTOM_WAF_RULESET_COLLECTION_PATH,
+        );
+        capability.entitlement.source = Some(
+            "https://developers.cloudflare.com/ruleset-engine/rulesets-api/delete/".to_owned(),
+        );
+        zero_cost_mutation(
+            capability,
+            "deleting one exact ruleset has no direct operation charge; the removed configuration cannot be reconstructed without its prior snapshot",
+            official_reference(
+                "Delete a Ruleset Engine ruleset",
+                "https://developers.cloudflare.com/ruleset-engine/rulesets-api/delete/",
+            ),
+        );
+        capability.verification.required = true;
+        "same_resource_returns_not_found_after_delete"
+            .clone_into(&mut capability.verification.strategy);
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: CUSTOM_WAF_RULESET_DETAIL_PATH.to_owned(),
+            read_capability_id: CUSTOM_WAF_RULESET_READ_ID.to_owned(),
+            verified_response_fields: Vec::new(),
+        });
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "ruleset deletion is irreversible; capture the complete current ruleset before approval and use create/update operations to reconstruct it if needed"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+
+    if let Some(source) = snapshot
+        .capabilities
+        .get(CUSTOM_WAF_RULESET_SOURCE_CREATE_ID)
+        .cloned()
+    {
+        let mut capability = source;
+        CUSTOM_WAF_RULESET_CREATE_ID.clone_into(&mut capability.id);
+        "Create an empty custom WAF ruleset".clone_into(&mut capability.title);
+        capability.description = Some(
+            "Creates one dormant, empty zone custom ruleset in the fixed http_request_firewall_custom phase. Arbitrary rules, expressions, entry-point kinds, and other phases are rejected; add evidence-bound rules through the typed security-response capability."
+                .to_owned(),
+        );
+        capability.aliases = vec![
+            "bootstrap custom WAF ruleset".to_owned(),
+            "create empty security ruleset".to_owned(),
+            "prepare expiring WAF actions".to_owned(),
+        ];
+        "cfctl-safe-ruleset-v1+cloudflare-rulesets-api".clone_into(&mut capability.source);
+        capability.permissions = vec!["Zone WAF Read".to_owned(), "Zone WAF Write".to_owned()];
+        capability.request_schema = Some(empty_custom_waf_ruleset_schema());
+        capability.risk = RiskClass::CrossConfig;
+        capability.effect = EffectClass::ReversibleWrite;
+        attach_live_read_entitlement_probe(
+            &mut capability,
+            CUSTOM_WAF_RULESET_LIST_ID,
+            CUSTOM_WAF_RULESET_COLLECTION_PATH,
+        );
+        capability.entitlement.source =
+            Some("https://developers.cloudflare.com/waf/custom-rulesets/".to_owned());
+        zero_cost_mutation(
+            &mut capability,
+            "creating an empty dormant custom WAF ruleset has no direct operation charge; rule quotas and deployment entitlement remain plan-governed",
+            official_reference(
+                "Create a Ruleset Engine ruleset",
+                "https://developers.cloudflare.com/ruleset-engine/rulesets-api/create/",
+            ),
+        );
+        capability.verification.required = true;
+        "created_resource_contains_planned_fields_by_returned_id"
+            .clone_into(&mut capability.verification.strategy);
+        capability.created_resource = Some(CreatedResourceContractV1 {
+            detail_path: CUSTOM_WAF_RULESET_DETAIL_PATH.to_owned(),
+            identity_selector: "ruleset_id".to_owned(),
+            response_result_identity_pointer: "/id".to_owned(),
+            read_capability_id: CUSTOM_WAF_RULESET_READ_ID.to_owned(),
+            delete_capability_id: CUSTOM_WAF_RULESET_DELETE_ID.to_owned(),
+            verified_response_fields: vec![
+                "description".to_owned(),
+                "kind".to_owned(),
+                "name".to_owned(),
+                "phase".to_owned(),
+                "rules".to_owned(),
+            ],
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.rollback.warning = Some(
+            "rollback is a separate exact-ruleset delete plan derived only from the returned ID; the create contract proves the ruleset was empty"
+                .to_owned(),
+        );
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
+        refresh_dynamic_mutation_contract(&mut capability);
+        snapshot
+            .capabilities
+            .insert(CUSTOM_WAF_RULESET_CREATE_ID.to_owned(), capability);
+    }
+
+    if let Some(capability) = snapshot
+        .capabilities
+        .get_mut(CUSTOM_WAF_RULESET_SOURCE_CREATE_ID)
+    {
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "blocked by design: arbitrary ruleset kinds, phases, and embedded rules are not a public cfctl surface; use `security-response-create-empty-custom-ruleset` and typed rule capabilities"
+                .to_owned(),
+        );
+    }
+}
+
+fn zero_cost_mutation(capability: &mut CapabilityV1, basis: &str, reference: KnowledgeReferenceV1) {
+    capability.cost.incremental = false;
+    capability.cost.currency = None;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.known = true;
+    capability.cost.billing_model = BillingModelV1::Subscription;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(basis.to_owned());
+    capability.cost.references = vec![reference];
+}
+
+fn attach_live_read_entitlement_probe(
+    capability: &mut CapabilityV1,
+    capability_id: &str,
+    path: &str,
+) {
+    let mut selector_names = path
+        .split('/')
+        .filter_map(|segment| {
+            segment
+                .strip_prefix('{')
+                .and_then(|segment| segment.strip_suffix('}'))
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    selector_names.sort();
+    selector_names.dedup();
+    capability.entitlement.available = None;
+    capability.entitlement.blocker = None;
+    capability.entitlement.requires_live_resolution = true;
+    capability.entitlement.observed_plan = None;
+    capability.entitlement.probe = Some(EntitlementProbeV1 {
+        capability_id: capability_id.to_owned(),
+        path: path.to_owned(),
+        selector_names,
+    });
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Web Analytics create, update, verify, and delete contracts are intentionally co-located"
+)]
+fn finalize_web_analytics_site_lifecycle(snapshot: &mut CatalogSnapshot) {
+    const CREATE: &str = "web-analytics-create-site";
+    const READ: &str = "web-analytics-get-site";
+    const UPDATE: &str = "web-analytics-update-site";
+    const DELETE: &str = "web-analytics-delete-site";
+    const COLLECTION: &str = "/accounts/{account_id}/rum/site_info";
+    const DETAIL: &str = "/accounts/{account_id}/rum/site_info/{site_id}";
+    let identity_ok = snapshot.capabilities.get(CREATE).is_some_and(|capability| {
+        capability.method == "POST"
+            && capability.path == COLLECTION
+            && capability.permissions == ["Account Settings Write"]
+    }) && snapshot.capabilities.get(READ).is_some_and(|capability| {
+        capability.method == "GET" && capability.path == DETAIL && !capability.mutating
+    }) && snapshot
+        .capabilities
+        .get(UPDATE)
+        .is_some_and(|capability| capability.method == "PUT" && capability.path == DETAIL)
+        && snapshot
+            .capabilities
+            .get(DELETE)
+            .is_some_and(|capability| capability.method == "DELETE" && capability.path == DETAIL);
+    if !identity_ok {
+        for id in [CREATE, UPDATE] {
+            if let Some(capability) = snapshot.capabilities.get_mut(id) {
+                capability.adapter_status = AdapterStatus::Blocked;
+                capability.blocked_reason = Some(
+                    "schema drift: Web Analytics site lifecycle no longer matches the governed create/read/update/delete contract"
+                        .to_owned(),
+                );
+            }
+        }
+        return;
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(CREATE) {
+        capability.aliases = vec![
+            "create Web Analytics site".to_owned(),
+            "bootstrap browser analytics".to_owned(),
+            "configure RUM site".to_owned(),
+        ];
+        capability.request_schema = Some(serde_json::json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":["host"],
+            "properties":{
+                "auto_install":{"type":"boolean"},
+                "host":{"type":"string","minLength":1,"maxLength":253,"pattern":"^[A-Za-z0-9.-]+$"},
+                "zone_tag":{"type":"string","minLength":32,"maxLength":32}
+            },
+            "x-cfctl-body-required":true
+        }));
+        capability.risk = RiskClass::ScopedWrite;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.entitlement.available = Some(true);
+        zero_cost_mutation(
+            capability,
+            "creating the site has no direct operation charge; Web Analytics retention and volume remain plan-governed",
+            official_reference(
+                "Web Analytics configuration API",
+                "https://developers.cloudflare.com/api/resources/rum/subresources/site_info/methods/create/",
+            ),
+        );
+        capability.verification.required = true;
+        "created_resource_contains_planned_fields_by_returned_id"
+            .clone_into(&mut capability.verification.strategy);
+        capability.created_resource = Some(CreatedResourceContractV1 {
+            detail_path: DETAIL.to_owned(),
+            identity_selector: "site_id".to_owned(),
+            response_result_identity_pointer: "/site_tag".to_owned(),
+            read_capability_id: READ.to_owned(),
+            delete_capability_id: DELETE.to_owned(),
+            verified_response_fields: vec![
+                "auto_install".to_owned(),
+                "host".to_owned(),
+                "zone_tag".to_owned(),
+            ],
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.rollback.warning = Some(
+            "rollback is a separate exact-site delete plan; deleting the site invalidates its token and snippet"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(UPDATE) {
+        if let Some(schema) = capability
+            .request_schema
+            .as_mut()
+            .and_then(Value::as_object_mut)
+        {
+            schema.insert("additionalProperties".to_owned(), Value::Bool(false));
+            schema.insert("minProperties".to_owned(), Value::from(1));
+        }
+        capability.aliases = vec![
+            "update Web Analytics site".to_owned(),
+            "enable disable Web Analytics".to_owned(),
+            "configure browser insights".to_owned(),
+        ];
+        capability.risk = RiskClass::ScopedWrite;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.entitlement.available = Some(true);
+        zero_cost_mutation(
+            capability,
+            "updating site collection and RUM settings has no direct operation charge; downstream analytics volume remains plan-governed",
+            official_reference(
+                "Web Analytics site update API",
+                "https://developers.cloudflare.com/api/resources/rum/subresources/site_info/methods/update/",
+            ),
+        );
+        capability.verification.required = true;
+        "same_resource_contains_planned_fields_after_update"
+            .clone_into(&mut capability.verification.strategy);
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: DETAIL.to_owned(),
+            read_capability_id: READ.to_owned(),
+            verified_response_fields: vec![
+                "auto_install".to_owned(),
+                "enabled".to_owned(),
+                "host".to_owned(),
+                "lite".to_owned(),
+                "zone_tag".to_owned(),
+            ],
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+        capability.rollback.warning = Some(
+            "cfctl captures and rechecks the exact site state before applying; rollback is a separately reviewed restoration plan"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(DELETE) {
+        capability.aliases = vec![
+            "delete Web Analytics site".to_owned(),
+            "remove RUM site".to_owned(),
+        ];
+        capability.risk = RiskClass::Destructive;
+        capability.effect = EffectClass::Destructive;
+        capability.entitlement.available = Some(true);
+        zero_cost_mutation(
+            capability,
+            "deleting a Web Analytics site has no direct operation charge",
+            official_reference(
+                "Web Analytics site delete API",
+                "https://developers.cloudflare.com/api/resources/rum/subresources/site_info/methods/delete/",
+            ),
+        );
+        capability.verification.required = true;
+        "same_resource_returns_not_found_after_delete"
+            .clone_into(&mut capability.verification.strategy);
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: DETAIL.to_owned(),
+            read_capability_id: READ.to_owned(),
+            verified_response_fields: Vec::new(),
+        });
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "site deletion is irreversible because recreation issues new site identity and snippet material"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Web Analytics rule create and exact delete contracts are intentionally co-located"
+)]
+fn finalize_web_analytics_rule_lifecycle(snapshot: &mut CatalogSnapshot) {
+    const CREATE: &str = "web-analytics-create-rule";
+    const LIST: &str = "web-analytics-list-rules";
+    const UPDATE: &str = "web-analytics-update-rule";
+    const BULK_UPDATE: &str = "web-analytics-modify-rules";
+    const DELETE: &str = "web-analytics-delete-rule";
+    const CREATE_PATH: &str = "/accounts/{account_id}/rum/v2/{ruleset_id}/rule";
+    const LIST_PATH: &str = "/accounts/{account_id}/rum/v2/{ruleset_id}/rules";
+    const DETAIL_PATH: &str = "/accounts/{account_id}/rum/v2/{ruleset_id}/rule/{rule_id}";
+    let identity_ok =
+        snapshot.capabilities.get(CREATE).is_some_and(|capability| {
+            capability.method == "POST" && capability.path == CREATE_PATH
+        }) && snapshot.capabilities.get(LIST).is_some_and(|capability| {
+            capability.method == "GET" && capability.path == LIST_PATH && !capability.mutating
+        }) && snapshot.capabilities.get(DELETE).is_some_and(|capability| {
+            capability.method == "DELETE" && capability.path == DETAIL_PATH
+        });
+    if !identity_ok {
+        if let Some(capability) = snapshot.capabilities.get_mut(CREATE) {
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(
+                "schema drift: Web Analytics rule create/list/delete no longer matches the governed lifecycle"
+                    .to_owned(),
+            );
+        }
+        return;
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(LIST) {
+        capability.permissions = vec!["Account Settings Read".to_owned()];
+        capability.aliases = vec![
+            "list Web Analytics rules".to_owned(),
+            "inspect RUM include exclude rules".to_owned(),
+        ];
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(CREATE) {
+        capability.permissions = vec![
+            "Account Settings Read".to_owned(),
+            "Account Settings Write".to_owned(),
+        ];
+        capability.aliases = vec![
+            "create Web Analytics rule".to_owned(),
+            "configure RUM host path collection rule".to_owned(),
+            "include exclude browser analytics traffic".to_owned(),
+        ];
+        capability.request_schema = Some(serde_json::json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":["host","inclusive","paths"],
+            "properties":{
+                "host":{"type":"string","minLength":1,"maxLength":253,"pattern":"^[A-Za-z0-9.*-]+$"},
+                "inclusive":{"type":"boolean"},
+                "is_paused":{"type":"boolean"},
+                "paths":{"type":"array","minItems":1,"maxItems":50,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":2048}}
+            },
+            "x-cfctl-body-required":true
+        }));
+        capability.risk = RiskClass::ScopedWrite;
+        capability.effect = EffectClass::ReversibleWrite;
+        attach_live_read_entitlement_probe(capability, LIST, LIST_PATH);
+        zero_cost_mutation(
+            capability,
+            "creating a Web Analytics collection rule has no direct operation charge; it changes which browser measurements are collected",
+            official_reference(
+                "Create Web Analytics rule",
+                "https://developers.cloudflare.com/api/resources/rum/subresources/rules/methods/create/",
+            ),
+        );
+        capability.verification.required = true;
+        "web_analytics_rule_list_contains_created_id_and_planned_fields"
+            .clone_into(&mut capability.verification.strategy);
+        capability.created_resource = Some(CreatedResourceContractV1 {
+            detail_path: DETAIL_PATH.to_owned(),
+            identity_selector: "rule_id".to_owned(),
+            response_result_identity_pointer: "/id".to_owned(),
+            read_capability_id: LIST.to_owned(),
+            delete_capability_id: DELETE.to_owned(),
+            verified_response_fields: vec![
+                "host".to_owned(),
+                "inclusive".to_owned(),
+                "is_paused".to_owned(),
+                "paths".to_owned(),
+            ],
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.rollback.warning = Some(
+            "rollback is a separately approved exact-rule delete and cannot retract browser measurements already collected"
+                .to_owned(),
+        );
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
+        refresh_dynamic_mutation_contract(capability);
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(DELETE) {
+        capability.permissions = vec![
+            "Account Settings Read".to_owned(),
+            "Account Settings Write".to_owned(),
+        ];
+        capability.aliases = vec![
+            "delete Web Analytics rule".to_owned(),
+            "remove RUM host path rule".to_owned(),
+        ];
+        capability.risk = RiskClass::Destructive;
+        capability.effect = EffectClass::Destructive;
+        attach_live_read_entitlement_probe(capability, LIST, LIST_PATH);
+        zero_cost_mutation(
+            capability,
+            "deleting one exact Web Analytics rule has no direct operation charge",
+            official_reference(
+                "Delete Web Analytics rule",
+                "https://developers.cloudflare.com/api/resources/rum/subresources/rules/methods/delete/",
+            ),
+        );
+        capability.verification.required = true;
+        "web_analytics_rule_list_omits_deleted_id"
+            .clone_into(&mut capability.verification.strategy);
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: LIST_PATH.to_owned(),
+            read_capability_id: LIST.to_owned(),
+            verified_response_fields: Vec::new(),
+        });
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "rule deletion cannot restore the original identity; recreation requires a separately reviewed plan"
+                .to_owned(),
+        );
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
+        refresh_dynamic_mutation_contract(capability);
+    }
+
+    for id in [UPDATE, BULK_UPDATE] {
+        if let Some(capability) = snapshot.capabilities.get_mut(id) {
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(
+                "blocked by design: in-place Web Analytics rule replacement has no exact item read for a hash-bound prior-state snapshot; use the governed exact delete and create lifecycle"
+                    .to_owned(),
+            );
+        }
+    }
+}
+
+fn workers_observability_settings_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["observability"],
+        "properties":{
+            "observability":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["enabled"],
+                "properties":{
+                    "enabled":{"type":"boolean"},
+                    "head_sampling_rate":{"type":"number","minimum":0,"maximum":1},
+                    "logs":{
+                        "type":"object",
+                        "additionalProperties":false,
+                        "required":["enabled","invocation_logs"],
+                        "properties":{
+                            "enabled":{"type":"boolean"},
+                            "invocation_logs":{"type":"boolean"},
+                            "persist":{"type":"boolean"},
+                            "head_sampling_rate":{"type":"number","minimum":0,"maximum":1},
+                            "destinations":{"type":"array","maxItems":10,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":128}}
+                        }
+                    },
+                    "traces":{
+                        "type":"object",
+                        "additionalProperties":false,
+                        "properties":{
+                            "enabled":{"type":"boolean"},
+                            "persist":{"type":"boolean"},
+                            "head_sampling_rate":{"type":"number","minimum":0,"maximum":1},
+                            "propagation_policy":{"type":"string","enum":["authenticated","accept"]},
+                            "destinations":{"type":"array","maxItems":10,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":128}}
+                        }
+                    }
+                }
+            }
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn finalize_workers_observability_settings(snapshot: &mut CatalogSnapshot) {
+    const SOURCE: &str = "worker-script-settings-patch-settings";
+    const READ: &str = "worker-script-settings-get-settings";
+    const ID: &str = "workers-observability-settings-update";
+    const PATH: &str = "/accounts/{account_id}/workers/scripts/{script_name}/script-settings";
+    let Some(source) = snapshot.capabilities.get(SOURCE).cloned() else {
+        return;
+    };
+    let identity_ok = source.method == "PATCH"
+        && source.path == PATH
+        && source.permissions == ["Workers Scripts Write"]
+        && snapshot.capabilities.get(READ).is_some_and(|capability| {
+            capability.method == "GET" && capability.path == PATH && !capability.mutating
+        });
+    if !identity_ok {
+        let mut blocked = source;
+        ID.clone_into(&mut blocked.id);
+        blocked.adapter_status = AdapterStatus::Blocked;
+        blocked.blocked_reason = Some(
+            "schema drift: Workers script observability no longer matches the governed settings read/write pair"
+                .to_owned(),
+        );
+        snapshot.capabilities.insert(ID.to_owned(), blocked);
+        return;
+    }
+    let mut capability = source;
+    ID.clone_into(&mut capability.id);
+    "Update bounded Workers observability and trace settings".clone_into(&mut capability.title);
+    capability.description = Some(
+        "Configures only the observability subtree with bounded sampling and destination counts; bindings, tags, and tail consumers remain outside this capability."
+            .to_owned(),
+    );
+    capability.aliases = vec![
+        "configure Workers logs traces sampling".to_owned(),
+        "enable Worker observability".to_owned(),
+        "automatic traces invocation logs".to_owned(),
+    ];
+    capability.request_schema = Some(workers_observability_settings_schema());
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    zero_cost_mutation(
+        &mut capability,
+        "the settings update has no direct operation charge; log ingestion, retention, and destination usage remain governed by the Workers plan",
+        official_reference(
+            "Workers observability settings API",
+            "https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/script_settings/methods/edit/",
+        ),
+    );
+    capability.verification.required = true;
+    "same_path_result_contains_planned_fields_after_update"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: PATH.to_owned(),
+        read_capability_id: READ.to_owned(),
+        verified_response_fields: vec!["observability".to_owned()],
+    });
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+    capability.rollback.warning = Some(
+        "cfctl captures and rechecks the exact observability subtree before applying; rollback is a separately reviewed restoration plan"
+            .to_owned(),
+    );
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    capability.blocked_reason = None;
+    refresh_dynamic_mutation_contract(&mut capability);
+    snapshot.capabilities.insert(ID.to_owned(), capability);
+}
+
+struct LogpushLifecycleSpec<'a> {
+    scope: &'a str,
+    collection_path: &'a str,
+    detail_path: &'a str,
+    list_id: &'a str,
+    create_id: &'a str,
+    read_id: &'a str,
+    update_id: &'a str,
+    safe_update_id: &'a str,
+    delete_id: &'a str,
+}
+
+fn finalize_logpush_lifecycle(snapshot: &mut CatalogSnapshot) {
+    for spec in [
+        LogpushLifecycleSpec {
+            scope: "zone",
+            collection_path: "/zones/{zone_id}/logpush/jobs",
+            detail_path: "/zones/{zone_id}/logpush/jobs/{job_id}",
+            list_id: "get-zones-zone_id-logpush-jobs",
+            create_id: "post-zones-zone_id-logpush-jobs",
+            read_id: "get-zones-zone_id-logpush-jobs-job_id",
+            update_id: "put-zones-zone_id-logpush-jobs-job_id",
+            safe_update_id: "logpush-zone-job-settings-update",
+            delete_id: "delete-zones-zone_id-logpush-jobs-job_id",
+        },
+        LogpushLifecycleSpec {
+            scope: "account",
+            collection_path: "/accounts/{account_id}/logpush/jobs",
+            detail_path: "/accounts/{account_id}/logpush/jobs/{job_id}",
+            list_id: "get-accounts-account_id-logpush-jobs",
+            create_id: "post-accounts-account_id-logpush-jobs",
+            read_id: "get-accounts-account_id-logpush-jobs-job_id",
+            update_id: "put-accounts-account_id-logpush-jobs-job_id",
+            safe_update_id: "logpush-account-job-settings-update",
+            delete_id: "delete-accounts-account_id-logpush-jobs-job_id",
+        },
+    ] {
+        finalize_one_logpush_lifecycle(snapshot, &spec);
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one parameterized Logpush family overlay keeps create, safe update, verification, and delete symmetric"
+)]
+fn finalize_one_logpush_lifecycle(snapshot: &mut CatalogSnapshot, spec: &LogpushLifecycleSpec<'_>) {
+    let identity_ok = snapshot
+        .capabilities
+        .get(spec.create_id)
+        .is_some_and(|capability| {
+            capability.method == "POST"
+                && capability.path == spec.collection_path
+                && capability.permissions == ["Logs Write"]
+        })
+        && snapshot
+            .capabilities
+            .get(spec.list_id)
+            .is_some_and(|capability| {
+                capability.method == "GET"
+                    && capability.path == spec.collection_path
+                    && !capability.mutating
+            })
+        && snapshot
+            .capabilities
+            .get(spec.read_id)
+            .is_some_and(|capability| {
+                capability.method == "GET"
+                    && capability.path == spec.detail_path
+                    && !capability.mutating
+            })
+        && snapshot
+            .capabilities
+            .get(spec.update_id)
+            .is_some_and(|capability| {
+                capability.method == "PUT" && capability.path == spec.detail_path
+            })
+        && snapshot
+            .capabilities
+            .get(spec.delete_id)
+            .is_some_and(|capability| {
+                capability.method == "DELETE" && capability.path == spec.detail_path
+            });
+    if !identity_ok {
+        if let Some(source) = snapshot.capabilities.get(spec.update_id).cloned() {
+            let mut blocked = source;
+            spec.safe_update_id.clone_into(&mut blocked.id);
+            blocked.adapter_status = AdapterStatus::Blocked;
+            blocked.blocked_reason = Some(format!(
+                "schema drift: {} Logpush lifecycle no longer matches the governed create/read/update/delete contract",
+                spec.scope
+            ));
+            snapshot
+                .capabilities
+                .insert(spec.safe_update_id.to_owned(), blocked);
+        }
+        return;
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(spec.list_id) {
+        capability.permissions = vec!["Logs Read".to_owned()];
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(spec.create_id) {
+        harden_logpush_create_schema(capability.request_schema.as_mut());
+        capability.aliases = vec![
+            format!("create {} Logpush pipeline", spec.scope),
+            "deliver logs to R2 or external destination".to_owned(),
+            "configure Logpush fields filters sampling health".to_owned(),
+        ];
+        capability.risk = RiskClass::ExternalCommunication;
+        capability.effect = EffectClass::ExternalCommunication;
+        capability.permissions = vec!["Logs Read".to_owned(), "Logs Write".to_owned()];
+        attach_live_read_entitlement_probe(capability, spec.list_id, spec.collection_path);
+        zero_cost_mutation(
+            capability,
+            "creating the control-plane job has no direct operation charge; destination storage, egress, and subscribed Logpush usage remain downstream cost exposure",
+            official_reference(
+                "Create Logpush job",
+                "https://developers.cloudflare.com/api/resources/logpush/subresources/jobs/methods/create/",
+            ),
+        );
+        capability.verification.required = true;
+        "created_resource_contains_planned_fields_by_returned_id"
+            .clone_into(&mut capability.verification.strategy);
+        let verified_response_fields = capability
+            .verifiable_request_object_fields()
+            .unwrap_or_default();
+        capability.created_resource = Some(CreatedResourceContractV1 {
+            detail_path: spec.detail_path.to_owned(),
+            identity_selector: "job_id".to_owned(),
+            response_result_identity_pointer: "/id".to_owned(),
+            read_capability_id: spec.read_id.to_owned(),
+            delete_capability_id: spec.delete_id.to_owned(),
+            verified_response_fields,
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.rollback.warning = Some(
+            "rollback is a separate exact-job delete plan and does not remove objects already delivered to the destination"
+                .to_owned(),
+        );
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
+        refresh_dynamic_mutation_contract(capability);
+    }
+
+    let source_update = snapshot.capabilities.get(spec.update_id).cloned();
+    if let Some(mut capability) = source_update {
+        spec.safe_update_id.clone_into(&mut capability.id);
+        capability.title = format!("Update bounded {} Logpush job settings", spec.scope);
+        capability.description = Some(
+            "Updates enablement, filtering, batching, field selection, formatting, and sampling on one exact Logpush job. Destination credentials and ownership challenges are excluded; change those through a replacement pipeline so secrets never enter a plan receipt."
+                .to_owned(),
+        );
+        capability.aliases = vec![
+            format!("update {} Logpush job", spec.scope),
+            "configure Logpush sampling fields filters".to_owned(),
+            "enable disable Logpush pipeline".to_owned(),
+        ];
+        harden_logpush_safe_update_schema(capability.request_schema.as_mut());
+        capability.risk = RiskClass::ExternalCommunication;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.permissions = vec!["Logs Read".to_owned(), "Logs Write".to_owned()];
+        attach_live_read_entitlement_probe(&mut capability, spec.list_id, spec.collection_path);
+        zero_cost_mutation(
+            &mut capability,
+            "updating the control-plane job has no direct operation charge; changed sampling and delivery volume can alter downstream storage and egress usage",
+            official_reference(
+                "Update Logpush job",
+                "https://developers.cloudflare.com/api/resources/logpush/subresources/jobs/methods/update/",
+            ),
+        );
+        capability.verification.required = true;
+        "same_resource_contains_planned_fields_after_update"
+            .clone_into(&mut capability.verification.strategy);
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: spec.detail_path.to_owned(),
+            read_capability_id: spec.read_id.to_owned(),
+            verified_response_fields: capability
+                .verifiable_request_object_fields()
+                .unwrap_or_default(),
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+        capability.rollback.warning = Some(
+            "cfctl captures and rechecks every writable job setting before applying; rollback is a separately reviewed restoration plan and cannot retract delivered logs"
+                .to_owned(),
+        );
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
+        refresh_dynamic_mutation_contract(&mut capability);
+        snapshot
+            .capabilities
+            .insert(spec.safe_update_id.to_owned(), capability);
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(spec.update_id) {
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "blocked by design: the upstream PUT can replace secret-bearing destination configuration, but cfctl cannot persist that prior secret in an immutable plan; use the bounded Logpush settings update or create a replacement pipeline"
+                .to_owned(),
+        );
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(spec.delete_id) {
+        capability.aliases = vec![
+            format!("delete {} Logpush job", spec.scope),
+            "remove Logpush pipeline".to_owned(),
+        ];
+        capability.risk = RiskClass::Destructive;
+        capability.effect = EffectClass::Destructive;
+        capability.permissions = vec!["Logs Read".to_owned(), "Logs Write".to_owned()];
+        attach_live_read_entitlement_probe(capability, spec.list_id, spec.collection_path);
+        zero_cost_mutation(
+            capability,
+            "deleting the control-plane job has no direct operation charge and does not remove logs already delivered",
+            official_reference(
+                "Delete Logpush job",
+                "https://developers.cloudflare.com/api/resources/logpush/subresources/jobs/methods/delete/",
+            ),
+        );
+        capability.verification.required = true;
+        "same_resource_returns_not_found_after_delete"
+            .clone_into(&mut capability.verification.strategy);
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: spec.detail_path.to_owned(),
+            read_capability_id: spec.read_id.to_owned(),
+            verified_response_fields: Vec::new(),
+        });
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "job deletion cannot restore the exact pipeline identity; recreate it through a separately reviewed create plan, and treat already delivered logs as outside rollback"
+                .to_owned(),
+        );
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
+
+fn harden_logpush_create_schema(schema: Option<&mut Value>) {
+    let Some(root) = schema.and_then(Value::as_object_mut) else {
+        return;
+    };
+    root.insert("additionalProperties".to_owned(), Value::Bool(false));
+    root.insert(
+        "required".to_owned(),
+        serde_json::json!(["dataset", "destination_conf", "enabled"]),
+    );
+    if let Some(properties) = root.get_mut("properties").and_then(Value::as_object_mut) {
+        for field in ["destination_conf", "ownership_challenge"] {
+            if let Some(property) = properties.get_mut(field).and_then(Value::as_object_mut) {
+                property.insert("writeOnly".to_owned(), Value::Bool(true));
+                property.insert(
+                    "x-cfctl-verification-observable".to_owned(),
+                    Value::Bool(false),
+                );
+            }
+        }
+        harden_logpush_output_options(properties);
+    }
+}
+
+fn harden_logpush_safe_update_schema(schema: Option<&mut Value>) {
+    let Some(root) = schema.and_then(Value::as_object_mut) else {
+        return;
+    };
+    root.insert("additionalProperties".to_owned(), Value::Bool(false));
+    root.insert("minProperties".to_owned(), Value::from(1));
+    if let Some(properties) = root.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.remove("destination_conf");
+        properties.remove("ownership_challenge");
+        harden_logpush_output_options(properties);
+    }
+}
+
+fn harden_logpush_output_options(properties: &mut serde_json::Map<String, Value>) {
+    let Some(output_schema) = properties
+        .get_mut("output_options")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    output_schema.insert("additionalProperties".to_owned(), Value::Bool(false));
+    let Some(output) = output_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if let Some(fields) = output.get_mut("field_names").and_then(Value::as_object_mut) {
+        fields.insert("minItems".to_owned(), Value::from(1));
+        fields.insert("maxItems".to_owned(), Value::from(200));
+        fields.insert("uniqueItems".to_owned(), Value::Bool(true));
+    }
+}
+
+const SECURITY_IP_RULE_CREATE_ID: &str = "security-response-create-expiring-ip-access-rule";
+const SECURITY_IP_RULE_REMOVE_ID: &str = "security-response-remove-expired-ip-access-rule";
+const SECURITY_IP_RULE_SOURCE_CREATE_ID: &str =
+    "ip-access-rules-for-a-zone-create-an-ip-access-rule";
+const SECURITY_IP_RULE_LIST_ID: &str = "ip-access-rules-for-a-zone-list-ip-access-rules";
+const SECURITY_IP_RULE_DELETE_ID: &str = "ip-access-rules-for-a-zone-delete-an-ip-access-rule";
+const SECURITY_IP_RULE_UPDATE_ID: &str = "ip-access-rules-for-a-zone-update-an-ip-access-rule";
+const SECURITY_IP_RULE_COLLECTION: &str = "/zones/{zone_id}/firewall/access_rules/rules";
+const SECURITY_IP_RULE_DETAIL: &str = "/zones/{zone_id}/firewall/access_rules/rules/{rule_id}";
+
+fn security_ip_rule_wire_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["configuration","mode","notes"],
+        "properties":{
+            "configuration":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["target","value"],
+                "properties":{
+                    "target":{"type":"string","enum":["ip","ip6","ip_range","asn","country"]},
+                    "value":{"type":"string","minLength":1,"maxLength":64}
+                }
+            },
+            "mode":{"type":"string","enum":["managed_challenge","block"]},
+            "notes":{"type":"string","minLength":1,"maxLength":500}
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn security_ip_rule_create_input_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["actor","evidence_ref","reason","target"],
+        "properties":{
+            "action":{"type":"string","enum":["managed_challenge","block"],"default":"managed_challenge"},
+            "actor":{"type":"string","minLength":1,"maxLength":80,"pattern":"^[A-Za-z0-9._:@+ -]+$"},
+            "evidence_ref":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+            "expires_at":{"type":"string","format":"date-time","description":"Defaults to 24 hours from plan creation; maximum seven days."},
+            "reason":{"type":"string","minLength":4,"maxLength":160},
+            "target":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["type","value"],
+                "properties":{
+                    "type":{"type":"string","enum":["ip","ip_range","asn","country"]},
+                    "value":{"type":"string","minLength":1,"maxLength":64}
+                }
+            },
+            "operator_ip":{"type":"string","minLength":2,"maxLength":64,"description":"Required for a block so cfctl can reject direct self-blocking."},
+            "confirm_broad_scope":{"type":"boolean","description":"Required for ASN and country targets; those targets are managed-challenge only and limited to one hour."},
+            "confirm_block":{"type":"boolean","description":"Required for block; permanent blocks are not accepted by this capability."}
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn security_ip_rule_remove_input_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["actor","evidence_ref","expires_at","reason","source_operation_id"],
+        "properties":{
+            "actor":{"type":"string","minLength":1,"maxLength":80,"pattern":"^[A-Za-z0-9._:@+ -]+$"},
+            "evidence_ref":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+            "expires_at":{"type":"string","format":"date-time"},
+            "reason":{"type":"string","minLength":4,"maxLength":160},
+            "source_operation_id":{"type":"string","minLength":1,"maxLength":80}
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the evidence-bound IP action and exact expiry removal are one safety lifecycle"
+)]
+fn finalize_security_response_lifecycle(snapshot: &mut CatalogSnapshot) {
+    let identity_ok = snapshot
+        .capabilities
+        .get(SECURITY_IP_RULE_SOURCE_CREATE_ID)
+        .is_some_and(|capability| {
+            capability.method == "POST"
+                && capability.path == SECURITY_IP_RULE_COLLECTION
+                && capability.permissions == ["Firewall Services Write"]
+        })
+        && snapshot
+            .capabilities
+            .get(SECURITY_IP_RULE_LIST_ID)
+            .is_some_and(|capability| {
+                capability.method == "GET"
+                    && capability.path == SECURITY_IP_RULE_COLLECTION
+                    && !capability.mutating
+            })
+        && snapshot
+            .capabilities
+            .get(SECURITY_IP_RULE_DELETE_ID)
+            .is_some_and(|capability| {
+                capability.method == "DELETE" && capability.path == SECURITY_IP_RULE_DETAIL
+            });
+    if !identity_ok {
+        if let Some(source) = snapshot
+            .capabilities
+            .get(SECURITY_IP_RULE_SOURCE_CREATE_ID)
+            .cloned()
+        {
+            let mut blocked = source;
+            SECURITY_IP_RULE_CREATE_ID.clone_into(&mut blocked.id);
+            blocked.adapter_status = AdapterStatus::Blocked;
+            blocked.blocked_reason = Some(
+                "schema drift: zone IP Access rule create/list/delete no longer matches the evidence-bound security-response lifecycle"
+                    .to_owned(),
+            );
+            snapshot
+                .capabilities
+                .insert(SECURITY_IP_RULE_CREATE_ID.to_owned(), blocked);
+        }
+        return;
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(SECURITY_IP_RULE_DELETE_ID) {
+        // The upstream `cascade` body is optional and is not needed for exact
+        // rule deletion. cfctl deliberately exposes the no-cascade subset so
+        // compensation and expiry removal share one deterministic wire shape.
+        capability.request_schema = None;
+        capability.permissions = vec![
+            "Firewall Services Read".to_owned(),
+            "Firewall Services Write".to_owned(),
+        ];
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::Destructive;
+        zero_cost_mutation(
+            capability,
+            "removing an IP Access rule has no direct operation charge",
+            official_reference(
+                "Delete zone IP Access rule",
+                "https://developers.cloudflare.com/api/resources/firewall/subresources/access_rules/subresources/rules/methods/delete/",
+            ),
+        );
+        capability.verification.required = true;
+        "parent_collection_omits_deleted_resource_id"
+            .clone_into(&mut capability.verification.strategy);
+        capability.deleted_resource = Some(DeletedResourceContractV1 {
+            collection_path: SECURITY_IP_RULE_COLLECTION.to_owned(),
+            identity_selector: "rule_id".to_owned(),
+            response_item_identity_pointer: "/id".to_owned(),
+            read_capability_id: SECURITY_IP_RULE_LIST_ID.to_owned(),
+            requires_page_number_completion: true,
+        });
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "rule removal restores traffic eligibility but cannot restore the original rule identity; recreation requires a separately reviewed evidence-bound plan"
+                .to_owned(),
+        );
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
+        refresh_dynamic_mutation_contract(capability);
+    }
+
+    if let Some(source) = snapshot
+        .capabilities
+        .get(SECURITY_IP_RULE_SOURCE_CREATE_ID)
+        .cloned()
+    {
+        let mut capability = source;
+        SECURITY_IP_RULE_CREATE_ID.clone_into(&mut capability.id);
+        "Create an evidence-bound expiring zone security action".clone_into(&mut capability.title);
+        capability.description = Some(
+            "Creates one bounded zone IP Access rule from a normalized IP, prefix, ASN, or country target. cfctl defaults to Managed Challenge, requires a telemetry evidence receipt, records an operator and reason, rejects permanent actions, and hash-binds a removal deadline plus exact delete rollback. Anonymous analytics is never treated as person identity."
+                .to_owned(),
+        );
+        capability.aliases = vec![
+            "expiring managed challenge".to_owned(),
+            "challenge suspicious source from security events".to_owned(),
+            "temporary IP block".to_owned(),
+            "telemetry derived enforcement".to_owned(),
+            "IP blocking".to_owned(),
+        ];
+        "cfctl-security-action-v1+cloudflare-api-schemas".clone_into(&mut capability.source);
+        capability.permissions = vec![
+            "Firewall Services Read".to_owned(),
+            "Firewall Services Write".to_owned(),
+        ];
+        capability.request_schema = Some(security_ip_rule_wire_schema());
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::ReversibleWrite;
+        zero_cost_mutation(
+            &mut capability,
+            "the rule write has no direct operation charge; challenged or blocked traffic can change application behavior and downstream usage",
+            official_reference(
+                "Create zone IP Access rule",
+                "https://developers.cloudflare.com/api/resources/firewall/subresources/access_rules/subresources/rules/methods/create/",
+            ),
+        );
+        capability.verification.required = true;
+        "parent_collection_contains_created_resource_id_and_planned_fields"
+            .clone_into(&mut capability.verification.strategy);
+        capability.created_resource = None;
+        capability.created_collection_resource = Some(CreatedCollectionResourceContractV1 {
+            collection_path: SECURITY_IP_RULE_COLLECTION.to_owned(),
+            identity_selector: "rule_id".to_owned(),
+            response_result_identity_pointer: "/id".to_owned(),
+            response_item_identity_pointer: "/id".to_owned(),
+            read_capability_id: SECURITY_IP_RULE_LIST_ID.to_owned(),
+            delete_capability_id: SECURITY_IP_RULE_DELETE_ID.to_owned(),
+            verified_response_fields: vec![
+                "configuration".to_owned(),
+                "mode".to_owned(),
+                "notes".to_owned(),
+            ],
+            requires_page_number_completion: true,
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.rollback.warning = Some(
+            "rollback is a separate exact-rule delete plan derived only from the returned rule ID; cfctl also records the mandatory removal deadline"
+                .to_owned(),
+        );
+        capability.security_action = Some(SecurityActionContractV1 {
+            kind: SecurityActionKindV1::CreateExpiring,
+            input_schema: security_ip_rule_create_input_schema(),
+            default_action: Some("managed_challenge".to_owned()),
+            allowed_actions: vec!["managed_challenge".to_owned(), "block".to_owned()],
+            allowed_target_types: vec![
+                "asn".to_owned(),
+                "country".to_owned(),
+                "ip".to_owned(),
+                "ip_range".to_owned(),
+            ],
+            default_ttl_seconds: 86_400,
+            max_ttl_seconds: 604_800,
+            current_state_capability_id: SECURITY_IP_RULE_LIST_ID.to_owned(),
+            safety_profile: SecurityActionSafetyProfileV1::TelemetryDerivedStrict,
+        });
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
+        refresh_dynamic_mutation_contract(&mut capability);
+        snapshot
+            .capabilities
+            .insert(SECURITY_IP_RULE_CREATE_ID.to_owned(), capability);
+    }
+
+    if let Some(source) = snapshot
+        .capabilities
+        .get(SECURITY_IP_RULE_DELETE_ID)
+        .cloned()
+    {
+        let mut capability = source;
+        SECURITY_IP_RULE_REMOVE_ID.clone_into(&mut capability.id);
+        "Remove an expired evidence-bound zone security action".clone_into(&mut capability.title);
+        capability.description = Some(
+            "Removes one exact IP Access rule only after its cfctl evidence marker and removal deadline are proven against the complete live rule collection."
+                .to_owned(),
+        );
+        capability.aliases = vec![
+            "remove expired enforcement action".to_owned(),
+            "expire temporary block".to_owned(),
+            "rollback managed challenge".to_owned(),
+        ];
+        "cfctl-security-action-v1+cloudflare-api-schemas".clone_into(&mut capability.source);
+        // The upstream delete operation currently declares an optional
+        // `cascade` request object. Expiry removal intentionally exposes no
+        // such choice: the runtime renders an empty wire body after validating
+        // the separate governance schema below. Removing the optional wire
+        // schema makes that safe subset explicit and lets the generic
+        // collection-absence verifier prove exactly the operation cfctl sends.
+        capability.request_schema = None;
+        capability.security_action = Some(SecurityActionContractV1 {
+            kind: SecurityActionKindV1::RemoveExpired,
+            input_schema: security_ip_rule_remove_input_schema(),
+            default_action: None,
+            allowed_actions: Vec::new(),
+            allowed_target_types: Vec::new(),
+            default_ttl_seconds: 0,
+            max_ttl_seconds: 0,
+            current_state_capability_id: SECURITY_IP_RULE_LIST_ID.to_owned(),
+            safety_profile: SecurityActionSafetyProfileV1::TelemetryDerivedStrict,
+        });
+        refresh_dynamic_mutation_contract(&mut capability);
+        snapshot
+            .capabilities
+            .insert(SECURITY_IP_RULE_REMOVE_ID.to_owned(), capability);
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(SECURITY_IP_RULE_UPDATE_ID) {
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "blocked by missing cfctl contract: the zone API has no exact rule-detail read for a pre-change snapshot; use the evidence-bound remove and recreate lifecycle instead of an unverifiable in-place update"
+                .to_owned(),
+        );
+    }
+}
+
+const WAF_RULE_SOURCE_CREATE_ID: &str = "createZoneRulesetRule";
+const WAF_RULE_CREATE_ID: &str = "security-response-create-expiring-waf-rule";
+const WAF_RULE_REMOVE_ID: &str = "security-response-remove-expired-waf-rule";
+const WAF_RULE_READ_ID: &str = "getZoneRuleset";
+const WAF_RULE_DELETE_ID: &str = "deleteZoneRulesetRule";
+const WAF_RULE_PARENT_PATH: &str = "/zones/{zone_id}/rulesets/{ruleset_id}";
+const WAF_RULE_COLLECTION_PATH: &str = "/zones/{zone_id}/rulesets/{ruleset_id}/rules";
+const WAF_RULE_DETAIL_PATH: &str = "/zones/{zone_id}/rulesets/{ruleset_id}/rules/{rule_id}";
+
+fn waf_security_rule_wire_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["action","description","enabled","expression","ref"],
+        "properties":{
+            "action":{"type":"string","enum":["block","js_challenge","log","managed_challenge","skip"]},
+            "action_parameters":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["phases"],
+                "properties":{
+                    "phases":{
+                        "type":"array",
+                        "minItems":1,
+                        "maxItems":1,
+                        "uniqueItems":true,
+                        "items":{"type":"string","enum":["http_request_firewall_managed"]}
+                    }
+                }
+            },
+            "description":{"type":"string","minLength":1,"maxLength":500},
+            "enabled":{"type":"boolean","const":true},
+            "expression":{"type":"string","minLength":1,"maxLength":4096},
+            "ref":{"type":"string","pattern":"^cfctl_security_[0-9a-f]{24}$"}
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn waf_security_rule_input_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["actor","evidence_ref","reason","target"],
+        "properties":{
+            "action":{"type":"string","enum":["block","js_challenge","log","managed_challenge","skip"],"default":"managed_challenge"},
+            "actor":{"type":"string","minLength":1,"maxLength":80,"pattern":"^[A-Za-z0-9._:@+ -]+$"},
+            "evidence_ref":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+            "expires_at":{"type":"string","format":"date-time","description":"Defaults to 24 hours from plan creation; maximum seven days."},
+            "reason":{"type":"string","minLength":4,"maxLength":160},
+            "target":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["type","value"],
+                "properties":{
+                    "type":{"type":"string","enum":["asn","country","hostname","ip","ip_range","ja4","path"]},
+                    "value":{"type":"string","minLength":1,"maxLength":2048}
+                }
+            },
+            "operator_ip":{"type":"string","minLength":2,"maxLength":64,"description":"Required for block so cfctl can reject direct self-blocking for IP targets."},
+            "confirm_broad_scope":{"type":"boolean","description":"Required for IP ranges, ASNs, countries, and skip actions after reviewing the blast radius."},
+            "confirm_block":{"type":"boolean","description":"Required for block; permanent blocks are rejected."},
+            "confirm_skip":{"type":"boolean","description":"Required for skip; cfctl only skips the managed WAF phase and limits the action to one hour."},
+            "confirm_enterprise_bot_management":{"type":"boolean","description":"Required for JA4 because Cloudflare documents the field as Enterprise with Bot Management."}
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the evidence-bound WAF action and exact expiry removal are one safety lifecycle"
+)]
+fn finalize_waf_security_response_lifecycle(snapshot: &mut CatalogSnapshot) {
+    let identity_ok = snapshot
+        .capabilities
+        .get(WAF_RULE_SOURCE_CREATE_ID)
+        .is_some_and(|capability| {
+            capability.method == "POST" && capability.path == WAF_RULE_COLLECTION_PATH
+        })
+        && snapshot
+            .capabilities
+            .get(WAF_RULE_READ_ID)
+            .is_some_and(|capability| {
+                capability.method == "GET"
+                    && capability.path == WAF_RULE_PARENT_PATH
+                    && !capability.mutating
+            })
+        && snapshot
+            .capabilities
+            .get(WAF_RULE_DELETE_ID)
+            .is_some_and(|capability| {
+                capability.method == "DELETE" && capability.path == WAF_RULE_DETAIL_PATH
+            });
+    if !identity_ok {
+        if let Some(source) = snapshot
+            .capabilities
+            .get(WAF_RULE_SOURCE_CREATE_ID)
+            .cloned()
+        {
+            let mut blocked = source;
+            WAF_RULE_CREATE_ID.clone_into(&mut blocked.id);
+            blocked.adapter_status = AdapterStatus::Blocked;
+            blocked.blocked_reason = Some(
+                "schema drift: Ruleset Engine zone rule create/read/delete no longer matches the governed nested-resource lifecycle"
+                    .to_owned(),
+            );
+            snapshot
+                .capabilities
+                .insert(WAF_RULE_CREATE_ID.to_owned(), blocked);
+        }
+        return;
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(WAF_RULE_DELETE_ID) {
+        capability.permissions = vec!["Zone WAF Read".to_owned(), "Zone WAF Write".to_owned()];
+        capability.request_schema = None;
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::Destructive;
+        zero_cost_mutation(
+            capability,
+            "deleting one exact custom WAF rule has no direct operation charge; traffic handling changes immediately",
+            official_reference(
+                "Delete zone ruleset rule",
+                "https://developers.cloudflare.com/api/resources/rulesets/subresources/rules/methods/delete/",
+            ),
+        );
+        capability.verification.required = true;
+        "parent_object_omits_deleted_nested_resource_id"
+            .clone_into(&mut capability.verification.strategy);
+        capability.deleted_nested_resource = Some(DeletedNestedResourceContractV1 {
+            parent_path: WAF_RULE_PARENT_PATH.to_owned(),
+            collection_path: WAF_RULE_COLLECTION_PATH.to_owned(),
+            items_pointer: "/rules".to_owned(),
+            identity_selector: "rule_id".to_owned(),
+            response_item_identity_pointer: "/id".to_owned(),
+            read_capability_id: WAF_RULE_READ_ID.to_owned(),
+        });
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(
+            "rule deletion is not identity-reversible; recreation requires a separately reviewed evidence-bound plan"
+                .to_owned(),
+        );
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
+        refresh_dynamic_mutation_contract(capability);
+    }
+
+    if let Some(source) = snapshot
+        .capabilities
+        .get(WAF_RULE_SOURCE_CREATE_ID)
+        .cloned()
+    {
+        let mut capability = source;
+        WAF_RULE_CREATE_ID.clone_into(&mut capability.id);
+        "Create an evidence-bound expiring zone WAF rule".clone_into(&mut capability.title);
+        capability.description = Some(
+            "Compiles one normalized IP, prefix, ASN, country, hostname, exact path, or JA4 target into a fixed Ruleset Engine expression. Managed Challenge is the default; every action carries evidence, actor, reason, expiry, conflict detection, blast-radius metadata, exact nested-resource verification, and deletion rollback. Raw expressions are never accepted."
+                .to_owned(),
+        );
+        capability.aliases = vec![
+            "expiring WAF custom rule".to_owned(),
+            "managed challenge hostname path fingerprint".to_owned(),
+            "block challenge skip log suspicious source".to_owned(),
+            "telemetry derived Ruleset Engine enforcement".to_owned(),
+        ];
+        "cfctl-security-action-v1+cloudflare-rulesets-api".clone_into(&mut capability.source);
+        capability.permissions = vec!["Zone WAF Read".to_owned(), "Zone WAF Write".to_owned()];
+        capability.request_schema = Some(waf_security_rule_wire_schema());
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.entitlement.available = None;
+        capability.entitlement.requires_live_resolution = true;
+        capability.entitlement.source =
+            Some("https://developers.cloudflare.com/waf/custom-rules/".to_owned());
+        zero_cost_mutation(
+            &mut capability,
+            "the rule write has no direct operation charge; plan rule quotas, Log action, and JA4/Bot Management availability are resolved against live state and Cloudflare entitlement responses",
+            official_reference(
+                "WAF custom rules availability and limits",
+                "https://developers.cloudflare.com/waf/custom-rules/",
+            ),
+        );
+        capability.verification.required = true;
+        "parent_object_contains_created_nested_resource_by_correlation"
+            .clone_into(&mut capability.verification.strategy);
+        capability.created_nested_resource = Some(CreatedNestedResourceContractV1 {
+            parent_path: WAF_RULE_PARENT_PATH.to_owned(),
+            items_pointer: "/rules".to_owned(),
+            identity_selector: "rule_id".to_owned(),
+            response_item_identity_pointer: "/id".to_owned(),
+            correlation_field: "ref".to_owned(),
+            read_capability_id: WAF_RULE_READ_ID.to_owned(),
+            delete_capability_id: WAF_RULE_DELETE_ID.to_owned(),
+            delete_path: WAF_RULE_DETAIL_PATH.to_owned(),
+            verified_response_fields: vec![
+                "action".to_owned(),
+                "action_parameters".to_owned(),
+                "description".to_owned(),
+                "enabled".to_owned(),
+                "expression".to_owned(),
+                "ref".to_owned(),
+            ],
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+        capability.rollback.warning = Some(
+            "rollback is a separate exact-rule delete plan derived only from the correlated returned rule ID; cfctl also records the mandatory expiry"
+                .to_owned(),
+        );
+        capability.security_action = Some(SecurityActionContractV1 {
+            kind: SecurityActionKindV1::CreateExpiring,
+            input_schema: waf_security_rule_input_schema(),
+            default_action: Some("managed_challenge".to_owned()),
+            allowed_actions: vec![
+                "block".to_owned(),
+                "js_challenge".to_owned(),
+                "log".to_owned(),
+                "managed_challenge".to_owned(),
+                "skip".to_owned(),
+            ],
+            allowed_target_types: vec![
+                "asn".to_owned(),
+                "country".to_owned(),
+                "hostname".to_owned(),
+                "ip".to_owned(),
+                "ip_range".to_owned(),
+                "ja4".to_owned(),
+                "path".to_owned(),
+            ],
+            default_ttl_seconds: 86_400,
+            max_ttl_seconds: 604_800,
+            current_state_capability_id: WAF_RULE_READ_ID.to_owned(),
+            safety_profile: SecurityActionSafetyProfileV1::TelemetryDerivedStrict,
+        });
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
+        refresh_dynamic_mutation_contract(&mut capability);
+        snapshot
+            .capabilities
+            .insert(WAF_RULE_CREATE_ID.to_owned(), capability);
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(WAF_RULE_SOURCE_CREATE_ID) {
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "blocked by design: arbitrary Ruleset Engine rule bodies and expressions are not a public cfctl surface; use `security-response-create-expiring-waf-rule`"
+                .to_owned(),
+        );
+    }
+
+    if let Some(source) = snapshot.capabilities.get(WAF_RULE_DELETE_ID).cloned() {
+        let mut capability = source;
+        WAF_RULE_REMOVE_ID.clone_into(&mut capability.id);
+        "Remove an expired evidence-bound zone WAF rule".clone_into(&mut capability.title);
+        capability.description = Some(
+            "Removes one exact WAF rule only after its verified cfctl source operation, evidence reference, expiry, and unchanged live rule body are proven."
+                .to_owned(),
+        );
+        capability.aliases = vec![
+            "remove expired WAF enforcement".to_owned(),
+            "expire managed challenge custom rule".to_owned(),
+            "rollback telemetry derived WAF action".to_owned(),
+        ];
+        capability.security_action = Some(SecurityActionContractV1 {
+            kind: SecurityActionKindV1::RemoveExpired,
+            input_schema: security_ip_rule_remove_input_schema(),
+            default_action: None,
+            allowed_actions: Vec::new(),
+            allowed_target_types: Vec::new(),
+            default_ttl_seconds: 0,
+            max_ttl_seconds: 0,
+            current_state_capability_id: WAF_RULE_READ_ID.to_owned(),
+            safety_profile: SecurityActionSafetyProfileV1::TelemetryDerivedStrict,
+        });
+        refresh_dynamic_mutation_contract(&mut capability);
+        snapshot
+            .capabilities
+            .insert(WAF_RULE_REMOVE_ID.to_owned(), capability);
+    }
+}
+
+fn harden_rate_limit_schema(schema: Option<&mut Value>) {
+    let Some(root) = schema.and_then(Value::as_object_mut) else {
+        return;
+    };
+    root.insert("additionalProperties".to_owned(), Value::Bool(false));
+    let Some(properties) = root.get_mut("properties").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for name in ["action", "match"] {
+        if let Some(branches) = properties
+            .get_mut(name)
+            .and_then(|schema| schema.get_mut(if name == "action" { "anyOf" } else { "oneOf" }))
+            .and_then(Value::as_array_mut)
+        {
+            for branch in branches {
+                if let Some(branch) = branch.as_object_mut() {
+                    branch.insert("additionalProperties".to_owned(), Value::Bool(false));
+                }
+            }
+        }
+    }
+    if let Some(threshold) = properties
+        .get_mut("threshold")
+        .and_then(Value::as_object_mut)
+    {
+        threshold.insert("maximum".to_owned(), Value::from(1_000_000));
+    }
+}
+
+fn finalize_rate_limit_lifecycle(snapshot: &mut CatalogSnapshot) {
+    const CREATE: &str = "rate-limits-for-a-zone-create-a-rate-limit";
+    const READ: &str = "rate-limits-for-a-zone-get-a-rate-limit";
+    const UPDATE: &str = "rate-limits-for-a-zone-update-a-rate-limit";
+    const DELETE: &str = "rate-limits-for-a-zone-delete-a-rate-limit";
+    const COLLECTION: &str = "/zones/{zone_id}/rate_limits";
+    const DETAIL: &str = "/zones/{zone_id}/rate_limits/{rate_limit_id}";
+    let identity_ok = snapshot.capabilities.get(CREATE).is_some_and(|capability| {
+        capability.method == "POST"
+            && capability.path == COLLECTION
+            && capability.permissions == ["Firewall Services Write"]
+    }) && snapshot.capabilities.get(READ).is_some_and(|capability| {
+        capability.method == "GET" && capability.path == DETAIL && !capability.mutating
+    }) && snapshot
+        .capabilities
+        .get(UPDATE)
+        .is_some_and(|capability| capability.method == "PUT" && capability.path == DETAIL)
+        && snapshot
+            .capabilities
+            .get(DELETE)
+            .is_some_and(|capability| capability.method == "DELETE" && capability.path == DETAIL);
+    if !identity_ok {
+        for id in [CREATE, UPDATE] {
+            if let Some(capability) = snapshot.capabilities.get_mut(id) {
+                capability.adapter_status = AdapterStatus::Blocked;
+                capability.blocked_reason = Some(
+                    "schema drift: zone rate-limit create/read/update/delete no longer matches the governed lifecycle"
+                        .to_owned(),
+                );
+            }
+        }
+        return;
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(CREATE) {
+        harden_rate_limit_schema(capability.request_schema.as_mut());
+        capability.aliases = vec![
+            "create rate limiting rule".to_owned(),
+            "configure managed challenge rate limit".to_owned(),
+            "protect route from request flood".to_owned(),
+        ];
+        capability.permissions = vec![
+            "Firewall Services Read".to_owned(),
+            "Firewall Services Write".to_owned(),
+        ];
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.maturity = Maturity::Deprecated;
+        zero_cost_mutation(
+            capability,
+            "creating the rate-limit configuration has no direct operation charge; enforcement changes request handling and downstream usage",
+            official_reference(
+                "Create zone rate limit",
+                "https://developers.cloudflare.com/api/resources/rate_limits/methods/create/",
+            ),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+
+    if let Some(capability) = snapshot.capabilities.get_mut(UPDATE) {
+        harden_rate_limit_schema(capability.request_schema.as_mut());
+        capability.aliases = vec![
+            "update rate limiting rule".to_owned(),
+            "change rate-limit threshold period action".to_owned(),
+        ];
+        capability.permissions = vec![
+            "Firewall Services Read".to_owned(),
+            "Firewall Services Write".to_owned(),
+        ];
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::ReversibleWrite;
+        capability.maturity = Maturity::Deprecated;
+        zero_cost_mutation(
+            capability,
+            "updating the rate-limit configuration has no direct operation charge; enforcement changes request handling and downstream usage",
+            official_reference(
+                "Update zone rate limit",
+                "https://developers.cloudflare.com/api/resources/rate_limits/methods/update/",
+            ),
+        );
+        capability.rollback.supported = true;
+        capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+        capability.rollback.warning = Some(
+            "cfctl captures and rechecks the exact rate-limit body before applying; rollback is a separately reviewed restoration plan"
+                .to_owned(),
+        );
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
+
+fn finalize_notification_policy_lifecycle(snapshot: &mut CatalogSnapshot) {
+    const CREATE: &str = "notification-policies-create-a-notification-policy";
+    const READ: &str = "notification-policies-get-a-notification-policy";
+    const UPDATE: &str = "notification-policies-update-a-notification-policy";
+    const DELETE: &str = "notification-policies-delete-a-notification-policy";
+    const COLLECTION: &str = "/accounts/{account_id}/alerting/v3/policies";
+    const DETAIL: &str = "/accounts/{account_id}/alerting/v3/policies/{policy_id}";
+    let accepted_permissions = ["Notifications Write", "Account Settings Write"];
+    let identity_ok = snapshot.capabilities.get(CREATE).is_some_and(|capability| {
+        capability.method == "POST"
+            && capability.path == COLLECTION
+            && capability.created_resource.is_some()
+            && capability.permissions == accepted_permissions
+    }) && snapshot.capabilities.get(READ).is_some_and(|capability| {
+        capability.method == "GET" && capability.path == DETAIL && !capability.mutating
+    }) && snapshot.capabilities.get(UPDATE).is_some_and(|capability| {
+        capability.method == "PUT"
+            && capability.path == DETAIL
+            && capability.same_path_read.is_some()
+    }) && snapshot
+        .capabilities
+        .get(DELETE)
+        .is_some_and(|capability| capability.method == "DELETE" && capability.path == DETAIL);
+    if !identity_ok {
+        for id in [CREATE, UPDATE] {
+            if let Some(capability) = snapshot.capabilities.get_mut(id) {
+                capability.adapter_status = AdapterStatus::Blocked;
+                capability.blocked_reason = Some(
+                    "schema drift: notification policy create/read/update/delete no longer matches the governed external-communication lifecycle"
+                        .to_owned(),
+                );
+            }
+        }
+        return;
+    }
+    for id in [CREATE, UPDATE] {
+        let Some(capability) = snapshot.capabilities.get_mut(id) else {
+            return;
+        };
+        capability.aliases = vec![
+            "security availability alert policy".to_owned(),
+            "Logpush health notification".to_owned(),
+            "DDoS WAF bot traffic alert".to_owned(),
+        ];
+        capability.risk = RiskClass::ExternalCommunication;
+        capability.effect = EffectClass::ExternalCommunication;
+        capability.entitlement.requires_live_resolution = true;
+        capability.entitlement.source = Some(
+            "https://developers.cloudflare.com/api/resources/alerting/subresources/available_alerts/"
+                .to_owned(),
+        );
+        zero_cost_mutation(
+            capability,
+            "creating or updating the policy has no direct operation charge; delivery eligibility and destination readiness require live account resolution",
+            official_reference(
+                "Notification policy API",
+                "https://developers.cloudflare.com/api/resources/alerting/subresources/policies/",
+            ),
+        );
+        if id == UPDATE {
+            capability.rollback.supported = true;
+            capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+            capability.rollback.warning = Some(
+                "cfctl captures and rechecks the exact policy before sending; rollback is a separately reviewed restoration plan and can itself send or suppress notifications"
+                    .to_owned(),
+            );
+        }
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
+
+fn finalize_list_container_lifecycle(snapshot: &mut CatalogSnapshot) {
+    const CREATE: &str = "lists-create-a-list";
+    const READ: &str = "lists-get-a-list";
+    const UPDATE: &str = "lists-update-a-list";
+    const DELETE: &str = "lists-delete-a-list";
+    const COLLECTION: &str = "/accounts/{account_id}/rules/lists";
+    const DETAIL: &str = "/accounts/{account_id}/rules/lists/{list_id}";
+    let identity_ok = snapshot.capabilities.get(CREATE).is_some_and(|capability| {
+        capability.method == "POST"
+            && capability.path == COLLECTION
+            && capability.permissions == ["Account Filter Lists Edit"]
+            && capability.created_resource.is_some()
+    }) && snapshot.capabilities.get(READ).is_some_and(|capability| {
+        capability.method == "GET" && capability.path == DETAIL && !capability.mutating
+    }) && snapshot.capabilities.get(UPDATE).is_some_and(|capability| {
+        capability.method == "PUT"
+            && capability.path == DETAIL
+            && capability.same_path_read.is_some()
+    }) && snapshot
+        .capabilities
+        .get(DELETE)
+        .is_some_and(|capability| capability.method == "DELETE" && capability.path == DETAIL);
+    if !identity_ok {
+        for id in [CREATE, UPDATE] {
+            if let Some(capability) = snapshot.capabilities.get_mut(id) {
+                capability.adapter_status = AdapterStatus::Blocked;
+                capability.blocked_reason = Some(
+                    "schema drift: Cloudflare List create/read/update/delete no longer matches the governed container lifecycle"
+                        .to_owned(),
+                );
+            }
+        }
+        return;
+    }
+    for id in [CREATE, UPDATE] {
+        let Some(capability) = snapshot.capabilities.get_mut(id) else {
+            return;
+        };
+        capability.aliases = vec![
+            "create governed IP ASN hostname list".to_owned(),
+            "manage WAF target list".to_owned(),
+            "Cloudflare custom list".to_owned(),
+        ];
+        capability.risk = RiskClass::ScopedWrite;
+        capability.effect = EffectClass::ReversibleWrite;
+        zero_cost_mutation(
+            capability,
+            "the list container has no direct operation charge; member modification quotas and any referencing rules remain separate governed effects",
+            official_reference(
+                "Lists API limits",
+                "https://developers.cloudflare.com/waf/tools/lists/lists-api/",
+            ),
+        );
+        if id == UPDATE {
+            capability.rollback.supported = true;
+            capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+            capability.rollback.warning = Some(
+                "cfctl captures and rechecks the exact list metadata before applying; rollback restores only that metadata and never changes members"
+                    .to_owned(),
+            );
+        }
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
+
+const LIST_MEMBER_SOURCE_CREATE_ID: &str = "lists-create-list-items";
+const LIST_MEMBER_SOURCE_DELETE_ID: &str = "lists-delete-list-items";
+const LIST_MEMBER_CREATE_ID: &str = "security-response-add-expiring-list-member";
+const LIST_MEMBER_REMOVE_ID: &str = "security-response-remove-expired-list-member";
+const LIST_MEMBER_READ_ID: &str = "lists-get-list-items";
+const LIST_METADATA_READ_ID: &str = "lists-get-a-list";
+const LIST_BULK_STATUS_ID: &str = "lists-get-bulk-operation-status";
+const LIST_MEMBER_COLLECTION: &str = "/accounts/{account_id}/rules/lists/{list_id}/items";
+const LIST_METADATA_PATH: &str = "/accounts/{account_id}/rules/lists/{list_id}";
+const LIST_BULK_STATUS_PATH: &str =
+    "/accounts/{account_id}/rules/lists/bulk_operations/{operation_id}";
+
+fn governed_list_member_wire_schema() -> Value {
+    serde_json::json!({
+        "type":"array",
+        "minItems":1,
+        "maxItems":1,
+        "items":{
+            "oneOf":[
+                {
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["comment","ip"],
+                    "properties":{
+                        "comment":{"type":"string","minLength":1,"maxLength":500},
+                        "ip":{"type":"string","minLength":2,"maxLength":64}
+                    }
+                },
+                {
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["asn","comment"],
+                    "properties":{
+                        "asn":{"type":"integer","minimum":1,"maximum":4_294_967_295_u64},
+                        "comment":{"type":"string","minLength":1,"maxLength":500}
+                    }
+                },
+                {
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["comment","hostname"],
+                    "properties":{
+                        "comment":{"type":"string","minLength":1,"maxLength":500},
+                        "hostname":{
+                            "type":"object",
+                            "additionalProperties":false,
+                            "required":["url_hostname"],
+                            "properties":{
+                                "url_hostname":{"type":"string","minLength":1,"maxLength":253}
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn governed_list_member_delete_wire_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["items"],
+        "properties":{
+            "items":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":1,
+                "items":{
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["id"],
+                    "properties":{"id":{"type":"string","minLength":32,"maxLength":32}}
+                }
+            }
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn governed_list_member_input_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["actor","confirm_consumer_scope","evidence_ref","reason","target"],
+        "properties":{
+            "action":{"type":"string","enum":["managed_challenge","block"],"default":"managed_challenge","description":"Expected action of every reviewed consumer; the list itself is neutral data."},
+            "actor":{"type":"string","minLength":1,"maxLength":80,"pattern":"^[A-Za-z0-9._:@+ -]+$"},
+            "confirm_block":{"type":"boolean"},
+            "confirm_broad_scope":{"type":"boolean"},
+            "confirm_consumer_scope":{"type":"boolean","description":"Confirms the operator reviewed every rule that consumes this list; cfctl does not infer consumer semantics from the member write."},
+            "evidence_ref":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+            "expires_at":{"type":"string","format":"date-time","description":"Defaults to 24 hours; maximum seven days."},
+            "operator_ip":{"type":"string","minLength":2,"maxLength":64},
+            "reason":{"type":"string","minLength":4,"maxLength":160},
+            "target":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["type","value"],
+                "properties":{
+                    "type":{"type":"string","enum":["asn","hostname","ip","ip_range"]},
+                    "value":{"type":"string","minLength":1,"maxLength":253}
+                }
+            }
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn governed_list_member_remove_input_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["actor","evidence_ref","expires_at","member_id","reason","source_operation_id"],
+        "properties":{
+            "actor":{"type":"string","minLength":1,"maxLength":80,"pattern":"^[A-Za-z0-9._:@+ -]+$"},
+            "evidence_ref":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+            "expires_at":{"type":"string","format":"date-time"},
+            "member_id":{"type":"string","minLength":32,"maxLength":32},
+            "reason":{"type":"string","minLength":4,"maxLength":160},
+            "source_operation_id":{"type":"string","minLength":1,"maxLength":80}
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn list_member_async_contract(create: bool) -> AsyncCollectionMutationContractV1 {
+    AsyncCollectionMutationContractV1 {
+        operation_status_path: LIST_BULK_STATUS_PATH.to_owned(),
+        operation_status_capability_id: LIST_BULK_STATUS_ID.to_owned(),
+        operation_id_selector: "operation_id".to_owned(),
+        apply_operation_id_pointer: "/operation_id".to_owned(),
+        status_operation_id_pointer: "/id".to_owned(),
+        status_state_pointer: "/status".to_owned(),
+        pending_states: vec!["pending".to_owned(), "running".to_owned()],
+        completed_state: "completed".to_owned(),
+        failed_state: "failed".to_owned(),
+        max_poll_attempts: 30,
+        poll_interval_ms: 1_000,
+        collection_path: LIST_MEMBER_COLLECTION.to_owned(),
+        collection_capability_id: LIST_MEMBER_READ_ID.to_owned(),
+        collection_metadata_path: LIST_METADATA_PATH.to_owned(),
+        collection_metadata_capability_id: LIST_METADATA_READ_ID.to_owned(),
+        collection_item_identity_pointer: "/id".to_owned(),
+        correlation_field: create.then(|| "comment".to_owned()),
+        remove_capability_id: create.then(|| LIST_MEMBER_REMOVE_ID.to_owned()),
+        requires_cursor_completion: true,
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the asynchronous List add and exact expiry removal share one correlated lifecycle"
+)]
+fn finalize_list_member_lifecycle(snapshot: &mut CatalogSnapshot) {
+    let identity_ok = snapshot
+        .capabilities
+        .get(LIST_MEMBER_SOURCE_CREATE_ID)
+        .is_some_and(|capability| {
+            capability.method == "POST"
+                && capability.path == LIST_MEMBER_COLLECTION
+                && capability.permissions == ["Account Filter Lists Edit"]
+                && capability
+                    .request_schema
+                    .as_ref()
+                    .and_then(|schema| schema.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("array")
+        })
+        && snapshot
+            .capabilities
+            .get(LIST_MEMBER_SOURCE_DELETE_ID)
+            .is_some_and(|capability| {
+                capability.method == "DELETE" && capability.path == LIST_MEMBER_COLLECTION
+            })
+        && snapshot
+            .capabilities
+            .get(LIST_MEMBER_READ_ID)
+            .is_some_and(|capability| {
+                capability.method == "GET"
+                    && capability.path == LIST_MEMBER_COLLECTION
+                    && !capability.mutating
+            })
+        && snapshot
+            .capabilities
+            .get(LIST_METADATA_READ_ID)
+            .is_some_and(|capability| {
+                capability.method == "GET"
+                    && capability.path == LIST_METADATA_PATH
+                    && !capability.mutating
+            })
+        && snapshot
+            .capabilities
+            .get(LIST_BULK_STATUS_ID)
+            .is_some_and(|capability| {
+                capability.method == "GET"
+                    && capability.path == LIST_BULK_STATUS_PATH
+                    && !capability.mutating
+            });
+    if !identity_ok {
+        for id in [LIST_MEMBER_SOURCE_CREATE_ID, LIST_MEMBER_SOURCE_DELETE_ID] {
+            if let Some(capability) = snapshot.capabilities.get_mut(id) {
+                capability.adapter_status = AdapterStatus::Blocked;
+                capability.blocked_reason = Some(
+                    "schema drift: Cloudflare Lists members no longer match the governed asynchronous add/status/read/remove lifecycle"
+                        .to_owned(),
+                );
+            }
+        }
+        return;
+    }
+
+    let Some(source_create) = snapshot
+        .capabilities
+        .get(LIST_MEMBER_SOURCE_CREATE_ID)
+        .cloned()
+    else {
+        return;
+    };
+    let mut create = source_create;
+    LIST_MEMBER_CREATE_ID.clone_into(&mut create.id);
+    "Add one evidence-bound expiring Cloudflare List member".clone_into(&mut create.title);
+    create.description = Some(
+        "Adds one normalized IP, prefix, ASN, or exact hostname to one reviewed Cloudflare List. cfctl defaults the expected consumer action to Managed Challenge, requires evidence, actor, reason, expiry, and consumer-scope confirmation, polls the asynchronous bulk operation, correlates the exact member, and records its identity for verified removal. The list member is not represented as a person identity."
+            .to_owned(),
+    );
+    create.aliases = vec![
+        "add expiring IP to Cloudflare list".to_owned(),
+        "temporary ASN list member".to_owned(),
+        "hostname security list member".to_owned(),
+        "telemetry derived list enforcement".to_owned(),
+    ];
+    "cfctl-security-action-v1+cloudflare-api-schemas".clone_into(&mut create.source);
+    create.permissions = vec![
+        "Account Filter Lists Edit".to_owned(),
+        "Account Filter Lists Read".to_owned(),
+    ];
+    create.request_schema = Some(governed_list_member_wire_schema());
+    create.risk = RiskClass::IdentityOrOwnership;
+    create.effect = EffectClass::ReversibleWrite;
+    attach_live_read_entitlement_probe(&mut create, LIST_MEMBER_READ_ID, LIST_MEMBER_COLLECTION);
+    create.entitlement.source = Some(
+        "https://developers.cloudflare.com/api/resources/rules/subresources/lists/subresources/items/methods/create/"
+            .to_owned(),
+    );
+    zero_cost_mutation(
+        &mut create,
+        "the member write has no direct operation charge; list quotas and every consuming rule remain separate governed effects",
+        official_reference(
+            "Cloudflare Lists API limits",
+            "https://developers.cloudflare.com/waf/tools/lists/lists-api/",
+        ),
+    );
+    create.verification.required = true;
+    "async_list_operation_completes_and_correlated_member_exists"
+        .clone_into(&mut create.verification.strategy);
+    create.async_collection_mutation = Some(list_member_async_contract(true));
+    create.rollback.supported = true;
+    create.rollback.strategy = Some("remove_async_created_list_member_by_correlated_id".to_owned());
+    create.rollback.warning = Some(
+        "removal is a separate exact-member plan derived from the correlated verification receipt; it cannot reverse traffic decisions already made by consuming rules"
+            .to_owned(),
+    );
+    create.security_action = Some(SecurityActionContractV1 {
+        kind: SecurityActionKindV1::AddExpiringListMember,
+        input_schema: governed_list_member_input_schema(),
+        default_action: Some("managed_challenge".to_owned()),
+        allowed_actions: vec!["managed_challenge".to_owned(), "block".to_owned()],
+        allowed_target_types: vec![
+            "asn".to_owned(),
+            "hostname".to_owned(),
+            "ip".to_owned(),
+            "ip_range".to_owned(),
+        ],
+        default_ttl_seconds: 86_400,
+        max_ttl_seconds: 604_800,
+        current_state_capability_id: LIST_MEMBER_READ_ID.to_owned(),
+        safety_profile: SecurityActionSafetyProfileV1::TelemetryDerivedStrict,
+    });
+    create.adapter_status = AdapterStatus::DynamicApi;
+    create.blocked_reason = None;
+    refresh_dynamic_mutation_contract(&mut create);
+    snapshot
+        .capabilities
+        .insert(LIST_MEMBER_CREATE_ID.to_owned(), create);
+
+    let Some(source_remove) = snapshot
+        .capabilities
+        .get(LIST_MEMBER_SOURCE_DELETE_ID)
+        .cloned()
+    else {
+        return;
+    };
+    let mut remove = source_remove;
+    LIST_MEMBER_REMOVE_ID.clone_into(&mut remove.id);
+    "Remove one expired evidence-bound Cloudflare List member".clone_into(&mut remove.title);
+    remove.description = Some(
+        "Removes exactly one List member only after its verified source operation, expiry, live identity, and audit correlation have been rechecked. The asynchronous delete is polled to completion and the complete cursor-paginated collection must omit the member."
+            .to_owned(),
+    );
+    remove.aliases = vec![
+        "remove expired list enforcement".to_owned(),
+        "delete verified Cloudflare list member".to_owned(),
+    ];
+    "cfctl-security-action-v1+cloudflare-api-schemas".clone_into(&mut remove.source);
+    remove.permissions = vec![
+        "Account Filter Lists Edit".to_owned(),
+        "Account Filter Lists Read".to_owned(),
+    ];
+    remove.request_schema = Some(governed_list_member_delete_wire_schema());
+    remove.risk = RiskClass::IdentityOrOwnership;
+    remove.effect = EffectClass::Destructive;
+    attach_live_read_entitlement_probe(&mut remove, LIST_MEMBER_READ_ID, LIST_MEMBER_COLLECTION);
+    remove.entitlement.source = Some(
+        "https://developers.cloudflare.com/api/resources/rules/subresources/lists/subresources/items/methods/delete/"
+            .to_owned(),
+    );
+    zero_cost_mutation(
+        &mut remove,
+        "removing one exact list member has no direct operation charge and cannot reverse traffic decisions already made",
+        official_reference(
+            "Delete Cloudflare List items",
+            "https://developers.cloudflare.com/api/resources/rules/subresources/lists/subresources/items/methods/delete/",
+        ),
+    );
+    remove.verification.required = true;
+    "async_list_operation_completes_and_members_absent"
+        .clone_into(&mut remove.verification.strategy);
+    remove.async_collection_mutation = Some(list_member_async_contract(false));
+    remove.rollback.supported = false;
+    remove.rollback.strategy = None;
+    remove.rollback.warning = Some(
+        "member removal cannot restore the original identity or undo prior consumer effects; recreation requires a separately reviewed expiring add plan"
+            .to_owned(),
+    );
+    remove.security_action = Some(SecurityActionContractV1 {
+        kind: SecurityActionKindV1::RemoveExpiredListMember,
+        input_schema: governed_list_member_remove_input_schema(),
+        default_action: None,
+        allowed_actions: Vec::new(),
+        allowed_target_types: vec![
+            "asn".to_owned(),
+            "hostname".to_owned(),
+            "ip".to_owned(),
+            "ip_range".to_owned(),
+        ],
+        default_ttl_seconds: 0,
+        max_ttl_seconds: 0,
+        current_state_capability_id: LIST_MEMBER_READ_ID.to_owned(),
+        safety_profile: SecurityActionSafetyProfileV1::TelemetryDerivedStrict,
+    });
+    remove.adapter_status = AdapterStatus::DynamicApi;
+    remove.blocked_reason = None;
+    refresh_dynamic_mutation_contract(&mut remove);
+    snapshot
+        .capabilities
+        .insert(LIST_MEMBER_REMOVE_ID.to_owned(), remove);
+
+    for id in [LIST_MEMBER_SOURCE_CREATE_ID, LIST_MEMBER_SOURCE_DELETE_ID] {
+        let Some(capability) = snapshot.capabilities.get_mut(id) else {
+            return;
+        };
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "blocked by design: raw asynchronous multi-item List writes bypass evidence, expiry, consumer-scope review, exact member correlation, and verified removal; use the governed single-member security-response capability"
+                .to_owned(),
+        );
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the bounded SQL and negotiated response contract is reviewed as one overlay"
+)]
+fn finalize_analytics_engine_query(snapshot: &mut CatalogSnapshot) {
+    let Some(capability) = snapshot
+        .capabilities
+        .get_mut("analytics-engine-sql-query-get")
+    else {
+        return;
+    };
+    let identity_supported = capability.method == "GET"
+        && capability.path == "/accounts/{account_id}/analytics_engine/sql"
+        && capability.permissions == ["Account Analytics Read"]
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.success_statuses == ["200"]
+                    && response
+                        .success_media_types
+                        .iter()
+                        .any(|media| media == "application/json")
+                    && response
+                        .success_media_types
+                        .iter()
+                        .any(|media| media == "application/x-ndjson")
+            });
+    if !identity_supported {
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(
+            "schema drift: Analytics Engine SQL no longer matches the governed GET, permission, and response contract"
+                .to_owned(),
+        );
+        return;
+    }
+    capability
+        .selectors
+        .retain(|selector| !(selector.location == "query" && selector.name == "query"));
+    capability.aliases = vec![
+        "Analytics Engine".to_owned(),
+        "Analytics Engine SQL".to_owned(),
+        "query dataset".to_owned(),
+        "stream analytics results".to_owned(),
+        "export analytics".to_owned(),
+    ];
+    capability.description = Some(
+        "Runs a compiler-rendered, single-statement SELECT over one Analytics Engine dataset with explicit time, row, byte, timeout, and output bounds. Raw SQL is not accepted."
+            .to_owned(),
+    );
+    capability.request_schema = Some(structured_analytics_engine_schema());
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec![
+            "application/json".to_owned(),
+            "application/x-ndjson".to_owned(),
+            "text/csv".to_owned(),
+        ],
+        body_mode: ResponseBodyModeV1::NegotiatedRows,
+    });
+    capability.analytics_query = Some(AnalyticsQueryContractV1 {
+        kind: AnalyticsQueryKindV1::StructuredSql,
+        dataset: None,
+        dataset_pointer: Some("/dataset".to_owned()),
+        time_range: Some(TimeRangeContractV1 {
+            start_pointer: "/start".to_owned(),
+            end_pointer: "/end".to_owned(),
+            timestamp_format: TimestampFormatV1::Rfc3339,
+            max_lookback_seconds: 90 * 24 * 60 * 60,
+            max_window_seconds: 7 * 24 * 60 * 60,
+        }),
+        row_limit_pointer: Some("/limit".to_owned()),
+        max_rows: 10_000,
+        max_bytes: 64 * 1024 * 1024,
+        max_timeout_seconds: 60,
+        allowed_output_formats: vec![
+            OutputFormatV1::Json,
+            OutputFormatV1::Ndjson,
+            OutputFormatV1::Csv,
+        ],
+        default_output_format: OutputFormatV1::Ndjson,
+        pagination: PaginationModeV1::BoundedResult,
+        read_only: true,
+        freshness: Some("dataset-defined; reported in the query receipt".to_owned()),
+        sampling: Some("dataset-defined; cfctl never infers unsampled results".to_owned()),
+    });
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    capability.blocked_reason = None;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.mutating = false;
+    capability.cost.known = true;
+    capability.cost.incremental = false;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "Cloudflare currently documents Analytics Engine SQL queries as not separately billed; bounded query volume remains visible in the receipt because upstream pricing may change"
+            .to_owned(),
+    );
+    capability.cost.references = vec![official_reference(
+        "Analytics Engine pricing",
+        "https://developers.cloudflare.com/analytics/analytics-engine/pricing/",
+    )];
+    capability.verification.required = false;
+    "not_applicable".clone_into(&mut capability.verification.strategy);
+    capability.rollback.warning = None;
+
+    if let Some(post) = snapshot
+        .capabilities
+        .get_mut("analytics-engine-sql-query-post")
+    {
+        post.adapter_status = AdapterStatus::Blocked;
+        post.blocked_reason = Some(
+            "blocked by design: raw SQL bodies are not a public cfctl surface; use `analytics-engine-sql-query-get`, which compiles a bounded typed SELECT"
+                .to_owned(),
+        );
+    }
+}
+
+fn structured_analytics_engine_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["dataset","start","end","columns","limit","format","timeout_seconds"],
+        "properties":{
+            "dataset":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"},
+            "start":{"type":"string","format":"date-time"},
+            "end":{"type":"string","format":"date-time"},
+            "columns":{"type":"array","minItems":1,"maxItems":50,"uniqueItems":true,"items":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"}},
+            "aggregates":{"type":"array","maxItems":20,"items":{"type":"object","additionalProperties":false,"required":["function","alias"],"properties":{"function":{"type":"string","enum":["count","sum","avg","min","max"]},"field":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"},"alias":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"}}}},
+            "filters":{"type":"array","maxItems":20,"items":{"type":"object","additionalProperties":false,"required":["field","operator","value"],"properties":{"field":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"},"operator":{"type":"string","enum":["eq","ne","gt","gte","lt","lte","in","not_in"]},"value":{}}}},
+            "group_by":{"type":"array","maxItems":20,"uniqueItems":true,"items":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"}},
+            "order_by":{"type":"array","maxItems":10,"items":{"type":"object","additionalProperties":false,"required":["field","direction"],"properties":{"field":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"},"direction":{"type":"string","enum":["asc","desc"]}}}},
+            "limit":{"type":"integer","minimum":1,"maximum":10000},
+            "format":{"type":"string","enum":["json","ndjson","csv"]},
+            "timeout_seconds":{"type":"integer","minimum":1,"maximum":60}
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn finalize_workers_observability_reads(snapshot: &mut CatalogSnapshot) {
+    for (id, dataset_pointer, start_pointer, end_pointer, row_pointer) in [
+        ("telemetry.keys.list", "/datasets", "/from", "/to", "/limit"),
+        (
+            "telemetry.values.list",
+            "/datasets",
+            "/timeframe/from",
+            "/timeframe/to",
+            "/limit",
+        ),
+        (
+            "telemetry.query",
+            "/parameters/datasets",
+            "/timeframe/from",
+            "/timeframe/to",
+            "/parameters/limit",
+        ),
+    ] {
+        let Some(capability) = snapshot.capabilities.get_mut(id) else {
+            continue;
+        };
+        if capability.method != "POST"
+            || !capability
+                .path
+                .starts_with("/accounts/{account_id}/workers/observability/telemetry/")
+            || capability.permissions != ["Workers Observability Write"]
+            || capability
+                .response_contract
+                .as_ref()
+                .is_none_or(|response| {
+                    response.body_mode != ResponseBodyModeV1::CloudflareJsonEnvelope
+                })
+        {
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(format!(
+                "schema drift: `{id}` no longer matches the fixed Workers observability read contract"
+            ));
+            continue;
+        }
+        harden_workers_observability_schema(id, capability.request_schema.as_mut());
+        capability.mutating = false;
+        capability.risk = RiskClass::Read;
+        capability.effect = EffectClass::ReadOnly;
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.blocked_reason = None;
+        capability.aliases = workers_observability_aliases(id);
+        capability.analytics_query = Some(AnalyticsQueryContractV1 {
+            kind: AnalyticsQueryKindV1::WorkersObservability,
+            dataset: None,
+            dataset_pointer: Some(dataset_pointer.to_owned()),
+            time_range: Some(TimeRangeContractV1 {
+                start_pointer: start_pointer.to_owned(),
+                end_pointer: end_pointer.to_owned(),
+                timestamp_format: TimestampFormatV1::UnixMilliseconds,
+                max_lookback_seconds: 7 * 24 * 60 * 60,
+                max_window_seconds: 60 * 60,
+            }),
+            row_limit_pointer: Some(row_pointer.to_owned()),
+            max_rows: 2_000,
+            max_bytes: 16 * 1024 * 1024,
+            max_timeout_seconds: 30,
+            allowed_output_formats: vec![OutputFormatV1::Json],
+            default_output_format: OutputFormatV1::Json,
+            pagination: PaginationModeV1::TimeWindow,
+            read_only: true,
+            freshness: Some(
+                "Workers observability ingestion freshness is upstream-reported".to_owned(),
+            ),
+            sampling: Some(
+                "sampling follows the selected Worker's observability settings".to_owned(),
+            ),
+        });
+        capability.cost.known = true;
+        capability.cost.incremental = false;
+        capability.cost.maximum = Some(0.0);
+        capability.cost.billing_model = BillingModelV1::Subscription;
+        capability.cost.exposure = CostExposureV1::DownstreamUsage;
+        capability.cost.basis = Some(
+            "the bounded read has no direct operation charge; Workers logging retention and ingestion remain governed by the account plan"
+                .to_owned(),
+        );
+        capability.verification.required = false;
+        "not_applicable".clone_into(&mut capability.verification.strategy);
+        capability.rollback.warning = None;
+    }
+}
+
+fn harden_workers_observability_schema(id: &str, schema: Option<&mut Value>) {
+    let Some(root) = schema.and_then(Value::as_object_mut) else {
+        return;
+    };
+    root.insert("additionalProperties".to_owned(), Value::Bool(false));
+    let required = match id {
+        "telemetry.keys.list" => serde_json::json!(["datasets", "from", "to", "limit"]),
+        "telemetry.values.list" => {
+            serde_json::json!(["datasets", "timeframe", "key", "type", "limit"])
+        }
+        _ => serde_json::json!(["queryId", "timeframe", "view", "parameters"]),
+    };
+    root.insert("required".to_owned(), required);
+    let Some(properties) = root.get_mut("properties").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if let Some(datasets) = if id == "telemetry.query" {
+        properties
+            .get_mut("parameters")
+            .and_then(Value::as_object_mut)
+            .and_then(|parameters| parameters.get_mut("properties"))
+            .and_then(Value::as_object_mut)
+            .and_then(|properties| properties.get_mut("datasets"))
+    } else {
+        properties.get_mut("datasets")
+    }
+    .and_then(Value::as_object_mut)
+    {
+        datasets.insert("minItems".to_owned(), Value::from(1));
+        datasets.insert("maxItems".to_owned(), Value::from(20));
+        datasets.insert("uniqueItems".to_owned(), Value::Bool(true));
+    }
+    if id == "telemetry.query" {
+        if let Some(parameters) = properties
+            .get_mut("parameters")
+            .and_then(Value::as_object_mut)
+        {
+            parameters.insert("additionalProperties".to_owned(), Value::Bool(false));
+            parameters.insert(
+                "required".to_owned(),
+                serde_json::json!(["datasets", "limit"]),
+            );
+            if let Some(limit) = parameters
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+                .and_then(|properties| properties.get_mut("limit"))
+                .and_then(Value::as_object_mut)
+            {
+                limit.insert("minimum".to_owned(), Value::from(1));
+                limit.insert("maximum".to_owned(), Value::from(2_000));
+            }
+        }
+    } else if let Some(limit) = properties.get_mut("limit").and_then(Value::as_object_mut) {
+        limit.insert("type".to_owned(), Value::String("integer".to_owned()));
+        limit.insert("minimum".to_owned(), Value::from(1));
+        limit.insert("maximum".to_owned(), Value::from(2_000));
+    }
+}
+
+fn workers_observability_aliases(id: &str) -> Vec<String> {
+    let mut aliases = vec![
+        "Workers logs".to_owned(),
+        "Workers traces".to_owned(),
+        "Workers observability".to_owned(),
+        "exceptions invocations CPU time subrequests latency".to_owned(),
+    ];
+    aliases.push(
+        match id {
+            "telemetry.keys.list" => "discover telemetry fields",
+            "telemetry.values.list" => "discover telemetry values",
+            _ => "query Worker logs traces exceptions and invocation metrics",
+        }
+        .to_owned(),
+    );
+    aliases
+}
+
+fn graphql_analytics_capabilities() -> Result<Vec<CapabilityV1>> {
+    Ok(vec![
+        zone_http_graphql_capability()?,
+        account_http_graphql_capability()?,
+        zone_firewall_graphql_capability()?,
+        zone_dataset_settings_graphql_capability()?,
+    ])
+}
+
+fn zone_http_graphql_capability() -> Result<CapabilityV1> {
+    let document = "query CfctlZoneHttpAnalytics($zoneTag: string!, $start: Time!, $end: Time!, $limit: Int!) { viewer { zones(filter: {zoneTag: $zoneTag}) { series: httpRequestsAdaptiveGroups(filter: {datetime_geq: $start, datetime_lt: $end}, limit: $limit, orderBy: [datetimeHour_ASC]) { count avg { sampleInterval } sum { edgeResponseBytes visits } dimensions { datetimeHour cacheStatus edgeResponseStatus clientRequestHTTPHost clientRequestPath } } } } }";
+    graphql_capability(GraphqlCapabilitySpec {
+        id: "graphql-analytics-zone-http-requests",
+        title: "Query bounded zone HTTP analytics",
+        aliases: &[
+            "zone traffic requests bandwidth cache status codes",
+            "host traffic route traffic",
+            "GraphQL analytics HTTP",
+        ],
+        operation_name: "CfctlZoneHttpAnalytics",
+        document,
+        dataset: "httpRequestsAdaptiveGroups",
+        selectors: vec![graphql_selector("zone_id", "Exact zone scope")],
+        selector_variables: [("zone_id", "zoneTag")].as_slice(),
+        body_variables: &[("start", "start"), ("end", "end"), ("limit", "limit")],
+        response_pointer: "/viewer/zones/0/series",
+        expected_fields: &["avg", "count", "dimensions", "sum"],
+        cursor_fields: &[],
+        cursor_input_pointers: &[],
+        request_schema: graphql_time_request_schema("httpRequestsAdaptiveGroups", 5_000, false),
+        max_rows: 5_000,
+        pagination: PaginationModeV1::TimeWindow,
+    })
+}
+
+fn account_http_graphql_capability() -> Result<CapabilityV1> {
+    let document = "query CfctlAccountHttpAnalytics($zoneTags: [string!]!, $start: Time!, $end: Time!, $limit: Int!) { viewer { zones(filter: {zoneTag_in: $zoneTags}) { zoneTag series: httpRequestsAdaptiveGroups(filter: {datetime_geq: $start, datetime_lt: $end}, limit: $limit, orderBy: [datetimeHour_ASC]) { count sum { edgeResponseBytes visits } dimensions { datetimeHour cacheStatus edgeResponseStatus clientRequestHTTPHost clientRequestPath } } } } }";
+    graphql_capability(GraphqlCapabilitySpec {
+        id: "graphql-analytics-account-http-requests",
+        title: "Query bounded HTTP analytics across selected account zones",
+        aliases: &[
+            "account traffic requests bandwidth cache status codes",
+            "multi zone HTTP analytics",
+            "account GraphQL analytics",
+        ],
+        operation_name: "CfctlAccountHttpAnalytics",
+        document,
+        dataset: "httpRequestsAdaptiveGroups",
+        selectors: vec![target_selector(
+            "account_id",
+            "Exact account governance scope",
+        )],
+        selector_variables: &[],
+        body_variables: &[
+            ("zone_ids", "zoneTags"),
+            ("start", "start"),
+            ("end", "end"),
+            ("limit", "limit"),
+        ],
+        response_pointer: "/viewer/zones",
+        expected_fields: &["series", "zoneTag"],
+        cursor_fields: &[],
+        cursor_input_pointers: &[],
+        request_schema: graphql_time_request_schema("httpRequestsAdaptiveGroups", 1_000, true),
+        max_rows: 10,
+        pagination: PaginationModeV1::BoundedResult,
+    })
+}
+
+fn zone_firewall_graphql_capability() -> Result<CapabilityV1> {
+    let document = "query CfctlZoneFirewallEvents($zoneTag: string!, $start: Time!, $end: Time!, $limit: Int!) { viewer { zones(filter: {zoneTag: $zoneTag}) { events: firewallEventsAdaptive(filter: {datetime_geq: $start, datetime_lt: $end}, limit: $limit, orderBy: [datetime_ASC, rayName_ASC]) { action clientAsn clientCountryName clientIP clientRequestHTTPHost clientRequestPath datetime rayName source userAgent } } } }";
+    let mut capability = graphql_capability(GraphqlCapabilitySpec {
+        id: "graphql-analytics-zone-firewall-events",
+        title: "Query bounded firewall and Security Events analytics",
+        aliases: &[
+            "firewall events Security Events WAF outcomes",
+            "bot traffic DDoS managed challenge block skip allow",
+            "suspicious IP ASN country hostname path fingerprint",
+        ],
+        operation_name: "CfctlZoneFirewallEvents",
+        document,
+        dataset: "firewallEventsAdaptive",
+        selectors: vec![graphql_selector("zone_id", "Exact zone scope")],
+        selector_variables: &[("zone_id", "zoneTag")],
+        body_variables: &[("start", "start"), ("end", "end"), ("limit", "limit")],
+        response_pointer: "/viewer/zones/0/events",
+        expected_fields: &[
+            "action",
+            "clientAsn",
+            "clientCountryName",
+            "clientIP",
+            "clientRequestHTTPHost",
+            "clientRequestPath",
+            "datetime",
+            "rayName",
+            "source",
+            "userAgent",
+        ],
+        cursor_fields: &[],
+        cursor_input_pointers: &[],
+        request_schema: graphql_time_request_schema("firewallEventsAdaptive", 1_000, false),
+        max_rows: 1_000,
+        pagination: PaginationModeV1::BoundedResult,
+    })?;
+    if let Some(query) = capability.analytics_query.as_mut() {
+        query.sampling = Some(
+            "Cloudflare Security Events are sampled, and one request can emit multiple events with the same timestamp and Ray ID; cfctl returns one bounded page and does not claim lossless continuation or exhaustive coverage"
+                .to_owned(),
+        );
+    }
+    Ok(capability)
+}
+
+fn zone_dataset_settings_graphql_capability() -> Result<CapabilityV1> {
+    let document = "query CfctlZoneAnalyticsSettings($zoneTag: string!) { viewer { zones(filter: {zoneTag: $zoneTag}) { settings { httpRequestsAdaptiveGroups { enabled maxDuration maxNumberOfFields maxPageSize notOlderThan } firewallEventsAdaptive { enabled maxDuration maxNumberOfFields maxPageSize notOlderThan } } } } }";
+    graphql_capability(GraphqlCapabilitySpec {
+        id: "graphql-analytics-zone-dataset-settings",
+        title: "Inspect GraphQL analytics retention and query limits",
+        aliases: &[
+            "analytics retention sampling freshness limits",
+            "GraphQL dataset settings entitlement",
+            "maximum lookback page size fields",
+        ],
+        operation_name: "CfctlZoneAnalyticsSettings",
+        document,
+        dataset: "settings",
+        selectors: vec![graphql_selector("zone_id", "Exact zone scope")],
+        selector_variables: &[("zone_id", "zoneTag")],
+        body_variables: &[],
+        response_pointer: "/viewer/zones/0/settings",
+        expected_fields: &["firewallEventsAdaptive", "httpRequestsAdaptiveGroups"],
+        cursor_fields: &[],
+        cursor_input_pointers: &[],
+        request_schema: serde_json::json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{},
+            "x-cfctl-body-required":true
+        }),
+        max_rows: 1,
+        pagination: PaginationModeV1::BoundedResult,
+    })
+}
+
+struct GraphqlCapabilitySpec<'a> {
+    id: &'a str,
+    title: &'a str,
+    aliases: &'a [&'a str],
+    operation_name: &'a str,
+    document: &'a str,
+    dataset: &'a str,
+    selectors: Vec<SelectorV1>,
+    selector_variables: &'a [(&'a str, &'a str)],
+    body_variables: &'a [(&'a str, &'a str)],
+    response_pointer: &'a str,
+    expected_fields: &'a [&'a str],
+    cursor_fields: &'a [&'a str],
+    cursor_input_pointers: &'a [(&'a str, &'a str)],
+    request_schema: Value,
+    max_rows: u64,
+    pagination: PaginationModeV1,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fixed GraphQL document, bounds, fingerprint, entitlement, and cost form one contract"
+)]
+fn graphql_capability(spec: GraphqlCapabilitySpec<'_>) -> Result<CapabilityV1> {
+    let mut capability = CapabilityV1::new(spec.id, spec.title, "POST", "/graphql");
+    capability.description = Some(
+        "Executes one fingerprinted Cloudflare GraphQL Analytics query. Callers may supply only declared variables; arbitrary documents and mutations are rejected."
+            .to_owned(),
+    );
+    "GraphQL Analytics".clone_into(&mut capability.product);
+    "https://developers.cloudflare.com/analytics/graphql-api/".clone_into(&mut capability.source);
+    if spec
+        .selectors
+        .iter()
+        .any(|selector| selector.name == "account_id")
+    {
+        "account"
+    } else {
+        "zone"
+    }
+    .clone_into(&mut capability.account_scope);
+    capability.selectors = spec.selectors;
+    capability.aliases = spec.aliases.iter().map(ToString::to_string).collect();
+    capability.permissions = vec!["Account Analytics Read".to_owned()];
+    capability.mutating = false;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.verification.required = false;
+    "not_applicable".clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = None;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.blocked_reason = None;
+    capability.request_schema = Some(spec.request_schema);
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::GraphqlJson,
+    });
+    capability.analytics_query = Some(AnalyticsQueryContractV1 {
+        kind: AnalyticsQueryKindV1::GraphqlAnalytics,
+        dataset: Some(spec.dataset.to_owned()),
+        dataset_pointer: if spec.dataset == "settings" {
+            None
+        } else {
+            Some("/dataset".to_owned())
+        },
+        time_range: (spec.dataset != "settings").then(|| TimeRangeContractV1 {
+            start_pointer: "/start".to_owned(),
+            end_pointer: "/end".to_owned(),
+            timestamp_format: TimestampFormatV1::Rfc3339,
+            max_lookback_seconds: 31 * 24 * 60 * 60,
+            max_window_seconds: 24 * 60 * 60,
+        }),
+        row_limit_pointer: (spec.dataset != "settings").then(|| "/limit".to_owned()),
+        max_rows: spec.max_rows,
+        max_bytes: 16 * 1024 * 1024,
+        max_timeout_seconds: 30,
+        allowed_output_formats: vec![OutputFormatV1::Json],
+        default_output_format: OutputFormatV1::Json,
+        pagination: spec.pagination,
+        read_only: true,
+        freshness: Some("inspect the dataset settings capability for upstream limits".to_owned()),
+        sampling: Some("adaptive datasets are sampled; cfctl reports the dataset without inferring unsampled identity".to_owned()),
+    });
+    let mut graphql = GraphqlAnalyticsContractV1 {
+        operation_name: spec.operation_name.to_owned(),
+        document: spec.document.to_owned(),
+        dataset: spec.dataset.to_owned(),
+        selector_variables: spec
+            .selector_variables
+            .iter()
+            .map(|(selector, variable)| ((*selector).to_owned(), (*variable).to_owned()))
+            .collect(),
+        body_variables: spec
+            .body_variables
+            .iter()
+            .map(|(field, variable)| ((*field).to_owned(), (*variable).to_owned()))
+            .collect(),
+        response_data_pointer: spec.response_pointer.to_owned(),
+        expected_row_fields: spec
+            .expected_fields
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        cursor_fields: spec.cursor_fields.iter().map(ToString::to_string).collect(),
+        cursor_input_pointer: None,
+        cursor_input_pointers: spec
+            .cursor_input_pointers
+            .iter()
+            .map(|(field, pointer)| ((*field).to_owned(), (*pointer).to_owned()))
+            .collect(),
+        schema_fingerprint: String::new(),
+    };
+    graphql.refresh_schema_fingerprint()?;
+    capability.graphql = Some(graphql);
+    capability.entitlement.source = Some(
+        "https://developers.cloudflare.com/analytics/graphql-api/features/discovery/settings/"
+            .to_owned(),
+    );
+    capability.entitlement.requires_live_resolution = true;
+    capability.cost.basis = Some(
+        "the read has no direct operation charge; Cloudflare GraphQL rate and node limits are enforced independently of product retention and sampling"
+            .to_owned(),
+    );
+    capability.cost.references = vec![official_reference(
+        "GraphQL Analytics limits",
+        "https://developers.cloudflare.com/analytics/graphql-api/limits/",
+    )];
+    Ok(capability)
+}
+
+fn graphql_time_request_schema(dataset: &str, max_rows: u64, multi_zone: bool) -> Value {
+    let mut properties = serde_json::json!({
+        "dataset":{"type":"string","enum":[dataset]},
+        "start":{"type":"string","format":"date-time"},
+        "end":{"type":"string","format":"date-time"},
+        "limit":{"type":"integer","minimum":1,"maximum":max_rows},
+        "timeout_seconds":{"type":"integer","minimum":1,"maximum":30}
+    });
+    let mut required = vec!["dataset", "start", "end", "limit"];
+    if multi_zone {
+        if let Some(properties) = properties.as_object_mut() {
+            properties.insert(
+                "zone_ids".to_owned(),
+                serde_json::json!({"type":"array","minItems":1,"maxItems":10,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":32}}),
+            );
+        }
+        required.push("zone_ids");
+    }
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":required,
+        "properties":properties,
+        "x-cfctl-body-required":true
+    })
+}
+
+fn graphql_selector(name: &str, description: &str) -> SelectorV1 {
+    SelectorV1 {
+        name: name.to_owned(),
+        location: "graphql".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: Some(description.to_owned()),
+        contract: Some(SelectorContractV1 {
+            schema: serde_json::json!({"type":"string","minLength":1,"maxLength":32}),
+            query: None,
+        }),
+    }
+}
+
+fn target_selector(name: &str, description: &str) -> SelectorV1 {
+    let mut selector = graphql_selector(name, description);
+    "target".clone_into(&mut selector.location);
+    selector
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the ordered governed workflow inventory is intentionally reviewable as one table"
+)]
+fn telemetry_workflow_capabilities() -> Vec<CapabilityV1> {
+    vec![
+        workflow_capability(
+            "workflow.telemetry.bootstrap-worker-observability",
+            "Bootstrap observability for a Worker",
+            "Inspect settings, plan bounded logging and tracing changes, then verify telemetry freshness.",
+            &[
+                ("inspect", "worker-script-get-settings", false),
+                ("configure", "workers-observability-settings-update", true),
+                ("verify", "telemetry.query", false),
+            ],
+        ),
+        workflow_capability(
+            "workflow.telemetry.bootstrap-web-analytics-rum",
+            "Bootstrap Web Analytics and RUM for a site",
+            "Validate the host, create or inspect the site, configure RUM, and verify the resulting state.",
+            &[
+                ("validate", "web-analytics-validate-site-hostname", false),
+                ("site", "web-analytics-create-site", true),
+                ("rum", "web-analytics-toggle-rum", true),
+                ("verify", "web-analytics-get-rum-status", false),
+            ],
+        ),
+        workflow_capability(
+            "workflow.telemetry.privacy-bounded-pipeline",
+            "Create a privacy-bounded analytics pipeline",
+            "Discover fields, validate destination ownership, plan a minimized Logpush job, and verify job health.",
+            &[
+                (
+                    "fields",
+                    "get-zones-zone_id-logpush-datasets-dataset_id-fields",
+                    false,
+                ),
+                (
+                    "destination",
+                    "post-zones-zone_id-logpush-validate-destination",
+                    false,
+                ),
+                ("create", "post-zones-zone_id-logpush-jobs", true),
+                ("verify", "get-zones-zone_id-logpush-jobs-job_id", false),
+            ],
+        ),
+        workflow_capability(
+            "workflow.telemetry.worker-traces-logpush",
+            "Configure Workers traces plus Logpush",
+            "Plan observability sampling and a workers_trace_events destination as separately approved components.",
+            &[
+                ("settings", "workers-observability-settings-update", true),
+                (
+                    "destination",
+                    "post-accounts-account_id-logpush-validate-destination",
+                    false,
+                ),
+                ("logpush", "post-accounts-account_id-logpush-jobs", true),
+                ("verify", "telemetry.query", false),
+            ],
+        ),
+        workflow_capability(
+            "workflow.security.investigate-source",
+            "Investigate a suspicious source",
+            "Query bounded security events and normalize a source without identifying a person.",
+            &[("events", "graphql-analytics-zone-firewall-events", false)],
+        ),
+        workflow_capability(
+            "workflow.security.propose-expiring-managed-challenge",
+            "Turn security evidence into an expiring managed-challenge proposal",
+            "Bind a security-event receipt to a scoped, expiring proposal; applying the rule remains a separate approved plan.",
+            &[
+                ("events", "graphql-analytics-zone-firewall-events", false),
+                ("proposal", SECURITY_IP_RULE_CREATE_ID, true),
+            ],
+        ),
+        workflow_capability(
+            "workflow.telemetry.verify-freshness",
+            "Verify telemetry freshness after deployment",
+            "Inspect upstream dataset limits and query a bounded recent window.",
+            &[
+                ("limits", "graphql-analytics-zone-dataset-settings", false),
+                ("http", "graphql-analytics-zone-http-requests", false),
+                ("worker", "telemetry.query", false),
+            ],
+        ),
+        workflow_capability(
+            "workflow.telemetry.audit-account",
+            "Audit telemetry coverage across an account",
+            "Enumerate bounded HTTP analytics, Worker observability, Web Analytics, Logpush, and audit-log capabilities.",
+            &[
+                ("http", "graphql-analytics-account-http-requests", false),
+                ("workers", "telemetry.keys.list", false),
+                ("sites", "web-analytics-list-sites", false),
+                ("logpush", "get-accounts-account_id-logpush-jobs", false),
+            ],
+        ),
+        workflow_capability(
+            "workflow.telemetry.audit-governance",
+            "Audit telemetry retention, sampling, destinations, permissions, and entitlements",
+            "Return current dataset limits and configuration reads without turning unknown entitlement into success.",
+            &[
+                ("settings", "graphql-analytics-zone-dataset-settings", false),
+                ("worker", "worker-script-get-settings", false),
+                (
+                    "destinations",
+                    "get-accounts-account_id-logpush-jobs",
+                    false,
+                ),
+            ],
+        ),
+        workflow_capability(
+            "workflow.security.remove-expired-enforcement",
+            "Remove an expired enforcement action",
+            "Read the exact managed rule, then create a separate removal plan bound to its expiry receipt.",
+            &[("remove", SECURITY_IP_RULE_REMOVE_ID, true)],
+        ),
+        workflow_capability(
+            "workflow.telemetry.export-evidence-packet",
+            "Export an operator telemetry evidence packet",
+            "Collect content-addressed read, plan, apply, verify, rollback, and expiry receipts without embedding credentials.",
+            &[("inventory", "workflow.telemetry.audit-governance", false)],
+        ),
+    ]
+}
+
+fn workflow_capability(
+    id: &str,
+    title: &str,
+    purpose: &str,
+    steps: &[(&str, &str, bool)],
+) -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(id, title, "GET", &format!("/cfctl/workflows/{id}"));
+    capability.description = Some(purpose.to_owned());
+    "Telemetry workflows".clone_into(&mut capability.product);
+    "cfctl-native-workflow".clone_into(&mut capability.source);
+    "workflow".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![title.to_owned(), purpose.to_owned()];
+    capability.adapter_status = AdapterStatus::Native;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.workflow = Some(WorkflowContractV1 {
+        purpose: purpose.to_owned(),
+        steps: steps
+            .iter()
+            .enumerate()
+            .map(|(index, (step, capability_id, mutating))| WorkflowStepV1 {
+                id: (*step).to_owned(),
+                capability_id: (*capability_id).to_owned(),
+                purpose: format!("Run `{capability_id}` as workflow step `{step}`"),
+                mutating: *mutating,
+                depends_on: index
+                    .checked_sub(1)
+                    .map(|previous| vec![steps[previous].0.to_owned()])
+                    .unwrap_or_default(),
+            })
+            .collect(),
+        preserves_component_approval: true,
+        exports_evidence_packet: id.ends_with("export-evidence-packet"),
+    });
+    capability
+}
+
+fn official_reference(title: &str, url: &str) -> KnowledgeReferenceV1 {
+    KnowledgeReferenceV1 {
+        title: title.to_owned(),
+        url: url.to_owned(),
+        source: "official Cloudflare docs".to_owned(),
+    }
 }
 
 fn apply_post_normalization_contracts(
@@ -2639,11 +6755,13 @@ fn request_schema_contract(document: &Value, operation: &Value) -> Option<Value>
 fn success_response_contract(
     document: &Value,
     operation: &Value,
+    mutating: bool,
 ) -> Result<Option<ResponseContractV1>> {
     let responses = operation.get("responses").and_then(Value::as_object);
     let mut success_statuses = BTreeSet::new();
     let mut success_media_types = BTreeSet::new();
     let mut every_success_is_cloudflare_json = true;
+    let mut every_success_is_json = true;
     let mut every_success_is_empty = true;
     if let Some(responses) = responses {
         for (status, response) in responses {
@@ -2660,11 +6778,13 @@ fn success_response_contract(
             success_media_types.extend(media.iter().cloned());
             if media.is_empty() {
                 every_success_is_cloudflare_json = false;
+                every_success_is_json = false;
                 continue;
             }
             every_success_is_empty = false;
             if media.as_slice() != ["application/json"] {
                 every_success_is_cloudflare_json = false;
+                every_success_is_json = false;
                 continue;
             }
             let envelope_proven = response
@@ -2683,6 +6803,8 @@ fn success_response_contract(
             ResponseBodyModeV1::Unsupported
         } else if every_success_is_cloudflare_json {
             ResponseBodyModeV1::CloudflareJsonEnvelope
+        } else if every_success_is_json && !mutating {
+            ResponseBodyModeV1::JsonValue
         } else if every_success_is_empty {
             ResponseBodyModeV1::Empty
         } else {
@@ -9167,6 +13289,7 @@ fn intent_score(capability: &CapabilityV1, terms: &[Vec<String>]) -> usize {
         (capability.id.to_ascii_lowercase(), 6_usize),
         (capability.title.to_ascii_lowercase(), 8),
         (capability.product.to_ascii_lowercase(), 4),
+        (capability.aliases.join(" ").to_ascii_lowercase(), 7),
         (
             capability
                 .description
