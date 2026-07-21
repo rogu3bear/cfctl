@@ -11,10 +11,14 @@ cfctl docs changes --json
 cfctl agents doctor --json
 ```
 
-Require the PATH entry reported by both doctors to resolve to the running
-executable. A doctor never launches a different PATH executable to inspect it;
-invoke that binary directly with `cfctl version --json` if its self-reported
-identity is needed. Missing or different PATH executables and
+Require `build_identity_healthy: true` and the PATH entry reported by both
+doctors to resolve to the running executable. Checkout builds claim a commit
+only when tracked and untracked non-ignored files are clean; otherwise
+`cfctl version --json` reports `identity_source: unknown` and both doctors fail
+closed. Release builds may use the verified full-commit release override. A
+doctor never launches a different PATH executable to inspect it; invoke that
+binary directly with `cfctl version --json` if its self-reported identity is
+needed. Unknown source identity, missing or different PATH executables, and
 managed-instruction drift are unhealthy installation states.
 
 If a command reports `catalog content hash mismatch`, do not edit the stored

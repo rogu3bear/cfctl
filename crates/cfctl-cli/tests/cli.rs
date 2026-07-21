@@ -2,9 +2,27 @@
 
 use std::{fs, process::Command as ProcessCommand};
 
-use cfctl_cli::{Cli, Command, InvocationMode, KeysCommand, classify_invocation};
+use cfctl_cli::{
+    Cli, Command, InvocationMode, KeysCommand,
+    build_identity::{build_identity_is_healthy, current_build_info},
+    classify_invocation,
+};
 use cfctl_core::{GuideTopicV1, PUBLIC_V2_SUBCOMMANDS, render_guide_topic_markdown};
 use clap::{CommandFactory as _, Parser};
+
+fn health_envelope(output: &std::process::Output, context: &str) -> serde_json::Value {
+    let bytes = if output.status.success() {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    serde_json::from_slice(bytes).unwrap_or_else(|error| {
+        panic!(
+            "{context} did not emit a JSON health envelope: {error}: {}",
+            String::from_utf8_lossy(bytes)
+        )
+    })
+}
 
 #[test]
 fn every_public_command_group_is_parseable() {
@@ -829,17 +847,14 @@ fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
         .args(["doctor", "--json"])
         .output()
         .expect("run isolated doctor");
-    assert!(
-        doctor.status.success(),
-        "{}",
-        String::from_utf8_lossy(&doctor.stderr)
-    );
-    let doctor: serde_json::Value =
-        serde_json::from_slice(&doctor.stdout).expect("doctor JSON envelope");
+    let identity_healthy = build_identity_is_healthy(&current_build_info());
+    assert_eq!(doctor.status.success(), identity_healthy);
+    let doctor = health_envelope(&doctor, "doctor");
     assert_eq!(doctor["schema_version"], 2);
-    assert_eq!(doctor["ok"], true);
+    assert_eq!(doctor["ok"], identity_healthy);
     assert_eq!(doctor["performed"], false);
     assert_eq!(doctor["command"], "doctor");
+    assert_eq!(doctor["result"]["build_identity_healthy"], identity_healthy);
     assert_eq!(doctor["result"]["catalog"]["present"], false);
     assert_eq!(doctor["result"]["path_build"]["state"], "current");
     assert_eq!(
@@ -918,14 +933,14 @@ fn isolated_agents_doctor_accepts_the_exact_running_path_build() {
         .args(["agents", "doctor", "--json"])
         .output()
         .expect("run isolated agents doctor");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let envelope: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("agents doctor JSON envelope");
+    let identity_healthy = build_identity_is_healthy(&current_build_info());
+    assert_eq!(output.status.success(), identity_healthy);
+    let envelope = health_envelope(&output, "agents doctor");
     assert_eq!(envelope["command"], "agents doctor");
+    assert_eq!(
+        envelope["result"]["build_identity_healthy"],
+        identity_healthy
+    );
     assert_eq!(envelope["result"]["path_build"]["state"], "current");
     assert_eq!(envelope["result"]["instruction_drift"], 0);
 }
@@ -1014,13 +1029,9 @@ fn legacy_wrangler_profile_can_be_inspected_and_removed_without_revival() {
         .args(["doctor", "--json"])
         .output()
         .expect("diagnose legacy profile");
-    assert!(
-        doctor.status.success(),
-        "{}",
-        String::from_utf8_lossy(&doctor.stderr)
-    );
-    let doctor: serde_json::Value =
-        serde_json::from_slice(&doctor.stdout).expect("doctor envelope");
+    let identity_healthy = build_identity_is_healthy(&current_build_info());
+    assert_eq!(doctor.status.success(), identity_healthy);
+    let doctor = health_envelope(&doctor, "legacy profile doctor");
     assert_eq!(
         doctor["result"]["unsupported_legacy_profiles"][0]["profile"],
         "legacy"

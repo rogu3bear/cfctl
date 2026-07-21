@@ -54,7 +54,7 @@ use crate::{
     KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs,
     KeyPolicySelector, KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs,
     PlanSelector, PlansCommand, ProfileSelector, ResolveArgs, SearchArgs, WorkspaceCommand,
-    build_identity::{current_build_info, inspect_path_build},
+    build_identity::{build_identity_is_healthy, current_build_info, inspect_path_build},
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
 
@@ -13256,16 +13256,18 @@ fn agents_command(store: &StateStore, command: AgentsCommand) -> Result<ResultEn
                 .collect();
             let configured = configured_agent()?;
             let running_build = current_build_info();
+            let build_identity_healthy = build_identity_is_healthy(&running_build);
             let path_build = inspect_path_build(&running_build);
             let instruction_drift = status
                 .iter()
                 .filter(|agent| agent.skill_present && !agent.skill_current)
                 .count();
-            let healthy = path_build.healthy && instruction_drift == 0;
+            let healthy = build_identity_healthy && path_build.healthy && instruction_drift == 0;
             Ok(health_envelope(
                 "agents doctor",
                 json!({
                     "running_build": running_build,
+                    "build_identity_healthy": build_identity_healthy,
                     "path_build": path_build,
                     "configured_default_agent": configured,
                     "platform": env::consts::OS,
@@ -13275,7 +13277,7 @@ fn agents_command(store: &StateStore, command: AgentsCommand) -> Result<ResultEn
                 }),
                 healthy,
                 "CFCTL_AGENT_OR_BUILD_DRIFT",
-                "The PATH build or managed agent instructions are not current.",
+                "The source identity, PATH build, or managed agent instructions are not current.",
             ))
         }
     }
@@ -13478,16 +13480,18 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
         .map(|agent| inspect_agent(&home, agent, which::which(agent.program()).is_ok()))
         .collect();
     let running_build = current_build_info();
+    let build_identity_healthy = build_identity_is_healthy(&running_build);
     let path_build = inspect_path_build(&running_build);
     let instruction_drift = agents
         .iter()
         .filter(|agent| agent.skill_present && !agent.skill_current)
         .count();
-    let healthy = path_build.healthy && instruction_drift == 0;
+    let healthy = build_identity_healthy && path_build.healthy && instruction_drift == 0;
     Ok(health_envelope(
         "doctor",
         json!({
             "running_build": running_build,
+            "build_identity_healthy": build_identity_healthy,
             "path_build": path_build,
             "platform": env::consts::OS,
             "config_dir": store.paths().config_dir,
@@ -13507,7 +13511,7 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
         }),
         healthy,
         "CFCTL_RUNTIME_DRIFT",
-        "The PATH build or managed agent instructions are not current.",
+        "The source identity, PATH build, or managed agent instructions are not current.",
     ))
 }
 

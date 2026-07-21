@@ -33,6 +33,14 @@ flowchart TD
 | `cfctl-storage` | Platform paths, atomic plans, locks, content-addressed evidence, tamper-evident operational-proof rows, and bounded recent-proof projections |
 | `xtask` | Local verification, reproducible release assembly, publication |
 
+The binary exposes a timestamp-free `BuildInfoV1`. A checkout build embeds its
+full `HEAD` commit only when Git reports no tracked or untracked non-ignored
+changes; Cargo watches those repository inputs plus the Git index and `HEAD` so
+a later edit invalidates the embedded identity. A verified release build may
+instead inject the same full commit through the release environment. Any
+missing, malformed, or unknown source identity is reported as unhealthy by
+both doctor surfaces even when PATH resolves to the running executable.
+
 ## Adapter boundary
 
 Every capability is classified as `native`, `dynamic_api`, `delegated_cli`,

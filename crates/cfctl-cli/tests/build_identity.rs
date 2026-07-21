@@ -6,9 +6,13 @@ use std::{fs, path::Path, process::Command};
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 use cfctl_cli::{
-    build_identity::{PathBuildProbeV1, PathBuildStateV1, classify_path_build},
-    build_support::{ResolvedIdentitySource, resolve_build_identity},
+    build_identity::{
+        PathBuildProbeV1, PathBuildStateV1, build_identity_is_healthy, classify_path_build,
+        current_build_info,
+    },
+    build_support::{ResolvedIdentitySource, build_identity_rerun_paths, resolve_build_identity},
 };
+use cfctl_core::{BuildIdentitySourceV1, BuildInfoV1};
 const COMMIT_A: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// Builds a `git` invocation that cannot see the caller's git environment.
@@ -85,6 +89,66 @@ fn clean_checkout_fallback_binds_head_and_dirty_checkout_is_unknown() {
     let dirty = resolve_build_identity(None, repository.path()).expect("dirty checkout");
     assert!(dirty.git_commit.is_none());
     assert_eq!(dirty.identity_source, ResolvedIdentitySource::Unknown);
+
+    fs::write(repository.path().join("tracked"), "clean\n").expect("restore tracked file");
+    fs::write(repository.path().join("untracked"), "new compiler input\n")
+        .expect("write untracked file");
+    let untracked = resolve_build_identity(None, repository.path()).expect("untracked checkout");
+    assert!(untracked.git_commit.is_none());
+    assert_eq!(untracked.identity_source, ResolvedIdentitySource::Unknown);
+}
+
+#[test]
+fn checkout_build_watches_tracked_untracked_and_parent_paths() {
+    let repository = tempfile::tempdir().expect("repository");
+    git(repository.path(), &["init", "--quiet"]);
+    fs::create_dir_all(repository.path().join("crates/example/src")).expect("source directory");
+    let tracked = repository.path().join("crates/example/src/lib.rs");
+    fs::write(&tracked, "pub fn tracked() {}\n").expect("tracked source");
+    git(repository.path(), &["add", "."]);
+
+    let initial = build_identity_rerun_paths(repository.path());
+    assert!(initial.contains(&tracked));
+    assert!(initial.contains(&repository.path().join("crates/example/src")));
+    assert!(initial.contains(&repository.path().join("crates/example")));
+    assert!(initial.contains(&repository.path().join("crates")));
+    assert!(initial.contains(&repository.path().to_path_buf()));
+
+    let untracked = repository.path().join("crates/example/src/new.rs");
+    fs::write(&untracked, "pub fn untracked() {}\n").expect("untracked source");
+    let updated = build_identity_rerun_paths(repository.path());
+    assert!(updated.contains(&untracked));
+}
+
+#[test]
+fn build_identity_health_requires_a_trusted_source_and_full_commit() {
+    let build = |identity_source, git_commit: Option<&str>| BuildInfoV1 {
+        schema_version: 1,
+        version: "test".to_owned(),
+        git_commit: git_commit.map(str::to_owned),
+        identity_source,
+    };
+
+    assert!(build_identity_is_healthy(&build(
+        BuildIdentitySourceV1::GitCheckout,
+        Some(COMMIT_A),
+    )));
+    assert!(build_identity_is_healthy(&build(
+        BuildIdentitySourceV1::ReleaseEnv,
+        Some(COMMIT_A),
+    )));
+    assert!(!build_identity_is_healthy(&build(
+        BuildIdentitySourceV1::Unknown,
+        Some(COMMIT_A),
+    )));
+    assert!(!build_identity_is_healthy(&build(
+        BuildIdentitySourceV1::GitCheckout,
+        None,
+    )));
+    assert!(!build_identity_is_healthy(&build(
+        BuildIdentitySourceV1::GitCheckout,
+        Some("short"),
+    )));
 }
 
 #[test]
@@ -170,16 +234,21 @@ fn doctor_accepts_a_path_symlink_to_the_running_cfctl() {
         .args(["doctor", "--json"])
         .output()
         .expect("run doctor through same-file PATH");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let envelope: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("doctor JSON envelope");
+    let identity_healthy = build_identity_is_healthy(&current_build_info());
+    assert_eq!(output.status.success(), identity_healthy);
+    let bytes = if output.status.success() {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    let envelope: serde_json::Value = serde_json::from_slice(bytes).expect("doctor JSON envelope");
 
     assert_eq!(envelope["result"]["path_build"]["state"], "current");
     assert_eq!(envelope["result"]["path_build"]["healthy"], true);
+    assert_eq!(
+        envelope["result"]["build_identity_healthy"],
+        identity_healthy
+    );
 }
 
 /// Pins the sanitization itself, because its absence is silent: the suite still
