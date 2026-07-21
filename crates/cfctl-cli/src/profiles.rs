@@ -83,3 +83,56 @@ pub fn ensure_supported_profile(profile: &ProfileMetadata) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use cfctl_storage::RuntimePaths;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn loading_pre_generation_metadata_remains_unbound_until_reauthentication() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store opens");
+        store
+            .write_json(
+                &store.paths().profiles_file(),
+                &json!({
+                    "schema_version": 1,
+                    "current_profile": "default",
+                    "profiles": {
+                        "default": {
+                            "schema_version": 1,
+                            "id": "default",
+                            "kind": "api_token",
+                            "account_id": "account-a",
+                            "oauth_client_id": null,
+                            "oauth_scopes": [],
+                            "oauth_scope_inventory_hash": null,
+                            "emergency_only": false
+                        }
+                    },
+                    "pending_logins": {}
+                }),
+            )
+            .expect("old metadata writes");
+
+        let loaded = ProfilesConfig::load(&store).expect("old metadata loads");
+        assert!(
+            loaded.profiles["default"]
+                .credential_generation_id
+                .is_none()
+        );
+        let persisted: serde_json::Value = store
+            .read_json(&store.paths().profiles_file())
+            .expect("metadata reloads");
+        assert!(
+            persisted["profiles"]["default"]
+                .get("credential_generation_id")
+                .is_none()
+        );
+    }
+}

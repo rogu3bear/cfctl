@@ -43,6 +43,7 @@ use futures_util::{StreamExt, stream};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio::process::Command as ProcessCommand;
+use uuid::Uuid;
 
 pub(crate) use crate::telemetry_product::{
     OPERATIONAL_PROOF_PROJECTION_LIMIT, execute_native_workflow, operational_proof_coverage,
@@ -736,8 +737,6 @@ async fn complete_oauth_login(
         .ok_or_else(|| CliError::Input("pending PKCE verifier is missing".to_owned()))?;
     let tokens =
         exchange_authorization_code(&http_client()?, &pending.client, &code, &verifier).await?;
-    secrets.store_oauth_tokens(&arguments.profile, &tokens)?;
-    secrets.delete(&verifier_key)?;
     let mut profile = ProfileMetadata::new(
         &arguments.profile,
         ProfileKind::OAuth,
@@ -746,10 +745,13 @@ async fn complete_oauth_login(
     profile.oauth_client_id = Some(pending.client.client_id);
     profile.oauth_scopes = tokens.scopes().into_iter().map(str::to_owned).collect();
     profile.oauth_scope_inventory_hash = oauth_scope_inventory_hash(store)?;
+    mark_credential_install_pending(store, profiles, &profile, true)?;
+    secrets.store_oauth_tokens(&arguments.profile, &tokens)?;
     profiles.profiles.insert(arguments.profile.clone(), profile);
     profiles.current_profile = Some(arguments.profile.clone());
     profiles.pending_logins.remove(&arguments.profile);
     profiles.save(store)?;
+    secrets.delete(&verifier_key)?;
     Ok(ResultEnvelopeV2::success(
         "auth login",
         json!({
@@ -890,10 +892,11 @@ fn store_imported_api_token(
             "the supplied API token must be a single value without whitespace".to_owned(),
         ));
     }
+    let profile = ProfileMetadata::new(profile_id, ProfileKind::ApiToken, Some(account));
+    mark_credential_install_pending(store, profiles, &profile, true)?;
     secrets.store_api_token(profile_id, token)?;
     let (secret_backend, storage_note) =
         describe_secret_backend(secrets.locate_api_token(profile_id)?);
-    let profile = ProfileMetadata::new(profile_id, ProfileKind::ApiToken, Some(account));
     profiles.profiles.insert(profile_id.to_owned(), profile);
     profiles.current_profile = Some(profile_id.to_owned());
     profiles.save(store)?;
@@ -925,10 +928,11 @@ fn import_global_key(
             "the supplied global key was empty".to_owned(),
         ));
     }
+    let profile = ProfileMetadata::new(&arguments.profile, ProfileKind::GlobalKey, None);
+    mark_credential_install_pending(store, profiles, &profile, false)?;
     secrets.store_global_key(&arguments.profile, &arguments.email, &key)?;
     let (secret_backend, storage_note) =
         describe_secret_backend(secrets.locate_global_key(&arguments.profile)?);
-    let profile = ProfileMetadata::new(&arguments.profile, ProfileKind::GlobalKey, None);
     profiles.profiles.insert(arguments.profile.clone(), profile);
     profiles.save(store)?;
     Ok(ResultEnvelopeV2::success(
@@ -941,6 +945,23 @@ fn import_global_key(
             "message": format!("Emergency global key stored {storage_note}. It was not selected.")
         }),
     ))
+}
+
+fn mark_credential_install_pending(
+    store: &StateStore,
+    profiles: &mut ProfilesConfig,
+    complete_profile: &ProfileMetadata,
+    select: bool,
+) -> Result<()> {
+    let mut pending_profile = complete_profile.clone();
+    pending_profile.credential_generation_id = None;
+    profiles
+        .profiles
+        .insert(pending_profile.id.clone(), pending_profile);
+    if select {
+        profiles.current_profile = Some(complete_profile.id.clone());
+    }
+    profiles.save(store)
 }
 
 async fn catalog_command(store: &StateStore, command: CatalogCommand) -> Result<ResultEnvelopeV2> {
@@ -1179,7 +1200,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
             .as_deref()
             .map(read_r2_log_retrieval_credentials)
             .transpose()?;
-        let mut envelope = execute_read(
+        let executed = execute_read(
             store,
             &catalog,
             &capability,
@@ -1190,8 +1211,15 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
             r2_credentials.as_ref(),
         )
         .await?;
-        let proof_result =
-            record_operational_proof(store, &catalog, &capability, &prepared.input, &envelope);
+        let mut envelope = executed.envelope;
+        let proof_result = record_operational_proof(
+            store,
+            &catalog,
+            &capability,
+            &prepared.input,
+            executed.credential_generation_id.as_deref(),
+            &envelope,
+        );
         apply_operational_proof_index_result(&mut envelope, proof_result);
         return Ok(envelope);
     }
@@ -3810,9 +3838,25 @@ fn validate_warp_connector_vip_addresses(
     Ok(())
 }
 
+#[derive(Debug)]
+struct ExecutedRead {
+    envelope: ResultEnvelopeV2,
+    credential_generation_id: Option<String>,
+}
+
+impl ExecutedRead {
+    fn without_credential(envelope: ResultEnvelopeV2) -> Self {
+        Self {
+            envelope,
+            credential_generation_id: None,
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
-    reason = "read execution receives explicit catalog, selector, credential, private retrieval, and file-output inputs so no authority or destination is hidden in ambient state"
+    clippy::too_many_lines,
+    reason = "read execution receives explicit catalog, selector, credential generation, private retrieval, and file-output inputs so no authority or destination is hidden in ambient state"
 )]
 async fn execute_read(
     store: &StateStore,
@@ -3823,9 +3867,11 @@ async fn execute_read(
     requested_account: Option<&str>,
     output_path: Option<&Path>,
     r2_credentials: Option<&R2LogRetrievalCredentials>,
-) -> Result<ResultEnvelopeV2> {
+) -> Result<ExecutedRead> {
     if capability.workflow.is_some() {
-        return execute_native_workflow(store, catalog, capability);
+        return Ok(ExecutedRead::without_credential(execute_native_workflow(
+            store, catalog, capability,
+        )?));
     }
     match capability.adapter_status {
         AdapterStatus::DelegatedCli => {
@@ -3840,29 +3886,32 @@ async fn execute_read(
             .await;
         }
         AdapterStatus::GovernedUi => {
-            return execute_governed_ui_read(
+            return Ok(ExecutedRead::without_credential(execute_governed_ui_read(
                 store,
                 catalog,
                 capability,
                 input,
                 requested_profile,
                 requested_account,
-            );
+            )?));
         }
         AdapterStatus::Blocked => {
-            return Ok(blocked_capability_envelope(
-                "call",
-                capability,
-                capability
-                    .blocked_reason
-                    .as_deref()
-                    .unwrap_or("no executable adapter is available"),
+            return Ok(ExecutedRead::without_credential(
+                blocked_capability_envelope(
+                    "call",
+                    capability,
+                    capability
+                        .blocked_reason
+                        .as_deref()
+                        .unwrap_or("no executable adapter is available"),
+                ),
             ));
         }
         AdapterStatus::Native | AdapterStatus::DynamicApi => {}
     }
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
+    let credential_generation_id = credential_generation_for_read(profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
@@ -3921,7 +3970,10 @@ async fn execute_read(
             next_step: Some(next_step),
         });
     }
-    Ok(envelope)
+    Ok(ExecutedRead {
+        envelope,
+        credential_generation_id: Some(credential_generation_id),
+    })
 }
 
 async fn execute_delegated_read(
@@ -3931,21 +3983,41 @@ async fn execute_delegated_read(
     input: &CallInput,
     requested_profile: Option<&str>,
     requested_account: Option<&str>,
-) -> Result<ResultEnvelopeV2> {
+) -> Result<ExecutedRead> {
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
+    let credential_generation_id = credential_generation_for_read(profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let receipt = run_delegated_cli(capability, input, &credential).await?;
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
-    Ok(delegated_read_envelope(
-        &catalog.schema_hash,
-        &capability.id,
-        &profile.id,
-        account_id,
-        receipt,
-        evidence,
-    ))
+    Ok(ExecutedRead {
+        envelope: delegated_read_envelope(
+            &catalog.schema_hash,
+            &capability.id,
+            &profile.id,
+            account_id,
+            receipt,
+            evidence,
+        ),
+        credential_generation_id: Some(credential_generation_id),
+    })
+}
+
+fn credential_generation_for_read(profile: &ProfileMetadata) -> Result<String> {
+    let generation = profile.credential_generation_id.as_deref().ok_or_else(|| {
+        CliError::Input(format!(
+            "profile `{}` has no credential generation; re-import or log in again",
+            profile.id
+        ))
+    })?;
+    Uuid::parse_str(generation).map_err(|_| {
+        CliError::Input(format!(
+            "profile `{}` has an invalid credential generation; re-import or log in again",
+            profile.id
+        ))
+    })?;
+    Ok(generation.to_owned())
 }
 
 fn delegated_read_envelope(
@@ -13095,6 +13167,7 @@ fn workspace_command(store: &StateStore, command: WorkspaceCommand) -> Result<Re
             let proof_page =
                 store.list_recent_operational_proofs(OPERATIONAL_PROOF_PROJECTION_LIMIT)?;
             let proofs = &proof_page.proofs;
+            let profiles = ProfilesConfig::load(store)?;
             let current_catalog_hash = store
                 .paths()
                 .catalog_file()
@@ -13126,6 +13199,7 @@ fn workspace_command(store: &StateStore, command: WorkspaceCommand) -> Result<Re
                     "account_id": account_id,
                     "operational_proof": workspace_operational_proof_posture(
                         proofs,
+                        &profiles,
                         account_id,
                         current_catalog_hash.as_deref(),
                     ),
@@ -13146,6 +13220,7 @@ fn workspace_command(store: &StateStore, command: WorkspaceCommand) -> Result<Re
 
 fn workspace_operational_proof_posture(
     proofs: &[OperationalProofV1],
+    profiles: &ProfilesConfig,
     account_id: Option<&str>,
     current_catalog_hash: Option<&str>,
 ) -> Value {
@@ -13169,6 +13244,13 @@ fn workspace_operational_proof_posture(
             .iter()
             .filter(|proof| {
                 proof.catalog_hash == catalog_hash
+                    && proof
+                        .profile_id
+                        .as_deref()
+                        .and_then(|profile_id| profiles.profiles.get(profile_id))
+                        .and_then(|profile| profile.credential_generation_id.as_deref())
+                        == proof.credential_generation_id.as_deref()
+                    && proof.credential_generation_id.is_some()
                     && proof.outcome == OperationalProofOutcomeV1::Succeeded
             })
             .count()
@@ -13178,6 +13260,13 @@ fn workspace_operational_proof_posture(
             .iter()
             .filter(|proof| {
                 proof.catalog_hash == catalog_hash
+                    && proof
+                        .profile_id
+                        .as_deref()
+                        .and_then(|profile_id| profiles.profiles.get(profile_id))
+                        .and_then(|profile| profile.credential_generation_id.as_deref())
+                        == proof.credential_generation_id.as_deref()
+                    && proof.credential_generation_id.is_some()
                     && proof.outcome == OperationalProofOutcomeV1::Failed
             })
             .count()
@@ -13192,6 +13281,13 @@ fn workspace_operational_proof_posture(
         "current_catalog_successes": current_catalog_successes,
         "current_catalog_failures": current_catalog_failures,
         "catalog_drifted_or_unclassified": scoped.len().saturating_sub(current_catalog_successes + current_catalog_failures),
+        "credential_unbound_or_drifted": scoped.iter().filter(|proof| {
+            proof.credential_generation_id.is_none()
+                || proof.profile_id.as_deref()
+                    .and_then(|profile_id| profiles.profiles.get(profile_id))
+                    .and_then(|profile| profile.credential_generation_id.as_deref())
+                    != proof.credential_generation_id.as_deref()
+        }).count(),
         "freshness_policy": "Select a governed workflow to evaluate time freshness; workspace audit does not invent a universal window."
     })
 }
@@ -15902,12 +15998,13 @@ mod tests {
         apply_zone_entitlement_response, approve_plan, bind_required_empty_compensation_body,
         blocked_capability_envelope, boundary_response_artifact, build_mint_policy_body,
         call_command, cancel_plan, capability_call_argv, compensation_request,
-        delegated_read_envelope, entitlement_probe_selectors, execute_native_workflow,
-        execute_read, find_secret_value, force_ipv4_from, guide_document, guide_stage_commands,
-        http_client, is_live_plan_precondition_hash, is_secret_output_capability,
-        key_policy_approve, key_policy_list, key_policy_revoke, list_security_action_state_receipt,
-        non_readback_verification_basis, operational_proof_coverage, permission_inventory_call,
-        permission_inventory_envelope, persist_prepared_plan, persist_secret_lifecycle,
+        credential_generation_for_read, delegated_read_envelope, entitlement_probe_selectors,
+        execute_native_workflow, execute_read, find_secret_value, force_ipv4_from, guide_document,
+        guide_stage_commands, http_client, is_live_plan_precondition_hash,
+        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
+        list_security_action_state_receipt, non_readback_verification_basis,
+        operational_proof_coverage, permission_inventory_call, permission_inventory_envelope,
+        persist_prepared_plan, persist_secret_lifecycle,
         persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
         preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
@@ -17178,6 +17275,7 @@ mod tests {
     }
 
     struct DeleteFailingSecretStore;
+    struct PutFailingSecretStore;
 
     #[test]
     fn d1_state_hash_is_validated_by_the_live_precondition_lane() {
@@ -20725,6 +20823,24 @@ mod tests {
         }
     }
 
+    impl SecretStore for PutFailingSecretStore {
+        fn put(&self, _key: &str, _value: &str) -> cfctl_auth::Result<()> {
+            Err(AuthError::SecretStore("injected put failure".to_owned()))
+        }
+
+        fn get(&self, _key: &str) -> cfctl_auth::Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn delete(&self, _key: &str) -> cfctl_auth::Result<()> {
+            Ok(())
+        }
+
+        fn locate(&self, _key: &str) -> cfctl_auth::Result<Option<cfctl_auth::SecretBackend>> {
+            Ok(None)
+        }
+    }
+
     #[test]
     fn selected_permission_groups_must_match_unique_live_inventory_entries() {
         let inventory = json!([
@@ -21822,12 +21938,33 @@ mod tests {
         assert_eq!(profile.kind, ProfileKind::ApiToken);
         assert_eq!(profile.account_id.as_deref(), Some("account-a"));
         assert!(!profile.emergency_only);
+        let initial_generation = profile
+            .credential_generation_id
+            .clone()
+            .expect("import assigns a credential generation");
         assert_eq!(
             secrets
                 .load_credential("default", ProfileKind::ApiToken)
                 .expect("credential")
                 .bearer_token(),
             Some(token)
+        );
+
+        store_imported_api_token(
+            &store,
+            &mut profiles,
+            &secrets,
+            "default",
+            "account-a",
+            "cfat_replacement_token",
+        )
+        .expect("replacement import");
+        assert_ne!(
+            profiles.profiles["default"]
+                .credential_generation_id
+                .as_deref(),
+            Some(initial_generation.as_str()),
+            "credential replacement must not inherit prior proof scope"
         );
 
         let empty = store_imported_api_token(
@@ -21851,6 +21988,61 @@ mod tests {
         )
         .expect_err("empty account rejected");
         assert!(unpinned.to_string().contains("--account"));
+    }
+
+    #[test]
+    fn failed_credential_install_leaves_profile_unbound_instead_of_reusing_old_proof_scope() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut profiles = ProfilesConfig::default();
+        let old_profile = ProfileMetadata::new("default", ProfileKind::ApiToken, Some("account-a"));
+        let old_generation = old_profile
+            .credential_generation_id
+            .clone()
+            .expect("old profile generation");
+        profiles.profiles.insert("default".to_owned(), old_profile);
+        profiles.current_profile = Some("default".to_owned());
+        profiles.save(&store).expect("old profile persists");
+
+        let error = store_imported_api_token(
+            &store,
+            &mut profiles,
+            &PutFailingSecretStore,
+            "default",
+            "account-a",
+            "cfat_replacement_token",
+        )
+        .expect_err("injected credential-store failure");
+        assert!(error.to_string().contains("injected put failure"));
+
+        let persisted = ProfilesConfig::load(&store).expect("pending profile reloads");
+        assert_eq!(persisted.current_profile.as_deref(), Some("default"));
+        assert!(
+            persisted.profiles["default"]
+                .credential_generation_id
+                .is_none(),
+            "a partial replacement must fail closed instead of preserving {old_generation}"
+        );
+    }
+
+    #[test]
+    fn proof_bearing_reads_reject_missing_or_malformed_credential_generations() {
+        let mut profile = ProfileMetadata::new("default", ProfileKind::ApiToken, Some("account-a"));
+        profile.credential_generation_id = None;
+        assert!(
+            credential_generation_for_read(&profile)
+                .expect_err("missing generation")
+                .to_string()
+                .contains("has no credential generation")
+        );
+
+        profile.credential_generation_id = Some("not-a-uuid".to_owned());
+        assert!(
+            credential_generation_for_read(&profile)
+                .expect_err("malformed generation")
+                .to_string()
+                .contains("invalid credential generation")
+        );
     }
 
     #[test]
@@ -24949,19 +25141,48 @@ mod tests {
             .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
             .expect("live evidence");
         let input_hash = format!("sha256:{}", "a".repeat(64));
-        for profile_id in ["default", "secondary"] {
+        let mut profiles = ProfilesConfig::default();
+        for (profile_id, generation_id) in [
+            ("default", "11111111-1111-4111-8111-111111111111"),
+            ("secondary", "22222222-2222-4222-8222-222222222222"),
+        ] {
+            let mut profile =
+                ProfileMetadata::new(profile_id, ProfileKind::ApiToken, Some("account-a"));
+            profile.credential_generation_id = Some(generation_id.to_owned());
+            profiles.profiles.insert(profile_id.to_owned(), profile);
             store
                 .record_operational_proof(&OperationalProofV1::new(
                     Utc::now(),
                     "graphql-analytics-zone-http-requests",
                     &catalog.schema_hash,
                     &input_hash,
-                    OperationalProofScopeV1::new(Some(profile_id), Some("account-a")),
+                    OperationalProofScopeV1::new(
+                        Some(profile_id),
+                        Some("account-a"),
+                        Some(generation_id),
+                    ),
                     OperationalProofOutcomeV1::Succeeded,
                     evidence.clone(),
                 ))
                 .expect("proof indexes");
         }
+        store
+            .record_operational_proof(&OperationalProofV1::new(
+                Utc::now(),
+                "graphql-analytics-zone-http-requests",
+                &catalog.schema_hash,
+                &input_hash,
+                OperationalProofScopeV1::new(
+                    Some("default"),
+                    Some("account-a"),
+                    Some("33333333-3333-4333-8333-333333333333"),
+                ),
+                OperationalProofOutcomeV1::Failed,
+                evidence.clone(),
+            ))
+            .expect("prior credential generation remains separately indexed");
+        profiles.current_profile = Some("default".to_owned());
+        profiles.save(&store).expect("profiles persist");
         let mut mutation = resolver_mutation_capability();
         mutation.id = "security-response-create-expiring-ip-access-rule".to_owned();
         let plan = PlanV1::draft(
@@ -24987,19 +25208,31 @@ mod tests {
             envelope.result["steps"][0]["proof"]["observations"]
                 .as_array()
                 .map(Vec::len),
-            Some(2),
-            "identical account/input observations from separate profiles remain distinct"
+            Some(3),
+            "profile and credential generations remain distinct"
+        );
+        let workflow_states = envelope.result["steps"][0]["proof"]["observations"]
+            .as_array()
+            .expect("workflow observations")
+            .iter()
+            .filter_map(|observation| observation["state"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            workflow_states,
+            std::collections::BTreeSet::from(["credential_drifted", "fresh"])
         );
         assert_eq!(envelope.evidence[0].class, EvidenceClass::AgentAction);
 
         let coverage = operational_proof_coverage(&store, &catalog).expect("proof coverage");
         assert_eq!(coverage["current_catalog_successes"], 2);
         assert_eq!(coverage["current_catalog_failures"], 0);
+        assert_eq!(coverage["credential_drifted_observations"], 1);
+        assert_eq!(coverage["credential_unbound_observations"], 0);
         assert_eq!(
             coverage["latest_scoped_observations"]
                 .as_array()
                 .map(Vec::len),
-            Some(2)
+            Some(3)
         );
         assert_eq!(
             coverage["mutation_lifecycle"]["observations"][0]["capability_id"],
@@ -25024,7 +25257,7 @@ mod tests {
             packet.result["evidence_packet"]["read_receipts"]
                 .as_array()
                 .map(Vec::len),
-            Some(2)
+            Some(3)
         );
         assert_eq!(
             packet.result["evidence_packet"]["mutation_lifecycle_receipts"][0]["operation_id"],
@@ -25197,7 +25430,11 @@ mod tests {
                 "telemetry.query",
                 "sha256:current",
                 "sha256:input-a",
-                OperationalProofScopeV1::new(Some("default"), Some("account-a")),
+                OperationalProofScopeV1::new(
+                    Some("default"),
+                    Some("account-a"),
+                    Some("11111111-1111-4111-8111-111111111111"),
+                ),
                 OperationalProofOutcomeV1::Succeeded,
                 evidence.clone(),
             ),
@@ -25206,16 +25443,29 @@ mod tests {
                 "telemetry.query",
                 "sha256:old",
                 "sha256:input-b",
-                OperationalProofScopeV1::new(Some("other"), Some("account-b")),
+                OperationalProofScopeV1::new(
+                    Some("other"),
+                    Some("account-b"),
+                    Some("22222222-2222-4222-8222-222222222222"),
+                ),
                 OperationalProofOutcomeV1::Succeeded,
                 evidence,
             ),
         ];
 
-        let unscoped = workspace_operational_proof_posture(&proofs, None, None);
+        let mut profiles = ProfilesConfig::default();
+        let mut profile = ProfileMetadata::new("default", ProfileKind::ApiToken, Some("account-a"));
+        profile.credential_generation_id = Some("11111111-1111-4111-8111-111111111111".to_owned());
+        profiles.profiles.insert("default".to_owned(), profile);
+
+        let unscoped = workspace_operational_proof_posture(&proofs, &profiles, None, None);
         assert_eq!(unscoped["state"], "unscoped");
-        let account =
-            workspace_operational_proof_posture(&proofs, Some("account-a"), Some("sha256:current"));
+        let account = workspace_operational_proof_posture(
+            &proofs,
+            &profiles,
+            Some("account-a"),
+            Some("sha256:current"),
+        );
         assert_eq!(account["proof_count"], 1);
         assert_eq!(account["current_catalog_successes"], 1);
         assert_eq!(account["catalog_drifted_or_unclassified"], 0);

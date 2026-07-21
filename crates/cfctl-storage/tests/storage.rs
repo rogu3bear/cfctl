@@ -8,10 +8,13 @@ use cfctl_core::{
 use cfctl_storage::{RuntimePaths, StateStore, StorageError};
 use chrono::{Duration, Utc};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 
 fn sha256(byte: char) -> String {
     format!("sha256:{}", byte.to_string().repeat(64))
 }
+
+const GENERATION_A: &str = "11111111-1111-4111-8111-111111111111";
 
 fn only_proof_index_path(paths: &RuntimePaths) -> std::path::PathBuf {
     let mut entries = std::fs::read_dir(paths.data_dir.join("evidence-index"))
@@ -95,7 +98,7 @@ fn operational_proof_index_is_append_only_scoped_and_live_read_only() {
         "zones-list",
         &sha256('a'),
         &sha256('b'),
-        OperationalProofScopeV1::new(Some("default"), Some("account-a")),
+        OperationalProofScopeV1::new(Some("default"), Some("account-a"), Some(GENERATION_A)),
         OperationalProofOutcomeV1::Succeeded,
         evidence,
     );
@@ -124,7 +127,7 @@ fn operational_proof_index_is_append_only_scoped_and_live_read_only() {
         "zones-list",
         &sha256('a'),
         &sha256('b'),
-        OperationalProofScopeV1::new(None, None),
+        OperationalProofScopeV1::new(None, None, None),
         OperationalProofOutcomeV1::Succeeded,
         local_evidence,
     );
@@ -147,7 +150,7 @@ fn operational_proof_index_rejects_tampered_stored_bytes() {
         "zones-list",
         &sha256('a'),
         &sha256('b'),
-        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a")),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
         OperationalProofOutcomeV1::Succeeded,
         evidence,
     );
@@ -187,7 +190,7 @@ fn operational_proof_requires_exact_hashes_and_nonempty_scope() {
         "zones-list",
         "sha256:catalog",
         &sha256('b'),
-        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a")),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
         OperationalProofOutcomeV1::Succeeded,
         evidence.clone(),
     );
@@ -200,13 +203,67 @@ fn operational_proof_requires_exact_hashes_and_nonempty_scope() {
         "zones-list",
         &sha256('a'),
         &sha256('b'),
-        OperationalProofScopeV1::new(Some("  "), Some("account-a")),
+        OperationalProofScopeV1::new(Some("  "), Some("account-a"), Some(GENERATION_A)),
         OperationalProofOutcomeV1::Succeeded,
-        evidence,
+        evidence.clone(),
     );
     assert!(matches!(
         store.record_operational_proof(&empty_scope),
         Err(StorageError::InvalidOperationalProof(_))
+    ));
+
+    let unbound = OperationalProofV1::new(
+        Utc::now(),
+        "zones-list",
+        &sha256('a'),
+        &sha256('b'),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), None),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+    assert!(matches!(
+        store.record_operational_proof(&unbound),
+        Err(StorageError::InvalidOperationalProof(message))
+            if message.contains("credential-generation")
+    ));
+}
+
+#[test]
+fn legacy_unbound_operational_proof_remains_readable_but_cannot_be_rewritten() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("storage opens");
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
+        .expect("evidence writes");
+    let legacy = OperationalProofV1::new(
+        Utc::now(),
+        "zones-list",
+        &sha256('a'),
+        &sha256('b'),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), None),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+    let encoded = serde_json::to_vec_pretty(&legacy).expect("legacy row encodes");
+    let digest = hex::encode(Sha256::digest(&encoded));
+    std::fs::write(
+        paths
+            .data_dir
+            .join("evidence-index")
+            .join(format!("{digest}.json")),
+        encoded,
+    )
+    .expect("legacy index row writes");
+
+    assert_eq!(
+        store.list_operational_proofs().expect("legacy row reads"),
+        vec![legacy.clone()]
+    );
+    assert!(matches!(
+        store.record_operational_proof(&legacy),
+        Err(StorageError::InvalidOperationalProof(message))
+            if message.contains("credential-generation")
     ));
 }
 
@@ -224,7 +281,7 @@ fn operational_proof_join_rejects_missing_or_modified_evidence() {
             "zones-list",
             &sha256('a'),
             &sha256('b'),
-            OperationalProofScopeV1::new(Some("profile-a"), Some("account-a")),
+            OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
             OperationalProofOutcomeV1::Succeeded,
             evidence,
         );
@@ -256,7 +313,7 @@ fn operational_proof_join_rejects_symlinked_evidence() {
         "zones-list",
         &sha256('a'),
         &sha256('b'),
-        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a")),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
         OperationalProofOutcomeV1::Succeeded,
         evidence,
     );
@@ -288,7 +345,11 @@ fn recent_operational_proof_projection_is_bounded_and_reports_truncation() {
                 "zones-list",
                 &sha256('a'),
                 &sha256(input_byte),
-                OperationalProofScopeV1::new(Some("profile-a"), Some("account-a")),
+                OperationalProofScopeV1::new(
+                    Some("profile-a"),
+                    Some("account-a"),
+                    Some(GENERATION_A),
+                ),
                 OperationalProofOutcomeV1::Succeeded,
                 evidence.clone(),
             ))
