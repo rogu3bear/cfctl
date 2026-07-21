@@ -18,6 +18,9 @@ For every request:
 3. Inspect the selected operation with
    `cfctl catalog show <capability-id> --json`.
 4. For unfamiliar or mutating work, run `cfctl guide <capability-id> --json`.
+   For telemetry investigations and audits, prefer the ranked native workflow.
+   Its `call` is a local component/proof preview, not component execution or
+   mutation authority; run bounded reads individually.
 5. Register and inspect relevant repository roots with `cfctl workspace ...`.
    Nested fixture basenames are skipped; fixture directories are opt-in roots
    and must be registered directly when intentional.

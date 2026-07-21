@@ -221,6 +221,7 @@ cannot keep true.
 
 ```bash
 cfctl catalog coverage --json          # what is executable, and what is not
+cfctl call workflow.telemetry.audit-account --json # bounded proof preview; blocked/gapped steps have no runnable call
 cfctl catalog show <capability-id>     # exactly which fields are missing
 ```
 

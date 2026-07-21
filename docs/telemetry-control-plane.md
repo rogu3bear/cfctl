@@ -21,7 +21,7 @@ operation, with protocol-specific adapters where REST is not an honest model.
 | Permissions and entitlement | Exact token permission metadata and live-safe product probes; a denied probe never pretends to distinguish permission from plan entitlement |
 | Mutations | Immutable plan, current-state and entitlement preconditions, risk/effect/cost, approval, apply, exact verification, and separate compensation/removal plan |
 | Security response | Evidence, actor, reason, normalized scope, expiry, conflict/self-block guards, Managed Challenge default, verification, and auditable removal |
-| Evidence | Content-addressed live-read, plan, apply, verification, rollback, and expiry receipts with secrets and sensitive response fields redacted |
+| Evidence | Content-addressed live-read identities and the mutation lifecycle checkpoints that durably exist across plan, approval, apply, verification, compensation, and closure; secrets, plan payloads, and sensitive response fields stay omitted or redacted |
 
 Arbitrary HTTP, GraphQL documents, SQL, headers, dashboard actions, and Wrangler
 commands are not public escape hatches. A source operation remains blocked when
@@ -161,8 +161,15 @@ under short TTLs. Unknown state cannot satisfy a precondition.
 
 ## Composable workflows
 
-Workflows are discovery and sequencing recipes. Each mutating component still
-creates its own plan and consumes its own approval.
+Workflows are workflow-first operator previews. Calling one expands its
+component graph, required selectors and bodies, approval boundaries, and any
+locally indexed proof observations. It emits an exact governed component
+command only when that component is currently available and contract-ready;
+blocked, incomplete, missing, or cyclic components expose a guide command and
+blocking gaps but no runnable `call_argv`. A workflow does not execute the
+components or aggregate their authority. Each bounded read is run explicitly,
+and each mutating component still creates its own plan and consumes its own
+approval.
 
 - `workflow.telemetry.bootstrap-worker-observability`
 - `workflow.telemetry.bootstrap-web-analytics-rum`
@@ -177,9 +184,21 @@ creates its own plan and consumes its own approval.
 - `workflow.telemetry.export-evidence-packet`
 
 `cfctl resolve "telemetry overview" --json` returns the four telemetry domains,
-ranked read capabilities, workflows, and separately labeled mutation
-candidates. It emits no mutation command until the operator names and guides a
-specific capability.
+workflow-first ranked capabilities, bounded reads, contract-ready mutation
+candidates, and separately labeled blocked or unclassified gaps. It emits no
+mutation command until the operator names and guides a specific capability.
+
+`workflow.telemetry.export-evidence-packet` expands nested workflow components
+and returns a receipt-only manifest. Read receipts carry account/profile scope,
+input and catalog identities, observation time, outcome, workflow-relative
+freshness, and the immutable evidence reference. Targeted mutation receipts
+carry safe plan identity, approval metadata, status, verification posture, and
+content-addressed transaction checkpoints classified as plan, approval,
+execution admission, apply, verification, compensation, or closure. A class is
+present only when the durable journal contains it. The packet contains no plan
+input, target, transaction artifact, credential, or raw telemetry. Plan expiry
+metadata is not a resource-expiry receipt, and freshness never proves
+retention, sampling completeness, or mutation readiness.
 
 ## Coverage ledger and honest boundaries
 
@@ -193,6 +212,17 @@ operation with:
 - verification and rollback/removal methods;
 - fixture, live-read, and live-mutation-drill status;
 - the remaining upstream or local blocker.
+
+The same response includes `operational_proof`, a bounded projection of the 512
+most recently indexed local live-read receipts. It reports the retained count,
+total index rows, limit, and whether the projection was truncated. Counts never
+silently claim full history when truncated. Profile, account, and redacted input
+identity all remain part of the observation key. Catalog coverage and
+operational proof remain separate: a capability may be contract-complete
+without ever having been read successfully on this account, and a prior
+successful receipt may be stale or bound to an older catalog, profile, account,
+or input. Workflow previews apply their explicit freshness policy; the catalog
+does not invent one universal window.
 
 Known upstream boundaries remain explicit:
 
@@ -212,3 +242,21 @@ Known upstream boundaries remain explicit:
 No live mutation is part of catalog or release verification. A mutation drill
 requires a separate, exact authorization for disposable resources, followed by
 post-apply verification and removal receipts.
+
+### Explicit mutation canary lane
+
+A live canary is an operator-authorized operational exercise, never a hidden CI
+step. Before a drill, name one exact mutation capability, account, disposable
+target, cost ceiling, expiry/removal contract, and stop condition. Then:
+
+1. Read current state and inspect the capability guide.
+2. Create and review the hash-bound plan.
+3. Approve only that operation ID and cost ceiling.
+4. Run it once and retain the apply receipt.
+5. Perform the declared independent readback.
+6. Create and approve the exact compensation/removal plan when required.
+7. Retain post-removal verification and report uncertain boundaries honestly.
+
+Until all receipts exist, catalog coverage continues to report the mutation
+drill as not authorized or incomplete. No standing authority, broad target, or
+production resource is inferred from this procedure.

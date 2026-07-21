@@ -162,6 +162,31 @@ cfctl resolve "telemetry overview" --json
 cfctl catalog coverage --json
 ```
 
+Prefer the governed workflow ranked for an investigation or audit. Calling a
+workflow is a local preview: it expands component selectors and emits commands
+only for currently available, contract-ready components while showing
+workflow-relative proof freshness without crossing the Cloudflare boundary.
+Blocked, incomplete, or cyclic components expose blocking gaps and a guide but
+no runnable call. Run each bounded read explicitly. A mutating component always
+remains a separate `call` plan followed by its own approve/run/status lifecycle.
+
+Coverage reports both declared catalog coverage and a bounded projection of the
+local `operational_proof` index. Inspect its retained/total counts and
+`truncated` flag before interpreting counts. Do not collapse coverage and proof
+into one success claim: contract-complete is not account-proven, a receipt is
+not dataset completeness, and freshness is evaluated only under the selected
+workflow policy.
+
+The evidence-packet workflow exports read-receipt identities and safe mutation
+lifecycle checkpoint metadata. It omits plan inputs, targets, transaction
+artifacts, credentials, and raw telemetry; an absent apply, verification, or
+compensation class remains absent evidence rather than an inferred success.
+
+Registered roots with an explicit account pin receive the same proof posture as
+a separate overlay in `cfctl workspace audit --json`. An unpinned repository is
+reported as `unscoped`; cfctl never joins it to the newest or only available
+account. Use a governed workflow when time freshness matters.
+
 GraphQL Analytics capabilities carry fixed documents; provide only their
 declared variables. Analytics Engine and Log Explorer accept typed query
 objects that cfctl compiles into one bounded `SELECT`—never raw SQL. Large

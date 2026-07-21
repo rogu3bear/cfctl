@@ -30,7 +30,7 @@ flowchart TD
 | `cfctl-planner` | Risk, impact, cost, and approval policy |
 | `cfctl-workspace` | Registered-root Git/IaC discovery, exact local diffs, and repository/resource graph |
 | `cfctl-agent` | Agent discovery, maintained instructions, recursion-safe handoff |
-| `cfctl-storage` | Platform paths, atomic plans, locks, content-addressed evidence |
+| `cfctl-storage` | Platform paths, atomic plans, locks, content-addressed evidence, tamper-evident operational-proof rows, and bounded recent-proof projections |
 | `xtask` | Local verification, reproducible release assembly, publication |
 
 ## Adapter boundary
@@ -73,6 +73,13 @@ identity links come only from literal, resource-type-specific properties;
 dynamic expressions and local binding symbols never masquerade as Cloudflare
 identities.
 
+`workspace audit` joins an explicitly account-pinned repository only to
+operational-proof rows for that same account. The overlay reports observed
+capabilities and current-catalog outcomes but preserves the truth boundary:
+checked-in configuration remains source-config evidence, receipts remain live-
+read evidence, and neither is silently promoted to desired-state or edge
+verification.
+
 `PlanV1` carries a hash-chained transaction journal. Checkpoints distinguish
 the point before a Cloudflare boundary from the persisted response, secret
 sink, and operation-specific verification, so a network failure after a
@@ -82,6 +89,13 @@ validates the journal on both writes and reads. The storage crash matrix drops
 volatile state and reopens the real local store between each journal
 transition, proving recovery at every persisted stage; it does not claim
 account-backed network mutation proof.
+
+Live reads also write `OperationalProofV1` index rows beside their immutable
+evidence. Each row binds the capability, catalog hash, redacted input hash,
+profile/account scope, outcome, and receipt. Catalog coverage projects these
+rows separately from declared capability coverage. Native workflow previews
+apply their own explicit maximum proof age and current catalog identity; they
+never convert an old receipt into authority or dataset-completeness proof.
 
 ## Trust sequence
 

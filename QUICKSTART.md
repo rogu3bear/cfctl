@@ -45,6 +45,8 @@ cfctl agents doctor --json
 ```bash
 cfctl catalog sync
 cfctl catalog coverage --json
+cfctl resolve "telemetry overview" --json
+cfctl call workflow.telemetry.audit-account --json
 cfctl resolve "rotate a worker secret"
 cfctl catalog search "Worker secret"
 cfctl docs changes

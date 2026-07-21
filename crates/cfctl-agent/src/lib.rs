@@ -355,6 +355,9 @@ pub const FRAGMENT_DOCTOR_TRUST: &str = "`cfctl doctor` and `cfctl agents doctor
 /// Resolve is the primary intent-to-capability translation; browsing is secondary.
 pub const FRAGMENT_RESOLVE_PRIMARY: &str = r#"Translate intent with `cfctl resolve "<intent>" --json`: it deterministically maps the goal to a capability and emits the exact governed `call`/`approve`/`run` commands, and fails closed with ranked candidates when the match is ambiguous. To browse instead, use `cfctl catalog search "<intent>" --json`."#;
 
+/// Workflow-first telemetry discovery and its non-authoritative preview boundary.
+pub const FRAGMENT_WORKFLOW_FIRST: &str = "For telemetry investigations and audits, prefer the governed workflow ranked by `cfctl resolve` over assembling unrelated raw capabilities. Calling a native workflow returns a component preview, exact selector requirements, and a bounded profile/account/input-scoped proof projection; it does not execute the components or aggregate mutation authority. Run only steps with `available:true` and a non-null `call_argv`; blocked, contract-gapped, missing, or cyclic steps expose guidance but no runnable call. Run bounded reads individually and keep every mutation in its own plan/approve/run/verify lifecycle.";
+
 /// Registered-root discovery skips nested fixture trees.
 pub const FRAGMENT_FIXTURE_SKIP: &str = "Nested `fixtures`, `__fixtures__`, `testdata`, `test-data`, and `test_data` directories are skipped; fixture directories are opt-in roots and must be registered directly when they are intentional workspace evidence.";
 
@@ -380,6 +383,7 @@ pub const FRAGMENT_BLOCKED_ROUTE: &str = "When a capability or plan is blocked (
 pub const MANAGED_FRAGMENTS: &[&str] = &[
     FRAGMENT_DOCTOR_TRUST,
     FRAGMENT_RESOLVE_PRIMARY,
+    FRAGMENT_WORKFLOW_FIRST,
     FRAGMENT_FIXTURE_SKIP,
     FRAGMENT_APPROVE_COMMAND,
     FRAGMENT_MAX_COST,
@@ -408,7 +412,7 @@ pub fn managed_documents() -> [(&'static str, &'static str); 2] {
 /// The managed-skill contract number carried in the installed front matter.
 /// Bump this when the installed document's contract changes; `agents doctor`
 /// compares whole strings, so every install goes stale on purpose when it moves.
-pub const MANAGED_SKILL_CONTRACT: u32 = 4;
+pub const MANAGED_SKILL_CONTRACT: u32 = 5;
 
 static MANAGED_OPERATOR_SKILL: LazyLock<String> = LazyLock::new(build_managed_operator_skill);
 static MANAGED_CURSOR_RULE: LazyLock<String> = LazyLock::new(build_managed_cursor_rule);
@@ -422,6 +426,8 @@ fn build_managed_operator_skill() -> String {
         FRAGMENT_DOCTOR_TRUST,
         "\n2. ",
         FRAGMENT_RESOLVE_PRIMARY,
+        " ",
+        FRAGMENT_WORKFLOW_FIRST,
         "\n3. Inspect the capability with `cfctl catalog show <capability-id> --json`.\n4. Load its lifecycle with `cfctl guide <capability-id> --json`.\n5. Use `cfctl call <capability-id>` for deterministic reads or plan creation.\n6. Register repository roots with `cfctl workspace add` before workspace discovery; never scan arbitrary paths. ",
         FRAGMENT_FIXTURE_SKIP,
         "\n7. If approval is required, show the exact plan and ask y/n.\n8. Translate yes only into ",
@@ -445,6 +451,8 @@ fn build_managed_cursor_rule() -> String {
         FRAGMENT_DOCTOR_TRUST,
         " ",
         FRAGMENT_RESOLVE_PRIMARY,
+        " ",
+        FRAGMENT_WORKFLOW_FIRST,
         " Inspect capabilities with `cfctl catalog show <capability-id> --json`, load lifecycles with `cfctl guide <capability-id> --json`, run governed reads or plan creation with `cfctl call <capability-id>`, and bound impact with `cfctl workspace`. ",
         FRAGMENT_FIXTURE_SKIP,
         " ",

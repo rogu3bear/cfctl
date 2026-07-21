@@ -51,7 +51,7 @@ fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() 
     assert!(content.contains("cfctl keys policy revoke <authority-id>"));
     assert!(content.contains("fixture directories are opt-in roots"));
     assert!(content.contains("Every cfctl failure envelope carries a specific `next_step`"));
-    assert!(content.contains("contract: 4"));
+    assert!(content.contains("contract: 5"));
     assert!(content.contains("CFCTL_CAPABILITY_BLOCKED"));
     assert!(content.contains("cfctl guide <capability-id> --json"));
     assert!(content.contains("report the capability id, `blocking_gaps`, and the guide output"));
@@ -228,7 +228,7 @@ fn managed_skill_contract_header_is_single_sourced() {
         "contract: {}",
         cfctl_agent::MANAGED_SKILL_CONTRACT
     )));
-    assert!(skill.contains("contract: 4"));
+    assert!(skill.contains("contract: 5"));
 }
 
 fn install_and_read(home: &std::path::Path, agent: AgentKind) -> String {
