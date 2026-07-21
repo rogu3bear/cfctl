@@ -37,7 +37,7 @@ if ! git -C "$root" diff --quiet HEAD --; then
 fi
 head=$(git -C "$root" rev-parse --verify HEAD)
 
-(cd "$root" && cargo run --locked -p xtask -- verify)
+(cd "$root" && cargo xtask verify)
 
 if [ "$check_only" = true ]; then
   echo "cfctl v2 source proof passed"
