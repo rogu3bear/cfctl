@@ -582,6 +582,12 @@ pub struct WorkflowContractV1 {
     pub steps: Vec<WorkflowStepV1>,
     pub preserves_component_approval: bool,
     pub exports_evidence_packet: bool,
+    /// Maximum age at which a prior component read can be described as fresh
+    /// in this workflow's preview. Zero means the workflow never labels prior
+    /// evidence fresh. This is workflow policy, not a claim about upstream
+    /// retention or dataset completeness.
+    #[serde(default)]
+    pub proof_freshness_seconds: u64,
 }
 
 /// Governance carried beside one telemetry-derived security action. The
@@ -4824,6 +4830,112 @@ impl EvidenceV1 {
             metadata: Value::Null,
         }
     }
+}
+
+/// Outcome of one account-scoped operation that crossed a live read boundary.
+/// This is deliberately narrower than `ResultEnvelopeV2`: workflow previews,
+/// source audits, plans, and agent actions are evidence but are not operational
+/// proof of a Cloudflare read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationalProofOutcomeV1 {
+    Succeeded,
+    Failed,
+}
+
+/// The identity scope attached to one operational proof. Keeping profile and
+/// account together prevents constructors from silently swapping adjacent
+/// optional string arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationalProofScopeV1 {
+    pub profile_id: Option<String>,
+    pub account_id: Option<String>,
+}
+
+impl OperationalProofScopeV1 {
+    #[must_use]
+    pub fn new(profile_id: Option<&str>, account_id: Option<&str>) -> Self {
+        Self {
+            profile_id: profile_id.map(str::to_owned),
+            account_id: account_id.map(str::to_owned),
+        }
+    }
+}
+
+/// Durable index row binding a live-read receipt to the exact public contract,
+/// account context, and redacted input identity that produced it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperationalProofV1 {
+    pub schema_version: u8,
+    pub observed_at: DateTime<Utc>,
+    pub capability_id: String,
+    pub catalog_hash: String,
+    pub input_hash: String,
+    pub profile_id: Option<String>,
+    pub account_id: Option<String>,
+    pub outcome: OperationalProofOutcomeV1,
+    pub evidence: EvidenceV1,
+}
+
+impl OperationalProofV1 {
+    #[must_use]
+    pub fn new(
+        observed_at: DateTime<Utc>,
+        capability_id: &str,
+        catalog_hash: &str,
+        input_hash: &str,
+        scope: OperationalProofScopeV1,
+        outcome: OperationalProofOutcomeV1,
+        evidence: EvidenceV1,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            observed_at,
+            capability_id: capability_id.to_owned(),
+            catalog_hash: catalog_hash.to_owned(),
+            input_hash: input_hash.to_owned(),
+            profile_id: scope.profile_id,
+            account_id: scope.account_id,
+            outcome,
+            evidence,
+        }
+    }
+
+    #[must_use]
+    pub fn freshness(
+        &self,
+        now: DateTime<Utc>,
+        current_catalog_hash: &str,
+        max_age_seconds: u64,
+    ) -> OperationalProofFreshnessV1 {
+        if self.catalog_hash != current_catalog_hash {
+            return OperationalProofFreshnessV1::CatalogDrifted;
+        }
+        if self.outcome == OperationalProofOutcomeV1::Failed {
+            return OperationalProofFreshnessV1::Failed;
+        }
+        if max_age_seconds == 0 {
+            return OperationalProofFreshnessV1::Stale;
+        }
+        let age = now.signed_duration_since(self.observed_at);
+        if age < Duration::zero()
+            || age > Duration::seconds(i64::try_from(max_age_seconds).unwrap_or(i64::MAX))
+        {
+            OperationalProofFreshnessV1::Stale
+        } else {
+            OperationalProofFreshnessV1::Fresh
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationalProofFreshnessV1 {
+    Fresh,
+    Stale,
+    CatalogDrifted,
+    Failed,
+    NotRecorded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

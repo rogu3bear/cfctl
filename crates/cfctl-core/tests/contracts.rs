@@ -6,12 +6,14 @@ use cfctl_core::{
     CostV1, CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
     CreatedResourceContractV1, DeletedNestedResourceContractV1, EffectClass, EntitlementProbeV1,
     EvidenceClass, EvidenceV1, GraphqlAnalyticsContractV1, GuideActionV1, GuideCloudflareEffectV1,
-    GuideContractStateV1, GuideStage, GuideTopicV1, OutputFormatV1, PaginationModeV1, PlanStatus,
-    PlanV1, R2LogRetrievalContractV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1,
-    SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
-    SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
-    TimeRangeContractV1, TimestampFormatV1, TransactionStageV1, UpdatedResourceContractV1,
-    guide_stages, guide_topic_document, hash_value, redact_json, render_guide_topic_markdown,
+    GuideContractStateV1, GuideStage, GuideTopicV1, OperationalProofFreshnessV1,
+    OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, OutputFormatV1,
+    PaginationModeV1, PlanStatus, PlanV1, R2LogRetrievalContractV1, ResultEnvelopeV2, RiskClass,
+    SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
+    StandingAuthorityV1, TimeRangeContractV1, TimestampFormatV1, TransactionStageV1,
+    UpdatedResourceContractV1, guide_stages, guide_topic_document, hash_value, redact_json,
+    render_guide_topic_markdown,
 };
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
@@ -25,6 +27,55 @@ fn uncontracted_selector(name: &str, location: &str, value_type: &str) -> Select
         description: None,
         contract: None,
     }
+}
+
+#[test]
+fn operational_proof_freshness_is_contract_and_catalog_bound() {
+    let now = Utc::now();
+    let evidence = EvidenceV1::new(
+        EvidenceClass::LiveRead,
+        "sha256:evidence",
+        "/tmp/evidence.json",
+    );
+    let proof = OperationalProofV1::new(
+        now - Duration::seconds(30),
+        "telemetry.query",
+        "sha256:catalog-a",
+        "sha256:input",
+        OperationalProofScopeV1::new(Some("default"), Some("account-a")),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+    assert_eq!(
+        proof.freshness(now, "sha256:catalog-a", 60),
+        OperationalProofFreshnessV1::Fresh
+    );
+    assert_eq!(
+        proof.freshness(now, "sha256:catalog-a", 10),
+        OperationalProofFreshnessV1::Stale
+    );
+    assert_eq!(
+        proof.freshness(now, "sha256:catalog-b", 60),
+        OperationalProofFreshnessV1::CatalogDrifted
+    );
+    assert_eq!(
+        proof.freshness(now, "sha256:catalog-a", 0),
+        OperationalProofFreshnessV1::Stale
+    );
+
+    let mut failed = proof.clone();
+    failed.outcome = OperationalProofOutcomeV1::Failed;
+    assert_eq!(
+        failed.freshness(now, "sha256:catalog-a", 60),
+        OperationalProofFreshnessV1::Failed
+    );
+
+    let mut future = proof;
+    future.observed_at = now + Duration::seconds(1);
+    assert_eq!(
+        future.freshness(now, "sha256:catalog-a", 60),
+        OperationalProofFreshnessV1::Stale
+    );
 }
 
 #[test]
