@@ -10,6 +10,7 @@ pub mod build_identity;
 pub mod build_support;
 mod profiles;
 pub mod runtime;
+mod telemetry_product;
 
 #[derive(Debug, Parser)]
 #[command(

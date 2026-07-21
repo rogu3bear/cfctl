@@ -30,9 +30,10 @@ use cfctl_cloudflare::{
 use cfctl_core::{
     AdapterStatus, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1, EffectClass, ErrorV1,
     EvidenceClass, EvidenceV1, GuideActionV1, GuideContractStateV1, GuideTopicDocumentV1,
-    GuideTopicV1, MoneyV1, PlanStatus, PlanV1, PolicyDisposition, ResultEnvelopeV2, RiskClass,
-    SecurityActionKindV1, StandingAuthorityV1, TransactionStageV1, VerificationState, guide_stages,
-    guide_topic_document, hash_value, redact_json, render_guide_topic_document_markdown,
+    GuideTopicV1, MoneyV1, OperationalProofOutcomeV1, OperationalProofV1, PlanStatus, PlanV1,
+    PolicyDisposition, ResultEnvelopeV2, RiskClass, SecurityActionKindV1, StandingAuthorityV1,
+    TransactionStageV1, VerificationState, guide_stages, guide_topic_document, hash_value,
+    redact_json, render_guide_topic_document_markdown,
 };
 use cfctl_planner::{ImpactContext, PolicyEngine};
 use cfctl_storage::{RuntimePaths, StateStore};
@@ -43,6 +44,10 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio::process::Command as ProcessCommand;
 
+pub(crate) use crate::telemetry_product::{
+    OPERATIONAL_PROOF_PROJECTION_LIMIT, execute_native_workflow, operational_proof_coverage,
+    operational_proof_projection_json, record_operational_proof,
+};
 use crate::{
     AgentsCommand, AuthCommand, AuthLoginArgs, CallArgs, CatalogCommand, Cli, Command, DocsCommand,
     GuideArgs, GuideTopicArg, ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs,
@@ -978,10 +983,14 @@ async fn catalog_command(store: &StateStore, command: CatalogCommand) -> Result<
         }
         CatalogCommand::Coverage => {
             let catalog = ensure_catalog(store).await?;
-            Ok(ResultEnvelopeV2::success(
-                "catalog coverage",
-                serde_json::to_value(catalog.coverage())?,
-            ))
+            let mut coverage = serde_json::to_value(catalog.coverage())?;
+            if let Some(object) = coverage.as_object_mut() {
+                object.insert(
+                    "operational_proof".to_owned(),
+                    operational_proof_coverage(store, &catalog)?,
+                );
+            }
+            Ok(ResultEnvelopeV2::success("catalog coverage", coverage))
         }
     }
 }
@@ -1170,7 +1179,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
             .as_deref()
             .map(read_r2_log_retrieval_credentials)
             .transpose()?;
-        return execute_read(
+        let mut envelope = execute_read(
             store,
             &catalog,
             &capability,
@@ -1180,7 +1189,11 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
             arguments.out.as_deref(),
             r2_credentials.as_ref(),
         )
-        .await;
+        .await?;
+        let proof_result =
+            record_operational_proof(store, &catalog, &capability, &prepared.input, &envelope);
+        apply_operational_proof_index_result(&mut envelope, proof_result);
+        return Ok(envelope);
     }
     let secrets = platform_secrets(store);
     let mut secret_ref = None;
@@ -3911,54 +3924,6 @@ async fn execute_read(
     Ok(envelope)
 }
 
-fn execute_native_workflow(
-    store: &StateStore,
-    catalog: &CatalogSnapshot,
-    capability: &CapabilityV1,
-) -> Result<ResultEnvelopeV2> {
-    let workflow = capability.workflow.as_ref().ok_or_else(|| {
-        CliError::Input("native workflow capability is missing its recipe".to_owned())
-    })?;
-    let steps = workflow
-        .steps
-        .iter()
-        .map(|step| {
-            let component = catalog.get(&step.capability_id);
-            json!({
-                "id": step.id,
-                "capability_id": step.capability_id,
-                "purpose": step.purpose,
-                "mutating": step.mutating,
-                "depends_on": step.depends_on,
-                "available": component.is_some(),
-                "adapter_status": component.map(|capability| capability.adapter_status),
-                "blocked_reason": component.and_then(|capability| capability.blocked_reason.clone()),
-                "contract_gaps": component.map(CapabilityV1::mutation_contract_gaps).unwrap_or_default(),
-            })
-        })
-        .collect::<Vec<_>>();
-    let receipt = json!({
-        "workflow_id": capability.id,
-        "catalog_hash": catalog.schema_hash,
-        "purpose": workflow.purpose,
-        "preserves_component_approval": workflow.preserves_component_approval,
-        "exports_evidence_packet": workflow.exports_evidence_packet,
-        "performed": false,
-        "steps": steps,
-        "next_action": "Inspect each component with `cfctl guide <capability-id>`; every mutating component must be planned, approved, run, and verified separately."
-    });
-    let evidence = store.write_evidence(EvidenceClass::AgentAction, &receipt)?;
-    let mut envelope = ResultEnvelopeV2::success("call", receipt).with_evidence(evidence);
-    envelope.capability_id = Some(capability.id.clone());
-    envelope.performed = false;
-    envelope.verification.state = VerificationState::NotApplicable;
-    envelope.verification.basis = Some(
-        "native workflow composition only; no Cloudflare boundary or mutation was crossed"
-            .to_owned(),
-    );
-    Ok(envelope)
-}
-
 async fn execute_delegated_read(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -3973,21 +3938,55 @@ async fn execute_delegated_read(
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
     let receipt = run_delegated_cli(capability, input, &credential).await?;
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok(delegated_read_envelope(
+        &catalog.schema_hash,
+        &capability.id,
+        &profile.id,
+        account_id,
+        receipt,
+        evidence,
+    ))
+}
+
+fn delegated_read_envelope(
+    catalog_hash: &str,
+    capability_id: &str,
+    profile_id: &str,
+    account_id: Option<String>,
+    receipt: Value,
+    evidence: EvidenceV1,
+) -> ResultEnvelopeV2 {
     let success = receipt
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let mut envelope = ResultEnvelopeV2::success("call", receipt).with_evidence(evidence);
     envelope.ok = success;
-    envelope.capability_id = Some(capability.id.clone());
-    envelope.profile_id = Some(profile.id.clone());
+    envelope.performed = true;
+    envelope.capability_id = Some(capability_id.to_owned());
+    envelope.profile_id = Some(profile_id.to_owned());
     envelope.account_id = account_id;
     envelope.verification.state = VerificationState::NotApplicable;
     envelope.verification.basis = Some(format!(
-        "governed CLI read pinned to catalog {}",
-        catalog.schema_hash
+        "governed CLI read pinned to catalog {catalog_hash}"
     ));
-    Ok(envelope)
+    envelope
+}
+
+fn apply_operational_proof_index_result(envelope: &mut ResultEnvelopeV2, proof_result: Result<()>) {
+    if let Err(error) = proof_result {
+        envelope.ok = false;
+        envelope.error = Some(ErrorV1 {
+            code: "CFCTL_OPERATIONAL_PROOF_INDEX_FAILED".to_owned(),
+            message: format!(
+                "the bounded read completed, but its operational-proof index row was not durably recorded: {error}"
+            ),
+            next_step: Some(
+                "Preserve the live-read evidence receipt, repair the local cfctl data directory, and repeat the bounded read before relying on workflow freshness or catalog operational-proof coverage."
+                    .to_owned(),
+            ),
+        });
+    }
 }
 
 fn execute_governed_ui_read(
@@ -13087,6 +13086,22 @@ fn workspace_command(store: &StateStore, command: WorkspaceCommand) -> Result<Re
         }
         WorkspaceCommand::Audit => {
             let graph = discover_registered(store)?;
+            let account_pins_path = store.paths().config_dir.join("workspace-accounts.json");
+            let account_pins: BTreeMap<PathBuf, String> = if account_pins_path.is_file() {
+                store.read_json(&account_pins_path)?
+            } else {
+                BTreeMap::new()
+            };
+            let proof_page =
+                store.list_recent_operational_proofs(OPERATIONAL_PROOF_PROJECTION_LIMIT)?;
+            let proofs = &proof_page.proofs;
+            let current_catalog_hash = store
+                .paths()
+                .catalog_file()
+                .is_file()
+                .then(|| CatalogSnapshot::load(&store.paths().catalog_file()))
+                .transpose()?
+                .map(|catalog| catalog.schema_hash);
             let mut repositories = Vec::new();
             for repository in &graph.repositories {
                 let output = std::process::Command::new("git")
@@ -13098,19 +13113,87 @@ fn workspace_command(store: &StateStore, command: WorkspaceCommand) -> Result<Re
                     ])
                     .output()
                     .map_err(|source| cli_io(&repository.path, source))?;
+                let account_id = account_pins
+                    .iter()
+                    .filter(|(root, _)| repository.path.starts_with(root))
+                    .max_by_key(|(root, _)| root.components().count())
+                    .map(|(_, account)| account.as_str());
                 repositories.push(json!({
                     "name": repository.name,
                     "path": repository.path,
                     "dirty": !output.stdout.is_empty(),
                     "cloudflare_configs": repository.cloudflare_configs,
+                    "account_id": account_id,
+                    "operational_proof": workspace_operational_proof_posture(
+                        proofs,
+                        account_id,
+                        current_catalog_hash.as_deref(),
+                    ),
                 }));
             }
             Ok(ResultEnvelopeV2::success(
                 "workspace audit",
-                json!({"repositories": repositories, "resource_count": graph.resources.len()}),
+                json!({
+                    "repositories": repositories,
+                    "resource_count": graph.resources.len(),
+                    "operational_proof_projection": operational_proof_projection_json(&proof_page),
+                    "truth_boundary": "Repository configuration is source-config evidence. The operational-proof overlay contains account-scoped live-read receipts and remains separate from edge verification or desired-state convergence."
+                }),
             ))
         }
     }
+}
+
+fn workspace_operational_proof_posture(
+    proofs: &[OperationalProofV1],
+    account_id: Option<&str>,
+    current_catalog_hash: Option<&str>,
+) -> Value {
+    let Some(account_id) = account_id else {
+        return json!({
+            "state": "unscoped",
+            "proof_count": 0,
+            "next_action": "Register the root with an explicit account pin before joining local configuration to operational proof."
+        });
+    };
+    let scoped = proofs
+        .iter()
+        .filter(|proof| proof.account_id.as_deref() == Some(account_id))
+        .collect::<Vec<_>>();
+    let capabilities = scoped
+        .iter()
+        .map(|proof| proof.capability_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let current_catalog_successes = current_catalog_hash.map_or(0, |catalog_hash| {
+        scoped
+            .iter()
+            .filter(|proof| {
+                proof.catalog_hash == catalog_hash
+                    && proof.outcome == OperationalProofOutcomeV1::Succeeded
+            })
+            .count()
+    });
+    let current_catalog_failures = current_catalog_hash.map_or(0, |catalog_hash| {
+        scoped
+            .iter()
+            .filter(|proof| {
+                proof.catalog_hash == catalog_hash
+                    && proof.outcome == OperationalProofOutcomeV1::Failed
+            })
+            .count()
+    });
+    json!({
+        "state": if scoped.is_empty() { "not_recorded" } else { "recorded" },
+        "account_id": account_id,
+        "proof_count": scoped.len(),
+        "capabilities_observed": capabilities,
+        "latest_observed_at": scoped.iter().map(|proof| proof.observed_at).max(),
+        "current_catalog_hash": current_catalog_hash,
+        "current_catalog_successes": current_catalog_successes,
+        "current_catalog_failures": current_catalog_failures,
+        "catalog_drifted_or_unclassified": scoped.len().saturating_sub(current_catalog_successes + current_catalog_failures),
+        "freshness_policy": "Select a governed workflow to evaluate time freshness; workspace audit does not invent a universal window."
+    })
 }
 
 fn agents_command(store: &StateStore, command: AgentsCommand) -> Result<ResultEnvelopeV2> {
@@ -13965,7 +14048,7 @@ fn parse_money(value: &str) -> Result<MoneyV1> {
     })
 }
 
-fn verification_for_status(status: PlanStatus) -> VerificationState {
+pub(crate) fn verification_for_status(status: PlanStatus) -> VerificationState {
     match status {
         PlanStatus::Verified | PlanStatus::Rectified => VerificationState::Passed,
         PlanStatus::Failed => VerificationState::Failed,
@@ -13976,6 +14059,16 @@ fn verification_for_status(status: PlanStatus) -> VerificationState {
 
 fn stage_required(stage: cfctl_core::GuideStage, capability: &cfctl_core::CapabilityV1) -> bool {
     use cfctl_core::GuideStage;
+    if capability.workflow.is_some() {
+        return matches!(
+            stage,
+            GuideStage::Discover
+                | GuideStage::InspectCurrentState
+                | GuideStage::LoadStandards
+                | GuideStage::Execute
+                | GuideStage::CloseWithEvidence
+        );
+    }
     match stage {
         GuideStage::RequestApproval | GuideStage::Rectify => capability.mutating,
         GuideStage::CalculateCost => capability.cost.incremental || !capability.cost.known,
@@ -14091,21 +14184,36 @@ fn resolve_result(
         .collect();
 
     if is_broad_telemetry_intent(intent) {
-        let reads = ranked
+        let telemetry_ranked = rank_telemetry_overview(intent, ranked);
+        let reads = telemetry_ranked
             .iter()
             .filter(|(capability, _)| !capability.mutating && capability.workflow.is_none())
             .take(limit)
             .map(|(capability, score)| resolve_candidate_json(capability, *score))
             .collect::<Vec<_>>();
-        let workflows = ranked
+        let workflows = telemetry_ranked
             .iter()
             .filter(|(capability, _)| capability.workflow.is_some())
             .take(limit)
             .map(|(capability, score)| resolve_candidate_json(capability, *score))
             .collect::<Vec<_>>();
-        let mutations = ranked
+        let mutations = telemetry_ranked
             .iter()
-            .filter(|(capability, _)| capability.mutating)
+            .filter(|(capability, _)| {
+                capability.mutating
+                    && capability.adapter_status != AdapterStatus::Blocked
+                    && capability.mutation_contract_gaps().is_empty()
+            })
+            .take(limit)
+            .map(|(capability, score)| resolve_candidate_json(capability, *score))
+            .collect::<Vec<_>>();
+        let blocked_gaps = telemetry_ranked
+            .iter()
+            .filter(|(capability, _)| {
+                capability.mutating
+                    && (capability.adapter_status == AdapterStatus::Blocked
+                        || !capability.mutation_contract_gaps().is_empty())
+            })
             .take(limit)
             .map(|(capability, score)| resolve_candidate_json(capability, *score))
             .collect::<Vec<_>>();
@@ -14119,6 +14227,7 @@ fn resolve_result(
                     "ranked_reads": reads,
                     "governed_workflows": workflows,
                     "mutation_candidates": mutations,
+                    "blocked_or_unclassified_gaps": blocked_gaps,
                     "mutation_selection": "withheld_until_a_specific_capability_is_resolved_and_guided",
                     "discovery_argv": {
                         "coverage": ["cfctl", "catalog", "coverage", "--json"],
@@ -14126,7 +14235,7 @@ fn resolve_result(
                     }
                 },
                 "ambiguous": false,
-                "guidance": "Broad telemetry language returns a domain overview. Choose and inspect one typed capability; cfctl never selects an enforcement or configuration mutation from this overview.",
+                "guidance": "Broad telemetry language returns workflow-first, domain-aware discovery. Choose and inspect one typed capability; cfctl never selects an enforcement or configuration mutation from this overview, and blocked mutations remain labeled contract gaps.",
             }),
             None,
         );
@@ -14205,6 +14314,48 @@ fn resolve_result(
         "guidance": guidance,
     });
     (result, None)
+}
+
+fn rank_telemetry_overview<'a>(
+    intent: &str,
+    ranked: &[(&'a CapabilityV1, usize)],
+) -> Vec<(&'a CapabilityV1, usize)> {
+    let terms = intent
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<BTreeSet<_>>();
+    let asks_for_audit = ["audit", "coverage", "overview", "discover"]
+        .iter()
+        .any(|term| terms.contains(*term));
+    let mut reranked = ranked
+        .iter()
+        .map(|(capability, score)| {
+            let mut adjusted = *score;
+            if capability.workflow.is_some() {
+                adjusted += 24;
+            }
+            if asks_for_audit {
+                adjusted += match capability.id.as_str() {
+                    "workflow.telemetry.audit-account" => 64,
+                    "workflow.telemetry.audit-governance" => 56,
+                    "workflow.telemetry.export-evidence-packet" => 48,
+                    "workflow.telemetry.verify-freshness" => 40,
+                    _ => 0,
+                };
+            }
+            if capability.adapter_status == AdapterStatus::Blocked {
+                adjusted = adjusted.saturating_sub(8);
+            }
+            (*capability, adjusted)
+        })
+        .collect::<Vec<_>>();
+    reranked.sort_by(|(left, left_score), (right, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    reranked
 }
 
 fn is_broad_telemetry_intent(intent: &str) -> bool {
@@ -14299,7 +14450,7 @@ fn resolve_candidate_json(capability: &CapabilityV1, score: usize) -> Value {
     })
 }
 
-fn required_selectors_json(capability: &CapabilityV1) -> Vec<Value> {
+pub(crate) fn required_selectors_json(capability: &CapabilityV1) -> Vec<Value> {
     capability
         .selectors
         .iter()
@@ -14367,7 +14518,7 @@ fn is_domain_like(token: &str) -> bool {
     })
 }
 
-fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
+pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
     if matches!(
         capability.id.as_str(),
         "account-api-tokens-create-token" | "user-api-tokens-create-token"
@@ -14424,7 +14575,7 @@ fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
     argv
 }
 
-fn capability_has_meaningful_request_body(capability: &CapabilityV1) -> bool {
+pub(crate) fn capability_has_meaningful_request_body(capability: &CapabilityV1) -> bool {
     let Some(schema) = capability.request_schema.as_ref() else {
         return false;
     };
@@ -14615,6 +14766,21 @@ fn guide_stage_contract_state(
 ) -> GuideContractStateV1 {
     use cfctl_core::GuideStage;
 
+    if capability.workflow.is_some() {
+        return if matches!(
+            stage,
+            GuideStage::Discover
+                | GuideStage::InspectCurrentState
+                | GuideStage::LoadStandards
+                | GuideStage::Execute
+                | GuideStage::CloseWithEvidence
+        ) {
+            GuideContractStateV1::Available
+        } else {
+            GuideContractStateV1::NotApplicable
+        };
+    }
+
     let entitlement_blocked = capability.entitlement.available == Some(false)
         || blocking_gaps.iter().any(|gap| gap.contains("entitlement"));
     let entitlement_unresolved = capability.mutating
@@ -14800,7 +14966,16 @@ fn guide_stage_document(
     );
     let summary = guide_live_read_summary(stage, &live_reads)
         .unwrap_or_else(|| guide_stage_summary(stage, capability));
-    let evidence_class = if guide_stage_uses_live_read(stage, &live_reads) {
+    let evidence_class = if capability.workflow.is_some() {
+        if matches!(
+            stage,
+            cfctl_core::GuideStage::Discover | cfctl_core::GuideStage::LoadStandards
+        ) {
+            EvidenceClass::SourceConfig
+        } else {
+            EvidenceClass::AgentAction
+        }
+    } else if guide_stage_uses_live_read(stage, &live_reads) {
         EvidenceClass::LiveRead
     } else {
         guide_stage_evidence_class(stage, capability.mutating)
@@ -14819,6 +14994,27 @@ fn guide_stage_document(
 
 fn guide_stage_summary(stage: cfctl_core::GuideStage, capability: &CapabilityV1) -> &'static str {
     use cfctl_core::GuideStage;
+
+    if capability.workflow.is_some() {
+        return match stage {
+            GuideStage::Discover => {
+                "Inspect the workflow outcome, component graph, selector handoffs, and component approval boundaries."
+            }
+            GuideStage::InspectCurrentState => {
+                "Preview the workflow against the local operational-proof index; no Cloudflare boundary is crossed."
+            }
+            GuideStage::LoadStandards => {
+                "Load current official product documentation for the workflow's component capabilities."
+            }
+            GuideStage::Execute => {
+                "Generate the workflow preview and exact component commands. Run bounded reads individually; mutations remain separate plans."
+            }
+            GuideStage::CloseWithEvidence => {
+                "Use the preview receipt and any exported receipt-only manifest without treating artifact presence as verification."
+            }
+            _ => "This generic capability stage does not apply to a preview-only native workflow.",
+        };
+    }
 
     let mutating = capability.mutating;
 
@@ -14999,6 +15195,22 @@ fn guide_stage_commands(
     let available = contract_state == GuideContractStateV1::Available;
     let conditional =
         |command: Option<Vec<String>>| available.then_some(command).flatten().into_iter().collect();
+    if capability.workflow.is_some() {
+        return match stage {
+            GuideStage::Discover => vec![catalog_show_argv(&capability.id)],
+            GuideStage::InspectCurrentState | GuideStage::Execute => {
+                conditional(call_argv.map(<[String]>::to_vec))
+            }
+            GuideStage::LoadStandards => vec![vec![
+                "cfctl".to_owned(),
+                "docs".to_owned(),
+                "search".to_owned(),
+                capability.product.clone(),
+                "--json".to_owned(),
+            ]],
+            _ => Vec::new(),
+        };
+    }
     match stage {
         GuideStage::SelectAccount | GuideStage::CheckEntitlement
             if contract_state == GuideContractStateV1::LiveReadRequired =>
@@ -15669,7 +15881,7 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        CallInput, DNS_RECORD_DETAIL_PATH, DNS_RECORD_DETAIL_READ_CAPABILITY_ID,
+        CallInput, CliError, DNS_RECORD_DETAIL_PATH, DNS_RECORD_DETAIL_READ_CAPABILITY_ID,
         DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
         OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, SECURITY_IP_RULE_COLLECTION_PATH,
         SECURITY_IP_RULE_CREATE_ID, SECURITY_IP_RULE_STATE_CAPABILITY_ID,
@@ -15680,17 +15892,18 @@ mod tests {
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
         apply_dns_record_state_response, apply_entitlement_probe_response,
         apply_global_warp_override_state_response, apply_kv_empty_namespace_state_response,
-        apply_oauth_client_secret_state_response, apply_r2_parent_token_response,
-        apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
-        apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
-        bind_required_empty_compensation_body, blocked_capability_envelope,
-        boundary_response_artifact, build_mint_policy_body, call_command, cancel_plan,
-        capability_call_argv, compensation_request, entitlement_probe_selectors, execute_read,
-        find_secret_value, force_ipv4_from, guide_document, guide_stage_commands, http_client,
-        is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
-        key_policy_list, key_policy_revoke, list_security_action_state_receipt,
-        non_readback_verification_basis, permission_inventory_call, permission_inventory_envelope,
-        persist_prepared_plan, persist_secret_lifecycle,
+        apply_oauth_client_secret_state_response, apply_operational_proof_index_result,
+        apply_r2_parent_token_response, apply_warp_connector_configuration_state_response,
+        apply_web_analytics_rum_state_response, apply_zone_account_response,
+        apply_zone_entitlement_response, approve_plan, bind_required_empty_compensation_body,
+        blocked_capability_envelope, boundary_response_artifact, build_mint_policy_body,
+        call_command, cancel_plan, capability_call_argv, compensation_request,
+        delegated_read_envelope, entitlement_probe_selectors, execute_native_workflow,
+        execute_read, find_secret_value, force_ipv4_from, guide_document, guide_stage_commands,
+        http_client, is_live_plan_precondition_hash, is_secret_output_capability,
+        key_policy_approve, key_policy_list, key_policy_revoke, list_security_action_state_receipt,
+        non_readback_verification_basis, operational_proof_coverage, permission_inventory_call,
+        permission_inventory_envelope, persist_prepared_plan, persist_secret_lifecycle,
         persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
         preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
@@ -15720,8 +15933,8 @@ mod tests {
         validate_standing_authority_permission_inventory, validate_token_policy_body,
         validate_worker_script_secret_semantics, validate_zone_account_receipt_precondition,
         validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
-        workspace_resource_keys, wrangler_config_directory, wrangler_deploy_version_id,
-        wrangler_status_has_promoted_version, zone_target,
+        workspace_operational_proof_posture, workspace_resource_keys, wrangler_config_directory,
+        wrangler_deploy_version_id, wrangler_status_has_promoted_version, zone_target,
     };
     use crate::profiles::ProfilesConfig;
     use crate::{
@@ -15736,11 +15949,12 @@ mod tests {
         AsyncCollectionMutationContractV1, CapabilityV1, CostV1,
         CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
         CreatedResourceContractV1, EffectClass, EntitlementProbeV1, EvidenceClass, EvidenceV1,
-        OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1, QuerySerializationV1,
-        ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1,
-        SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
-        SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
-        TransactionStageV1, VerificationState, hash_value,
+        OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, OutputFormatV1,
+        PaginationModeV1, PlanStatus, PlanV1, QuerySerializationV1, ResultEnvelopeV2, RiskClass,
+        SECRET_FIELD_NAMES, SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+        SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
+        StandingAuthorityV1, TransactionStageV1, VerificationState, WorkflowContractV1,
+        WorkflowStepV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -24641,6 +24855,368 @@ mod tests {
         capability
     }
 
+    fn resolver_workflow_capability(id: &str, title: &str) -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(id, title, "GET", "/cfctl/workflows/test");
+        capability.adapter_status = AdapterStatus::Native;
+        capability.product = "Telemetry workflows".to_owned();
+        capability.workflow = Some(WorkflowContractV1 {
+            purpose: title.to_owned(),
+            steps: vec![WorkflowStepV1 {
+                id: "inspect".to_owned(),
+                capability_id: "graphql-analytics-zone-http-requests".to_owned(),
+                purpose: "Inspect bounded analytics".to_owned(),
+                mutating: false,
+                depends_on: Vec::new(),
+            }],
+            preserves_component_approval: true,
+            exports_evidence_packet: false,
+            proof_freshness_seconds: 300,
+        });
+        capability
+    }
+
+    #[test]
+    fn workflow_guide_replaces_generic_mutation_ceremony_with_preview_semantics() {
+        let workflow = resolver_workflow_capability(
+            "workflow.telemetry.audit-account",
+            "Audit telemetry coverage across an account",
+        );
+        let guide = guide_json(&workflow);
+        let stages = guide["stages"].as_array().expect("guide stages");
+        let build_plan = stages
+            .iter()
+            .find(|stage| stage["name"] == "build_plan")
+            .expect("build-plan stage remains visible");
+        assert_eq!(build_plan["required"], false);
+        assert_eq!(build_plan["contract_state"], "not_applicable");
+        assert!(build_plan["commands"].as_array().is_some_and(Vec::is_empty));
+        let execute = stages
+            .iter()
+            .find(|stage| stage["name"] == "execute")
+            .expect("execute stage");
+        assert_eq!(execute["evidence_class"], "agent_action");
+        assert!(
+            execute["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Generate the workflow preview")
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end fixture binds preview freshness, profile isolation, coverage, and lifecycle packet export"
+    )]
+    fn workflow_preview_joins_scoped_proof_without_crossing_the_cloudflare_boundary() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store opens");
+        let read = resolver_read_capability(
+            "graphql-analytics-zone-http-requests",
+            "Query zone HTTP analytics",
+            "GraphQL Analytics",
+        );
+        let workflow = resolver_workflow_capability(
+            "workflow.telemetry.audit-account",
+            "Audit telemetry coverage across an account",
+        );
+        let mut export = resolver_workflow_capability(
+            "workflow.telemetry.export-evidence-packet",
+            "Export an operator telemetry evidence packet",
+        );
+        let export_contract = export.workflow.as_mut().expect("export workflow");
+        export_contract.steps[0].capability_id = workflow.id.clone();
+        export_contract.exports_evidence_packet = true;
+        export_contract.proof_freshness_seconds = 3_600;
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://workflow".to_owned(),
+            source_hash: "sha256:source".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([
+                (read.id.clone(), read),
+                (workflow.id.clone(), workflow.clone()),
+                (export.id.clone(), export.clone()),
+            ]),
+        };
+        catalog.refresh_hash().expect("catalog hashes");
+        let evidence = store
+            .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
+            .expect("live evidence");
+        let input_hash = format!("sha256:{}", "a".repeat(64));
+        for profile_id in ["default", "secondary"] {
+            store
+                .record_operational_proof(&OperationalProofV1::new(
+                    Utc::now(),
+                    "graphql-analytics-zone-http-requests",
+                    &catalog.schema_hash,
+                    &input_hash,
+                    OperationalProofScopeV1::new(Some(profile_id), Some("account-a")),
+                    OperationalProofOutcomeV1::Succeeded,
+                    evidence.clone(),
+                ))
+                .expect("proof indexes");
+        }
+        let mut mutation = resolver_mutation_capability();
+        mutation.id = "security-response-create-expiring-ip-access-rule".to_owned();
+        let plan = PlanV1::draft(
+            "default",
+            "account-a",
+            &catalog.schema_hash,
+            mutation,
+            json!({"zone_id": "zone-a"}),
+        )
+        .expect("mutation plan drafts");
+        store.save_plan(&plan).expect("mutation plan persists");
+
+        let envelope = execute_native_workflow(&store, &catalog, &workflow)
+            .expect("workflow preview succeeds");
+        assert!(!envelope.performed);
+        assert_eq!(envelope.result["kind"], "workflow_preview_v1");
+        assert_eq!(envelope.result["cloudflare_boundary_crossed"], false);
+        assert_eq!(
+            envelope.result["steps"][0]["proof"]["observations"][0]["state"],
+            "fresh"
+        );
+        assert_eq!(
+            envelope.result["steps"][0]["proof"]["observations"]
+                .as_array()
+                .map(Vec::len),
+            Some(2),
+            "identical account/input observations from separate profiles remain distinct"
+        );
+        assert_eq!(envelope.evidence[0].class, EvidenceClass::AgentAction);
+
+        let coverage = operational_proof_coverage(&store, &catalog).expect("proof coverage");
+        assert_eq!(coverage["current_catalog_successes"], 2);
+        assert_eq!(coverage["current_catalog_failures"], 0);
+        assert_eq!(
+            coverage["latest_scoped_observations"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            coverage["mutation_lifecycle"]["observations"][0]["capability_id"],
+            "security-response-create-expiring-ip-access-rule"
+        );
+        assert_eq!(
+            coverage["mutation_lifecycle"]["observations"][0]["status"],
+            "draft"
+        );
+        assert_eq!(
+            coverage["mutation_lifecycle"]["observations"][0]["verification"],
+            "pending"
+        );
+
+        let packet = execute_native_workflow(&store, &catalog, &export)
+            .expect("evidence packet preview succeeds");
+        assert_eq!(
+            packet.result["evidence_packet"]["contains_raw_telemetry"],
+            false
+        );
+        assert_eq!(
+            packet.result["evidence_packet"]["read_receipts"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            packet.result["evidence_packet"]["mutation_lifecycle_receipts"][0]["operation_id"],
+            plan.operation_id
+        );
+        assert_eq!(
+            packet.result["evidence_packet"]["mutation_lifecycle_receipts"][0]["receipt_classes"]
+                [0],
+            "plan"
+        );
+        assert_eq!(
+            packet.result["evidence_packet"]["contains_plan_inputs"],
+            false
+        );
+        assert_eq!(
+            packet.result["evidence_packet"]["contains_transaction_artifacts"],
+            false
+        );
+        let packet_text = serde_json::to_string(&packet.result["evidence_packet"])
+            .expect("evidence packet serializes");
+        assert!(!packet_text.contains("\"targets\""));
+        assert!(!packet_text.contains("\"input\""));
+        assert!(!packet_text.contains("\"transaction_artifacts\":"));
+        assert!(packet.result["steps"][0]["nested_steps"].is_array());
+    }
+
+    #[test]
+    fn delegated_cli_receipt_is_truthfully_marked_performed() {
+        let envelope = delegated_read_envelope(
+            "sha256:catalog",
+            "delegated.read",
+            "profile-a",
+            Some("account-a".to_owned()),
+            json!({"success": true, "bounded": true}),
+            EvidenceV1::new(
+                EvidenceClass::LiveRead,
+                "sha256:evidence",
+                "/tmp/evidence.json",
+            ),
+        );
+
+        assert!(envelope.ok);
+        assert!(envelope.performed);
+        assert_eq!(envelope.capability_id.as_deref(), Some("delegated.read"));
+        assert_eq!(envelope.evidence[0].class, EvidenceClass::LiveRead);
+    }
+
+    #[test]
+    fn operational_proof_persistence_failure_preserves_boundary_truth_and_fails_envelope() {
+        let mut envelope = ResultEnvelopeV2::success("call", json!({"bounded": true}))
+            .with_evidence(EvidenceV1::new(
+                EvidenceClass::LiveRead,
+                "sha256:evidence",
+                "/tmp/evidence.json",
+            ));
+        envelope.performed = true;
+
+        apply_operational_proof_index_result(
+            &mut envelope,
+            Err(CliError::Input("fixture persistence failure".to_owned())),
+        );
+
+        assert!(!envelope.ok);
+        assert!(envelope.performed, "the completed read remains truthful");
+        assert_eq!(
+            envelope.error.as_ref().map(|error| error.code.as_str()),
+            Some("CFCTL_OPERATIONAL_PROOF_INDEX_FAILED")
+        );
+        assert_eq!(envelope.evidence[0].class, EvidenceClass::LiveRead);
+    }
+
+    #[test]
+    fn workflow_preview_withholds_calls_for_blocked_gapped_and_cyclic_components() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store opens");
+        let mut blocked = resolver_read_capability("blocked.read", "Blocked read", "Telemetry");
+        blocked.adapter_status = AdapterStatus::Blocked;
+        blocked.blocked_reason = Some("fixture blocker".to_owned());
+        let mut gapped = CapabilityV1::new(
+            "gapped.mutation",
+            "Gapped mutation",
+            "POST",
+            "/accounts/{account_id}/gapped",
+        );
+        gapped.mutating = true;
+        gapped.adapter_status = AdapterStatus::DynamicApi;
+        let mut workflow = resolver_workflow_capability("workflow.fail-closed", "Fail closed");
+        workflow.workflow.as_mut().expect("workflow contract").steps = vec![
+            WorkflowStepV1 {
+                id: "blocked".to_owned(),
+                capability_id: blocked.id.clone(),
+                purpose: "Blocked component".to_owned(),
+                mutating: false,
+                depends_on: Vec::new(),
+            },
+            WorkflowStepV1 {
+                id: "gapped".to_owned(),
+                capability_id: gapped.id.clone(),
+                purpose: "Gapped component".to_owned(),
+                mutating: true,
+                depends_on: Vec::new(),
+            },
+        ];
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://workflow".to_owned(),
+            source_hash: "sha256:source".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([
+                (blocked.id.clone(), blocked),
+                (gapped.id.clone(), gapped),
+                (workflow.id.clone(), workflow.clone()),
+            ]),
+        };
+        catalog.refresh_hash().expect("catalog hashes");
+
+        let preview = execute_native_workflow(&store, &catalog, &workflow)
+            .expect("fail-closed preview renders");
+        for step in preview.result["steps"].as_array().expect("preview steps") {
+            assert_eq!(step["available"], false);
+            assert!(step["call_argv"].is_null());
+            assert!(step["guide_argv"].is_array());
+            assert!(
+                step["blocking_gaps"]
+                    .as_array()
+                    .is_some_and(|gaps| !gaps.is_empty())
+            );
+        }
+
+        let mut cycle_a = resolver_workflow_capability("workflow.cycle-a", "Cycle A");
+        let mut cycle_b = resolver_workflow_capability("workflow.cycle-b", "Cycle B");
+        cycle_a.workflow.as_mut().expect("cycle A contract").steps[0].capability_id =
+            cycle_b.id.clone();
+        cycle_b.workflow.as_mut().expect("cycle B contract").steps[0].capability_id =
+            cycle_a.id.clone();
+        let mut cycle_catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://cycle".to_owned(),
+            source_hash: "sha256:source".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([
+                (cycle_a.id.clone(), cycle_a.clone()),
+                (cycle_b.id.clone(), cycle_b),
+            ]),
+        };
+        cycle_catalog.refresh_hash().expect("cycle catalog hashes");
+        let cycle = execute_native_workflow(&store, &cycle_catalog, &cycle_a)
+            .expect("cyclic preview terminates");
+        let blocked_cycle = &cycle.result["steps"][0]["nested_steps"][0]["nested_steps"][0];
+        assert_eq!(blocked_cycle["available"], false);
+        assert!(blocked_cycle["call_argv"].is_null());
+        assert_eq!(
+            blocked_cycle["blocking_gaps"][0],
+            "workflow composition cycle detected"
+        );
+    }
+
+    #[test]
+    fn workspace_proof_posture_requires_an_account_pin_and_keeps_catalog_truth_separate() {
+        let evidence = EvidenceV1::new(
+            EvidenceClass::LiveRead,
+            "sha256:evidence",
+            "/tmp/evidence.json",
+        );
+        let proofs = vec![
+            OperationalProofV1::new(
+                Utc::now(),
+                "telemetry.query",
+                "sha256:current",
+                "sha256:input-a",
+                OperationalProofScopeV1::new(Some("default"), Some("account-a")),
+                OperationalProofOutcomeV1::Succeeded,
+                evidence.clone(),
+            ),
+            OperationalProofV1::new(
+                Utc::now(),
+                "telemetry.query",
+                "sha256:old",
+                "sha256:input-b",
+                OperationalProofScopeV1::new(Some("other"), Some("account-b")),
+                OperationalProofOutcomeV1::Succeeded,
+                evidence,
+            ),
+        ];
+
+        let unscoped = workspace_operational_proof_posture(&proofs, None, None);
+        assert_eq!(unscoped["state"], "unscoped");
+        let account =
+            workspace_operational_proof_posture(&proofs, Some("account-a"), Some("sha256:current"));
+        assert_eq!(account["proof_count"], 1);
+        assert_eq!(account["current_catalog_successes"], 1);
+        assert_eq!(account["catalog_drifted_or_unclassified"], 0);
+    }
+
     #[test]
     fn resolve_result_empty_fails_closed_with_discovery_guidance() {
         let ranked: Vec<(&CapabilityV1, usize)> = Vec::new();
@@ -24664,7 +25240,20 @@ mod tests {
             "GraphQL Analytics",
         );
         let mutation = resolver_mutation_capability();
-        let ranked = vec![(&mutation, 20usize), (&read, 18usize)];
+        let workflow = resolver_workflow_capability(
+            "workflow.telemetry.audit-account",
+            "Audit telemetry coverage across an account",
+        );
+        let mut blocked = resolver_mutation_capability();
+        blocked.id = "telemetry.live-tail.heartbeat.get".to_owned();
+        blocked.adapter_status = AdapterStatus::Blocked;
+        blocked.blocked_reason = Some("operation contract incomplete: risk_unknown".to_owned());
+        let ranked = vec![
+            (&mutation, 20usize),
+            (&read, 18usize),
+            (&workflow, 4usize),
+            (&blocked, 19usize),
+        ];
         let (result, error) = super::resolve_result("telemetry overview", &ranked, None, 5);
         assert!(error.is_none());
         assert_eq!(result["resolved"]["kind"], "telemetry_domain_overview");
@@ -24678,6 +25267,14 @@ mod tests {
                 .as_array()
                 .map(Vec::len),
             Some(1)
+        );
+        assert_eq!(
+            result["resolved"]["governed_workflows"][0]["capability_id"],
+            "workflow.telemetry.audit-account"
+        );
+        assert_eq!(
+            result["resolved"]["blocked_or_unclassified_gaps"][0]["capability_id"],
+            "telemetry.live-tail.heartbeat.get"
         );
         assert!(!result.to_string().contains("draft_argv"));
         assert!(super::is_broad_telemetry_intent("show analytics"));

@@ -1728,6 +1728,7 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
     finalize_logpull_retrieval(snapshot);
     finalize_workers_observability_reads(snapshot);
     finalize_telemetry_mutations(snapshot);
+    block_misleading_live_tail_heartbeat_identity(snapshot);
     for capability in graphql_analytics_capabilities()? {
         snapshot
             .capabilities
@@ -1739,6 +1740,35 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
             .insert(capability.id.clone(), capability);
     }
     snapshot.refresh_hash()
+}
+
+const LIVE_TAIL_HEARTBEAT_MISLEADING_ID: &str = "telemetry.live-tail.heartbeat.get";
+const LIVE_TAIL_HEARTBEAT_PATH: &str =
+    "/accounts/{account_id}/workers/observability/telemetry/live-tail/heartbeat";
+
+/// The upstream operation id ends in `.get`, but the wire operation is a POST
+/// with a mutating classification. Keep it discoverable as catalog debt while
+/// preventing a future generic classifier from presenting it as an ordinary
+/// read or contract-ready mutation.
+fn block_misleading_live_tail_heartbeat_identity(snapshot: &mut CatalogSnapshot) {
+    let Some(capability) = snapshot
+        .capabilities
+        .get_mut(LIVE_TAIL_HEARTBEAT_MISLEADING_ID)
+    else {
+        return;
+    };
+    let exact_known_identity =
+        capability.method == "POST" && capability.path == LIVE_TAIL_HEARTBEAT_PATH;
+    capability.adapter_status = AdapterStatus::Blocked;
+    capability.blocked_reason = Some(if exact_known_identity {
+        "blocked by design: upstream operation id ends in `.get`, but the exact wire operation is a mutating POST; classify its effect, cost, verification, rollback, and stable public identity before promotion"
+            .to_owned()
+    } else {
+        format!(
+            "blocked by design: the reserved misleading heartbeat operation identity drifted from the reviewed POST {}; reclassify the new {} {} contract before promotion",
+            LIVE_TAIL_HEARTBEAT_PATH, capability.method, capability.path
+        )
+    });
 }
 
 const LOGPULL_RETRIEVE_ID: &str = "logpull-retrieve-logs";
@@ -5088,7 +5118,7 @@ fn telemetry_workflow_capabilities() -> Vec<CapabilityV1> {
         workflow_capability(
             "workflow.telemetry.export-evidence-packet",
             "Export an operator telemetry evidence packet",
-            "Collect content-addressed read, plan, apply, verify, rollback, and expiry receipts without embedding credentials.",
+            "Collect available content-addressed read and mutation lifecycle checkpoints across plan, apply, verification, compensation, and closure without embedding inputs, artifacts, telemetry, or credentials.",
             &[("inventory", "workflow.telemetry.audit-governance", false)],
         ),
     ]
@@ -5126,8 +5156,30 @@ fn workflow_capability(
             .collect(),
         preserves_component_approval: true,
         exports_evidence_packet: id.ends_with("export-evidence-packet"),
+        proof_freshness_seconds: workflow_proof_freshness_seconds(id),
     });
     capability
+}
+
+fn workflow_proof_freshness_seconds(id: &str) -> u64 {
+    match id {
+        // Security investigation and deploy verification should not borrow an
+        // old observation merely because it exists in the evidence store.
+        "workflow.security.investigate-source" | "workflow.telemetry.verify-freshness" => 300,
+        // Configuration workflows are still previews, but a recent read can
+        // save an operator from repeating discovery while they fill selectors.
+        "workflow.telemetry.bootstrap-worker-observability"
+        | "workflow.telemetry.bootstrap-web-analytics-rum"
+        | "workflow.telemetry.privacy-bounded-pipeline"
+        | "workflow.telemetry.worker-traces-logpush" => 900,
+        // Account/governance inventory changes less rapidly. The label remains
+        // workflow-scoped and never claims upstream dataset completeness.
+        "workflow.telemetry.audit-account"
+        | "workflow.telemetry.audit-governance"
+        | "workflow.telemetry.export-evidence-packet" => 3_600,
+        // Mutation-oriented recipes cannot use an old read as authority.
+        _ => 0,
+    }
 }
 
 fn official_reference(title: &str, url: &str) -> KnowledgeReferenceV1 {
@@ -13602,5 +13654,75 @@ mod search_scored_tests {
     fn search_scored_is_empty_when_nothing_matches() {
         let snap = snapshot(vec![CapabilityV1::new("a", "Widgets", "GET", "/p")]);
         assert!(snap.search_scored("nonexistent zzz term").is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod telemetry_identity_hygiene_tests {
+    use super::*;
+
+    #[test]
+    fn mutating_post_with_get_identity_stays_doctrine_blocked() {
+        let mut capability = CapabilityV1::new(
+            LIVE_TAIL_HEARTBEAT_MISLEADING_ID,
+            "Live Tail heartbeat",
+            "POST",
+            LIVE_TAIL_HEARTBEAT_PATH,
+        );
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        let mut snapshot = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://telemetry".to_owned(),
+            source_hash: "sha256:test".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability.id.clone(), capability)]),
+        };
+
+        block_misleading_live_tail_heartbeat_identity(&mut snapshot);
+        let blocked = snapshot
+            .get(LIVE_TAIL_HEARTBEAT_MISLEADING_ID)
+            .expect("capability remains discoverable");
+        assert_eq!(blocked.adapter_status, AdapterStatus::Blocked);
+        assert!(
+            blocked
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("mutating POST")
+        );
+    }
+
+    #[test]
+    fn misleading_heartbeat_identity_drift_stays_blocked() {
+        let capability = CapabilityV1::new(
+            LIVE_TAIL_HEARTBEAT_MISLEADING_ID,
+            "Live Tail heartbeat",
+            "GET",
+            "/accounts/{account_id}/workers/observability/telemetry/live-tail/new-heartbeat",
+        );
+        let mut snapshot = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://telemetry".to_owned(),
+            source_hash: "sha256:test".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability.id.clone(), capability)]),
+        };
+
+        block_misleading_live_tail_heartbeat_identity(&mut snapshot);
+        let blocked = snapshot
+            .get(LIVE_TAIL_HEARTBEAT_MISLEADING_ID)
+            .expect("drifted capability remains discoverable");
+        assert_eq!(blocked.adapter_status, AdapterStatus::Blocked);
+        assert!(
+            blocked
+                .blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("identity drifted")
+        );
     }
 }
