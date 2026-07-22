@@ -29,6 +29,11 @@ For every request:
    while retaining that explicit account resource context.
 7. Use `cfctl call <capability-id> ... --json` for a live read or to create a
    hash-bound plan.
+   Read the full `ResultEnvelopeV2`: `ok` is command success; `performed` says
+   whether an external boundary was crossed; `verification.state` names proof
+   status; `evidence` carries redacted receipts; and `error.next_step` is the
+   governed recovery command when present. Do not collapse them into one
+   success claim.
 8. If policy requires approval, show the exact operation ID, account, targets,
    diffs, costs, warnings, compensation, and verification. Ask y/n.
 9. Translate yes only into
@@ -42,6 +47,13 @@ For every request:
 12. Inspect `cfctl plans status <operation-id> --json` and report the evidence
    class and verification state honestly. Use `plans rectify` for uncertain or
    non-replayable outcomes.
+
+Operational proof is bound to profile, account, input, catalog, and credential
+generation. Treat `credential_unbound` and `credential_drifted` as historical
+audit rows, never current proof. Re-import or log in again, then repeat the
+bounded read. If `performed:true` or a transport failure follows a mutation
+boundary attempt, preserve the operation ID and use status plus the guide's
+recovery command; never replay the call or run.
 
 Do not infer an account, broaden a selector, select the emergency global-key
 profile silently, expose a secret to stdout, overwrite a secret sink, approve
@@ -59,3 +71,8 @@ Use browser or Computer Use only when the catalog status is `governed_ui` and
 the target-bound `AgentActionV1` preserves the same account, operation ID,
 approval, redaction, before/after evidence, and verification rules. A handoff
 receipt is not proof that an action happened.
+
+Application repositories own checked-in Wrangler configuration and their
+repo-local deployment gates. `cfctl` owns account and live-edge truth. A local
+build, source diff, or successful deploy command is not live Cloudflare
+verification; use a cataloged read when one exists.
