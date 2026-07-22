@@ -42,39 +42,89 @@ fn operational_proof_freshness_is_contract_and_catalog_bound() {
         "telemetry.query",
         "sha256:catalog-a",
         "sha256:input",
-        OperationalProofScopeV1::new(Some("default"), Some("account-a")),
+        OperationalProofScopeV1::new(
+            Some("default"),
+            Some("account-a"),
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
         OperationalProofOutcomeV1::Succeeded,
         evidence,
     );
     assert_eq!(
-        proof.freshness(now, "sha256:catalog-a", 60),
+        proof.freshness(
+            now,
+            "sha256:catalog-a",
+            60,
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
         OperationalProofFreshnessV1::Fresh
     );
     assert_eq!(
-        proof.freshness(now, "sha256:catalog-a", 10),
+        proof.freshness(
+            now,
+            "sha256:catalog-a",
+            10,
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
         OperationalProofFreshnessV1::Stale
     );
     assert_eq!(
-        proof.freshness(now, "sha256:catalog-b", 60),
+        proof.freshness(
+            now,
+            "sha256:catalog-b",
+            60,
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
         OperationalProofFreshnessV1::CatalogDrifted
     );
     assert_eq!(
-        proof.freshness(now, "sha256:catalog-a", 0),
+        proof.freshness(
+            now,
+            "sha256:catalog-a",
+            0,
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
         OperationalProofFreshnessV1::Stale
     );
 
     let mut failed = proof.clone();
     failed.outcome = OperationalProofOutcomeV1::Failed;
     assert_eq!(
-        failed.freshness(now, "sha256:catalog-a", 60),
+        failed.freshness(
+            now,
+            "sha256:catalog-a",
+            60,
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
         OperationalProofFreshnessV1::Failed
     );
 
-    let mut future = proof;
+    let mut future = proof.clone();
     future.observed_at = now + Duration::seconds(1);
     assert_eq!(
-        future.freshness(now, "sha256:catalog-a", 60),
+        future.freshness(
+            now,
+            "sha256:catalog-a",
+            60,
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
         OperationalProofFreshnessV1::Stale
+    );
+
+    assert_eq!(
+        proof.freshness(
+            now,
+            "sha256:catalog-a",
+            60,
+            Some("22222222-2222-4222-8222-222222222222"),
+        ),
+        OperationalProofFreshnessV1::CredentialDrifted
+    );
+    let mut unbound = proof.clone();
+    unbound.credential_generation_id = None;
+    assert_eq!(
+        unbound.freshness(now, "sha256:catalog-a", 60, None),
+        OperationalProofFreshnessV1::CredentialUnbound
     );
 }
 

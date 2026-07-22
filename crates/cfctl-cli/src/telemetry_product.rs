@@ -18,6 +18,7 @@ use cfctl_storage::{OperationalProofPageV1, StateStore};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
+use crate::profiles::ProfilesConfig;
 use crate::runtime::{
     CliError, Result, capability_call_argv, capability_has_meaningful_request_body,
     required_selectors_json, verification_for_status,
@@ -31,6 +32,7 @@ pub(crate) fn operational_proof_coverage(
 ) -> Result<Value> {
     let proof_page = store.list_recent_operational_proofs(OPERATIONAL_PROOF_PROJECTION_LIMIT)?;
     let proofs = &proof_page.proofs;
+    let profiles = ProfilesConfig::load(store)?;
     let targeted_mutations = catalog
         .coverage()
         .telemetry_ledger
@@ -46,10 +48,14 @@ pub(crate) fn operational_proof_coverage(
     let mut latest = BTreeMap::<String, &OperationalProofV1>::new();
     for proof in proofs {
         let key = format!(
-            "{}\u{0}{}\u{0}{}\u{0}{}",
+            "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
             proof.capability_id,
             proof.profile_id.as_deref().unwrap_or("unscoped"),
             proof.account_id.as_deref().unwrap_or("unscoped"),
+            proof
+                .credential_generation_id
+                .as_deref()
+                .unwrap_or("unbound"),
             proof.input_hash
         );
         latest
@@ -68,6 +74,8 @@ pub(crate) fn operational_proof_coverage(
                 "capability_id": proof.capability_id,
                 "account_id": proof.account_id,
                 "profile_id": proof.profile_id,
+                "credential_generation_id": proof.credential_generation_id,
+                "credential_generation_current": credential_generation_current(proof, &profiles),
                 "input_hash": proof.input_hash,
                 "catalog_hash": proof.catalog_hash,
                 "catalog_current": proof.catalog_hash == catalog.schema_hash,
@@ -81,6 +89,7 @@ pub(crate) fn operational_proof_coverage(
         .iter()
         .filter(|proof| {
             proof.catalog_hash == catalog.schema_hash
+                && credential_generation_current(proof, &profiles)
                 && proof.outcome == OperationalProofOutcomeV1::Succeeded
         })
         .count();
@@ -88,6 +97,7 @@ pub(crate) fn operational_proof_coverage(
         .iter()
         .filter(|proof| {
             proof.catalog_hash == catalog.schema_hash
+                && credential_generation_current(proof, &profiles)
                 && proof.outcome == OperationalProofOutcomeV1::Failed
         })
         .count();
@@ -99,11 +109,29 @@ pub(crate) fn operational_proof_coverage(
         "latest_scoped_observations": latest_rows,
         "current_catalog_successes": current_catalog_successes,
         "current_catalog_failures": current_catalog_failures,
-        "catalog_drifted_observations": proofs.len().saturating_sub(current_catalog_successes + current_catalog_failures),
+        "catalog_drifted_observations": proofs.iter().filter(|proof| proof.catalog_hash != catalog.schema_hash).count(),
+        "credential_drifted_observations": proofs.iter().filter(|proof| proof.credential_generation_id.is_some() && !credential_generation_current(proof, &profiles)).count(),
+        "credential_unbound_observations": proofs.iter().filter(|proof| proof.credential_generation_id.is_none()).count(),
         "mutation_lifecycle": mutation_lifecycle,
         "freshness_policy": "evaluated by each workflow; catalog coverage never invents a universal freshness window",
         "boundary": "A recorded successful read proves that exact bounded call crossed the Cloudflare read boundary. It does not prove dataset completeness, current freshness for every workflow, or mutation readiness."
     }))
+}
+
+fn current_credential_generation<'a>(
+    proof: &OperationalProofV1,
+    profiles: &'a ProfilesConfig,
+) -> Option<&'a str> {
+    proof
+        .profile_id
+        .as_deref()
+        .and_then(|profile_id| profiles.profiles.get(profile_id))
+        .and_then(|profile| profile.credential_generation_id.as_deref())
+}
+
+fn credential_generation_current(proof: &OperationalProofV1, profiles: &ProfilesConfig) -> bool {
+    proof.credential_generation_id.as_deref() == current_credential_generation(proof, profiles)
+        && proof.credential_generation_id.is_some()
 }
 
 fn mutation_lifecycle_coverage(plans: &[PlanV1], catalog: &CatalogSnapshot) -> Value {
@@ -148,6 +176,7 @@ pub(crate) fn record_operational_proof(
     catalog: &CatalogSnapshot,
     capability: &CapabilityV1,
     input: &CallInput,
+    credential_generation_id: Option<&str>,
     envelope: &ResultEnvelopeV2,
 ) -> Result<()> {
     if !envelope.performed || capability.workflow.is_some() {
@@ -173,6 +202,7 @@ pub(crate) fn record_operational_proof(
         OperationalProofScopeV1::new(
             envelope.profile_id.as_deref(),
             envelope.account_id.as_deref(),
+            credential_generation_id,
         ),
         if envelope.ok {
             OperationalProofOutcomeV1::Succeeded
@@ -195,6 +225,7 @@ pub(crate) fn execute_native_workflow(
     })?;
     let proof_page = store.list_recent_operational_proofs(OPERATIONAL_PROOF_PROJECTION_LIMIT)?;
     let proofs = &proof_page.proofs;
+    let profiles = ProfilesConfig::load(store)?;
     let now = Utc::now();
     let steps = workflow
         .steps
@@ -204,6 +235,7 @@ pub(crate) fn execute_native_workflow(
                 catalog,
                 step,
                 proofs,
+                &profiles,
                 now,
                 workflow.proof_freshness_seconds,
                 &mut BTreeSet::new(),
@@ -232,6 +264,7 @@ pub(crate) fn execute_native_workflow(
             capability,
             &proof_page,
             &plans,
+            &profiles,
             now,
             workflow.proof_freshness_seconds,
         );
@@ -252,6 +285,7 @@ fn workflow_step_preview(
     catalog: &CatalogSnapshot,
     step: &cfctl_core::WorkflowStepV1,
     proofs: &[OperationalProofV1],
+    profiles: &ProfilesConfig,
     now: DateTime<Utc>,
     proof_freshness_seconds: u64,
     ancestors: &mut BTreeSet<String>,
@@ -306,6 +340,7 @@ fn workflow_step_preview(
         },
         "proof": workflow_component_proof(
             proofs,
+            profiles,
             component,
             now,
             &catalog.schema_hash,
@@ -328,6 +363,7 @@ fn workflow_step_preview(
                         catalog,
                         nested_step,
                         proofs,
+                        profiles,
                         now,
                         proof_freshness_seconds,
                         ancestors,
@@ -342,6 +378,7 @@ fn workflow_step_preview(
 
 fn workflow_component_proof(
     proofs: &[OperationalProofV1],
+    profiles: &ProfilesConfig,
     component: &CapabilityV1,
     now: DateTime<Utc>,
     catalog_hash: &str,
@@ -363,9 +400,13 @@ fn workflow_component_proof(
         .filter(|proof| proof.capability_id == component.id)
     {
         let key = format!(
-            "{}\u{0}{}\u{0}{}",
+            "{}\u{0}{}\u{0}{}\u{0}{}",
             proof.profile_id.as_deref().unwrap_or("unscoped"),
             proof.account_id.as_deref().unwrap_or("unscoped"),
+            proof
+                .credential_generation_id
+                .as_deref()
+                .unwrap_or("unbound"),
             proof.input_hash
         );
         latest
@@ -384,10 +425,17 @@ fn workflow_component_proof(
         .values()
         .map(|proof| {
             json!({
-                "state": proof.freshness(now, catalog_hash, proof_freshness_seconds),
+                "state": proof.freshness(
+                    now,
+                    catalog_hash,
+                    proof_freshness_seconds,
+                    current_credential_generation(proof, profiles),
+                ),
                 "observed_at": proof.observed_at,
                 "account_id": proof.account_id,
                 "profile_id": proof.profile_id,
+                "credential_generation_id": proof.credential_generation_id,
+                "credential_generation_current": credential_generation_current(proof, profiles),
                 "input_hash": proof.input_hash,
                 "outcome": proof.outcome,
                 "evidence": proof.evidence,
@@ -402,6 +450,7 @@ fn workflow_evidence_packet(
     capability: &CapabilityV1,
     proof_page: &OperationalProofPageV1,
     plans: &[PlanV1],
+    profiles: &ProfilesConfig,
     now: DateTime<Utc>,
     proof_freshness_seconds: u64,
 ) -> Value {
@@ -417,6 +466,8 @@ fn workflow_evidence_packet(
                 "capability_id": proof.capability_id,
                 "account_id": proof.account_id,
                 "profile_id": proof.profile_id,
+                "credential_generation_id": proof.credential_generation_id,
+                "credential_generation_current": credential_generation_current(proof, profiles),
                 "input_hash": proof.input_hash,
                 "catalog_hash": proof.catalog_hash,
                 "observed_at": proof.observed_at,
@@ -425,6 +476,7 @@ fn workflow_evidence_packet(
                     now,
                     &catalog.schema_hash,
                     proof_freshness_seconds,
+                    current_credential_generation(proof, profiles),
                 ),
                 "evidence": proof.evidence,
             })

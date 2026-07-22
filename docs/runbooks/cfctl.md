@@ -179,7 +179,13 @@ local `operational_proof` index. Inspect its retained/total counts and
 `truncated` flag before interpreting counts. Do not collapse coverage and proof
 into one success claim: contract-complete is not account-proven, a receipt is
 not dataset completeness, and freshness is evaluated only under the selected
-workflow policy.
+workflow policy. Proof scope includes the credential generation captured before
+the read boundary. Re-login or re-import advances that generation: earlier rows
+remain auditable but report `credential_drifted`, while rows created before the
+generation contract report `credential_unbound`. Repeat the bounded read before
+using a drifted row as current evidence. A profile with no generation represents
+pre-generation metadata or an interrupted credential replacement; log in or
+import the credential again before performing a proof-bearing read.
 
 The evidence-packet workflow exports read-receipt identities and safe mutation
 lifecycle checkpoint metadata. It omits plan inputs, targets, transaction

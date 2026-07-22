@@ -380,10 +380,33 @@ fn verify_source_contract() -> Result<(), TaskError> {
         ],
     )?;
 
+    verify_bootstrap_contract()?;
     verify_workspace_contract()?;
     verify_v1_cutover_contract()?;
     verify_managed_agent_documents()?;
     verify_documented_contracts()
+}
+
+fn verify_bootstrap_contract() -> Result<(), TaskError> {
+    let source = fs::read_to_string("bootstrap.sh").map_err(|error| {
+        TaskError::InvalidSourceContract(format!("bootstrap.sh could not be read: {error}"))
+    })?;
+    validate_bootstrap_contract(&source)
+}
+
+fn validate_bootstrap_contract(source: &str) -> Result<(), TaskError> {
+    if source.contains("cargo run --locked -p xtask -- verify") {
+        return Err(TaskError::InvalidSourceContract(
+            "bootstrap.sh must not hold a Cargo run gate around the nested xtask verifier"
+                .to_owned(),
+        ));
+    }
+    if !source.contains("cargo xtask verify") {
+        return Err(TaskError::InvalidSourceContract(
+            "bootstrap.sh must invoke the repository's cargo xtask verify entrypoint".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn verify_workspace_contract() -> Result<(), TaskError> {
@@ -2667,13 +2690,29 @@ mod tests {
         is_forbidden_quarantine_consumer, is_linux_musl, parse_remote_tag_commit,
         release_build_driver, release_build_subcommand, release_tag_is_exact_version,
         render_linux_installer_text, repository_root, security_proof_commands,
-        validate_codesign_details, validate_command_refs, validate_extracted_command_refs,
-        validate_notary_receipt_value, validate_signed_release_file_set, validated_release_targets,
+        validate_bootstrap_contract, validate_codesign_details, validate_command_refs,
+        validate_extracted_command_refs, validate_notary_receipt_value,
+        validate_signed_release_file_set, validated_release_targets,
         verify_active_guidance_has_no_v1_commands, verify_documented_contracts,
         verify_generated_guidance_section_text, verify_managed_agent_documents,
         verify_quickstart_pins_the_release_version, verify_tracked_cfctl_command_references,
         verify_v1_cutover_contract, verify_workspace_dependency_versions,
     };
+
+    #[test]
+    fn bootstrap_does_not_hold_an_outer_cargo_gate_around_xtask() {
+        validate_bootstrap_contract("(cd \"$root\" && cargo xtask verify)\n")
+            .expect("the public xtask entrypoint is safe for nested Cargo commands");
+
+        let error = validate_bootstrap_contract(
+            "(cd \"$root\" && cargo run --locked -p xtask -- verify)\n",
+        )
+        .expect_err("an outer cargo run gate would deadlock nested proof commands");
+        assert!(
+            error.to_string().contains("must not hold a Cargo run gate"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn command_reference_extraction_is_structural_and_ignores_prose() {
