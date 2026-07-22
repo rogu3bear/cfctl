@@ -196,7 +196,7 @@ impl StateStore {
     /// evidence body remains immutable and content-addressed; this side index
     /// is a redacted, append-only lookup surface for coverage and workflows.
     pub fn record_operational_proof(&self, proof: &OperationalProofV1) -> Result<()> {
-        validate_operational_proof(proof)?;
+        validate_operational_proof(proof, true)?;
         validate_operational_evidence(&self.paths, proof)?;
         let value = serde_json::to_value(proof)?;
         if redact_json(&value) != value {
@@ -633,7 +633,10 @@ fn ensure_authority_identity(authority: &StandingAuthorityV1, filename_id: &str)
     Ok(())
 }
 
-fn validate_operational_proof(proof: &OperationalProofV1) -> Result<()> {
+fn validate_operational_proof(
+    proof: &OperationalProofV1,
+    require_credential_generation: bool,
+) -> Result<()> {
     if proof.schema_version != 1 {
         return Err(StorageError::InvalidOperationalProof(format!(
             "unsupported schema version {}",
@@ -649,6 +652,29 @@ fn validate_operational_proof(proof: &OperationalProofV1) -> Result<()> {
     validate_sha256_identity("input", &proof.input_hash)?;
     validate_optional_scope("profile", proof.profile_id.as_deref())?;
     validate_optional_scope("account", proof.account_id.as_deref())?;
+    validate_optional_scope(
+        "credential generation",
+        proof.credential_generation_id.as_deref(),
+    )?;
+    if proof.credential_generation_id.is_some() && proof.profile_id.is_none() {
+        return Err(StorageError::InvalidOperationalProof(
+            "credential generation requires a profile scope".to_owned(),
+        ));
+    }
+    if require_credential_generation
+        && (proof.profile_id.is_none() || proof.credential_generation_id.is_none())
+    {
+        return Err(StorageError::InvalidOperationalProof(
+            "new operational proof requires profile and credential-generation scope".to_owned(),
+        ));
+    }
+    if let Some(generation) = proof.credential_generation_id.as_deref()
+        && Uuid::parse_str(generation).is_err()
+    {
+        return Err(StorageError::InvalidOperationalProof(
+            "credential generation must be a UUID".to_owned(),
+        ));
+    }
     if proof.evidence.class != EvidenceClass::LiveRead {
         return Err(StorageError::InvalidOperationalProof(
             "only live-read evidence can enter the operational proof index".to_owned(),
@@ -755,7 +781,9 @@ fn read_operational_proof_index(paths: &RuntimePaths, path: &Path) -> Result<Ope
         ));
     }
     let proof: OperationalProofV1 = serde_json::from_slice(&encoded)?;
-    validate_operational_proof(&proof)?;
+    // Pre-generation rows remain readable for audit/history, but freshness
+    // projects them as credential_unbound and the writer never creates more.
+    validate_operational_proof(&proof, false)?;
     validate_operational_evidence(paths, &proof)?;
     Ok(proof)
 }

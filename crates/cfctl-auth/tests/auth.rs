@@ -55,6 +55,7 @@ fn api_token_profiles_store_bearer_credentials_outside_profile_metadata() {
     assert!(!format!("{credential:?}").contains("cf-api-token-value"));
     let profile = ProfileMetadata::new("default", ProfileKind::ApiToken, Some("account-a"));
     assert!(!profile.emergency_only);
+    assert!(profile.credential_generation_id.is_some());
     let json = serde_json::to_string(&profile).expect("profile serializes");
     assert!(!json.contains("cf-api-token-value"));
     assert_eq!(
@@ -101,6 +102,22 @@ fn profile_metadata_contains_no_credentials() {
     let json = serde_json::to_string(&profile).expect("profile serializes");
     assert!(!json.contains("access_token"));
     assert!(!json.contains("global_key"));
+    assert!(json.contains("credential_generation_id"));
+}
+
+#[test]
+fn pre_generation_profiles_remain_unbound_until_reauthentication() {
+    let governed: ProfileMetadata = serde_json::from_str(
+        r#"{"schema_version":1,"id":"default","kind":"api_token","account_id":"account-a","oauth_client_id":null,"oauth_scopes":[],"oauth_scope_inventory_hash":null,"emergency_only":false}"#,
+    )
+    .expect("old governed profile");
+    assert!(governed.credential_generation_id.is_none());
+
+    let legacy: ProfileMetadata = serde_json::from_str(
+        r#"{"schema_version":1,"id":"legacy","kind":"wrangler_session","account_id":"account-a","oauth_client_id":null,"oauth_scopes":[],"oauth_scope_inventory_hash":null,"emergency_only":false}"#,
+    )
+    .expect("legacy profile");
+    assert!(legacy.credential_generation_id.is_none());
 }
 
 #[test]

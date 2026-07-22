@@ -175,6 +175,11 @@ pub struct ProfileMetadata {
     pub oauth_scopes: Vec<String>,
     #[serde(default)]
     pub oauth_scope_inventory_hash: Option<String>,
+    /// Opaque local lineage for the credential material installed through this
+    /// profile. Re-login or re-import creates a new generation without
+    /// persisting any secret-derived verifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_generation_id: Option<String>,
     pub emergency_only: bool,
 }
 
@@ -189,6 +194,8 @@ impl ProfileMetadata {
             oauth_client_id: None,
             oauth_scopes: Vec::new(),
             oauth_scope_inventory_hash: None,
+            credential_generation_id: (kind != ProfileKind::LegacyWranglerSession)
+                .then(|| Uuid::new_v4().to_string()),
             emergency_only: kind == ProfileKind::GlobalKey,
         }
     }

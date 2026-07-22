@@ -33,6 +33,14 @@ flowchart TD
 | `cfctl-storage` | Platform paths, atomic plans, locks, content-addressed evidence, tamper-evident operational-proof rows, and bounded recent-proof projections |
 | `xtask` | Local verification, reproducible release assembly, publication |
 
+The binary exposes a timestamp-free `BuildInfoV1`. A checkout build embeds its
+full `HEAD` commit only when Git reports no tracked or untracked non-ignored
+changes; Cargo watches those repository inputs plus the Git index and `HEAD` so
+a later edit invalidates the embedded identity. A verified release build may
+instead inject the same full commit through the release environment. Any
+missing, malformed, or unknown source identity is reported as unhealthy by
+both doctor surfaces even when PATH resolves to the running executable.
+
 ## Adapter boundary
 
 Every capability is classified as `native`, `dynamic_api`, `delegated_cli`,
@@ -92,10 +100,19 @@ account-backed network mutation proof.
 
 Live reads also write `OperationalProofV1` index rows beside their immutable
 evidence. Each row binds the capability, catalog hash, redacted input hash,
-profile/account scope, outcome, and receipt. Catalog coverage projects these
-rows separately from declared capability coverage. Native workflow previews
-apply their own explicit maximum proof age and current catalog identity; they
-never convert an old receipt into authority or dataset-completeness proof.
+profile/account scope, captured credential generation, outcome, and receipt.
+Login or import assigns a new opaque generation without persisting a
+secret-derived verifier. Credential replacement first persists an unbound
+profile, writes the secret, and only then commits the new generation; an
+interrupted or failed replacement therefore blocks proof-bearing reads instead
+of inheriting the prior generation. Pre-generation profile metadata remains
+unbound until the operator logs in or imports the credential again.
+Catalog coverage projects rows separately from declared capability coverage.
+Native workflow previews apply their own explicit maximum proof age, current
+catalog identity, and currently installed credential generation. Historical
+rows without a generation remain readable as `credential_unbound`, and a row
+from a replaced credential is `credential_drifted`; neither becomes fresh
+proof for the current profile.
 
 ## Trust sequence
 

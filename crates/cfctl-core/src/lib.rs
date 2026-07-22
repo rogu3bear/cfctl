@@ -4850,14 +4850,21 @@ pub enum OperationalProofOutcomeV1 {
 pub struct OperationalProofScopeV1 {
     pub profile_id: Option<String>,
     pub account_id: Option<String>,
+    #[serde(default)]
+    pub credential_generation_id: Option<String>,
 }
 
 impl OperationalProofScopeV1 {
     #[must_use]
-    pub fn new(profile_id: Option<&str>, account_id: Option<&str>) -> Self {
+    pub fn new(
+        profile_id: Option<&str>,
+        account_id: Option<&str>,
+        credential_generation_id: Option<&str>,
+    ) -> Self {
         Self {
             profile_id: profile_id.map(str::to_owned),
             account_id: account_id.map(str::to_owned),
+            credential_generation_id: credential_generation_id.map(str::to_owned),
         }
     }
 }
@@ -4873,6 +4880,8 @@ pub struct OperationalProofV1 {
     pub input_hash: String,
     pub profile_id: Option<String>,
     pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_generation_id: Option<String>,
     pub outcome: OperationalProofOutcomeV1,
     pub evidence: EvidenceV1,
 }
@@ -4896,6 +4905,7 @@ impl OperationalProofV1 {
             input_hash: input_hash.to_owned(),
             profile_id: scope.profile_id,
             account_id: scope.account_id,
+            credential_generation_id: scope.credential_generation_id,
             outcome,
             evidence,
         }
@@ -4907,7 +4917,14 @@ impl OperationalProofV1 {
         now: DateTime<Utc>,
         current_catalog_hash: &str,
         max_age_seconds: u64,
+        current_credential_generation_id: Option<&str>,
     ) -> OperationalProofFreshnessV1 {
+        let Some(recorded_generation) = self.credential_generation_id.as_deref() else {
+            return OperationalProofFreshnessV1::CredentialUnbound;
+        };
+        if current_credential_generation_id != Some(recorded_generation) {
+            return OperationalProofFreshnessV1::CredentialDrifted;
+        }
         if self.catalog_hash != current_catalog_hash {
             return OperationalProofFreshnessV1::CatalogDrifted;
         }
@@ -4933,6 +4950,8 @@ impl OperationalProofV1 {
 pub enum OperationalProofFreshnessV1 {
     Fresh,
     Stale,
+    CredentialUnbound,
+    CredentialDrifted,
     CatalogDrifted,
     Failed,
     NotRecorded,
