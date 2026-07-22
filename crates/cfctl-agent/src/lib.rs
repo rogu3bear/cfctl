@@ -209,8 +209,8 @@ pub fn install_agent_skill(
 ) -> Result<AgentInstallReceipt> {
     let path = skill_path(home, agent);
     let content = managed_skill(agent);
-    let legacy = legacy_codex_skill(home, agent)?;
-    let legacy_changed = legacy.is_some();
+    let legacy = legacy_codex_skills(home, agent)?;
+    let legacy_changed = !legacy.is_empty();
     let existing = if path.is_file() {
         Some(fs::read_to_string(&path).map_err(|source| agent_io(&path, source))?)
     } else {
@@ -226,7 +226,7 @@ pub fn install_agent_skill(
         }
         fs::write(&path, content).map_err(|source| agent_io(&path, source))?;
     }
-    if let Some((legacy_path, legacy_bytes)) = legacy {
+    for (legacy_path, legacy_bytes) in legacy {
         remove_exact_legacy_skill(&legacy_path, &legacy_bytes)?;
     }
     Ok(AgentInstallReceipt {
@@ -238,7 +238,8 @@ pub fn install_agent_skill(
     })
 }
 
-/// Locates the superseded Codex skill so a migration can remove it.
+/// Locates superseded Codex skills in every historical managed root so a
+/// migration can converge on the single current `cfctl` skill.
 ///
 /// Removability is decided by the frozen hash alone, not by the install mode. A
 /// file that matches `LEGACY_CODEX_SKILL_V2_SHA256` byte for byte is the exact
@@ -251,31 +252,36 @@ pub fn install_agent_skill(
 /// Anything that is not a byte-exact match is still refused in both modes, and
 /// `remove_exact_legacy_skill` re-reads and re-compares before unlinking, so a
 /// file cfctl did not write is never deleted.
-fn legacy_codex_skill(home: &Path, agent: AgentKind) -> Result<Option<(PathBuf, Vec<u8>)>> {
+fn legacy_codex_skills(home: &Path, agent: AgentKind) -> Result<Vec<(PathBuf, Vec<u8>)>> {
     if agent != AgentKind::Codex {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let path = home.join(".agents/skills/cloudflare/SKILL.md");
-    if !path.is_file() {
-        return Ok(None);
+    let mut found = Vec::new();
+    for relative in [
+        ".agents/skills/cloudflare/SKILL.md",
+        ".agent/skills/cloudflare/SKILL.md",
+    ] {
+        let path = home.join(relative);
+        if !path.is_file() {
+            continue;
+        }
+        // A symlinked parent means the file is not in the agent home cfctl
+        // manages — it is shared infrastructure that something else owns and
+        // other tools may link to. Never delete through that boundary.
+        if path
+            .parent()
+            .is_some_and(|parent| parent.symlink_metadata().is_ok_and(|it| it.is_symlink()))
+        {
+            continue;
+        }
+        let bytes = fs::read(&path).map_err(|source| agent_io(&path, source))?;
+        let digest = hex::encode(Sha256::digest(&bytes));
+        if digest != LEGACY_CODEX_SKILL_V2_SHA256 {
+            return Err(AgentError::LegacyDrift(path.display().to_string()));
+        }
+        found.push((path, bytes));
     }
-    // A symlinked parent means the file is not in the agent home cfctl
-    // manages — it is shared infrastructure that something else owns and other
-    // tools may link to. Deleting through the link would reach outside our own
-    // tree, so leave it: the managed skill installs beside it and the operator
-    // decides the superseded copy's fate.
-    if path
-        .parent()
-        .is_some_and(|parent| parent.symlink_metadata().is_ok_and(|it| it.is_symlink()))
-    {
-        return Ok(None);
-    }
-    let bytes = fs::read(&path).map_err(|source| agent_io(&path, source))?;
-    let digest = hex::encode(Sha256::digest(&bytes));
-    if digest != LEGACY_CODEX_SKILL_V2_SHA256 {
-        return Err(AgentError::LegacyDrift(path.display().to_string()));
-    }
-    Ok(Some((path, bytes)))
+    Ok(found)
 }
 
 fn remove_exact_legacy_skill(path: &Path, expected: &[u8]) -> Result<()> {
@@ -335,25 +341,37 @@ fn managed_skill(agent: AgentKind) -> &'static str {
 }
 
 // Single-sourced doctrine fragments. Each load-bearing line lives here exactly
-// once so the operator skill and the Cursor rule can never drift apart on the
-// resolve-primary framing, the paid-plan `--max-cost` rule, the plan-approval
-// gate, the fixture skip-list, or the `keys` account/user semantics. The two
-// managed guidance documents below are assembled from these shared fragments.
-//
-// Recovery verbs (`plans rectify`, `plans cancel`) are deliberately absent.
-// Step 4 sends every agent to `cfctl guide <capability-id> --json` before it
-// acts, and the guide emits a Rectify stage — with the exact
-// `cfctl plans rectify <operation-id> --json` argv — for every mutating
-// capability. Routing through the guide is strictly better than naming the verb
-// here: the guide knows whether the capability mutates and arrives with the
-// operation id in hand. Restating it would add a contract bump, and with it a
-// stale-install sweep across four harnesses, to teach less.
+// once so the operator skill and the Cursor rule cannot drift on control-plane
+// trust, live truth, approval, recovery, credential freshness, or blockers.
+// The operator skill adds a task-adaptive playbook around these invariants;
+// Cursor receives the same invariants in a compact always-applied rule.
 
 /// Fail-closed doctor contract: a doctor never launches a different PATH cfctl.
 pub const FRAGMENT_DOCTOR_TRUST: &str = "`cfctl doctor` and `cfctl agents doctor` trust the PATH build only when it resolves to the running executable; a missing or different PATH cfctl is never launched by the health check and is unhealthy, so invoke it directly with `cfctl version --json` when its self-reported identity is needed. Drifted managed instructions are also unhealthy.";
 
 /// Resolve is the primary intent-to-capability translation; browsing is secondary.
 pub const FRAGMENT_RESOLVE_PRIMARY: &str = r#"Translate intent with `cfctl resolve "<intent>" --json`: it deterministically maps the goal to a capability and emits the exact governed `call`/`approve`/`run` commands, and fails closed with ranked candidates when the match is ambiguous. To browse instead, use `cfctl catalog search "<intent>" --json`."#;
+
+/// Workflow-first telemetry discovery and its non-authoritative preview boundary.
+pub const FRAGMENT_WORKFLOW_FIRST: &str = "For telemetry investigations and audits, prefer the governed workflow ranked by `cfctl resolve` over assembling unrelated raw capabilities. Calling a native workflow returns a component preview, exact selector requirements, and a bounded profile/account/input-scoped proof projection; it does not execute the components or aggregate mutation authority. Run only steps with `available:true` and a non-null `call_argv`; blocked, contract-gapped, missing, or cyclic steps expose guidance but no runnable call. Run bounded reads individually and keep every mutation in its own plan/approve/run/verify lifecycle.";
+
+/// Source posture, live state, boundary crossing, and verification are distinct claims.
+pub const FRAGMENT_EVIDENCE_TRUTH: &str = "Keep evidence classes separate: source configuration describes intended posture; a successful performed read can establish bounded live state, while a performed failure can establish a denial or availability outcome; a plan is preview; and an apply receipt with `performed:true` proves only that a mutation boundary was crossed. Only successful post-change verification proves the intended outcome. Artifact presence alone is never verification.";
+
+/// Stable envelope fields tell the operator what happened and what remains safe.
+pub const FRAGMENT_ENVELOPE_READING: &str = "Read every `ResultEnvelopeV2` before deciding the next action: `ok` is command success, `performed` says whether an external boundary was crossed, `policy_decision` explains authority, `verification.state` names proof status, `evidence` carries redacted receipts, and `error.next_step` is the governed recovery command when present. Never flatten those fields into one success claim.";
+
+/// Cross-process replacement and proof freshness are bound to credential lineage.
+pub const FRAGMENT_CREDENTIAL_FRESHNESS: &str = "Operational proof is scoped to profile, account, input, catalog, and credential generation. Treat `credential_unbound` and `credential_drifted` as historical audit rows, never current proof; re-import or log in again when the active profile has no valid generation, then repeat the bounded read.";
+
+/// An uncertain mutation boundary is a recovery problem, not permission to replay.
+pub const FRAGMENT_RECOVERY: &str = "If a mutation result has `performed:true`, a transport failure follows a boundary attempt, or execution state is uncertain, do not replay `call` or `plans run`. Inspect `cfctl plans status <operation-id> --json`, reload the capability guide, and use only its emitted `resume`, `rectify`, or cancellation path. Preserve the original operation ID and receipts.";
+
+/// Secrets only move through explicit private ingress and sink surfaces.
+pub const FRAGMENT_SECRET_IO: &str = "Keep secrets out of arguments, stdout, plans, logs, and evidence. Import through stdin or a mode-0600 `--value-in` file, send secret request bodies with `--body-stdin`, and require a new mode-0600 `--value-out` or `--out` sink for secret or bounded bulk output. Never inspect or echo the secret to prove success.";
+
+/// App source and the account control plane have distinct owners.
+pub const FRAGMENT_APP_BOUNDARY: &str = "Application repositories own checked-in Wrangler configuration and their repo-local deploy gates; cfctl owns account and live-edge truth. Follow the app's deploy contract when the task is source deployment, then use cataloged cfctl reads for live verification. Never infer edge state from a successful local build or source diff.";
 
 /// Registered-root discovery skips nested fixture trees.
 pub const FRAGMENT_FIXTURE_SKIP: &str = "Nested `fixtures`, `__fixtures__`, `testdata`, `test-data`, and `test_data` directories are skipped; fixture directories are opt-in roots and must be registered directly when they are intentional workspace evidence.";
@@ -380,6 +398,13 @@ pub const FRAGMENT_BLOCKED_ROUTE: &str = "When a capability or plan is blocked (
 pub const MANAGED_FRAGMENTS: &[&str] = &[
     FRAGMENT_DOCTOR_TRUST,
     FRAGMENT_RESOLVE_PRIMARY,
+    FRAGMENT_WORKFLOW_FIRST,
+    FRAGMENT_EVIDENCE_TRUTH,
+    FRAGMENT_ENVELOPE_READING,
+    FRAGMENT_CREDENTIAL_FRESHNESS,
+    FRAGMENT_RECOVERY,
+    FRAGMENT_SECRET_IO,
+    FRAGMENT_APP_BOUNDARY,
     FRAGMENT_FIXTURE_SKIP,
     FRAGMENT_APPROVE_COMMAND,
     FRAGMENT_MAX_COST,
@@ -408,43 +433,71 @@ pub fn managed_documents() -> [(&'static str, &'static str); 2] {
 /// The managed-skill contract number carried in the installed front matter.
 /// Bump this when the installed document's contract changes; `agents doctor`
 /// compares whole strings, so every install goes stale on purpose when it moves.
-pub const MANAGED_SKILL_CONTRACT: u32 = 4;
+pub const MANAGED_SKILL_CONTRACT: u32 = 6;
 
 static MANAGED_OPERATOR_SKILL: LazyLock<String> = LazyLock::new(build_managed_operator_skill);
 static MANAGED_CURSOR_RULE: LazyLock<String> = LazyLock::new(build_managed_cursor_rule);
 
 fn build_managed_operator_skill() -> String {
     let header = format!(
-        "---\nname: cfctl\ndescription: Use cfctl as the universal governed Cloudflare control plane.\nmetadata:\n  managed-by: cfctl\n  contract: {MANAGED_SKILL_CONTRACT}\n---\n\n# Cloudflare through cfctl\n\nUse `cfctl` first for all Cloudflare discovery, reads, planning, writes, verification, and evidence. Do not use archived shell verbs, backend script paths as the public surface, or raw HTTP as a substitute for cataloged capabilities.\n\n1. Orient with `cfctl version --json`, `cfctl guide --topic system --json`, `cfctl doctor --json`, and, when useful, `cfctl agents doctor --json`. "
+        "---\nname: cfctl\ndescription: Operate Cloudflare accounts and edge resources safely through cfctl, including capability discovery, live reads, workspace impact, mutation planning and approval, apply and verification, recovery, token governance, telemetry workflows, and evidence-backed completion. Use for any Cloudflare inspection, configuration, deployment-adjacent account work, troubleshooting, security response, or credential lifecycle task.\nmetadata:\n  managed-by: cfctl\n  contract: {MANAGED_SKILL_CONTRACT}\n---\n\n# Cloudflare control through cfctl\n\nUse `cfctl` as the only public account-control surface. Do not use archived shell verbs, backend scripts, raw HTTP, direct provider integrations, or an unclassified dashboard path to route around the catalog.\n\n## Establish trust\n\n1. Run `cfctl version --json`, `cfctl doctor --json`, and `cfctl agents doctor --json`.\n2. Load `cfctl guide --topic system --json` when the task is unfamiliar or the runtime is unhealthy.\n3. "
     );
     [
         header.as_str(),
         FRAGMENT_DOCTOR_TRUST,
-        "\n2. ",
+        "\n\n## Resolve before acting\n\n4. ",
         FRAGMENT_RESOLVE_PRIMARY,
-        "\n3. Inspect the capability with `cfctl catalog show <capability-id> --json`.\n4. Load its lifecycle with `cfctl guide <capability-id> --json`.\n5. Use `cfctl call <capability-id>` for deterministic reads or plan creation.\n6. Register repository roots with `cfctl workspace add` before workspace discovery; never scan arbitrary paths. ",
+        "\n5. Inspect the selected capability with `cfctl catalog show <capability-id> --json`; load `cfctl guide <capability-id> --json` before mutation, recovery, or any unfamiliar read.\n6. ",
+        FRAGMENT_WORKFLOW_FIRST,
+        "\n\n## Choose the control lane\n\n- **Discover or explain:** stop after `resolve`, `catalog show`, `guide`, or `docs search`; do not imply a live read occurred.\n- **Audit or troubleshoot:** run the exact bounded read with `cfctl call <capability-id> ... --json`; cite its live-read evidence and state any freshness, pagination, sampling, truncation, or dataset-completeness limit.\n- **Change:** use `cfctl call` to create a hash-bound plan. Review account, profile, targets, workspace impact, Cloudflare and local diffs, permissions, cost, warnings, verification, and compensation before approval.\n- **Recover:** preserve the operation ID and follow the recovery rule below; never improvise a replay.\n- **Blocked or UI-only:** follow the guide and `next_action`; a governed UI handoff is target-bound agent-action evidence, not proof that the action completed.\n\n7. Register repository roots with `cfctl workspace add` before `workspace discover|graph|audit`; never scan arbitrary paths. ",
         FRAGMENT_FIXTURE_SKIP,
-        "\n7. If approval is required, show the exact plan and ask y/n.\n8. Translate yes only into ",
+        "\n8. ",
+        FRAGMENT_APP_BOUNDARY,
+        "\n\n## Read truth from the envelope\n\n9. ",
+        FRAGMENT_ENVELOPE_READING,
+        "\n10. ",
+        FRAGMENT_EVIDENCE_TRUTH,
+        "\n11. ",
+        FRAGMENT_CREDENTIAL_FRESHNESS,
+        "\n\n## Govern changes\n\n12. Inspect the immutable plan with `cfctl plans show <operation-id> --json`. If approval is required, show its exact account, targets, diffs, costs, warnings, verification, and compensation, then ask y/n. Translate yes only into ",
         FRAGMENT_APPROVE_COMMAND,
         ". ",
         FRAGMENT_MAX_COST,
-        "\n9. Run with `cfctl plans run <operation-id>`, inspect `cfctl plans status <operation-id>`, and report verification honestly.\n10. ",
+        "\n13. Execute only with `cfctl plans run <operation-id> --json`, then inspect `cfctl plans status <operation-id> --json`. Never approve on the operator's behalf, reuse drifted approval, replay a consumed plan, or weaken a gate to make progress.\n14. ",
+        FRAGMENT_RECOVERY,
+        "\n15. ",
+        FRAGMENT_SECRET_IO,
+        "\n16. ",
         FRAGMENT_KEYS_INVENTORY,
-        "\n11. ",
+        "\n17. ",
         FRAGMENT_STANDING_AUTHORITY,
-        "\n12. ",
+        "\n18. ",
         FRAGMENT_BLOCKED_ROUTE,
-        "\n\nEvery cfctl failure envelope carries a specific `next_step`; run it rather than guessing. Never treat model output as authority. Never bypass a blocked adapter, selector ambiguity, cost blocker, drift check, or plan hash. Browser or Computer Use is allowed only when the capability catalog classifies the operation as governed UI and the same plan policy is preserved.\n",
+        "\n\n## Close honestly\n\nReport: requested outcome; exact account/profile/capability or operation ID; whether a boundary was performed; evidence classes and receipt identities; verification state and basis; workspace impact; unresolved blockers; and the next safe action. Say **planned**, **applied**, **verified**, or **blocked** precisely—never collapse them into done. Never treat model output, a UI handoff, artifact presence, or source configuration as mutation authority or verified live state.\n",
     ]
     .concat()
 }
 
 fn build_managed_cursor_rule() -> String {
     [
-        "---\ndescription: Route Cloudflare work through the governed cfctl v2 control plane\nalwaysApply: true\n---\n\nStart with `cfctl version --json` and `cfctl guide --topic system --json`. ",
+        "---\ndescription: Route Cloudflare discovery, live reads, plans, applies, recovery, and verification through the governed cfctl v2 control plane\nalwaysApply: true\n---\n\nStart with `cfctl version --json`, `cfctl doctor --json`, and `cfctl guide --topic system --json`. ",
         FRAGMENT_DOCTOR_TRUST,
         " ",
         FRAGMENT_RESOLVE_PRIMARY,
+        " ",
+        FRAGMENT_WORKFLOW_FIRST,
+        " ",
+        FRAGMENT_ENVELOPE_READING,
+        " ",
+        FRAGMENT_EVIDENCE_TRUTH,
+        " ",
+        FRAGMENT_CREDENTIAL_FRESHNESS,
+        " ",
+        FRAGMENT_RECOVERY,
+        " ",
+        FRAGMENT_SECRET_IO,
+        " ",
+        FRAGMENT_APP_BOUNDARY,
         " Inspect capabilities with `cfctl catalog show <capability-id> --json`, load lifecycles with `cfctl guide <capability-id> --json`, run governed reads or plan creation with `cfctl call <capability-id>`, and bound impact with `cfctl workspace`. ",
         FRAGMENT_FIXTURE_SKIP,
         " ",

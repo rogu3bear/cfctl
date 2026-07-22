@@ -2,15 +2,19 @@
 
 use cfctl_auth::AuthCredential;
 use cfctl_cloudflare::{
-    CallInput, CloudflareError, CloudflareResponseV1, Executor, RequestBuilder,
-    validate_request_contract,
+    CallInput, CloudflareError, CloudflareResponseV1, Executor, R2LogRetrievalCredentials,
+    RequestBuilder, validate_request_contract,
 };
 use cfctl_core::{
-    CapabilityV1, CreatedCollectionResourceContractV1, CreatedResourceContractV1,
-    DeletedResourceContractV1, PlanStatus, PlanV1, QuerySerializationV1, ResponseBodyModeV1,
-    ResponseContractV1, SamePathReadContractV1, SelectorContractV1, SelectorV1,
-    UpdatedResourceContractV1,
+    AnalyticsQueryContractV1, AnalyticsQueryKindV1, AsyncCollectionMutationContractV1,
+    CapabilityV1, CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
+    CreatedResourceContractV1, DeletedNestedResourceContractV1, DeletedResourceContractV1,
+    EffectClass, GraphqlAnalyticsContractV1, OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1,
+    QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
+    RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
+    TimestampFormatV1, UpdatedResourceContractV1,
 };
+use chrono::{Duration, SecondsFormat, Utc};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -18,8 +22,9 @@ use tokio::{
 };
 
 async fn json_response_sequence_server(
-    bodies: Vec<&'static str>,
+    bodies: Vec<impl Into<String>>,
 ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    let bodies = bodies.into_iter().map(Into::into).collect::<Vec<String>>();
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind fake server");
@@ -46,10 +51,13 @@ async fn json_response_sequence_server(
 }
 
 async fn single_raw_response_server(
-    status: &'static str,
-    content_type: &'static str,
-    body: &'static str,
+    status: impl Into<String>,
+    content_type: impl Into<String>,
+    body: impl Into<String>,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    let status = status.into();
+    let content_type = content_type.into();
+    let body = body.into();
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind fake server");
@@ -1521,6 +1529,1199 @@ async fn executor_enforces_pinned_empty_responses_and_success_statuses() {
     server.await.expect("server joins");
 }
 
+fn bounded_analytics_contract(kind: AnalyticsQueryKindV1) -> AnalyticsQueryContractV1 {
+    AnalyticsQueryContractV1 {
+        kind,
+        dataset: None,
+        dataset_pointer: Some("/dataset".to_owned()),
+        time_range: Some(TimeRangeContractV1 {
+            start_pointer: "/start".to_owned(),
+            end_pointer: "/end".to_owned(),
+            timestamp_format: TimestampFormatV1::Rfc3339,
+            max_lookback_seconds: 86_400,
+            max_window_seconds: 3_600,
+        }),
+        row_limit_pointer: Some("/limit".to_owned()),
+        max_rows: 3,
+        max_bytes: 1_024,
+        max_timeout_seconds: 30,
+        allowed_output_formats: vec![
+            OutputFormatV1::Json,
+            OutputFormatV1::Ndjson,
+            OutputFormatV1::Csv,
+        ],
+        default_output_format: OutputFormatV1::Ndjson,
+        pagination: PaginationModeV1::BoundedResult,
+        read_only: true,
+        freshness: Some("upstream reported".to_owned()),
+        sampling: Some("upstream reported".to_owned()),
+    }
+}
+
+fn bounded_query_body(format: &str, limit: u64) -> Value {
+    let end = Utc::now();
+    let start = end - Duration::minutes(10);
+    json!({
+        "dataset":"worker_events",
+        "start":start.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "end":end.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "columns":["blob1"],
+        "aggregates":[{"function":"count","alias":"rows"}],
+        "filters":[],
+        "group_by":["blob1"],
+        "order_by":[{"field":"blob1","direction":"asc"}],
+        "limit":limit,
+        "format":format,
+        "timeout_seconds":10
+    })
+}
+
+fn structured_sql_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "analytics-engine-sql-query-get",
+        "Run bounded Analytics Engine SQL",
+        "GET",
+        "/accounts/{account_id}/analytics_engine/sql",
+    );
+    capability.analytics_query = Some(bounded_analytics_contract(
+        AnalyticsQueryKindV1::StructuredSql,
+    ));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec![
+            "application/json".to_owned(),
+            "application/x-ndjson".to_owned(),
+            "text/csv".to_owned(),
+        ],
+        body_mode: ResponseBodyModeV1::NegotiatedRows,
+    });
+    capability.selectors = vec![SelectorV1 {
+        name: "account_id".to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }];
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["dataset","start","end","columns","limit","format","timeout_seconds"],
+        "properties":{
+            "dataset":{"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"},
+            "start":{"type":"string","format":"date-time"},
+            "end":{"type":"string","format":"date-time"},
+            "columns":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"string"}},
+            "aggregates":{"type":"array"},
+            "filters":{"type":"array"},
+            "group_by":{"type":"array"},
+            "order_by":{"type":"array"},
+            "limit":{"type":"integer","minimum":1,"maximum":3},
+            "format":{"type":"string","enum":["json","ndjson","csv"]},
+            "timeout_seconds":{"type":"integer","minimum":1,"maximum":30}
+        },
+        "x-cfctl-body-required":true
+    }));
+    capability
+}
+
+fn r2_log_retrieval_capability(max_bytes: u64) -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "logpull-retrieve-logs",
+        "Retrieve logs",
+        "GET",
+        "/accounts/{account_id}/logs/retrieve",
+    );
+    "Logpull".clone_into(&mut capability.product);
+    capability.permissions = vec!["Logs Read".to_owned()];
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "start".to_owned(),
+            location: "query".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "end".to_owned(),
+            location: "query".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "bucket".to_owned(),
+            location: "query".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+        SelectorV1 {
+            name: "prefix".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        },
+    ];
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::JsonValue,
+    });
+    capability.r2_log_retrieval = Some(R2LogRetrievalContractV1 {
+        access_key_input_field: "access_key_id".to_owned(),
+        secret_access_key_input_field: "secret_access_key".to_owned(),
+        access_key_header: "R2-Access-Key-Id".to_owned(),
+        secret_access_key_header: "R2-Secret-Access-Key".to_owned(),
+        start_query_selector: "start".to_owned(),
+        end_query_selector: "end".to_owned(),
+        bucket_query_selector: "bucket".to_owned(),
+        prefix_query_selector: "prefix".to_owned(),
+        max_lookback_seconds: 10 * 365 * 24 * 60 * 60,
+        max_window_seconds: 3_600,
+        max_bytes,
+        max_timeout_seconds: 120,
+        output_media_types: vec!["application/json".to_owned()],
+        requires_new_mode_0600_file: true,
+    });
+    capability
+}
+
+fn r2_log_retrieval_input() -> CallInput {
+    let end = Utc::now();
+    let start = end - Duration::minutes(5);
+    CallInput {
+        selectors: json!({"account_id":"account-1"}),
+        query: json!({
+            "start":start.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "end":end.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "bucket":"cloudflare-logs",
+            "prefix":"http_requests/example.com/{DATE}"
+        }),
+        ..CallInput::default()
+    }
+}
+
+fn log_explorer_capability() -> CapabilityV1 {
+    let mut capability = structured_sql_capability();
+    "zones-logs-explorer-query-post".clone_into(&mut capability.id);
+    "POST".clone_into(&mut capability.method);
+    "/zones/{zone_id}/logs/explorer/query/sql".clone_into(&mut capability.path);
+    "zone_id".clone_into(&mut capability.selectors[0].name);
+    let query = capability
+        .analytics_query
+        .as_mut()
+        .expect("analytics contract");
+    query.kind = AnalyticsQueryKindV1::LogExplorerSql;
+    query.allowed_output_formats = vec![OutputFormatV1::Json];
+    query.default_output_format = OutputFormatV1::Json;
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    let schema = capability
+        .request_schema
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .expect("request schema");
+    schema
+        .get_mut("required")
+        .and_then(Value::as_array_mut)
+        .expect("required")
+        .retain(|field| field.as_str() != Some("format"));
+    schema
+        .get_mut("required")
+        .and_then(Value::as_array_mut)
+        .expect("required")
+        .push(json!("timestamp_field"));
+    let properties = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("properties");
+    properties.remove("format");
+    properties.insert(
+        "timestamp_field".to_owned(),
+        json!({"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$"}),
+    );
+    capability
+}
+
+fn bounded_log_explorer_body(limit: u64) -> Value {
+    let mut body = bounded_query_body("json", limit);
+    body.as_object_mut().expect("body object").remove("format");
+    body["timestamp_field"] = json!("EdgeStartTimestamp");
+    body
+}
+
+#[test]
+fn request_builder_renders_only_structured_read_only_analytics_sql() {
+    let capability = structured_sql_capability();
+    let request = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build(
+            &capability,
+            &CallInput {
+                selectors: json!({"account_id":"account-1"}),
+                body: Some(bounded_query_body("ndjson", 3)),
+                ..CallInput::default()
+            },
+        )
+        .expect("structured query should render");
+    let sql = request
+        .url
+        .query_pairs()
+        .find_map(|(name, value)| (name == "query").then_some(value.into_owned()))
+        .expect("rendered SQL query");
+    assert!(sql.starts_with("SELECT "));
+    assert!(sql.contains("FROM worker_events"));
+    assert!(sql.contains("timestamp >= toDateTime64("));
+    assert!(sql.ends_with("LIMIT 3 FORMAT JSONEachRow"));
+    assert!(!sql.contains(';'));
+    assert!(
+        request.body.is_none(),
+        "typed input must not be sent as a GET body"
+    );
+    assert_eq!(
+        request
+            .headers
+            .get("accept")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-ndjson")
+    );
+
+    let mut invalid = bounded_query_body("ndjson", 3);
+    invalid["dataset"] = json!("events; DROP TABLE events");
+    let error = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build(
+            &capability,
+            &CallInput {
+                selectors: json!({"account_id":"account-1"}),
+                body: Some(invalid),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("untyped SQL fragments must fail closed");
+    assert!(matches!(error, CloudflareError::InvalidAnalyticsQuery(_)));
+}
+
+#[tokio::test]
+async fn log_explorer_uses_only_compiler_rendered_text_sql_and_bounds_enveloped_rows() {
+    let capability = log_explorer_capability();
+    let input = CallInput {
+        selectors: json!({"zone_id":"zone-1"}),
+        body: Some(bounded_log_explorer_body(2)),
+        ..CallInput::default()
+    };
+    let request = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build(&capability, &input)
+        .expect("typed Log Explorer query");
+    let sql = request.text_body.as_deref().expect("compiled text body");
+    assert!(sql.starts_with("SELECT "));
+    assert!(sql.contains("FROM worker_events"));
+    assert!(sql.contains("EdgeStartTimestamp >= '"));
+    assert!(sql.ends_with("LIMIT 2"));
+    assert!(!sql.contains(';'));
+    assert!(request.url.query().is_none());
+    assert!(request.body.is_none());
+    assert_eq!(
+        request
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"errors":[],"messages":[],"result":[{"row":1},{"row":2},{"row":3}]}"#,
+    ])
+    .await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &input,
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("bounded Log Explorer response");
+    assert_eq!(response.result.as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        response
+            .result_info
+            .as_ref()
+            .and_then(|value| value.pointer("/output/truncated")),
+        Some(&json!(true))
+    );
+    let requests = server.await.expect("server joins");
+    assert!(
+        requests[0]
+            .to_ascii_lowercase()
+            .contains("content-type: text/plain")
+    );
+    assert!(requests[0].contains("SELECT "));
+}
+
+fn graphql_http_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "graphql-analytics-zone-http-requests",
+        "Query zone HTTP analytics",
+        "POST",
+        "/graphql",
+    );
+    capability.mutating = false;
+    let mut query = bounded_analytics_contract(AnalyticsQueryKindV1::GraphqlAnalytics);
+    query.dataset = Some("httpRequestsAdaptiveGroups".to_owned());
+    query.allowed_output_formats = vec![OutputFormatV1::Json];
+    query.default_output_format = OutputFormatV1::Json;
+    capability.analytics_query = Some(query);
+    let mut graphql = GraphqlAnalyticsContractV1 {
+        operation_name: "CfctlZoneHttp".to_owned(),
+        document: "query CfctlZoneHttp($zoneTag: string, $start: Time, $end: Time, $limit: Int) { viewer { zones(filter: {zoneTag: $zoneTag}) { series: httpRequestsAdaptiveGroups(filter: {datetime_geq: $start, datetime_lt: $end}, limit: $limit, orderBy: [datetimeHour_ASC]) { count } } } }".to_owned(),
+        dataset: "httpRequestsAdaptiveGroups".to_owned(),
+        selector_variables: [("zone_id".to_owned(), "zoneTag".to_owned())]
+            .into_iter()
+            .collect(),
+        body_variables: [
+            ("start".to_owned(), "start".to_owned()),
+            ("end".to_owned(), "end".to_owned()),
+            ("limit".to_owned(), "limit".to_owned()),
+        ]
+        .into_iter()
+        .collect(),
+        response_data_pointer: "/viewer/zones/0/series".to_owned(),
+        expected_row_fields: vec!["count".to_owned()],
+        cursor_fields: Vec::new(),
+        cursor_input_pointer: None,
+        cursor_input_pointers: std::collections::BTreeMap::new(),
+        schema_fingerprint: String::new(),
+    };
+    graphql.refresh_schema_fingerprint().expect("fingerprint");
+    capability.graphql = Some(graphql);
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::GraphqlJson,
+    });
+    capability.selectors = vec![SelectorV1 {
+        name: "zone_id".to_owned(),
+        location: "graphql".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }];
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["dataset","start","end","limit"],
+        "properties":{
+            "dataset":{"type":"string","enum":["httpRequestsAdaptiveGroups"]},
+            "start":{"type":"string","format":"date-time"},
+            "end":{"type":"string","format":"date-time"},
+            "limit":{"type":"integer","minimum":1,"maximum":3}
+        },
+        "x-cfctl-body-required":true
+    }));
+    capability
+}
+
+fn graphql_firewall_capability() -> CapabilityV1 {
+    let mut capability = graphql_http_capability();
+    "graphql-analytics-zone-firewall-events".clone_into(&mut capability.id);
+    let query = capability
+        .analytics_query
+        .as_mut()
+        .expect("analytics contract");
+    query.dataset = Some("firewallEventsAdaptive".to_owned());
+    query.pagination = PaginationModeV1::BoundedResult;
+    query.sampling = Some(
+        "sampled bounded page; dataset completeness and lossless continuation are not claimed"
+            .to_owned(),
+    );
+    let graphql = capability.graphql.as_mut().expect("GraphQL contract");
+    "CfctlZoneFirewallEvents".clone_into(&mut graphql.operation_name);
+    "query CfctlZoneFirewallEvents($zoneTag: string!, $start: Time!, $end: Time!, $limit: Int!) { viewer { zones(filter: {zoneTag: $zoneTag}) { series: firewallEventsAdaptive(filter: {datetime_geq: $start, datetime_lt: $end}, limit: $limit, orderBy: [datetime_ASC, rayName_ASC]) { datetime rayName } } } }".clone_into(&mut graphql.document);
+    "firewallEventsAdaptive".clone_into(&mut graphql.dataset);
+    graphql.expected_row_fields = vec!["datetime".to_owned(), "rayName".to_owned()];
+    graphql.cursor_fields.clear();
+    graphql.cursor_input_pointer = None;
+    graphql.cursor_input_pointers.clear();
+    graphql.refresh_schema_fingerprint().expect("fingerprint");
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["dataset","start","end","limit"],
+        "properties":{
+            "dataset":{"type":"string","enum":["firewallEventsAdaptive"]},
+            "start":{"type":"string","format":"date-time"},
+            "end":{"type":"string","format":"date-time"},
+            "limit":{"type":"integer","minimum":1,"maximum":3}
+        },
+        "x-cfctl-body-required":true
+    }));
+    capability
+}
+
+fn graphql_unique_test_cursor_capability() -> CapabilityV1 {
+    let mut capability = graphql_firewall_capability();
+    let query = capability
+        .analytics_query
+        .as_mut()
+        .expect("analytics contract");
+    query.dataset = Some("syntheticUniqueEvents".to_owned());
+    query.pagination = PaginationModeV1::OrderedKeyset;
+    query.sampling = None;
+    let graphql = capability.graphql.as_mut().expect("GraphQL contract");
+    "CfctlSyntheticUniqueEvents".clone_into(&mut graphql.operation_name);
+    "query CfctlSyntheticUniqueEvents($zoneTag: string!, $start: Time!, $end: Time!, $after: Time!, $afterEventId: string!, $limit: Int!) { viewer { zones(filter: {zoneTag: $zoneTag}) { series: syntheticUniqueEvents(filter: {datetime_geq: $start, datetime_lt: $end, OR: [{datetime_gt: $after}, {datetime: $after, eventId_gt: $afterEventId}]}, limit: $limit, orderBy: [datetime_ASC, eventId_ASC]) { datetime eventId } } } }".clone_into(&mut graphql.document);
+    "syntheticUniqueEvents".clone_into(&mut graphql.dataset);
+    graphql
+        .body_variables
+        .insert("after".to_owned(), "after".to_owned());
+    graphql
+        .body_variables
+        .insert("after_event_id".to_owned(), "afterEventId".to_owned());
+    graphql.expected_row_fields = vec!["datetime".to_owned(), "eventId".to_owned()];
+    graphql.cursor_fields = vec!["datetime".to_owned(), "eventId".to_owned()];
+    graphql.cursor_input_pointers = [
+        ("datetime".to_owned(), "/after".to_owned()),
+        ("eventId".to_owned(), "/after_event_id".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    graphql.refresh_schema_fingerprint().expect("fingerprint");
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["dataset","start","end","after","after_event_id","limit"],
+        "properties":{
+            "dataset":{"type":"string","enum":["syntheticUniqueEvents"]},
+            "start":{"type":"string","format":"date-time"},
+            "end":{"type":"string","format":"date-time"},
+            "after":{"type":"string","format":"date-time"},
+            "after_event_id":{"type":"string"},
+            "limit":{"type":"integer","minimum":1,"maximum":3}
+        },
+        "x-cfctl-body-required":true
+    }));
+    capability
+}
+
+fn assert_bounded_sample_receipt(response: &CloudflareResponseV1) {
+    let info = response.result_info.as_ref().expect("result info");
+    assert!(response.success);
+    assert_eq!(response.result.as_array().map(Vec::len), Some(2));
+    assert!(
+        info.get("continuation").is_none(),
+        "Security Events must not issue a cursor that can omit duplicate event keys"
+    );
+    assert_eq!(
+        info.pointer("/coverage/classification"),
+        Some(&json!("bounded_sample"))
+    );
+    assert_eq!(info.pointer("/coverage/limit_reached"), Some(&json!(true)));
+    assert_eq!(
+        info.pointer("/coverage/dataset_completeness"),
+        Some(&json!("not_proven"))
+    );
+    assert_eq!(
+        info.pointer("/query/pagination"),
+        Some(&json!("bounded_result"))
+    );
+    assert!(
+        info.pointer("/query/sampling")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.contains("lossless continuation are not claimed"))
+    );
+}
+
+#[tokio::test]
+async fn executor_sends_only_the_pinned_graphql_document_and_detects_response_drift() {
+    let capability = graphql_http_capability();
+    let body = bounded_query_body("ndjson", 2);
+    let graphql_body = json!({
+        "dataset":"httpRequestsAdaptiveGroups",
+        "start":body["start"],
+        "end":body["end"],
+        "limit":2
+    });
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"data":{"viewer":{"zones":[{"series":[{"count":2}]}]}},"errors":null}"#,
+    ])
+    .await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &CallInput {
+            selectors: json!({"zone_id":"zone-1"}),
+            body: Some(graphql_body.clone()),
+            ..CallInput::default()
+        },
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("GraphQL response");
+    assert!(response.success);
+    assert_eq!(response.result, json!([{"count":2}]));
+    let requests = server.await.expect("server joins");
+    assert!(requests[0].contains("CfctlZoneHttp"));
+    assert!(requests[0].contains("\"zoneTag\":\"zone-1\""));
+    assert!(!requests[0].contains("mutation"));
+
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"data":{"viewer":{"zones":[{"series":[{"unexpected":2}]}]}},"errors":null}"#,
+    ])
+    .await;
+    let error = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &CallInput {
+            selectors: json!({"zone_id":"zone-1"}),
+            body: Some(graphql_body),
+            ..CallInput::default()
+        },
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect_err("response schema drift must fail closed");
+    assert!(matches!(error, CloudflareError::GraphqlSchemaDrift { .. }));
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn graphql_firewall_events_are_one_bounded_sample_without_continuation() {
+    let capability = graphql_firewall_capability();
+    let end = Utc::now();
+    let start = end - Duration::minutes(10);
+    let event_time = start + Duration::minutes(1);
+    let event_time = event_time.to_rfc3339_opts(SecondsFormat::Secs, true);
+    let input_body = json!({
+        "dataset":"firewallEventsAdaptive",
+        "start":start.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "end":end.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "limit":2
+    });
+    let (address, server) = json_response_sequence_server(vec![
+        json!({
+            "data":{"viewer":{"zones":[{"series":[
+                {"datetime":event_time,"rayName":"ray-shared"},
+                {"datetime":event_time,"rayName":"ray-shared"}
+            ]}]}}
+        })
+        .to_string(),
+    ])
+    .await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &CallInput {
+            selectors: json!({"zone_id":"zone-1"}),
+            body: Some(input_body.clone()),
+            ..CallInput::default()
+        },
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("bounded sampled GraphQL response");
+    assert_bounded_sample_receipt(&response);
+    let requests = server.await.expect("server joins");
+    assert!(requests[0].contains("orderBy: [datetime_ASC, rayName_ASC]"));
+    assert!(!requests[0].contains("afterRayName"));
+    assert!(!requests[0].contains("datetime_gt"));
+
+    let mut legacy_body = input_body;
+    legacy_body["after"] = legacy_body["start"].clone();
+    legacy_body["after_ray_name"] = json!("ray-shared");
+    RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build(
+            &capability,
+            &CallInput {
+                selectors: json!({"zone_id":"zone-1"}),
+                body: Some(legacy_body),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("undeclared continuation inputs must fail closed");
+}
+
+#[tokio::test]
+async fn graphql_ordered_keyset_binds_each_field_for_a_unique_test_cursor() {
+    let capability = graphql_unique_test_cursor_capability();
+    let end = Utc::now();
+    let start = end - Duration::minutes(10);
+    let event_time = (start + Duration::minutes(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let input_body = json!({
+        "dataset":"syntheticUniqueEvents",
+        "start":start.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "end":end.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "after":start.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "after_event_id":"",
+        "limit":2
+    });
+    let (address, server) = json_response_sequence_server(vec![
+        json!({
+            "data":{"viewer":{"zones":[{"series":[
+                {"datetime":event_time,"eventId":"event-a"},
+                {"datetime":event_time,"eventId":"event-b"}
+            ]}]}}
+        })
+        .to_string(),
+    ])
+    .await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &CallInput {
+            selectors: json!({"zone_id":"zone-1"}),
+            body: Some(input_body.clone()),
+            ..CallInput::default()
+        },
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("unique ordered keyset response");
+    let next_body_patch = response
+        .result_info
+        .as_ref()
+        .and_then(|value| value.pointer("/continuation/next_body_patch"))
+        .and_then(Value::as_object)
+        .cloned()
+        .expect("composite continuation patch");
+    assert_eq!(next_body_patch.get("after"), Some(&json!(event_time)));
+    assert_eq!(
+        next_body_patch.get("after_event_id"),
+        Some(&json!("event-b"))
+    );
+    let requests = server.await.expect("server joins");
+    assert!(requests[0].contains("orderBy: [datetime_ASC, eventId_ASC]"));
+
+    let mut incomplete = capability;
+    let graphql = incomplete.graphql.as_mut().expect("GraphQL contract");
+    graphql.cursor_input_pointers.clear();
+    graphql.cursor_input_pointer = Some("/after".to_owned());
+    graphql
+        .refresh_schema_fingerprint()
+        .expect("legacy fingerprint");
+    let error = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build(
+            &incomplete,
+            &CallInput {
+                selectors: json!({"zone_id":"zone-1"}),
+                body: Some(input_body),
+                ..CallInput::default()
+            },
+        )
+        .expect_err("a multi-field cursor cannot use one legacy input pointer");
+    assert!(matches!(error, CloudflareError::InvalidAnalyticsQuery(_)));
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one streaming matrix covers row, byte, malformed-record, partial-stream, and private-file receipts"
+)]
+async fn executor_streams_ndjson_with_limits_partial_failures_and_private_file_receipts() {
+    let capability = structured_sql_capability();
+    let credential = AuthCredential::Bearer {
+        token: "selected-token".to_owned(),
+    };
+
+    let (address, server) = single_raw_response_server(
+        "200 OK",
+        "application/x-ndjson",
+        "{\"row\":1}\n{\"row\":2}\n{malformed}\n",
+    )
+    .await;
+    let partial = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &CallInput {
+            selectors: json!({"account_id":"account-1"}),
+            body: Some(bounded_query_body("ndjson", 3)),
+            ..CallInput::default()
+        },
+        &credential,
+    )
+    .await
+    .expect("malformed stream is a deterministic partial envelope");
+    assert!(!partial.success);
+    assert_eq!(partial.result, json!([{"row":1},{"row":2}]));
+    assert_eq!(
+        partial
+            .result_info
+            .as_ref()
+            .and_then(|v| v.pointer("/output/partial"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(partial.errors.len(), 1);
+    assert!(!partial.errors[0].message.contains("malformed"));
+    server.await.expect("server joins");
+
+    let (address, server) = single_raw_response_server(
+        "200 OK",
+        "application/x-ndjson",
+        "{\"row\":1}\n{\"row\":2}\n{\"row\":3}\n",
+    )
+    .await;
+    let truncated = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &CallInput {
+            selectors: json!({"account_id":"account-1"}),
+            body: Some(bounded_query_body("ndjson", 2)),
+            ..CallInput::default()
+        },
+        &credential,
+    )
+    .await
+    .expect("row limit is a successful truncated receipt");
+    assert!(truncated.success);
+    assert_eq!(truncated.result.as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        truncated
+            .result_info
+            .as_ref()
+            .and_then(|v| v.pointer("/output/truncated"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    server.await.expect("server joins");
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = directory.path().join("analytics.ndjson");
+    let (address, server) = single_raw_response_server(
+        "200 OK",
+        "application/x-ndjson",
+        "{\"row\":1}\n{\"row\":2}\n",
+    )
+    .await;
+    let receipt = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read_to_file(
+        &capability,
+        &CallInput {
+            selectors: json!({"account_id":"account-1"}),
+            body: Some(bounded_query_body("ndjson", 3)),
+            ..CallInput::default()
+        },
+        &credential,
+        &output,
+    )
+    .await
+    .expect("private output receipt");
+    assert!(receipt.success);
+    assert!(
+        receipt
+            .result
+            .pointer("/output_file/sha256")
+            .and_then(Value::as_str)
+            .is_some()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&output).expect("output"),
+        "{\"row\":1}\n{\"row\":2}\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&output)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn r2_log_retrieval_injects_only_ephemeral_headers_and_returns_a_private_file_receipt() {
+    let capability = r2_log_retrieval_capability(1024);
+    let input = r2_log_retrieval_input();
+    let credential = AuthCredential::Bearer {
+        token: "selected-api-token".to_owned(),
+    };
+    let r2_credentials =
+        R2LogRetrievalCredentials::new("r2-access-test".to_owned(), "r2-secret-test".to_owned())
+            .expect("valid ephemeral credentials");
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = directory.path().join("retrieved.ndjson");
+    let body = "{\"RayID\":\"one\"}\n{\"RayID\":\"two\"}\n";
+    let (address, server) = json_response_sequence_server(vec![body]).await;
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let response = executor
+        .execute_r2_log_retrieval_to_file(
+            &capability,
+            &input,
+            &credential,
+            &r2_credentials,
+            &output,
+        )
+        .await
+        .expect("bounded retrieval");
+    assert!(response.success);
+    assert_eq!(std::fs::read_to_string(&output).expect("output"), body);
+    assert_eq!(
+        response.result.pointer("/output_file/complete"),
+        Some(&json!(true))
+    );
+    assert!(
+        response
+            .result_info
+            .as_ref()
+            .and_then(|value| value.pointer("/query/bucket_sha256"))
+            .and_then(Value::as_str)
+            .is_some()
+    );
+    let serialized = serde_json::to_string(&response).expect("serialize receipt");
+    for secret in ["r2-access-test", "r2-secret-test", "cloudflare-logs"] {
+        assert!(!serialized.contains(secret));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&output)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let requests = server.await.expect("server joins");
+    let request = requests.first().expect("request captured");
+    assert!(
+        request
+            .lines()
+            .any(|line| { line.eq_ignore_ascii_case("r2-access-key-id: r2-access-test") })
+    );
+    assert!(
+        request
+            .lines()
+            .any(|line| { line.eq_ignore_ascii_case("r2-secret-access-key: r2-secret-test") })
+    );
+    assert!(
+        request
+            .lines()
+            .any(|line| { line.eq_ignore_ascii_case("authorization: Bearer selected-api-token") })
+    );
+    assert!(request.starts_with("GET /client/v4/accounts/account-1/logs/retrieve?"));
+    assert!(!format!("{r2_credentials:?}").contains("r2-secret-test"));
+}
+
+#[tokio::test]
+async fn r2_log_retrieval_fails_closed_without_the_specialized_path_and_on_byte_truncation() {
+    let capability = r2_log_retrieval_capability(24);
+    let input = r2_log_retrieval_input();
+    let credential = AuthCredential::Bearer {
+        token: "selected-api-token".to_owned(),
+    };
+    let no_bundle = Executor::new(reqwest::Client::new(), "http://127.0.0.1:9/client/v4")
+        .expect("executor")
+        .execute_read(&capability, &input, &credential)
+        .await
+        .expect_err("ordinary executor cannot omit the R2 bundle");
+    assert!(matches!(
+        no_bundle,
+        CloudflareError::R2LogCredentialsRequired
+    ));
+
+    let r2_credentials =
+        R2LogRetrievalCredentials::new("r2-access".to_owned(), "r2-secret".to_owned())
+            .expect("credentials");
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = directory.path().join("partial.ndjson");
+    let body = format!("{{\"payload\":\"{}\"}}\n", "x".repeat(100));
+    let (address, server) = json_response_sequence_server(vec![body]).await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_r2_log_retrieval_to_file(&capability, &input, &credential, &r2_credentials, &output)
+    .await
+    .expect("truncation becomes a receipt");
+    assert!(!response.success);
+    assert_eq!(std::fs::metadata(&output).expect("output").len(), 24);
+    assert_eq!(
+        response
+            .result_info
+            .as_ref()
+            .and_then(|value| value.pointer("/output/truncated")),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        response.result.pointer("/output_file/complete"),
+        Some(&json!(false))
+    );
+    server.await.expect("server joins");
+}
+
+#[test]
+fn r2_log_retrieval_rejects_unbounded_windows_bad_buckets_and_catalog_grafts() {
+    let capability = r2_log_retrieval_capability(1024);
+    let mut input = r2_log_retrieval_input();
+    input.query["bucket"] = json!("Bad_Bucket");
+    let error = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build(&capability, &input)
+        .expect_err("bad bucket");
+    assert!(matches!(error, CloudflareError::InvalidR2LogRetrieval(_)));
+
+    let mut long_window = r2_log_retrieval_input();
+    let end = Utc::now();
+    long_window.query["start"] =
+        json!((end - Duration::hours(2)).to_rfc3339_opts(SecondsFormat::Secs, true));
+    long_window.query["end"] = json!(end.to_rfc3339_opts(SecondsFormat::Secs, true));
+    let error = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build(&capability, &long_window)
+        .expect_err("long window");
+    assert!(matches!(error, CloudflareError::InvalidR2LogRetrieval(_)));
+
+    let mut graft = capability;
+    graft.id = "arbitrary-r2-download".to_owned();
+    let error = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build(&graft, &r2_log_retrieval_input())
+        .expect_err("contract cannot be grafted");
+    assert!(matches!(error, CloudflareError::InvalidR2LogRetrieval(_)));
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one negotiation matrix proves JSON, CSV, empty, malformed, and byte-bounded responses"
+)]
+async fn executor_negotiates_json_csv_empty_and_byte_bounded_analytics_results() {
+    let capability = structured_sql_capability();
+    let credential = AuthCredential::Bearer {
+        token: "selected-token".to_owned(),
+    };
+
+    let (address, server) =
+        single_raw_response_server("200 OK", "application/json", "[{\"row\":1},{\"row\":2}]").await;
+    let json_response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &CallInput {
+            selectors: json!({"account_id":"account-1"}),
+            body: Some(bounded_query_body("json", 3)),
+            ..CallInput::default()
+        },
+        &credential,
+    )
+    .await
+    .expect("JSON analytics response");
+    assert_eq!(json_response.result.as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        json_response
+            .result_info
+            .as_ref()
+            .and_then(|value| value.pointer("/output/format")),
+        Some(&json!("json"))
+    );
+    server.await.expect("server joins");
+
+    let (address, server) =
+        single_raw_response_server("200 OK", "text/csv; charset=utf-8", "row,value\n1,a\n2,b\n")
+            .await;
+    let csv_response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &CallInput {
+            selectors: json!({"account_id":"account-1"}),
+            body: Some(bounded_query_body("csv", 3)),
+            ..CallInput::default()
+        },
+        &credential,
+    )
+    .await
+    .expect("CSV analytics response");
+    assert!(csv_response.success);
+    assert_eq!(
+        csv_response
+            .result_info
+            .as_ref()
+            .and_then(|value| value.pointer("/output/rows")),
+        Some(&json!(2))
+    );
+    server.await.expect("server joins");
+
+    let (address, server) = single_raw_response_server("200 OK", "application/x-ndjson", "").await;
+    let empty = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &CallInput {
+            selectors: json!({"account_id":"account-1"}),
+            body: Some(bounded_query_body("ndjson", 3)),
+            ..CallInput::default()
+        },
+        &credential,
+    )
+    .await
+    .expect("empty NDJSON response");
+    assert_eq!(empty.result, json!([]));
+    assert!(empty.success);
+    server.await.expect("server joins");
+
+    let mut large_capability = capability.clone();
+    large_capability
+        .analytics_query
+        .as_mut()
+        .expect("analytics contract")
+        .max_rows = 100;
+    large_capability.request_schema.as_mut().expect("schema")["properties"]["limit"]["maximum"] =
+        json!(100);
+    let oversized = format!("{{\"payload\":\"{}\"}}\n", "x".repeat(1_100));
+    let (address, server) =
+        single_raw_response_server("200 OK", "application/x-ndjson", &oversized).await;
+    let bounded = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &large_capability,
+        &CallInput {
+            selectors: json!({"account_id":"account-1"}),
+            body: Some(bounded_query_body("ndjson", 100)),
+            ..CallInput::default()
+        },
+        &credential,
+    )
+    .await
+    .expect("byte-bounded stream receipt");
+    assert_eq!(
+        bounded
+            .result_info
+            .as_ref()
+            .and_then(|value| value.pointer("/output/truncated")),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        bounded
+            .result_info
+            .as_ref()
+            .and_then(|value| value.pointer("/output/bytes")),
+        Some(&json!(1_024))
+    );
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn executor_rejects_a_success_media_type_not_declared_by_the_capability() {
+    let mut capability = structured_sql_capability();
+    capability
+        .response_contract
+        .as_mut()
+        .expect("response contract")
+        .success_media_types = vec!["application/x-ndjson".to_owned()];
+    let (address, server) = single_raw_response_server("200 OK", "application/json", "[]").await;
+    let error = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &CallInput {
+            selectors: json!({"account_id":"account-1"}),
+            body: Some(bounded_query_body("json", 3)),
+            ..CallInput::default()
+        },
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect_err("undeclared JSON representation must fail closed");
+    assert!(matches!(
+        error,
+        CloudflareError::UnexpectedResponseMediaType { status: 200, .. }
+    ));
+    server.await.expect("server joins");
+}
+
 #[test]
 fn request_builder_rejects_an_unsupported_pinned_response_contract() {
     let mut capability = CapabilityV1::new("object-read", "Read object", "GET", "/object");
@@ -2820,6 +4021,730 @@ async fn created_resource_is_verified_through_a_complete_parent_collection() {
             && !request.contains("mutation_mode")
             && !request.contains("mutation-etag")
     }));
+}
+
+fn worker_tail_create_plan(body: Option<Value>) -> PlanV1 {
+    let mut plan = dns_record_plan(
+        "worker-tail-logs-start-tail",
+        "POST",
+        "/accounts/{account_id}/workers/scripts/{script_name}/tails",
+        "worker_tail_collection_contains_created_lease_id",
+        json!({"account_id":"account-1", "script_name":"edge-worker"}),
+        body,
+    );
+    "Worker Tail Logs".clone_into(&mut plan.capability.product);
+    "account".clone_into(&mut plan.capability.account_scope);
+    plan.capability.permissions = vec![
+        "Workers Tail Read".to_owned(),
+        "Workers Scripts Write".to_owned(),
+    ];
+    plan.capability.selectors = ["account_id", "script_name"]
+        .into_iter()
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .collect();
+    plan.capability.risk = RiskClass::SecretSensitive;
+    plan.capability.effect = EffectClass::ReversibleWrite;
+    plan.capability.created_collection_resource = Some(CreatedCollectionResourceContractV1 {
+        collection_path: plan.capability.path.clone(),
+        identity_selector: "id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "worker-tail-logs-list-tails".to_owned(),
+        delete_capability_id: "worker-tail-logs-delete-tail".to_owned(),
+        verified_response_fields: Vec::new(),
+        requires_page_number_completion: false,
+    });
+    plan.capability.rollback.supported = true;
+    plan.capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    plan
+}
+
+#[tokio::test]
+async fn worker_tail_create_verifies_exact_lease_identity_without_a_fabricated_body() {
+    let body = r#"{"success":true,"result":[{"id":"tail-lease-1","expires_at":"2026-07-21T18:00:00Z","url":"wss://tail.example.invalid/private-token"}],"errors":[]}"#;
+    let (address, server) = json_response_sequence_server(vec![body]).await;
+    let plan = worker_tail_create_plan(None);
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({
+            "id":"tail-lease-1",
+            "expires_at":"2026-07-21T18:00:00Z",
+            "url":"wss://tail.example.invalid/private-token"
+        }),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("tail verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    assert!(verification.basis.contains("exactly one lease"));
+    assert!(!verification.basis.contains("private-token"));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .starts_with("GET /client/v4/accounts/account-1/workers/scripts/edge-worker/tails ")
+    );
+    assert!(!requests[0].contains("private-token"));
+}
+
+#[tokio::test]
+async fn worker_tail_create_fails_closed_on_identity_absence_or_any_body() {
+    let body = r#"{"success":true,"result":[{"id":"different-tail"}],"errors":[]}"#;
+    let (address, server) = json_response_sequence_server(vec![body]).await;
+    let plan = worker_tail_create_plan(None);
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({
+            "id":"tail-lease-1",
+            "expires_at":"2026-07-21T18:00:00Z",
+            "url":"wss://tail.example.invalid/private-token"
+        }),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("tail verification result");
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("identity matches=0"));
+    assert!(!verification.basis.contains("tail-lease-1"));
+    assert!(!verification.basis.contains("private-token"));
+    server.await.expect("server joins");
+
+    let body_plan = worker_tail_create_plan(Some(json!({"unsafe":"input"})));
+    let offline = Executor::new(reqwest::Client::new(), "http://127.0.0.1:9/client/v4")
+        .expect("offline executor");
+    let error = offline
+        .verify_plan(
+            &body_plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect_err("tail body must fail before network")
+        .to_string();
+    assert!(error.contains("Worker tail lease verification target is malformed"));
+    assert!(!error.contains("private-token"));
+}
+
+fn async_list_plan(create: bool, body: Value) -> PlanV1 {
+    let id = if create {
+        "security-response-add-expiring-list-member"
+    } else {
+        "security-response-remove-expired-list-member"
+    };
+    let method = if create { "POST" } else { "DELETE" };
+    let strategy = if create {
+        "async_list_operation_completes_and_correlated_member_exists"
+    } else {
+        "async_list_operation_completes_and_members_absent"
+    };
+    let mut capability = CapabilityV1::new(
+        id,
+        id,
+        method,
+        "/accounts/{account_id}/rules/lists/{list_id}/items",
+    );
+    "Lists".clone_into(&mut capability.product);
+    "account".clone_into(&mut capability.account_scope);
+    capability.permissions = vec![
+        "Account Filter Lists Edit".to_owned(),
+        "Account Filter Lists Read".to_owned(),
+    ];
+    capability.selectors = ["account_id", "list_id"]
+        .into_iter()
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .collect();
+    capability.risk = RiskClass::IdentityOrOwnership;
+    capability.effect = if create {
+        EffectClass::ReversibleWrite
+    } else {
+        EffectClass::Destructive
+    };
+    strategy.clone_into(&mut capability.verification.strategy);
+    capability.async_collection_mutation = Some(AsyncCollectionMutationContractV1 {
+        operation_status_path: "/accounts/{account_id}/rules/lists/bulk_operations/{operation_id}"
+            .to_owned(),
+        operation_status_capability_id: "lists-get-bulk-operation-status".to_owned(),
+        operation_id_selector: "operation_id".to_owned(),
+        apply_operation_id_pointer: "/operation_id".to_owned(),
+        status_operation_id_pointer: "/id".to_owned(),
+        status_state_pointer: "/status".to_owned(),
+        pending_states: vec!["pending".to_owned(), "running".to_owned()],
+        completed_state: "completed".to_owned(),
+        failed_state: "failed".to_owned(),
+        max_poll_attempts: 30,
+        poll_interval_ms: 1_000,
+        collection_path: "/accounts/{account_id}/rules/lists/{list_id}/items".to_owned(),
+        collection_capability_id: "lists-get-list-items".to_owned(),
+        collection_metadata_path: "/accounts/{account_id}/rules/lists/{list_id}".to_owned(),
+        collection_metadata_capability_id: "lists-get-a-list".to_owned(),
+        collection_item_identity_pointer: "/id".to_owned(),
+        correlation_field: create.then(|| "comment".to_owned()),
+        remove_capability_id: create
+            .then(|| "security-response-remove-expired-list-member".to_owned()),
+        requires_cursor_completion: true,
+    });
+    let mut plan = PlanV1::draft(
+        "profile",
+        "account-1",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("plan");
+    plan.input = serde_json::to_value(CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "list_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        }),
+        query: json!({}),
+        body: Some(body),
+        ..CallInput::default()
+    })
+    .expect("input");
+    plan
+}
+
+#[tokio::test]
+async fn async_list_add_polls_and_correlates_across_complete_cursor_pagination() {
+    let comment = r#"{"cfctl_list_security_v1":{"evidence_ref":"sha256:redacted"}}"#;
+    let plan = async_list_plan(true, json!([{"comment":comment,"ip":"203.0.113.17"}]));
+    let operation_id = "bulk-operation-1";
+    let member_id = "cccccccccccccccccccccccccccccccc";
+    let bodies = vec![
+        format!(r#"{{"success":true,"result":{{"id":"{operation_id}","status":"pending"}}}}"#),
+        format!(r#"{{"success":true,"result":{{"id":"{operation_id}","completed":"2026-07-21T17:30:00Z","status":"completed"}}}}"#),
+        r#"{"success":true,"result":[{"id":"dddddddddddddddddddddddddddddddd","comment":"other","ip":"198.51.100.1"}],"result_info":{"cursors":{"after":"cursor-2"}}}"#.to_owned(),
+        format!(r#"{{"success":true,"result":[{{"id":"{member_id}","comment":{},"ip":"203.0.113.17"}}],"result_info":{{"cursors":{{"after":null}}}}}}"#, serde_json::to_string(comment).expect("comment JSON")),
+    ];
+    let (address, server) = json_response_sequence_server(bodies).await;
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"operation_id":operation_id}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("async List verification");
+
+    assert!(verification.passed, "{}", verification.basis);
+    assert_eq!(verification.correlated_resource_id, Some(json!(member_id)));
+    let receipt = verification.readback.result.to_string();
+    assert!(!receipt.contains("203.0.113.17"));
+    assert!(!receipt.contains("evidence_ref"));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 4);
+    assert!(requests[0].contains(&format!("bulk_operations/{operation_id}")));
+    assert!(
+        requests[2].contains("/rules/lists/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/items?per_page=500")
+    );
+    assert!(requests[3].contains("cursor=cursor-2"));
+    assert!(requests[3].contains("per_page=500"));
+}
+
+#[tokio::test]
+async fn async_list_remove_requires_terminal_completion_and_complete_absence() {
+    let member_id = "cccccccccccccccccccccccccccccccc";
+    let plan = async_list_plan(false, json!({"items":[{"id":member_id}]}));
+    let operation_id = "bulk-operation-delete";
+    let bodies = vec![
+        format!(r#"{{"success":true,"result":{{"id":"{operation_id}","status":"completed"}}}}"#),
+        r#"{"success":true,"result":[{"id":"dddddddddddddddddddddddddddddddd","comment":"other","ip":"198.51.100.1"}],"result_info":{"cursors":{"after":null}}}"#.to_owned(),
+    ];
+    let (address, server) = json_response_sequence_server(bodies).await;
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"operation_id":operation_id}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("async List removal verification");
+    assert!(verification.passed, "{}", verification.basis);
+    assert!(verification.correlated_resource_id.is_none());
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
+async fn async_list_failure_is_terminal_redacted_and_never_reads_the_collection() {
+    let plan = async_list_plan(
+        true,
+        json!([{"comment":"sensitive-correlation","ip":"203.0.113.17"}]),
+    );
+    let operation_id = "bulk-operation-failed";
+    let body = format!(
+        r#"{{"success":true,"result":{{"id":"{operation_id}","status":"failed","error":"target 203.0.113.17 rejected"}}}}"#
+    );
+    let (address, server) = json_response_sequence_server(vec![body]).await;
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"operation_id":operation_id}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("terminal failure receipt");
+    assert!(!verification.passed);
+    assert!(
+        !verification
+            .readback
+            .result
+            .to_string()
+            .contains("203.0.113.17")
+    );
+    assert!(
+        !verification
+            .readback
+            .result
+            .to_string()
+            .contains("sensitive-correlation")
+    );
+    assert_eq!(server.await.expect("server joins").len(), 1);
+}
+
+#[tokio::test]
+async fn nested_resource_creation_is_correlated_in_apply_and_live_parent_readback() {
+    let body = r#"{"success":true,"result":{"id":"ruleset-1","rules":[{"id":"rule-1","action":"managed_challenge","description":"bounded action","enabled":true,"expression":"ip.src eq 1.1.1.1","ref":"cfctl_security_0123456789abcdef01234567"}]},"errors":[]}"#;
+    let (address, server) = json_response_sequence_server(vec![body]).await;
+    let planned_body = json!({
+        "action":"managed_challenge",
+        "description":"bounded action",
+        "enabled":true,
+        "expression":"ip.src eq 1.1.1.1",
+        "ref":"cfctl_security_0123456789abcdef01234567"
+    });
+    let mut plan = dns_record_plan(
+        "ruleset-rule-create",
+        "POST",
+        "/zones/{zone_id}/rulesets/{ruleset_id}/rules",
+        "parent_object_contains_created_nested_resource_by_correlation",
+        json!({"zone_id":"zone-1", "ruleset_id":"ruleset-1"}),
+        Some(planned_body.clone()),
+    );
+    plan.capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{
+            "action":{"type":"string"},
+            "description":{"type":"string"},
+            "enabled":{"type":"boolean"},
+            "expression":{"type":"string"},
+            "ref":{"type":"string"}
+        }
+    }));
+    plan.capability.created_nested_resource = Some(CreatedNestedResourceContractV1 {
+        parent_path: "/zones/{zone_id}/rulesets/{ruleset_id}".to_owned(),
+        items_pointer: "/rules".to_owned(),
+        identity_selector: "rule_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        correlation_field: "ref".to_owned(),
+        read_capability_id: "ruleset-get".to_owned(),
+        delete_capability_id: "ruleset-rule-delete".to_owned(),
+        delete_path: "/zones/{zone_id}/rulesets/{ruleset_id}/rules/{rule_id}".to_owned(),
+        verified_response_fields: vec![
+            "action".to_owned(),
+            "description".to_owned(),
+            "enabled".to_owned(),
+            "expression".to_owned(),
+            "ref".to_owned(),
+        ],
+    });
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({
+            "id":"ruleset-1",
+            "rules":[{
+                "id":"rule-1",
+                "action":"managed_challenge",
+                "description":"bounded action",
+                "enabled":true,
+                "expression":"ip.src eq 1.1.1.1",
+                "ref":"cfctl_security_0123456789abcdef01234567"
+            }]
+        }),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let requests = server.await.expect("server joins");
+    let request = &requests[0];
+    assert!(request.starts_with("GET /client/v4/zones/zone-1/rulesets/ruleset-1 HTTP/1.1"));
+    assert!(!request.contains("rule-1"));
+    assert!(!request.contains("cfctl_security_0123456789abcdef01234567"));
+}
+
+#[tokio::test]
+async fn nested_resource_creation_rejects_ambiguous_apply_correlation() {
+    let body = r#"{"success":true,"result":{"rules":[{"id":"rule-1","action":"managed_challenge","ref":"duplicate-ref"}]},"errors":[]}"#;
+    let (address, server) = json_response_sequence_server(vec![body]).await;
+    let mut plan = dns_record_plan(
+        "ruleset-rule-create",
+        "POST",
+        "/zones/{zone_id}/rulesets/{ruleset_id}/rules",
+        "parent_object_contains_created_nested_resource_by_correlation",
+        json!({"zone_id":"zone-1", "ruleset_id":"ruleset-1"}),
+        Some(json!({"action":"managed_challenge", "ref":"duplicate-ref"})),
+    );
+    plan.capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{"action":{"type":"string"}, "ref":{"type":"string"}}
+    }));
+    plan.capability.created_nested_resource = Some(CreatedNestedResourceContractV1 {
+        parent_path: "/zones/{zone_id}/rulesets/{ruleset_id}".to_owned(),
+        items_pointer: "/rules".to_owned(),
+        identity_selector: "rule_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        correlation_field: "ref".to_owned(),
+        read_capability_id: "ruleset-get".to_owned(),
+        delete_capability_id: "ruleset-rule-delete".to_owned(),
+        delete_path: "/zones/{zone_id}/rulesets/{ruleset_id}/rules/{rule_id}".to_owned(),
+        verified_response_fields: vec!["action".to_owned(), "ref".to_owned()],
+    });
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"rules":[
+            {"id":"rule-1", "action":"managed_challenge", "ref":"duplicate-ref"},
+            {"id":"rule-2", "action":"managed_challenge", "ref":"duplicate-ref"}
+        ]}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("apply matches=2"));
+    assert!(!verification.basis.contains("duplicate-ref"));
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn exact_nested_resource_deletion_is_verified_by_parent_object_absence() {
+    let body =
+        r#"{"success":true,"result":{"id":"ruleset-1","rules":[{"id":"rule-2"}]},"errors":[]}"#;
+    let (address, server) = json_response_sequence_server(vec![body]).await;
+    let mut plan = dns_record_plan(
+        "ruleset-rule-delete",
+        "DELETE",
+        "/zones/{zone_id}/rulesets/{ruleset_id}/rules/{rule_id}",
+        "parent_object_omits_deleted_nested_resource_id",
+        json!({"zone_id":"zone-1", "ruleset_id":"ruleset-1", "rule_id":"rule-1"}),
+        None,
+    );
+    plan.capability.deleted_nested_resource = Some(DeletedNestedResourceContractV1 {
+        parent_path: "/zones/{zone_id}/rulesets/{ruleset_id}".to_owned(),
+        collection_path: "/zones/{zone_id}/rulesets/{ruleset_id}/rules".to_owned(),
+        items_pointer: "/rules".to_owned(),
+        identity_selector: "rule_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "ruleset-get".to_owned(),
+    });
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"ruleset-1", "rules":[{"id":"rule-2"}]}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let requests = server.await.expect("server joins");
+    let request = &requests[0];
+    assert!(request.starts_with("GET /client/v4/zones/zone-1/rulesets/ruleset-1 HTTP/1.1"));
+    assert!(!request.contains("rule-1"));
+}
+
+#[tokio::test]
+async fn web_analytics_rule_creation_is_verified_through_the_sibling_rule_list() {
+    let body = r#"{"success":true,"result":{"rules":[{"id":"rum-rule-1","host":"example.com","inclusive":true,"paths":["/app/*"]}],"ruleset":{"id":"rum-ruleset-1"}},"errors":[]}"#;
+    let (address, server) = json_response_sequence_server(vec![body]).await;
+    let mut plan = dns_record_plan(
+        "web-analytics-create-rule",
+        "POST",
+        "/accounts/{account_id}/rum/v2/{ruleset_id}/rule",
+        "web_analytics_rule_list_contains_created_id_and_planned_fields",
+        json!({"account_id":"account-1", "ruleset_id":"rum-ruleset-1"}),
+        Some(json!({"host":"example.com", "inclusive":true, "paths":["/app/*"]})),
+    );
+    plan.capability.permissions = vec![
+        "Account Settings Read".to_owned(),
+        "Account Settings Write".to_owned(),
+    ];
+    plan.capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{
+            "host":{"type":"string"},
+            "inclusive":{"type":"boolean"},
+            "is_paused":{"type":"boolean"},
+            "paths":{"type":"array","items":{"type":"string"}}
+        }
+    }));
+    plan.capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/rum/v2/{ruleset_id}/rule/{rule_id}".to_owned(),
+        identity_selector: "rule_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "web-analytics-list-rules".to_owned(),
+        delete_capability_id: "web-analytics-delete-rule".to_owned(),
+        verified_response_fields: vec![
+            "host".to_owned(),
+            "inclusive".to_owned(),
+            "is_paused".to_owned(),
+            "paths".to_owned(),
+        ],
+    });
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({
+            "id":"rum-rule-1",
+            "host":"example.com",
+            "inclusive":true,
+            "paths":["/app/*"]
+        }),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let requests = server.await.expect("server joins");
+    assert!(
+        requests[0]
+            .starts_with("GET /client/v4/accounts/account-1/rum/v2/rum-ruleset-1/rules HTTP/1.1")
+    );
+    assert!(!requests[0].contains("rum-rule-1"));
+}
+
+#[tokio::test]
+async fn web_analytics_rule_deletion_is_verified_by_sibling_list_absence() {
+    let body = r#"{"success":true,"result":{"rules":[{"id":"rum-rule-2"}],"ruleset":{"id":"rum-ruleset-1"}},"errors":[]}"#;
+    let (address, server) = json_response_sequence_server(vec![body]).await;
+    let mut plan = dns_record_plan(
+        "web-analytics-delete-rule",
+        "DELETE",
+        "/accounts/{account_id}/rum/v2/{ruleset_id}/rule/{rule_id}",
+        "web_analytics_rule_list_omits_deleted_id",
+        json!({
+            "account_id":"account-1",
+            "ruleset_id":"rum-ruleset-1",
+            "rule_id":"rum-rule-1"
+        }),
+        None,
+    );
+    plan.capability.permissions = vec![
+        "Account Settings Read".to_owned(),
+        "Account Settings Write".to_owned(),
+    ];
+    plan.capability.same_path_read = Some(SamePathReadContractV1 {
+        path: "/accounts/{account_id}/rum/v2/{ruleset_id}/rules".to_owned(),
+        read_capability_id: "web-analytics-list-rules".to_owned(),
+        verified_response_fields: Vec::new(),
+    });
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"rum-rule-1"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+
+    let verification = executor
+        .verify_plan(
+            &plan,
+            &apply,
+            &AuthCredential::Bearer {
+                token: "governing-token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification result");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let requests = server.await.expect("server joins");
+    assert!(
+        requests[0]
+            .starts_with("GET /client/v4/accounts/account-1/rum/v2/rum-ruleset-1/rules HTTP/1.1")
+    );
+    assert!(!requests[0].contains("rum-rule-1"));
 }
 
 #[tokio::test]

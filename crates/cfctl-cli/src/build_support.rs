@@ -1,7 +1,8 @@
 //! Dependency-free build identity resolution shared by build.rs and tests.
 
 use std::{
-    path::Path,
+    collections::BTreeSet,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
@@ -42,7 +43,7 @@ pub fn resolve_build_identity(
     }
     let Some(status) = git(
         repository_root,
-        &["status", "--porcelain=v1", "--untracked-files=no"],
+        &["status", "--porcelain=v1", "--untracked-files=normal"],
     ) else {
         return Ok(unknown_identity());
     };
@@ -67,6 +68,48 @@ pub fn resolve_build_identity(
     })
 }
 
+/// Every repository path whose change can alter checkout-derived build
+/// identity. Existing files catch content edits; parent directories catch new
+/// or removed untracked compiler inputs. Git metadata catches commit, staging,
+/// and branch movement.
+#[must_use]
+pub fn build_identity_rerun_paths(repository_root: &Path) -> Vec<PathBuf> {
+    let mut paths = BTreeSet::new();
+    for name in ["HEAD", "index"] {
+        if let Some(path) = git_path(repository_root, name) {
+            paths.insert(path);
+        }
+    }
+    let Some(files) = git(
+        repository_root,
+        &["ls-files", "--cached", "--others", "--exclude-standard"],
+    ) else {
+        return paths.into_iter().collect();
+    };
+    if !files.status.success() {
+        return paths.into_iter().collect();
+    }
+    let Ok(files) = String::from_utf8(files.stdout) else {
+        return paths.into_iter().collect();
+    };
+    for relative in files.lines().filter(|line| !line.is_empty()) {
+        let file = repository_root.join(relative);
+        paths.insert(file.clone());
+        let mut parent = file.parent();
+        while let Some(directory) = parent {
+            if !directory.starts_with(repository_root) {
+                break;
+            }
+            paths.insert(directory.to_owned());
+            if directory == repository_root {
+                break;
+            }
+            parent = directory.parent();
+        }
+    }
+    paths.into_iter().collect()
+}
+
 pub fn validate_full_commit(commit: &str) -> Result<(), String> {
     if commit.len() == 40
         && commit
@@ -88,11 +131,30 @@ fn unknown_identity() -> ResolvedBuildIdentity {
     }
 }
 
+fn git_path(repository_root: &Path, name: &str) -> Option<PathBuf> {
+    let output = git(repository_root, &["rev-parse", "--git-path", name])?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    Some(if path.is_absolute() {
+        path
+    } else {
+        repository_root.join(path)
+    })
+}
+
 fn git(repository_root: &Path, arguments: &[&str]) -> Option<Output> {
-    Command::new("git")
-        .arg("-C")
-        .arg(repository_root)
-        .args(arguments)
-        .output()
-        .ok()
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repository_root).args(arguments);
+    // Hooks and linked worktrees may export GIT_DIR, GIT_WORK_TREE, or index
+    // overrides. `-C` does not outrank those variables, so inherited Git
+    // process state would let a checkout build claim another repository's
+    // identity.
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command.output().ok()
 }

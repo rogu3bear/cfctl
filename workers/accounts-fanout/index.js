@@ -1,9 +1,10 @@
 // Accounts fanout email-routing Worker (template).
 //
-// Replace EXPECTED_RECIPIENT and FORWARD_TO with the values for your deployment,
-// then upload via `cfctl wrangler deploy` or one of the provision scripts under
-// `scripts/`. Set the matching catch-all rule on the source zone to route to
-// this Worker.
+// This source template is not a cfctl deployment surface. Copy it into the app
+// repository that owns the Worker and deploy through that repository's checked-
+// in Wrangler configuration and release gate. Use `cfctl resolve "configure
+// email routing"` for account-level discovery and governed planning; cfctl has
+// no public `wrangler deploy` subcommand or backend-script fallback.
 //
 // Required Cloudflare features:
 //   - Email Routing enabled on the source zone

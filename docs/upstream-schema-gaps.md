@@ -98,3 +98,31 @@ cfctl catalog show <capability-id> --json
 ```
 
 _Counts drift as the schema evolves._
+
+## Telemetry-specific upstream boundaries
+
+The targeted telemetry ledger is generated separately inside
+`cfctl catalog coverage --json`; its `telemetry_targeted` summary and
+`telemetry_ledger` rows are the current authority. The remaining known product
+boundaries are not repaired with synthetic endpoints:
+
+- The current public schema has no Pages analytics results API.
+- Cloudflare has no universal analytics-dataset localization API; any
+  localization control must be attached to its exact product contract.
+- Logs Engine requires reserved R2 credential headers and is being replaced by
+  Log Explorer. cfctl supports only the exact bounded retrieval operation with
+  a private credential bundle and file receipt.
+- GraphQL Analytics has a dynamic, plan-sensitive schema and adaptive sampling.
+  cfctl therefore uses fixed documents, fingerprints, settings reads, and
+  explicit sampling language rather than claiming universal dataset access or
+  billing truth.
+- Security Events can contain multiple rows for one request, so the documented
+  `datetime` and Ray ID fields do not form a unique pagination key. cfctl returns
+  one bounded sampled page and exposes no continuation until Cloudflare provides
+  a schema-supported unique ordering key.
+- A 403 or empty result cannot, by itself, distinguish missing permission,
+  unavailable entitlement, disabled product configuration, retention, or no
+  data. Only successful product-specific probes narrow that state.
+
+See [`telemetry-control-plane.md`](telemetry-control-plane.md) for the typed
+protocol and lifecycle contracts.

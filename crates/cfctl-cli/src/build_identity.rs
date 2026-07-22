@@ -24,6 +24,17 @@ pub fn current_build_info() -> BuildInfoV1 {
     }
 }
 
+#[must_use]
+pub fn build_identity_is_healthy(build: &BuildInfoV1) -> bool {
+    build.identity_source != BuildIdentitySourceV1::Unknown
+        && build.git_commit.as_deref().is_some_and(|commit| {
+            commit.len() == 40
+                && commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PathBuildStateV1 {

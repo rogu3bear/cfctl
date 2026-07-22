@@ -1,12 +1,29 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use cfctl_core::{
-    CapabilityV1, EvidenceClass, PlanStatus, PlanV1, StandingAuthorityStatus, StandingAuthorityV1,
+    CapabilityV1, EvidenceClass, OperationalProofOutcomeV1, OperationalProofScopeV1,
+    OperationalProofV1, PlanStatus, PlanV1, StandingAuthorityStatus, StandingAuthorityV1,
     TransactionStageV1,
 };
 use cfctl_storage::{RuntimePaths, StateStore, StorageError};
 use chrono::{Duration, Utc};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
+
+fn sha256(byte: char) -> String {
+    format!("sha256:{}", byte.to_string().repeat(64))
+}
+
+const GENERATION_A: &str = "11111111-1111-4111-8111-111111111111";
+
+fn only_proof_index_path(paths: &RuntimePaths) -> std::path::PathBuf {
+    let mut entries = std::fs::read_dir(paths.data_dir.join("evidence-index"))
+        .expect("proof index lists")
+        .map(|entry| entry.expect("proof index entry").path())
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1, "fixture has one proof-index row");
+    entries.pop().expect("one proof-index row")
+}
 
 fn draft_plan() -> PlanV1 {
     PlanV1::draft(
@@ -64,6 +81,293 @@ fn evidence_is_redacted_content_addressed_and_deduplicated() {
     assert!(!stored.contains("must-not-survive"));
     assert!(!stored.contains("another-value"));
     assert!(stored.contains("[REDACTED]"));
+}
+
+#[test]
+fn operational_proof_index_is_append_only_scoped_and_live_read_only() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let evidence = store
+        .write_evidence(
+            EvidenceClass::LiveRead,
+            &json!({"result": {"id": "zone-1"}}),
+        )
+        .expect("live evidence writes");
+    let proof = OperationalProofV1::new(
+        Utc::now(),
+        "zones-list",
+        &sha256('a'),
+        &sha256('b'),
+        OperationalProofScopeV1::new(Some("default"), Some("account-a"), Some(GENERATION_A)),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+
+    store
+        .record_operational_proof(&proof)
+        .expect("proof indexes");
+    store
+        .record_operational_proof(&proof)
+        .expect("same proof is idempotent");
+    let indexed = store.list_operational_proofs().expect("proofs list");
+    assert_eq!(indexed, vec![proof.clone()]);
+
+    let mut forged = proof;
+    forged.evidence.path = "/tmp/not-this-store.json".to_owned();
+    assert!(matches!(
+        store.record_operational_proof(&forged),
+        Err(StorageError::InvalidOperationalProof(_))
+    ));
+
+    let local_evidence = store
+        .write_evidence(EvidenceClass::LocalProof, &json!({"ok": true}))
+        .expect("local evidence writes");
+    let invalid = OperationalProofV1::new(
+        Utc::now(),
+        "zones-list",
+        &sha256('a'),
+        &sha256('b'),
+        OperationalProofScopeV1::new(None, None, None),
+        OperationalProofOutcomeV1::Succeeded,
+        local_evidence,
+    );
+    assert!(matches!(
+        store.record_operational_proof(&invalid),
+        Err(StorageError::InvalidOperationalProof(_))
+    ));
+}
+
+#[test]
+fn operational_proof_index_rejects_tampered_stored_bytes() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("storage opens");
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
+        .expect("evidence writes");
+    let proof = OperationalProofV1::new(
+        Utc::now(),
+        "zones-list",
+        &sha256('a'),
+        &sha256('b'),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+    store
+        .record_operational_proof(&proof)
+        .expect("proof indexes");
+    let index_path = only_proof_index_path(&paths);
+    let mut tampered = serde_json::to_value(&proof).expect("proof encodes");
+    tampered["account_id"] = json!("account-b");
+    std::fs::write(
+        &index_path,
+        serde_json::to_vec_pretty(&tampered).expect("tampered proof encodes"),
+    )
+    .expect("tampered proof writes");
+
+    assert!(matches!(
+        store.list_operational_proofs(),
+        Err(StorageError::InvalidOperationalProof(message))
+            if message.contains("filename does not match")
+    ));
+    assert!(matches!(
+        store.record_operational_proof(&proof),
+        Err(StorageError::InvalidOperationalProof(message))
+            if message.contains("filename does not match")
+    ));
+}
+
+#[test]
+fn operational_proof_requires_exact_hashes_and_nonempty_scope() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
+        .expect("evidence writes");
+    let invalid_hash = OperationalProofV1::new(
+        Utc::now(),
+        "zones-list",
+        "sha256:catalog",
+        &sha256('b'),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence.clone(),
+    );
+    assert!(matches!(
+        store.record_operational_proof(&invalid_hash),
+        Err(StorageError::InvalidOperationalProof(_))
+    ));
+    let empty_scope = OperationalProofV1::new(
+        Utc::now(),
+        "zones-list",
+        &sha256('a'),
+        &sha256('b'),
+        OperationalProofScopeV1::new(Some("  "), Some("account-a"), Some(GENERATION_A)),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence.clone(),
+    );
+    assert!(matches!(
+        store.record_operational_proof(&empty_scope),
+        Err(StorageError::InvalidOperationalProof(_))
+    ));
+
+    let unbound = OperationalProofV1::new(
+        Utc::now(),
+        "zones-list",
+        &sha256('a'),
+        &sha256('b'),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), None),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+    assert!(matches!(
+        store.record_operational_proof(&unbound),
+        Err(StorageError::InvalidOperationalProof(message))
+            if message.contains("credential-generation")
+    ));
+}
+
+#[test]
+fn legacy_unbound_operational_proof_remains_readable_but_cannot_be_rewritten() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("storage opens");
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
+        .expect("evidence writes");
+    let legacy = OperationalProofV1::new(
+        Utc::now(),
+        "zones-list",
+        &sha256('a'),
+        &sha256('b'),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), None),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+    let encoded = serde_json::to_vec_pretty(&legacy).expect("legacy row encodes");
+    let digest = hex::encode(Sha256::digest(&encoded));
+    std::fs::write(
+        paths
+            .data_dir
+            .join("evidence-index")
+            .join(format!("{digest}.json")),
+        encoded,
+    )
+    .expect("legacy index row writes");
+
+    assert_eq!(
+        store.list_operational_proofs().expect("legacy row reads"),
+        vec![legacy.clone()]
+    );
+    assert!(matches!(
+        store.record_operational_proof(&legacy),
+        Err(StorageError::InvalidOperationalProof(message))
+            if message.contains("credential-generation")
+    ));
+}
+
+#[test]
+fn operational_proof_join_rejects_missing_or_modified_evidence() {
+    for replacement in [None, Some(br#"{"different":true}"#.as_slice())] {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+        let evidence = store
+            .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
+            .expect("evidence writes");
+        let evidence_path = std::path::PathBuf::from(&evidence.path);
+        let proof = OperationalProofV1::new(
+            Utc::now(),
+            "zones-list",
+            &sha256('a'),
+            &sha256('b'),
+            OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+            OperationalProofOutcomeV1::Succeeded,
+            evidence,
+        );
+        store
+            .record_operational_proof(&proof)
+            .expect("proof indexes");
+        if let Some(bytes) = replacement {
+            std::fs::write(&evidence_path, bytes).expect("evidence replacement writes");
+        } else {
+            std::fs::remove_file(&evidence_path).expect("evidence removes");
+        }
+        assert!(store.list_operational_proofs().is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn operational_proof_join_rejects_symlinked_evidence() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
+        .expect("evidence writes");
+    let evidence_path = std::path::PathBuf::from(&evidence.path);
+    let proof = OperationalProofV1::new(
+        Utc::now(),
+        "zones-list",
+        &sha256('a'),
+        &sha256('b'),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+    store
+        .record_operational_proof(&proof)
+        .expect("proof indexes");
+    let target = root.path().join("alternate-evidence.json");
+    std::fs::write(&target, b"{}").expect("symlink target writes");
+    std::fs::remove_file(&evidence_path).expect("evidence removes");
+    symlink(&target, &evidence_path).expect("evidence symlink creates");
+
+    assert!(matches!(
+        store.list_operational_proofs(),
+        Err(StorageError::UnsafeManagedDocument { .. })
+    ));
+}
+
+#[test]
+fn recent_operational_proof_projection_is_bounded_and_reports_truncation() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &json!({"bounded": true}))
+        .expect("evidence writes");
+    for (offset, input_byte) in [(3, 'b'), (2, 'c'), (1, 'd')] {
+        store
+            .record_operational_proof(&OperationalProofV1::new(
+                Utc::now() - Duration::seconds(offset),
+                "zones-list",
+                &sha256('a'),
+                &sha256(input_byte),
+                OperationalProofScopeV1::new(
+                    Some("profile-a"),
+                    Some("account-a"),
+                    Some(GENERATION_A),
+                ),
+                OperationalProofOutcomeV1::Succeeded,
+                evidence.clone(),
+            ))
+            .expect("proof indexes");
+    }
+
+    let page = store
+        .list_recent_operational_proofs(2)
+        .expect("recent proof projection loads");
+    assert_eq!(page.proofs.len(), 2);
+    assert_eq!(page.total_count, 3);
+    assert!(page.truncated);
+    let empty = store
+        .list_recent_operational_proofs(0)
+        .expect("zero-sized projection reports history");
+    assert!(empty.proofs.is_empty());
+    assert_eq!(empty.total_count, 3);
+    assert!(empty.truncated);
 }
 
 #[test]

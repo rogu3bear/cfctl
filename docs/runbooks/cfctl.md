@@ -11,10 +11,14 @@ cfctl docs changes --json
 cfctl agents doctor --json
 ```
 
-Require the PATH entry reported by both doctors to resolve to the running
-executable. A doctor never launches a different PATH executable to inspect it;
-invoke that binary directly with `cfctl version --json` if its self-reported
-identity is needed. Missing or different PATH executables and
+Require `build_identity_healthy: true` and the PATH entry reported by both
+doctors to resolve to the running executable. Checkout builds claim a commit
+only when tracked and untracked non-ignored files are clean; otherwise
+`cfctl version --json` reports `identity_source: unknown` and both doctors fail
+closed. Release builds may use the verified full-commit release override. A
+doctor never launches a different PATH executable to inspect it; invoke that
+binary directly with `cfctl version --json` if its self-reported identity is
+needed. Unknown source identity, missing or different PATH executables, and
 managed-instruction drift are unhealthy installation states.
 
 If a command reports `catalog content hash mismatch`, do not edit the stored
@@ -154,6 +158,70 @@ The typed transport validates selectors and bodies against the pinned schema,
 paginates, backs off on rate limits, uses conditionals when supplied, and emits
 structured Cloudflare errors.
 
+Broad telemetry language returns a domain overview instead of choosing a
+configuration or enforcement mutation:
+
+```bash
+cfctl resolve "telemetry overview" --json
+cfctl catalog coverage --json
+```
+
+Prefer the governed workflow ranked for an investigation or audit. Calling a
+workflow is a local preview: it expands component selectors and emits commands
+only for currently available, contract-ready components while showing
+workflow-relative proof freshness without crossing the Cloudflare boundary.
+Blocked, incomplete, or cyclic components expose blocking gaps and a guide but
+no runnable call. Run each bounded read explicitly. A mutating component always
+remains a separate `call` plan followed by its own approve/run/status lifecycle.
+
+Coverage reports both declared catalog coverage and a bounded projection of the
+local `operational_proof` index. Inspect its retained/total counts and
+`truncated` flag before interpreting counts. Do not collapse coverage and proof
+into one success claim: contract-complete is not account-proven, a receipt is
+not dataset completeness, and freshness is evaluated only under the selected
+workflow policy. Proof scope includes the credential generation captured before
+the read boundary. Re-login or re-import advances that generation: earlier rows
+remain auditable but report `credential_drifted`, while rows created before the
+generation contract report `credential_unbound`. Repeat the bounded read before
+using a drifted row as current evidence. A profile with no generation represents
+pre-generation metadata or an interrupted credential replacement; log in or
+import the credential again before performing a proof-bearing read.
+
+The evidence-packet workflow exports read-receipt identities and safe mutation
+lifecycle checkpoint metadata. It omits plan inputs, targets, transaction
+artifacts, credentials, and raw telemetry; an absent apply, verification, or
+compensation class remains absent evidence rather than an inferred success.
+
+Registered roots with an explicit account pin receive the same proof posture as
+a separate overlay in `cfctl workspace audit --json`. An unpinned repository is
+reported as `unscoped`; cfctl never joins it to the newest or only available
+account. Use a governed workflow when time freshness matters.
+
+GraphQL Analytics capabilities carry fixed documents; provide only their
+declared variables. Analytics Engine and Log Explorer accept typed query
+objects that cfctl compiles into one bounded `SELECT`—never raw SQL. Large
+declared JSON/NDJSON/CSV results can use `--out <new-path>`; stdout contains a
+hash receipt rather than the rows. See
+[`telemetry-control-plane.md`](../telemetry-control-plane.md) for exact IDs and
+contracts.
+
+Logs Engine retrieval is the one reserved-header exception and remains
+operation-specific. Supply a mode-0600 JSON bundle containing exactly
+`access_key_id` and `secret_access_key`, plus a new output path:
+
+```bash
+cfctl call logpull-retrieve-logs \
+  --selector account_id=<account-id> \
+  --query start=<rfc3339> --query end=<rfc3339> \
+  --query bucket=<r2-bucket> --query prefix=<log-prefix> \
+  --credential-in <mode-0600-json-path> \
+  --out <new-output-path> --json
+```
+
+The bundle values are injected only as the two pinned R2 headers and never
+enter argv, `CallInput`, stdout, plans, or evidence. The read fails closed
+without both the private bundle and file output.
+
 ## Writes
 
 `call` creates a plan for a mutating capability. Review it, then:
@@ -172,6 +240,21 @@ uncertain or unsupported result.
 
 The DNS record lifecycle is governed end to end — create, update, patch, and
 delete — with deletion verified by a not-found readback of the exact record.
+
+Telemetry-derived security actions require an evidence receipt, actor, reason,
+normalized target, finite expiry, current-state/conflict checks, and exact
+removal. Managed Challenge is the default; broad targets cannot silently become
+permanent blocks. Inspect the exact capability and its generated 15-stage guide
+before drafting a plan:
+
+```bash
+cfctl guide security-response-create-expiring-waf-rule --json
+cfctl guide security-response-add-expiring-list-member --json
+```
+
+Raw Ruleset and asynchronous List bulk writes remain blocked by design. Use the
+single-action capabilities so verification can correlate one returned identity
+and compensation cannot delete an inferred or caller-selected resource.
 
 Queue consumers are likewise governed end to end: create and update accept the
 worker and `http_pull` variants, verification reads the exact consumer back by

@@ -39,6 +39,7 @@ fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() 
     );
     let content = std::fs::read_to_string(&receipt.path).expect("installed skill");
     assert!(content.starts_with("---\nname: cfctl\n"));
+    assert!(content.contains("troubleshooting, security response, or credential lifecycle task"));
     assert!(content.contains("cfctl version --json"));
     assert!(content.contains("cfctl resolve \"<intent>\" --json"));
     assert!(content.contains("cfctl catalog search"));
@@ -47,11 +48,19 @@ fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() 
     assert!(content.contains("cfctl keys permissions --user --account <account-id> --json"));
     assert!(content.contains("cfctl guide --topic standing-authority --json"));
     assert!(content.contains("cfctl plans approve <operation-id> --yes"));
+    assert!(content.contains("cfctl plans show <operation-id> --json"));
     assert!(content.contains("cfctl keys policy approve <authority-id> --yes"));
     assert!(content.contains("cfctl keys policy revoke <authority-id>"));
     assert!(content.contains("fixture directories are opt-in roots"));
-    assert!(content.contains("Every cfctl failure envelope carries a specific `next_step`"));
-    assert!(content.contains("contract: 4"));
+    assert!(content.contains("## Choose the control lane"));
+    assert!(content.contains("## Read truth from the envelope"));
+    assert!(content.contains("## Close honestly"));
+    assert!(content.contains("`performed` says whether an external boundary was crossed"));
+    assert!(content.contains("credential_unbound"));
+    assert!(content.contains("cfctl plans status <operation-id> --json"));
+    assert!(content.contains("Artifact presence alone is never verification"));
+    assert!(content.contains("planned**, **applied**, **verified**, or **blocked"));
+    assert!(content.contains("contract: 6"));
     assert!(content.contains("CFCTL_CAPABILITY_BLOCKED"));
     assert!(content.contains("cfctl guide <capability-id> --json"));
     assert!(content.contains("report the capability id, `blocking_gaps`, and the guide output"));
@@ -112,6 +121,52 @@ fn install_migrates_the_legacy_skill_when_the_managed_skill_is_absent() {
     assert_eq!(
         std::fs::read_to_string(&receipt.path).expect("installed skill"),
         cfctl_agent::managed_documents()[0].1
+    );
+}
+
+#[test]
+fn install_migrates_the_exact_legacy_skill_from_the_singular_agent_root() {
+    let root = tempfile::tempdir().expect("agent home");
+    let legacy = root.path().join(".agent/skills/cloudflare/SKILL.md");
+    std::fs::create_dir_all(legacy.parent().expect("legacy parent"))
+        .expect("create legacy directory");
+    std::fs::write(&legacy, legacy_managed_skill()).expect("legacy skill");
+
+    let receipt = install_agent_skill(root.path(), AgentKind::Codex, InstallMode::Install)
+        .expect("install migrates exact singular-root legacy skill");
+
+    assert!(receipt.changed);
+    assert!(!legacy.exists(), "the superseded skill must be removed");
+    assert!(receipt.path.is_file(), "the managed skill must be written");
+}
+
+#[test]
+fn legacy_drift_in_either_root_prevents_partial_migration() {
+    let root = tempfile::tempdir().expect("agent home");
+    let exact = root.path().join(".agents/skills/cloudflare/SKILL.md");
+    let drifted = root.path().join(".agent/skills/cloudflare/SKILL.md");
+    for path in [&exact, &drifted] {
+        std::fs::create_dir_all(path.parent().expect("legacy parent"))
+            .expect("create legacy directory");
+    }
+    std::fs::write(&exact, legacy_managed_skill()).expect("exact legacy skill");
+    std::fs::write(&drifted, "operator-owned drift").expect("drifted legacy skill");
+
+    let error = install_agent_skill(root.path(), AgentKind::Codex, InstallMode::Install)
+        .expect_err("drift in either root blocks the whole migration");
+
+    assert!(error.to_string().contains("will not remove it"));
+    assert!(
+        exact.is_file(),
+        "exact legacy must survive a blocked migration"
+    );
+    assert!(
+        drifted.is_file(),
+        "operator-owned legacy must survive a blocked migration"
+    );
+    assert!(
+        !root.path().join(".agents/skills/cfctl/SKILL.md").exists(),
+        "managed skill must not be written before all legacy roots validate"
     );
 }
 
@@ -228,7 +283,7 @@ fn managed_skill_contract_header_is_single_sourced() {
         "contract: {}",
         cfctl_agent::MANAGED_SKILL_CONTRACT
     )));
-    assert!(skill.contains("contract: 4"));
+    assert!(skill.contains("contract: 6"));
 }
 
 fn install_and_read(home: &std::path::Path, agent: AgentKind) -> String {

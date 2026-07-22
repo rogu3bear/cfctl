@@ -1,13 +1,19 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use cfctl_core::{
-    AdapterStatus, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1, CostV1,
-    CreatedCollectionResourceContractV1, CreatedResourceContractV1, EffectClass, EvidenceClass,
-    EvidenceV1, GuideActionV1, GuideCloudflareEffectV1, GuideContractStateV1, GuideStage,
-    GuideTopicV1, PlanStatus, PlanV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1,
-    SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
-    TransactionStageV1, UpdatedResourceContractV1, guide_stages, guide_topic_document, hash_value,
-    redact_json, render_guide_topic_markdown,
+    AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
+    AsyncCollectionMutationContractV1, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1,
+    CostV1, CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
+    CreatedResourceContractV1, DeletedNestedResourceContractV1, EffectClass, EntitlementProbeV1,
+    EvidenceClass, EvidenceV1, GraphqlAnalyticsContractV1, GuideActionV1, GuideCloudflareEffectV1,
+    GuideContractStateV1, GuideStage, GuideTopicV1, OperationalProofFreshnessV1,
+    OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, OutputFormatV1,
+    PaginationModeV1, PlanStatus, PlanV1, R2LogRetrievalContractV1, ResultEnvelopeV2, RiskClass,
+    SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
+    StandingAuthorityV1, TimeRangeContractV1, TimestampFormatV1, TransactionStageV1,
+    UpdatedResourceContractV1, guide_stages, guide_topic_document, hash_value, redact_json,
+    render_guide_topic_markdown,
 };
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
@@ -21,6 +27,140 @@ fn uncontracted_selector(name: &str, location: &str, value_type: &str) -> Select
         description: None,
         contract: None,
     }
+}
+
+#[test]
+fn operational_proof_freshness_is_contract_and_catalog_bound() {
+    let now = Utc::now();
+    let evidence = EvidenceV1::new(
+        EvidenceClass::LiveRead,
+        "sha256:evidence",
+        "/tmp/evidence.json",
+    );
+    let proof = OperationalProofV1::new(
+        now - Duration::seconds(30),
+        "telemetry.query",
+        "sha256:catalog-a",
+        "sha256:input",
+        OperationalProofScopeV1::new(
+            Some("default"),
+            Some("account-a"),
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+    assert_eq!(
+        proof.freshness(
+            now,
+            "sha256:catalog-a",
+            60,
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
+        OperationalProofFreshnessV1::Fresh
+    );
+    assert_eq!(
+        proof.freshness(
+            now,
+            "sha256:catalog-a",
+            10,
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
+        OperationalProofFreshnessV1::Stale
+    );
+    assert_eq!(
+        proof.freshness(
+            now,
+            "sha256:catalog-b",
+            60,
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
+        OperationalProofFreshnessV1::CatalogDrifted
+    );
+    assert_eq!(
+        proof.freshness(
+            now,
+            "sha256:catalog-a",
+            0,
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
+        OperationalProofFreshnessV1::Stale
+    );
+
+    let mut failed = proof.clone();
+    failed.outcome = OperationalProofOutcomeV1::Failed;
+    assert_eq!(
+        failed.freshness(
+            now,
+            "sha256:catalog-a",
+            60,
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
+        OperationalProofFreshnessV1::Failed
+    );
+
+    let mut future = proof.clone();
+    future.observed_at = now + Duration::seconds(1);
+    assert_eq!(
+        future.freshness(
+            now,
+            "sha256:catalog-a",
+            60,
+            Some("11111111-1111-4111-8111-111111111111"),
+        ),
+        OperationalProofFreshnessV1::Stale
+    );
+
+    assert_eq!(
+        proof.freshness(
+            now,
+            "sha256:catalog-a",
+            60,
+            Some("22222222-2222-4222-8222-222222222222"),
+        ),
+        OperationalProofFreshnessV1::CredentialDrifted
+    );
+    let mut unbound = proof.clone();
+    unbound.credential_generation_id = None;
+    assert_eq!(
+        unbound.freshness(now, "sha256:catalog-a", 60, None),
+        OperationalProofFreshnessV1::CredentialUnbound
+    );
+}
+
+#[test]
+fn r2_log_retrieval_contract_round_trips_without_credential_values() {
+    let mut capability = CapabilityV1::new(
+        "logpull-retrieve-logs",
+        "Retrieve logs",
+        "GET",
+        "/accounts/{account_id}/logs/retrieve",
+    );
+    capability.r2_log_retrieval = Some(R2LogRetrievalContractV1 {
+        access_key_input_field: "access_key_id".to_owned(),
+        secret_access_key_input_field: "secret_access_key".to_owned(),
+        access_key_header: "R2-Access-Key-Id".to_owned(),
+        secret_access_key_header: "R2-Secret-Access-Key".to_owned(),
+        start_query_selector: "start".to_owned(),
+        end_query_selector: "end".to_owned(),
+        bucket_query_selector: "bucket".to_owned(),
+        prefix_query_selector: "prefix".to_owned(),
+        max_lookback_seconds: 315_360_000,
+        max_window_seconds: 3_600,
+        max_bytes: 268_435_456,
+        max_timeout_seconds: 120,
+        output_media_types: vec!["application/json".to_owned()],
+        requires_new_mode_0600_file: true,
+    });
+    let encoded = serde_json::to_value(&capability).expect("serialize contract");
+    assert!(encoded.get("r2_log_retrieval").is_some());
+    assert!(!encoded.to_string().contains("credential-value"));
+    let decoded: CapabilityV1 = serde_json::from_value(encoded).expect("deserialize contract");
+    assert_eq!(decoded, capability);
+
+    let ordinary = CapabilityV1::new("accounts-list", "List", "GET", "/accounts");
+    let ordinary = serde_json::to_value(ordinary).expect("ordinary capability");
+    assert!(ordinary.get("r2_log_retrieval").is_none());
 }
 
 fn workers_secret_put_capability() -> CapabilityV1 {
@@ -892,6 +1032,61 @@ fn dns_record_restore_strategy_is_bound_to_the_exact_official_update_contract() 
 }
 
 #[test]
+fn generic_same_path_restore_is_bound_to_an_exact_verified_update() {
+    let mut capability = CapabilityV1::new(
+        "workers-observability-settings-update",
+        "Update observability",
+        "PATCH",
+        "/accounts/{account_id}/workers/scripts/{script_name}/script-settings",
+    );
+    capability.mutating = true;
+    capability.selectors = ["account_id", "script_name"]
+        .iter()
+        .map(|name| SelectorV1 {
+            name: (*name).to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .collect();
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "additionalProperties":false,
+        "minProperties":1,
+        "properties":{"observability":{"type":"object"}}
+    }));
+    capability.verification.strategy =
+        "same_path_result_contains_planned_fields_after_update".to_owned();
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: capability.path.clone(),
+        read_capability_id: "worker-script-settings-get-settings".to_owned(),
+        verified_response_fields: vec!["observability".to_owned()],
+    });
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+
+    assert!(capability.verification_contract_supported());
+    assert!(capability.rollback_contract_supported());
+
+    let mut query_broadened = capability.clone();
+    query_broadened.selectors.push(SelectorV1 {
+        name: "unsafe".to_owned(),
+        location: "query".to_owned(),
+        required: false,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    });
+    assert!(!query_broadened.rollback_contract_supported());
+
+    let mut unverified = capability;
+    unverified.verification.strategy = "post_change_read_or_operation_specific_verifier".to_owned();
+    assert!(!unverified.rollback_contract_supported());
+}
+
+#[test]
 fn discriminated_request_paths_preserve_dns_branch_specific_nested_fields() {
     let mut capability = CapabilityV1::new("dns-update", "DNS update", "PUT", "/dns");
     capability.request_schema = Some(
@@ -1513,6 +1708,81 @@ fn request_object_field_extraction_is_width_bounded() {
     assert!(!capability.request_object_field_is_write_only("secret"));
 }
 
+fn worker_tail_create_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "worker-tail-logs-start-tail",
+        "Start Tail",
+        "POST",
+        "/accounts/{account_id}/workers/scripts/{script_name}/tails",
+    );
+    "Worker Tail Logs".clone_into(&mut capability.product);
+    "account".clone_into(&mut capability.account_scope);
+    capability.permissions = vec![
+        "Workers Tail Read".to_owned(),
+        "Workers Scripts Write".to_owned(),
+    ];
+    capability.selectors = ["account_id", "script_name"]
+        .into_iter()
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .collect();
+    capability.risk = RiskClass::SecretSensitive;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.verification.required = true;
+    "worker_tail_collection_contains_created_lease_id"
+        .clone_into(&mut capability.verification.strategy);
+    capability.created_collection_resource = Some(CreatedCollectionResourceContractV1 {
+        collection_path: capability.path.clone(),
+        identity_selector: "id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "worker-tail-logs-list-tails".to_owned(),
+        delete_capability_id: "worker-tail-logs-delete-tail".to_owned(),
+        verified_response_fields: Vec::new(),
+        requires_page_number_completion: false,
+    });
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    capability
+}
+
+#[test]
+fn worker_tail_lease_verifier_and_rollback_are_exact_and_bodyless() {
+    let capability = worker_tail_create_capability();
+    assert!(capability.verification_contract_supported());
+    assert!(capability.rollback_contract_supported());
+
+    let mut grafted = capability.clone();
+    grafted.product = "Workers Scripts".to_owned();
+    assert!(!grafted.verification_contract_supported());
+
+    let mut body_added = capability.clone();
+    body_added.request_schema = Some(json!({"type":"object"}));
+    assert!(!body_added.verification_contract_supported());
+
+    let mut readback_fields_invented = capability.clone();
+    readback_fields_invented
+        .created_collection_resource
+        .as_mut()
+        .expect("tail collection contract")
+        .verified_response_fields = vec!["expires_at".to_owned()];
+    assert!(!readback_fields_invented.verification_contract_supported());
+
+    let mut broad_delete = capability;
+    broad_delete
+        .created_collection_resource
+        .as_mut()
+        .expect("tail collection contract")
+        .delete_capability_id = "workers-delete-all-tails".to_owned();
+    assert!(!broad_delete.rollback_contract_supported());
+}
+
 #[test]
 fn created_resource_contract_rejects_noncanonical_field_allowlists() {
     let mut capability = CapabilityV1::new(
@@ -1635,6 +1905,194 @@ fn created_resource_contracts_require_exact_identity_pointers() {
         .expect("created-collection contract")
         .response_item_identity_pointer = "/id".to_owned();
     assert!(!collection.verification_contract_supported());
+}
+
+#[test]
+fn nested_resource_contracts_bind_correlation_exact_delete_and_parent_absence() {
+    let collection_path = "/zones/{zone_id}/rulesets/{ruleset_id}/rules";
+    let mut create = CapabilityV1::new(
+        "ruleset-rule-create",
+        "Create ruleset rule",
+        "POST",
+        collection_path,
+    );
+    create.verification.strategy =
+        "parent_object_contains_created_nested_resource_by_correlation".to_owned();
+    create.request_schema = Some(json!({
+        "type":"object",
+        "properties":{
+            "action":{"type":"string"},
+            "enabled":{"type":"boolean"},
+            "expression":{"type":"string"},
+            "ref":{"type":"string"}
+        }
+    }));
+    create.created_nested_resource = Some(CreatedNestedResourceContractV1 {
+        parent_path: "/zones/{zone_id}/rulesets/{ruleset_id}".to_owned(),
+        items_pointer: "/rules".to_owned(),
+        identity_selector: "rule_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        correlation_field: "ref".to_owned(),
+        read_capability_id: "ruleset-get".to_owned(),
+        delete_capability_id: "ruleset-rule-delete".to_owned(),
+        delete_path: format!("{collection_path}/{{rule_id}}"),
+        verified_response_fields: vec![
+            "action".to_owned(),
+            "enabled".to_owned(),
+            "expression".to_owned(),
+            "ref".to_owned(),
+        ],
+    });
+    create.rollback.supported = true;
+    create.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+
+    assert!(create.verification_contract_supported());
+    assert!(create.rollback_contract_supported());
+
+    let mut missing_correlation = create.clone();
+    missing_correlation
+        .created_nested_resource
+        .as_mut()
+        .expect("nested create")
+        .correlation_field = "undeclared_ref".to_owned();
+    assert!(!missing_correlation.verification_contract_supported());
+    assert!(!missing_correlation.rollback_contract_supported());
+
+    let mut broad_delete = create;
+    broad_delete
+        .created_nested_resource
+        .as_mut()
+        .expect("nested create")
+        .delete_path = collection_path.to_owned();
+    assert!(!broad_delete.verification_contract_supported());
+    assert!(!broad_delete.rollback_contract_supported());
+
+    let mut delete = CapabilityV1::new(
+        "ruleset-rule-delete",
+        "Delete ruleset rule",
+        "DELETE",
+        &format!("{collection_path}/{{rule_id}}"),
+    );
+    delete.verification.strategy = "parent_object_omits_deleted_nested_resource_id".to_owned();
+    delete.selectors = vec![
+        uncontracted_selector("zone_id", "path", "string"),
+        uncontracted_selector("ruleset_id", "path", "string"),
+        uncontracted_selector("rule_id", "path", "string"),
+    ];
+    delete.deleted_nested_resource = Some(DeletedNestedResourceContractV1 {
+        parent_path: "/zones/{zone_id}/rulesets/{ruleset_id}".to_owned(),
+        collection_path: collection_path.to_owned(),
+        items_pointer: "/rules".to_owned(),
+        identity_selector: "rule_id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "ruleset-get".to_owned(),
+    });
+    assert!(delete.verification_contract_supported());
+
+    delete
+        .deleted_nested_resource
+        .as_mut()
+        .expect("nested delete")
+        .response_item_identity_pointer = "/name".to_owned();
+    assert!(!delete.verification_contract_supported());
+}
+
+#[test]
+fn declared_live_read_entitlement_probe_completes_the_plan_time_contract() {
+    let mut capability = CapabilityV1::new(
+        "widgets-create",
+        "Create widget",
+        "POST",
+        "/accounts/{account_id}/widgets",
+    );
+    capability.selectors = vec![uncontracted_selector("account_id", "path", "string")];
+    capability.selectors[0].required = true;
+    capability.account_scope = "account".to_owned();
+    capability.permissions = vec!["Widgets Read".to_owned(), "Widgets Write".to_owned()];
+    capability.risk = RiskClass::ScopedWrite;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost = CostV1::default();
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{"name":{"type":"string"}}
+    }));
+    capability.verification.strategy =
+        "created_resource_contains_planned_fields_by_returned_id".to_owned();
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/widgets/{widget_id}".to_owned(),
+        identity_selector: "widget_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "widgets-get".to_owned(),
+        delete_capability_id: "widgets-delete".to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+    });
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    capability
+        .entitlement
+        .plans
+        .insert("free".to_owned(), false);
+    capability
+        .entitlement
+        .plans
+        .insert("enterprise".to_owned(), true);
+    capability.entitlement.requires_live_resolution = true;
+    capability.entitlement.probe = Some(EntitlementProbeV1 {
+        capability_id: "widgets-list".to_owned(),
+        path: "/accounts/{account_id}/widgets".to_owned(),
+        selector_names: vec!["account_id".to_owned()],
+    });
+
+    assert!(
+        capability.mutation_contract_gaps().is_empty(),
+        "{:?}",
+        capability.mutation_contract_gaps()
+    );
+
+    capability
+        .entitlement
+        .probe
+        .as_mut()
+        .expect("probe")
+        .selector_names = vec!["missing_id".to_owned()];
+    assert!(
+        capability
+            .mutation_contract_gaps()
+            .iter()
+            .any(|gap| gap == "declared live entitlement probe is malformed")
+    );
+}
+
+#[test]
+fn web_analytics_site_tag_is_an_explicit_non_secret_identity_mapping() {
+    let mut capability = CapabilityV1::new(
+        "web-analytics-create-site",
+        "Create site",
+        "POST",
+        "/accounts/{account_id}/rum/site_info",
+    );
+    capability.verification.strategy =
+        "created_resource_contains_planned_fields_by_returned_id".to_owned();
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{"host":{"type":"string"}}
+    }));
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/rum/site_info/{site_id}".to_owned(),
+        identity_selector: "site_id".to_owned(),
+        response_result_identity_pointer: "/site_tag".to_owned(),
+        read_capability_id: "web-analytics-get-site".to_owned(),
+        delete_capability_id: "web-analytics-delete-site".to_owned(),
+        verified_response_fields: vec!["host".to_owned()],
+    });
+    assert!(capability.verification_contract_supported());
+
+    capability
+        .created_resource
+        .as_mut()
+        .expect("created site")
+        .response_result_identity_pointer = "/site_token".to_owned();
+    assert!(!capability.verification_contract_supported());
 }
 
 #[test]
@@ -2374,12 +2832,16 @@ fn redaction_recurses_through_objects_and_arrays() {
     let value = json!({
         "access_token": "secret-a",
         "nested": [{"client_secret": "secret-b"}],
+        "destination_conf": "r2://bucket?secret=not-for-a-receipt",
+        "ownership_challenge": "challenge-secret",
         "safe": "visible"
     });
 
     let redacted = redact_json(&value);
     assert_eq!(redacted["access_token"], "[REDACTED]");
     assert_eq!(redacted["nested"][0]["client_secret"], "[REDACTED]");
+    assert_eq!(redacted["destination_conf"], "[REDACTED]");
+    assert_eq!(redacted["ownership_challenge"], "[REDACTED]");
     assert_eq!(redacted["safe"], "visible");
 }
 
@@ -3068,5 +3530,337 @@ fn zone_cache_purge_verifier_is_bound_to_purge_ids_and_post() {
     assert!(
         !wrong_id.verification_contract_supported(),
         "the purge verifier must be bound to the purge ids"
+    );
+}
+
+#[test]
+fn graphql_contract_fingerprint_detects_document_or_shape_drift() {
+    let mut contract = GraphqlAnalyticsContractV1 {
+        operation_name: "CfctlZoneHttp".to_owned(),
+        document: "query CfctlZoneHttp($zoneTag: string) { viewer { zones(filter: {zoneTag: $zoneTag}) { series: httpRequestsAdaptiveGroups(limit: 10) { count } } } }".to_owned(),
+        dataset: "httpRequestsAdaptiveGroups".to_owned(),
+        selector_variables: [("zone_id".to_owned(), "zoneTag".to_owned())]
+            .into_iter()
+            .collect(),
+        body_variables: [("start".to_owned(), "start".to_owned())]
+            .into_iter()
+            .collect(),
+        response_data_pointer: "/viewer/zones/0/series".to_owned(),
+        expected_row_fields: vec!["count".to_owned()],
+        cursor_fields: Vec::new(),
+        cursor_input_pointer: None,
+        cursor_input_pointers: std::collections::BTreeMap::new(),
+        schema_fingerprint: String::new(),
+    };
+    contract.refresh_schema_fingerprint().expect("fingerprint");
+    assert!(contract.validate_schema_fingerprint().is_ok());
+
+    let mut document_drift = contract.clone();
+    document_drift.document.push_str(" # changed");
+    assert!(document_drift.validate_schema_fingerprint().is_err());
+
+    let mut response_drift = contract;
+    response_drift.expected_row_fields.push("sum".to_owned());
+    assert!(response_drift.validate_schema_fingerprint().is_err());
+
+    let mut cursor_contract = response_drift;
+    cursor_contract.cursor_fields = vec!["datetime".to_owned(), "rayName".to_owned()];
+    cursor_contract.cursor_input_pointers = [
+        ("datetime".to_owned(), "/after".to_owned()),
+        ("rayName".to_owned(), "/after_ray_name".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    cursor_contract
+        .refresh_schema_fingerprint()
+        .expect("cursor fingerprint");
+    cursor_contract
+        .cursor_input_pointers
+        .insert("rayName".to_owned(), "/wrong_input".to_owned());
+    assert!(cursor_contract.validate_schema_fingerprint().is_err());
+}
+
+#[test]
+fn bounded_analytics_contract_round_trips_without_changing_rest_defaults() {
+    let mut capability = CapabilityV1::new(
+        "analytics-engine-sql-query-get",
+        "Run a bounded Analytics Engine query",
+        "GET",
+        "/accounts/{account_id}/analytics_engine/sql",
+    );
+    capability.aliases = vec!["analytics engine".to_owned(), "telemetry SQL".to_owned()];
+    capability.analytics_query = Some(AnalyticsQueryContractV1 {
+        kind: AnalyticsQueryKindV1::StructuredSql,
+        dataset: None,
+        dataset_pointer: Some("/dataset".to_owned()),
+        time_range: Some(TimeRangeContractV1 {
+            start_pointer: "/start".to_owned(),
+            end_pointer: "/end".to_owned(),
+            timestamp_format: TimestampFormatV1::Rfc3339,
+            max_lookback_seconds: 2_592_000,
+            max_window_seconds: 86_400,
+        }),
+        row_limit_pointer: Some("/limit".to_owned()),
+        max_rows: 10_000,
+        max_bytes: 16 * 1024 * 1024,
+        max_timeout_seconds: 60,
+        allowed_output_formats: vec![
+            OutputFormatV1::Json,
+            OutputFormatV1::Ndjson,
+            OutputFormatV1::Csv,
+        ],
+        default_output_format: OutputFormatV1::Ndjson,
+        pagination: PaginationModeV1::BoundedResult,
+        read_only: true,
+        freshness: Some("reported by the upstream dataset".to_owned()),
+        sampling: Some("reported in query metadata when available".to_owned()),
+    });
+
+    let encoded = serde_json::to_value(&capability).expect("serialize capability");
+    let decoded: CapabilityV1 = serde_json::from_value(encoded).expect("deserialize capability");
+    assert_eq!(decoded, capability);
+    assert!(decoded.graphql.is_none());
+    assert!(decoded.workflow.is_none());
+    assert!(decoded.security_action.is_none());
+
+    let ordinary = CapabilityV1::new("zones-list", "List zones", "GET", "/zones");
+    assert!(ordinary.aliases.is_empty());
+    assert!(ordinary.analytics_query.is_none());
+    assert!(ordinary.graphql.is_none());
+    assert!(ordinary.workflow.is_none());
+    assert!(ordinary.security_action.is_none());
+}
+
+#[test]
+fn security_action_contract_requires_evidence_expiry_and_exact_rollback_lifecycle() {
+    let mut capability = CapabilityV1::new(
+        "security-response-create-expiring-ip-access-rule",
+        "Create expiring security action",
+        "POST",
+        "/zones/{zone_id}/firewall/access_rules/rules",
+    );
+    capability.product = "IP Access rules for a zone".to_owned();
+    capability.permissions = vec![
+        "Firewall Services Read".to_owned(),
+        "Firewall Services Write".to_owned(),
+    ];
+    capability.selectors = vec![SelectorV1 {
+        name: "zone_id".to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }];
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["configuration","mode","notes"],
+        "properties":{
+            "configuration":{"type":"object"},
+            "mode":{"type":"string"},
+            "notes":{"type":"string"}
+        },
+        "x-cfctl-body-required":true
+    }));
+    capability.risk = RiskClass::IdentityOrOwnership;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost.known = true;
+    capability.cost.maximum = Some(0.0);
+    capability.verification.strategy =
+        "parent_collection_contains_created_resource_id_and_planned_fields".to_owned();
+    capability.created_collection_resource = Some(CreatedCollectionResourceContractV1 {
+        collection_path: capability.path.clone(),
+        identity_selector: "rule_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        response_item_identity_pointer: "/id".to_owned(),
+        read_capability_id: "ip-access-rules-for-a-zone-list-ip-access-rules".to_owned(),
+        delete_capability_id: "ip-access-rules-for-a-zone-delete-an-ip-access-rule".to_owned(),
+        verified_response_fields: vec![
+            "configuration".to_owned(),
+            "mode".to_owned(),
+            "notes".to_owned(),
+        ],
+        requires_page_number_completion: true,
+    });
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    capability.security_action = Some(SecurityActionContractV1 {
+        kind: SecurityActionKindV1::CreateExpiring,
+        input_schema: json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":["actor","evidence_ref","reason","target"],
+            "properties":{}
+        }),
+        default_action: Some("managed_challenge".to_owned()),
+        allowed_actions: vec!["managed_challenge".to_owned(), "block".to_owned()],
+        allowed_target_types: vec!["ip".to_owned()],
+        default_ttl_seconds: 86_400,
+        max_ttl_seconds: 604_800,
+        current_state_capability_id: "ip-access-rules-for-a-zone-list-ip-access-rules".to_owned(),
+        safety_profile: SecurityActionSafetyProfileV1::TelemetryDerivedStrict,
+    });
+
+    assert!(capability.security_action_contract_supported());
+    assert!(
+        capability.mutation_contract_gaps().is_empty(),
+        "{:?}",
+        capability.mutation_contract_gaps()
+    );
+
+    capability
+        .security_action
+        .as_mut()
+        .expect("security contract")
+        .default_action = Some("block".to_owned());
+    assert!(!capability.security_action_contract_supported());
+    assert!(
+        capability
+            .mutation_contract_gaps()
+            .iter()
+            .any(|gap| gap.contains("security action"))
+    );
+}
+
+#[test]
+fn legacy_security_action_contract_defaults_to_the_strict_indivisible_profile() {
+    let contract: SecurityActionContractV1 = serde_json::from_value(json!({
+        "kind": "create_expiring",
+        "input_schema": {
+            "type": "object",
+            "required": ["actor", "evidence_ref", "reason"],
+            "additionalProperties": false,
+            "properties": {}
+        },
+        "default_action": "managed_challenge",
+        "allowed_actions": ["managed_challenge"],
+        "allowed_target_types": ["ip"],
+        "default_ttl_seconds": 86_400,
+        "max_ttl_seconds": 604_800,
+        "current_state_capability_id": "ip-access-rules-for-a-zone-list-ip-access-rules",
+        "evidence_required": true,
+        "actor_required": true,
+        "reason_required": true,
+        "anonymous_identity_inference_forbidden": true
+    }))
+    .expect("legacy v2 security action contract should deserialize");
+
+    assert_eq!(
+        contract.safety_profile,
+        SecurityActionSafetyProfileV1::TelemetryDerivedStrict
+    );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one lifecycle scenario keeps polling, correlation, verification, and rollback assertions together"
+)]
+fn asynchronous_list_security_action_pins_poll_correlation_and_exact_removal() {
+    let mut capability = CapabilityV1::new(
+        "security-response-add-expiring-list-member",
+        "Add expiring List member",
+        "POST",
+        "/accounts/{account_id}/rules/lists/{list_id}/items",
+    );
+    capability.product = "Lists".to_owned();
+    capability.account_scope = "account".to_owned();
+    capability.permissions = vec![
+        "Account Filter Lists Edit".to_owned(),
+        "Account Filter Lists Read".to_owned(),
+    ];
+    capability.selectors = ["account_id", "list_id"]
+        .into_iter()
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .collect();
+    capability.request_schema = Some(json!({
+        "type":"array",
+        "minItems":1,
+        "maxItems":1,
+        "items":{"type":"object"},
+        "x-cfctl-body-required":true
+    }));
+    capability.risk = RiskClass::IdentityOrOwnership;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost.known = true;
+    capability.cost.maximum = Some(0.0);
+    capability.verification.strategy =
+        "async_list_operation_completes_and_correlated_member_exists".to_owned();
+    capability.async_collection_mutation = Some(AsyncCollectionMutationContractV1 {
+        operation_status_path: "/accounts/{account_id}/rules/lists/bulk_operations/{operation_id}"
+            .to_owned(),
+        operation_status_capability_id: "lists-get-bulk-operation-status".to_owned(),
+        operation_id_selector: "operation_id".to_owned(),
+        apply_operation_id_pointer: "/operation_id".to_owned(),
+        status_operation_id_pointer: "/id".to_owned(),
+        status_state_pointer: "/status".to_owned(),
+        pending_states: vec!["pending".to_owned(), "running".to_owned()],
+        completed_state: "completed".to_owned(),
+        failed_state: "failed".to_owned(),
+        max_poll_attempts: 30,
+        poll_interval_ms: 1_000,
+        collection_path: "/accounts/{account_id}/rules/lists/{list_id}/items".to_owned(),
+        collection_capability_id: "lists-get-list-items".to_owned(),
+        collection_metadata_path: "/accounts/{account_id}/rules/lists/{list_id}".to_owned(),
+        collection_metadata_capability_id: "lists-get-a-list".to_owned(),
+        collection_item_identity_pointer: "/id".to_owned(),
+        correlation_field: Some("comment".to_owned()),
+        remove_capability_id: Some("security-response-remove-expired-list-member".to_owned()),
+        requires_cursor_completion: true,
+    });
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("remove_async_created_list_member_by_correlated_id".to_owned());
+    capability.security_action = Some(SecurityActionContractV1 {
+        kind: SecurityActionKindV1::AddExpiringListMember,
+        input_schema: json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":["actor","confirm_consumer_scope","evidence_ref","reason","target"],
+            "properties":{}
+        }),
+        default_action: Some("managed_challenge".to_owned()),
+        allowed_actions: vec!["managed_challenge".to_owned(), "block".to_owned()],
+        allowed_target_types: vec![
+            "asn".to_owned(),
+            "hostname".to_owned(),
+            "ip".to_owned(),
+            "ip_range".to_owned(),
+        ],
+        default_ttl_seconds: 86_400,
+        max_ttl_seconds: 604_800,
+        current_state_capability_id: "lists-get-list-items".to_owned(),
+        safety_profile: SecurityActionSafetyProfileV1::TelemetryDerivedStrict,
+    });
+
+    assert!(capability.verification_contract_supported());
+    assert!(capability.rollback_contract_supported());
+    assert!(capability.security_action_contract_supported());
+    assert!(
+        capability.mutation_contract_gaps().is_empty(),
+        "{:?}",
+        capability.mutation_contract_gaps()
+    );
+
+    capability
+        .async_collection_mutation
+        .as_mut()
+        .expect("async contract")
+        .max_poll_attempts = 31;
+    assert!(!capability.verification_contract_supported());
+    assert!(!capability.rollback_contract_supported());
+    assert!(
+        capability
+            .mutation_contract_gaps()
+            .iter()
+            .any(|gap| gap.contains("verification strategy"))
     );
 }

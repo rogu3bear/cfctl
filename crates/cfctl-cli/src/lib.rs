@@ -10,6 +10,7 @@ pub mod build_identity;
 pub mod build_support;
 mod profiles;
 pub mod runtime;
+mod telemetry_product;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -390,6 +391,19 @@ pub struct CallArgs {
     pub if_none_match: Option<String>,
     #[arg(long, help = "Write a one-time secret result to a new mode-0600 file")]
     pub value_out: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "MODE_0600_JSON_PATH",
+        help = "Read an operation-specific credential bundle from a mode-0600 JSON file; currently accepted only by governed R2 log retrieval"
+    )]
+    pub credential_in: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "NEW_PATH",
+        conflicts_with = "value_out",
+        help = "Stream a bounded analytics or governed log-retrieval result to a new mode-0600 file and return its hash receipt"
+    )]
+    pub out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
