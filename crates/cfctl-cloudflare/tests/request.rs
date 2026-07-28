@@ -6,13 +6,15 @@ use cfctl_cloudflare::{
     RequestBuilder, validate_request_contract,
 };
 use cfctl_core::{
-    AnalyticsQueryContractV1, AnalyticsQueryKindV1, AsyncCollectionMutationContractV1,
-    CapabilityV1, CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
-    CreatedResourceContractV1, DeletedNestedResourceContractV1, DeletedResourceContractV1,
-    EffectClass, GraphqlAnalyticsContractV1, OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1,
+    AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
+    AsyncCollectionMutationContractV1, CapabilityV1, CreatedCollectionResourceContractV1,
+    CreatedNestedResourceContractV1, CreatedResourceContractV1, DeletedNestedResourceContractV1,
+    DeletedResourceContractV1, EffectClass, EventBatchContractV1, GraphqlAnalyticsContractV1,
+    KnowledgeReferenceV1, OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1,
+    QUEUE_ACK_CAPABILITY_ID, QUEUE_ACK_PATH, QUEUE_PULL_CAPABILITY_ID, QUEUE_PULL_PATH,
     QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
     RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
-    TimestampFormatV1, UpdatedResourceContractV1,
+    TimestampFormatV1, TransactionStageV1, UpdatedResourceContractV1,
 };
 use chrono::{Duration, SecondsFormat, Utc};
 use serde_json::{Value, json};
@@ -684,6 +686,193 @@ fn mutating_request_requires_a_consumable_approved_plan() {
             },
         );
     assert!(result.is_err());
+}
+
+fn queue_event_batch_operations() -> (Vec<String>, CapabilityV1, CapabilityV1) {
+    let permissions = vec![
+        "Queues Write".to_owned(),
+        "Workers Scripts Write".to_owned(),
+    ];
+    let mut pull = CapabilityV1::new(
+        QUEUE_PULL_CAPABILITY_ID,
+        "Pull Queue messages",
+        "POST",
+        QUEUE_PULL_PATH,
+    );
+    pull.mutating = true;
+    pull.permissions.clone_from(&permissions);
+    pull.selectors = ["account_id", "queue_id"]
+        .into_iter()
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .collect();
+    pull.request_schema = Some(json!({
+        "type":"object",
+        "required":["visibility_timeout_ms","batch_size"],
+        "properties":{
+            "visibility_timeout_ms":{"type":"integer"},
+            "batch_size":{"type":"integer"}
+        },
+        "additionalProperties":false,
+        "x-cfctl-body-required":true
+    }));
+    pull.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    let mut acknowledge = CapabilityV1::new(
+        QUEUE_ACK_CAPABILITY_ID,
+        "Acknowledge Queue messages",
+        "POST",
+        QUEUE_ACK_PATH,
+    );
+    acknowledge.mutating = true;
+    acknowledge.permissions.clone_from(&permissions);
+    acknowledge.selectors.clone_from(&pull.selectors);
+    acknowledge.request_schema = Some(json!({
+        "type":"object",
+        "required":["acks","retries"],
+        "properties":{
+            "acks":{"type":"array"},
+            "retries":{"type":"array"}
+        },
+        "additionalProperties":false,
+        "x-cfctl-body-required":true
+    }));
+    acknowledge
+        .response_contract
+        .clone_from(&pull.response_contract);
+    (permissions, pull, acknowledge)
+}
+
+fn consumed_event_batch_plan(permissions: Vec<String>) -> PlanV1 {
+    let reference = |title: &str, url: &str| KnowledgeReferenceV1 {
+        title: title.to_owned(),
+        url: url.to_owned(),
+        source: "official Cloudflare documentation".to_owned(),
+    };
+    let mut capability = CapabilityV1::new(
+        cfctl_core::EVENT_BATCH_CAPABILITY_ID,
+        "Consume event batch",
+        "POST",
+        "/cfctl/events/queue-batches/{account_id}/{queue_id}/{subscription_id}",
+    );
+    capability.adapter_status = AdapterStatus::Native;
+    capability.event_batch = Some(EventBatchContractV1 {
+        pull_capability_id: QUEUE_PULL_CAPABILITY_ID.to_owned(),
+        pull_path: QUEUE_PULL_PATH.to_owned(),
+        acknowledge_capability_id: QUEUE_ACK_CAPABILITY_ID.to_owned(),
+        acknowledge_path: QUEUE_ACK_PATH.to_owned(),
+        required_permissions: permissions,
+        max_batch_size: 100,
+        max_visibility_timeout_ms: 43_200_000,
+        max_message_bytes: 131_072,
+        billing_chunk_bytes: 65_536,
+        price_per_million_operations: 0.40,
+        pricing_reference: reference(
+            "Cloudflare Queues pricing",
+            "https://developers.cloudflare.com/queues/platform/pricing/",
+        ),
+        schema_reference: reference(
+            "Cloudflare Queues pull consumers",
+            "https://developers.cloudflare.com/queues/configuration/pull-consumers/",
+        ),
+    });
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"account-a",
+            "queue_id":"queue-a",
+            "subscription_id":"subscription-a"
+        }),
+        body: Some(json!({"visibility_timeout_ms":60000,"batch_size":10})),
+        ..CallInput::default()
+    };
+    let mut plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("event batch plan");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    plan.refresh_hash().expect("refresh plan hash");
+    plan.approve(true, None).expect("approve plan");
+    plan.mark_consumed().expect("consume plan");
+    plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+        .expect("persist boundary attempt");
+    plan
+}
+
+#[tokio::test]
+async fn event_batch_transport_executes_only_the_consumed_plan_bound_queue_operations() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"messages":[{"id":"message-a","lease_id":"lease-a","body":"e30=","metadata":{"CF-Content-Type":"json"}}]},"errors":[]}"#,
+        r#"{"success":true,"result":{},"errors":[]}"#,
+    ])
+    .await;
+    let (permissions, pull, acknowledge) = queue_event_batch_operations();
+    let plan = consumed_event_batch_plan(permissions);
+    let credential = AuthCredential::Bearer {
+        token: "selected-token".to_owned(),
+    };
+    let executor = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor");
+    let transport = executor
+        .event_batch_transport(&plan, &pull, &acknowledge)
+        .expect("exact consumed event batch transport");
+    let response = transport
+        .pull(&credential)
+        .await
+        .expect("exact Queue pull executes");
+    assert!(response.success);
+    let response = transport
+        .acknowledge(&["lease-a".to_owned()], &credential)
+        .await
+        .expect("exact Queue acknowledgement executes");
+    assert!(response.success);
+    let requests = server.await.expect("server joins");
+    assert!(
+        requests[0]
+            .contains("POST /client/v4/accounts/account-a/queues/queue-a/messages/pull HTTP/1.1")
+    );
+    assert!(requests[0].contains("authorization: Bearer selected-token"));
+    assert!(requests[0].contains("\"batch_size\":10"));
+    assert!(
+        requests[1]
+            .contains("POST /client/v4/accounts/account-a/queues/queue-a/messages/ack HTTP/1.1")
+    );
+    assert!(requests[1].contains("\"lease_id\":\"lease-a\""));
+
+    let mut lookalike = pull.clone();
+    lookalike.id = "queues-pull-messages-lookalike".to_owned();
+    let Err(error) = executor.event_batch_transport(&plan, &lookalike, &acknowledge) else {
+        panic!("lookalike identity must fail before network access");
+    };
+    assert!(matches!(
+        error,
+        CloudflareError::InvalidEventBatchPlan { .. }
+    ));
+
+    let mut permission_drift = pull;
+    permission_drift.permissions = vec!["Queues Write".to_owned()];
+    let Err(error) = executor.event_batch_transport(&plan, &permission_drift, &acknowledge) else {
+        panic!("permission drift must fail before network access");
+    };
+    assert!(matches!(
+        error,
+        CloudflareError::InvalidEventBatchPlan { .. }
+    ));
 }
 
 #[test]
@@ -1446,6 +1635,45 @@ async fn executor_enforces_pinned_json_response_contract_without_echoing_bodies(
     .await
     .expect("the pinned JSON envelope should be accepted");
     assert!(response.success);
+    server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn executor_parses_realtimekit_data_envelopes_without_losing_resource_identity() {
+    let mut capability = CapabilityV1::new(
+        "getWebhook",
+        "Fetch details of a webhook",
+        "GET",
+        "/accounts/account-a/realtime/kit/app-a/webhooks/webhook-a",
+    );
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareDataEnvelope,
+    });
+    let (address, server) = single_raw_response_server(
+        "200 OK",
+        "application/json",
+        r#"{"success":true,"data":{"id":"webhook-a","enabled":true}}"#,
+    )
+    .await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &CallInput::default(),
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("data envelope is supported");
+    assert!(response.success);
+    assert_eq!(response.result["id"], "webhook-a");
+    assert_eq!(response.result["enabled"], true);
     server.await.expect("server joins");
 }
 

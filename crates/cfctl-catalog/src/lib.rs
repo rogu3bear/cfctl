@@ -11,10 +11,10 @@ use cfctl_core::{
     AsyncCollectionMutationContractV1, BillingModelV1, CapabilityV1, CostExposureV1, CostV1,
     CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
     CreatedResourceContractV1, DeletedNestedResourceContractV1, DeletedResourceContractV1,
-    EffectClass, EntitlementProbeV1, EntitlementV1, GraphqlAnalyticsContractV1,
-    KnowledgeReferenceV1, Maturity, OutputFormatV1, PaginationModeV1, QuerySerializationV1,
-    R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1, RiskClass,
-    SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+    EffectClass, EntitlementProbeV1, EntitlementV1, EventBatchContractV1,
+    GraphqlAnalyticsContractV1, KnowledgeReferenceV1, Maturity, OutputFormatV1, PaginationModeV1,
+    QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
+    RiskClass, SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
     SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
     TimestampFormatV1, UpdatedResourceContractV1, WorkflowContractV1, WorkflowStepV1, hash_value,
     request_header_is_reserved,
@@ -1723,6 +1723,14 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
 /// promoted when their current operation identity still matches; GraphQL and
 /// native workflows are additive, fixed-document capabilities.
 pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
+    finalize_event_subscription_lifecycle(snapshot);
+    finalize_realtimekit_webhook_lifecycle(snapshot);
+    reserve_queue_message_operations_for_event_consumer(snapshot);
+    let event_batch = event_batch_capability(snapshot);
+    snapshot
+        .capabilities
+        .insert(event_batch.id.clone(), event_batch);
+    block_deprecated_pipeline_update(snapshot);
     finalize_analytics_engine_query(snapshot);
     finalize_log_explorer_queries(snapshot);
     finalize_logpull_retrieval(snapshot);
@@ -1740,6 +1748,472 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
             .insert(capability.id.clone(), capability);
     }
     snapshot.refresh_hash()
+}
+
+fn reserve_queue_message_operations_for_event_consumer(snapshot: &mut CatalogSnapshot) {
+    for (id, path) in [
+        (
+            "queues-pull-messages",
+            "/accounts/{account_id}/queues/{queue_id}/messages/pull",
+        ),
+        (
+            "queues-ack-messages",
+            "/accounts/{account_id}/queues/{queue_id}/messages/ack",
+        ),
+    ] {
+        let Some(capability) = snapshot.capabilities.get_mut(id) else {
+            continue;
+        };
+        let identity_ok = capability.method == "POST"
+            && capability.path == path
+            && capability.permissions == ["Queues Write", "Workers Scripts Write"];
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(if identity_ok {
+            "blocked by design for generic `cfctl call`: raw Queue pull and acknowledgement are executable only inside one approved `events-consume-queue-batch` plan"
+                .to_owned()
+        } else {
+            "schema drift: Queue pull/ack identity or permission changed; the event-consumer adapter remains unavailable until the new contract is reviewed"
+                .to_owned()
+        });
+    }
+}
+
+fn event_batch_capability(snapshot: &CatalogSnapshot) -> CapabilityV1 {
+    use cfctl_core::{
+        EVENT_BATCH_CAPABILITY_ID, QUEUE_ACK_CAPABILITY_ID, QUEUE_ACK_PATH,
+        QUEUE_PULL_CAPABILITY_ID, QUEUE_PULL_PATH, RollbackSpecV1, VerificationSpecV1,
+    };
+
+    let permissions = vec![
+        "Queues Write".to_owned(),
+        "Workers Scripts Write".to_owned(),
+    ];
+    let raw_identity_matches = [
+        (QUEUE_PULL_CAPABILITY_ID, QUEUE_PULL_PATH),
+        (QUEUE_ACK_CAPABILITY_ID, QUEUE_ACK_PATH),
+    ]
+    .into_iter()
+    .all(|(id, path)| {
+        snapshot.get(id).is_some_and(|capability| {
+            capability.method == "POST"
+                && capability.path == path
+                && capability.permissions == permissions
+                && capability
+                    .response_contract
+                    .as_ref()
+                    .is_some_and(|contract| {
+                        contract.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                    })
+        })
+    });
+    let (pricing_reference, schema_reference) = event_batch_references();
+    let mut capability = CapabilityV1::new(
+        EVENT_BATCH_CAPABILITY_ID,
+        "Consume one governed Cloudflare event Queue batch",
+        "POST",
+        "/cfctl/events/queue-batches/{account_id}/{queue_id}/{subscription_id}",
+    );
+    capability.description = Some(
+        "Pull one bounded Queue batch, validate and durably commit every event receipt and reconciliation job, then acknowledge only the exact committed leases."
+            .to_owned(),
+    );
+    "Events".clone_into(&mut capability.product);
+    "cfctl native event batch adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![
+        "consume event queue batch".to_owned(),
+        "pull and acknowledge Cloudflare events".to_owned(),
+    ];
+    capability.permissions.clone_from(&permissions);
+    capability.selectors = ["account_id", "queue_id", "subscription_id"]
+        .into_iter()
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .collect();
+    capability.risk = RiskClass::Irreversible;
+    capability.effect = EffectClass::Irreversible;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.entitlement.available = Some(true);
+    capability.cost = event_batch_cost(&pricing_reference);
+    capability.verification = VerificationSpecV1 {
+        required: true,
+        strategy: "event_batch_registry_commit_and_queue_acknowledgement_receipt".to_owned(),
+    };
+    capability.rollback = RollbackSpecV1 {
+        supported: false,
+        strategy: None,
+        warning: Some(
+            "Queue acknowledgement is irreversible; redelivery is not requested after the exact leases are acknowledged."
+                .to_owned(),
+        ),
+    };
+    capability.request_schema = Some(event_batch_request_schema());
+    capability.event_batch = Some(EventBatchContractV1 {
+        pull_capability_id: QUEUE_PULL_CAPABILITY_ID.to_owned(),
+        pull_path: QUEUE_PULL_PATH.to_owned(),
+        acknowledge_capability_id: QUEUE_ACK_CAPABILITY_ID.to_owned(),
+        acknowledge_path: QUEUE_ACK_PATH.to_owned(),
+        required_permissions: permissions,
+        max_batch_size: 100,
+        max_visibility_timeout_ms: 43_200_000,
+        max_message_bytes: 131_072,
+        billing_chunk_bytes: 65_536,
+        price_per_million_operations: 0.40,
+        pricing_reference,
+        schema_reference,
+    });
+    capability.adapter_status = if raw_identity_matches {
+        AdapterStatus::Native
+    } else {
+        AdapterStatus::Blocked
+    };
+    capability.blocked_reason = (!raw_identity_matches).then(|| {
+        "schema drift: exact Queue pull/ack identity, permissions, or response contract changed; event batch planning is blocked pending review"
+            .to_owned()
+    });
+    capability
+}
+
+fn event_batch_cost(pricing_reference: &KnowledgeReferenceV1) -> CostV1 {
+    CostV1 {
+        incremental: true,
+        currency: Some("USD".to_owned()),
+        maximum: Some(0.00016),
+        basis: Some(
+            "100 messages x read and delete x at most two 64 KB billing chunks x USD 0.40 per million operations"
+                .to_owned(),
+        ),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![pricing_reference.clone()],
+    }
+}
+
+fn event_batch_references() -> (KnowledgeReferenceV1, KnowledgeReferenceV1) {
+    let reference = |title: &str, url: &str| KnowledgeReferenceV1 {
+        title: title.to_owned(),
+        url: url.to_owned(),
+        source: "official Cloudflare documentation".to_owned(),
+    };
+    (
+        reference(
+            "Cloudflare Queues pricing",
+            "https://developers.cloudflare.com/queues/platform/pricing/",
+        ),
+        reference(
+            "Cloudflare Queues pull consumers",
+            "https://developers.cloudflare.com/queues/configuration/pull-consumers/",
+        ),
+    )
+}
+
+fn event_batch_request_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "required":["batch_size","visibility_timeout_ms"],
+        "properties":{
+            "batch_size":{"type":"integer","minimum":1,"maximum":100},
+            "visibility_timeout_ms":{"type":"integer","minimum":1000,"maximum":43_200_000}
+        },
+        "additionalProperties":false,
+        "x-cfctl-body-required":true
+    })
+}
+
+fn block_deprecated_pipeline_update(snapshot: &mut CatalogSnapshot) {
+    const ID: &str = "putV4AccountsByAccount_idPipelinesByPipeline_name_deprecated";
+    let Some(capability) = snapshot.capabilities.get_mut(ID) else {
+        return;
+    };
+    capability.adapter_status = AdapterStatus::Blocked;
+    capability.blocked_reason = Some(
+        "blocked by design: Cloudflare Pipelines SQL configuration is immutable; replace it through separately reviewed delete and create plans instead of modeling this deprecated PUT as an update"
+            .to_owned(),
+    );
+}
+
+const EVENT_SUBSCRIPTION_COLLECTION_PATH: &str =
+    "/accounts/{account_id}/event_subscriptions/subscriptions";
+const EVENT_SUBSCRIPTION_DETAIL_PATH: &str =
+    "/accounts/{account_id}/event_subscriptions/subscriptions/{subscription_id}";
+
+fn event_source_variant(source_type: &str, fields: &[&str]) -> Value {
+    let mut properties = serde_json::Map::from_iter([(
+        "type".to_owned(),
+        serde_json::json!({"type":"string","enum":[source_type]}),
+    )]);
+    for field in fields {
+        properties.insert((*field).to_owned(), serde_json::json!({"type":"string"}));
+    }
+    let mut required = vec!["type"];
+    required.extend(fields.iter().copied());
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":required,
+        "properties":properties
+    })
+}
+
+fn add_current_event_subscription_sources(schema: &mut Value) -> bool {
+    let Some(variants) = schema
+        .pointer_mut("/properties/source/oneOf")
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let declared = variants
+        .iter()
+        .filter_map(|variant| variant.pointer("/properties/type/enum/0"))
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    for (source_type, fields) in [
+        ("access", Vec::<&str>::new()),
+        ("artifacts", Vec::<&str>::new()),
+        ("artifacts.repo", vec!["namespace", "repo_name"]),
+        ("email.sending", vec!["domain"]),
+    ] {
+        if !declared.contains(source_type) {
+            variants.push(event_source_variant(source_type, &fields));
+        }
+    }
+    true
+}
+
+fn finalize_event_subscription_lifecycle(snapshot: &mut CatalogSnapshot) {
+    const CREATE: &str = "subscriptions-create";
+    const READ: &str = "subscriptions-get";
+    const LIST: &str = "subscriptions-list";
+    const UPDATE: &str = "subscriptions-patch";
+    const DELETE: &str = "subscriptions-delete";
+    let identity_ok = snapshot.capabilities.get(CREATE).is_some_and(|capability| {
+        capability.method == "POST" && capability.path == EVENT_SUBSCRIPTION_COLLECTION_PATH
+    }) && snapshot.capabilities.get(READ).is_some_and(|capability| {
+        capability.method == "GET" && capability.path == EVENT_SUBSCRIPTION_DETAIL_PATH
+    }) && snapshot.capabilities.get(LIST).is_some_and(|capability| {
+        capability.method == "GET" && capability.path == EVENT_SUBSCRIPTION_COLLECTION_PATH
+    }) && snapshot.capabilities.get(UPDATE).is_some_and(|capability| {
+        capability.method == "PATCH" && capability.path == EVENT_SUBSCRIPTION_DETAIL_PATH
+    }) && snapshot.capabilities.get(DELETE).is_some_and(|capability| {
+        capability.method == "DELETE" && capability.path == EVENT_SUBSCRIPTION_DETAIL_PATH
+    });
+    if !identity_ok {
+        for id in [CREATE, UPDATE] {
+            if let Some(capability) = snapshot.capabilities.get_mut(id) {
+                capability.adapter_status = AdapterStatus::Blocked;
+                capability.blocked_reason = Some(
+                    "schema drift: Event Subscription create/read/update/delete no longer matches the reviewed Queue lifecycle"
+                        .to_owned(),
+                );
+            }
+        }
+        return;
+    }
+
+    for id in [LIST, READ, DELETE] {
+        if let Some(capability) = snapshot.capabilities.get_mut(id) {
+            capability.aliases.extend([
+                "Cloudflare Event Subscriptions".to_owned(),
+                "real-time event sources to Queue".to_owned(),
+            ]);
+        }
+    }
+    for id in [CREATE, UPDATE] {
+        let Some(capability) = snapshot.capabilities.get_mut(id) else {
+            continue;
+        };
+        let Some(schema) = capability.request_schema.as_mut() else {
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(
+                "schema drift: Event Subscription mutation has no typed request schema".to_owned(),
+            );
+            continue;
+        };
+        let has_source = schema.pointer("/properties/source").is_some();
+        if (id == CREATE || has_source) && !add_current_event_subscription_sources(schema) {
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(
+                "schema drift: Event Subscription source union cannot be safely extended"
+                    .to_owned(),
+            );
+            continue;
+        }
+        capability.aliases = vec![
+            "Cloudflare Event Subscription Queue bridge".to_owned(),
+            "subscribe Access Artifacts Email Sending events".to_owned(),
+            "real-time resource event reconciliation".to_owned(),
+        ];
+        capability.risk = RiskClass::ScopedWrite;
+        capability.effect = EffectClass::ReversibleWrite;
+        zero_cost_mutation(
+            capability,
+            "creating or changing the subscription has no direct configuration charge; resulting Queue operations remain usage-based and are bounded separately by the event-consumer authority",
+            official_reference(
+                "Event Subscription schemas",
+                "https://developers.cloudflare.com/queues/event-subscriptions/events-schemas/",
+            ),
+        );
+        if id == UPDATE {
+            capability.verification.required = true;
+            "same_resource_contains_planned_fields_after_update"
+                .clone_into(&mut capability.verification.strategy);
+            capability.same_path_read = Some(SamePathReadContractV1 {
+                path: EVENT_SUBSCRIPTION_DETAIL_PATH.to_owned(),
+                read_capability_id: READ.to_owned(),
+                verified_response_fields: vec![
+                    "destination".to_owned(),
+                    "enabled".to_owned(),
+                    "events".to_owned(),
+                    "name".to_owned(),
+                ],
+            });
+            capability.rollback.supported = true;
+            capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+            capability.rollback.warning = Some(
+                "rollback restores the exact pre-change subscription through a separately reviewed plan; already-enqueued events remain durable"
+                    .to_owned(),
+            );
+        }
+        refresh_dynamic_mutation_contract(capability);
+    }
+}
+
+const REALTIMEKIT_WEBHOOK_COLLECTION_PATH: &str =
+    "/accounts/{account_id}/realtime/kit/{app_id}/webhooks";
+const REALTIMEKIT_WEBHOOK_DETAIL_PATH: &str =
+    "/accounts/{account_id}/realtime/kit/{app_id}/webhooks/{webhook_id}";
+const REALTIMEKIT_WEBHOOK_FIELDS: &[&str] = &["enabled", "events", "name", "url"];
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exact RealtimeKit CRUD identities, data-envelope protocol, verifier, cost, and compensation contracts are reviewed together"
+)]
+fn finalize_realtimekit_webhook_lifecycle(snapshot: &mut CatalogSnapshot) {
+    const CREATE: &str = "addWebhook";
+    const LIST: &str = "getAllWebhooks";
+    const READ: &str = "getWebhook";
+    const PATCH: &str = "editWebhook";
+    const REPLACE: &str = "replaceWebhook";
+    const DELETE: &str = "deleteWebhook";
+    let identities = [
+        (CREATE, "POST", REALTIMEKIT_WEBHOOK_COLLECTION_PATH),
+        (LIST, "GET", REALTIMEKIT_WEBHOOK_COLLECTION_PATH),
+        (READ, "GET", REALTIMEKIT_WEBHOOK_DETAIL_PATH),
+        (PATCH, "PATCH", REALTIMEKIT_WEBHOOK_DETAIL_PATH),
+        (REPLACE, "PUT", REALTIMEKIT_WEBHOOK_DETAIL_PATH),
+        (DELETE, "DELETE", REALTIMEKIT_WEBHOOK_DETAIL_PATH),
+    ];
+    let identity_ok = identities.iter().all(|(id, method, path)| {
+        snapshot.capabilities.get(*id).is_some_and(|capability| {
+            capability.method == *method
+                && capability.path == *path
+                && capability.permissions == ["Realtime Admin", "Realtime"]
+        })
+    });
+    if !identity_ok {
+        for id in [CREATE, PATCH, REPLACE] {
+            if let Some(capability) = snapshot.capabilities.get_mut(id) {
+                capability.adapter_status = AdapterStatus::Blocked;
+                capability.blocked_reason = Some(
+                    "schema drift: RealtimeKit webhook CRUD no longer matches the reviewed data-envelope lifecycle"
+                        .to_owned(),
+                );
+            }
+        }
+        return;
+    }
+
+    for (id, _, _) in identities {
+        let Some(capability) = snapshot.capabilities.get_mut(id) else {
+            return;
+        };
+        capability.response_contract = Some(ResponseContractV1 {
+            success_statuses: capability.response_contract.as_ref().map_or_else(
+                || vec!["200".to_owned()],
+                |contract| contract.success_statuses.clone(),
+            ),
+            success_media_types: vec!["application/json".to_owned()],
+            body_mode: ResponseBodyModeV1::CloudflareDataEnvelope,
+        });
+        capability.aliases.extend([
+            "meeting event webhook API".to_owned(),
+            "signed meeting webhook delivery".to_owned(),
+        ]);
+        capability.entitlement.requires_live_resolution = true;
+        capability.entitlement.source =
+            Some("https://developers.cloudflare.com/realtime/realtimekit/webhooks/".to_owned());
+    }
+
+    for id in [CREATE, PATCH, REPLACE] {
+        let Some(capability) = snapshot.capabilities.get_mut(id) else {
+            return;
+        };
+        capability.risk = RiskClass::ExternalCommunication;
+        capability.effect = EffectClass::ExternalCommunication;
+        zero_cost_mutation(
+            capability,
+            "registering or changing a webhook has no direct operation charge; RealtimeKit session usage remains governed by its separate product pricing",
+            official_reference(
+                "RealtimeKit webhooks",
+                "https://developers.cloudflare.com/realtime/realtimekit/webhooks/",
+            ),
+        );
+        if id == CREATE {
+            capability.created_resource = Some(CreatedResourceContractV1 {
+                detail_path: REALTIMEKIT_WEBHOOK_DETAIL_PATH.to_owned(),
+                identity_selector: "webhook_id".to_owned(),
+                response_result_identity_pointer: "/id".to_owned(),
+                read_capability_id: READ.to_owned(),
+                delete_capability_id: DELETE.to_owned(),
+                verified_response_fields: REALTIMEKIT_WEBHOOK_FIELDS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            });
+            capability.verification.required = true;
+            "created_resource_contains_planned_fields_by_returned_id"
+                .clone_into(&mut capability.verification.strategy);
+            capability.rollback.supported = true;
+            capability.rollback.strategy =
+                Some("delete_created_resource_by_returned_id".to_owned());
+            capability.rollback.warning = Some(
+                "compensation deletes only the returned webhook id through a separately reviewed plan; deliveries already accepted by the endpoint are outside rollback"
+                    .to_owned(),
+            );
+        } else {
+            if id == PATCH
+                && let Some(schema) = capability.request_schema.as_mut()
+            {
+                schema["minProperties"] = serde_json::json!(1);
+            }
+            capability.same_path_read = Some(SamePathReadContractV1 {
+                path: REALTIMEKIT_WEBHOOK_DETAIL_PATH.to_owned(),
+                read_capability_id: READ.to_owned(),
+                verified_response_fields: REALTIMEKIT_WEBHOOK_FIELDS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            });
+            capability.verification.required = true;
+            "same_resource_contains_planned_fields_after_update"
+                .clone_into(&mut capability.verification.strategy);
+            capability.rollback.supported = true;
+            capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+            capability.rollback.warning = Some(
+                "rollback restores the exact pre-change webhook through a separately reviewed plan; deliveries already accepted by either endpoint are outside rollback"
+                    .to_owned(),
+            );
+        }
+        refresh_dynamic_mutation_contract(capability);
+    }
 }
 
 const LIVE_TAIL_HEARTBEAT_MISLEADING_ID: &str = "telemetry.live-tail.heartbeat.get";
@@ -5004,6 +5478,89 @@ fn target_selector(name: &str, description: &str) -> SelectorV1 {
 )]
 fn telemetry_workflow_capabilities() -> Vec<CapabilityV1> {
     vec![
+        control_plane_workflow_capability(
+            "workflow.registry.reconcile-estate",
+            "Discover and reconcile the Cloudflare resource registry",
+            "Preview bounded inventory reads across account audit, events, Queues, Access, Gateway, and Rulesets without treating source config or events as live resource truth.",
+            "Registry",
+            &[
+                "registry control plane",
+                "discover Cloudflare resources",
+                "reconcile Cloudflare estate",
+            ],
+            &[
+                ("audit", "audit-logs-v2-get-account-audit-logs", false),
+                ("subscriptions", "subscriptions-list", false),
+                ("queues", "queues-list", false),
+                (
+                    "access",
+                    "access-policies-list-access-reusable-policies",
+                    false,
+                ),
+                (
+                    "gateway",
+                    "zero-trust-gateway-rules-list-zero-trust-gateway-rules",
+                    false,
+                ),
+                ("rulesets", "listAccountRulesets", false),
+            ],
+        ),
+        control_plane_workflow_capability(
+            "workflow.events.reconcile-control-plane",
+            "Reconcile the real-time Cloudflare event control plane",
+            "Preview Event Subscription, Queue, and Audit Logs v2 reads that feed durable local reconciliation; events remain triggers rather than observed resource truth.",
+            "Events",
+            &[
+                "real-time control plane",
+                "event subscription queue reconciliation",
+                "consume Cloudflare event batch",
+            ],
+            &[
+                ("subscriptions", "subscriptions-list", false),
+                ("queues", "queues-list", false),
+                ("audit", "audit-logs-v2-get-account-audit-logs", false),
+            ],
+        ),
+        control_plane_workflow_capability(
+            "workflow.policy.audit-cloudflare",
+            "Audit Cloudflare Access, Gateway, and Rulesets policy",
+            "Preview the live reads needed to compare Access, Gateway, and Rulesets policy while preserving each future mutation's independent plan and approval lifecycle.",
+            "Cloudflare policy",
+            &[
+                "Gateway policy",
+                "Access Gateway Rulesets policy",
+                "Cloudflare product policy",
+            ],
+            &[
+                (
+                    "access",
+                    "access-policies-list-access-reusable-policies",
+                    false,
+                ),
+                (
+                    "gateway",
+                    "zero-trust-gateway-rules-list-zero-trust-gateway-rules",
+                    false,
+                ),
+                ("rulesets", "listAccountRulesets", false),
+            ],
+        ),
+        control_plane_workflow_capability(
+            "workflow.realtimekit.webhook-lifecycle",
+            "Manage RealtimeKit webhooks lifecycle",
+            "Preview RealtimeKit webhook inventory, create, and exact-resource update components; every write remains a separate governed plan with post-change verification.",
+            "RealtimeKit",
+            &[
+                "RealtimeKit webhooks",
+                "RealtimeKit webhook configuration",
+                "meeting webhook lifecycle",
+            ],
+            &[
+                ("list", "getAllWebhooks", false),
+                ("create", "addWebhook", true),
+                ("update", "editWebhook", true),
+            ],
+        ),
         workflow_capability(
             "workflow.telemetry.bootstrap-worker-observability",
             "Bootstrap observability for a Worker",
@@ -5124,6 +5681,22 @@ fn telemetry_workflow_capabilities() -> Vec<CapabilityV1> {
     ]
 }
 
+fn control_plane_workflow_capability(
+    id: &str,
+    title: &str,
+    purpose: &str,
+    product: &str,
+    aliases: &[&str],
+    steps: &[(&str, &str, bool)],
+) -> CapabilityV1 {
+    let mut capability = workflow_capability(id, title, purpose, steps);
+    product.clone_into(&mut capability.product);
+    capability
+        .aliases
+        .extend(aliases.iter().map(ToString::to_string));
+    capability
+}
+
 fn workflow_capability(
     id: &str,
     title: &str,
@@ -5176,7 +5749,10 @@ fn workflow_proof_freshness_seconds(id: &str) -> u64 {
         // workflow-scoped and never claims upstream dataset completeness.
         "workflow.telemetry.audit-account"
         | "workflow.telemetry.audit-governance"
-        | "workflow.telemetry.export-evidence-packet" => 3_600,
+        | "workflow.telemetry.export-evidence-packet"
+        | "workflow.registry.reconcile-estate"
+        | "workflow.events.reconcile-control-plane"
+        | "workflow.policy.audit-cloudflare" => 3_600,
         // Mutation-oriented recipes cannot use an old read as authority.
         _ => 0,
     }
@@ -13723,6 +14299,154 @@ mod telemetry_identity_hygiene_tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("identity drifted")
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod control_plane_overlay_tests {
+    use super::*;
+
+    #[test]
+    fn event_subscription_source_union_includes_current_access_artifacts_and_email_sources() {
+        let mut schema = serde_json::json!({
+            "type":"object",
+            "properties":{
+                "source":{
+                    "oneOf":[{
+                        "type":"object",
+                        "properties":{"type":{"type":"string","enum":["r2"]}}
+                    }]
+                }
+            }
+        });
+        assert!(add_current_event_subscription_sources(&mut schema));
+        let variants = schema
+            .pointer("/properties/source/oneOf")
+            .and_then(Value::as_array)
+            .expect("source union");
+        let by_type = variants
+            .iter()
+            .filter_map(|variant| {
+                variant
+                    .pointer("/properties/type/enum/0")
+                    .and_then(Value::as_str)
+                    .map(|source_type| (source_type, variant))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for source_type in ["access", "artifacts", "artifacts.repo", "email.sending"] {
+            assert!(by_type.contains_key(source_type), "missing {source_type}");
+        }
+        assert_eq!(
+            by_type["artifacts.repo"]["required"],
+            serde_json::json!(["type", "namespace", "repo_name"])
+        );
+        assert_eq!(
+            by_type["email.sending"]["required"],
+            serde_json::json!(["type", "domain"])
+        );
+    }
+
+    #[test]
+    fn control_plane_workflows_win_the_four_regression_intents() {
+        let capabilities = telemetry_workflow_capabilities()
+            .into_iter()
+            .map(|capability| (capability.id.clone(), capability))
+            .collect();
+        let snapshot = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://workflows".to_owned(),
+            source_hash: "sha256:test".to_owned(),
+            schema_hash: String::new(),
+            capabilities,
+        };
+        for (intent, expected) in [
+            (
+                "registry control plane",
+                "workflow.registry.reconcile-estate",
+            ),
+            (
+                "real-time control plane",
+                "workflow.events.reconcile-control-plane",
+            ),
+            ("Gateway policy", "workflow.policy.audit-cloudflare"),
+            (
+                "RealtimeKit webhooks",
+                "workflow.realtimekit.webhook-lifecycle",
+            ),
+        ] {
+            let ranked = snapshot.search_scored(intent);
+            assert_eq!(
+                ranked.first().map(|(capability, _)| capability.id.as_str()),
+                Some(expected),
+                "{intent}"
+            );
+            let top = ranked.first().map_or(0, |(_, score)| *score);
+            let next = ranked.get(1).map_or(0, |(_, score)| *score);
+            assert!(
+                top >= next.saturating_add(5),
+                "{intent} margin was only {top}-{next}"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_pull_ack_and_deprecated_pipeline_update_remain_explicitly_reserved() {
+        let mut pull = CapabilityV1::new(
+            "queues-pull-messages",
+            "Pull messages",
+            "POST",
+            "/accounts/{account_id}/queues/{queue_id}/messages/pull",
+        );
+        pull.permissions = vec![
+            "Queues Write".to_owned(),
+            "Workers Scripts Write".to_owned(),
+        ];
+        let mut acknowledge = CapabilityV1::new(
+            "queues-ack-messages",
+            "Acknowledge messages",
+            "POST",
+            "/accounts/{account_id}/queues/{queue_id}/messages/ack",
+        );
+        acknowledge.permissions = pull.permissions.clone();
+        let pipeline = CapabilityV1::new(
+            "putV4AccountsByAccount_idPipelinesByPipeline_name_deprecated",
+            "Deprecated Pipeline update",
+            "PUT",
+            "/accounts/{account_id}/pipelines/{pipeline_name}",
+        );
+        let mut snapshot = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://reserved".to_owned(),
+            source_hash: "sha256:test".to_owned(),
+            schema_hash: String::new(),
+            capabilities: [pull, acknowledge, pipeline]
+                .into_iter()
+                .map(|capability| (capability.id.clone(), capability))
+                .collect(),
+        };
+        reserve_queue_message_operations_for_event_consumer(&mut snapshot);
+        block_deprecated_pipeline_update(&mut snapshot);
+        for id in ["queues-pull-messages", "queues-ack-messages"] {
+            let capability = snapshot.get(id).expect("Queue capability");
+            assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+            assert!(
+                capability
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("events-consume-queue-batch")
+            );
+        }
+        assert!(
+            snapshot
+                .get("putV4AccountsByAccount_idPipelinesByPipeline_name_deprecated")
+                .and_then(|capability| capability.blocked_reason.as_deref())
+                .unwrap_or_default()
+                .contains("delete and create")
         );
     }
 }

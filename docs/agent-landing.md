@@ -66,7 +66,7 @@ cfctl call dns-records-for-a-zone-list-dns-records \
   --selector zone_id=<zone-id> --json
 ```
 
-Reads emit redacted live-read evidence. Writes emit `PlanV1` first. Review the
+Reads emit redacted live-read evidence. Writes emit a canonical `PlanV2` first. Review the
 plan, then use the exact ID:
 
 ```bash
@@ -94,6 +94,7 @@ Discovery never escapes registered boundaries:
 
 ```bash
 cfctl workspace add /absolute/repository/root --account <account-id> --json
+cfctl workspace remove /absolute/repository/root --json
 cfctl workspace discover --json
 cfctl workspace graph --json
 cfctl workspace audit --json
@@ -102,10 +103,33 @@ cfctl workspace audit --json
 Workspace account pins resolve ambiguity. Source configuration, routes,
 hostnames, bindings, desired state, and cross-repository references become
 plan preconditions, but a source audit is not live Cloudflare truth; use a
-live `call` for edge/account assertions. Nested directories named `fixtures`,
-`__fixtures__`, `testdata`, `test-data`, and `test_data` are excluded;
-register a fixture directory directly only when its contents should enter the
-workspace graph.
+live `call` for edge/account assertions. Remove stale roots explicitly;
+removal preserves historical graphs and evidence. Nested generated, cache,
+fixture, dependency/build, vendor, and nested-repository paths are excluded;
+register an excluded directory directly only when its contents should enter
+the workspace graph.
+
+Use `cfctl registry sync --json` to rebuild the local resource projection, then
+inspect `cfctl registry coverage --json` before relying on it. Registry rows do
+not collapse authority: catalog metadata says what is known, source config and
+desired declarations say what is intended, and only evidence-backed live reads
+say what Cloudflare currently returns. A partial registry must remain visibly
+partial.
+
+Inspect `cfctl policy admission list --json` before creating mutation plans.
+An active admission bundle can tighten the compiled floor but never weaken it.
+Bundle approval and activation are local, explicit, hash-bound, and distinct
+from a Cloudflare apply. Do not approve or run an unconsumed historical PlanV1;
+recreate it as a fully pinned PlanV2. The only standing-authority exception is
+the bounded token lifecycle exposed by `cfctl keys policy`.
+
+For event-driven reconciliation, inspect `cfctl events sources|status --json`
+first. Queue pull and acknowledgement are private implementation operations
+behind one ordinary `events-consume-queue-batch` PlanV2 per batch. Receipts and
+reconciliation jobs commit atomically before acknowledgement. Events never
+become observed resource state; only successful bounded Cloudflare reads do.
+The inbound Worker bridge is a Bun project, and `events bridge prepare` is
+local configuration staging rather than deployment.
 
 ## Authentication and secrets
 

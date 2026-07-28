@@ -395,12 +395,14 @@ dependencies = [
 name = "cfctl-cli"
 version = "1.2.1"
 dependencies = [
+ "base64",
  "cfctl-agent",
  "cfctl-auth",
  "cfctl-catalog",
  "cfctl-cloudflare",
  "cfctl-core",
  "cfctl-planner",
+ "cfctl-registry",
  "cfctl-storage",
  "cfctl-workspace",
  "chrono",
@@ -467,10 +469,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfctl-registry"
+version = "1.2.1"
+dependencies = [
+ "cfctl-core",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "cfctl-storage"
 version = "1.2.1"
 dependencies = [
  "cfctl-core",
+ "cfctl-workspace",
  "chrono",
  "directories",
  "hex",

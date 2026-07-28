@@ -38,9 +38,12 @@ fn every_public_command_group_is_parseable() {
             "resolve" => vec!["cfctl", "resolve", "list dns records"],
             "guide" => vec!["cfctl", "guide", "dns-records-delete"],
             "plans" => vec!["cfctl", "plans", "status", "operation-id"],
+            "policy" => vec!["cfctl", "policy", "admission", "list"],
+            "registry" => vec!["cfctl", "registry", "status"],
             "workspace" => vec!["cfctl", "workspace", "graph"],
             "agents" => vec!["cfctl", "agents", "doctor"],
             "docs" => vec!["cfctl", "docs", "coverage"],
+            "events" => vec!["cfctl", "events", "status"],
             "doctor" => vec!["cfctl", "doctor"],
             "update" => vec!["cfctl", "update", "--check"],
             "version" => vec!["cfctl", "version"],
@@ -834,6 +837,10 @@ fn help_and_version_are_successful_public_commands() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the isolated CLI contract covers doctor, registered workspace add/remove, registry sync, and rebuild in one process-boundary fixture"
+)]
 fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
     let runtime = tempfile::tempdir().expect("runtime root");
     let workspace = tempfile::tempdir().expect("workspace root");
@@ -869,6 +876,8 @@ fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
             "workspace",
             "add",
             workspace.path().to_str().expect("UTF-8 workspace path"),
+            "--account",
+            "account-a",
             "--json",
         ])
         .output()
@@ -918,6 +927,318 @@ fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
         Some(0),
         "a registered configless, non-Git directory is bounded but is not fabricated as a repository"
     );
+
+    let remove = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args([
+            "workspace",
+            "remove",
+            workspace.path().to_str().expect("UTF-8 workspace path"),
+            "--json",
+        ])
+        .output()
+        .expect("remove registered workspace");
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    let remove: serde_json::Value =
+        serde_json::from_slice(&remove.stdout).expect("workspace remove JSON");
+    assert_eq!(remove["schema_version"], 2);
+    assert_eq!(remove["ok"], true);
+    assert_eq!(remove["performed"], false);
+    assert_eq!(remove["command"], "workspace remove");
+    assert_eq!(remove["result"]["removed"], true);
+    assert_eq!(remove["result"]["account_pin_removed"], true);
+
+    let graph = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args(["workspace", "graph", "--json"])
+        .output()
+        .expect("read workspace graph after removal");
+    assert!(graph.status.success());
+    let graph: serde_json::Value =
+        serde_json::from_slice(&graph.stdout).expect("workspace graph JSON");
+    assert_eq!(
+        graph["result"]["repositories"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        graph["result"]["resources"].as_array().map(Vec::len),
+        Some(0)
+    );
+}
+
+#[test]
+fn isolated_registry_is_versioned_rebuildable_and_honest_about_partial_coverage() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cfctl"));
+
+    let adopt = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .args([
+            "registry",
+            "scopes",
+            "adopt",
+            "--kind",
+            "account",
+            "--id",
+            "account-a",
+            "--json",
+        ])
+        .output()
+        .expect("adopt registry scope");
+    assert!(
+        adopt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&adopt.stderr)
+    );
+
+    let sync = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .args(["registry", "sync", "--json"])
+        .output()
+        .expect("sync registry");
+    assert!(
+        sync.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    let sync: serde_json::Value = serde_json::from_slice(&sync.stdout).expect("registry sync JSON");
+    assert_eq!(sync["schema_version"], 2);
+    assert_eq!(sync["command"], "registry sync");
+    assert_eq!(sync["performed"], false);
+    assert_eq!(sync["result"]["coverage"]["partial"], true);
+    assert_eq!(
+        sync["result"]["coverage"]["blockers"][0],
+        "no live inventory providers are registered"
+    );
+
+    let status = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .args(["registry", "status", "--json"])
+        .output()
+        .expect("registry status");
+    assert!(status.status.success());
+    let status: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("registry status JSON");
+    assert_eq!(status["result"]["database_schema_version"], 3);
+    assert_eq!(status["result"]["journal_mode"], "wal");
+    assert_eq!(status["result"]["integrity"], "ok");
+    assert!(status["result"]["last_sync_at"].is_string());
+
+    let rebuild = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .args(["registry", "rebuild", "--json"])
+        .output()
+        .expect("rebuild registry");
+    assert!(
+        rebuild.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rebuild.stderr)
+    );
+    let rebuild: serde_json::Value =
+        serde_json::from_slice(&rebuild.stdout).expect("registry rebuild JSON");
+    assert!(
+        std::path::Path::new(rebuild["result"]["backup"].as_str().expect("backup path")).is_file()
+    );
+}
+
+#[test]
+fn admission_policy_lifecycle_requires_separate_explicit_approval() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let inputs = tempfile::tempdir().expect("input root");
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cfctl"));
+    let bundle_file = inputs.path().join("bundle.json");
+    fs::write(
+        &bundle_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "name":"block worker deletion",
+            "rules":[{
+                "rule_id":"deny-worker-delete",
+                "capability_id":"workers-delete",
+                "disposition":"blocked",
+                "reason":"local policy forbids deletion"
+            }]
+        }))
+        .expect("bundle JSON"),
+    )
+    .expect("write bundle input");
+    let stage = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .args([
+            "policy",
+            "admission",
+            "stage",
+            "--file",
+            bundle_file.to_str().expect("bundle path"),
+            "--json",
+        ])
+        .output()
+        .expect("stage admission bundle");
+    assert!(
+        stage.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stage.stderr)
+    );
+    let stage: serde_json::Value = serde_json::from_slice(&stage.stdout).expect("stage JSON");
+    let bundle_id = stage["result"]["bundle"]["bundle_id"]
+        .as_str()
+        .expect("bundle id");
+    assert_eq!(stage["result"]["bundle"]["status"], "pending");
+
+    let approve = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .args([
+            "policy",
+            "admission",
+            "approve",
+            bundle_id,
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .expect("approve admission bundle");
+    assert!(approve.status.success());
+    let activate = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .args(["policy", "admission", "activate", bundle_id, "--json"])
+        .output()
+        .expect("activate admission bundle");
+    assert!(activate.status.success());
+    let activate: serde_json::Value =
+        serde_json::from_slice(&activate.stdout).expect("activate JSON");
+    assert_eq!(activate["result"]["bundle"]["status"], "active");
+}
+
+#[test]
+fn generalized_authority_and_event_watch_are_not_public_commands() {
+    assert!(Cli::try_parse_from(["cfctl", "authority", "list"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "cfctl",
+            "events",
+            "watch",
+            "--queue",
+            "queue-a",
+            "--subscription",
+            "subscription-a",
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn historical_plan_v1_is_readable_but_unconsumed_mutation_requires_replanning() {
+    use cfctl_core::{CapabilityV1, PlanV1, TransactionStageV1};
+    use cfctl_storage::{RuntimePaths, StateStore};
+
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let store = StateStore::open(RuntimePaths::from_root(runtime.path())).expect("store");
+    let mut plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "sha256:catalog",
+        CapabilityV1::new(
+            "workers-delete",
+            "Delete worker",
+            "DELETE",
+            "/accounts/{account_id}/workers/{script_name}",
+        ),
+        serde_json::json!({"script_name":"worker-a"}),
+    )
+    .expect("historical plan");
+    plan.created_at = chrono::DateTime::parse_from_rfc3339("2026-07-20T00:00:00Z")
+        .expect("historical timestamp")
+        .with_timezone(&chrono::Utc);
+    plan.expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
+    plan.transaction_journal.clear();
+    plan.refresh_hash().expect("refresh historical plan");
+    plan.record_transaction_stage(TransactionStageV1::PlanPrepared)
+        .expect("historical journal");
+    store.save_plan(&plan).expect("save historical plan");
+
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cfctl"));
+    let show = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .args(["plans", "show", &plan.operation_id, "--json"])
+        .output()
+        .expect("show historical plan");
+    assert!(show.status.success());
+    let show: serde_json::Value = serde_json::from_slice(&show.stdout).expect("show JSON");
+    assert_eq!(show["result"]["schema_version"], 1);
+    assert_eq!(show["result"]["execution_compatible"], false);
+    assert_eq!(
+        show["result"]["execution_incompatibility_reason"],
+        "legacy_plan_v1"
+    );
+
+    let approve = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .args(["plans", "approve", &plan.operation_id, "--yes", "--json"])
+        .output()
+        .expect("refuse historical approval");
+    assert!(!approve.status.success());
+    let approve = health_envelope(&approve, "historical PlanV1 approval");
+    assert_eq!(approve["error"]["code"], "CFCTL_PLAN_REPLAN_REQUIRED");
+}
+
+#[test]
+fn current_mutation_missing_plan_v2_is_readable_but_fails_closed() {
+    use cfctl_core::{CapabilityV1, PlanV1};
+    use cfctl_storage::{RuntimePaths, StateStore};
+
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let store = StateStore::open(RuntimePaths::from_root(runtime.path())).expect("store");
+    let plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "sha256:catalog",
+        CapabilityV1::new(
+            "workers-delete",
+            "Delete worker",
+            "DELETE",
+            "/accounts/{account_id}/workers/{script_name}",
+        ),
+        serde_json::json!({"script_name":"worker-a"}),
+    )
+    .expect("current plan");
+    store
+        .save_plan(&plan)
+        .expect("inject missing PlanV2 fixture");
+
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cfctl"));
+    let show = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .args(["plans", "show", &plan.operation_id, "--json"])
+        .output()
+        .expect("show incomplete current plan");
+    assert!(show.status.success());
+    let show: serde_json::Value = serde_json::from_slice(&show.stdout).expect("show JSON");
+    assert_eq!(show["result"]["execution_compatible"], false);
+    assert_eq!(
+        show["result"]["execution_incompatibility_reason"],
+        "required_plan_v2_missing"
+    );
+
+    let approve = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .args(["plans", "approve", &plan.operation_id, "--yes", "--json"])
+        .output()
+        .expect("refuse incomplete current plan");
+    assert!(!approve.status.success());
+    let approve = health_envelope(&approve, "current plan missing PlanV2");
+    assert_eq!(approve["error"]["code"], "CFCTL_PLAN_V2_MISSING");
+
+    let cancel = ProcessCommand::new(binary)
+        .env("CFCTL_HOME", runtime.path())
+        .args(["plans", "cancel", &plan.operation_id, "--json"])
+        .output()
+        .expect("cancel incomplete current plan");
+    assert!(cancel.status.success());
+    let cancelled: serde_json::Value = serde_json::from_slice(&cancel.stdout).expect("cancel JSON");
+    assert_eq!(cancelled["result"]["status"], "cancelled");
 }
 
 #[test]

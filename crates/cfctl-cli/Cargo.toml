@@ -17,8 +17,10 @@ cfctl-catalog = { workspace = true }
 cfctl-cloudflare = { workspace = true }
 cfctl-core = { workspace = true }
 cfctl-planner = { workspace = true }
+cfctl-registry = { workspace = true }
 cfctl-storage = { workspace = true }
 cfctl-workspace = { workspace = true }
+base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures-util.workspace = true

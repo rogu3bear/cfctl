@@ -39,7 +39,7 @@ fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() 
     );
     let content = std::fs::read_to_string(&receipt.path).expect("installed skill");
     assert!(content.starts_with("---\nname: cfctl\n"));
-    assert!(content.contains("troubleshooting, security response, or credential lifecycle task"));
+    assert!(content.contains("event reconciliation, telemetry workflows"));
     assert!(content.contains("cfctl version --json"));
     assert!(content.contains("cfctl resolve \"<intent>\" --json"));
     assert!(content.contains("cfctl catalog search"));
@@ -51,7 +51,8 @@ fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() 
     assert!(content.contains("cfctl plans show <operation-id> --json"));
     assert!(content.contains("cfctl keys policy approve <authority-id> --yes"));
     assert!(content.contains("cfctl keys policy revoke <authority-id>"));
-    assert!(content.contains("fixture directories are opt-in roots"));
+    assert!(content.contains("excluded directories are opt-in roots"));
+    assert!(content.contains("cfctl workspace remove <absolute-path>"));
     assert!(content.contains("## Choose the control lane"));
     assert!(content.contains("## Read truth from the envelope"));
     assert!(content.contains("## Close honestly"));
@@ -60,7 +61,11 @@ fn agent_skill_installation_is_managed_versioned_and_does_not_overwrite_drift() 
     assert!(content.contains("cfctl plans status <operation-id> --json"));
     assert!(content.contains("Artifact presence alone is never verification"));
     assert!(content.contains("planned**, **applied**, **verified**, or **blocked"));
-    assert!(content.contains("contract: 6"));
+    assert!(content.contains("contract: 9"));
+    assert!(content.contains("cfctl policy admission list --json"));
+    assert!(content.contains("fully pinned PlanV2"));
+    assert!(content.contains("events-consume-queue-batch"));
+    assert!(content.contains("Worker bridge is a Bun project"));
     assert!(content.contains("CFCTL_CAPABILITY_BLOCKED"));
     assert!(content.contains("cfctl guide <capability-id> --json"));
     assert!(content.contains("report the capability id, `blocking_gaps`, and the guide output"));
@@ -237,7 +242,9 @@ fn cursor_guidance_preserves_plan_approval_and_explains_standing_policy_ceremony
     assert!(content.contains("cfctl guide --topic standing-authority --json"));
     assert!(content.contains("cfctl keys policy approve <authority-id> --yes"));
     assert!(content.contains("cfctl keys policy revoke <authority-id>"));
-    assert!(content.contains("fixture directories are opt-in roots"));
+    assert!(content.contains("excluded directories are opt-in roots"));
+    assert!(content.contains("cfctl workspace remove <absolute-path>"));
+    assert!(content.contains("cfctl events status --json"));
     assert!(content.contains("CFCTL_CAPABILITY_BLOCKED"));
     assert!(content.contains("cfctl guide <capability-id> --json"));
     // Drift rectification: the Cursor rule must carry the paid-plan cost gate
@@ -283,7 +290,7 @@ fn managed_skill_contract_header_is_single_sourced() {
         "contract: {}",
         cfctl_agent::MANAGED_SKILL_CONTRACT
     )));
-    assert!(skill.contains("contract: 6"));
+    assert!(skill.contains("contract: 9"));
 }
 
 fn install_and_read(home: &std::path::Path, agent: AgentKind) -> String {

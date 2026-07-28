@@ -49,3 +49,5 @@ WEB.md
 target/
 .cfctl-private-archive/
 dist/
+node_modules/
+bridge/event-ingress/worker-configuration.d.ts

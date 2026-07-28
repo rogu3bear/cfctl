@@ -18,6 +18,176 @@ use cfctl_core::{
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 
+#[test]
+fn registry_contracts_preserve_scope_identity_and_redact_observations() {
+    let account = cfctl_core::ScopeRefV1::new(
+        cfctl_core::ScopeKindV1::Account,
+        "account-a",
+        Some(cfctl_core::ScopeRefV1::new(
+            cfctl_core::ScopeKindV1::Organization,
+            "org-a",
+            None,
+        )),
+    );
+    let resource = cfctl_core::ResourceRefV1::new(account, "worker", "worker-a");
+    assert_eq!(
+        resource.key(),
+        "organization:org-a/account:account-a/worker:worker-a"
+    );
+    let now = Utc::now();
+    let observation = cfctl_core::RegistryObservationV1::new(
+        resource,
+        now,
+        now + Duration::minutes(5),
+        "sha256:catalog",
+        "workers-get",
+        json!({"name":"worker-a","api_token":"secret-value"}),
+        cfctl_core::RegistryObservationStatusV1::Current,
+        EvidenceV1::new(
+            EvidenceClass::LiveRead,
+            "sha256:evidence",
+            "/evidence/read.json",
+        ),
+    )
+    .expect("registry observation");
+    assert_eq!(observation.schema_version, 1);
+    assert_ne!(observation.state["api_token"], "secret-value");
+    let round_trip: cfctl_core::RegistryObservationV1 = serde_json::from_value(
+        serde_json::to_value(&observation).expect("serialize registry observation"),
+    )
+    .expect("deserialize registry observation");
+    assert_eq!(round_trip, observation);
+}
+
+#[test]
+fn event_envelopes_are_hash_bound_redacted_and_never_observations() {
+    let account = cfctl_core::ScopeRefV1::new(cfctl_core::ScopeKindV1::Account, "account-a", None);
+    let resource = cfctl_core::ResourceRefV1::new(account.clone(), "worker", "worker-a");
+    let now = Utc::now();
+    let envelope = cfctl_core::EventEnvelopeV1::new(
+        cfctl_core::EventUpstreamIdentityV1 {
+            provider: "cloudflare".to_owned(),
+            source: "workersBuilds.worker".to_owned(),
+            event_type: "cf.workersBuilds.worker.build.succeeded".to_owned(),
+            event_id: "delivery-a".to_owned(),
+            queue_id: Some("queue-a".to_owned()),
+            subscription_id: Some("subscription-a".to_owned()),
+        },
+        1,
+        now,
+        now,
+        Some(account),
+        "queue-a:delivery-a",
+        cfctl_core::EventSignatureStatusV1::ProviderOriginated,
+        Some("authority-a".to_owned()),
+        Some("lease-a".to_owned()),
+        vec![resource],
+        json!({"buildUuid":"build-a","api_token":"must-not-persist"}),
+        EvidenceV1::new(
+            EvidenceClass::EventReceipt,
+            "sha256:event",
+            "/evidence/event.json",
+        ),
+    )
+    .expect("event envelope");
+    assert_eq!(envelope.schema_version, 1);
+    assert_ne!(envelope.payload["api_token"], "must-not-persist");
+    envelope.validate().expect("event remains valid");
+
+    let mut drifted = envelope.clone();
+    drifted.payload["buildUuid"] = json!("different");
+    assert!(drifted.validate().is_err());
+}
+
+#[test]
+fn admission_bundles_can_only_tighten_the_compiled_floor() {
+    let capability =
+        CapabilityV1::new("workers-list", "List workers", "GET", "/accounts/a/workers");
+    let floor = cfctl_core::PolicyDecisionV1 {
+        schema_version: 1,
+        disposition: cfctl_core::PolicyDisposition::AutoExecute,
+        reasons: vec!["compiled read floor".to_owned()],
+        requires_cost_ceiling: false,
+    };
+    let mut bundle = cfctl_core::AdmissionPolicyBundleV1::pending(
+        "require approval for workers reads",
+        vec![cfctl_core::AdmissionPolicyRuleV1 {
+            rule_id: "workers-read-review".to_owned(),
+            capability_id: Some("workers-list".to_owned()),
+            product: None,
+            effect: None,
+            risk: None,
+            disposition: cfctl_core::PolicyDisposition::ApprovalRequired,
+            reason: "operator review is locally required".to_owned(),
+        }],
+    )
+    .expect("pending bundle");
+    bundle.approve(true).expect("approve bundle");
+    bundle.activate().expect("activate bundle");
+    let tightened = bundle.tighten(&floor, &capability).expect("tighten floor");
+    assert_eq!(
+        tightened.disposition,
+        cfctl_core::PolicyDisposition::ApprovalRequired
+    );
+
+    assert!(
+        cfctl_core::AdmissionPolicyBundleV1::pending(
+            "unsafe",
+            vec![cfctl_core::AdmissionPolicyRuleV1 {
+                rule_id: "broaden".to_owned(),
+                capability_id: None,
+                product: None,
+                effect: None,
+                risk: None,
+                disposition: cfctl_core::PolicyDisposition::AutoExecute,
+                reason: "unsafe".to_owned(),
+            }],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn plan_v2_pins_every_execution_authority_without_rewriting_plan_v1() {
+    let plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "sha256:catalog",
+        CapabilityV1::new("workers-list", "List", "GET", "/accounts/a/workers"),
+        json!({"account_id":"account-a"}),
+    )
+    .expect("plan v1");
+    let mut document = cfctl_core::PlanV2::new(
+        plan.clone(),
+        cfctl_core::PlanPinsV2 {
+            build_identity_hash: "sha256:build".to_owned(),
+            catalog_hash: plan.catalog_hash.clone(),
+            credential_generation_id: "generation-a".to_owned(),
+            admission_policy_hash: "sha256:policy".to_owned(),
+            authority_hash: None,
+            workspace_graph_hash: "sha256:workspace".to_owned(),
+            resource_observation_hashes: std::collections::BTreeMap::default(),
+            cost_budget: None,
+        },
+    )
+    .expect("plan v2");
+    assert_eq!(document.schema_version, 2);
+    assert_eq!(document.plan, plan);
+    document.validate().expect("pins validate");
+    document
+        .bind_authority_hash("sha256:standing-authority")
+        .expect("standing authority binds once");
+    assert_eq!(
+        document.pins.authority_hash.as_deref(),
+        Some("sha256:standing-authority")
+    );
+    assert!(
+        document
+            .bind_authority_hash("sha256:different-authority")
+            .is_err()
+    );
+}
+
 fn uncontracted_selector(name: &str, location: &str, value_type: &str) -> SelectorV1 {
     SelectorV1 {
         name: name.to_owned(),

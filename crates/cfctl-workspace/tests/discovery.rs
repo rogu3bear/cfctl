@@ -112,6 +112,53 @@ fn nested_fixture_directories_are_excluded_but_explicit_fixture_roots_are_discov
 }
 
 #[test]
+fn nested_generated_directories_are_excluded_but_remain_explicitly_discoverable() {
+    let root = tempfile::tempdir().expect("workspace root");
+    let repository = root.path().join("production-app");
+    init_repo(&repository, "wrangler.toml", "name = \"real-worker\"\n");
+    let generated_repository = repository
+        .join("var")
+        .join("cargo-home")
+        .join("advisory-dbs")
+        .join("rustsec");
+    init_repo(
+        &generated_repository,
+        "wrangler.toml",
+        "name = \"generated-worker\"\n",
+    );
+
+    let graph = WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())])
+        .expect("generated-path-safe discovery");
+    assert!(
+        graph
+            .resources
+            .iter()
+            .any(|resource| resource.key == "worker:real-worker")
+    );
+    assert!(
+        graph
+            .resources
+            .iter()
+            .all(|resource| resource.key != "worker:generated-worker")
+    );
+    assert!(
+        graph
+            .repositories
+            .iter()
+            .all(|repository| repository.path != generated_repository)
+    );
+
+    let explicit_graph = WorkspaceGraph::discover(&[RegisteredRoot::new(&generated_repository)])
+        .expect("explicit generated-root discovery");
+    assert!(
+        explicit_graph
+            .resources
+            .iter()
+            .any(|resource| resource.key == "worker:generated-worker")
+    );
+}
+
+#[test]
 fn impact_query_returns_every_repository_linked_to_a_resource() {
     let graph = WorkspaceGraph::from_links([
         ("repo-a", "hostname:api.example.com"),
