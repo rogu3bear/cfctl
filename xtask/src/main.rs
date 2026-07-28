@@ -207,11 +207,27 @@ fn verify() -> Result<(), TaskError> {
             "--locked",
         ],
     )?;
+    verify_event_ingress_bridge()?;
     verify_security_contract()?;
     verify_source_contract()?;
     verify_cross_target()?;
     report_pre_push_registration();
     Ok(())
+}
+
+fn verify_event_ingress_bridge() -> Result<(), TaskError> {
+    let root = repository_root()?.join("bridge/event-ingress");
+    let mut install = Command::new("bun");
+    install
+        .args(["install", "--frozen-lockfile"])
+        .current_dir(&root);
+    run_command(
+        &mut install,
+        "bun install --frozen-lockfile (bridge/event-ingress)",
+    )?;
+    let mut check = Command::new("bun");
+    check.args(["run", "check"]).current_dir(&root);
+    run_command(&mut check, "bun run check (bridge/event-ingress)")
 }
 
 /// Cross-build the Linux (musl) ship target so a change that compiles on the
@@ -421,9 +437,9 @@ fn verify_workspace_contract() -> Result<(), TaskError> {
         .ok_or_else(|| {
             TaskError::InvalidSourceContract("workspace_members must be an array".to_owned())
         })?;
-    if members.len() != 10 {
+    if members.len() != 11 {
         return Err(TaskError::InvalidSourceContract(format!(
-            "expected 10 workspace members, found {}",
+            "expected 11 workspace members, found {}",
             members.len()
         )));
     }
@@ -438,6 +454,7 @@ fn verify_workspace_contract() -> Result<(), TaskError> {
         "cfctl-cli",
         "cfctl-core",
         "cfctl-cloudflare",
+        "cfctl-registry",
         "cfctl-workspace",
         "xtask",
     ] {
@@ -457,7 +474,7 @@ fn verify_workspace_contract() -> Result<(), TaskError> {
 /// clean, resolves clean, and ships a lie about which version the workspace
 /// depends on. Only an equality check bites.
 fn verify_workspace_dependency_versions() -> Result<(), TaskError> {
-    const EXPECTED_PINS: usize = 9;
+    const EXPECTED_PINS: usize = 10;
 
     let manifest_path = repository_root()?.join("Cargo.toml");
     let manifest =

@@ -44,6 +44,12 @@ pub enum Command {
     Guide(GuideArgs),
     /// Review, approve, run, recover, and inspect durable plans.
     Plans(PlansArgs),
+    /// Stage and activate local admission policy or inspect Cloudflare policy.
+    Policy(PolicyArgs),
+    /// Inspect and reconcile the local Cloudflare resource registry.
+    Registry(RegistryArgs),
+    /// Consume durable event receipts and enqueue bounded reconciliation.
+    Events(EventsArgs),
     /// Register and inspect repository impact boundaries.
     Workspace(WorkspaceArgs),
     /// Install and verify managed agent guidance.
@@ -447,6 +453,7 @@ pub struct WorkspaceArgs {
 #[derive(Debug, Subcommand)]
 pub enum WorkspaceCommand {
     Add(WorkspaceAddArgs),
+    Remove(WorkspaceRemoveArgs),
     Discover,
     Graph,
     Audit,
@@ -457,6 +464,213 @@ pub struct WorkspaceAddArgs {
     pub path: PathBuf,
     #[arg(long)]
     pub account: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkspaceRemoveArgs {
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct RegistryArgs {
+    #[command(subcommand)]
+    pub command: RegistryCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RegistryCommand {
+    Scopes(RegistryScopesArgs),
+    Sync,
+    Status,
+    Coverage,
+    List(RegistryListArgs),
+    Get(RegistryResourceArgs),
+    Graph,
+    Diff(RegistryOptionalResourceArgs),
+    History(RegistryResourceArgs),
+    Export,
+    Rebuild,
+    Declarations(RegistryDeclarationsArgs),
+    Ownership(RegistryOwnershipArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RegistryScopesArgs {
+    #[command(subcommand)]
+    pub command: RegistryScopesCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RegistryScopesCommand {
+    List,
+    Discover,
+    Adopt(RegistryScopeArgs),
+    Remove(RegistryScopeArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RegistryScopeKindArg {
+    Organization,
+    Account,
+    Zone,
+    Resource,
+}
+
+#[derive(Debug, Args)]
+pub struct RegistryScopeArgs {
+    #[arg(long, value_enum)]
+    pub kind: RegistryScopeKindArg,
+    #[arg(long)]
+    pub id: String,
+    #[arg(long, value_enum, requires = "parent_id")]
+    pub parent_kind: Option<RegistryScopeKindArg>,
+    #[arg(long, requires = "parent_kind")]
+    pub parent_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct RegistryListArgs {
+    #[arg(long)]
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct RegistryResourceArgs {
+    #[arg(long)]
+    pub resource: String,
+}
+
+#[derive(Debug, Args)]
+pub struct RegistryOptionalResourceArgs {
+    #[arg(long)]
+    pub resource: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct RegistryDeclarationsArgs {
+    #[command(subcommand)]
+    pub command: RegistryDeclarationsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RegistryDeclarationsCommand {
+    Validate,
+    Diff(RegistryOptionalResourceArgs),
+    Plan(RegistryOptionalResourceArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RegistryOwnershipArgs {
+    #[command(subcommand)]
+    pub command: RegistryOwnershipCommand,
+}
+
+#[derive(Debug, Args)]
+pub struct PolicyArgs {
+    #[command(subcommand)]
+    pub command: PolicyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PolicyCommand {
+    Admission(AdmissionPolicyArgs),
+    Cloudflare(CloudflarePolicyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AdmissionPolicyArgs {
+    #[command(subcommand)]
+    pub command: AdmissionPolicyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AdmissionPolicyCommand {
+    Stage(FileInputArgs),
+    List,
+    Show(BundleSelector),
+    Diff(BundleSelector),
+    Approve(BundleApproveArgs),
+    Activate(BundleSelector),
+    Rollback(BundleSelector),
+}
+
+#[derive(Debug, Args)]
+pub struct FileInputArgs {
+    #[arg(long, value_name = "JSON_PATH")]
+    pub file: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct BundleSelector {
+    pub bundle_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct BundleApproveArgs {
+    pub bundle_id: String,
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CloudflarePolicyArgs {
+    #[command(subcommand)]
+    pub command: CloudflarePolicyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CloudflarePolicyCommand {
+    List,
+    Get(RegistryResourceArgs),
+    Diff(RegistryOptionalResourceArgs),
+    Plan(RegistryOptionalResourceArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RegistryOwnershipCommand {
+    List,
+    Get(RegistryResourceArgs),
+    Check,
+}
+
+#[derive(Debug, Args)]
+pub struct EventsArgs {
+    #[command(subcommand)]
+    pub command: EventsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EventsCommand {
+    Sources,
+    Status,
+    History(EventHistoryArgs),
+    Reconcile(EventReconcileArgs),
+    Bridge(EventBridgeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct EventHistoryArgs {
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    pub limit: u32,
+}
+
+#[derive(Debug, Args)]
+pub struct EventReconcileArgs {
+    #[arg(long)]
+    pub resource: String,
+}
+
+#[derive(Debug, Args)]
+pub struct EventBridgeArgs {
+    #[command(subcommand)]
+    pub command: EventBridgeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EventBridgeCommand {
+    Inspect,
+    Prepare,
+    Status,
 }
 
 #[derive(Debug, Args)]

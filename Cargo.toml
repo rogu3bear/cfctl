@@ -7,6 +7,7 @@ members = [
   "crates/cfctl-cloudflare",
   "crates/cfctl-core",
   "crates/cfctl-planner",
+  "crates/cfctl-registry",
   "crates/cfctl-storage",
   "crates/cfctl-workspace",
   "crates/cfctl-cli",
@@ -30,6 +31,7 @@ cfctl-cli = { path = "crates/cfctl-cli", version = "1.2.1" }
 cfctl-cloudflare = { path = "crates/cfctl-cloudflare", version = "1.2.1" }
 cfctl-core = { path = "crates/cfctl-core", version = "1.2.1" }
 cfctl-planner = { path = "crates/cfctl-planner", version = "1.2.1" }
+cfctl-registry = { path = "crates/cfctl-registry", version = "1.2.1" }
 cfctl-storage = { path = "crates/cfctl-storage", version = "1.2.1" }
 cfctl-workspace = { path = "crates/cfctl-workspace", version = "1.2.1" }
 async-trait = "0.1.91"
@@ -43,7 +45,7 @@ http = "1.4.2"
 memchr = "2.7.6"
 rand = "0.10.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "rustls"] }
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde-saphyr = { version = "0.0.29", default-features = false, features = ["deserialize"] }

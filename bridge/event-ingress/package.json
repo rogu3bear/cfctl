@@ -1,0 +1,14 @@
+{
+  "name": "@cfctl/event-ingress",
+  "private": true,
+  "scripts": {
+    "types": "wrangler types worker-configuration.d.ts --config wrangler.jsonc",
+    "types:check": "wrangler types worker-configuration.d.ts --config wrangler.jsonc --check",
+    "test": "bun test",
+    "check": "bun run types:check && tsc --noEmit -p tsconfig.json && bun test"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "wrangler": "^4.113.0"
+  }
+}

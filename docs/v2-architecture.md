@@ -14,7 +14,9 @@ flowchart TD
     CLI -->|managed instructions and handoff| AGENT[cfctl-agent]
     CAT -->|capability contract| PLAN[cfctl-planner]
     WS -->|impact graph| PLAN
-    PLAN -->|hash-bound PlanV1 and policy decision| STORE[cfctl-storage]
+    CLI -->|scope sync and event reconciliation| REG[cfctl-registry]
+    REG -.->|immutable evidence references| STORE
+    PLAN -->|canonical pinned PlanV2 and policy decision| STORE[cfctl-storage]
     STORE -->|approved, durably consumed plan| CF[cfctl-cloudflare]
     AUTH -->|one selected credential| CF
     CF -->|receipts and verification| STORE
@@ -31,6 +33,7 @@ flowchart TD
 | `cfctl-workspace` | Registered-root Git/IaC discovery, exact local diffs, and repository/resource graph |
 | `cfctl-agent` | Agent discovery, maintained instructions, recursion-safe handoff |
 | `cfctl-storage` | Platform paths, atomic plans, locks, content-addressed evidence, tamper-evident operational-proof rows, and bounded recent-proof projections |
+| `cfctl-registry` | Rebuildable SQLite projection for scopes, normalized resources, observations, desired declarations, ownership, provider coverage, events, authorities, and operation maturity |
 | `xtask` | Local verification, reproducible release assembly, publication |
 
 The binary exposes a timestamp-free `BuildInfoV1`. A checkout build embeds its
@@ -88,7 +91,9 @@ checked-in configuration remains source-config evidence, receipts remain live-
 read evidence, and neither is silently promoted to desired-state or edge
 verification.
 
-`PlanV1` carries a hash-chained transaction journal. Checkpoints distinguish
+Canonical `PlanV2` binds the compatible `PlanV1` transaction journal to build,
+catalog, credential generation, admission policy, workspace, observation, and
+cost pins. The journal checkpoints distinguish
 the point before a Cloudflare boundary from the persisted response, secret
 sink, and operation-specific verification, so a network failure after a
 boundary attempt enters rectification and cannot be mistaken for a safe retry.
@@ -113,6 +118,18 @@ catalog identity, and currently installed credential generation. Historical
 rows without a generation remain readable as `credential_unbound`, and a row
 from a replaced credential is `credential_drifted`; neither becomes fresh
 proof for the current profile.
+
+The registry is a WAL-backed, rebuildable projection with versioned
+migrations, foreign keys, integrity checks, atomic backups, and per-resource
+writer locks. It keeps capability metadata, source configuration, desired
+declarations, live observations, ownership, operations, token authorities, and event
+receipts in separate truth domains. Queue messages are eligible for
+acknowledgement only after their evidence and reconciliation jobs commit under
+one ordinary, fully pinned event-batch PlanV2. Raw Queue pull and acknowledgement
+remain blocked catalog operations. Redelivery deduplicates by upstream identity.
+Events trigger bounded live reads; only a successful read may update an
+observation, so Audit Logs and Event Subscriptions cannot masquerade as a
+complete inventory.
 
 ## Trust sequence
 

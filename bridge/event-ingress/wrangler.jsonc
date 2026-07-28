@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cfctl-event-ingress",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-22",
+  "vars": {
+    "REALTIMEKIT_WEBHOOK_PUBLIC_KEY_URL": "https://api.realtime.cloudflare.com/.well-known/webhooks.json"
+  },
+  "queues": {
+    "producers": [
+      {
+        "binding": "EVENT_QUEUE",
+        "queue": "REPLACE_WITH_PLANNED_QUEUE_NAME"
+      }
+    ]
+  },
+  "observability": {
+    "enabled": true,
+    "logs": { "head_sampling_rate": 1 },
+    "traces": { "enabled": true, "head_sampling_rate": 0.01 }
+  }
+}

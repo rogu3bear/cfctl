@@ -30,6 +30,99 @@ pub enum WorkspaceError {
 
 pub type Result<T> = std::result::Result<T, WorkspaceError>;
 
+pub const WORKSPACE_MANIFEST_SCHEMA_VERSION: u8 = 1;
+
+/// One registered discovery boundary and its optional account selection.
+///
+/// The path and account pin intentionally live in the same record so callers
+/// cannot update discovery scope without updating its selection metadata in
+/// the same durable transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRegistrationV1 {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+}
+
+/// Canonical registered-root configuration consumed by discovery and account
+/// resolution. Storage persists this document atomically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceManifestV1 {
+    pub schema_version: u8,
+    pub registrations: Vec<WorkspaceRegistrationV1>,
+}
+
+impl Default for WorkspaceManifestV1 {
+    fn default() -> Self {
+        Self {
+            schema_version: WORKSPACE_MANIFEST_SCHEMA_VERSION,
+            registrations: Vec::new(),
+        }
+    }
+}
+
+impl WorkspaceManifestV1 {
+    #[must_use]
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.registrations
+            .iter()
+            .map(|registration| registration.path.clone())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn account_pins(&self) -> BTreeMap<PathBuf, String> {
+        self.registrations
+            .iter()
+            .filter_map(|registration| {
+                registration
+                    .account_id
+                    .as_ref()
+                    .map(|account| (registration.path.clone(), account.clone()))
+            })
+            .collect()
+    }
+
+    /// Registers one canonical root. Omitting `account_id` preserves an
+    /// existing pin, matching the public `workspace add` contract.
+    pub fn register(
+        &mut self,
+        path: PathBuf,
+        account_id: Option<String>,
+    ) -> WorkspaceRegistrationV1 {
+        if let Some(registration) = self
+            .registrations
+            .iter_mut()
+            .find(|registration| registration.path == path)
+        {
+            if account_id.is_some() {
+                registration.account_id = account_id;
+            }
+            return registration.clone();
+        }
+        let registration = WorkspaceRegistrationV1 { path, account_id };
+        self.registrations.push(registration.clone());
+        self.registrations
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        registration
+    }
+
+    pub fn unregister(&mut self, path: &Path) -> (bool, bool) {
+        let account_pin_removed = self
+            .registrations
+            .iter()
+            .find(|registration| registration.path == path)
+            .is_some_and(|registration| registration.account_id.is_some());
+        let original_len = self.registrations.len();
+        self.registrations
+            .retain(|registration| registration.path != path);
+        (
+            self.registrations.len() != original_len,
+            account_pin_removed,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisteredRoot {
     pub path: PathBuf,
@@ -310,16 +403,21 @@ fn included_entry(entry: &DirEntry) -> bool {
     !matches!(
         entry.file_name().to_str(),
         Some(
-            ".git"
+            ".cache"
+                | ".git"
                 | ".terraform"
                 | ".wrangler"
                 | "__fixtures__"
+                | "cargo-home"
+                | "coverage"
+                | "dist"
                 | "fixtures"
                 | "node_modules"
                 | "target"
                 | "test-data"
                 | "test_data"
                 | "testdata"
+                | "var"
                 | "vendor"
         )
     )

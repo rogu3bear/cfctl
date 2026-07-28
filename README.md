@@ -49,7 +49,7 @@ flowchart TD
     C --> G["cfctl guide"]
     G --> CALL["cfctl call"]
     CALL -->|read| EV[Redacted live evidence]
-    CALL -->|write| P[Hash-bound PlanV1]
+    CALL -->|write| P[Fully pinned PlanV2]
     P --> POL{Policy engine}
     POL -->|narrow safe class| RUN["cfctl plans run"]
     POL -->|everything else| APR["cfctl plans approve --yes"]
@@ -79,7 +79,7 @@ cfctl is a local-first, catalog-driven control plane: it separates intent, live 
 1. **Orient** (`none`) — Check running and PATH build identity, local state, credentials, catalog health, and agent integration.
 2. **Discover** (`none`) — Resolve the intent to the catalog-selected capability and adapter; browse the catalog when exploring.
 3. **Read** (`read`) — Inspect exact live Cloudflare state and registered-workspace impact. Durable state: redacted live-read and source-config evidence
-4. **Plan** (`none`) — Bind the request, account, catalog, impact, cost, verification, and compensation contracts. Durable state: hash-bound PlanV1 and PlanPrepared checkpoint
+4. **Plan** (`none`) — Bind the request, account, catalog, impact, cost, verification, and compensation contracts. Durable state: canonical pinned PlanV2, compatible PlanV1 journal projection, and PlanPrepared checkpoint
 5. **Admit** (`none`) — Apply policy, bind any explicit approval, acquire locks, and recheck drift. Durable state: approval, standing reservation, and consumption checkpoints
 6. **Execute** (`write`) — Persist the boundary attempt, then cross exactly one catalog-selected adapter boundary. Durable state: boundary-attempt and response checkpoints
 7. **Verify** (`read`) — Run the operation-specific verifier or record why rectification is required. Durable state: sink and verification receipts
@@ -121,7 +121,15 @@ cfctl call <capability-id> [selectors/body]
 cfctl guide <capability-id>
 cfctl guide --topic system|standing-authority
 cfctl plans show|approve|run|status|resume|rectify|cancel
-cfctl workspace add|discover|graph|audit
+cfctl policy admission stage|list|show|diff|approve|activate|rollback
+cfctl policy cloudflare list|get|diff|plan
+cfctl registry scopes list|discover|adopt|remove
+cfctl registry sync|status|coverage|list|get|graph|diff|history|export|rebuild
+cfctl registry declarations validate|diff|plan
+cfctl registry ownership list|get|check
+cfctl events sources|status|history|reconcile
+cfctl events bridge inspect|prepare|status
+cfctl workspace add|remove|discover|graph|audit
 cfctl agents install|doctor|sync
 cfctl docs search|changes|coverage
 cfctl doctor
@@ -235,15 +243,67 @@ Registered roots bound all discovery — cfctl never scans outside them:
 
 ```bash
 cfctl workspace add /absolute/repository/root --account <account-id>
+cfctl workspace remove /absolute/repository/root
 cfctl workspace discover --json
 cfctl workspace audit --json
 ```
 
-Discovery inventories Git repositories even when they carry no Cloudflare
+Removing a root stops future discovery and removes its account pin while
+preserving historical graph and evidence records. Discovery excludes nested
+generated, cache, fixture, vendor, and nested-repository paths unless they are
+registered directly. It inventories Git repositories even when they carry no Cloudflare
 configuration, and links Wrangler TOML/JSON/JSONC, Terraform HCL/JSON, and
 Pulumi YAML to catalog targets with current-content, `HEAD`-content, and exact
 worktree-diff hashes, so dirty or unmanaged dependencies stay visible in a
 plan.
+
+The registry is a rebuildable local projection, not a replacement authority:
+
+```bash
+cfctl registry sync --json
+cfctl registry coverage --json
+cfctl registry list --json
+cfctl registry diff --json
+```
+
+Catalog operations, source configuration, desired declarations under
+`CFCTL_HOME/config/registry/declarations/`, live observations, and evidence
+remain distinct. Coverage stays `partial` whenever a live normalization
+provider, permission, or fresh observation is missing. `registry rebuild`
+creates a consistent SQLite backup before reconstructing derived rows.
+
+Admission policy is staged, reviewed, approved, and atomically activated as a
+separate local policy input. A bundle can tighten the compiled hard safety
+floor but cannot override ambiguity, incomplete contracts, unknown cost,
+secret hazards, stale observations, or pinned-state drift:
+
+```bash
+cfctl policy admission list --json
+```
+
+New mutation plans carry a PlanV2 pin set while the PlanV1 body remains
+readable for compatibility. Historical unconsumed PlanV1 mutations must be
+replanned before approval or execution.
+
+Events are durable reconciliation triggers, never observed resource truth:
+
+```bash
+cfctl events sources --json
+cfctl events status --json
+cfctl events bridge inspect --json
+cfctl call events-consume-queue-batch \
+  --selector account_id=<account-id> --selector queue_id=<queue-id> \
+  --selector subscription_id=<subscription-or-webhook-id> \
+  --body-json '{"batch_size":100,"visibility_timeout_ms":60000}' --json
+```
+
+The synthetic event-batch capability is the only Queue pull/ack lane. Each
+batch is one fully pinned ordinary PlanV2 with explicit approval and the
+reviewed USD 0.00016 maximum; raw pull and acknowledgement capabilities remain
+blocked. Event evidence and derived reconciliation jobs commit atomically
+before exact lease acknowledgement. The inbound Worker under
+`bridge/event-ingress` is managed with Bun (`bun install --frozen-lockfile`,
+`bun run check`); preparing its manifest does not deploy it.
 
 ```bash
 cfctl agents install --all-detected

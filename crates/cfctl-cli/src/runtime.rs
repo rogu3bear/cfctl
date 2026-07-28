@@ -1,5 +1,7 @@
 //! Deterministic command handlers for the cfctl v2 binary.
 
+mod event_batch;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
@@ -28,18 +30,22 @@ use cfctl_cloudflare::{
     R2LogRetrievalCredentials, validate_request_contract,
 };
 use cfctl_core::{
-    AdapterStatus, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1, EffectClass, ErrorV1,
-    EvidenceClass, EvidenceV1, GuideActionV1, GuideContractStateV1, GuideTopicDocumentV1,
-    GuideTopicV1, MoneyV1, OperationalProofOutcomeV1, OperationalProofV1, PlanStatus, PlanV1,
-    PolicyDisposition, ResultEnvelopeV2, RiskClass, SecurityActionKindV1, StandingAuthorityV1,
+    AdapterStatus, AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1,
+    CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1, DesiredResourceV1, EffectClass,
+    ErrorV1, EvidenceClass, EvidenceV1, GuideActionV1, GuideContractStateV1, GuideTopicDocumentV1,
+    GuideTopicV1, MoneyV1, OperationalProofOutcomeV1, OperationalProofV1, OwnershipRecordV1,
+    PlanPinsV2, PlanStatus, PlanV1, PlanV2, PolicyDisposition, ResourceRefV1, ResultEnvelopeV2,
+    RiskClass, ScopeKindV1, ScopeRefV1, SecurityActionKindV1, StandingAuthorityV1,
     TransactionStageV1, VerificationState, guide_stages, guide_topic_document, hash_value,
     redact_json, render_guide_topic_document_markdown,
 };
 use cfctl_planner::{ImpactContext, PolicyEngine};
-use cfctl_storage::{RuntimePaths, StateStore};
+use cfctl_registry::{InventoryProviderV1, OperationIndexRecordV1, Registry};
+use cfctl_storage::{RuntimePaths, StateStore, StoredPlanRecord};
 use cfctl_workspace::{RegisteredRoot, WorkspaceGraph};
 use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::{StreamExt, stream};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio::process::Command as ProcessCommand;
@@ -50,11 +56,15 @@ pub(crate) use crate::telemetry_product::{
     operational_proof_projection_json, record_operational_proof,
 };
 use crate::{
-    AgentsCommand, AuthCommand, AuthLoginArgs, CallArgs, CatalogCommand, Cli, Command, DocsCommand,
-    GuideArgs, GuideTopicArg, ImportApiTokenArgs, ImportGlobalKeyArgs, KeyMutationArgs,
-    KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicyCommand, KeyPolicyCreateArgs,
-    KeyPolicySelector, KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs,
-    PlanSelector, PlansCommand, ProfileSelector, ResolveArgs, SearchArgs, WorkspaceCommand,
+    AdmissionPolicyCommand, AgentsCommand, AuthCommand, AuthLoginArgs, CallArgs, CatalogCommand,
+    Cli, CloudflarePolicyCommand, Command, DocsCommand, EventBridgeCommand, EventHistoryArgs,
+    EventReconcileArgs, EventsCommand, GuideArgs, GuideTopicArg, ImportApiTokenArgs,
+    ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs, KeyPolicyApproveArgs,
+    KeyPolicyCommand, KeyPolicyCreateArgs, KeyPolicySelector, KeyRevokeArgs, KeyRotateArgs,
+    KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector, PlansCommand, PolicyCommand,
+    ProfileSelector, RegistryCommand, RegistryDeclarationsCommand, RegistryOwnershipCommand,
+    RegistryScopeArgs, RegistryScopeKindArg, RegistryScopesCommand, ResolveArgs, SearchArgs,
+    WorkspaceCommand,
     build_identity::{build_identity_is_healthy, current_build_info, inspect_path_build},
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
@@ -82,6 +92,8 @@ pub enum CliError {
     Cloudflare(#[from] cfctl_cloudflare::CloudflareError),
     #[error(transparent)]
     Workspace(#[from] cfctl_workspace::WorkspaceError),
+    #[error(transparent)]
+    Registry(#[from] cfctl_registry::RegistryError),
     #[error(transparent)]
     Agent(#[from] cfctl_agent::AgentError),
     #[error(transparent)]
@@ -143,6 +155,11 @@ impl CliError {
             Self::Workspace(_) => Some((
                 "CFCTL_WORKSPACE",
                 "Run `cfctl workspace audit --json` to inspect registered roots and drift."
+                    .to_owned(),
+            )),
+            Self::Registry(_) => Some((
+                "CFCTL_REGISTRY",
+                "Run `cfctl registry status --json` and `cfctl registry coverage --json` to inspect projection health and blockers."
                     .to_owned(),
             )),
             _ => None,
@@ -481,6 +498,9 @@ pub async fn execute(cli: Cli) -> Result<ResultEnvelopeV2> {
         Command::Resolve(arguments) => resolve_command(&store, arguments).await,
         Command::Guide(arguments) => guide_command(&store, &arguments).await,
         Command::Plans(arguments) => Box::pin(plans_command(&store, arguments.command)).await,
+        Command::Policy(arguments) => policy_command(&store, arguments.command),
+        Command::Registry(arguments) => registry_command(&store, arguments.command),
+        Command::Events(arguments) => events_command(&store, arguments.command),
         Command::Workspace(arguments) => workspace_command(&store, arguments.command),
         Command::Agents(arguments) => agents_command(&store, arguments.command),
         Command::Docs(arguments) => docs_command(&store, arguments.command).await,
@@ -7795,6 +7815,10 @@ fn planned_cloudflare_diff(
     diff
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "PlanV1 compatibility, PlanV2 pins, durable persistence, and the returned preview must be constructed from one immutable preparation context"
+)]
 fn persist_prepared_plan(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -7817,7 +7841,12 @@ fn persist_prepared_plan(
         &live_preconditions,
     )?;
     let impact = plan_impact(store, &capability, &input, account_id)?;
-    let policy = PolicyEngine.evaluate(&capability, &impact.policy);
+    let compiled_policy = PolicyEngine.evaluate(&capability, &impact.policy);
+    let active_policy = active_admission_policy(store)?;
+    let policy = active_policy.as_ref().map_or_else(
+        || Ok(compiled_policy.clone()),
+        |bundle| bundle.tighten(&compiled_policy, &capability),
+    )?;
     if policy.disposition == PolicyDisposition::Blocked {
         return Ok(blocked_capability_envelope(
             "call",
@@ -7863,12 +7892,66 @@ fn persist_prepared_plan(
     }
     plan.policy = policy.clone();
     plan.refresh_hash()?;
-    store.save_plan(&plan)?;
-    let evidence = store.write_evidence(EvidenceClass::Preview, &serde_json::to_value(&plan)?)?;
+    let build_identity_hash = hash_value(&serde_json::to_value(current_build_info())?)?;
+    let credential_generation_id = profile.credential_generation_id.clone().ok_or_else(|| {
+        CliError::guided(
+            "CFCTL_CREDENTIAL_UNBOUND",
+            format!(
+                "profile `{}` has no credential generation and cannot create a PlanV2",
+                profile.id
+            ),
+            format!(
+                "Re-import or log in to profile `{}` before creating the mutation plan.",
+                profile.id
+            ),
+        )
+    })?;
+    let admission_policy_hash = active_policy.as_ref().map_or_else(
+        || {
+            hash_value(&json!({"compiled_safety_floor": compiled_policy}))
+                .map(|hash| format!("compiled:{hash}"))
+        },
+        |bundle| Ok(format!("bundle:{}", bundle.content_hash)),
+    )?;
+    let workspace_graph_hash = plan
+        .precondition_hashes
+        .get("workspace_graph")
+        .cloned()
+        .ok_or_else(|| {
+            CliError::Input("PlanV2 requires a pinned workspace graph hash".to_owned())
+        })?;
+    let resource_observation_hashes = plan
+        .precondition_hashes
+        .iter()
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "catalog" | "request_input" | "workspace_graph"
+            )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let plan_v2 = PlanV2::new(
+        plan.clone(),
+        PlanPinsV2 {
+            build_identity_hash,
+            catalog_hash: catalog.schema_hash.clone(),
+            credential_generation_id,
+            admission_policy_hash,
+            authority_hash: None,
+            workspace_graph_hash,
+            resource_observation_hashes,
+            cost_budget: None,
+        },
+    )?;
+    store.save_plan_v2(&plan_v2)?;
+    let evidence =
+        store.write_evidence(EvidenceClass::Preview, &serde_json::to_value(&plan_v2)?)?;
     let mut envelope = ResultEnvelopeV2::success(
         "call",
         json!({
             "plan": plan,
+            "plan_v2": plan_v2,
             "approval_command": approval_command_argv(&plan.capability, &plan.operation_id).join(" "),
             "run_command": format!("cfctl plans run {}", plan.operation_id),
             "message": if policy.disposition == PolicyDisposition::AutoExecute {
@@ -8697,9 +8780,154 @@ async fn plans_command(store: &StateStore, command: PlansCommand) -> Result<Resu
 }
 
 fn load_validated_plan(store: &StateStore, operation_id: &str) -> Result<PlanV1> {
-    let plan = store.load_plan(operation_id)?;
+    let record = store.load_stored_plan_record(operation_id)?;
+    let plan = match record {
+        StoredPlanRecord::Current(plan) => plan.plan,
+        StoredPlanRecord::LegacyReadable(plan) | StoredPlanRecord::RequiredSidecarMissing(plan) => {
+            *plan
+        }
+        StoredPlanRecord::ProjectionDrift { .. } => {
+            return Err(CliError::guided(
+                "CFCTL_PLAN_V2_DRIFT",
+                format!(
+                    "PlanV2 `{operation_id}` disagrees with its PlanV1 compatibility projection"
+                ),
+                "Do not approve, run, or resume this plan. Inspect the canonical PlanV2 and repair its compatibility projection before proceeding.",
+            ));
+        }
+        StoredPlanRecord::Corrupt { reason, .. } => {
+            return Err(CliError::guided(
+                "CFCTL_PLAN_CORRUPT",
+                format!("plan `{operation_id}` is corrupt: {reason}"),
+                "Do not replay or replace the plan in place. Preserve the files and inspect the exact durable record before recovery.",
+            ));
+        }
+    };
     plan.validate_transaction_journal()?;
     Ok(plan)
+}
+
+fn ensure_plan_execution_contract(store: &StateStore, plan: &PlanV1) -> Result<()> {
+    match store.load_stored_plan_record(&plan.operation_id)? {
+        StoredPlanRecord::Current(_) => Ok(()),
+        StoredPlanRecord::LegacyReadable(_) => Err(CliError::guided(
+            "CFCTL_PLAN_REPLAN_REQUIRED",
+            format!(
+                "historical PlanV1 mutation `{}` remains readable but cannot be approved or executed",
+                plan.operation_id
+            ),
+            format!(
+                "Re-run `cfctl call {}` with the original reviewed selectors and body to create a fully pinned PlanV2.",
+                plan.capability.id
+            ),
+        )),
+        StoredPlanRecord::RequiredSidecarMissing(_) => Err(CliError::guided(
+            "CFCTL_PLAN_V2_MISSING",
+            format!(
+                "current mutation plan `{}` is missing its required canonical PlanV2 document",
+                plan.operation_id
+            ),
+            format!(
+                "Do not approve or execute this incomplete plan. Re-run `cfctl call {}` to create a new fully pinned PlanV2.",
+                plan.capability.id
+            ),
+        )),
+        StoredPlanRecord::ProjectionDrift { .. } => Err(CliError::guided(
+            "CFCTL_PLAN_V2_DRIFT",
+            "the canonical PlanV2 disagrees with its PlanV1 compatibility projection",
+            "Do not approve, run, or resume this plan until its durable projection is repaired.",
+        )),
+        StoredPlanRecord::Corrupt { reason, .. } => Err(CliError::guided(
+            "CFCTL_PLAN_CORRUPT",
+            reason,
+            "Preserve the durable files and inspect the exact plan record before recovery.",
+        )),
+    }
+}
+
+fn validate_plan_v2_runtime_pins(
+    store: &StateStore,
+    plan: &PlanV1,
+    profile: &ProfileMetadata,
+) -> Result<()> {
+    let StoredPlanRecord::Current(plan_v2) = store.load_stored_plan_record(&plan.operation_id)?
+    else {
+        ensure_plan_execution_contract(store, plan)?;
+        return Err(CliError::guided(
+            "CFCTL_PLAN_V2_MISSING",
+            "the execution contract is not a current PlanV2",
+            "Create and approve a new fully pinned PlanV2.",
+        ));
+    };
+    let plan_v2 = *plan_v2;
+    let current_build_hash = hash_value(&serde_json::to_value(current_build_info())?)?;
+    if plan_v2.pins.build_identity_hash != current_build_hash {
+        return Err(CliError::guided(
+            "CFCTL_PLAN_BUILD_DRIFT",
+            "the running build identity no longer matches the PlanV2 pin",
+            format!(
+                "Re-run `cfctl call {}` under the current checkout build.",
+                plan.capability.id
+            ),
+        ));
+    }
+    if profile.credential_generation_id.as_deref()
+        != Some(plan_v2.pins.credential_generation_id.as_str())
+    {
+        return Err(CliError::guided(
+            "CFCTL_PLAN_CREDENTIAL_DRIFT",
+            "the selected credential generation no longer matches the PlanV2 pin",
+            format!(
+                "Re-authenticate profile `{}` and create a new plan.",
+                profile.id
+            ),
+        ));
+    }
+    let current_policy = active_admission_policy(store)?;
+    match current_policy {
+        Some(bundle)
+            if plan_v2.pins.admission_policy_hash != format!("bundle:{}", bundle.content_hash) =>
+        {
+            return Err(CliError::guided(
+                "CFCTL_PLAN_POLICY_DRIFT",
+                "the active admission policy no longer matches the PlanV2 pin",
+                format!(
+                    "Re-run `cfctl call {}` under the active bundle.",
+                    plan.capability.id
+                ),
+            ));
+        }
+        None if !plan_v2
+            .pins
+            .admission_policy_hash
+            .starts_with("compiled:sha256:") =>
+        {
+            return Err(CliError::guided(
+                "CFCTL_PLAN_POLICY_DRIFT",
+                "the PlanV2 was created under an admission bundle that is no longer active",
+                format!(
+                    "Re-run `cfctl call {}` under the compiled safety floor.",
+                    plan.capability.id
+                ),
+            ));
+        }
+        _ => {}
+    }
+    if let Some(authority_hash) = &plan_v2.pins.authority_hash {
+        let authority = store
+            .list_authorities()?
+            .into_iter()
+            .find(|authority| &authority.content_hash == authority_hash)
+            .ok_or_else(|| {
+                CliError::guided(
+                    "CFCTL_PLAN_AUTHORITY_DRIFT",
+                    "the PlanV2 authority pin no longer resolves",
+                    "Create and approve a new token lifecycle policy, then re-plan.",
+                )
+            })?;
+        authority.ensure_operational()?;
+    }
+    Ok(())
 }
 
 fn persist_transaction_stage(
@@ -8724,8 +8952,37 @@ fn persist_transaction_stage_with_artifact(
 }
 
 fn show_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
-    let plan = load_validated_plan(store, &selector.operation_id)?;
-    let mut envelope = ResultEnvelopeV2::success("plans show", serde_json::to_value(&plan)?);
+    let record = store.load_stored_plan_record(&selector.operation_id)?;
+    let plan = record.readable_plan().cloned().ok_or_else(|| {
+        let reason = match &record {
+            StoredPlanRecord::Corrupt { reason, .. } => reason.as_str(),
+            _ => "the plan has no readable body",
+        };
+        CliError::guided(
+            "CFCTL_PLAN_CORRUPT",
+            reason,
+            "Preserve the durable files and inspect the exact plan record before recovery.",
+        )
+    })?;
+    plan.validate_transaction_journal()?;
+    let mut result = serde_json::to_value(&plan)?;
+    let plan_v2 = match &record {
+        StoredPlanRecord::Current(plan)
+        | StoredPlanRecord::ProjectionDrift { current: plan, .. } => Some(plan),
+        _ => None,
+    };
+    if let Some(object) = result.as_object_mut() {
+        object.insert("plan_v2".to_owned(), serde_json::to_value(plan_v2)?);
+        object.insert(
+            "execution_compatible".to_owned(),
+            json!(record.execution_compatible()),
+        );
+        object.insert(
+            "execution_incompatibility_reason".to_owned(),
+            serde_json::to_value(record.execution_incompatibility_reason())?,
+        );
+    }
+    let mut envelope = ResultEnvelopeV2::success("plans show", result);
     envelope.operation_id = Some(plan.operation_id);
     envelope.capability_id = Some(plan.capability.id);
     envelope.policy_decision = Some(plan.policy);
@@ -8736,6 +8993,7 @@ fn show_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelo
 fn approve_plan(store: &StateStore, arguments: &PlanApproveArgs) -> Result<ResultEnvelopeV2> {
     let _lock = store.lock_plan(&arguments.operation_id)?;
     let mut plan = load_validated_plan(store, &arguments.operation_id)?;
+    ensure_plan_execution_contract(store, &plan)?;
     let max_cost = arguments.max_cost.as_deref().map(parse_money).transpose()?;
     plan.approve(arguments.yes, max_cost)?;
     store.save_plan(&plan)?;
@@ -8759,10 +9017,18 @@ fn approve_plan(store: &StateStore, arguments: &PlanApproveArgs) -> Result<Resul
 
 fn cancel_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
     let _lock = store.lock_plan(&selector.operation_id)?;
-    // Deliberately `load_plan`, not `load_validated_plan`: cancellation must
+    // Deliberately load the storage classification, not the execution
+    // contract: cancellation must
     // de-authorize even a plan whose journal or content no longer validates —
     // refusing would preserve exactly the authority being retired.
-    let mut plan = store.load_plan(&selector.operation_id)?;
+    let record = store.load_stored_plan_record(&selector.operation_id)?;
+    let mut plan = record.readable_plan().cloned().ok_or_else(|| {
+        CliError::guided(
+            "CFCTL_PLAN_CORRUPT",
+            "the plan has no readable canonical body to cancel",
+            "Preserve the durable record and inspect it before attempting recovery.",
+        )
+    })?;
     plan.cancel()?;
     store.save_plan(&plan)?;
     let evidence = store.write_evidence(EvidenceClass::Preview, &serde_json::to_value(&plan)?)?;
@@ -8786,6 +9052,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     let _lock = store.lock_plan(&selector.operation_id)?;
     let catalog = ensure_catalog(store).await?;
     let mut plan = load_validated_plan(store, &selector.operation_id)?;
+    ensure_plan_execution_contract(store, &plan)?;
     if plan.catalog_hash != catalog.schema_hash {
         return Err(CliError::Input(format!(
             "catalog drift invalidated the plan: planned {}, current {}",
@@ -8810,6 +9077,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     preflight_secret_sink(&plan)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(Some(&plan.profile_id))?;
+    validate_plan_v2_runtime_pins(store, &plan, profile)?;
     if is_r2_temporary_credentials_operation_identity(&plan.capability)
         && profile.kind != ProfileKind::ApiToken
     {
@@ -8846,7 +9114,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     )?;
     execute_consumed_plan(
         store,
-        &catalog.schema_hash,
+        &catalog,
         &mut plan,
         &execution_input,
         &credential,
@@ -8872,8 +9140,10 @@ async fn run_plan_under_standing_authority(
     // admission critical section below and is released before network I/O.
     let _plan_lock = store.lock_plan(operation_id)?;
     let authority_snapshot = store.load_authority(authority_id)?;
+    store.bind_plan_authority_hash(operation_id, &authority_snapshot.content_hash)?;
     let catalog = ensure_catalog(store).await?;
     let mut plan = load_validated_plan(store, operation_id)?;
+    ensure_plan_execution_contract(store, &plan)?;
     if plan.catalog_hash != catalog.schema_hash {
         return Err(CliError::Input(format!(
             "catalog drift invalidated the plan: planned {}, current {}",
@@ -8898,6 +9168,7 @@ async fn run_plan_under_standing_authority(
     preflight_secret_sink(&plan)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(Some(&plan.profile_id))?;
+    validate_plan_v2_runtime_pins(store, &plan, profile)?;
     let secrets = platform_secrets(store);
     let credential = fresh_credential(profile, &secrets).await?;
     let execution_input = resolved_plan_input(&plan, &secrets)?;
@@ -8923,7 +9194,7 @@ async fn run_plan_under_standing_authority(
     let admitted_authority_id = authority_snapshot.authority_id.clone();
     let mut envelope = execute_consumed_plan(
         store,
-        &catalog.schema_hash,
+        &catalog,
         &mut plan,
         &execution_input,
         &credential,
@@ -9359,13 +9630,20 @@ async fn validate_live_plan_precondition_evidence(
 
 async fn execute_consumed_plan(
     store: &StateStore,
-    catalog_hash: &str,
+    catalog: &CatalogSnapshot,
     plan: &mut PlanV1,
     execution_input: &CallInput,
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
     evidence: LivePreconditionEvidence,
 ) -> Result<ResultEnvelopeV2> {
+    if plan.capability.id == cfctl_core::EVENT_BATCH_CAPABILITY_ID {
+        let mut result = event_batch::execute(store, catalog, plan, credential, secrets).await;
+        if let Ok(envelope) = &mut result {
+            prepend_live_precondition_evidence(envelope, evidence);
+        }
+        return result;
+    }
     if plan.capability.adapter_status == AdapterStatus::DelegatedCli {
         let mut result =
             execute_delegated_plan(store, plan, execution_input, credential, secrets).await;
@@ -9405,7 +9683,7 @@ async fn execute_consumed_plan(
     }
     let mut envelope = execute_api_plan(
         store,
-        catalog_hash,
+        &catalog.schema_hash,
         plan,
         execution_input,
         credential,
@@ -13116,29 +13394,814 @@ async fn key_revoke(store: &StateStore, arguments: &KeyRevokeArgs) -> Result<Res
     .await
 }
 
+#[derive(Debug, Deserialize)]
+struct AdmissionPolicyStageInput {
+    name: String,
+    rules: Vec<AdmissionPolicyRuleV1>,
+}
+
+fn policy_command(store: &StateStore, command: PolicyCommand) -> Result<ResultEnvelopeV2> {
+    match command {
+        PolicyCommand::Admission(command) => admission_policy_command(store, command.command),
+        PolicyCommand::Cloudflare(command) => cloudflare_policy_command(store, command.command),
+    }
+}
+
+fn admission_policy_command(
+    store: &StateStore,
+    command: AdmissionPolicyCommand,
+) -> Result<ResultEnvelopeV2> {
+    match command {
+        AdmissionPolicyCommand::Stage(arguments) => {
+            let value: Value = serde_json::from_slice(
+                &fs::read(&arguments.file).map_err(|source| cli_io(&arguments.file, source))?,
+            )?;
+            let bundle = if value.get("schema_version").is_some() {
+                serde_json::from_value::<AdmissionPolicyBundleV1>(value)?
+            } else {
+                let input: AdmissionPolicyStageInput = serde_json::from_value(value)?;
+                AdmissionPolicyBundleV1::pending(input.name, input.rules)?
+            };
+            if bundle.status != AdmissionPolicyBundleStatusV1::Pending {
+                return Err(CliError::Input(
+                    "only a pending admission bundle may be staged".to_owned(),
+                ));
+            }
+            bundle.validate()?;
+            store.create_admission_bundle(&bundle)?;
+            Ok(ResultEnvelopeV2::success(
+                "policy admission stage",
+                json!({
+                    "bundle": bundle,
+                    "approval_command": format!("cfctl policy admission approve {} --yes", bundle.bundle_id),
+                    "message": "Admission bundle staged. It has no effect until separately approved and atomically activated."
+                }),
+            ))
+        }
+        AdmissionPolicyCommand::List => Ok(ResultEnvelopeV2::success(
+            "policy admission list",
+            json!({
+                "bundles": store.list_admission_bundles()?,
+                "active_bundle_id": store.active_admission_bundle_id()?,
+            }),
+        )),
+        AdmissionPolicyCommand::Show(arguments) => {
+            let bundle = store.load_admission_bundle(&arguments.bundle_id)?;
+            Ok(ResultEnvelopeV2::success(
+                "policy admission show",
+                serde_json::to_value(bundle)?,
+            ))
+        }
+        AdmissionPolicyCommand::Diff(arguments) => {
+            let candidate = store.load_admission_bundle(&arguments.bundle_id)?;
+            let active = active_admission_policy(store)?;
+            Ok(ResultEnvelopeV2::success(
+                "policy admission diff",
+                json!({
+                    "candidate": candidate,
+                    "active": active,
+                    "rules_changed": active.as_ref().is_none_or(|active| active.rules != candidate.rules),
+                    "safety_floor": "Compiled ambiguity, incomplete-contract, cost, secret, stale-observation, and drift blockers remain non-overridable."
+                }),
+            ))
+        }
+        AdmissionPolicyCommand::Approve(arguments) => {
+            let bundle = store.approve_admission_bundle(&arguments.bundle_id, arguments.yes)?;
+            Ok(ResultEnvelopeV2::success(
+                "policy admission approve",
+                json!({
+                    "bundle_id": bundle.bundle_id,
+                    "content_hash": bundle.content_hash,
+                    "status": bundle.status,
+                    "activate_command": format!("cfctl policy admission activate {}", bundle.bundle_id),
+                    "message": "The exact bundle is approved but is not active."
+                }),
+            ))
+        }
+        AdmissionPolicyCommand::Activate(arguments) => {
+            activate_admission_bundle(store, &arguments.bundle_id, false)
+        }
+        AdmissionPolicyCommand::Rollback(arguments) => {
+            activate_admission_bundle(store, &arguments.bundle_id, true)
+        }
+    }
+}
+
+fn cloudflare_policy_command(
+    store: &StateStore,
+    command: CloudflarePolicyCommand,
+) -> Result<ResultEnvelopeV2> {
+    let registry = Registry::open(&store.paths().data_dir)?;
+    match command {
+        CloudflarePolicyCommand::List => {
+            let policies = registry
+                .list_resources(None)?
+                .into_iter()
+                .filter(|resource| is_policy_resource_kind(&resource.kind))
+                .collect::<Vec<_>>();
+            Ok(ResultEnvelopeV2::success(
+                "policy cloudflare list",
+                json!({"resources": policies, "coverage": registry.coverage()?}),
+            ))
+        }
+        CloudflarePolicyCommand::Get(arguments) => {
+            let resource = registry.get_resource(&arguments.resource)?;
+            Ok(ResultEnvelopeV2::success(
+                "policy cloudflare get",
+                json!({
+                    "resource": resource,
+                    "observations": registry.observation_history(&arguments.resource)?,
+                    "found": resource.is_some(),
+                }),
+            ))
+        }
+        CloudflarePolicyCommand::Diff(arguments) => registry_diff_envelope(
+            &registry,
+            "policy cloudflare diff",
+            arguments.resource.as_deref(),
+            false,
+        ),
+        CloudflarePolicyCommand::Plan(arguments) => registry_diff_envelope(
+            &registry,
+            "policy cloudflare plan",
+            arguments.resource.as_deref(),
+            true,
+        ),
+    }
+}
+
+fn is_policy_resource_kind(kind: &str) -> bool {
+    let kind = kind.to_ascii_lowercase();
+    [
+        "access",
+        "gateway",
+        "notification",
+        "policy",
+        "ruleset",
+        "waf",
+    ]
+    .iter()
+    .any(|term| kind.contains(term))
+}
+
+fn active_admission_policy(store: &StateStore) -> Result<Option<AdmissionPolicyBundleV1>> {
+    store.active_admission_policy().map_err(CliError::from)
+}
+
+fn activate_admission_bundle(
+    store: &StateStore,
+    bundle_id: &str,
+    rollback: bool,
+) -> Result<ResultEnvelopeV2> {
+    let activation = store.activate_admission_bundle(bundle_id)?;
+    let target = activation.bundle;
+    let previous_id = activation.previous_bundle_id;
+    Ok(ResultEnvelopeV2::success(
+        if rollback {
+            "policy admission rollback"
+        } else {
+            "policy admission activate"
+        },
+        json!({
+            "bundle": target,
+            "previous_bundle_id": previous_id,
+            "message": if rollback {
+                "Previously approved bundle atomically selected as active; compiled safety floor remains authoritative."
+            } else {
+                "Approved bundle atomically selected as active; compiled safety floor remains authoritative."
+            }
+        }),
+    ))
+}
+
+const EVENT_SCHEMA_REFERENCE: &str =
+    "https://developers.cloudflare.com/queues/event-subscriptions/events-schemas/";
+const QUEUE_PULL_REFERENCE: &str =
+    "https://developers.cloudflare.com/queues/configuration/pull-consumers/";
+const REALTIMEKIT_WEBHOOK_REFERENCE: &str =
+    "https://developers.cloudflare.com/realtime/realtimekit/webhooks/";
+const EVENT_BRIDGE_WORKER_SOURCE: &str = include_str!("../../../bridge/event-ingress/src/index.ts");
+const EVENT_BRIDGE_WRANGLER_SOURCE: &str =
+    include_str!("../../../bridge/event-ingress/wrangler.jsonc");
+
+fn events_command(store: &StateStore, command: EventsCommand) -> Result<ResultEnvelopeV2> {
+    let mut registry = Registry::open(&store.paths().data_dir)?;
+    match command {
+        EventsCommand::Sources => Ok(ResultEnvelopeV2::success(
+            "events sources",
+            json!({
+                "schema_version": 1,
+                "verified_at": "2026-07-22",
+                "documentation_last_updated": "2026-07-15",
+                "documentation": EVENT_SCHEMA_REFERENCE,
+                "sources": [
+                    {"family":"Access","source_ids":["access"]},
+                    {"family":"Artifacts","source_ids":["artifacts","artifacts.repo"]},
+                    {"family":"Email Sending","source_ids":["email.sending"]},
+                    {"family":"R2","source_ids":["r2"]},
+                    {"family":"Super Slurper","source_ids":["superSlurper","superSlurper.job"]},
+                    {"family":"Vectorize","source_ids":["vectorize"]},
+                    {"family":"Workers AI","source_ids":["workersAi.model"]},
+                    {"family":"Workers Builds","source_ids":["workersBuilds.worker"]},
+                    {"family":"Workers KV","source_ids":["kv"]},
+                    {"family":"Workflows","source_ids":["workflows.workflow"]}
+                ],
+                "truth_boundary": "This is a versioned local documentation snapshot. Use catalog/docs drift checks before changing Event Subscription request schemas."
+            }),
+        )),
+        EventsCommand::Status => Ok(ResultEnvelopeV2::success(
+            "events status",
+            json!({
+                "ledger": registry.event_status()?,
+                "reconciliation_jobs": registry.reconciliation_jobs()?,
+                "queue_pull_contract": QUEUE_PULL_REFERENCE,
+                "truth_boundary": "Events and queued reconciliation jobs are durable local evidence. They are not observed Cloudflare resource state."
+            }),
+        )),
+        EventsCommand::History(EventHistoryArgs { limit }) => Ok(ResultEnvelopeV2::success(
+            "events history",
+            json!({"events": registry.event_history(limit)?, "limit": limit}),
+        )),
+        EventsCommand::Reconcile(EventReconcileArgs { resource }) => {
+            let resource_ref = registry.get_resource(&resource)?.ok_or_else(|| {
+                CliError::Input(format!(
+                    "registry resource `{resource}` was not found; run `cfctl registry sync` and inspect `cfctl registry list --json`"
+                ))
+            })?;
+            let job = registry.enqueue_reconciliation(resource_ref)?;
+            Ok(ResultEnvelopeV2::success(
+                "events reconcile",
+                json!({
+                    "job": job,
+                    "live_read_executed": false,
+                    "next_action": "Resolve the resource kind to its registered inventory provider and execute the bounded live read; only a successful evidence-backed read may record an observation."
+                }),
+            ))
+        }
+        EventsCommand::Bridge(arguments) => event_bridge_command(store, arguments.command),
+    }
+}
+
+fn event_bridge_command(
+    store: &StateStore,
+    command: EventBridgeCommand,
+) -> Result<ResultEnvelopeV2> {
+    let manifest_path = store
+        .paths()
+        .config_dir
+        .join("events/bridge/event-ingress.json");
+    let template = json!({
+        "schema_version": 1,
+        "worker_name": "cfctl-event-ingress",
+        "worker_source_hash": hash_value(&json!(EVENT_BRIDGE_WORKER_SOURCE))?,
+        "wrangler_source_hash": hash_value(&json!(EVENT_BRIDGE_WRANGLER_SOURCE))?,
+        "queue_binding": "EVENT_QUEUE",
+        "realtimekit": {
+            "signature_header": "rtk-signature",
+            "delivery_id_header": "rtk-uuid",
+            "webhook_id_header": "rtk-webhook-id",
+            "algorithm": "RSA-SHA256",
+            "public_key_url": "https://api.realtime.cloudflare.com/.well-known/webhooks.json",
+            "documentation": REALTIMEKIT_WEBHOOK_REFERENCE
+        },
+        "deployment_state": "not_applied"
+    });
+    match command {
+        EventBridgeCommand::Inspect => Ok(ResultEnvelopeV2::success(
+            "events bridge inspect",
+            json!({"template": template, "manifest_path": manifest_path}),
+        )),
+        EventBridgeCommand::Prepare => {
+            let parent = manifest_path.parent().ok_or_else(|| {
+                CliError::Input("event bridge manifest has no parent directory".to_owned())
+            })?;
+            fs::create_dir_all(parent).map_err(|source| cli_io(parent, source))?;
+            store.write_json(&manifest_path, &template)?;
+            Ok(ResultEnvelopeV2::success(
+                "events bridge prepare",
+                json!({
+                    "manifest_path": manifest_path,
+                    "manifest": template,
+                    "cloudflare_applied": false,
+                    "next_action": "Resolve and plan the exact Worker, Queue, and Event Subscription capabilities separately. This command stages local configuration only and grants no Cloudflare mutation authority."
+                }),
+            ))
+        }
+        EventBridgeCommand::Status => {
+            let manifest: Option<Value> = manifest_path
+                .is_file()
+                .then(|| store.read_json(&manifest_path))
+                .transpose()?;
+            Ok(ResultEnvelopeV2::success(
+                "events bridge status",
+                json!({
+                    "prepared": manifest.is_some(),
+                    "manifest_path": manifest_path,
+                    "manifest": manifest,
+                    "cloudflare_apply_proven": false
+                }),
+            ))
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the public registry subcommand dispatcher keeps every read-only projection and local declaration action explicit"
+)]
+fn registry_command(store: &StateStore, command: RegistryCommand) -> Result<ResultEnvelopeV2> {
+    let mut registry = Registry::open(&store.paths().data_dir)?;
+    match command {
+        RegistryCommand::Scopes(arguments) => match arguments.command {
+            RegistryScopesCommand::List => Ok(ResultEnvelopeV2::success(
+                "registry scopes list",
+                json!({"scopes": registry.list_scopes()?}),
+            )),
+            RegistryScopesCommand::Discover => {
+                let profiles = ProfilesConfig::load(store)?;
+                let scopes = profiles
+                    .profiles
+                    .values()
+                    .filter_map(|profile| profile.account_id.as_deref())
+                    .map(|account| ScopeRefV1::new(ScopeKindV1::Account, account, None))
+                    .collect::<BTreeSet<_>>();
+                Ok(ResultEnvelopeV2::success(
+                    "registry scopes discover",
+                    json!({
+                        "scopes": scopes,
+                        "source": "configured credential profile metadata",
+                        "adopted": false,
+                        "next_action": "Review each scope, then use `cfctl registry scopes adopt --kind account --id <account-id>` or run `cfctl registry sync` to adopt configured account scopes."
+                    }),
+                ))
+            }
+            RegistryScopesCommand::Adopt(arguments) => {
+                let scope = registry_scope(&arguments);
+                registry.adopt_scope(&scope)?;
+                Ok(ResultEnvelopeV2::success(
+                    "registry scopes adopt",
+                    json!({"scope": scope, "message": "Scope adopted for local registry synchronization; no Cloudflare boundary was crossed."}),
+                ))
+            }
+            RegistryScopesCommand::Remove(arguments) => {
+                let scope = registry_scope(&arguments);
+                let removed = registry.remove_scope(&scope)?;
+                Ok(ResultEnvelopeV2::success(
+                    "registry scopes remove",
+                    json!({"scope": scope, "removed": removed, "message": "Scope retired from future registry synchronization; immutable evidence remains authoritative."}),
+                ))
+            }
+        },
+        RegistryCommand::Sync => registry_sync(store, &mut registry),
+        RegistryCommand::Status => Ok(ResultEnvelopeV2::success(
+            "registry status",
+            serde_json::to_value(registry.status()?)?,
+        )),
+        RegistryCommand::Coverage => Ok(ResultEnvelopeV2::success(
+            "registry coverage",
+            serde_json::to_value(registry.coverage()?)?,
+        )),
+        RegistryCommand::List(arguments) => Ok(ResultEnvelopeV2::success(
+            "registry list",
+            json!({"resources": registry.list_resources(arguments.kind.as_deref())?}),
+        )),
+        RegistryCommand::Get(arguments) => {
+            let resource = registry.get_resource(&arguments.resource)?;
+            let desired = registry
+                .list_desired_resources()?
+                .into_iter()
+                .find(|candidate| candidate.resource.key() == arguments.resource);
+            let ownership = registry
+                .list_ownership()?
+                .into_iter()
+                .find(|candidate| candidate.resource.key() == arguments.resource);
+            let observation = registry
+                .observation_history(&arguments.resource)?
+                .into_iter()
+                .next();
+            Ok(ResultEnvelopeV2::success(
+                "registry get",
+                json!({
+                    "resource": resource,
+                    "latest_observation": observation,
+                    "desired": desired,
+                    "ownership": ownership,
+                    "found": resource.is_some(),
+                }),
+            ))
+        }
+        RegistryCommand::Graph => Ok(ResultEnvelopeV2::success(
+            "registry graph",
+            json!({
+                "scopes": registry.list_scopes()?,
+                "resources": registry.list_resources(None)?,
+                "ownership": registry.list_ownership()?,
+                "truth_boundary": "Scope and relationship rows are a rebuildable projection; desired declarations, live-read evidence, and Cloudflare state retain separate authority."
+            }),
+        )),
+        RegistryCommand::Diff(arguments) => registry_diff_envelope(
+            &registry,
+            "registry diff",
+            arguments.resource.as_deref(),
+            false,
+        ),
+        RegistryCommand::History(arguments) => Ok(ResultEnvelopeV2::success(
+            "registry history",
+            json!({
+                "resource": arguments.resource,
+                "observations": registry.observation_history(&arguments.resource)?,
+            }),
+        )),
+        RegistryCommand::Export => Ok(ResultEnvelopeV2::success(
+            "registry export",
+            serde_json::to_value(registry.export()?)?,
+        )),
+        RegistryCommand::Rebuild => {
+            let backup = registry.rebuild_projection()?;
+            let sync = registry_sync_result(store, &mut registry)?;
+            Ok(ResultEnvelopeV2::success(
+                "registry rebuild",
+                json!({
+                    "backup": backup,
+                    "sync": sync,
+                    "message": "The rebuildable projection was backed up, cleared, reconstructed from configured sources, and integrity-checked."
+                }),
+            ))
+        }
+        RegistryCommand::Declarations(arguments) => match arguments.command {
+            RegistryDeclarationsCommand::Validate => {
+                let declarations = load_registry_declarations(store)?;
+                Ok(ResultEnvelopeV2::success(
+                    "registry declarations validate",
+                    json!({
+                        "valid": true,
+                        "declaration_count": declarations.len(),
+                        "declarations": declarations,
+                    }),
+                ))
+            }
+            RegistryDeclarationsCommand::Diff(arguments) => registry_diff_envelope(
+                &registry,
+                "registry declarations diff",
+                arguments.resource.as_deref(),
+                false,
+            ),
+            RegistryDeclarationsCommand::Plan(arguments) => registry_diff_envelope(
+                &registry,
+                "registry declarations plan",
+                arguments.resource.as_deref(),
+                true,
+            ),
+        },
+        RegistryCommand::Ownership(arguments) => match arguments.command {
+            RegistryOwnershipCommand::List => Ok(ResultEnvelopeV2::success(
+                "registry ownership list",
+                json!({"ownership": registry.list_ownership()?}),
+            )),
+            RegistryOwnershipCommand::Get(arguments) => {
+                let ownership = registry
+                    .list_ownership()?
+                    .into_iter()
+                    .find(|candidate| candidate.resource.key() == arguments.resource);
+                Ok(ResultEnvelopeV2::success(
+                    "registry ownership get",
+                    json!({"resource": arguments.resource, "ownership": ownership, "found": ownership.is_some()}),
+                ))
+            }
+            RegistryOwnershipCommand::Check => {
+                let desired = registry.list_desired_resources()?;
+                let ownership = registry.list_ownership()?;
+                let missing = desired
+                    .iter()
+                    .filter(|item| {
+                        !ownership
+                            .iter()
+                            .any(|owner| owner.resource.key() == item.resource.key())
+                    })
+                    .map(|item| item.resource.key())
+                    .collect::<Vec<_>>();
+                Ok(ResultEnvelopeV2::success(
+                    "registry ownership check",
+                    json!({
+                        "valid": missing.is_empty(),
+                        "missing_ownership": missing,
+                        "duplicate_owners": [],
+                        "note": "The SQLite uniqueness constraint rejects duplicate resource owners at import time."
+                    }),
+                ))
+            }
+        },
+    }
+}
+
+fn registry_scope(arguments: &RegistryScopeArgs) -> ScopeRefV1 {
+    let parent = arguments
+        .parent_kind
+        .zip(arguments.parent_id.as_deref())
+        .map(|(kind, id)| ScopeRefV1::new(registry_scope_kind(kind), id, None));
+    ScopeRefV1::new(
+        registry_scope_kind(arguments.kind),
+        arguments.id.clone(),
+        parent,
+    )
+}
+
+const fn registry_scope_kind(kind: RegistryScopeKindArg) -> ScopeKindV1 {
+    match kind {
+        RegistryScopeKindArg::Organization => ScopeKindV1::Organization,
+        RegistryScopeKindArg::Account => ScopeKindV1::Account,
+        RegistryScopeKindArg::Zone => ScopeKindV1::Zone,
+        RegistryScopeKindArg::Resource => ScopeKindV1::Resource,
+    }
+}
+
+fn registry_sync(store: &StateStore, registry: &mut Registry) -> Result<ResultEnvelopeV2> {
+    Ok(ResultEnvelopeV2::success(
+        "registry sync",
+        registry_sync_result(store, registry)?,
+    ))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "registry rebuild, provider coverage, source-config separation, and historical evidence indexing form one deterministic sync projection"
+)]
+fn registry_sync_result(store: &StateStore, registry: &mut Registry) -> Result<Value> {
+    let profiles = ProfilesConfig::load(store)?;
+    let mut adopted_accounts = BTreeSet::new();
+    for account in profiles
+        .profiles
+        .values()
+        .filter_map(|profile| profile.account_id.as_deref())
+    {
+        registry.adopt_scope(&ScopeRefV1::new(ScopeKindV1::Account, account, None))?;
+        adopted_accounts.insert(account.to_owned());
+    }
+
+    let mut operation_count = 0_usize;
+    let mut catalog_hash = None;
+    if store.paths().catalog_file().is_file() {
+        let catalog = CatalogSnapshot::load(&store.paths().catalog_file())?;
+        catalog_hash = Some(catalog.schema_hash.clone());
+        for capability in catalog.capabilities.values() {
+            let gaps = capability.mutation_contract_gaps();
+            let blocker = capability
+                .blocked_reason
+                .clone()
+                .or_else(|| (!gaps.is_empty()).then(|| gaps.join("; ")));
+            registry.upsert_operation(&OperationIndexRecordV1 {
+                schema_version: 1,
+                capability_id: capability.id.clone(),
+                product: capability.product.clone(),
+                method: capability.method.clone(),
+                path: capability.path.clone(),
+                adapter_status: adapter_status_label(capability.adapter_status).to_owned(),
+                maturity: operation_maturity(capability, &gaps).to_owned(),
+                blocker,
+                catalog_hash: catalog.schema_hash.clone(),
+            })?;
+            operation_count += 1;
+        }
+    }
+
+    let declarations = load_registry_declarations(store)?;
+    for desired in &declarations {
+        registry.upsert_desired_resource(desired)?;
+        let repository = Path::new(&desired.source_path)
+            .parent()
+            .unwrap_or_else(|| Path::new(&desired.source_path))
+            .display()
+            .to_string();
+        registry.upsert_ownership(&OwnershipRecordV1 {
+            schema_version: 1,
+            resource: desired.resource.clone(),
+            owner: desired.owner.clone(),
+            repository,
+            deploy_lane: desired.deploy_lane.clone(),
+            verifier: desired.verifier.clone(),
+            allowed_change_path: desired.allowed_change_path.clone(),
+        })?;
+    }
+
+    let account_pins = store.workspace_manifest()?.account_pins();
+    let graph = discover_registered(store)?;
+    let mut source_resources = 0_usize;
+    let mut unscoped_source_resources = Vec::new();
+    let mut source_kinds = BTreeSet::new();
+    for resource in &graph.resources {
+        let accounts = graph
+            .links
+            .get(&resource.key)
+            .into_iter()
+            .flatten()
+            .filter_map(|repository| {
+                let repository = Path::new(repository);
+                account_pins
+                    .iter()
+                    .filter(|(root, _)| repository.starts_with(root))
+                    .max_by_key(|(root, _)| root.components().count())
+                    .map(|(_, account)| account.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        if accounts.len() != 1 {
+            unscoped_source_resources.push(resource.key.clone());
+            continue;
+        }
+        let account = accounts.into_iter().next().ok_or_else(|| {
+            CliError::Input("account scope selection unexpectedly became empty".to_owned())
+        })?;
+        let id = resource
+            .key
+            .split_once(':')
+            .map_or_else(|| resource.key.clone(), |(_, id)| id.to_owned());
+        registry.upsert_resource(
+            &ResourceRefV1::new(
+                ScopeRefV1::new(ScopeKindV1::Account, account, None),
+                resource.kind.clone(),
+                id,
+            ),
+            "source_config",
+        )?;
+        source_kinds.insert(resource.kind.clone());
+        source_resources += 1;
+    }
+    for kind in source_kinds {
+        registry.upsert_provider(&InventoryProviderV1 {
+            schema_version: 1,
+            resource_kind: kind.clone(),
+            scope_kind: "account_or_zone".to_owned(),
+            list_capability_id: String::new(),
+            detail_capability_id: None,
+            pagination: "unbound".to_owned(),
+            normalization_rule: format!(
+                "source-config kind `{kind}` requires an explicit live response identity mapping"
+            ),
+            freshness_seconds: 0,
+            permissions: Vec::new(),
+            status: "blocked".to_owned(),
+            blocker: Some(format!(
+                "{kind} source configuration is indexed, but no live normalization provider is bound"
+            )),
+        })?;
+    }
+    let proof_page = store.list_recent_operational_proofs(OPERATIONAL_PROOF_PROJECTION_LIMIT)?;
+    for proof in &proof_page.proofs {
+        registry.record_unindexable_evidence(
+            &proof.evidence.content_hash,
+            "operational proof receipt has no normalized resource-state payload",
+        )?;
+    }
+    registry.mark_sync_complete()?;
+    Ok(json!({
+        "catalog_hash": catalog_hash,
+        "operation_count": operation_count,
+        "adopted_accounts": adopted_accounts,
+        "desired_resource_count": declarations.len(),
+        "source_config_resource_count": source_resources,
+        "unscoped_source_resources": unscoped_source_resources,
+        "unindexable_evidence": registry.unindexable_evidence()?,
+        "unindexable_evidence_projection_truncated": proof_page.truncated,
+        "coverage": registry.coverage()?,
+        "truth_boundary": "This sync indexes catalog and local source/desired state. Only successful, evidence-backed inventory-provider reads may create live observations; events and source config never do so."
+    }))
+}
+
+fn operation_maturity(capability: &CapabilityV1, gaps: &[String]) -> &'static str {
+    if capability.adapter_status == AdapterStatus::Blocked {
+        "indexed"
+    } else if !capability.mutating {
+        "observable"
+    } else if gaps.is_empty() {
+        "verifiable"
+    } else {
+        "typed"
+    }
+}
+
+const fn adapter_status_label(status: AdapterStatus) -> &'static str {
+    match status {
+        AdapterStatus::Native => "native",
+        AdapterStatus::DynamicApi => "dynamic_api",
+        AdapterStatus::DelegatedCli => "delegated_cli",
+        AdapterStatus::GovernedUi => "governed_ui",
+        AdapterStatus::Blocked => "blocked",
+    }
+}
+
+fn load_registry_declarations(store: &StateStore) -> Result<Vec<DesiredResourceV1>> {
+    let directory = store.paths().config_dir.join("registry/declarations");
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths = fs::read_dir(&directory)
+        .map_err(|source| cli_io(&directory, source))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|source| cli_io(&directory, source))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    paths.retain(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "json")
+    });
+    paths.sort();
+    let mut declarations = Vec::new();
+    for path in paths {
+        let value: Value = store.read_json(&path)?;
+        if value.is_array() {
+            declarations.extend(serde_json::from_value::<Vec<DesiredResourceV1>>(value)?);
+        } else {
+            declarations.push(serde_json::from_value::<DesiredResourceV1>(value)?);
+        }
+    }
+    if let Some(invalid) = declarations
+        .iter()
+        .find(|declaration| declaration.schema_version != 1)
+    {
+        return Err(CliError::Input(format!(
+            "desired resource `{}` uses unsupported schema version {}",
+            invalid.resource.key(),
+            invalid.schema_version
+        )));
+    }
+    Ok(declarations)
+}
+
+fn registry_diff_envelope(
+    registry: &Registry,
+    command: &'static str,
+    selected_resource: Option<&str>,
+    planning: bool,
+) -> Result<ResultEnvelopeV2> {
+    let diffs = registry
+        .list_desired_resources()?
+        .into_iter()
+        .filter(|desired| {
+            selected_resource.is_none_or(|selected| desired.resource.key() == selected)
+        })
+        .map(|desired| {
+            let resource_key = desired.resource.key();
+            let observation = registry
+                .observation_history(&resource_key)?
+                .into_iter()
+                .next();
+            let state = observation.as_ref().map_or("unobserved", |observed| {
+                if observed.state_hash == desired.manifest_hash {
+                    "converged"
+                } else {
+                    "drifted"
+                }
+            });
+            Ok(json!({
+                "resource": desired.resource,
+                "state": state,
+                "desired_hash": desired.manifest_hash,
+                "observed_hash": observation.as_ref().map(|item| &item.state_hash),
+                "observation": observation,
+                "next_action": if state == "converged" {
+                    Value::Null
+                } else {
+                    json!(format!("cfctl resolve \"reconcile {}\" --json", resource_key))
+                },
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ResultEnvelopeV2::success(
+        command,
+        json!({
+            "diffs": diffs,
+            "aggregate_plan_created": false,
+            "planning_requested": planning,
+            "message": if planning {
+                "Registry planning never aggregates mutation approvals. Resolve and create one governed child plan per drifted resource after a fresh live read."
+            } else {
+                "Desired declarations were compared only with the latest successful live observations; unobserved resources remain unknown."
+            }
+        }),
+    ))
+}
+
 fn workspace_command(store: &StateStore, command: WorkspaceCommand) -> Result<ResultEnvelopeV2> {
     match command {
         WorkspaceCommand::Add(arguments) => {
-            store.register_workspace_root(&arguments.path)?;
-            if let Some(account) = arguments.account {
-                let path = store.paths().config_dir.join("workspace-accounts.json");
-                let mut pins: BTreeMap<PathBuf, String> = if path.is_file() {
-                    store.read_json(&path)?
-                } else {
-                    BTreeMap::new()
-                };
-                pins.insert(
-                    arguments
-                        .path
-                        .canonicalize()
-                        .map_err(|source| cli_io(&arguments.path, source))?,
-                    account,
-                );
-                store.write_json(&path, &pins)?;
-            }
+            store.register_workspace(&arguments.path, arguments.account)?;
             Ok(ResultEnvelopeV2::success(
                 "workspace add",
                 json!({"path": arguments.path, "message": "Workspace root registered; discovery remains bounded to registered roots."}),
+            ))
+        }
+        WorkspaceCommand::Remove(arguments) => {
+            let (path, removed, account_pin_removed) =
+                store.unregister_workspace(&arguments.path)?;
+            Ok(ResultEnvelopeV2::success(
+                "workspace remove",
+                json!({
+                    "path": path,
+                    "removed": removed,
+                    "account_pin_removed": account_pin_removed,
+                    "message": "Workspace root retired from future discovery; historical graphs and evidence were preserved."
+                }),
             ))
         }
         WorkspaceCommand::Discover => {
@@ -13158,12 +14221,7 @@ fn workspace_command(store: &StateStore, command: WorkspaceCommand) -> Result<Re
         }
         WorkspaceCommand::Audit => {
             let graph = discover_registered(store)?;
-            let account_pins_path = store.paths().config_dir.join("workspace-accounts.json");
-            let account_pins: BTreeMap<PathBuf, String> = if account_pins_path.is_file() {
-                store.read_json(&account_pins_path)?
-            } else {
-                BTreeMap::new()
-            };
+            let account_pins = store.workspace_manifest()?.account_pins();
             let proof_page =
                 store.list_recent_operational_proofs(OPERATIONAL_PROOF_PROJECTION_LIMIT)?;
             let proofs = &proof_page.proofs;
@@ -13997,17 +15055,13 @@ fn resolve_account_id(
         return Ok(Some(explicit.to_owned()));
     }
 
-    let pin_path = store.paths().config_dir.join("workspace-accounts.json");
-    let workspace_pin = if pin_path.is_file() {
-        let pins: BTreeMap<PathBuf, String> = store.read_json(&pin_path)?;
-        let cwd = env::current_dir().map_err(|source| cli_io(Path::new("."), source))?;
-        pins.into_iter()
-            .filter(|(root, _)| cwd.starts_with(root))
-            .max_by_key(|(root, _)| root.components().count())
-            .map(|(_, account)| account)
-    } else {
-        None
-    };
+    let pins = store.workspace_manifest()?.account_pins();
+    let cwd = env::current_dir().map_err(|source| cli_io(Path::new("."), source))?;
+    let workspace_pin = pins
+        .into_iter()
+        .filter(|(root, _)| cwd.starts_with(root))
+        .max_by_key(|(root, _)| root.components().count())
+        .map(|(_, account)| account);
     if let (Some(workspace), Some(profile_account)) =
         (workspace_pin.as_deref(), profile.account_id.as_deref())
         && workspace != profile_account
@@ -16051,11 +17105,11 @@ mod tests {
         CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
         CreatedResourceContractV1, EffectClass, EntitlementProbeV1, EvidenceClass, EvidenceV1,
         OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, OutputFormatV1,
-        PaginationModeV1, PlanStatus, PlanV1, QuerySerializationV1, ResultEnvelopeV2, RiskClass,
-        SECRET_FIELD_NAMES, SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
-        SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
-        StandingAuthorityV1, TransactionStageV1, VerificationState, WorkflowContractV1,
-        WorkflowStepV1, hash_value,
+        PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1, PlanV2, QuerySerializationV1,
+        ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1,
+        SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
+        SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
+        TransactionStageV1, VerificationState, WorkflowContractV1, WorkflowStepV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -16070,6 +17124,26 @@ mod tests {
 
     fn guide_json(capability: &CapabilityV1) -> Value {
         serde_json::to_value(guide_document(capability)).expect("typed capability guide JSON")
+    }
+
+    fn save_current_test_plan(store: &StateStore, plan: &PlanV1) {
+        let document = PlanV2::new(
+            plan.clone(),
+            PlanPinsV2 {
+                build_identity_hash: "sha256:test-build".to_owned(),
+                catalog_hash: plan.catalog_hash.clone(),
+                credential_generation_id: "test-credential-generation".to_owned(),
+                admission_policy_hash: "compiled:test-policy".to_owned(),
+                authority_hash: None,
+                workspace_graph_hash: "sha256:test-workspace".to_owned(),
+                resource_observation_hashes: BTreeMap::new(),
+                cost_budget: None,
+            },
+        )
+        .expect("current PlanV2 fixture");
+        store
+            .save_plan_v2(&document)
+            .expect("persist current PlanV2 fixture");
     }
 
     fn security_action_create_capability() -> CapabilityV1 {
@@ -23405,7 +24479,7 @@ mod tests {
         )
         .expect("draft plan");
         let operation_id = plan.operation_id.clone();
-        store.save_plan(&plan).expect("persist draft");
+        save_current_test_plan(&store, &plan);
         approve_plan(
             &store,
             &PlanApproveArgs {
@@ -23478,7 +24552,7 @@ mod tests {
         )
         .expect("draft plan");
         let operation_id = plan.operation_id.clone();
-        store.save_plan(&plan).expect("persist draft");
+        save_current_test_plan(&store, &plan);
 
         let error = approve_plan(
             &store,
@@ -23520,7 +24594,7 @@ mod tests {
         .expect("draft plan");
         let operation_id = plan.operation_id.clone();
         let bound_hash = plan.content_hash.clone();
-        store.save_plan(&plan).expect("persist hash-bound draft");
+        save_current_test_plan(&store, &plan);
 
         plan.targets = json!({"zone_id":"zone-b","record_id":"record-a"});
         assert_eq!(plan.content_hash, bound_hash);

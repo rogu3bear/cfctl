@@ -26,7 +26,7 @@ Automatic execution is limited to operations with all of these properties:
 
 ## Approval
 
-All other executable writes require a reviewed `PlanV1` and this exact
+All other executable writes require a reviewed `PlanV2` and this exact
 mutation:
 
 ```bash

@@ -10,9 +10,13 @@ use std::{
 };
 
 use cfctl_core::{
-    EvidenceClass, EvidenceV1, OperationalProofV1, PlanV1, StandingAuthorityStatus,
-    StandingAuthorityV1, redact_json,
+    AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, EvidenceClass, EvidenceV1,
+    OperationalProofV1, PlanV1, PlanV2, StandingAuthorityStatus, StandingAuthorityV1, redact_json,
 };
+use cfctl_workspace::{
+    WORKSPACE_MANIFEST_SCHEMA_VERSION, WorkspaceManifestV1, WorkspaceRegistrationV1,
+};
+use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -49,6 +53,24 @@ pub enum StorageError {
     UnsafeImportPath(String),
     #[error("plan `{0}` does not exist")]
     PlanNotFound(String),
+    #[error("plan v2 pins for `{0}` do not exist")]
+    PlanV2NotFound(String),
+    #[error(
+        "plan `{0}` has a PlanV2 compatibility projection that disagrees with its canonical document"
+    )]
+    PlanProjectionDrift(String),
+    #[error("plan `{operation_id}` is corrupt: {reason}")]
+    CorruptPlan {
+        operation_id: String,
+        reason: String,
+    },
+    #[error(
+        "canonical PlanV2 `{operation_id}` was stored, but its PlanV1 compatibility projection could not be updated: {reason}"
+    )]
+    PlanProjectionWriteFailed {
+        operation_id: String,
+        reason: String,
+    },
     #[error("standing authority `{0}` does not exist")]
     AuthorityNotFound(String),
     #[error("plan identifier `{0}` is not a canonical lowercase hyphenated UUID")]
@@ -67,6 +89,18 @@ pub enum StorageError {
     },
     #[error("standing authority `{0}` already exists")]
     AuthorityAlreadyExists(String),
+    #[error("admission policy bundle `{0}` does not exist")]
+    AdmissionBundleNotFound(String),
+    #[error("admission policy bundle `{0}` already exists")]
+    AdmissionBundleAlreadyExists(String),
+    #[error(
+        "admission policy bundle identifier `{0}` is not a canonical lowercase hyphenated UUID"
+    )]
+    InvalidAdmissionBundleId(String),
+    #[error("active admission policy pointer is invalid: {0}")]
+    InvalidAdmissionPointer(String),
+    #[error("workspace manifest is invalid: {0}")]
+    InvalidWorkspaceManifest(String),
     #[error("the standing authority lock guard does not authorize saving `{0}`")]
     AuthorityLockMismatch(String),
     #[error("standing authority `{0}` is durably revoked and cannot be restored")]
@@ -148,6 +182,69 @@ pub struct OperationalProofPageV1 {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdmissionActivationV1 {
+    pub bundle: AdmissionPolicyBundleV1,
+    pub previous_bundle_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AdmissionPolicyPointerV1 {
+    schema_version: u8,
+    bundle_id: String,
+    content_hash: String,
+}
+
+/// Storage-owned classification of the durable plan format.
+///
+/// `PlanV2` is canonical for current plans. `PlanV1` remains a readable
+/// compatibility projection and a historical format, but it never silently
+/// grants execution compatibility once the `PlanV2` boundary is active.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StoredPlanRecord {
+    Current(Box<PlanV2>),
+    LegacyReadable(Box<PlanV1>),
+    RequiredSidecarMissing(Box<PlanV1>),
+    ProjectionDrift {
+        current: Box<PlanV2>,
+        projection: Box<PlanV1>,
+    },
+    Corrupt {
+        operation_id: String,
+        reason: String,
+    },
+}
+
+impl StoredPlanRecord {
+    #[must_use]
+    pub const fn execution_compatible(&self) -> bool {
+        matches!(self, Self::Current(_))
+    }
+
+    #[must_use]
+    pub const fn execution_incompatibility_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Current(_) => None,
+            Self::LegacyReadable(_) => Some("legacy_plan_v1"),
+            Self::RequiredSidecarMissing(_) => Some("required_plan_v2_missing"),
+            Self::ProjectionDrift { .. } => Some("plan_v2_projection_drift"),
+            Self::Corrupt { .. } => Some("corrupt_plan_record"),
+        }
+    }
+
+    #[must_use]
+    pub const fn readable_plan(&self) -> Option<&PlanV1> {
+        match self {
+            Self::Current(plan) => Some(&plan.plan),
+            Self::LegacyReadable(plan) | Self::RequiredSidecarMissing(plan) => Some(plan),
+            Self::ProjectionDrift { current, .. } => Some(&current.plan),
+            Self::Corrupt { .. } => None,
+        }
+    }
+}
+
+const PLAN_V2_ACTIVATED_AT: &str = "2026-07-22T00:00:00Z";
+
 impl StateStore {
     pub fn open(paths: RuntimePaths) -> Result<Self> {
         for path in [
@@ -157,8 +254,14 @@ impl StateStore {
             &paths.data_dir.join("evidence"),
             &paths.data_dir.join("evidence-index"),
             &paths.data_dir.join("plans"),
+            &paths.data_dir.join("plans-v2"),
             &paths.data_dir.join("locks"),
             &paths.data_dir.join("locks").join("authorities"),
+            &paths
+                .config_dir
+                .join("policy")
+                .join("admission")
+                .join("bundles"),
             &paths.data_dir.join("catalog"),
             &paths.data_dir.join("authorities"),
         ] {
@@ -302,6 +405,12 @@ impl StateStore {
         if redact_json(&value) != value {
             return Err(StorageError::SensitiveData);
         }
+        let plan_v2_path = self.plan_v2_path(&plan.operation_id)?;
+        if validate_existing_managed_file(&plan_v2_path)? {
+            let mut current = self.load_plan_v2(&plan.operation_id)?;
+            current.refresh_from_plan(plan.clone())?;
+            return self.write_current_plan(&current);
+        }
         let path = self.plan_path(&plan.operation_id)?;
         if validate_existing_managed_file(&path)? {
             let stored: PlanV1 = self.read_json(&path)?;
@@ -311,15 +420,175 @@ impl StateStore {
         self.write_json(&path, plan)
     }
 
-    pub fn load_plan(&self, operation_id: &str) -> Result<PlanV1> {
-        let path = self.plan_path(operation_id)?;
+    /// Stores a current plan with `PlanV2` as the canonical document and `PlanV1`
+    /// as a compatibility projection. The canonical write is intentionally
+    /// first: a projection failure can reduce compatibility, but can never
+    /// acknowledge an authority state that is absent from the canonical plan.
+    pub fn save_plan_v2(&self, plan: &PlanV2) -> Result<()> {
+        validate_plan_id(&plan.plan.operation_id)?;
+        plan.validate()?;
+        let plan_v2_path = self.plan_v2_path(&plan.plan.operation_id)?;
+        if validate_existing_managed_file(&plan_v2_path)? {
+            let stored = self.load_plan_v2(&plan.plan.operation_id)?;
+            if stored.pins != plan.pins {
+                return Err(StorageError::InvalidPlan(
+                    cfctl_core::CoreError::InvalidPlanV2(
+                        "canonical execution pins cannot be replaced".to_owned(),
+                    ),
+                ));
+            }
+        } else {
+            let projection_path = self.plan_path(&plan.plan.operation_id)?;
+            if validate_existing_managed_file(&projection_path)? {
+                let projection: PlanV1 = self.read_json(&projection_path)?;
+                ensure_plan_identity(&projection, &plan.plan.operation_id)?;
+                projection.validate_transaction_journal()?;
+                if projection != plan.plan {
+                    return Err(StorageError::InvalidPlan(
+                        cfctl_core::CoreError::InvalidPlanV2(
+                            "v2 wrapper does not match the stored PlanV1 projection".to_owned(),
+                        ),
+                    ));
+                }
+            }
+        }
+        self.write_current_plan(plan)
+    }
+
+    /// Binds the one existing standing-authority lane to a draft `PlanV2`.
+    /// This is the only execution pin that may transition from absent to
+    /// present after preparation; it is immutable once set.
+    pub fn bind_plan_authority_hash(&self, operation_id: &str, authority_hash: &str) -> Result<()> {
+        let mut plan = match self.load_stored_plan_record(operation_id)? {
+            StoredPlanRecord::Current(plan) => *plan,
+            StoredPlanRecord::LegacyReadable(_) | StoredPlanRecord::RequiredSidecarMissing(_) => {
+                return Err(StorageError::PlanV2NotFound(operation_id.to_owned()));
+            }
+            StoredPlanRecord::ProjectionDrift { .. } => {
+                return Err(StorageError::PlanProjectionDrift(operation_id.to_owned()));
+            }
+            StoredPlanRecord::Corrupt { reason, .. } => {
+                return Err(StorageError::CorruptPlan {
+                    operation_id: operation_id.to_owned(),
+                    reason,
+                });
+            }
+        };
+        plan.bind_authority_hash(authority_hash)?;
+        self.write_current_plan(&plan)
+    }
+
+    pub fn load_plan_v2(&self, operation_id: &str) -> Result<PlanV2> {
+        let path = self.plan_v2_path(operation_id)?;
         if !validate_existing_managed_file(&path)? {
+            return Err(StorageError::PlanV2NotFound(operation_id.to_owned()));
+        }
+        let plan: PlanV2 = self.read_json(&path)?;
+        ensure_plan_identity(&plan.plan, operation_id)?;
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    pub fn has_plan_v2(&self, operation_id: &str) -> Result<bool> {
+        validate_existing_managed_file(&self.plan_v2_path(operation_id)?)
+    }
+
+    pub fn load_stored_plan_record(&self, operation_id: &str) -> Result<StoredPlanRecord> {
+        validate_plan_id(operation_id)?;
+        let projection_path = self.plan_path(operation_id)?;
+        let current_path = self.plan_v2_path(operation_id)?;
+        let projection_exists = validate_existing_managed_file(&projection_path)?;
+        let current_exists = validate_existing_managed_file(&current_path)?;
+        if !projection_exists && !current_exists {
             return Err(StorageError::PlanNotFound(operation_id.to_owned()));
         }
-        let plan: PlanV1 = self.read_json(&path)?;
-        ensure_plan_identity(&plan, operation_id)?;
-        plan.validate_transaction_journal()?;
-        Ok(plan)
+
+        let projection = if projection_exists {
+            match self.read_json::<PlanV1>(&projection_path).and_then(|plan| {
+                ensure_plan_identity(&plan, operation_id)?;
+                plan.validate_transaction_journal()?;
+                Ok(plan)
+            }) {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    return Ok(StoredPlanRecord::Corrupt {
+                        operation_id: operation_id.to_owned(),
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        if current_exists {
+            let current = match self.read_json::<PlanV2>(&current_path).and_then(|plan| {
+                ensure_plan_identity(&plan.plan, operation_id)?;
+                plan.validate()?;
+                Ok(plan)
+            }) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return Ok(StoredPlanRecord::Corrupt {
+                        operation_id: operation_id.to_owned(),
+                        reason: error.to_string(),
+                    });
+                }
+            };
+            return Ok(match projection {
+                Some(projection) if projection != current.plan => {
+                    StoredPlanRecord::ProjectionDrift {
+                        current: Box::new(current),
+                        projection: Box::new(projection),
+                    }
+                }
+                _ => StoredPlanRecord::Current(Box::new(current)),
+            });
+        }
+
+        let projection =
+            projection.ok_or_else(|| StorageError::PlanNotFound(operation_id.to_owned()))?;
+        if plan_v2_is_required(&projection) {
+            Ok(StoredPlanRecord::RequiredSidecarMissing(Box::new(
+                projection,
+            )))
+        } else {
+            Ok(StoredPlanRecord::LegacyReadable(Box::new(projection)))
+        }
+    }
+
+    pub fn load_plan(&self, operation_id: &str) -> Result<PlanV1> {
+        match self.load_stored_plan_record(operation_id)? {
+            StoredPlanRecord::Current(plan) => Ok(plan.plan),
+            StoredPlanRecord::LegacyReadable(plan)
+            | StoredPlanRecord::RequiredSidecarMissing(plan) => Ok(*plan),
+            StoredPlanRecord::ProjectionDrift { .. } => {
+                Err(StorageError::PlanProjectionDrift(operation_id.to_owned()))
+            }
+            StoredPlanRecord::Corrupt { .. } if self.has_plan_v2(operation_id)? => {
+                self.load_plan_v2(operation_id).map(|plan| plan.plan)
+            }
+            StoredPlanRecord::Corrupt { .. } => {
+                let path = self.plan_path(operation_id)?;
+                let plan: PlanV1 = self.read_json(&path)?;
+                ensure_plan_identity(&plan, operation_id)?;
+                plan.validate_transaction_journal()?;
+                Ok(plan)
+            }
+        }
+    }
+
+    fn write_current_plan(&self, plan: &PlanV2) -> Result<()> {
+        let value = serde_json::to_value(plan)?;
+        if redact_json(&value) != value {
+            return Err(StorageError::SensitiveData);
+        }
+        self.write_json(&self.plan_v2_path(&plan.plan.operation_id)?, plan)?;
+        self.write_json(&self.plan_path(&plan.plan.operation_id)?, &plan.plan)
+            .map_err(|error| StorageError::PlanProjectionWriteFailed {
+                operation_id: plan.plan.operation_id.clone(),
+                reason: error.to_string(),
+            })
     }
 
     pub fn list_plans(&self) -> Result<Vec<PlanV1>> {
@@ -352,6 +621,15 @@ impl StateStore {
             .data_dir
             .join("authorities")
             .join(format!("{authority_id}.json")))
+    }
+
+    fn plan_v2_path(&self, operation_id: &str) -> Result<PathBuf> {
+        validate_plan_id(operation_id)?;
+        Ok(self
+            .paths
+            .data_dir
+            .join("plans-v2")
+            .join(format!("{operation_id}.json")))
     }
 
     /// Persists a new authority without replacing any existing document.
@@ -501,25 +779,173 @@ impl StateStore {
         })
     }
 
-    pub fn register_workspace_root(&self, root: &Path) -> Result<()> {
+    /// Creates a pending admission bundle exactly once. Existing bundle IDs
+    /// are immutable identities and are never overwritten by staging.
+    pub fn create_admission_bundle(&self, bundle: &AdmissionPolicyBundleV1) -> Result<()> {
+        bundle.validate()?;
+        if bundle.status != AdmissionPolicyBundleStatusV1::Pending {
+            return Err(StorageError::InvalidAdmissionPointer(
+                "only a pending admission bundle may be staged".to_owned(),
+            ));
+        }
+        let _guard = self.lock_admission_policy()?;
+        let path = self.admission_bundle_path(&bundle.bundle_id)?;
+        let value = serde_json::to_value(bundle)?;
+        if redact_json(&value) != value {
+            return Err(StorageError::SensitiveData);
+        }
+        let encoded = serde_json::to_vec_pretty(bundle)?;
+        match atomic_create(&path, &encoded) {
+            Err(StorageError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                Err(StorageError::AdmissionBundleAlreadyExists(
+                    bundle.bundle_id.clone(),
+                ))
+            }
+            result => result,
+        }
+    }
+
+    pub fn load_admission_bundle(&self, bundle_id: &str) -> Result<AdmissionPolicyBundleV1> {
+        let path = self.admission_bundle_path(bundle_id)?;
+        if !validate_existing_managed_file(&path)? {
+            return Err(StorageError::AdmissionBundleNotFound(bundle_id.to_owned()));
+        }
+        let bundle: AdmissionPolicyBundleV1 = self.read_json(&path)?;
+        validate_admission_bundle_identity(&bundle, bundle_id)?;
+        bundle.validate()?;
+        Ok(bundle)
+    }
+
+    pub fn list_admission_bundles(&self) -> Result<Vec<AdmissionPolicyBundleV1>> {
+        let directory = self.admission_bundle_directory();
+        let mut bundles = Vec::new();
+        for entry in fs::read_dir(&directory).map_err(|source| io_error(&directory, source))? {
+            let entry = entry.map_err(|source| io_error(&directory, source))?;
+            if entry.path().extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+                continue;
+            }
+            let bundle_id = admission_bundle_id_from_path(&entry.path())?;
+            if !validate_existing_managed_file(&entry.path())? {
+                return Err(unsafe_managed_document(
+                    &entry.path(),
+                    "directory entry disappeared while listing",
+                ));
+            }
+            let bundle: AdmissionPolicyBundleV1 = self.read_json(&entry.path())?;
+            validate_admission_bundle_identity(&bundle, &bundle_id)?;
+            bundle.validate()?;
+            bundles.push(bundle);
+        }
+        bundles.sort_by_key(|bundle| bundle.created_at);
+        Ok(bundles)
+    }
+
+    pub fn approve_admission_bundle(
+        &self,
+        bundle_id: &str,
+        explicit_yes: bool,
+    ) -> Result<AdmissionPolicyBundleV1> {
+        let _guard = self.lock_admission_policy()?;
+        let mut bundle = self.load_admission_bundle(bundle_id)?;
+        bundle.approve(explicit_yes)?;
+        self.write_admission_bundle(&bundle)?;
+        Ok(bundle)
+    }
+
+    #[must_use = "activation changes the active policy pointer and the returned transition must be reported"]
+    pub fn activate_admission_bundle(&self, bundle_id: &str) -> Result<AdmissionActivationV1> {
+        let _guard = self.lock_admission_policy()?;
+        let previous_id = self
+            .active_admission_pointer()?
+            .map(|pointer| pointer.bundle_id);
+        let mut target = self.load_admission_bundle(bundle_id)?;
+        target.activate()?;
+        self.write_admission_bundle(&target)?;
+        let pointer = AdmissionPolicyPointerV1 {
+            schema_version: 1,
+            bundle_id: target.bundle_id.clone(),
+            content_hash: target.content_hash.clone(),
+        };
+        self.write_json(&self.active_admission_policy_path(), &pointer)?;
+        if let Some(previous_id) = previous_id.as_deref().filter(|id| *id != bundle_id) {
+            let mut previous = self.load_admission_bundle(previous_id)?;
+            previous.supersede();
+            self.write_admission_bundle(&previous)?;
+        }
+        Ok(AdmissionActivationV1 {
+            bundle: target,
+            previous_bundle_id: previous_id,
+        })
+    }
+
+    pub fn active_admission_bundle_id(&self) -> Result<Option<String>> {
+        Ok(self
+            .active_admission_pointer()?
+            .map(|pointer| pointer.bundle_id))
+    }
+
+    pub fn active_admission_policy(&self) -> Result<Option<AdmissionPolicyBundleV1>> {
+        let Some(pointer) = self.active_admission_pointer()? else {
+            return Ok(None);
+        };
+        let bundle = self.load_admission_bundle(&pointer.bundle_id)?;
+        if bundle.status != AdmissionPolicyBundleStatusV1::Active
+            || bundle.content_hash != pointer.content_hash
+        {
+            return Err(StorageError::InvalidAdmissionPointer(format!(
+                "pointer selects bundle `{}` without the exact active content hash",
+                pointer.bundle_id
+            )));
+        }
+        Ok(Some(bundle))
+    }
+
+    pub fn register_workspace(
+        &self,
+        root: &Path,
+        account_id: Option<String>,
+    ) -> Result<WorkspaceRegistrationV1> {
         let canonical = root
             .canonicalize()
             .map_err(|source| io_error(root, source))?;
-        let mut roots = self.workspace_roots()?;
-        if !roots.contains(&canonical) {
-            roots.push(canonical);
-            roots.sort();
-            self.write_json(&self.paths.config_dir.join("workspace-roots.json"), &roots)?;
+        let _guard = self.lock_workspace_manifest()?;
+        let mut manifest = self.load_workspace_manifest_unlocked()?;
+        let registration = manifest.register(canonical, account_id);
+        self.write_json(&self.workspace_manifest_path(), &manifest)?;
+        Ok(registration)
+    }
+
+    /// Stop future discovery beneath one exact registered root.
+    ///
+    /// Missing absolute paths remain removable so an operator can retire a
+    /// stale registration after the repository itself has already moved or
+    /// been deleted. Historical workspace graphs and evidence are preserved.
+    pub fn unregister_workspace(&self, root: &Path) -> Result<(PathBuf, bool, bool)> {
+        let canonical = match root.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound && root.is_absolute() => {
+                root.to_path_buf()
+            }
+            Err(source) => return Err(io_error(root, source)),
+        };
+        let _guard = self.lock_workspace_manifest()?;
+        let mut manifest = self.load_workspace_manifest_unlocked()?;
+        let (removed, account_pin_removed) = manifest.unregister(&canonical);
+        if removed {
+            self.write_json(&self.workspace_manifest_path(), &manifest)?;
         }
-        Ok(())
+        Ok((canonical, removed, account_pin_removed))
     }
 
     pub fn workspace_roots(&self) -> Result<Vec<PathBuf>> {
-        let path = self.paths.config_dir.join("workspace-roots.json");
-        if !path.is_file() {
-            return Ok(Vec::new());
-        }
-        self.read_json(&path)
+        Ok(self.workspace_manifest()?.roots())
+    }
+
+    pub fn workspace_manifest(&self) -> Result<WorkspaceManifestV1> {
+        let _guard = self.lock_workspace_manifest()?;
+        self.load_workspace_manifest_unlocked()
     }
 
     pub fn write_json<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
@@ -555,6 +981,127 @@ impl StateStore {
             .join("plans")
             .join(format!("{operation_id}.json")))
     }
+
+    fn admission_bundle_directory(&self) -> PathBuf {
+        self.paths
+            .config_dir
+            .join("policy")
+            .join("admission")
+            .join("bundles")
+    }
+
+    fn admission_bundle_path(&self, bundle_id: &str) -> Result<PathBuf> {
+        validate_admission_bundle_id(bundle_id)?;
+        Ok(self
+            .admission_bundle_directory()
+            .join(format!("{bundle_id}.json")))
+    }
+
+    fn active_admission_policy_path(&self) -> PathBuf {
+        self.paths
+            .config_dir
+            .join("policy")
+            .join("admission")
+            .join("active.json")
+    }
+
+    fn active_admission_pointer(&self) -> Result<Option<AdmissionPolicyPointerV1>> {
+        let path = self.active_admission_policy_path();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let pointer: AdmissionPolicyPointerV1 = self.read_json(&path)?;
+        if pointer.schema_version != 1 || pointer.content_hash.is_empty() {
+            return Err(StorageError::InvalidAdmissionPointer(
+                "unsupported schema or empty content hash".to_owned(),
+            ));
+        }
+        validate_admission_bundle_id(&pointer.bundle_id)?;
+        Ok(Some(pointer))
+    }
+
+    fn write_admission_bundle(&self, bundle: &AdmissionPolicyBundleV1) -> Result<()> {
+        bundle.validate()?;
+        let path = self.admission_bundle_path(&bundle.bundle_id)?;
+        if !validate_existing_managed_file(&path)? {
+            return Err(StorageError::AdmissionBundleNotFound(
+                bundle.bundle_id.clone(),
+            ));
+        }
+        let stored: AdmissionPolicyBundleV1 = self.read_json(&path)?;
+        validate_admission_bundle_identity(&stored, &bundle.bundle_id)?;
+        self.write_json(&path, bundle)
+    }
+
+    fn lock_admission_policy(&self) -> Result<AdmissionPolicyLock> {
+        let path = self
+            .paths
+            .data_dir
+            .join("locks")
+            .join("admission-policy.lock");
+        let file = open_lock_file(&path)?;
+        file.lock().map_err(|source| io_error(&path, source))?;
+        Ok(AdmissionPolicyLock { _file: file })
+    }
+
+    fn workspace_manifest_path(&self) -> PathBuf {
+        self.paths.config_dir.join("workspace-manifest-v1.json")
+    }
+
+    fn load_workspace_manifest_unlocked(&self) -> Result<WorkspaceManifestV1> {
+        let path = self.workspace_manifest_path();
+        if path.is_file() {
+            let manifest: WorkspaceManifestV1 = self.read_json(&path)?;
+            validate_workspace_manifest(&manifest)?;
+            return Ok(manifest);
+        }
+
+        let roots_path = self.paths.config_dir.join("workspace-roots.json");
+        let account_pins_path = self.paths.config_dir.join("workspace-accounts.json");
+        let mut roots: Vec<PathBuf> = if roots_path.is_file() {
+            self.read_json(&roots_path)?
+        } else {
+            Vec::new()
+        };
+        roots.sort();
+        roots.dedup();
+        let account_pins: std::collections::BTreeMap<PathBuf, String> =
+            if account_pins_path.is_file() {
+                self.read_json(&account_pins_path)?
+            } else {
+                std::collections::BTreeMap::new()
+            };
+        if let Some(orphan) = account_pins.keys().find(|path| !roots.contains(path)) {
+            return Err(StorageError::InvalidWorkspaceManifest(format!(
+                "legacy account pin `{}` is not an explicitly registered root",
+                orphan.display()
+            )));
+        }
+        let manifest = WorkspaceManifestV1 {
+            schema_version: WORKSPACE_MANIFEST_SCHEMA_VERSION,
+            registrations: roots
+                .into_iter()
+                .map(|path| WorkspaceRegistrationV1 {
+                    account_id: account_pins.get(&path).cloned(),
+                    path,
+                })
+                .collect(),
+        };
+        validate_workspace_manifest(&manifest)?;
+        self.write_json(&path, &manifest)?;
+        Ok(manifest)
+    }
+
+    fn lock_workspace_manifest(&self) -> Result<WorkspaceManifestLock> {
+        let path = self
+            .paths
+            .data_dir
+            .join("locks")
+            .join("workspace-manifest.lock");
+        let file = open_lock_file(&path)?;
+        file.lock().map_err(|source| io_error(&path, source))?;
+        Ok(WorkspaceManifestLock { _file: file })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -581,6 +1128,15 @@ impl ManagedIdKind {
 
 fn validate_plan_id(operation_id: &str) -> Result<()> {
     validate_managed_id(operation_id, ManagedIdKind::Plan)
+}
+
+fn plan_v2_is_required(plan: &PlanV1) -> bool {
+    if !plan.capability.mutating {
+        return false;
+    }
+    DateTime::parse_from_rfc3339(PLAN_V2_ACTIVATED_AT).map_or(true, |activated_at| {
+        plan.created_at >= activated_at.with_timezone(&Utc)
+    })
 }
 
 fn validate_authority_id(authority_id: &str) -> Result<()> {
@@ -935,6 +1491,89 @@ pub struct AuthorityLock {
     _file: fs::File,
     authority_id: String,
     authority_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct AdmissionPolicyLock {
+    _file: fs::File,
+}
+
+#[derive(Debug)]
+struct WorkspaceManifestLock {
+    _file: fs::File,
+}
+
+fn validate_workspace_manifest(manifest: &WorkspaceManifestV1) -> Result<()> {
+    if manifest.schema_version != WORKSPACE_MANIFEST_SCHEMA_VERSION {
+        return Err(StorageError::InvalidWorkspaceManifest(format!(
+            "unsupported schema version {}",
+            manifest.schema_version
+        )));
+    }
+    let mut previous: Option<&Path> = None;
+    for registration in &manifest.registrations {
+        if !registration.path.is_absolute() {
+            return Err(StorageError::InvalidWorkspaceManifest(format!(
+                "registered root `{}` is not absolute",
+                registration.path.display()
+            )));
+        }
+        if registration
+            .account_id
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err(StorageError::InvalidWorkspaceManifest(format!(
+                "registered root `{}` has an empty account pin",
+                registration.path.display()
+            )));
+        }
+        if previous.is_some_and(|path| path >= registration.path.as_path()) {
+            return Err(StorageError::InvalidWorkspaceManifest(
+                "registrations must be unique and sorted by path".to_owned(),
+            ));
+        }
+        previous = Some(&registration.path);
+    }
+    Ok(())
+}
+
+fn validate_admission_bundle_id(bundle_id: &str) -> Result<()> {
+    let parsed = Uuid::parse_str(bundle_id)
+        .map_err(|_| StorageError::InvalidAdmissionBundleId(bundle_id.to_owned()))?;
+    if parsed.hyphenated().to_string() != bundle_id {
+        return Err(StorageError::InvalidAdmissionBundleId(bundle_id.to_owned()));
+    }
+    Ok(())
+}
+
+fn admission_bundle_id_from_path(path: &Path) -> Result<String> {
+    let Some(file_name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return Err(unsafe_managed_document(path, "filename is not valid UTF-8"));
+    };
+    let Some(bundle_id) = file_name.strip_suffix(".json") else {
+        return Err(unsafe_managed_document(
+            path,
+            "filename does not end in .json",
+        ));
+    };
+    validate_admission_bundle_id(bundle_id)?;
+    Ok(bundle_id.to_owned())
+}
+
+fn validate_admission_bundle_identity(
+    bundle: &AdmissionPolicyBundleV1,
+    filename_id: &str,
+) -> Result<()> {
+    validate_admission_bundle_id(&bundle.bundle_id)?;
+    if bundle.bundle_id != filename_id {
+        return Err(StorageError::ManagedDocumentIdentityMismatch {
+            kind: "admission policy bundle",
+            filename_id: filename_id.to_owned(),
+            document_id: bundle.bundle_id.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn create_dir_all(path: &Path) -> Result<()> {

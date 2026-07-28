@@ -374,7 +374,7 @@ pub const FRAGMENT_SECRET_IO: &str = "Keep secrets out of arguments, stdout, pla
 pub const FRAGMENT_APP_BOUNDARY: &str = "Application repositories own checked-in Wrangler configuration and their repo-local deploy gates; cfctl owns account and live-edge truth. Follow the app's deploy contract when the task is source deployment, then use cataloged cfctl reads for live verification. Never infer edge state from a successful local build or source diff.";
 
 /// Registered-root discovery skips nested fixture trees.
-pub const FRAGMENT_FIXTURE_SKIP: &str = "Nested `fixtures`, `__fixtures__`, `testdata`, `test-data`, and `test_data` directories are skipped; fixture directories are opt-in roots and must be registered directly when they are intentional workspace evidence.";
+pub const FRAGMENT_FIXTURE_SKIP: &str = "Nested generated, cache, fixture, dependency/build, vendor, and nested-repository paths are skipped; excluded directories are opt-in roots and must be registered directly when they are intentional workspace evidence. Retire stale roots with `cfctl workspace remove <absolute-path>`; removal preserves historical graph and evidence records.";
 
 /// The exact plan-approval command that a reviewed yes maps to.
 pub const FRAGMENT_APPROVE_COMMAND: &str = "`cfctl plans approve <operation-id> --yes`";
@@ -388,6 +388,13 @@ pub const FRAGMENT_KEYS_INVENTORY: &str = "Read account-owned permission invento
 
 /// Standing-authority ceremony: bounded policy, explicit approval, immediate revoke.
 pub const FRAGMENT_STANDING_AUTHORITY: &str = "For recurring token-lifecycle work, first load `cfctl guide --topic standing-authority --json`, then activate a reviewed standing policy only after explicit approval with `cfctl keys policy approve <authority-id> --yes`. Standing approval moves authority to that bounded policy; it is not blanket mutation authority. Revoke standing authority with `cfctl keys policy revoke <authority-id>` and treat the policy as unusable immediately.";
+
+/// Data-driven admission remains subordinate to the compiled floor and exact
+/// approval ceremonies.
+pub const FRAGMENT_ADMISSION_AUTHORITY: &str = "Inspect `cfctl policy admission list --json` before mutation planning. An active bundle may tighten the compiled safety floor but never weaken it. Bundle approval and activation are explicit local policy ceremonies; only bounded token lifecycle work may use `cfctl keys policy` standing authority. Historical unconsumed PlanV1 mutations remain readable but must be replanned as fully pinned PlanV2 records.";
+
+/// Event receipts trigger durable reconciliation but never replace live reads.
+pub const FRAGMENT_EVENT_RECONCILIATION: &str = "Inspect event schemas with `cfctl events sources --json` and ledger health with `cfctl events status --json`. Live Queue pull and acknowledgement are private operations behind one ordinary `events-consume-queue-batch` PlanV2 per batch; raw pull and ack stay blocked. cfctl atomically persists redacted event evidence and reconciliation jobs before exact lease acknowledgement; events never update observed resource truth directly. The Worker bridge is a Bun project, and preparing it locally does not deploy it.";
 
 /// Blocked-capability route: follow the guide's next action, never route around it.
 pub const FRAGMENT_BLOCKED_ROUTE: &str = "When a capability or plan is blocked (`adapter_status: blocked`, `contract_state: blocked`, or error code `CFCTL_CAPABILITY_BLOCKED`), run `cfctl guide <capability-id> --json` and follow its `next_action` exactly. Satisfy the named contract gap or extend cfctl; never route around a blocker with raw HTTP, Wrangler, or the dashboard. If next_action cannot resolve the gap, stop and report the capability id, `blocking_gaps`, and the guide output to the operator.";
@@ -410,6 +417,8 @@ pub const MANAGED_FRAGMENTS: &[&str] = &[
     FRAGMENT_MAX_COST,
     FRAGMENT_KEYS_INVENTORY,
     FRAGMENT_STANDING_AUTHORITY,
+    FRAGMENT_ADMISSION_AUTHORITY,
+    FRAGMENT_EVENT_RECONCILIATION,
     FRAGMENT_BLOCKED_ROUTE,
 ];
 
@@ -433,14 +442,14 @@ pub fn managed_documents() -> [(&'static str, &'static str); 2] {
 /// The managed-skill contract number carried in the installed front matter.
 /// Bump this when the installed document's contract changes; `agents doctor`
 /// compares whole strings, so every install goes stale on purpose when it moves.
-pub const MANAGED_SKILL_CONTRACT: u32 = 6;
+pub const MANAGED_SKILL_CONTRACT: u32 = 9;
 
 static MANAGED_OPERATOR_SKILL: LazyLock<String> = LazyLock::new(build_managed_operator_skill);
 static MANAGED_CURSOR_RULE: LazyLock<String> = LazyLock::new(build_managed_cursor_rule);
 
 fn build_managed_operator_skill() -> String {
     let header = format!(
-        "---\nname: cfctl\ndescription: Operate Cloudflare accounts and edge resources safely through cfctl, including capability discovery, live reads, workspace impact, mutation planning and approval, apply and verification, recovery, token governance, telemetry workflows, and evidence-backed completion. Use for any Cloudflare inspection, configuration, deployment-adjacent account work, troubleshooting, security response, or credential lifecycle task.\nmetadata:\n  managed-by: cfctl\n  contract: {MANAGED_SKILL_CONTRACT}\n---\n\n# Cloudflare control through cfctl\n\nUse `cfctl` as the only public account-control surface. Do not use archived shell verbs, backend scripts, raw HTTP, direct provider integrations, or an unclassified dashboard path to route around the catalog.\n\n## Establish trust\n\n1. Run `cfctl version --json`, `cfctl doctor --json`, and `cfctl agents doctor --json`.\n2. Load `cfctl guide --topic system --json` when the task is unfamiliar or the runtime is unhealthy.\n3. "
+        "---\nname: cfctl\ndescription: Operate Cloudflare accounts and edge resources safely through cfctl, including capability discovery, live reads, workspace impact, mutation planning and approval, apply and verification, recovery, token governance, event reconciliation, telemetry workflows, and evidence-backed completion. Use for any Cloudflare inspection, configuration, deployment-adjacent account work, troubleshooting, security response, or credential lifecycle task.\nmetadata:\n  managed-by: cfctl\n  contract: {MANAGED_SKILL_CONTRACT}\n---\n\n# Cloudflare control through cfctl\n\nUse `cfctl` as the only public account-control surface. Do not use archived shell verbs, backend scripts, raw HTTP, direct provider integrations, or an unclassified dashboard path to route around the catalog.\n\n## Establish trust\n\n1. Run `cfctl version --json`, `cfctl doctor --json`, and `cfctl agents doctor --json`.\n2. Load `cfctl guide --topic system --json` when the task is unfamiliar or the runtime is unhealthy.\n3. "
     );
     [
         header.as_str(),
@@ -472,6 +481,10 @@ fn build_managed_operator_skill() -> String {
         "\n17. ",
         FRAGMENT_STANDING_AUTHORITY,
         "\n18. ",
+        FRAGMENT_ADMISSION_AUTHORITY,
+        "\n19. ",
+        FRAGMENT_EVENT_RECONCILIATION,
+        "\n20. ",
         FRAGMENT_BLOCKED_ROUTE,
         "\n\n## Close honestly\n\nReport: requested outcome; exact account/profile/capability or operation ID; whether a boundary was performed; evidence classes and receipt identities; verification state and basis; workspace impact; unresolved blockers; and the next safe action. Say **planned**, **applied**, **verified**, or **blocked** precisely—never collapse them into done. Never treat model output, a UI handoff, artifact presence, or source configuration as mutation authority or verified live state.\n",
     ]
@@ -508,6 +521,10 @@ fn build_managed_cursor_rule() -> String {
         FRAGMENT_MAX_COST,
         " ",
         FRAGMENT_STANDING_AUTHORITY,
+        " ",
+        FRAGMENT_ADMISSION_AUTHORITY,
+        " ",
+        FRAGMENT_EVENT_RECONCILIATION,
         " ",
         FRAGMENT_BLOCKED_ROUTE,
         " Do not bypass catalog blockers, selector ambiguity, cost ceilings, drift checks, or verification. Do not teach archived shell verbs or backend script paths as the public surface.\n",

@@ -23,10 +23,13 @@ pub const PUBLIC_V2_SUBCOMMANDS: &[&str] = &[
     "catalog",
     "docs",
     "doctor",
+    "events",
     "guide",
     "keys",
     "migrate",
     "plans",
+    "policy",
+    "registry",
     "resolve",
     "update",
     "version",
@@ -102,6 +105,23 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
         ],
     },
     CommandNodeV1 {
+        name: "events",
+        subcommands: &[
+            CommandNodeV1 {
+                name: "bridge",
+                subcommands: &[
+                    CommandNodeV1::leaf("inspect"),
+                    CommandNodeV1::leaf("prepare"),
+                    CommandNodeV1::leaf("status"),
+                ],
+            },
+            CommandNodeV1::leaf("history"),
+            CommandNodeV1::leaf("reconcile"),
+            CommandNodeV1::leaf("sources"),
+            CommandNodeV1::leaf("status"),
+        ],
+    },
+    CommandNodeV1 {
         name: "keys",
         subcommands: &[
             CommandNodeV1::leaf("mint"),
@@ -136,12 +156,79 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
         ],
     },
     CommandNodeV1 {
+        name: "policy",
+        subcommands: &[
+            CommandNodeV1 {
+                name: "admission",
+                subcommands: &[
+                    CommandNodeV1::leaf("activate"),
+                    CommandNodeV1::leaf("approve"),
+                    CommandNodeV1::leaf("diff"),
+                    CommandNodeV1::leaf("list"),
+                    CommandNodeV1::leaf("rollback"),
+                    CommandNodeV1::leaf("show"),
+                    CommandNodeV1::leaf("stage"),
+                ],
+            },
+            CommandNodeV1 {
+                name: "cloudflare",
+                subcommands: &[
+                    CommandNodeV1::leaf("diff"),
+                    CommandNodeV1::leaf("get"),
+                    CommandNodeV1::leaf("list"),
+                    CommandNodeV1::leaf("plan"),
+                ],
+            },
+        ],
+    },
+    CommandNodeV1 {
+        name: "registry",
+        subcommands: &[
+            CommandNodeV1::leaf("coverage"),
+            CommandNodeV1 {
+                name: "declarations",
+                subcommands: &[
+                    CommandNodeV1::leaf("diff"),
+                    CommandNodeV1::leaf("plan"),
+                    CommandNodeV1::leaf("validate"),
+                ],
+            },
+            CommandNodeV1::leaf("diff"),
+            CommandNodeV1::leaf("export"),
+            CommandNodeV1::leaf("get"),
+            CommandNodeV1::leaf("graph"),
+            CommandNodeV1::leaf("history"),
+            CommandNodeV1::leaf("list"),
+            CommandNodeV1 {
+                name: "ownership",
+                subcommands: &[
+                    CommandNodeV1::leaf("check"),
+                    CommandNodeV1::leaf("get"),
+                    CommandNodeV1::leaf("list"),
+                ],
+            },
+            CommandNodeV1::leaf("rebuild"),
+            CommandNodeV1 {
+                name: "scopes",
+                subcommands: &[
+                    CommandNodeV1::leaf("adopt"),
+                    CommandNodeV1::leaf("discover"),
+                    CommandNodeV1::leaf("list"),
+                    CommandNodeV1::leaf("remove"),
+                ],
+            },
+            CommandNodeV1::leaf("status"),
+            CommandNodeV1::leaf("sync"),
+        ],
+    },
+    CommandNodeV1 {
         name: "workspace",
         subcommands: &[
             CommandNodeV1::leaf("add"),
             CommandNodeV1::leaf("audit"),
             CommandNodeV1::leaf("discover"),
             CommandNodeV1::leaf("graph"),
+            CommandNodeV1::leaf("remove"),
         ],
     },
 ];
@@ -162,6 +249,407 @@ pub struct BuildInfoV1 {
     pub version: String,
     pub git_commit: Option<String>,
     pub identity_source: BuildIdentitySourceV1,
+}
+
+/// Cloudflare tenancy levels understood by the registry. Organization support
+/// is modeled even when the active credentials or entitlement cannot read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeKindV1 {
+    Organization,
+    Account,
+    Zone,
+    Resource,
+}
+
+impl ScopeKindV1 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Organization => "organization",
+            Self::Account => "account",
+            Self::Zone => "zone",
+            Self::Resource => "resource",
+        }
+    }
+}
+
+/// Stable reference to one organization, account, zone, or resource scope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ScopeRefV1 {
+    pub schema_version: u8,
+    pub kind: ScopeKindV1,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Box<Self>>,
+}
+
+impl ScopeRefV1 {
+    #[must_use]
+    pub fn new(kind: ScopeKindV1, id: impl Into<String>, parent: Option<Self>) -> Self {
+        Self {
+            schema_version: 1,
+            kind,
+            id: id.into(),
+            parent: parent.map(Box::new),
+        }
+    }
+
+    #[must_use]
+    pub fn key(&self) -> String {
+        self.parent.as_ref().map_or_else(
+            || format!("{}:{}", self.kind.as_str(), self.id),
+            |parent| format!("{}/{}:{}", parent.key(), self.kind.as_str(), self.id),
+        )
+    }
+}
+
+/// Stable resource identity within one explicit Cloudflare scope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ResourceRefV1 {
+    pub schema_version: u8,
+    pub scope: ScopeRefV1,
+    pub kind: String,
+    pub id: String,
+}
+
+impl ResourceRefV1 {
+    #[must_use]
+    pub fn new(scope: ScopeRefV1, kind: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            schema_version: 1,
+            scope,
+            kind: kind.into(),
+            id: id.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!("{}/{}:{}", self.scope.key(), self.kind, self.id)
+    }
+}
+
+/// Whether a live resource observation may still be used for reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryObservationStatusV1 {
+    Current,
+    Stale,
+    Partial,
+    PermissionDenied,
+    Tombstone,
+    UnknownSchema,
+}
+
+/// One normalized live-read result. Events may trigger creation of this row,
+/// but only a successful provider read may supply its state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegistryObservationV1 {
+    pub schema_version: u8,
+    pub resource: ResourceRefV1,
+    pub observed_at: DateTime<Utc>,
+    pub fresh_until: DateTime<Utc>,
+    pub catalog_hash: String,
+    pub capability_id: String,
+    pub state_hash: String,
+    pub state: Value,
+    pub status: RegistryObservationStatusV1,
+    pub evidence: EvidenceV1,
+}
+
+impl RegistryObservationV1 {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a normalized observation deliberately binds resource, freshness, catalog, capability, state, status, and evidence as one versioned contract"
+    )]
+    pub fn new(
+        resource: ResourceRefV1,
+        observed_at: DateTime<Utc>,
+        fresh_until: DateTime<Utc>,
+        catalog_hash: impl Into<String>,
+        capability_id: impl Into<String>,
+        state: Value,
+        status: RegistryObservationStatusV1,
+        evidence: EvidenceV1,
+    ) -> Result<Self> {
+        let state = redact_json(&state);
+        let state_hash = canonical_hash_value(&state)?;
+        Ok(Self {
+            schema_version: 1,
+            resource,
+            observed_at,
+            fresh_until,
+            catalog_hash: catalog_hash.into(),
+            capability_id: capability_id.into(),
+            state_hash,
+            state,
+            status,
+            evidence,
+        })
+    }
+}
+
+/// Versioned local declaration of intended resource state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DesiredResourceV1 {
+    pub schema_version: u8,
+    pub resource: ResourceRefV1,
+    pub manifest_hash: String,
+    pub manifest: Value,
+    pub owner: String,
+    pub deploy_lane: String,
+    pub verifier: String,
+    pub allowed_change_path: String,
+    pub source_path: String,
+}
+
+impl DesiredResourceV1 {
+    pub fn new(
+        resource: ResourceRefV1,
+        manifest: Value,
+        owner: impl Into<String>,
+        deploy_lane: impl Into<String>,
+        verifier: impl Into<String>,
+        allowed_change_path: impl Into<String>,
+        source_path: impl Into<String>,
+    ) -> Result<Self> {
+        let manifest = redact_json(&manifest);
+        let manifest_hash = canonical_hash_value(&manifest)?;
+        Ok(Self {
+            schema_version: 1,
+            resource,
+            manifest_hash,
+            manifest,
+            owner: owner.into(),
+            deploy_lane: deploy_lane.into(),
+            verifier: verifier.into(),
+            allowed_change_path: allowed_change_path.into(),
+            source_path: source_path.into(),
+        })
+    }
+}
+
+/// Single-owner projection for an intended resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnershipRecordV1 {
+    pub schema_version: u8,
+    pub resource: ResourceRefV1,
+    pub owner: String,
+    pub repository: String,
+    pub deploy_lane: String,
+    pub verifier: String,
+    pub allowed_change_path: String,
+}
+
+/// Honest provider coverage for one registry projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryCoverageV1 {
+    pub schema_version: u8,
+    pub as_of: DateTime<Utc>,
+    pub operation_count: u64,
+    pub scope_count: u64,
+    pub resource_count: u64,
+    pub current_observation_count: u64,
+    pub stale_observation_count: u64,
+    pub desired_resource_count: u64,
+    pub provider_count: u64,
+    pub blocked_provider_count: u64,
+    pub partial: bool,
+    pub blockers: Vec<String>,
+}
+
+/// Provider identity carried by one durable event receipt. The identity is
+/// intentionally independent from normalized resource identity: an event may
+/// be retained even when its schema cannot yet be mapped to a resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventUpstreamIdentityV1 {
+    pub provider: String,
+    pub source: String,
+    pub event_type: String,
+    pub event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_id: Option<String>,
+}
+
+/// How the event origin was authenticated before entering the local ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSignatureStatusV1 {
+    Verified,
+    ProviderOriginated,
+    NotRequired,
+    Invalid,
+    Unknown,
+}
+
+/// Immutable, redacted receipt for one provider event. Event payloads are
+/// evidence and reconciliation triggers; they never become observed resource
+/// state without a separate successful live read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventEnvelopeV1 {
+    pub schema_version: u8,
+    pub upstream: EventUpstreamIdentityV1,
+    pub upstream_schema_version: u64,
+    pub occurred_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeRefV1>,
+    pub dedupe_key: String,
+    pub signature_status: EventSignatureStatusV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    /// Legacy attribution retained only for reading pre-plan event receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_refs: Vec<ResourceRefV1>,
+    pub payload_hash: String,
+    pub payload: Value,
+    pub evidence: EvidenceV1,
+}
+
+impl EventEnvelopeV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        upstream: EventUpstreamIdentityV1,
+        upstream_schema_version: u64,
+        occurred_at: DateTime<Utc>,
+        received_at: DateTime<Utc>,
+        scope: Option<ScopeRefV1>,
+        dedupe_key: impl Into<String>,
+        signature_status: EventSignatureStatusV1,
+        operation_id: Option<String>,
+        cursor: Option<String>,
+        resource_refs: Vec<ResourceRefV1>,
+        payload: Value,
+        evidence: EvidenceV1,
+    ) -> Result<Self> {
+        let payload = redact_json(&payload);
+        let payload_hash = canonical_hash_value(&payload)?;
+        let envelope = Self {
+            schema_version: 1,
+            upstream,
+            upstream_schema_version,
+            occurred_at,
+            received_at,
+            scope,
+            dedupe_key: dedupe_key.into(),
+            signature_status,
+            operation_id,
+            authority_id: None,
+            cursor,
+            resource_refs,
+            payload_hash,
+            payload,
+            evidence,
+        };
+        envelope.validate()?;
+        Ok(envelope)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let required_identity = [
+            self.upstream.provider.as_str(),
+            self.upstream.source.as_str(),
+            self.upstream.event_type.as_str(),
+            self.upstream.event_id.as_str(),
+        ];
+        if self.schema_version != 1
+            || self.upstream_schema_version == 0
+            || self.dedupe_key.trim().is_empty()
+            || required_identity
+                .iter()
+                .any(|value| value.trim().is_empty())
+        {
+            return Err(CoreError::InvalidEventEnvelope(
+                "event version, provider identity, schema version, and dedupe key must be explicit"
+                    .to_owned(),
+            ));
+        }
+        if self.evidence.class != EvidenceClass::EventReceipt {
+            return Err(CoreError::InvalidEventEnvelope(
+                "event evidence must use the event_receipt evidence class".to_owned(),
+            ));
+        }
+        let actual_payload_hash = canonical_hash_value(&redact_json(&self.payload))?;
+        if actual_payload_hash != self.payload_hash {
+            return Err(CoreError::InvalidEventEnvelope(
+                "event payload no longer matches its hash".to_owned(),
+            ));
+        }
+        if self.resource_refs.iter().any(|resource| {
+            self.scope
+                .as_ref()
+                .is_some_and(|scope| &resource.scope != scope)
+        }) {
+            return Err(CoreError::InvalidEventEnvelope(
+                "event resource references must remain inside the declared scope".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationJobStatusV1 {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    BlockedUnknownSchema,
+    BlockedInvalidSignature,
+}
+
+/// One bounded request to refresh a resource through its inventory provider.
+/// Completing the job still requires a separate evidence-backed live read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconciliationJobV1 {
+    pub schema_version: u8,
+    pub job_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_dedupe_key: Option<String>,
+    pub resource: ResourceRefV1,
+    pub status: ReconciliationJobStatusV1,
+    pub enqueued_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ReconciliationJobV1 {
+    #[must_use]
+    pub fn queued(resource: ResourceRefV1, event_dedupe_key: Option<String>) -> Self {
+        let now = Utc::now();
+        Self {
+            schema_version: 1,
+            job_id: Uuid::new_v4().to_string(),
+            event_dedupe_key,
+            resource,
+            status: ReconciliationJobStatusV1::Queued,
+            enqueued_at: now,
+            updated_at: now,
+            attempts: 0,
+            error: None,
+        }
+    }
+}
+
+/// Durable cursor for polling sources such as Audit Logs v2. Overlap is part
+/// of the contract so a resumed poll cannot silently skip a boundary window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCursorV1 {
+    pub schema_version: u8,
+    pub source_key: String,
+    pub cursor: String,
+    pub overlap_seconds: u64,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Frozen top-level verbs from the retired shell control plane that must
@@ -280,6 +768,18 @@ pub enum CoreError {
         authority_id: String,
         reason: String,
     },
+    #[error("admission policy bundle `{bundle_id}` is in state `{actual}`; expected {expected}")]
+    InvalidAdmissionPolicyState {
+        bundle_id: String,
+        actual: String,
+        expected: &'static str,
+    },
+    #[error("admission policy bundle `{0}` may not broaden the compiled safety floor")]
+    AdmissionPolicyBroadened(String),
+    #[error("plan v2 is invalid: {0}")]
+    InvalidPlanV2(String),
+    #[error("event envelope is invalid: {0}")]
+    InvalidEventEnvelope(String),
     #[error("standing authority {authority_id} is {actual}; expected {expected}")]
     InvalidStandingAuthorityState {
         authority_id: String,
@@ -382,6 +882,7 @@ pub struct SelectorV1 {
 #[serde(rename_all = "snake_case")]
 pub enum ResponseBodyModeV1 {
     CloudflareJsonEnvelope,
+    CloudflareDataEnvelope,
     JsonValue,
     GraphqlJson,
     NegotiatedRows,
@@ -629,6 +1130,31 @@ pub struct SecurityActionContractV1 {
     pub current_state_capability_id: String,
     #[serde(default)]
     pub safety_profile: SecurityActionSafetyProfileV1,
+}
+
+pub const EVENT_BATCH_CAPABILITY_ID: &str = "events-consume-queue-batch";
+pub const QUEUE_PULL_CAPABILITY_ID: &str = "queues-pull-messages";
+pub const QUEUE_ACK_CAPABILITY_ID: &str = "queues-ack-messages";
+pub const QUEUE_PULL_PATH: &str = "/accounts/{account_id}/queues/{queue_id}/messages/pull";
+pub const QUEUE_ACK_PATH: &str = "/accounts/{account_id}/queues/{queue_id}/messages/ack";
+
+/// Exact Cloudflare Queue identities, safety limits, and pricing facts used by
+/// one ordinary plan-gated event batch. The synthetic capability is promoted
+/// only while all of these pins still match the raw catalog operations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventBatchContractV1 {
+    pub pull_capability_id: String,
+    pub pull_path: String,
+    pub acknowledge_capability_id: String,
+    pub acknowledge_path: String,
+    pub required_permissions: Vec<String>,
+    pub max_batch_size: u32,
+    pub max_visibility_timeout_ms: u64,
+    pub max_message_bytes: u64,
+    pub billing_chunk_bytes: u64,
+    pub price_per_million_operations: f64,
+    pub pricing_reference: KnowledgeReferenceV1,
+    pub schema_reference: KnowledgeReferenceV1,
 }
 
 #[must_use]
@@ -961,6 +1487,8 @@ pub struct CapabilityV1 {
     pub workflow: Option<WorkflowContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_action: Option<SecurityActionContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_batch: Option<EventBatchContractV1>,
 }
 
 /// Cloudflare's DNS record detail path. This is wire contract, not a local
@@ -1056,6 +1584,7 @@ impl CapabilityV1 {
             graphql: None,
             workflow: None,
             security_action: None,
+            event_batch: None,
         }
     }
 
@@ -1124,6 +1653,9 @@ impl CapabilityV1 {
         if self.security_action.is_some() && !self.security_action_contract_supported() {
             gaps.push("telemetry-derived security action safety contract is malformed".to_owned());
         }
+        if self.event_batch.is_some() && !self.event_batch_contract_supported() {
+            gaps.push("event batch safety contract is malformed or drifted".to_owned());
+        }
         if self.entitlement.probe.is_some() && !self.entitlement_probe_contract_supported() {
             gaps.push("declared live entitlement probe is malformed".to_owned());
         }
@@ -1175,6 +1707,31 @@ impl CapabilityV1 {
     }
 
     #[must_use]
+    pub fn event_batch_contract_supported(&self) -> bool {
+        self.event_batch.as_ref().is_some_and(|contract| {
+            self.id == EVENT_BATCH_CAPABILITY_ID
+                && self.adapter_status == AdapterStatus::Native
+                && self.method == "POST"
+                && self.path
+                    == "/cfctl/events/queue-batches/{account_id}/{queue_id}/{subscription_id}"
+                && contract.pull_capability_id == QUEUE_PULL_CAPABILITY_ID
+                && contract.pull_path == QUEUE_PULL_PATH
+                && contract.acknowledge_capability_id == QUEUE_ACK_CAPABILITY_ID
+                && contract.acknowledge_path == QUEUE_ACK_PATH
+                && contract.required_permissions == ["Queues Write", "Workers Scripts Write"]
+                && contract.max_batch_size == 100
+                && contract.max_visibility_timeout_ms == 43_200_000
+                && contract.max_message_bytes == 131_072
+                && contract.billing_chunk_bytes == 65_536
+                && (contract.price_per_million_operations - 0.40).abs() < f64::EPSILON
+                && contract.pricing_reference.url
+                    == "https://developers.cloudflare.com/queues/platform/pricing/"
+                && contract.schema_reference.url
+                    == "https://developers.cloudflare.com/queues/configuration/pull-consumers/"
+        })
+    }
+
+    #[must_use]
     pub fn verification_contract_declared(&self) -> bool {
         !self.verification.required
             || !matches!(
@@ -1200,6 +1757,9 @@ impl CapabilityV1 {
         }
 
         match self.verification.strategy.as_str() {
+            "event_batch_registry_commit_and_queue_acknowledgement_receipt" => {
+                self.event_batch_contract_supported()
+            }
             "api_token_details_match_created_id_and_active_status" => {
                 self.method == "POST"
                     && matches!(
@@ -3381,7 +3941,9 @@ fn system_guide_flow() -> Vec<GuideFlowStepV1> {
             "Plan",
             "Bind the request, account, catalog, impact, cost, verification, and compensation contracts.",
             GuideCloudflareEffectV1::None,
-            Some("hash-bound PlanV1 and PlanPrepared checkpoint"),
+            Some(
+                "canonical pinned PlanV2, compatible PlanV1 journal projection, and PlanPrepared checkpoint",
+            ),
         ),
         guide_flow_step(
             5,
@@ -3637,12 +4199,233 @@ pub enum PolicyDisposition {
     Blocked,
 }
 
+impl PolicyDisposition {
+    const fn restriction_rank(self) -> u8 {
+        match self {
+            Self::AutoExecute => 0,
+            Self::ApprovalRequired => 1,
+            Self::Blocked => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyDecisionV1 {
     pub schema_version: u8,
     pub disposition: PolicyDisposition,
     pub reasons: Vec<String>,
     pub requires_cost_ceiling: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionPolicyBundleStatusV1 {
+    Pending,
+    Approved,
+    Active,
+    Superseded,
+    Revoked,
+}
+
+impl AdmissionPolicyBundleStatusV1 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Active => "active",
+            Self::Superseded => "superseded",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+/// One data-driven rule. Rules may only preserve or increase the restriction
+/// chosen by the compiled safety floor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionPolicyRuleV1 {
+    pub rule_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<EffectClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskClass>,
+    pub disposition: PolicyDisposition,
+    pub reason: String,
+}
+
+impl AdmissionPolicyRuleV1 {
+    fn matches(&self, capability: &CapabilityV1) -> bool {
+        self.capability_id
+            .as_deref()
+            .is_none_or(|id| id == capability.id)
+            && self
+                .product
+                .as_deref()
+                .is_none_or(|product| product == capability.product)
+            && self.effect.is_none_or(|effect| effect == capability.effect)
+            && self.risk.is_none_or(|risk| risk == capability.risk)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdmissionPolicyBundleV1 {
+    pub schema_version: u8,
+    pub bundle_id: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub status: AdmissionPolicyBundleStatusV1,
+    pub rules: Vec<AdmissionPolicyRuleV1>,
+    pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_content_hash: Option<String>,
+}
+
+impl AdmissionPolicyBundleV1 {
+    pub fn pending(name: impl Into<String>, rules: Vec<AdmissionPolicyRuleV1>) -> Result<Self> {
+        if rules
+            .iter()
+            .any(|rule| rule.disposition == PolicyDisposition::AutoExecute)
+        {
+            return Err(CoreError::AdmissionPolicyBroadened(
+                "pending-bundle".to_owned(),
+            ));
+        }
+        let mut bundle = Self {
+            schema_version: 1,
+            bundle_id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            created_at: Utc::now(),
+            status: AdmissionPolicyBundleStatusV1::Pending,
+            rules,
+            content_hash: String::new(),
+            approved_at: None,
+            approved_content_hash: None,
+        };
+        bundle.refresh_hash()?;
+        Ok(bundle)
+    }
+
+    pub fn refresh_hash(&mut self) -> Result<()> {
+        self.content_hash = canonical_hash_value(&json_value(&(
+            self.schema_version,
+            &self.bundle_id,
+            &self.name,
+            self.created_at,
+            &self.rules,
+        ))?)?;
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != 1 {
+            return Err(CoreError::AdmissionPolicyBroadened(self.bundle_id.clone()));
+        }
+        if self
+            .rules
+            .iter()
+            .any(|rule| rule.disposition == PolicyDisposition::AutoExecute)
+        {
+            return Err(CoreError::AdmissionPolicyBroadened(self.bundle_id.clone()));
+        }
+        let actual = canonical_hash_value(&json_value(&(
+            self.schema_version,
+            &self.bundle_id,
+            &self.name,
+            self.created_at,
+            &self.rules,
+        ))?)?;
+        if actual != self.content_hash {
+            return Err(CoreError::AdmissionPolicyBroadened(self.bundle_id.clone()));
+        }
+        if self.status != AdmissionPolicyBundleStatusV1::Pending
+            && self.approved_content_hash.as_deref() != Some(self.content_hash.as_str())
+        {
+            return Err(CoreError::AdmissionPolicyBroadened(self.bundle_id.clone()));
+        }
+        Ok(())
+    }
+
+    pub fn approve(&mut self, explicit_yes: bool) -> Result<()> {
+        if self.status != AdmissionPolicyBundleStatusV1::Pending {
+            return Err(CoreError::InvalidAdmissionPolicyState {
+                bundle_id: self.bundle_id.clone(),
+                actual: self.status.as_str().to_owned(),
+                expected: "pending",
+            });
+        }
+        if !explicit_yes {
+            return Err(CoreError::ExplicitApprovalRequired);
+        }
+        self.validate()?;
+        self.status = AdmissionPolicyBundleStatusV1::Approved;
+        self.approved_at = Some(Utc::now());
+        self.approved_content_hash = Some(self.content_hash.clone());
+        Ok(())
+    }
+
+    pub fn activate(&mut self) -> Result<()> {
+        if !matches!(
+            self.status,
+            AdmissionPolicyBundleStatusV1::Approved | AdmissionPolicyBundleStatusV1::Superseded
+        ) {
+            return Err(CoreError::InvalidAdmissionPolicyState {
+                bundle_id: self.bundle_id.clone(),
+                actual: self.status.as_str().to_owned(),
+                expected: "approved or superseded",
+            });
+        }
+        self.validate()?;
+        self.status = AdmissionPolicyBundleStatusV1::Active;
+        Ok(())
+    }
+
+    pub fn supersede(&mut self) {
+        if self.status == AdmissionPolicyBundleStatusV1::Active {
+            self.status = AdmissionPolicyBundleStatusV1::Superseded;
+        }
+    }
+
+    pub fn revoke(&mut self) {
+        self.status = AdmissionPolicyBundleStatusV1::Revoked;
+    }
+
+    pub fn tighten(
+        &self,
+        floor: &PolicyDecisionV1,
+        capability: &CapabilityV1,
+    ) -> Result<PolicyDecisionV1> {
+        self.validate()?;
+        if self.status != AdmissionPolicyBundleStatusV1::Active {
+            return Err(CoreError::InvalidAdmissionPolicyState {
+                bundle_id: self.bundle_id.clone(),
+                actual: self.status.as_str().to_owned(),
+                expected: "active",
+            });
+        }
+        let mut decision = floor.clone();
+        for rule in self.rules.iter().filter(|rule| rule.matches(capability)) {
+            if rule.disposition.restriction_rank() < floor.disposition.restriction_rank() {
+                return Err(CoreError::AdmissionPolicyBroadened(self.bundle_id.clone()));
+            }
+            if rule.disposition.restriction_rank() > decision.disposition.restriction_rank() {
+                decision.disposition = rule.disposition;
+            }
+            decision
+                .reasons
+                .push(format!("admission rule {}: {}", rule.rule_id, rule.reason));
+        }
+        Ok(decision)
+    }
+}
+
+fn json_value<T: Serialize>(value: &T) -> Result<Value> {
+    Ok(serde_json::to_value(value)?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4378,6 +5161,108 @@ fn valid_non_negative_amount(amount: f64) -> bool {
     amount.is_finite() && amount >= 0.0
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanPinsV2 {
+    pub build_identity_hash: String,
+    pub catalog_hash: String,
+    pub credential_generation_id: String,
+    pub admission_policy_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_hash: Option<String>,
+    pub workspace_graph_hash: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resource_observation_hashes: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_budget: Option<MoneyV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanV2 {
+    pub schema_version: u8,
+    pub plan: PlanV1,
+    pub pins: PlanPinsV2,
+    pub content_hash: String,
+}
+
+impl PlanV2 {
+    pub fn new(plan: PlanV1, pins: PlanPinsV2) -> Result<Self> {
+        let mut document = Self {
+            schema_version: 2,
+            plan,
+            pins,
+            content_hash: String::new(),
+        };
+        document.refresh_hash()?;
+        document.validate()?;
+        Ok(document)
+    }
+
+    pub fn refresh_from_plan(&mut self, plan: PlanV1) -> Result<()> {
+        self.plan = plan;
+        self.pins.cost_budget = self
+            .plan
+            .approval
+            .as_ref()
+            .and_then(|approval| approval.max_cost.clone());
+        self.refresh_hash()?;
+        self.validate()
+    }
+
+    pub fn bind_authority_hash(&mut self, authority_hash: &str) -> Result<()> {
+        if authority_hash.is_empty() {
+            return Err(CoreError::InvalidPlanV2(
+                "authority hash cannot be empty".to_owned(),
+            ));
+        }
+        match self.pins.authority_hash.as_deref() {
+            Some(existing) if existing != authority_hash => {
+                return Err(CoreError::InvalidPlanV2(
+                    "a PlanV2 authority pin cannot be replaced".to_owned(),
+                ));
+            }
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        if self.plan.status != PlanStatus::Draft || self.plan.approval.is_some() {
+            return Err(CoreError::InvalidPlanV2(
+                "authority must be bound before plan approval or consumption".to_owned(),
+            ));
+        }
+        self.pins.authority_hash = Some(authority_hash.to_owned());
+        self.refresh_hash()?;
+        self.validate()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.plan.validate_transaction_journal()?;
+        if self.schema_version != 2
+            || self.pins.build_identity_hash.is_empty()
+            || self.pins.catalog_hash != self.plan.catalog_hash
+            || self.pins.credential_generation_id.is_empty()
+            || self.pins.admission_policy_hash.is_empty()
+            || self.pins.workspace_graph_hash.is_empty()
+        {
+            return Err(CoreError::InvalidPlanV2(
+                "required execution pins are missing or drifted".to_owned(),
+            ));
+        }
+        let actual =
+            canonical_hash_value(&json_value(&(self.schema_version, &self.plan, &self.pins))?)?;
+        if actual != self.content_hash {
+            return Err(CoreError::InvalidPlanV2(
+                "document content hash drifted".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn refresh_hash(&mut self) -> Result<()> {
+        self.content_hash =
+            canonical_hash_value(&json_value(&(self.schema_version, &self.plan, &self.pins))?)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StandingAuthorityStatus {
@@ -4802,6 +5687,7 @@ pub enum EvidenceClass {
     Preview,
     Apply,
     StandingApply,
+    EventReceipt,
     PostChangeVerification,
     AgentAction,
     LocalProof,

@@ -13,8 +13,8 @@ use cfctl_auth::AuthCredential;
 use cfctl_core::{
     AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1, GraphqlAnalyticsContractV1,
     OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1, R2LogRetrievalContractV1,
-    ResponseBodyModeV1, ResponseContractV1, RiskClass, SelectorV1, TimestampFormatV1, hash_value,
-    request_header_is_reserved,
+    ResponseBodyModeV1, ResponseContractV1, RiskClass, SelectorV1, TimestampFormatV1,
+    TransactionStageV1, hash_value, request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
@@ -98,6 +98,8 @@ pub enum CloudflareError {
     UnexpectedResponseBody { status: u16, received_bytes: usize },
     #[error("capability `{0}` mutates state and requires a consumable approved plan")]
     ApprovedPlanRequired(String),
+    #[error("plan or capability `{capability_id}` is not an exact consumed event batch contract")]
+    InvalidEventBatchPlan { capability_id: String },
     #[error("Cloudflare API base URL cannot accept path segments")]
     InvalidBaseUrl,
     #[error("invalid HTTP method `{0}`")]
@@ -864,6 +866,185 @@ pub struct Executor {
     max_retries: usize,
 }
 
+/// A Queue transport that can exist only for one consumed, boundary-attempted
+/// event-batch plan. Raw pull and acknowledgement remain private implementation
+/// details and cannot be reached with caller-supplied authority.
+pub struct EventBatchTransport<'a> {
+    executor: &'a Executor,
+    pull: &'a CapabilityV1,
+    acknowledge: &'a CapabilityV1,
+    account_id: String,
+    queue_id: String,
+    batch_size: u32,
+    visibility_timeout_ms: u64,
+}
+
+impl<'a> EventBatchTransport<'a> {
+    fn from_consumed_plan(
+        executor: &'a Executor,
+        plan: &PlanV1,
+        pull: &'a CapabilityV1,
+        acknowledge: &'a CapabilityV1,
+    ) -> Result<Self> {
+        let contract = plan.capability.event_batch.as_ref().ok_or_else(|| {
+            CloudflareError::InvalidEventBatchPlan {
+                capability_id: plan.capability.id.clone(),
+            }
+        })?;
+        if plan.status != PlanStatus::Consumed
+            || plan.transaction_stage != TransactionStageV1::BoundaryAttemptPersisted
+            || !plan.capability.event_batch_contract_supported()
+            || !raw_event_batch_operation_matches(
+                pull,
+                &contract.pull_capability_id,
+                &contract.pull_path,
+                &contract.required_permissions,
+            )
+            || !raw_event_batch_operation_matches(
+                acknowledge,
+                &contract.acknowledge_capability_id,
+                &contract.acknowledge_path,
+                &contract.required_permissions,
+            )
+        {
+            return Err(CloudflareError::InvalidEventBatchPlan {
+                capability_id: plan.capability.id.clone(),
+            });
+        }
+        let input: CallInput = serde_json::from_value(plan.input.clone()).map_err(|_| {
+            CloudflareError::InvalidEventBatchPlan {
+                capability_id: plan.capability.id.clone(),
+            }
+        })?;
+        let account_id = required_string(&input.selectors, "account_id", &plan.capability.id)?;
+        let queue_id = required_string(&input.selectors, "queue_id", &plan.capability.id)?;
+        let body = input
+            .body
+            .as_ref()
+            .ok_or_else(|| CloudflareError::InvalidEventBatchPlan {
+                capability_id: plan.capability.id.clone(),
+            })?;
+        let batch_size = body
+            .get("batch_size")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| (1..=contract.max_batch_size).contains(value))
+            .ok_or_else(|| CloudflareError::InvalidEventBatchPlan {
+                capability_id: plan.capability.id.clone(),
+            })?;
+        let visibility_timeout_ms = body
+            .get("visibility_timeout_ms")
+            .and_then(Value::as_u64)
+            .filter(|value| (1_000..=contract.max_visibility_timeout_ms).contains(value))
+            .ok_or_else(|| CloudflareError::InvalidEventBatchPlan {
+                capability_id: plan.capability.id.clone(),
+            })?;
+        Ok(Self {
+            executor,
+            pull,
+            acknowledge,
+            account_id,
+            queue_id,
+            batch_size,
+            visibility_timeout_ms,
+        })
+    }
+
+    pub async fn pull(&self, credential: &AuthCredential) -> Result<CloudflareResponseV1> {
+        self.execute(
+            self.pull,
+            CallInput {
+                selectors: serde_json::json!({
+                    "account_id": self.account_id,
+                    "queue_id": self.queue_id,
+                }),
+                body: Some(serde_json::json!({
+                    "batch_size": self.batch_size,
+                    "visibility_timeout_ms": self.visibility_timeout_ms,
+                })),
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await
+    }
+
+    pub async fn acknowledge(
+        &self,
+        lease_ids: &[String],
+        credential: &AuthCredential,
+    ) -> Result<CloudflareResponseV1> {
+        let unique = lease_ids.iter().collect::<BTreeSet<_>>();
+        if lease_ids.is_empty()
+            || lease_ids.len() > usize::try_from(self.batch_size).unwrap_or(usize::MAX)
+            || unique.len() != lease_ids.len()
+            || lease_ids.iter().any(String::is_empty)
+        {
+            return Err(CloudflareError::InvalidEventBatchPlan {
+                capability_id: self.acknowledge.id.clone(),
+            });
+        }
+        self.execute(
+            self.acknowledge,
+            CallInput {
+                selectors: serde_json::json!({
+                    "account_id": self.account_id,
+                    "queue_id": self.queue_id,
+                }),
+                body: Some(serde_json::json!({
+                    "acks": lease_ids
+                        .iter()
+                        .map(|lease_id| serde_json::json!({"lease_id":lease_id}))
+                        .collect::<Vec<_>>(),
+                    "retries": [],
+                })),
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await
+    }
+
+    async fn execute(
+        &self,
+        capability: &CapabilityV1,
+        input: CallInput,
+        credential: &AuthCredential,
+    ) -> Result<CloudflareResponseV1> {
+        let request = self.executor.builder.build_unchecked(capability, &input)?;
+        self.executor.send(&request, credential).await
+    }
+}
+
+fn raw_event_batch_operation_matches(
+    capability: &CapabilityV1,
+    expected_id: &str,
+    expected_path: &str,
+    expected_permissions: &[String],
+) -> bool {
+    capability.id == expected_id
+        && capability.method == "POST"
+        && capability.path == expected_path
+        && capability.permissions == expected_permissions
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|contract| {
+                contract.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            })
+}
+
+fn required_string(value: &Value, key: &str, capability_id: &str) -> Result<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| CloudflareError::InvalidEventBatchPlan {
+            capability_id: capability_id.to_owned(),
+        })
+}
+
 impl Executor {
     pub fn new(client: reqwest::Client, base_url: &str) -> Result<Self> {
         Ok(Self {
@@ -890,6 +1071,15 @@ impl Executor {
         }
         let request = self.builder.build(capability, input)?;
         self.send_paginated(&request, credential).await
+    }
+
+    pub fn event_batch_transport<'a>(
+        &'a self,
+        plan: &PlanV1,
+        pull: &'a CapabilityV1,
+        acknowledge: &'a CapabilityV1,
+    ) -> Result<EventBatchTransport<'a>> {
+        EventBatchTransport::from_consumed_plan(self, plan, pull, acknowledge)
     }
 
     /// Executes a bounded analytics read and writes only the declared output to
@@ -3198,6 +3388,20 @@ async fn parse_success_response(
                 Ok(parsed)
             }
         }
+        ResponseBodyModeV1::CloudflareDataEnvelope => {
+            require_json_media(status, content_type.as_deref())?;
+            let (bytes, truncated) = read_bounded_body(response, request.max_bytes).await?;
+            if truncated {
+                return Err(CloudflareError::InvalidResponseEnvelope { status });
+            }
+            let body = parse_json_bytes(&bytes, status)?;
+            if body.get("success").and_then(Value::as_bool).is_none()
+                || body.get("data").is_none_or(Value::is_null)
+            {
+                return Err(CloudflareError::InvalidResponseEnvelope { status });
+            }
+            Ok(parse_data_response(status, &body, etag, cf_ray))
+        }
         ResponseBodyModeV1::JsonValue => {
             require_json_media(status, content_type.as_deref())?;
             parse_bare_json_response(response, request, status, etag, cf_ray, output_path).await
@@ -4174,6 +4378,26 @@ fn parse_response(
         result: body.get("result").cloned().unwrap_or(Value::Null),
         errors,
         result_info: body.get("result_info").cloned(),
+        etag,
+        cf_ray,
+    }
+}
+
+fn parse_data_response(
+    status: u16,
+    body: &Value,
+    etag: Option<String>,
+    cf_ray: Option<String>,
+) -> CloudflareResponseV1 {
+    CloudflareResponseV1 {
+        status,
+        success: body
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or((200..300).contains(&status)),
+        result: body.get("data").cloned().unwrap_or(Value::Null),
+        errors: Vec::new(),
+        result_info: None,
         etag,
         cf_ray,
     }

@@ -1,11 +1,12 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use cfctl_core::{
-    CapabilityV1, EvidenceClass, OperationalProofOutcomeV1, OperationalProofScopeV1,
-    OperationalProofV1, PlanStatus, PlanV1, StandingAuthorityStatus, StandingAuthorityV1,
+    AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1, CapabilityV1,
+    EvidenceClass, OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1,
+    PlanStatus, PlanV1, PolicyDisposition, StandingAuthorityStatus, StandingAuthorityV1,
     TransactionStageV1,
 };
-use cfctl_storage::{RuntimePaths, StateStore, StorageError};
+use cfctl_storage::{RuntimePaths, StateStore, StorageError, StoredPlanRecord};
 use chrono::{Duration, Utc};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -54,6 +55,131 @@ fn draft_authority() -> StandingAuthorityV1 {
         Utc::now() + Duration::hours(24),
     )
     .expect("draft authority")
+}
+
+fn admission_bundle(name: &str) -> AdmissionPolicyBundleV1 {
+    AdmissionPolicyBundleV1::pending(
+        name,
+        vec![AdmissionPolicyRuleV1 {
+            rule_id: format!("block-{name}"),
+            capability_id: Some(format!("capability-{name}")),
+            product: None,
+            effect: None,
+            risk: None,
+            disposition: PolicyDisposition::Blocked,
+            reason: format!("{name} is locally blocked"),
+        }],
+    )
+    .expect("admission bundle")
+}
+
+#[test]
+fn admission_bundles_are_create_only_and_activation_uses_a_hash_bound_pointer() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("storage opens");
+    let bundle = admission_bundle("one");
+
+    store
+        .create_admission_bundle(&bundle)
+        .expect("pending bundle stages once");
+    assert!(matches!(
+        store.create_admission_bundle(&bundle),
+        Err(StorageError::AdmissionBundleAlreadyExists(id)) if id == bundle.bundle_id
+    ));
+    assert!(
+        store
+            .approve_admission_bundle(&bundle.bundle_id, false)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load_admission_bundle(&bundle.bundle_id)
+            .expect("pending bundle remains")
+            .status,
+        AdmissionPolicyBundleStatusV1::Pending
+    );
+    store
+        .approve_admission_bundle(&bundle.bundle_id, true)
+        .expect("explicit approval persists");
+    let activation = store
+        .activate_admission_bundle(&bundle.bundle_id)
+        .expect("approved bundle activates");
+    assert_eq!(activation.previous_bundle_id, None);
+    assert_eq!(
+        store
+            .active_admission_policy()
+            .expect("active pointer validates")
+            .expect("active bundle")
+            .content_hash,
+        bundle.content_hash
+    );
+
+    store
+        .write_json(
+            &paths.config_dir.join("policy/admission/active.json"),
+            &json!({
+                "schema_version":1,
+                "bundle_id":bundle.bundle_id,
+                "content_hash":"sha256:drift"
+            }),
+        )
+        .expect("tamper pointer fixture");
+    assert!(matches!(
+        store.active_admission_policy(),
+        Err(StorageError::InvalidAdmissionPointer(_))
+    ));
+}
+
+#[test]
+fn concurrent_admission_activation_serializes_to_one_active_bundle() {
+    use std::sync::{Arc, Barrier};
+
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let first = admission_bundle("first");
+    let second = admission_bundle("second");
+    for bundle in [&first, &second] {
+        store
+            .create_admission_bundle(bundle)
+            .expect("bundle stages");
+        store
+            .approve_admission_bundle(&bundle.bundle_id, true)
+            .expect("bundle approves");
+    }
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = Vec::new();
+    for bundle_id in [first.bundle_id.clone(), second.bundle_id.clone()] {
+        let store = store.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            store.activate_admission_bundle(&bundle_id)
+        }));
+    }
+    barrier.wait();
+    for handle in handles {
+        handle
+            .join()
+            .expect("activation thread joins")
+            .expect("serialized activation succeeds");
+    }
+
+    let active = store
+        .active_admission_policy()
+        .expect("active pointer validates")
+        .expect("one active bundle");
+    let bundles = store.list_admission_bundles().expect("bundles list");
+    assert_eq!(
+        bundles
+            .iter()
+            .filter(|bundle| bundle.status == AdmissionPolicyBundleStatusV1::Active)
+            .count(),
+        1
+    );
+    assert!(
+        matches!(active.bundle_id.as_str(), id if id == first.bundle_id || id == second.bundle_id)
+    );
 }
 
 #[test]
@@ -473,13 +599,252 @@ fn registered_roots_are_explicit_and_canonicalized() {
     let workspace = tempfile::tempdir().expect("workspace root");
     let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
     store
-        .register_workspace_root(workspace.path())
+        .register_workspace(workspace.path(), None)
         .expect("register root");
     let roots = store.workspace_roots().expect("read roots");
     assert_eq!(
         roots,
         vec![workspace.path().canonicalize().expect("canonical root")]
     );
+}
+
+#[test]
+fn workspace_manifest_migrates_legacy_roots_and_account_pins_once() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let workspace = tempfile::tempdir().expect("workspace root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("storage opens");
+    let canonical = workspace.path().canonicalize().expect("canonical root");
+    store
+        .write_json(
+            &paths.config_dir.join("workspace-roots.json"),
+            &vec![canonical.clone()],
+        )
+        .expect("legacy roots write");
+    store
+        .write_json(
+            &paths.config_dir.join("workspace-accounts.json"),
+            &std::collections::BTreeMap::from([(canonical.clone(), "account-a")]),
+        )
+        .expect("legacy pins write");
+
+    let manifest = store.workspace_manifest().expect("legacy state migrates");
+    assert_eq!(manifest.roots(), vec![canonical.clone()]);
+    assert_eq!(
+        manifest.account_pins(),
+        std::collections::BTreeMap::from([(canonical, "account-a".to_owned())])
+    );
+    assert!(
+        paths
+            .config_dir
+            .join("workspace-manifest-v1.json")
+            .is_file()
+    );
+}
+
+#[test]
+fn workspace_registration_updates_root_and_account_pin_atomically() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let workspace_a = tempfile::tempdir().expect("workspace a");
+    let workspace_b = tempfile::tempdir().expect("workspace b");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let store_a = store.clone();
+    let path_a = workspace_a.path().to_path_buf();
+    let write_a = std::thread::spawn(move || {
+        store_a
+            .register_workspace(&path_a, Some("account-a".to_owned()))
+            .expect("register workspace a");
+    });
+    let store_b = store.clone();
+    let path_b = workspace_b.path().to_path_buf();
+    let write_b = std::thread::spawn(move || {
+        store_b
+            .register_workspace(&path_b, Some("account-b".to_owned()))
+            .expect("register workspace b");
+    });
+    write_a.join().expect("workspace a writer joins");
+    write_b.join().expect("workspace b writer joins");
+
+    let manifest = store.workspace_manifest().expect("manifest reads");
+    let pins = manifest.account_pins();
+    let canonical_a = workspace_a.path().canonicalize().expect("canonical a");
+    let canonical_b = workspace_b.path().canonicalize().expect("canonical b");
+    assert_eq!(
+        pins.get(&canonical_a).map(String::as_str),
+        Some("account-a")
+    );
+    assert_eq!(
+        pins.get(&canonical_b).map(String::as_str),
+        Some("account-b")
+    );
+
+    let (_, removed, account_pin_removed) = store
+        .unregister_workspace(&canonical_a)
+        .expect("workspace removal");
+    assert!(removed);
+    assert!(account_pin_removed);
+    let manifest = store.workspace_manifest().expect("manifest rereads");
+    assert!(!manifest.roots().contains(&canonical_a));
+    assert!(!manifest.account_pins().contains_key(&canonical_a));
+}
+
+#[test]
+fn plan_v2_sidecar_tracks_forward_plan_state_while_plan_v1_history_remains_readable() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let capability = CapabilityV1::new("workers-list", "List", "GET", "/accounts/a/workers");
+    let mut plan = PlanV1::draft(
+        "profile-a",
+        "account-a",
+        "sha256:catalog",
+        capability,
+        json!({"account_id":"account-a"}),
+    )
+    .expect("plan");
+    store.save_plan(&plan).expect("plan v1 stores");
+    assert!(!store.has_plan_v2(&plan.operation_id).expect("v2 check"));
+    assert_eq!(store.load_plan(&plan.operation_id).expect("v1 reads"), plan);
+
+    let plan_v2 = cfctl_core::PlanV2::new(
+        plan.clone(),
+        cfctl_core::PlanPinsV2 {
+            build_identity_hash: "sha256:build".to_owned(),
+            catalog_hash: plan.catalog_hash.clone(),
+            credential_generation_id: "generation-a".to_owned(),
+            admission_policy_hash: "sha256:policy".to_owned(),
+            authority_hash: None,
+            workspace_graph_hash: "sha256:workspace".to_owned(),
+            resource_observation_hashes: std::collections::BTreeMap::default(),
+            cost_budget: None,
+        },
+    )
+    .expect("plan v2");
+    store.save_plan_v2(&plan_v2).expect("v2 stores");
+    plan.approve(true, None).expect("approve plan");
+    store.save_plan(&plan).expect("approved plan stores");
+
+    let reloaded = store.load_plan_v2(&plan.operation_id).expect("v2 reads");
+    assert_eq!(reloaded.plan.status, PlanStatus::Approved);
+    assert_eq!(reloaded.plan.content_hash, plan.content_hash);
+    reloaded.validate().expect("v2 remains valid");
+}
+
+#[test]
+fn stored_plan_record_fails_closed_when_a_current_mutation_loses_plan_v2() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let plan = draft_plan();
+    store.save_plan(&plan).expect("compatibility plan stores");
+
+    assert!(matches!(
+        store
+            .load_stored_plan_record(&plan.operation_id)
+            .expect("record classifies"),
+        StoredPlanRecord::RequiredSidecarMissing(candidate) if *candidate == plan
+    ));
+}
+
+#[test]
+fn stored_plan_record_keeps_historical_plan_v1_readable_but_not_execution_compatible() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let mut plan = draft_plan();
+    plan.created_at = chrono::DateTime::parse_from_rfc3339("2026-07-20T00:00:00Z")
+        .expect("historical timestamp")
+        .with_timezone(&Utc);
+    plan.transaction_journal.clear();
+    plan.refresh_hash().expect("refresh historical plan");
+    plan.record_transaction_stage(TransactionStageV1::PlanPrepared)
+        .expect("historical journal");
+    store.save_plan(&plan).expect("historical plan stores");
+
+    let record = store
+        .load_stored_plan_record(&plan.operation_id)
+        .expect("record classifies");
+    assert!(matches!(record, StoredPlanRecord::LegacyReadable(_)));
+    assert!(!record.execution_compatible());
+    assert_eq!(
+        record.execution_incompatibility_reason(),
+        Some("legacy_plan_v1")
+    );
+}
+
+#[test]
+fn stored_plan_record_detects_plan_v1_projection_drift() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("storage opens");
+    let plan = draft_plan();
+    let plan_v2 = cfctl_core::PlanV2::new(
+        plan.clone(),
+        cfctl_core::PlanPinsV2 {
+            build_identity_hash: "sha256:build".to_owned(),
+            catalog_hash: plan.catalog_hash.clone(),
+            credential_generation_id: "generation-a".to_owned(),
+            admission_policy_hash: "sha256:policy".to_owned(),
+            authority_hash: None,
+            workspace_graph_hash: "sha256:workspace".to_owned(),
+            resource_observation_hashes: std::collections::BTreeMap::default(),
+            cost_budget: None,
+        },
+    )
+    .expect("plan v2");
+    store.save_plan_v2(&plan_v2).expect("current plan stores");
+
+    let mut drifted = plan;
+    drifted.affected_resources.push("worker:other".to_owned());
+    drifted.transaction_journal.clear();
+    drifted.refresh_hash().expect("refresh drifted projection");
+    drifted
+        .record_transaction_stage(TransactionStageV1::PlanPrepared)
+        .expect("drifted journal");
+    store
+        .write_json(
+            &paths
+                .data_dir
+                .join("plans")
+                .join(format!("{}.json", drifted.operation_id)),
+            &drifted,
+        )
+        .expect("inject projection drift");
+
+    assert!(matches!(
+        store
+            .load_stored_plan_record(&drifted.operation_id)
+            .expect("record classifies"),
+        StoredPlanRecord::ProjectionDrift { .. }
+    ));
+    assert!(matches!(
+        store.load_plan(&drifted.operation_id),
+        Err(StorageError::PlanProjectionDrift(_))
+    ));
+}
+
+#[test]
+fn registered_roots_can_be_retired_after_the_workspace_disappears() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let workspace_parent = tempfile::tempdir().expect("workspace parent");
+    let workspace = workspace_parent.path().join("retired-workspace");
+    std::fs::create_dir(&workspace).expect("workspace root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    store
+        .register_workspace(&workspace, None)
+        .expect("register root");
+    let canonical = workspace.canonicalize().expect("canonical workspace");
+    std::fs::remove_dir(&workspace).expect("retire temporary workspace fixture");
+
+    let (removed_path, removed, account_pin_removed) = store
+        .unregister_workspace(&canonical)
+        .expect("unregister stale root");
+
+    assert_eq!(removed_path, canonical);
+    assert!(removed);
+    assert!(!account_pin_removed);
+    assert!(store.workspace_roots().expect("read roots").is_empty());
+    let (_, removed_again, _) = store
+        .unregister_workspace(&removed_path)
+        .expect("repeat removal is idempotent");
+    assert!(!removed_again);
 }
 
 #[test]

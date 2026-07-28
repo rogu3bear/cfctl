@@ -136,15 +136,103 @@ Wrangler authentication as an API or delegated-CLI credential lane.
 
 ```bash
 cfctl workspace add /absolute/root --account <account-id> --json
+cfctl workspace remove /absolute/root --json
 cfctl workspace discover --json
 cfctl workspace graph --json
 cfctl workspace audit --json
 ```
 
-Only registered roots are scanned. Nested `fixtures`, `__fixtures__`,
-`testdata`, `test-data`, and `test_data` directories are excluded from a
-broader root; register a fixture directory directly to opt it into discovery.
+Only registered roots are scanned. `workspace remove` retires a root and its
+account pin from future discovery without deleting historical graph or evidence
+records. Nested generated and cache paths (`var`, `cargo-home`, `.cache`,
+`coverage`, and `dist`) plus fixtures, dependency/build output, vendor, and
+nested repository metadata are excluded from a broader root; register an
+excluded directory directly to opt it into discovery.
 Fix account ambiguity or dirty overlap before planning writes.
+
+## Local registry
+
+```bash
+cfctl registry scopes discover --json
+cfctl registry sync --json
+cfctl registry status --json
+cfctl registry coverage --json
+cfctl registry diff --json
+```
+
+The SQLite registry uses WAL, foreign keys, versioned migrations, integrity
+checks, atomic backups, and per-resource locks. It is a rebuildable projection:
+the catalog remains capability authority, successful Cloudflare reads plus
+their evidence remain observed-state authority, and approved JSON declarations
+under `CFCTL_HOME/config/registry/declarations/` remain desired-state authority.
+Source configuration and events never become live observations. Partial or
+blocked provider coverage is reported as partial rather than complete.
+
+## Admission bundles and bounded token authority
+
+```bash
+cfctl policy admission stage --file ./bundle.json --json
+cfctl policy admission approve <bundle-id> --yes --json
+cfctl policy admission activate <bundle-id> --json
+cfctl keys policy create --account <account-id> --name-prefix <prefix> \
+  --permission <reviewed-group-id> --max-child-ttl-hours <hours> \
+  --max-runs-per-day <count> --json
+cfctl keys policy approve <authority-id> --yes --json
+```
+
+Bundle approval and activation are separate. The atomically selected active
+bundle may only tighten the compiled hard safety floor. `rollback` selects a
+previously approved bundle; it does not restore unapproved content. The only
+standing-authority exception is the bounded token lifecycle. Admission policy,
+event consumption, membership, ownership, billing, registrar, and arbitrary
+token mutation remain on ordinary plan and explicit-approval paths.
+
+New mutations persist a PlanV2 pin set beside the compatible PlanV1 body.
+Build, catalog, credential generation, active policy, authority, workspace,
+observation, and cost drift fail closed. Historical PlanV1 records remain
+readable, but pre-PlanV2 unconsumed mutations must be replanned.
+
+## Event ledger and reconciliation
+
+```bash
+cfctl events sources --json
+cfctl events status --json
+cfctl events history --limit 100 --json
+cfctl events bridge inspect --json
+cfctl events bridge prepare --json
+cfctl call events-consume-queue-batch \
+  --selector account_id=<account-id> --selector queue_id=<queue-id> \
+  --selector subscription_id=<subscription-or-webhook-id> \
+  --body-json '{"batch_size":100,"visibility_timeout_ms":60000}' --json
+cfctl plans approve <operation-id> --yes --max-cost USD:0.00016 --json
+cfctl plans run <operation-id> --json
+```
+
+`events-consume-queue-batch` is the only live Queue pull/ack adapter. Each
+batch receives an ordinary PlanV2 that binds the account, catalog hash,
+credential generation, queue, subscription, batch size, visibility timeout,
+workspace, active policy, observations, and cost ceiling. Queue JSON bodies
+are decoded from the documented base64 wire format; unknown content types and
+invalid provider signatures fail closed without acknowledgement.
+
+For every message, cfctl writes redacted EventReceipt evidence and atomically
+commits the event plus all derived reconciliation jobs before sending the
+Queue acknowledgement. A crash after commit causes safe redelivery and durable
+deduplication. Events may enqueue bounded live reads, but they never write the
+observed resource projection themselves. Periodic inventory remains required
+because Event Subscriptions and Audit Logs v2 are not complete state feeds.
+
+The inbound RealtimeKit verifier lives at `bridge/event-ingress` and uses the
+exact signed request bytes. It is Bun-only:
+
+```bash
+cd bridge/event-ingress
+bun install --frozen-lockfile
+bun run check
+```
+
+`events bridge prepare` stages a local manifest only. Worker, Queue, webhook,
+and Event Subscription deployment remain separate cataloged mutation plans.
 
 ## Reads
 
