@@ -744,33 +744,30 @@ where
         // primary value with stale data.
         fallback.put(key, value)?;
         checkpoint(CredentialWriteCheckpoint::FallbackJournalCommitted)?;
-        match primary.put(key, value) {
-            Ok(()) => {
-                checkpoint(CredentialWriteCheckpoint::PrimaryWriteCommitted)?;
-                match fallback.delete(key) {
-                    Ok(()) => {
-                        checkpoint(CredentialWriteCheckpoint::FallbackJournalCleared)?;
-                        Ok(())
-                    }
-                    Err(cleanup_error) => {
-                        checkpoint(CredentialWriteCheckpoint::FallbackJournalCleanupFailed)?;
-                        match fallback.get(key) {
-                            Ok(Some(journal)) if journal == value => Ok(()),
-                            Ok(None) => Ok(()),
-                            Ok(Some(_)) => Err(AuthError::SecretStore(format!(
-                                "primary secret store write succeeded, but fallback journal cleanup failed ({cleanup_error}) and recovery found a different fallback value; credential state is ambiguous and must be repaired before use"
-                            ))),
-                            Err(recovery_error) => Err(AuthError::SecretStore(format!(
-                                "primary secret store write succeeded, but fallback journal cleanup failed ({cleanup_error}) and recovery inspection failed ({recovery_error}); credential state is ambiguous and must be repaired before use"
-                            ))),
-                        }
+        if let Ok(()) = primary.put(key, value) {
+            checkpoint(CredentialWriteCheckpoint::PrimaryWriteCommitted)?;
+            match fallback.delete(key) {
+                Ok(()) => {
+                    checkpoint(CredentialWriteCheckpoint::FallbackJournalCleared)?;
+                    Ok(())
+                }
+                Err(cleanup_error) => {
+                    checkpoint(CredentialWriteCheckpoint::FallbackJournalCleanupFailed)?;
+                    match fallback.get(key) {
+                        Ok(Some(journal)) if journal == value => Ok(()),
+                        Ok(None) => Ok(()),
+                        Ok(Some(_)) => Err(AuthError::SecretStore(format!(
+                            "primary secret store write succeeded, but fallback journal cleanup failed ({cleanup_error}) and recovery found a different fallback value; credential state is ambiguous and must be repaired before use"
+                        ))),
+                        Err(recovery_error) => Err(AuthError::SecretStore(format!(
+                            "primary secret store write succeeded, but fallback journal cleanup failed ({cleanup_error}) and recovery inspection failed ({recovery_error}); credential state is ambiguous and must be repaired before use"
+                        ))),
                     }
                 }
             }
-            Err(_) => {
-                checkpoint(CredentialWriteCheckpoint::PrimaryWriteRejected)?;
-                Ok(())
-            }
+        } else {
+            checkpoint(CredentialWriteCheckpoint::PrimaryWriteRejected)?;
+            Ok(())
         }
     } else {
         match primary.put(key, value) {
