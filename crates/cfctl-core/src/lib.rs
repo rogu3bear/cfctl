@@ -6061,9 +6061,9 @@ fn redact_json_schema_inner(
                                 sensitive_instance_schema || is_sensitive_key(key),
                             ),
                         )
-                    } else if sensitive_instance_schema && is_json_schema_instance_annotation(key) {
-                        (key.clone(), Value::String("[REDACTED]".to_owned()))
-                    } else if is_sensitive_key(key) {
+                    } else if (sensitive_instance_schema && is_json_schema_instance_annotation(key))
+                        || is_sensitive_key(key)
+                    {
                         (key.clone(), Value::String("[REDACTED]".to_owned()))
                     } else {
                         (

@@ -882,7 +882,7 @@ fn recover_with_required_fresh_journal(
 ) -> Result<()> {
     match fallback.get(journal_key) {
         Ok(Some(journal)) if journal == value => Ok(()),
-        Ok(Some(_)) | Ok(None) => Err(AuthError::SecretStore(format!(
+        Ok(Some(_) | None) => Err(AuthError::SecretStore(format!(
             "primary secret store write succeeded, but {cleanup_target} cleanup failed ({cleanup_error}) and no matching fallback journal remains; credential state is ambiguous and must be repaired before use"
         ))),
         Err(recovery_error) => Err(AuthError::SecretStore(format!(
