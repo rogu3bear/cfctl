@@ -405,7 +405,9 @@ from wherever cfctl happened to be invoked. Both processes receive the
 plan-selected account ID and use cfctl's platform cache directory for Wrangler
 state; governed deploys never write account-selection cache files into a
 Worker's `node_modules`. Other delegated CLI capabilities keep their existing
-working directory.
+working directory. `cfctl doctor --json` projects this boundary under
+`result.delegated_cli_environment` so deploy wrappers can fail closed when an
+older cfctl build does not preserve it.
 
 Mint an account token only through the dedicated key workflow. The generic
 `account-api-tokens-update-token` and `user-api-tokens-update-token`
