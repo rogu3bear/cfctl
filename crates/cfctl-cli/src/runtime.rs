@@ -4708,7 +4708,23 @@ const OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION: &str = "oauth_client_key_overlap";
 const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str = "zone-subscription-zone-subscription-details";
 
-const ACCESS_APP_MUTABLE_FIELDS: [&str; 13] = [
+const ACCESS_APP_MUTABLE_FIELDS: [&str; 14] = [
+    "allowed_idps",
+    "app_launcher_visible",
+    "auto_redirect_to_identity",
+    "destinations",
+    "domain",
+    "enable_binding_cookie",
+    "http_only_cookie_attribute",
+    "name",
+    "options_preflight_bypass",
+    "policies",
+    "same_site_cookie_attribute",
+    "self_hosted_domains",
+    "session_duration",
+    "type",
+];
+const ACCESS_APP_REQUIRED_FIELDS: [&str; 13] = [
     "allowed_idps",
     "app_launcher_visible",
     "auto_redirect_to_identity",
@@ -4798,7 +4814,7 @@ fn access_application_login_methods_variant(
         ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID => Some(AccessApplicationLoginMethodsVariant {
             app_type: "self_hosted",
             mutable_fields: &ACCESS_APP_MUTABLE_FIELDS,
-            required_fields: &ACCESS_APP_MUTABLE_FIELDS,
+            required_fields: &ACCESS_APP_REQUIRED_FIELDS,
             read_only_fields: &ACCESS_APP_READ_ONLY_FIELDS,
         }),
         ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID => {
@@ -27954,6 +27970,7 @@ mod tests {
                 "precedence":1,
                 "updated_at":"2026-07-14T09:51:08Z"
             }],
+            "same_site_cookie_attribute":"lax",
             "self_hosted_domains":["investors.mlnavigator.com"],
             "session_duration":"24h",
             "tags":[],
@@ -28017,6 +28034,7 @@ mod tests {
         assert_eq!(body["auto_redirect_to_identity"], json!(false));
         assert_eq!(body["enable_binding_cookie"], json!(true));
         assert_eq!(body["domain"], json!("investors.mlnavigator.com"));
+        assert_eq!(body["same_site_cookie_attribute"], json!("lax"));
         assert!(body.get("id").is_none());
         assert!(body.get("aud").is_none());
         assert!(body.get("created_at").is_none());
@@ -28076,6 +28094,176 @@ mod tests {
         )
         .expect_err("unclassified app override must block");
         assert!(error.to_string().contains("mfa_config"));
+    }
+
+    fn access_application_login_methods_capability() -> CapabilityV1 {
+        let mut properties = json!({
+            "allowed_idps":{"type":"array","items":{"type":"string"}},
+            "app_launcher_visible":{"type":"boolean"},
+            "auto_redirect_to_identity":{"type":"boolean"},
+            "destinations":{"type":"array","items":{"type":"object"}},
+            "domain":{"type":"string"},
+            "enable_binding_cookie":{"type":"boolean"},
+            "http_only_cookie_attribute":{"type":"boolean"},
+            "name":{"type":"string"},
+            "options_preflight_bypass":{"type":"boolean"},
+            "policies":{"type":"array","items":{"type":"object"}},
+            "same_site_cookie_attribute":{"type":"string"},
+            "self_hosted_domains":{"type":"array","items":{"type":"string"}},
+            "session_duration":{"type":"string"},
+            "type":{"type":"string","enum":["self_hosted"]}
+        })
+        .as_object()
+        .cloned()
+        .expect("object properties");
+        properties.retain(|field, _| super::ACCESS_APP_MUTABLE_FIELDS.contains(&field.as_str()));
+        let required = super::ACCESS_APP_MUTABLE_FIELDS
+            .iter()
+            .filter(|field| **field != "same_site_cookie_attribute")
+            .copied()
+            .collect::<Vec<_>>();
+        let mut capability = CapabilityV1::new(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+            "Update self-hosted Access application login methods",
+            "PUT",
+            super::ACCESS_APP_DETAIL_PATH,
+        );
+        capability.product = "Access applications".to_owned();
+        capability.account_scope = "account".to_owned();
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.permissions = vec!["Access: Apps and Policies Write".to_owned()];
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::IdentityOrOwnership;
+        capability.cost.known = true;
+        capability.cost.maximum = Some(0.0);
+        capability.entitlement.available = Some(true);
+        capability.selectors = ["account_id", "app_id"]
+            .into_iter()
+            .map(|name| SelectorV1 {
+                name: name.to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            })
+            .collect();
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":required,
+            "properties":properties,
+            "x-cfctl-body-required":true
+        }));
+        capability.verification.required = true;
+        capability.verification.strategy =
+            "same_path_result_contains_planned_fields_after_update".to_owned();
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: super::ACCESS_APP_DETAIL_PATH.to_owned(),
+            read_capability_id: super::ACCESS_APP_READ_CAPABILITY_ID.to_owned(),
+            verified_response_fields: super::ACCESS_APP_MUTABLE_FIELDS
+                .iter()
+                .map(|field| (*field).to_owned())
+                .collect(),
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy =
+            Some(super::SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY.to_owned());
+        capability.rollback.warning =
+            Some("restoration requires a separate approved plan".to_owned());
+        capability
+    }
+
+    #[test]
+    fn access_application_same_site_cookie_round_trips_through_rollback() {
+        let capability = access_application_login_methods_capability();
+        assert!(
+            super::is_access_application_login_methods_mutation(&capability),
+            "gaps: {:?}",
+            capability.mutation_contract_gaps()
+        );
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut planned_source = access_application_live_result();
+        if !variant
+            .mutable_fields
+            .contains(&"same_site_cookie_attribute")
+        {
+            planned_source
+                .as_object_mut()
+                .expect("application object")
+                .remove("same_site_cookie_attribute");
+        }
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(
+                super::access_application_mutable_body(
+                    &planned_source,
+                    &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
+                    variant,
+                )
+                .expect("preservation-safe full PUT body"),
+            ),
+            ..CallInput::default()
+        };
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: access_application_live_result(),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let receipt = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &response,
+        )
+        .expect("exact prior-state receipt");
+        assert_eq!(
+            receipt["prior_state"]["same_site_cookie_attribute"],
+            json!("lax")
+        );
+
+        let receipt_hash = hash_value(&receipt).expect("receipt hash");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({
+                "selectors":input.selectors,
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{
+                    "same_path_prior_state":receipt
+                }
+            }),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(&input).expect("plan input");
+        plan.precondition_hashes.insert(
+            super::SAME_PATH_PRIOR_STATE_PRECONDITION.to_owned(),
+            receipt_hash,
+        );
+        let compensation =
+            super::same_path_prior_state_compensation_request(&plan).expect("restoration request");
+        assert_eq!(
+            compensation
+                .input
+                .body
+                .as_ref()
+                .and_then(|body| body.get("same_site_cookie_attribute")),
+            Some(&json!("lax"))
+        );
     }
 
     #[test]

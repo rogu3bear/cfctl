@@ -5215,6 +5215,7 @@ fn access_application_login_methods_fixture() -> serde_json::Value {
             "name":{"type":"string"},
             "options_preflight_bypass":{"type":"boolean"},
             "policies":{"type":"array","items":{"type":"object"}},
+            "same_site_cookie_attribute":{"type":"string"},
             "self_hosted_domains":{"type":"array","items":{"type":"string"}},
             "session_duration":{"type":"string"},
             "type":{"type":"string","enum":["self_hosted"]}
@@ -5242,6 +5243,7 @@ fn access_application_login_methods_fixture() -> serde_json::Value {
         "name":{"type":"string"},
         "options_preflight_bypass":{"type":"boolean"},
         "policies":{"type":"array","items":{"type":"object"}},
+        "same_site_cookie_attribute":{"type":"string"},
         "self_hosted_domains":{"type":"array","items":{"type":"string"}},
         "session_duration":{"type":"string"},
         "skip_app_launcher_login_page":{"type":"boolean"},
@@ -5335,6 +5337,7 @@ fn access_application_login_methods_update_is_full_snapshot_governed() {
             "name",
             "options_preflight_bypass",
             "policies",
+            "same_site_cookie_attribute",
             "self_hosted_domains",
             "session_duration",
             "type",
@@ -5347,6 +5350,19 @@ fn access_application_login_methods_update_is_full_snapshot_governed() {
             .and_then(|schema| schema.get("additionalProperties"))
             .and_then(serde_json::Value::as_bool),
         Some(false)
+    );
+    assert!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("required"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|required| {
+                required
+                    .iter()
+                    .all(|field| field.as_str() != Some("same_site_cookie_attribute"))
+            }),
+        "the cookie field is writable and verifiable when present, but optional on live self-hosted applications"
     );
     assert!(update.mutation_contract_gaps().is_empty());
 
@@ -5425,6 +5441,27 @@ fn access_application_login_methods_update_blocks_on_readback_schema_drift() {
             .blocked_reason
             .as_deref()
             .is_some_and(|reason| reason.starts_with("schema drift:"))
+    );
+}
+
+#[test]
+fn access_application_login_methods_update_blocks_when_cookie_readback_disappears() {
+    let mut fixture = access_application_login_methods_fixture();
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("result properties")
+        .remove("same_site_cookie_attribute");
+    let snapshot = normalize_openapi(&fixture).expect("drifted Access catalog");
+    let update = snapshot
+        .get("access-applications-update-self-hosted-login-methods")
+        .expect("derived login-method update");
+    assert_eq!(update.adapter_status, AdapterStatus::Blocked);
+    assert!(
+        update
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("same_site_cookie_attribute"))
     );
 }
 

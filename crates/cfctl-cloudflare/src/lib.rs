@@ -5181,6 +5181,44 @@ mod access_application_projection_tests {
             vec!["custom_deny_url"]
         );
     }
+
+    #[test]
+    fn self_hosted_cookie_readback_requires_exact_presence_and_value() {
+        let mut application = CapabilityV1::new(
+            "access-applications-update-self-hosted-login-methods",
+            "Update self-hosted Access application login methods",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}",
+        );
+        application.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{
+                "same_site_cookie_attribute":{"type":"string"}
+            }
+        }));
+        application.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+            path: application.path.clone(),
+            read_capability_id: "access-applications-get-an-access-application".to_owned(),
+            verified_response_fields: vec!["same_site_cookie_attribute".to_owned()],
+        });
+        let planned =
+            serde_json::Map::from_iter([("same_site_cookie_attribute".to_owned(), json!("lax"))]);
+        assert!(
+            super::mismatched_verifiable_planned_fields(
+                &application,
+                &planned,
+                &json!({"same_site_cookie_attribute":"lax"})
+            )
+            .is_empty()
+        );
+        for readback in [json!({}), json!({"same_site_cookie_attribute":"strict"})] {
+            assert_eq!(
+                super::mismatched_verifiable_planned_fields(&application, &planned, &readback),
+                vec!["same_site_cookie_attribute"]
+            );
+        }
+    }
 }
 
 fn verification_response_field(capability: &CapabilityV1, request_field: &str) -> Option<String> {

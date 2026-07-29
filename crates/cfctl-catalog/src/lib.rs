@@ -13370,6 +13370,7 @@ fn access_application_login_methods_schema() -> Value {
                     }
                 }
             },
+            "same_site_cookie_attribute":{"type":"string"},
             "self_hosted_domains":{
                 "type":"array",
                 "minItems":1,
