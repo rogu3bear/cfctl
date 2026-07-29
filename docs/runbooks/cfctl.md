@@ -401,8 +401,13 @@ evidence; never pass a secret through `var`. Both the deploy subprocess and the
 deployment-status verifier run from the reviewed config file's own directory,
 because Wrangler resolves dotenv credentials relative to its working directory
 — a plan reviewed against one config must not publish with a token discovered
-from wherever cfctl happened to be invoked. Other delegated CLI capabilities
-keep their existing working directory.
+from wherever cfctl happened to be invoked. Both processes receive the
+plan-selected account ID and use cfctl's platform cache directory for Wrangler
+state; governed deploys never write account-selection cache files into a
+Worker's `node_modules`. Other delegated CLI capabilities keep their existing
+working directory. `cfctl doctor --json` projects this boundary under
+`result.delegated_cli_environment` so deploy wrappers can fail closed when an
+older cfctl build does not preserve it.
 
 Mint an account token only through the dedicated key workflow. The generic
 `account-api-tokens-update-token` and `user-api-tokens-update-token`
