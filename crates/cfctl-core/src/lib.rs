@@ -6019,3 +6019,51 @@ fn is_sensitive_key(key: &str) -> bool {
     .iter()
     .any(|sensitive| normalized == *sensitive || normalized.ends_with(&format!("_{sensitive}")))
 }
+
+/// Redacts secret-bearing values inside catalog-owned JSON Schema metadata
+/// without mistaking schema property names for submitted secret values.
+///
+/// Keys beneath JSON Schema name maps such as `properties` and `$defs` are
+/// public contract labels. Their schema definitions are still traversed, and
+/// sensitive keys anywhere outside those name maps retain the ordinary
+/// [`redact_json`] behavior. This is deliberately separate from
+/// [`redact_json`]: runtime payloads must never opt into schema semantics.
+#[must_use]
+pub fn redact_json_schema(value: &Value) -> Value {
+    redact_json_schema_inner(value, false)
+}
+
+fn redact_json_schema_inner(value: &Value, schema_names: bool) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, item)| {
+                    if schema_names && matches!(item, Value::Object(_) | Value::Bool(_)) {
+                        (key.clone(), redact_json_schema_inner(item, false))
+                    } else if is_sensitive_key(key) {
+                        (key.clone(), Value::String("[REDACTED]".to_owned()))
+                    } else {
+                        (
+                            key.clone(),
+                            redact_json_schema_inner(item, is_json_schema_name_map(key)),
+                        )
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_json_schema_inner(item, false))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn is_json_schema_name_map(key: &str) -> bool {
+    matches!(
+        key,
+        "properties" | "patternProperties" | "dependentSchemas" | "definitions" | "$defs"
+    )
+}
