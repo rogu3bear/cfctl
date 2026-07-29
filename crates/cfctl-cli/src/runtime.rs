@@ -998,6 +998,7 @@ async fn catalog_command(store: &StateStore, command: CatalogCommand) -> Result<
                 .search(&arguments.query)
                 .into_iter()
                 .take(arguments.limit)
+                .map(caller_facing_capability)
                 .collect();
             Ok(ResultEnvelopeV2::success(
                 "catalog search",
@@ -16743,11 +16744,11 @@ fn stage_required(stage: cfctl_core::GuideStage, capability: &cfctl_core::Capabi
 }
 
 fn guide_document(capability: &CapabilityV1) -> CapabilityGuideV1 {
-    let capability = caller_facing_capability(capability);
     let blocking_gaps = capability.mutation_contract_gaps();
-    let post_resolution_call_argv = capability_call_argv(&capability);
     let contract_ready =
         capability.adapter_status != AdapterStatus::Blocked && blocking_gaps.is_empty();
+    let capability = caller_facing_capability(capability);
+    let post_resolution_call_argv = capability_call_argv(&capability);
     let call_argv = contract_ready.then(|| post_resolution_call_argv.clone());
     let stages = guide_stages()
         .iter()
@@ -18608,8 +18609,8 @@ mod tests {
     };
     use crate::profiles::ProfilesConfig;
     use crate::{
-        CallArgs, KeyMutationArgs, KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicySelector,
-        PlanApproveArgs, PlanSelector,
+        CallArgs, CapabilitySelector, CatalogCommand, KeyMutationArgs, KeyPermissionArgs,
+        KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs, PlanSelector, SearchArgs,
     };
     use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
@@ -29355,6 +29356,103 @@ mod tests {
         capability.rollback.warning =
             Some("restoration requires a separate approved plan".to_owned());
         capability
+    }
+
+    #[test]
+    fn access_human_policy_guide_readiness_uses_canonical_executable_contract() {
+        let capability = access_human_policy_capability();
+        assert!(
+            capability.mutation_contract_gaps().is_empty(),
+            "positive control requires an executable canonical human-policy contract"
+        );
+
+        let guide = guide_json(&capability);
+        assert_eq!(
+            guide["capability"]["request_schema"],
+            super::access_human_policy_desired_schema(),
+            "guide presentation must expose the caller-facing desired-state schema"
+        );
+        assert_eq!(
+            guide["contract_state"], "available",
+            "an executable human-policy operation must remain guide-ready: {:?}",
+            guide["blocking_gaps"]
+        );
+        assert_eq!(guide["blocking_gaps"], json!([]));
+        assert!(
+            guide["call_argv"].as_array().is_some(),
+            "an available human-policy guide must expose its governed call"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_search_exposes_same_access_caller_schema_as_show_and_call() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = access_human_policy_capability();
+        let capability_id = capability.id.clone();
+        let expected_schema = super::access_human_policy_desired_schema();
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "https://example.invalid/openapi.json".to_owned(),
+            source_hash: "source-sha".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability_id.clone(), capability.clone())]),
+        };
+        catalog.refresh_hash().expect("catalog hash");
+        store
+            .write_json(&store.paths().catalog_file(), &catalog)
+            .expect("current catalog");
+
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+                "policy_id":"45e44306-0e2a-460a-94aa-34c21eefdb4a"
+            }),
+            body: Some(json!({
+                "mfa_config":{
+                    "allowed_authenticators":["biometrics","totp"],
+                    "mfa_disabled":false
+                }
+            })),
+            ..CallInput::default()
+        };
+        super::validate_access_human_policy_desired_input(&capability, &input)
+            .expect("the real call branch accepts the caller-facing body");
+
+        let shown = super::catalog_command(
+            &store,
+            CatalogCommand::Show(CapabilitySelector {
+                capability_id: capability_id.clone(),
+            }),
+        )
+        .await
+        .expect("catalog show");
+        assert_eq!(
+            shown.result["request_schema"], expected_schema,
+            "catalog show positive control must expose the caller-facing schema"
+        );
+
+        let searched = super::catalog_command(
+            &store,
+            CatalogCommand::Search(SearchArgs {
+                query: capability_id.clone(),
+                limit: 1,
+            }),
+        )
+        .await
+        .expect("catalog search");
+        let result = searched
+            .result
+            .as_array()
+            .and_then(|results| results.first())
+            .filter(|result| result.get("id").and_then(Value::as_str) == Some(&capability_id))
+            .expect("catalog search returns the human-policy capability");
+        assert_eq!(
+            result["request_schema"], shown.result["request_schema"],
+            "catalog search must expose the same caller-facing schema as show and call"
+        );
     }
 
     #[test]
