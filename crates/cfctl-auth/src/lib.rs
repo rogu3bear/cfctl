@@ -781,6 +781,24 @@ where
         match primary.put(key, value) {
             Ok(()) => {
                 checkpoint(CredentialWriteCheckpoint::PrimaryWriteCommitted)?;
+                if fallback.get(journal_key.as_str())?.is_some() {
+                    fallback.put(journal_key.as_str(), value)?;
+                    checkpoint(CredentialWriteCheckpoint::FallbackJournalCommitted)?;
+                    match fallback.delete(journal_key.as_str()) {
+                        Ok(()) => {
+                            checkpoint(CredentialWriteCheckpoint::FallbackJournalCleared)?;
+                        }
+                        Err(cleanup_error) => {
+                            checkpoint(CredentialWriteCheckpoint::FallbackJournalCleanupFailed)?;
+                            recover_after_journal_cleanup_failure(
+                                fallback,
+                                journal_key.as_str(),
+                                value,
+                                &cleanup_error,
+                            )?;
+                        }
+                    }
+                }
                 Ok(())
             }
             Err(primary_error) => {
@@ -1287,6 +1305,44 @@ mod tests {
                 .get(fallback_journal_key("k").as_str())
                 .expect("journal"),
             None
+        );
+    }
+
+    #[test]
+    fn concurrent_successful_primary_write_does_not_leave_older_journal_authoritative() {
+        let primary = MemorySecretStore::default();
+        let fallback = MemorySecretStore::default();
+        let mut concurrent_write_injected = false;
+
+        chained_put_with_checkpoint(&primary, &fallback, "k", "newer", |checkpoint| {
+            if checkpoint == CredentialWriteCheckpoint::FallbackInspected
+                && !concurrent_write_injected
+            {
+                concurrent_write_injected = true;
+                chained_put(&RejectingSecretStore, &fallback, "k", "older")
+                    .expect("concurrent keyring rejection commits its fallback journal");
+                assert_eq!(
+                    fallback
+                        .get(fallback_journal_key("k").as_str())
+                        .expect("concurrent journal"),
+                    Some("older".to_owned()),
+                    "the simulated concurrent write must cross after clean-path inspection"
+                );
+            }
+            Ok(())
+        })
+        .expect("newer primary write");
+
+        assert!(concurrent_write_injected);
+        assert_eq!(
+            primary.get("k").expect("primary"),
+            Some("newer".to_owned()),
+            "the newer primary write must cross successfully"
+        );
+        assert_eq!(
+            chained_get(&primary, &fallback, "k").expect("recovered credential"),
+            Some("newer".to_owned()),
+            "an older journal created after clean-path inspection must not remain authoritative"
         );
     }
 
