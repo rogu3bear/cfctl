@@ -559,6 +559,7 @@ fn plan_v2_storage_preserves_secret_named_request_schema_properties() {
         "type": "object",
         "properties": {
             "name": {"type": "string"},
+            "enable_binding_cookie": {"type": "boolean"},
             "scim_config": {
                 "type": "object",
                 "properties": {
@@ -589,7 +590,7 @@ fn plan_v2_storage_preserves_secret_named_request_schema_properties() {
         "required": ["name"],
         "x-cfctl-body-required": true
     }));
-    let plan = PlanV1::draft(
+    let mut plan = PlanV1::draft(
         "minter",
         "account-a",
         "sha256:catalog",
@@ -597,6 +598,14 @@ fn plan_v2_storage_preserves_secret_named_request_schema_properties() {
         json!({"account_id":"account-a"}),
     )
     .expect("plan");
+    plan.input = json!({
+        "selectors": {"account_id": "account-a"},
+        "body": {
+            "name": "Advisor",
+            "enable_binding_cookie": true
+        }
+    });
+    plan.refresh_hash().expect("refresh plan hash");
     let plan_v2 = pinned_plan_v2(plan.clone());
 
     store
@@ -610,6 +619,7 @@ fn plan_v2_storage_preserves_secret_named_request_schema_properties() {
         loaded.plan.capability.request_schema,
         plan.capability.request_schema
     );
+    assert_eq!(loaded.plan.input, plan.input);
 }
 
 #[test]
