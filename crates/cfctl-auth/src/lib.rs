@@ -632,12 +632,13 @@ impl SecretStore for FileSecretStore {
 /// Platform keyring preferred for writes, with a durable file fallback so a
 /// broken keyring (for example `errSecAuthFailed` from a desynchronized login
 /// keychain) degrades to governed mode-0600 files instead of blocking
-/// credential import. A present fallback wins on reads. When one already
-/// exists, replacement first atomically stages the fresh value there as a
-/// write-ahead journal, then replaces the keyring value, then clears the
-/// journal. A process crash at any completed boundary therefore exposes one
-/// complete old or new value, never a newly written keyring value shadowed by
-/// a stale fallback.
+/// credential import. A reserved fallback sidecar is the only state treated
+/// as an in-flight write-ahead journal. Unequal raw primary/fallback values
+/// from the legacy protocol are ambiguous and fail closed. When fallback state
+/// already exists, replacement first atomically stages the fresh value in the
+/// sidecar, then replaces the keyring value, then clears the legacy fallback
+/// and sidecar. A process crash at any completed boundary therefore exposes
+/// one complete old or new value without guessing which legacy copy is newer.
 /// `cfctl doctor` reports which backend is active.
 #[derive(Debug, Clone)]
 pub struct PlatformSecretStore {
@@ -699,10 +700,7 @@ impl SecretStore for PlatformSecretStore {
     }
 
     fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
-        if self.fallback.locate(key)?.is_some() {
-            return Ok(Some(SecretBackend::FallbackFile));
-        }
-        self.keyring.locate(key)
+        chained_locate(&self.keyring, &self.fallback, key)
     }
 }
 
@@ -721,6 +719,8 @@ enum CredentialWriteCheckpoint {
     FallbackJournalCommitted,
     PrimaryWriteCommitted,
     PrimaryWriteRejected,
+    LegacyFallbackCleared,
+    LegacyFallbackCleanupFailed,
     FallbackJournalCleared,
     FallbackJournalCleanupFailed,
 }
@@ -735,34 +735,42 @@ fn chained_put_with_checkpoint<F>(
 where
     F: FnMut(CredentialWriteCheckpoint) -> Result<()>,
 {
-    let fallback_exists = fallback.get(key)?.is_some();
+    let journal_key = fallback_journal_key(key);
+    let fallback_exists =
+        fallback.get(key)?.is_some() || fallback.get(journal_key.as_str())?.is_some();
     checkpoint(CredentialWriteCheckpoint::FallbackInspected)?;
 
     if fallback_exists {
-        // The fallback is authoritative while present. Replace it atomically
-        // before crossing the primary boundary so it can never shadow a newer
-        // primary value with stale data.
-        fallback.put(key, value)?;
+        // The reserved sidecar distinguishes a current write-ahead journal
+        // from an untyped legacy fallback whose freshness is unknowable.
+        fallback.put(journal_key.as_str(), value)?;
         checkpoint(CredentialWriteCheckpoint::FallbackJournalCommitted)?;
         if let Ok(()) = primary.put(key, value) {
             checkpoint(CredentialWriteCheckpoint::PrimaryWriteCommitted)?;
-            match fallback.delete(key) {
+            if let Err(cleanup_error) = fallback.delete(key) {
+                checkpoint(CredentialWriteCheckpoint::LegacyFallbackCleanupFailed)?;
+                return recover_with_required_fresh_journal(
+                    fallback,
+                    journal_key.as_str(),
+                    value,
+                    "legacy fallback",
+                    &cleanup_error,
+                );
+            }
+            checkpoint(CredentialWriteCheckpoint::LegacyFallbackCleared)?;
+            match fallback.delete(journal_key.as_str()) {
                 Ok(()) => {
                     checkpoint(CredentialWriteCheckpoint::FallbackJournalCleared)?;
                     Ok(())
                 }
                 Err(cleanup_error) => {
                     checkpoint(CredentialWriteCheckpoint::FallbackJournalCleanupFailed)?;
-                    match fallback.get(key) {
-                        Ok(Some(journal)) if journal == value => Ok(()),
-                        Ok(None) => Ok(()),
-                        Ok(Some(_)) => Err(AuthError::SecretStore(format!(
-                            "primary secret store write succeeded, but fallback journal cleanup failed ({cleanup_error}) and recovery found a different fallback value; credential state is ambiguous and must be repaired before use"
-                        ))),
-                        Err(recovery_error) => Err(AuthError::SecretStore(format!(
-                            "primary secret store write succeeded, but fallback journal cleanup failed ({cleanup_error}) and recovery inspection failed ({recovery_error}); credential state is ambiguous and must be repaired before use"
-                        ))),
-                    }
+                    recover_after_journal_cleanup_failure(
+                        fallback,
+                        journal_key.as_str(),
+                        value,
+                        &cleanup_error,
+                    )
                 }
             }
         } else {
@@ -777,7 +785,9 @@ where
             }
             Err(primary_error) => {
                 checkpoint(CredentialWriteCheckpoint::PrimaryWriteRejected)?;
-                fallback.put(key, value).map_err(|fallback_error| {
+                fallback
+                    .put(journal_key.as_str(), value)
+                    .map_err(|fallback_error| {
                     AuthError::SecretStore(format!(
                         "primary secret store write failed ({primary_error}); fallback write also failed ({fallback_error})"
                     ))
@@ -793,17 +803,110 @@ fn chained_get(
     fallback: &dyn SecretStore,
     key: &str,
 ) -> Result<Option<String>> {
-    match fallback.get(key)? {
-        Some(value) => Ok(Some(value)),
-        None => primary.get(key),
+    match resolve_chained_credential(primary, fallback, key)? {
+        ResolvedChainedCredential::Fallback(value) | ResolvedChainedCredential::Primary(value) => {
+            Ok(Some(value))
+        }
+        ResolvedChainedCredential::Missing => Ok(None),
     }
 }
 
 fn chained_delete(primary: &dyn SecretStore, fallback: &dyn SecretStore, key: &str) -> Result<()> {
     let primary_result = primary.delete(key);
     let fallback_result = fallback.delete(key);
+    let journal_result = fallback.delete(fallback_journal_key(key).as_str());
     primary_result?;
-    fallback_result
+    fallback_result?;
+    journal_result
+}
+
+fn chained_locate(
+    primary: &dyn SecretStore,
+    fallback: &dyn SecretStore,
+    key: &str,
+) -> Result<Option<SecretBackend>> {
+    match resolve_chained_credential(primary, fallback, key)? {
+        ResolvedChainedCredential::Fallback(_) => Ok(Some(SecretBackend::FallbackFile)),
+        ResolvedChainedCredential::Primary(_) => primary.locate(key),
+        ResolvedChainedCredential::Missing => Ok(None),
+    }
+}
+
+enum ResolvedChainedCredential {
+    Fallback(String),
+    Primary(String),
+    Missing,
+}
+
+fn resolve_chained_credential(
+    primary: &dyn SecretStore,
+    fallback: &dyn SecretStore,
+    key: &str,
+) -> Result<ResolvedChainedCredential> {
+    if let Some(journal) = fallback.get(fallback_journal_key(key).as_str())? {
+        return Ok(ResolvedChainedCredential::Fallback(journal));
+    }
+    let fallback_value = fallback.get(key)?;
+    match (fallback_value, primary.get(key)) {
+        (Some(fallback_value), Ok(Some(primary_value))) if primary_value == fallback_value => {
+            Ok(ResolvedChainedCredential::Fallback(fallback_value))
+        }
+        (Some(_), Ok(Some(_))) => Err(AuthError::SecretStore(
+            "primary and fallback credential values differ without a current cfctl journal; credential state is ambiguous and must be repaired by re-importing the credential"
+                .to_owned(),
+        )),
+        (Some(fallback_value), Ok(None) | Err(_)) => {
+            Ok(ResolvedChainedCredential::Fallback(fallback_value))
+        }
+        (None, Ok(Some(primary_value))) => Ok(ResolvedChainedCredential::Primary(primary_value)),
+        (None, Ok(None)) => Ok(ResolvedChainedCredential::Missing),
+        (None, Err(error)) => Err(error),
+    }
+}
+
+const FALLBACK_JOURNAL_KEY_PREFIX: &str = "__cfctl_internal__/credential-journal/v1/";
+
+fn fallback_journal_key(key: &str) -> String {
+    format!(
+        "{FALLBACK_JOURNAL_KEY_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(key.as_bytes())
+    )
+}
+
+fn recover_with_required_fresh_journal(
+    fallback: &dyn SecretStore,
+    journal_key: &str,
+    value: &str,
+    cleanup_target: &str,
+    cleanup_error: &AuthError,
+) -> Result<()> {
+    match fallback.get(journal_key) {
+        Ok(Some(journal)) if journal == value => Ok(()),
+        Ok(Some(_)) | Ok(None) => Err(AuthError::SecretStore(format!(
+            "primary secret store write succeeded, but {cleanup_target} cleanup failed ({cleanup_error}) and no matching fallback journal remains; credential state is ambiguous and must be repaired before use"
+        ))),
+        Err(recovery_error) => Err(AuthError::SecretStore(format!(
+            "primary secret store write succeeded, but {cleanup_target} cleanup failed ({cleanup_error}) and recovery inspection failed ({recovery_error}); credential state is ambiguous and must be repaired before use"
+        ))),
+    }
+}
+
+fn recover_after_journal_cleanup_failure(
+    fallback: &dyn SecretStore,
+    journal_key: &str,
+    value: &str,
+    cleanup_error: &AuthError,
+) -> Result<()> {
+    match fallback.get(journal_key) {
+        Ok(Some(journal)) if journal == value => Ok(()),
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err(AuthError::SecretStore(format!(
+            "primary secret store write succeeded, but fallback journal cleanup failed ({cleanup_error}) and recovery found a different journal value; credential state is ambiguous and must be repaired before use"
+        ))),
+        Err(recovery_error) => Err(AuthError::SecretStore(format!(
+            "primary secret store write succeeded, but fallback journal cleanup failed ({cleanup_error}) and recovery inspection failed ({recovery_error}); credential state is ambiguous and must be repaired before use"
+        ))),
+    }
 }
 
 fn secret_file_name(key: &str) -> String {
@@ -992,6 +1095,63 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct JournalDeleteRejectingSecretStore {
+        inner: MemorySecretStore,
+    }
+
+    impl SecretStore for JournalDeleteRejectingSecretStore {
+        fn put(&self, key: &str, value: &str) -> Result<()> {
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.inner.get(key)
+        }
+
+        fn delete(&self, key: &str) -> Result<()> {
+            if key.starts_with(FALLBACK_JOURNAL_KEY_PREFIX) {
+                return Err(AuthError::SecretStore(
+                    "fallback journal delete rejected".to_owned(),
+                ));
+            }
+            self.inner.delete(key)
+        }
+
+        fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
+            self.inner.locate(key)
+        }
+    }
+
+    #[derive(Default)]
+    struct JournalDeleteAfterCommitRejectingSecretStore {
+        inner: MemorySecretStore,
+    }
+
+    impl SecretStore for JournalDeleteAfterCommitRejectingSecretStore {
+        fn put(&self, key: &str, value: &str) -> Result<()> {
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.inner.get(key)
+        }
+
+        fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key)?;
+            if key.starts_with(FALLBACK_JOURNAL_KEY_PREFIX) {
+                return Err(AuthError::SecretStore(
+                    "fallback journal delete crossed before reporting failure".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
+            self.inner.locate(key)
+        }
+    }
+
+    #[derive(Default)]
     struct PutRejectingMemorySecretStore {
         inner: MemorySecretStore,
     }
@@ -1023,7 +1183,12 @@ mod tests {
 
     impl SecretStore for JournalCheckingPrimary<'_> {
         fn put(&self, key: &str, value: &str) -> Result<()> {
-            if self.fallback.get(key)?.as_deref() != Some(value) {
+            if self
+                .fallback
+                .get(fallback_journal_key(key).as_str())?
+                .as_deref()
+                != Some(value)
+            {
                 return Err(AuthError::SecretStore(
                     "primary write crossed before the fresh fallback journal".to_owned(),
                 ));
@@ -1054,6 +1219,12 @@ mod tests {
 
         assert_eq!(primary.get("k").expect("primary"), Some("fresh".to_owned()));
         assert_eq!(fallback.get("k").expect("fallback"), None);
+        assert_eq!(
+            fallback
+                .get(fallback_journal_key("k").as_str())
+                .expect("journal"),
+            None
+        );
     }
 
     #[test]
@@ -1065,6 +1236,12 @@ mod tests {
 
         assert_eq!(primary.get("k").expect("primary"), Some("fresh".to_owned()));
         assert_eq!(fallback.get("k").expect("fallback"), None);
+        assert_eq!(
+            fallback
+                .get(fallback_journal_key("k").as_str())
+                .expect("journal"),
+            None
+        );
     }
 
     #[test]
@@ -1073,10 +1250,29 @@ mod tests {
 
         chained_put(&RejectingSecretStore, &fallback, "k", "v").expect("fallback put");
 
-        assert_eq!(fallback.get("k").expect("fallback"), Some("v".to_owned()));
+        assert_eq!(fallback.get("k").expect("legacy fallback"), None);
+        assert_eq!(
+            fallback
+                .get(fallback_journal_key("k").as_str())
+                .expect("journal"),
+            Some("v".to_owned())
+        );
         assert_eq!(
             chained_get(&RejectingSecretStore, &fallback, "k").expect("fallback read"),
             Some("v".to_owned())
+        );
+    }
+
+    #[test]
+    fn chained_get_accepts_legacy_fallback_only_when_primary_is_unavailable() {
+        let fallback = MemorySecretStore::default();
+        fallback
+            .put("k", "legacy-fallback")
+            .expect("seed legacy fallback");
+
+        assert_eq!(
+            chained_get(&RejectingSecretStore, &fallback, "k").expect("fallback-only legacy state"),
+            Some("legacy-fallback".to_owned())
         );
     }
 
@@ -1107,6 +1303,12 @@ mod tests {
         assert_eq!(primary.get("k").expect("primary"), Some("fresh".to_owned()));
         assert_eq!(
             fallback.get("k").expect("fallback"),
+            Some("stale".to_owned())
+        );
+        assert_eq!(
+            fallback
+                .get(fallback_journal_key("k").as_str())
+                .expect("journal"),
             Some("fresh".to_owned())
         );
         assert_eq!(
@@ -1131,6 +1333,45 @@ mod tests {
             Some("fresh".to_owned())
         );
         assert_eq!(fallback.get("k").expect("fallback read"), None);
+        assert_eq!(
+            fallback
+                .get(fallback_journal_key("k").as_str())
+                .expect("journal read"),
+            Some("fresh".to_owned())
+        );
+        assert_eq!(
+            chained_get(&primary, &fallback, "k").expect("journal recovery"),
+            Some("fresh".to_owned())
+        );
+    }
+
+    #[test]
+    fn chained_put_recovers_across_journal_delete_failure_before_or_after_commit() {
+        let primary = MemorySecretStore::default();
+        let retained = JournalDeleteRejectingSecretStore::default();
+        retained.put("k", "old").expect("seed fallback");
+        chained_put(&primary, &retained, "k", "fresh")
+            .expect("retained fresh journal remains authoritative");
+        assert_eq!(
+            chained_get(&primary, &retained, "k").expect("retained journal"),
+            Some("fresh".to_owned())
+        );
+
+        let primary = MemorySecretStore::default();
+        let crossed = JournalDeleteAfterCommitRejectingSecretStore::default();
+        crossed.put("k", "old").expect("seed fallback");
+        chained_put(&primary, &crossed, "k", "fresh")
+            .expect("fresh primary survives crossed journal cleanup");
+        assert_eq!(
+            crossed
+                .get(fallback_journal_key("k").as_str())
+                .expect("journal"),
+            None
+        );
+        assert_eq!(
+            chained_get(&primary, &crossed, "k").expect("primary recovery"),
+            Some("fresh".to_owned())
+        );
     }
 
     #[test]
@@ -1164,6 +1405,7 @@ mod tests {
         fallback: &dyn SecretStore,
         checkpoint: CredentialWriteCheckpoint,
         expected: &str,
+        expected_journal: Option<&str>,
     ) {
         let error =
             chained_put_with_checkpoint(primary, fallback, "k", "fresh", crash_at(checkpoint))
@@ -1174,21 +1416,45 @@ mod tests {
             Some(expected.to_owned()),
             "unexpected recovery at {checkpoint:?}"
         );
+        assert_eq!(
+            fallback
+                .get(fallback_journal_key("k").as_str())
+                .expect("journal state"),
+            expected_journal.map(str::to_owned),
+            "unexpected sidecar journal state at {checkpoint:?}"
+        );
     }
 
     #[test]
     fn chained_put_recovers_one_complete_old_or_new_value_at_every_crash_boundary() {
-        for (checkpoint, expected) in [
-            (CredentialWriteCheckpoint::FallbackInspected, "old"),
-            (CredentialWriteCheckpoint::FallbackJournalCommitted, "fresh"),
-            (CredentialWriteCheckpoint::PrimaryWriteCommitted, "fresh"),
-            (CredentialWriteCheckpoint::FallbackJournalCleared, "fresh"),
+        for (checkpoint, expected, expected_journal) in [
+            (CredentialWriteCheckpoint::FallbackInspected, "old", None),
+            (
+                CredentialWriteCheckpoint::FallbackJournalCommitted,
+                "fresh",
+                Some("fresh"),
+            ),
+            (
+                CredentialWriteCheckpoint::PrimaryWriteCommitted,
+                "fresh",
+                Some("fresh"),
+            ),
+            (
+                CredentialWriteCheckpoint::LegacyFallbackCleared,
+                "fresh",
+                Some("fresh"),
+            ),
+            (
+                CredentialWriteCheckpoint::FallbackJournalCleared,
+                "fresh",
+                None,
+            ),
         ] {
             let primary = MemorySecretStore::default();
             let fallback = MemorySecretStore::default();
             primary.put("k", "old").expect("seed primary");
             fallback.put("k", "old").expect("seed fallback");
-            assert_crash_recovers(&primary, &fallback, checkpoint, expected);
+            assert_crash_recovers(&primary, &fallback, checkpoint, expected, expected_journal);
         }
 
         let primary = MemorySecretStore::default();
@@ -1198,19 +1464,36 @@ mod tests {
         assert_crash_recovers(
             &primary,
             &fallback,
-            CredentialWriteCheckpoint::FallbackJournalCleanupFailed,
+            CredentialWriteCheckpoint::LegacyFallbackCleanupFailed,
             "fresh",
+            Some("fresh"),
         );
 
-        for (checkpoint, expected) in [
-            (CredentialWriteCheckpoint::FallbackInspected, "old"),
-            (CredentialWriteCheckpoint::PrimaryWriteRejected, "old"),
-            (CredentialWriteCheckpoint::FallbackJournalCommitted, "fresh"),
+        let primary = MemorySecretStore::default();
+        let fallback = JournalDeleteRejectingSecretStore::default();
+        primary.put("k", "old").expect("seed primary");
+        fallback.put("k", "old").expect("seed fallback");
+        assert_crash_recovers(
+            &primary,
+            &fallback,
+            CredentialWriteCheckpoint::FallbackJournalCleanupFailed,
+            "fresh",
+            Some("fresh"),
+        );
+
+        for (checkpoint, expected, expected_journal) in [
+            (CredentialWriteCheckpoint::FallbackInspected, "old", None),
+            (CredentialWriteCheckpoint::PrimaryWriteRejected, "old", None),
+            (
+                CredentialWriteCheckpoint::FallbackJournalCommitted,
+                "fresh",
+                Some("fresh"),
+            ),
         ] {
             let primary = PutRejectingMemorySecretStore::default();
             let fallback = MemorySecretStore::default();
             primary.inner.put("k", "old").expect("seed primary");
-            assert_crash_recovers(&primary, &fallback, checkpoint, expected);
+            assert_crash_recovers(&primary, &fallback, checkpoint, expected, expected_journal);
         }
 
         let primary = MemorySecretStore::default();
@@ -1221,6 +1504,7 @@ mod tests {
             &fallback,
             CredentialWriteCheckpoint::PrimaryWriteCommitted,
             "fresh",
+            None,
         );
 
         let primary = PutRejectingMemorySecretStore::default();
@@ -1232,15 +1516,18 @@ mod tests {
             &fallback,
             CredentialWriteCheckpoint::PrimaryWriteRejected,
             "fresh",
+            Some("fresh"),
         );
     }
 
     #[test]
-    fn chained_get_prefers_newer_fallback_and_surfaces_primary_error_on_double_miss() {
+    fn chained_get_trusts_explicit_journal_and_surfaces_primary_error_on_double_miss() {
         let primary = MemorySecretStore::default();
         let fallback = MemorySecretStore::default();
         primary.put("k", "primary-value").expect("seed primary");
-        fallback.put("k", "fallback-value").expect("seed fallback");
+        fallback
+            .put(fallback_journal_key("k").as_str(), "fallback-value")
+            .expect("seed explicit journal");
 
         assert_eq!(
             chained_get(&primary, &fallback, "k").expect("fallback wins"),
@@ -1252,14 +1539,75 @@ mod tests {
     }
 
     #[test]
+    fn chained_get_fails_closed_on_ambiguous_legacy_dual_store_credentials() {
+        let primary = MemorySecretStore::default();
+        let fallback = MemorySecretStore::default();
+        primary.put("k", "primary-value").expect("seed primary");
+        fallback.put("k", "fallback-value").expect("seed fallback");
+
+        let error = chained_get(&primary, &fallback, "k")
+            .expect_err("unequal legacy credentials must not select a generation");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(!message.contains("primary-value"), "{message}");
+        assert!(!message.contains("fallback-value"), "{message}");
+
+        fallback
+            .put("k", "primary-value")
+            .expect("equalize legacy fallback");
+        assert_eq!(
+            chained_get(&primary, &fallback, "k").expect("equal dual values are safe"),
+            Some("primary-value".to_owned())
+        );
+    }
+
+    #[test]
+    fn chained_locate_fails_closed_on_ambiguous_legacy_dual_store_credentials() {
+        let primary = MemorySecretStore::default();
+        let fallback = MemorySecretStore::default();
+        primary.put("k", "primary-value").expect("seed primary");
+        fallback.put("k", "fallback-value").expect("seed fallback");
+
+        let error = chained_locate(&primary, &fallback, "k")
+            .expect_err("ambiguous credentials must not report a healthy backend");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(!message.contains("primary-value"), "{message}");
+        assert!(!message.contains("fallback-value"), "{message}");
+    }
+
+    #[test]
     fn chained_delete_still_clears_the_fallback_when_primary_fails() {
         let fallback = MemorySecretStore::default();
         fallback.put("k", "v").expect("seed fallback");
+        fallback
+            .put(fallback_journal_key("k").as_str(), "journal")
+            .expect("seed journal");
 
         let error = chained_delete(&RejectingSecretStore, &fallback, "k")
             .expect_err("primary delete failure surfaces");
         assert!(error.to_string().contains("rejected the delete"));
         assert_eq!(fallback.get("k").expect("fallback"), None);
+        assert_eq!(
+            fallback
+                .get(fallback_journal_key("k").as_str())
+                .expect("journal"),
+            None
+        );
+    }
+
+    #[test]
+    fn chained_locate_reports_an_explicit_journal_as_fallback_state() {
+        let primary = MemorySecretStore::default();
+        let fallback = MemorySecretStore::default();
+        fallback
+            .put(fallback_journal_key("k").as_str(), "fresh")
+            .expect("seed journal");
+
+        assert_eq!(
+            chained_locate(&primary, &fallback, "k").expect("locate"),
+            Some(SecretBackend::FallbackFile)
+        );
     }
 
     #[test]
@@ -1418,6 +1766,9 @@ mod tests {
     fn chained_fallback_journal_preserves_private_file_permissions() {
         let root = tempfile::tempdir().expect("tempdir");
         let fallback = FileSecretStore::new(root.path().join("secrets"));
+        fallback
+            .put("profile/default/api-token", "old")
+            .expect("seed legacy fallback");
 
         chained_put(
             &RejectingSecretStore,
@@ -1432,14 +1783,23 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(dir_mode & 0o777, 0o700, "journal root must be 0700");
-        let path = fallback
-            .root()
-            .join(secret_file_name("profile/default/api-token"));
+        let path = fallback.root().join(secret_file_name(
+            fallback_journal_key("profile/default/api-token").as_str(),
+        ));
         let file_mode = fs::metadata(path)
             .expect("journal metadata")
             .permissions()
             .mode();
         assert_eq!(file_mode & 0o777, 0o600, "journal file must be 0600");
+        assert_eq!(
+            chained_get(
+                &RejectingSecretStore,
+                &fallback,
+                "profile/default/api-token"
+            )
+            .expect("journal read"),
+            Some("fresh".to_owned())
+        );
     }
 
     #[test]

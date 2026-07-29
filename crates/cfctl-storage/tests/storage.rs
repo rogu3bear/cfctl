@@ -8,7 +8,7 @@ use cfctl_core::{
 };
 use cfctl_storage::{RuntimePaths, StateStore, StorageError, StoredPlanRecord};
 use chrono::{Duration, Utc};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 fn sha256(byte: char) -> String {
@@ -620,6 +620,90 @@ fn plan_v2_storage_preserves_secret_named_request_schema_properties() {
         plan.capability.request_schema
     );
     assert_eq!(loaded.plan.input, plan.input);
+}
+
+#[test]
+fn plan_v2_storage_rejects_secret_bearing_schema_annotations_but_preserves_safe_labels() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let mut capability = CapabilityV1::new(
+        "access-applications-add-an-application",
+        "Add an Access application",
+        "POST",
+        "/accounts/{account_id}/access/apps",
+    );
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{
+            "client_secret":{
+                "type":"string",
+                "writeOnly":true,
+                "default":"default-must-not-persist"
+            },
+            "token":{
+                "type":"string",
+                "writeOnly":true,
+                "const":"const-must-not-persist"
+            },
+            "password":{
+                "type":"string",
+                "writeOnly":true,
+                "examples":["example-must-not-persist"]
+            }
+        }
+    }));
+    let mut plan = PlanV1::draft(
+        "minter",
+        "account-a",
+        "sha256:catalog",
+        capability,
+        json!({"account_id":"account-a"}),
+    )
+    .expect("plan");
+    plan.input = json!({
+        "selectors":{"account_id":"account-a"},
+        "body":{"name":"Advisor"}
+    });
+    plan.refresh_hash().expect("refresh plan hash");
+
+    let error = store
+        .save_plan_v2(&pinned_plan_v2(plan.clone()))
+        .expect_err("secret-bearing schema annotations must never persist");
+    assert!(matches!(error, StorageError::SensitiveData));
+
+    let properties = plan
+        .capability
+        .request_schema
+        .as_mut()
+        .and_then(|schema| schema.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+        .expect("schema properties");
+    properties
+        .get_mut("client_secret")
+        .and_then(Value::as_object_mut)
+        .expect("client secret schema")
+        .remove("default");
+    properties
+        .get_mut("token")
+        .and_then(Value::as_object_mut)
+        .expect("token schema")
+        .remove("const");
+    properties
+        .get_mut("password")
+        .and_then(Value::as_object_mut)
+        .expect("password schema")
+        .remove("examples");
+    plan.refresh_hash().expect("refresh safe plan hash");
+    store
+        .save_plan_v2(&pinned_plan_v2(plan.clone()))
+        .expect("safe secret-named schema labels remain usable");
+    let loaded = store
+        .load_plan_v2(&plan.operation_id)
+        .expect("safe plan reloads");
+    assert_eq!(
+        loaded.plan.capability.request_schema,
+        plan.capability.request_schema
+    );
 }
 
 #[test]

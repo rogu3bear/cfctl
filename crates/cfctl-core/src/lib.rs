@@ -6040,22 +6040,39 @@ fn is_sensitive_key(key: &str) -> bool {
 /// [`redact_json`]: runtime payloads must never opt into schema semantics.
 #[must_use]
 pub fn redact_json_schema(value: &Value) -> Value {
-    redact_json_schema_inner(value, false)
+    redact_json_schema_inner(value, false, false)
 }
 
-fn redact_json_schema_inner(value: &Value, schema_names: bool) -> Value {
+fn redact_json_schema_inner(
+    value: &Value,
+    schema_names: bool,
+    sensitive_instance_schema: bool,
+) -> Value {
     match value {
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(key, item)| {
                     if schema_names && matches!(item, Value::Object(_) | Value::Bool(_)) {
-                        (key.clone(), redact_json_schema_inner(item, false))
+                        (
+                            key.clone(),
+                            redact_json_schema_inner(
+                                item,
+                                false,
+                                sensitive_instance_schema || is_sensitive_key(key),
+                            ),
+                        )
+                    } else if sensitive_instance_schema && is_json_schema_instance_annotation(key) {
+                        (key.clone(), Value::String("[REDACTED]".to_owned()))
                     } else if is_sensitive_key(key) {
                         (key.clone(), Value::String("[REDACTED]".to_owned()))
                     } else {
                         (
                             key.clone(),
-                            redact_json_schema_inner(item, is_json_schema_name_map(key)),
+                            redact_json_schema_inner(
+                                item,
+                                is_json_schema_name_map(key),
+                                sensitive_instance_schema,
+                            ),
                         )
                     }
                 })
@@ -6064,7 +6081,7 @@ fn redact_json_schema_inner(value: &Value, schema_names: bool) -> Value {
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|item| redact_json_schema_inner(item, false))
+                .map(|item| redact_json_schema_inner(item, false, sensitive_instance_schema))
                 .collect(),
         ),
         _ => value.clone(),
@@ -6075,5 +6092,12 @@ fn is_json_schema_name_map(key: &str) -> bool {
     matches!(
         key,
         "properties" | "patternProperties" | "dependentSchemas" | "definitions" | "$defs"
+    )
+}
+
+fn is_json_schema_instance_annotation(key: &str) -> bool {
+    matches!(
+        key,
+        "const" | "default" | "enum" | "example" | "examples" | "x-example" | "x-examples"
     )
 }

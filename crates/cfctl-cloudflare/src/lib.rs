@@ -4749,7 +4749,14 @@ fn access_exact_snapshot_optional_absence_mismatches(
     read.verified_response_fields
         .iter()
         .filter(|field| !planned.contains_key(field.as_str()))
-        .filter(|field| actual.get(field.as_str()).is_some())
+        .filter(|field| {
+            let Some(actual_value) = actual.get(field.as_str()) else {
+                return false;
+            };
+            !(is_policy_snapshot
+                && field.as_str() == "session_duration"
+                && actual_value.as_str() == Some(""))
+        })
         .cloned()
         .collect()
 }
@@ -4773,8 +4780,8 @@ fn access_application_set_field_matches(
                     .map(Value::as_str)
                     .collect::<Option<Vec<_>>>()?
                     .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
+                    .map(canonical_cloudflare_uuid)
+                    .collect::<Option<Vec<_>>>()?;
                 values.sort();
                 (!values.is_empty() && !values.windows(2).any(|pair| pair[0] == pair[1]))
                     .then_some(values)
@@ -4811,6 +4818,16 @@ fn access_application_set_field_matches(
         }
         _ => false,
     }
+}
+
+fn canonical_cloudflare_uuid(value: &str) -> Option<String> {
+    is_valid_cloudflare_uuid(value).then(|| {
+        value
+            .bytes()
+            .filter(|byte| *byte != b'-')
+            .map(|byte| char::from(byte.to_ascii_lowercase()))
+            .collect()
+    })
 }
 
 fn access_human_policy_field_matches(name: &str, actual: Option<&Value>, planned: &Value) -> bool {
@@ -4947,10 +4964,12 @@ mod access_application_projection_tests {
 
     #[test]
     fn identity_provider_and_policy_sets_verify_without_order_dependence() {
+        let id_a = "699d98642c564d2e855e9661899b7252";
+        let id_b = "7b0bc4775d424dabb0eac97d0aef7810";
         assert!(access_application_set_field_matches(
             "allowed_idps",
-            Some(&json!(["id-b", "id-a"])),
-            &json!(["id-a", "id-b"]),
+            Some(&json!([id_b, id_a])),
+            &json!([id_a, id_b]),
         ));
         assert!(access_application_set_field_matches(
             "policies",
@@ -4977,10 +4996,11 @@ mod access_application_projection_tests {
 
     #[test]
     fn identity_provider_set_verification_rejects_duplicates() {
+        let id = "699d98642c564d2e855e9661899b7252";
         assert!(!access_application_set_field_matches(
             "allowed_idps",
-            Some(&json!(["id-a", "id-a"])),
-            &json!(["id-a"]),
+            Some(&json!([id, id])),
+            &json!([id]),
         ));
         assert!(!access_application_set_field_matches(
             "policies",
@@ -4992,6 +5012,22 @@ mod access_application_projection_tests {
                 {"id":"policy-a","precedence":1},
                 {"id":"policy-a","precedence":2}
             ]),
+        ));
+    }
+
+    #[test]
+    fn identity_provider_set_verification_normalizes_cloudflare_uuid_spelling() {
+        let compact = "7b0bc4775d424dabb0eac97d0aef7810";
+        let canonical = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810";
+        assert!(access_application_set_field_matches(
+            "allowed_idps",
+            Some(&json!([compact])),
+            &json!([canonical]),
+        ));
+        assert!(!access_application_set_field_matches(
+            "allowed_idps",
+            Some(&json!([compact, canonical])),
+            &json!([canonical]),
         ));
     }
 
@@ -5088,6 +5124,40 @@ mod access_application_projection_tests {
                 "mfa_disabled":false
             }),
         ));
+    }
+
+    #[test]
+    fn human_policy_readback_treats_empty_session_duration_as_absent_without_masking_drift() {
+        let mut policy = CapabilityV1::new(
+            "access-policies-update-human-access-controls",
+            "Update human Access eligibility and independent MFA",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}",
+        );
+        policy.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+            path: policy.path.clone(),
+            read_capability_id: "access-policies-get-an-access-policy".to_owned(),
+            verified_response_fields: vec!["session_duration".to_owned()],
+        });
+        let planned = serde_json::Map::new();
+
+        assert!(
+            super::mismatched_verifiable_planned_fields(
+                &policy,
+                &planned,
+                &json!({"session_duration":""})
+            )
+            .is_empty(),
+            "Cloudflare's empty optional-duration sentinel must equal absence"
+        );
+        assert_eq!(
+            super::mismatched_verifiable_planned_fields(
+                &policy,
+                &planned,
+                &json!({"session_duration":"24h"})
+            ),
+            vec!["session_duration"]
+        );
     }
 
     #[test]

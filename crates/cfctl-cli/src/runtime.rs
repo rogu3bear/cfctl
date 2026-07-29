@@ -5635,17 +5635,31 @@ fn access_human_policy_desired_changes(input: &CallInput) -> Result<Map<String, 
 }
 
 fn access_human_policy_mutable_body(result: &Value, desired: &Map<String, Value>) -> Result<Value> {
+    access_human_policy_projected_body(result, desired, true)
+}
+
+fn access_human_policy_restorable_body(result: &Value) -> Result<Value> {
+    access_human_policy_projected_body(result, &Map::new(), false)
+}
+
+fn access_human_policy_projected_body(
+    result: &Value,
+    desired: &Map<String, Value>,
+    require_application_scoped_classification: bool,
+) -> Result<Value> {
     let result = result.as_object().ok_or_else(|| {
         CliError::Input(
             "live human Access policy read did not return an object; the mutation boundary was not crossed"
                 .to_owned(),
         )
     })?;
-    let known_fields = ACCESS_HUMAN_POLICY_MUTABLE_FIELDS
+    let mut known_fields = ACCESS_HUMAN_POLICY_MUTABLE_FIELDS
         .iter()
-        .chain(ACCESS_HUMAN_POLICY_READ_ONLY_FIELDS.iter())
         .copied()
         .collect::<BTreeSet<_>>();
+    if require_application_scoped_classification {
+        known_fields.extend(ACCESS_HUMAN_POLICY_READ_ONLY_FIELDS);
+    }
     let unknown_fields = result
         .keys()
         .filter(|field| !known_fields.contains(field.as_str()))
@@ -5656,6 +5670,14 @@ fn access_human_policy_mutable_body(result: &Value, desired: &Map<String, Value>
             "live human Access policy contains unclassified field(s) {}; the preservation-safe mutation boundary was not crossed",
             unknown_fields.join(",")
         )));
+    }
+    if require_application_scoped_classification
+        && result.get("reusable").and_then(Value::as_bool) != Some(false)
+    {
+        return Err(CliError::Input(
+            "live Access policy is reusable or omitted its reusable classification; application-scoped policy updates cannot preserve that routing contract, so the mutation boundary was not crossed"
+                .to_owned(),
+        ));
     }
     if result.get("decision").and_then(Value::as_str) != Some("allow") {
         return Err(CliError::Input(
@@ -12241,7 +12263,7 @@ fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Res
         })?;
     let prior_state = Value::Object(prior_state);
     let valid_state_shape = if is_access_human_policy_mutation(&plan.capability) {
-        access_human_policy_prior_state(&prior_state)
+        access_human_policy_restorable_body(&prior_state)
             .is_ok_and(|normalized| normalized == prior_state)
     } else if is_access_application_login_methods_mutation(&plan.capability) {
         let expected_fields = same_path_prior_state_fields(&plan.capability, &input)?;
@@ -29034,6 +29056,58 @@ mod tests {
                 .to_string()
                 .contains("approval_groups")
         );
+    }
+
+    #[test]
+    fn access_human_policy_body_rejects_reusable_policy_before_app_scoped_projection() {
+        let input = CallInput {
+            body: Some(json!({"exclude":[]})),
+            ..CallInput::default()
+        };
+        let desired =
+            super::access_human_policy_desired_changes(&input).expect("narrow desired state");
+        let mut reusable = access_human_policy_live_result();
+        reusable["reusable"] = json!(true);
+
+        let error = super::access_human_policy_mutable_body(&reusable, &desired)
+            .expect_err("reusable policy must not enter the application-scoped PUT lane");
+        assert!(error.to_string().contains("reusable"), "{error}");
+    }
+
+    #[test]
+    fn access_human_policy_live_projection_rejects_omitted_reusable_classification() {
+        let input = CallInput {
+            body: Some(json!({"exclude":[]})),
+            ..CallInput::default()
+        };
+        let desired =
+            super::access_human_policy_desired_changes(&input).expect("narrow desired state");
+        let mut unclassified = access_human_policy_live_result();
+        unclassified
+            .as_object_mut()
+            .expect("policy object")
+            .remove("reusable");
+
+        let error = super::access_human_policy_mutable_body(&unclassified, &desired)
+            .expect_err("live policy must explicitly classify reusable false");
+        assert!(error.to_string().contains("reusable"), "{error}");
+    }
+
+    #[test]
+    fn access_human_policy_curated_rollback_accepts_only_mutable_field_allowlist() {
+        let prior = super::access_human_policy_prior_state(&access_human_policy_live_result())
+            .expect("classified live snapshot projects a rollback body");
+        assert!(prior.get("reusable").is_none());
+        assert_eq!(
+            super::access_human_policy_restorable_body(&prior).expect("curated rollback body"),
+            prior
+        );
+
+        let mut injected = prior;
+        injected["reusable"] = json!(false);
+        let error = super::access_human_policy_restorable_body(&injected)
+            .expect_err("rollback body must reject read-only routing metadata");
+        assert!(error.to_string().contains("reusable"), "{error}");
     }
 
     #[test]
