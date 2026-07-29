@@ -5364,7 +5364,7 @@ fn finalize_access_application_login_methods_plan_input(
     }
     input.body = Some(access_application_mutable_body(
         &response.result,
-        &desired_idps,
+        desired_idps,
         variant,
     )?);
     preflight_call_input(capability, input, None)?;
@@ -28917,6 +28917,78 @@ mod tests {
         );
     }
 
+    fn assert_implicit_open_concurrency_receipt_blocks_drift_without_rollback(
+        capability: CapabilityV1,
+        input: &CallInput,
+        prior_state: Option<Value>,
+        expected_current_state: &Value,
+    ) {
+        let receipt = prior_state.expect(
+            "implicit-open plans still need a hash-bound closed current-state receipt for apply-time concurrency checks",
+        );
+        assert_eq!(
+            receipt.get("prior_state"),
+            Some(expected_current_state),
+            "the concurrency receipt must retain the exact closed mutable snapshot"
+        );
+        let receipt_hash = hash_value(&receipt).expect("concurrency receipt hash");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({
+                "selectors":input.selectors,
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{
+                    "same_path_prior_state":receipt.clone()
+                }
+            }),
+        )
+        .expect("implicit-open plan");
+        plan.input = serde_json::to_value(input).expect("plan input");
+        plan.precondition_hashes.insert(
+            super::SAME_PATH_PRIOR_STATE_PRECONDITION.to_owned(),
+            receipt_hash.clone(),
+        );
+        assert_eq!(
+            super::required_same_path_prior_state_precondition(&plan)
+                .expect("apply must require the concurrency precondition"),
+            Some(receipt_hash.as_str()),
+            "unsupported rollback must not disable apply-time live re-read"
+        );
+
+        let mut drifted_receipt = receipt.clone();
+        drifted_receipt["prior_state"]["name"] = json!("Concurrent application rename");
+        let drift_error = super::validate_same_path_prior_state_receipt_precondition(
+            &receipt_hash,
+            &drifted_receipt,
+        )
+        .expect_err("a mutable-field change between plan and apply must block execution");
+        assert!(
+            drift_error.to_string().contains("drifted after planning"),
+            "{drift_error}"
+        );
+
+        plan.refresh_hash().expect("bind concurrency precondition");
+        plan.approve(true, None).expect("approve test plan");
+        plan.mark_consumed().expect("consume test plan");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("record boundary attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"success":true,"http_status":200}),
+        )
+        .expect("record successful boundary response");
+        assert!(
+            super::compensation_request(&plan)
+                .expect("compensation selection")
+                .is_none(),
+            "the concurrency receipt must not become automatic rollback authority"
+        );
+    }
+
     #[test]
     fn access_application_implicit_open_plan_is_concurrency_guarded_without_automatic_rollback() {
         let desired_idp = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned();
@@ -28986,69 +29058,11 @@ mod tests {
             capability.mutation_contract_gaps()
         );
 
-        let receipt = prior_state.expect(
-            "implicit-open plans still need a hash-bound closed current-state receipt for apply-time concurrency checks",
-        );
-        assert_eq!(
-            receipt.get("prior_state"),
-            Some(&expected_current_state),
-            "the concurrency receipt must retain the exact closed mutable snapshot"
-        );
-        let receipt_hash = hash_value(&receipt).expect("concurrency receipt hash");
-        let mut plan = PlanV1::draft(
-            "profile-a",
-            "account-a",
-            "catalog-sha",
+        assert_implicit_open_concurrency_receipt_blocks_drift_without_rollback(
             capability,
-            json!({
-                "selectors":input.selectors,
-                "account_id":"account-a",
-                "adapter":{},
-                "live_preconditions":{
-                    "same_path_prior_state":receipt.clone()
-                }
-            }),
-        )
-        .expect("implicit-open plan");
-        plan.input = serde_json::to_value(&input).expect("plan input");
-        plan.precondition_hashes.insert(
-            super::SAME_PATH_PRIOR_STATE_PRECONDITION.to_owned(),
-            receipt_hash.clone(),
-        );
-        assert_eq!(
-            super::required_same_path_prior_state_precondition(&plan)
-                .expect("apply must require the concurrency precondition"),
-            Some(receipt_hash.as_str()),
-            "unsupported rollback must not disable apply-time live re-read"
-        );
-
-        let mut drifted_receipt = receipt.clone();
-        drifted_receipt["prior_state"]["name"] = json!("Concurrent application rename");
-        let drift_error = super::validate_same_path_prior_state_receipt_precondition(
-            &receipt_hash,
-            &drifted_receipt,
-        )
-        .expect_err("a mutable-field change between plan and apply must block execution");
-        assert!(
-            drift_error.to_string().contains("drifted after planning"),
-            "{drift_error}"
-        );
-
-        plan.refresh_hash().expect("bind concurrency precondition");
-        plan.approve(true, None).expect("approve test plan");
-        plan.mark_consumed().expect("consume test plan");
-        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
-            .expect("record boundary attempt");
-        plan.record_transaction_stage_with_artifact(
-            TransactionStageV1::BoundaryResponsePersisted,
-            json!({"success":true,"http_status":200}),
-        )
-        .expect("record successful boundary response");
-        assert!(
-            super::compensation_request(&plan)
-                .expect("compensation selection")
-                .is_none(),
-            "the concurrency receipt must not become automatic rollback authority"
+            &input,
+            prior_state,
+            &expected_current_state,
         );
     }
 
