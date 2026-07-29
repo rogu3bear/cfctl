@@ -4,7 +4,9 @@ mod event_batch;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
@@ -4009,7 +4011,14 @@ async fn execute_delegated_read(
     let credential_generation_id = credential_generation_for_read(profile)?;
     let account_id = resolve_account_id(store, profile, requested_account, input)?;
     let credential = fresh_credential(profile, &platform_secrets(store)).await?;
-    let receipt = run_delegated_cli(capability, input, &credential).await?;
+    let receipt = run_delegated_cli(
+        capability,
+        input,
+        &credential,
+        account_id.as_deref(),
+        &store.paths().cache_dir,
+    )
+    .await?;
     let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
     Ok(ExecutedRead {
         envelope: delegated_read_envelope(
@@ -4138,7 +4147,14 @@ async fn execute_delegated_plan(
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
-    let receipt = run_delegated_cli(&plan.capability, input, credential).await?;
+    let receipt = run_delegated_cli(
+        &plan.capability,
+        input,
+        credential,
+        Some(&plan.account_id),
+        &store.paths().cache_dir,
+    )
+    .await?;
     let success = receipt
         .get("success")
         .and_then(Value::as_bool)
@@ -4170,7 +4186,7 @@ async fn execute_delegated_plan(
         plan,
         TransactionStageV1::VerificationAttemptPersisted,
     )?;
-    let verification = verify_delegated_cli_plan(plan, input, &receipt, credential).await;
+    let verification = verify_delegated_cli_plan(store, plan, input, &receipt, credential).await;
     let verification_evidence =
         store.write_evidence(EvidenceClass::PostChangeVerification, &verification)?;
     let passed = verification
@@ -4261,6 +4277,7 @@ fn delegated_cli_failure_envelope(
 }
 
 async fn verify_delegated_cli_plan(
+    store: &StateStore,
     plan: &PlanV1,
     input: &CallInput,
     receipt: &Value,
@@ -4296,7 +4313,14 @@ async fn verify_delegated_cli_plan(
         });
     };
 
-    verify_wrangler_deployment_status(config, &version_id, credential).await
+    verify_wrangler_deployment_status(
+        config,
+        &version_id,
+        credential,
+        &plan.account_id,
+        &store.paths().cache_dir,
+    )
+    .await
 }
 
 /// Wrangler discovers dotenv credentials relative to its process working
@@ -4319,6 +4343,8 @@ async fn verify_wrangler_deployment_status(
     config: &str,
     version_id: &str,
     credential: &AuthCredential,
+    account_id: &str,
+    cache_dir: &Path,
 ) -> Value {
     let working_directory = match wrangler_config_directory(config) {
         Ok(directory) => directory,
@@ -4342,6 +4368,9 @@ async fn verify_wrangler_deployment_status(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (name, value) in governed_cli_workspace_env("wrangler", Some(account_id), cache_dir) {
+        command.env(name, value);
+    }
     match credential {
         AuthCredential::Bearer { token } => {
             command.env("CLOUDFLARE_API_TOKEN", token);
@@ -4514,6 +4543,8 @@ async fn run_delegated_cli(
     capability: &CapabilityV1,
     input: &CallInput,
     credential: &AuthCredential,
+    account_id: Option<&str>,
+    cache_dir: &Path,
 ) -> Result<Value> {
     let mut path_parts = capability.path.split_whitespace();
     let program = path_parts
@@ -4550,6 +4581,9 @@ async fn run_delegated_cli(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (name, value) in governed_cli_workspace_env(program, account_id, cache_dir) {
+        command.env(name, value);
+    }
     match credential {
         AuthCredential::Bearer { token } => {
             command.env("CLOUDFLARE_API_TOKEN", token);
@@ -4579,6 +4613,32 @@ async fn run_delegated_cli(
             AuthCredential::GlobalKey { .. } => ["CLOUDFLARE_EMAIL", "CLOUDFLARE_API_KEY"].as_slice(),
         },
     }))
+}
+
+/// Environment that must survive cfctl's fail-closed `env_clear()` boundary
+/// for delegated CLI subprocesses.
+///
+/// Wrangler otherwise discovers its mutable account/config cache beneath the
+/// closest `node_modules`, which writes operator state into the reviewed
+/// workspace. Binding the cache to cfctl's platform cache directory keeps that
+/// state outside source trees. The plan-selected account ID also prevents
+/// Wrangler from enumerating accounts and writing a selection cache at all.
+fn governed_cli_workspace_env(
+    program: &str,
+    account_id: Option<&str>,
+    cache_dir: &Path,
+) -> Vec<(&'static str, OsString)> {
+    if program != "wrangler" {
+        return Vec::new();
+    }
+    let mut environment = vec![(
+        "WRANGLER_CACHE_DIR",
+        cache_dir.join("wrangler").into_os_string(),
+    )];
+    if let Some(account_id) = account_id.filter(|value| !value.is_empty()) {
+        environment.push(("CLOUDFLARE_ACCOUNT_ID", OsString::from(account_id)));
+    }
+    environment
 }
 
 fn append_cli_input(command: &mut ProcessCommand, input: &Value) -> Result<()> {
@@ -17053,12 +17113,12 @@ mod tests {
         blocked_capability_envelope, boundary_response_artifact, build_mint_policy_body,
         call_command, cancel_plan, capability_call_argv, compensation_request,
         credential_generation_for_read, delegated_read_envelope, entitlement_probe_selectors,
-        execute_native_workflow, execute_read, find_secret_value, force_ipv4_from, guide_document,
-        guide_stage_commands, http_client, is_live_plan_precondition_hash,
-        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
-        list_security_action_state_receipt, non_readback_verification_basis,
-        operational_proof_coverage, permission_inventory_call, permission_inventory_envelope,
-        persist_prepared_plan, persist_secret_lifecycle,
+        execute_native_workflow, execute_read, find_secret_value, force_ipv4_from,
+        governed_cli_workspace_env, guide_document, guide_stage_commands, http_client,
+        is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
+        key_policy_list, key_policy_revoke, list_security_action_state_receipt,
+        non_readback_verification_basis, operational_proof_coverage, permission_inventory_call,
+        permission_inventory_envelope, persist_prepared_plan, persist_secret_lifecycle,
         persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
         preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
@@ -18033,6 +18093,37 @@ mod tests {
             PathBuf::from(".")
         );
         assert!(wrangler_config_directory("/").is_err());
+    }
+
+    #[test]
+    fn governed_wrangler_subprocesses_pin_account_and_external_cache() {
+        let environment = governed_cli_workspace_env(
+            "wrangler",
+            Some("account-a"),
+            PathBuf::from("/platform/cache").as_path(),
+        );
+        assert_eq!(
+            environment,
+            vec![
+                (
+                    "WRANGLER_CACHE_DIR",
+                    PathBuf::from("/platform/cache/wrangler").into_os_string()
+                ),
+                (
+                    "CLOUDFLARE_ACCOUNT_ID",
+                    std::ffi::OsString::from("account-a")
+                ),
+            ]
+        );
+        assert!(
+            governed_cli_workspace_env(
+                "cloudflared",
+                Some("account-a"),
+                PathBuf::from("/platform/cache").as_path(),
+            )
+            .is_empty(),
+            "non-Wrangler subprocesses must not inherit Wrangler-specific state"
+        );
     }
 
     #[test]
