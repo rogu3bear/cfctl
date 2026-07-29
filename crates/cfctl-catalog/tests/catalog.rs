@@ -5129,6 +5129,50 @@ fn compatible_access_human_policy_put_schema() -> serde_json::Value {
 }
 
 #[test]
+fn access_human_policy_fixed_empty_require_ignores_impossible_source_items() {
+    const DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
+    const CAPABILITY_ID: &str = "access-policies-update-human-access-controls";
+
+    let mut fixture = access_human_policy_fixture();
+    let baseline = normalize_openapi(&fixture).expect("compatible human Access policy catalog");
+    assert_eq!(
+        baseline
+            .get(CAPABILITY_ID)
+            .expect("baseline human policy capability")
+            .adapter_status,
+        AdapterStatus::DynamicApi,
+        "positive control must derive the human policy capability"
+    );
+
+    fixture["paths"][DETAIL_PATH]["put"]["requestBody"]["content"]["application/json"]["schema"]
+        ["properties"]["require"] = json!({
+        "type":"array",
+        "items":{
+            "type":"object",
+            "required":["service_token"],
+            "properties":{
+                "service_token":{
+                    "type":"object",
+                    "required":["token_id"],
+                    "properties":{"token_id":{"type":"string"}}
+                }
+            }
+        }
+    });
+    let snapshot =
+        normalize_openapi(&fixture).expect("official-shaped human Access policy catalog");
+    let capability = snapshot
+        .get(CAPABILITY_ID)
+        .expect("derived human policy capability");
+    assert_eq!(
+        capability.adapter_status,
+        AdapterStatus::DynamicApi,
+        "a source item schema cannot constrain curated `require: []`: {:?}",
+        capability.blocked_reason
+    );
+}
+
+#[test]
 fn access_human_policy_derivation_fails_closed_on_source_put_schema_drift() {
     const DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
     const CAPABILITY_ID: &str = "access-policies-update-human-access-controls";
@@ -5676,6 +5720,161 @@ fn source_compatible_access_application_login_methods_fixture() -> Value {
         json!({"type":"string","enum":["self_hosted","app_launcher"]}),
     );
     complete
+}
+
+#[test]
+fn access_application_login_methods_derivation_accepts_official_policy_id_bound() {
+    let mut fixture = source_compatible_access_application_login_methods_fixture();
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["policies"]["items"] = json!({
+        "oneOf":[{
+            "type":"object",
+            "additionalProperties":false,
+            "required":["id","precedence"],
+            "properties":{
+                "id":{"type":"string","minLength":1,"maxLength":36},
+                "precedence":{"type":"integer","minimum":1}
+            }
+        }]
+    });
+
+    let snapshot = normalize_openapi(&fixture).expect("official-shaped Access application catalog");
+    for capability_id in [
+        "access-applications-update-self-hosted-login-methods",
+        "access-applications-update-app-launcher-login-methods",
+    ] {
+        let capability = snapshot
+            .get(capability_id)
+            .expect("derived login-method capability");
+        assert_eq!(
+            capability.adapter_status,
+            AdapterStatus::DynamicApi,
+            "{capability_id} must retain the source-proven 36-character policy ID bound: {:?}",
+            capability.blocked_reason
+        );
+    }
+}
+
+fn access_application_fixture_with_source_required_policy_variants(mut fixture: Value) -> Value {
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["policies"]["items"] = json!({
+        "oneOf":[
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["id","precedence"],
+                "properties":{
+                    "id":{"type":"string","minLength":1},
+                    "precedence":{"type":"integer","minimum":1}
+                }
+            },
+            {
+                "type":"object",
+                "required":["name"],
+                "properties":{"name":{"type":"string","minLength":1}}
+            }
+        ]
+    });
+    fixture
+}
+
+#[test]
+fn source_required_keys_disambiguate_access_one_of_variants() {
+    const HUMAN_POLICY_ID: &str = "access-policies-update-human-access-controls";
+    let application_ids = [
+        "access-applications-update-self-hosted-login-methods",
+        "access-applications-update-app-launcher-login-methods",
+    ];
+
+    let application_fixture = source_compatible_access_application_login_methods_fixture();
+    let application_baseline =
+        normalize_openapi(&application_fixture).expect("compatible Access application catalog");
+    for capability_id in application_ids {
+        assert_eq!(
+            application_baseline
+                .get(capability_id)
+                .expect("baseline application capability")
+                .adapter_status,
+            AdapterStatus::DynamicApi,
+            "{capability_id} positive control must be source-compatible"
+        );
+    }
+    let application_fixture =
+        access_application_fixture_with_source_required_policy_variants(application_fixture);
+
+    let mut human_fixture = access_human_policy_fixture();
+    let human_baseline =
+        normalize_openapi(&human_fixture).expect("compatible human Access policy catalog");
+    assert_eq!(
+        human_baseline
+            .get(HUMAN_POLICY_ID)
+            .expect("baseline human policy capability")
+            .adapter_status,
+        AdapterStatus::DynamicApi,
+        "human policy positive control must be source-compatible"
+    );
+    let identity_rule = json!({
+        "oneOf":[
+            {
+                "type":"object",
+                "required":["email"],
+                "properties":{
+                    "email":{
+                        "type":"object",
+                        "required":["email"],
+                        "properties":{"email":{"type":"string"}}
+                    }
+                }
+            },
+            {
+                "type":"object",
+                "required":["email_domain"],
+                "properties":{
+                    "email_domain":{
+                        "type":"object",
+                        "required":["domain"],
+                        "properties":{"domain":{"type":"string"}}
+                    }
+                }
+            }
+        ]
+    });
+    for field in ["include", "exclude"] {
+        human_fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}"]
+            ["put"]["requestBody"]["content"]["application/json"]["schema"]["properties"][field]
+            ["items"] = identity_rule.clone();
+    }
+
+    let mut blocked = Vec::new();
+    let application_snapshot =
+        normalize_openapi(&application_fixture).expect("official-shaped application catalog");
+    for capability_id in application_ids {
+        let capability = application_snapshot
+            .get(capability_id)
+            .expect("derived application capability");
+        if capability.adapter_status != AdapterStatus::DynamicApi {
+            blocked.push(format!(
+                "embedded policy shape: {capability_id}: {:?}",
+                capability.blocked_reason
+            ));
+        }
+    }
+    let human_snapshot =
+        normalize_openapi(&human_fixture).expect("official-shaped human policy catalog");
+    let human_capability = human_snapshot
+        .get(HUMAN_POLICY_ID)
+        .expect("derived human policy capability");
+    if human_capability.adapter_status != AdapterStatus::DynamicApi {
+        blocked.push(format!(
+            "email/email-domain shape: {HUMAN_POLICY_ID}: {:?}",
+            human_capability.blocked_reason
+        ));
+    }
+
+    assert!(
+        blocked.is_empty(),
+        "source-required keys must prove valid Access oneOf alternatives disjoint: {blocked:?}"
+    );
 }
 
 fn access_application_fixture_without_put_request_body(complete: &Value) -> Value {

@@ -1011,7 +1011,7 @@ async fn catalog_command(store: &StateStore, command: CatalogCommand) -> Result<
                 .ok_or_else(|| capability_missing(&selector.capability_id))?;
             Ok(ResultEnvelopeV2::success(
                 "catalog show",
-                serde_json::to_value(capability)?,
+                serde_json::to_value(caller_facing_capability(capability))?,
             ))
         }
         CatalogCommand::Changes => {
@@ -5193,6 +5193,23 @@ fn access_application_mutable_body(
             unknown_fields.join(",")
         )));
     }
+    if variant.app_type == "self_hosted" {
+        let (Some(destinations), Some(self_hosted_domains)) = (
+            result.get("destinations").and_then(Value::as_array),
+            result.get("self_hosted_domains").and_then(Value::as_array),
+        ) else {
+            return Err(CliError::Input(
+                "live self-hosted Access application has no populated destination representation; the mutation boundary was not crossed"
+                    .to_owned(),
+            ));
+        };
+        if destinations.is_empty() && self_hosted_domains.is_empty() {
+            return Err(CliError::Input(
+                "live self-hosted Access application has no populated destination representation; the mutation boundary was not crossed"
+                    .to_owned(),
+            ));
+        }
+    }
     let mut body = Map::new();
     for &field in variant.mutable_fields {
         let Some(value) = result.get(field).cloned() else {
@@ -5367,6 +5384,10 @@ fn finalize_access_application_login_methods_plan_input(
         desired_idps,
         variant,
     )?);
+    if variant.app_type == "self_hosted" {
+        capability.request_schema =
+            Some(cfctl_catalog::access_application_login_methods_materialized_schema());
+    }
     preflight_call_input(capability, input, None)?;
     if current_idps.is_empty() {
         capability.rollback.supported = false;
@@ -5499,6 +5520,16 @@ fn access_human_policy_desired_schema() -> Value {
         },
         "x-cfctl-body-required":true
     })
+}
+
+fn caller_facing_capability(capability: &CapabilityV1) -> CapabilityV1 {
+    let mut public = capability.clone();
+    if is_access_application_login_methods_mutation(capability) {
+        public.request_schema = Some(access_application_login_methods_desired_schema());
+    } else if is_access_human_policy_mutation(capability) {
+        public.request_schema = Some(access_human_policy_desired_schema());
+    }
+    public
 }
 
 fn validate_access_human_policy_desired_input(
@@ -16712,8 +16743,9 @@ fn stage_required(stage: cfctl_core::GuideStage, capability: &cfctl_core::Capabi
 }
 
 fn guide_document(capability: &CapabilityV1) -> CapabilityGuideV1 {
+    let capability = caller_facing_capability(capability);
     let blocking_gaps = capability.mutation_contract_gaps();
-    let post_resolution_call_argv = capability_call_argv(capability);
+    let post_resolution_call_argv = capability_call_argv(&capability);
     let contract_ready =
         capability.adapter_status != AdapterStatus::Blocked && blocking_gaps.is_empty();
     let call_argv = contract_ready.then(|| post_resolution_call_argv.clone());
@@ -16724,30 +16756,32 @@ fn guide_document(capability: &CapabilityV1) -> CapabilityGuideV1 {
             guide_stage_document(
                 index + 1,
                 *stage,
-                capability,
+                &capability,
                 contract_ready,
                 &blocking_gaps,
                 Some(&post_resolution_call_argv),
             )
         })
         .collect::<Vec<_>>();
+    let blocked_reason = capability.blocked_reason.clone();
+    let next_action = guide_next_action(
+        &capability,
+        contract_ready,
+        Some(&post_resolution_call_argv),
+    );
 
     CapabilityGuideV1 {
-        capability: capability.clone(),
+        capability,
         contract_state: if contract_ready {
             GuideContractStateV1::Available
         } else {
             GuideContractStateV1::Blocked
         },
         blocking_gaps,
-        blocked_reason: capability.blocked_reason.clone(),
+        blocked_reason,
         call_argv,
         post_resolution_call_argv: post_resolution_call_argv.clone(),
-        next_action: guide_next_action(
-            capability,
-            contract_ready,
-            Some(&post_resolution_call_argv),
-        ),
+        next_action,
         stages,
     }
 }
@@ -28918,6 +28952,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn access_application_plan_accepts_one_populated_destination_representation() {
+        let desired_idp = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut failures = Vec::new();
+
+        for (label, empty_field) in [
+            ("self-hosted domains only", "destinations"),
+            ("destinations only", "self_hosted_domains"),
+        ] {
+            let mut capability = access_application_login_methods_capability();
+            let schema = capability
+                .request_schema
+                .as_mut()
+                .expect("materialized application request schema");
+            schema["properties"]["destinations"]["minItems"] = json!(1);
+            schema["properties"]["self_hosted_domains"]["minItems"] = json!(1);
+
+            let mut input = CallInput {
+                selectors: json!({
+                    "account_id":"account-a",
+                    "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+                }),
+                body: Some(json!({"allowed_idps":[desired_idp.clone()]})),
+                ..CallInput::default()
+            };
+            super::validate_access_application_login_methods_desired_input(&capability, &input)
+                .expect("narrow desired input remains valid");
+
+            let mut live = access_application_live_result();
+            live[empty_field] = json!([]);
+            let populated_field = if empty_field == "destinations" {
+                "self_hosted_domains"
+            } else {
+                "destinations"
+            };
+            assert!(
+                live[empty_field].as_array().is_some_and(Vec::is_empty)
+                    && live[populated_field]
+                        .as_array()
+                        .is_some_and(|values| !values.is_empty()),
+                "{label} fixture must contain exactly one populated representation"
+            );
+
+            let response = CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: live,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            };
+            match super::finalize_access_application_login_methods_plan_input(
+                &mut capability,
+                &mut input,
+                std::slice::from_ref(&desired_idp),
+                variant,
+                "account-a",
+                &response,
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) => failures.push(format!("{label}: plan omitted its prior-state receipt")),
+                Err(error) => failures.push(format!("{label}: {error}")),
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "one valid destination representation must be sufficient for planning: {failures:?}"
+        );
+    }
+
     fn assert_implicit_open_concurrency_receipt_blocks_drift_without_rollback(
         capability: CapabilityV1,
         input: &CallInput,
@@ -29245,6 +29355,105 @@ mod tests {
         capability.rollback.warning =
             Some("restoration requires a separate approved plan".to_owned());
         capability
+    }
+
+    #[test]
+    fn access_discovery_matches_call_schema_and_keeps_materialization_internal() {
+        let application = access_application_login_methods_capability();
+        let application_input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(json!({
+                "allowed_idps":["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"]
+            })),
+            ..CallInput::default()
+        };
+        super::validate_access_application_login_methods_desired_input(
+            &application,
+            &application_input,
+        )
+        .expect("the real call branch accepts the narrow application input");
+
+        let human_policy = access_human_policy_capability();
+        let human_input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+                "policy_id":"45e44306-0e2a-460a-94aa-34c21eefdb4a"
+            }),
+            body: Some(json!({
+                "mfa_config":{
+                    "allowed_authenticators":["biometrics","totp"],
+                    "mfa_disabled":false
+                }
+            })),
+            ..CallInput::default()
+        };
+        super::validate_access_human_policy_desired_input(&human_policy, &human_input)
+            .expect("the real call branch accepts the narrow human-policy input");
+
+        let application_body = super::access_application_mutable_body(
+            &access_application_live_result(),
+            &super::access_application_desired_idps(&application_input)
+                .expect("validated desired identity providers"),
+            super::access_application_login_methods_variant(&application.id)
+                .expect("self-hosted application variant"),
+        )
+        .expect("application materialization");
+        assert!(
+            application_body.get("name").is_some() && application_body.get("policies").is_some(),
+            "the provider PUT body remains an internal full-state materialization"
+        );
+        let human_body = super::access_human_policy_mutable_body(
+            &access_human_policy_live_result(),
+            &super::access_human_policy_desired_changes(&human_input)
+                .expect("validated desired human-policy changes"),
+        )
+        .expect("human-policy materialization");
+        assert!(
+            human_body.get("name").is_some() && human_body.get("decision").is_some(),
+            "the provider policy PUT body remains an internal full-state materialization"
+        );
+
+        let mut mismatches = Vec::new();
+        for (label, capability, input, desired_schema) in [
+            (
+                "application",
+                application,
+                application_input,
+                super::access_application_login_methods_desired_schema(),
+            ),
+            (
+                "human policy",
+                human_policy,
+                human_input,
+                super::access_human_policy_desired_schema(),
+            ),
+        ] {
+            let discovered_schema = guide_json(&capability)
+                .pointer("/capability/request_schema")
+                .cloned()
+                .expect("guide advertises a request schema");
+            let mut discovered_capability = capability;
+            discovered_capability.request_schema = Some(discovered_schema.clone());
+            if let Err(error) = super::validate_request_contract(&discovered_capability, &input) {
+                mismatches.push(format!(
+                    "{label} discovery rejects the body accepted by call: {error}"
+                ));
+            }
+            if discovered_schema != desired_schema {
+                mismatches.push(format!(
+                    "{label} discovery exposes the internal materialized PUT schema"
+                ));
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "Access discovery and call disagree on caller-facing bodies: {mismatches:?}"
+        );
     }
 
     fn access_human_policy_materialized_input(policy_id: &str) -> CallInput {

@@ -13337,7 +13337,10 @@ pub fn access_identity_provider_id_schema() -> Value {
     })
 }
 
-fn access_application_login_methods_schema() -> Value {
+/// Complete provider body used internally when materializing a self-hosted
+/// Access application login-method update.
+#[must_use]
+pub fn access_application_login_methods_materialized_schema() -> Value {
     serde_json::json!({
         "type":"object",
         "additionalProperties":false,
@@ -13368,7 +13371,6 @@ fn access_application_login_methods_schema() -> Value {
             "auto_redirect_to_identity":{"type":"boolean"},
             "destinations":{
                 "type":"array",
-                "minItems":1,
                 "items":{
                     "type":"object",
                     "additionalProperties":false,
@@ -13392,7 +13394,7 @@ fn access_application_login_methods_schema() -> Value {
                     "additionalProperties":false,
                     "required":["id","precedence"],
                     "properties":{
-                        "id":{"type":"string","minLength":1},
+                        "id":{"type":"string","minLength":1,"maxLength":36},
                         "precedence":{"type":"integer","minimum":1}
                     }
                 }
@@ -13400,7 +13402,6 @@ fn access_application_login_methods_schema() -> Value {
             "same_site_cookie_attribute":{"type":"string"},
             "self_hosted_domains":{
                 "type":"array",
-                "minItems":1,
                 "uniqueItems":true,
                 "items":{"type":"string","minLength":1}
             },
@@ -13478,7 +13479,7 @@ fn access_app_launcher_login_methods_schema() -> Value {
                     "additionalProperties":false,
                     "required":["id","precedence"],
                     "properties":{
-                        "id":{"type":"string","minLength":1},
+                        "id":{"type":"string","minLength":1,"maxLength":36},
                         "precedence":{"type":"integer","minimum":1}
                     }
                 }
@@ -14237,7 +14238,10 @@ fn required_object_property_proves_disjoint(
     {
         return false;
     }
-    let Ok(curated_required) = schema_required_fields(curated) else {
+    let (Ok(source_required), Ok(curated_required)) = (
+        schema_required_fields(source),
+        schema_required_fields(curated),
+    ) else {
         return false;
     };
     let source_properties = match source.get("properties") {
@@ -14256,6 +14260,30 @@ fn required_object_property_proves_disjoint(
     ) else {
         return false;
     };
+    if source_required.iter().any(|field| {
+        let source_property = source_properties
+            .and_then(|properties| properties.get(field))
+            .map_or(source_additional, SchemaAllowance::Schema);
+        let curated_property = curated_properties
+            .and_then(|properties| properties.get(field))
+            .map_or(curated_additional, SchemaAllowance::Schema);
+        match (source_property, curated_property) {
+            (SchemaAllowance::Forbidden, _) | (_, SchemaAllowance::Forbidden) => true,
+            (
+                SchemaAllowance::Schema(source_property),
+                SchemaAllowance::Schema(curated_property),
+            ) => source_schema_is_provably_disjoint(
+                document,
+                source_property,
+                curated_property,
+                depth + 1,
+                active_references,
+            ),
+            _ => false,
+        }
+    }) {
+        return true;
+    }
     curated_required.iter().any(|field| {
         let source_property = source_properties
             .and_then(|properties| properties.get(field))
@@ -14648,6 +14676,9 @@ fn source_array_constraints_accept_curated(
     {
         return false;
     }
+    if curated.get("maxItems").and_then(Value::as_u64) == Some(0) {
+        return true;
+    }
     if let Some(unique) = source.get("uniqueItems") {
         let Some(unique) = unique.as_bool() else {
             return false;
@@ -14927,7 +14958,7 @@ fn finalize_access_application_login_methods_contract(
                 "remove GitHub login from Access application",
                 "allow Access one-time PIN login",
             ],
-            request_schema: access_application_login_methods_schema(),
+            request_schema: access_application_login_methods_materialized_schema(),
         },
     );
     insert_access_application_login_methods_contract(
