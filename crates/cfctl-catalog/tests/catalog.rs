@@ -5755,6 +5755,51 @@ fn access_application_login_methods_derivation_accepts_official_policy_id_bound(
     }
 }
 
+#[test]
+fn access_application_login_methods_compatibility_ignores_unrelated_deep_policy_branch() {
+    let capability_ids = [
+        "access-applications-update-self-hosted-login-methods",
+        "access-applications-update-app-launcher-login-methods",
+    ];
+    let mut fixture = source_compatible_access_application_login_methods_fixture();
+    let baseline = normalize_openapi(&fixture).expect("compatible Access application catalog");
+    for capability_id in capability_ids {
+        assert_eq!(
+            baseline
+                .get(capability_id)
+                .expect("baseline login-method capability")
+                .adapter_status,
+            AdapterStatus::DynamicApi,
+            "{capability_id} positive control must be source-compatible"
+        );
+    }
+
+    let mut unrelated_policy_branch = json!({"type":"string"});
+    for _ in 0..20 {
+        unrelated_policy_branch = json!({
+            "type":"array",
+            "items":unrelated_policy_branch
+        });
+    }
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["unrelated_policy_branch"] =
+        unrelated_policy_branch;
+
+    let snapshot =
+        normalize_openapi(&fixture).expect("Access catalog with an unrelated deep policy branch");
+    for capability_id in capability_ids {
+        let capability = snapshot
+            .get(capability_id)
+            .expect("derived login-method capability");
+        assert_eq!(
+            capability.adapter_status,
+            AdapterStatus::DynamicApi,
+            "{capability_id} must ignore an unrelated deep policy branch while proving the curated body: {:?}",
+            capability.blocked_reason
+        );
+    }
+}
+
 fn access_application_fixture_with_source_required_policy_variants(mut fixture: Value) -> Value {
     fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
         ["application/json"]["schema"]["properties"]["policies"]["items"] = json!({

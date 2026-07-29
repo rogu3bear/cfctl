@@ -13597,9 +13597,6 @@ fn access_application_source_request_body_compatible(
         return false;
     };
     let mut active_references = BTreeSet::new();
-    if !access_source_schema_is_supported(document, source_schema, 0, &mut active_references) {
-        return false;
-    }
     curated_properties.keys().all(|field| {
         source_schema_declares_top_level_field(
             document,
@@ -13615,76 +13612,6 @@ fn access_application_source_request_body_compatible(
         0,
         &mut active_references,
     )
-}
-
-fn access_source_schema_is_supported(
-    document: &Value,
-    source_schema: &Value,
-    depth: usize,
-    active_references: &mut BTreeSet<String>,
-) -> bool {
-    if depth >= MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
-        return false;
-    }
-    let Some(source) = source_schema.as_object() else {
-        return false;
-    };
-    let Ok(reference) = access_source_reference_target(document, source) else {
-        return false;
-    };
-    if let Some((reference, target)) = reference {
-        if !active_references.insert(reference.clone()) {
-            return false;
-        }
-        let supported =
-            access_source_schema_is_supported(document, target, depth + 1, active_references);
-        active_references.remove(&reference);
-        return supported;
-    }
-    if !access_source_schema_uses_supported_keywords(source) {
-        return false;
-    }
-    for composition in ["allOf", "oneOf", "anyOf"] {
-        if let Some(members) = source.get(composition) {
-            let Some(members) = members.as_array().filter(|members| !members.is_empty()) else {
-                return false;
-            };
-            if !members.iter().all(|member| {
-                access_source_schema_is_supported(document, member, depth + 1, active_references)
-            }) {
-                return false;
-            }
-        }
-    }
-    if let Some(properties) = source.get("properties") {
-        let Some(properties) = properties.as_object() else {
-            return false;
-        };
-        if !properties.values().all(|property| {
-            access_source_schema_is_supported(document, property, depth + 1, active_references)
-        }) {
-            return false;
-        }
-    }
-    for nested in ["items", "additionalProperties"] {
-        if let Some(schema) = source.get(nested) {
-            match schema {
-                Value::Bool(_) => {}
-                Value::Object(_) => {
-                    if !access_source_schema_is_supported(
-                        document,
-                        schema,
-                        depth + 1,
-                        active_references,
-                    ) {
-                        return false;
-                    }
-                }
-                _ => return false,
-            }
-        }
-    }
-    true
 }
 
 fn access_source_annotation_keyword(key: &str) -> bool {
