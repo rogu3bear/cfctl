@@ -4960,6 +4960,16 @@ fn normalize_access_application_policies(value: &Value) -> Result<Value> {
             Ok(json!({"id":id,"precedence":precedence}))
         })
         .collect::<Result<Vec<_>>>()?;
+    let policy_identities = normalized
+        .iter()
+        .filter_map(|policy| policy.get("id").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    if policy_identities.len() != normalized.len() {
+        return Err(CliError::Input(
+            "live Access application returned duplicate policy identities; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
     normalized.sort_by(|left, right| {
         let left_precedence = left
             .get("precedence")
@@ -28066,6 +28076,20 @@ mod tests {
         )
         .expect_err("unclassified app override must block");
         assert!(error.to_string().contains("mfa_config"));
+    }
+
+    #[test]
+    fn access_application_policy_projection_rejects_duplicate_stable_identity() {
+        let policies = json!([
+            {"id":"policy-a","precedence":1},
+            {"id":"policy-a","precedence":2}
+        ]);
+        assert!(
+            super::normalize_access_application_policies(&policies)
+                .expect_err("one policy identity cannot occupy two precedences")
+                .to_string()
+                .contains("duplicate")
+        );
     }
 
     #[test]

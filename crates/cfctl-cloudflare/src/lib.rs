@@ -4651,17 +4651,22 @@ fn exact_resource_readback_identity_matches(
         ) => Some("policy_id"),
         _ => None,
     };
-    selector.is_none_or(|selector| {
-        input
-            .selectors
-            .get(selector)
-            .and_then(Value::as_str)
-            .filter(|identity| !identity.is_empty())
-            == actual
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|identity| !identity.is_empty())
-    })
+    let Some(selector) = selector else {
+        return true;
+    };
+    let Some(expected_identity) = input
+        .selectors
+        .get(selector)
+        .and_then(Value::as_str)
+        .filter(|identity| !identity.is_empty())
+    else {
+        return false;
+    };
+    actual
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|identity| !identity.is_empty())
+        == Some(expected_identity)
 }
 
 fn mismatched_verifiable_planned_fields(
@@ -4670,7 +4675,7 @@ fn mismatched_verifiable_planned_fields(
     actual: &Value,
 ) -> Vec<String> {
     let schema = capability.request_schema.as_ref();
-    planned
+    let mut mismatches = planned
         .iter()
         .filter(|(name, planned_value)| {
             if matches!(
@@ -4711,6 +4716,41 @@ fn mismatched_verifiable_planned_fields(
             )
         })
         .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    mismatches.extend(access_exact_snapshot_optional_absence_mismatches(
+        capability, planned, actual,
+    ));
+    mismatches.sort();
+    mismatches.dedup();
+    mismatches
+}
+
+fn access_exact_snapshot_optional_absence_mismatches(
+    capability: &CapabilityV1,
+    planned: &serde_json::Map<String, Value>,
+    actual: &Value,
+) -> Vec<String> {
+    let is_application_snapshot = matches!(
+        capability.id.as_str(),
+        "access-applications-update-self-hosted-login-methods"
+            | "access-applications-update-app-launcher-login-methods"
+    ) && capability.method == "PUT"
+        && capability.path == "/accounts/{account_id}/access/apps/{app_id}";
+    let is_policy_snapshot = capability.id == "access-policies-update-human-access-controls"
+        && capability.method == "PUT"
+        && capability.path == "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
+    let is_exact_access_snapshot = is_application_snapshot || is_policy_snapshot;
+    if !is_exact_access_snapshot {
+        return Vec::new();
+    }
+    let Some(read) = capability.same_path_read.as_ref() else {
+        return vec!["same_path_read".to_owned()];
+    };
+    read.verified_response_fields
+        .iter()
+        .filter(|field| !planned.contains_key(field.as_str()))
+        .filter(|field| actual.get(field.as_str()).is_some())
+        .cloned()
         .collect()
 }
 
@@ -4739,7 +4779,9 @@ fn access_application_set_field_matches(
                 (!values.is_empty() && !values.windows(2).any(|pair| pair[0] == pair[1]))
                     .then_some(values)
             };
-            normalized(actual) == normalized(planned)
+            normalized(actual)
+                .zip(normalized(planned))
+                .is_some_and(|(actual, planned)| actual == planned)
         }
         "policies" => {
             let normalized = |values: &[Value]| -> Option<Vec<(String, u64)>> {
@@ -4747,16 +4789,25 @@ fn access_application_set_field_matches(
                     .iter()
                     .map(|value| {
                         Some((
-                            value.get("id")?.as_str()?.to_owned(),
-                            value.get("precedence")?.as_u64()?,
+                            value
+                                .get("id")?
+                                .as_str()
+                                .filter(|identity| !identity.is_empty())?
+                                .to_owned(),
+                            value
+                                .get("precedence")?
+                                .as_u64()
+                                .filter(|precedence| *precedence > 0)?,
                         ))
                     })
                     .collect::<Option<Vec<_>>>()?;
                 values.sort();
-                (!values.is_empty() && !values.windows(2).any(|pair| pair[0] == pair[1]))
+                (!values.is_empty() && !values.windows(2).any(|pair| pair[0].0 == pair[1].0))
                     .then_some(values)
             };
-            normalized(actual) == normalized(planned)
+            normalized(actual)
+                .zip(normalized(planned))
+                .is_some_and(|(actual, planned)| actual == planned)
         }
         _ => false,
     }
@@ -4773,7 +4824,11 @@ fn access_human_policy_field_matches(name: &str, actual: Option<&Value>, planned
             };
             let require_nonempty = name == "include";
             normalized_access_human_identity_rules(actual, require_nonempty)
-                == normalized_access_human_identity_rules(planned, require_nonempty)
+                .zip(normalized_access_human_identity_rules(
+                    planned,
+                    require_nonempty,
+                ))
+                .is_some_and(|(actual, planned)| actual == planned)
         }
         "mfa_config" => {
             let Some(actual) = actual.and_then(Value::as_object) else {
@@ -4782,23 +4837,43 @@ fn access_human_policy_field_matches(name: &str, actual: Option<&Value>, planned
             let Some(planned) = planned.as_object() else {
                 return false;
             };
-            planned.iter().all(|(field, planned_value)| {
-                if field == "allowed_authenticators" {
-                    let Some(actual) = actual.get(field).and_then(Value::as_array) else {
-                        return false;
-                    };
-                    let Some(planned) = planned_value.as_array() else {
-                        return false;
-                    };
-                    normalized_access_authenticators(actual)
-                        == normalized_access_authenticators(planned)
-                } else {
-                    actual.get(field) == Some(planned_value)
-                }
-            })
+            normalized_access_human_mfa_config(actual, true)
+                .zip(normalized_access_human_mfa_config(planned, false))
+                .is_some_and(|(actual, planned)| actual == planned)
         }
         _ => false,
     }
+}
+
+fn normalized_access_human_mfa_config(
+    config: &serde_json::Map<String, Value>,
+    tolerate_empty_provider_duration: bool,
+) -> Option<(Vec<String>, bool, Option<String>)> {
+    let known_fields = ["allowed_authenticators", "mfa_disabled", "session_duration"];
+    if config
+        .keys()
+        .any(|field| !known_fields.contains(&field.as_str()))
+    {
+        return None;
+    }
+    let authenticators =
+        normalized_access_authenticators(config.get("allowed_authenticators")?.as_array()?)?;
+    let mfa_disabled = config.get("mfa_disabled")?.as_bool()?;
+    let session_duration = match config.get("session_duration") {
+        None => None,
+        Some(duration) => {
+            let duration = duration.as_str()?;
+            if duration.is_empty() {
+                if !tolerate_empty_provider_duration {
+                    return None;
+                }
+                None
+            } else {
+                Some(duration.to_owned())
+            }
+        }
+    };
+    Some((authenticators, mfa_disabled, session_duration))
 }
 
 fn normalized_access_human_identity_rules(
@@ -4820,7 +4895,14 @@ fn normalized_access_human_identity_rules(
                 if email.len() != 1 {
                     return None;
                 }
-                return Some(("email".to_owned(), email.get("email")?.as_str()?.to_owned()));
+                return Some((
+                    "email".to_owned(),
+                    email
+                        .get("email")?
+                        .as_str()
+                        .filter(|value| !value.is_empty())?
+                        .to_owned(),
+                ));
             }
             let domain = rule.get("email_domain")?.as_object()?;
             if domain.len() != 1 {
@@ -4828,7 +4910,11 @@ fn normalized_access_human_identity_rules(
             }
             Some((
                 "email_domain".to_owned(),
-                domain.get("domain")?.as_str()?.to_owned(),
+                domain
+                    .get("domain")?
+                    .as_str()
+                    .filter(|value| !value.is_empty())?
+                    .to_owned(),
             ))
         })
         .collect::<Option<Vec<_>>>()?;
@@ -4852,7 +4938,8 @@ fn normalized_access_authenticators(values: &[Value]) -> Option<Vec<String>> {
 #[cfg(test)]
 mod access_application_projection_tests {
     use super::{
-        CallInput, access_application_set_field_matches, access_human_policy_field_matches,
+        CallInput, access_application_set_field_matches,
+        access_exact_snapshot_optional_absence_mismatches, access_human_policy_field_matches,
         exact_resource_readback_identity_matches,
     };
     use cfctl_core::CapabilityV1;
@@ -4876,6 +4963,16 @@ mod access_application_projection_tests {
                 {"id":"policy-b","precedence":2}
             ]),
         ));
+        assert!(!access_application_set_field_matches(
+            "policies",
+            Some(&json!([{"id":"policy-b","precedence":1}])),
+            &json!([{"id":"policy-a","precedence":1}]),
+        ));
+        assert!(!access_application_set_field_matches(
+            "policies",
+            Some(&json!([{"id":"policy-a"}])),
+            &json!([{"id":"policy-a","precedence":1}]),
+        ));
     }
 
     #[test]
@@ -4884,6 +4981,17 @@ mod access_application_projection_tests {
             "allowed_idps",
             Some(&json!(["id-a", "id-a"])),
             &json!(["id-a"]),
+        ));
+        assert!(!access_application_set_field_matches(
+            "policies",
+            Some(&json!([
+                {"id":"policy-a","precedence":1},
+                {"id":"policy-a","precedence":2}
+            ])),
+            &json!([
+                {"id":"policy-a","precedence":1},
+                {"id":"policy-a","precedence":2}
+            ]),
         ));
     }
 
@@ -4924,10 +5032,56 @@ mod access_application_projection_tests {
             &json!([{"email_domain":{"domain":"example.com"}}]),
         ));
         assert!(!access_human_policy_field_matches(
+            "include",
+            Some(&json!([{
+                "email":{
+                    "email":"person@example.com",
+                    "unclassified":"must-not-be-ignored"
+                }
+            }])),
+            &json!([{"email":{"email":"person@example.com"}}]),
+        ));
+        assert!(!access_human_policy_field_matches(
             "mfa_config",
             Some(&json!({
                 "allowed_authenticators":["totp","biometrics","security_key"],
                 "mfa_disabled":false
+            })),
+            &json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false
+            }),
+        ));
+        assert!(!access_human_policy_field_matches(
+            "mfa_config",
+            Some(&json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false,
+                "session_duration":"12h"
+            })),
+            &json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false
+            }),
+        ));
+        assert!(!access_human_policy_field_matches(
+            "mfa_config",
+            Some(&json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false,
+                "unclassified":true
+            })),
+            &json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false
+            }),
+        ));
+        assert!(access_human_policy_field_matches(
+            "mfa_config",
+            Some(&json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false,
+                "session_duration":""
             })),
             &json!({
                 "allowed_authenticators":["totp","biometrics"],
@@ -4963,6 +5117,69 @@ mod access_application_projection_tests {
             &input,
             &json!({})
         ));
+        assert!(!exact_resource_readback_identity_matches(
+            &capability,
+            &CallInput::default(),
+            &json!({})
+        ));
+    }
+
+    #[test]
+    fn access_exact_snapshot_verification_matches_optional_presence_and_absence() {
+        let mut launcher = CapabilityV1::new(
+            "access-applications-update-app-launcher-login-methods",
+            "Update Access App Launcher login methods",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}",
+        );
+        launcher.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+            path: launcher.path.clone(),
+            read_capability_id: "access-applications-get-an-access-application".to_owned(),
+            verified_response_fields: vec!["allowed_idps".to_owned(), "custom_deny_url".to_owned()],
+        });
+        let planned = serde_json::Map::from_iter([("allowed_idps".to_owned(), json!(["id-a"]))]);
+        assert_eq!(
+            access_exact_snapshot_optional_absence_mismatches(
+                &launcher,
+                &planned,
+                &json!({"allowed_idps":["id-a"],"custom_deny_url":"https://unexpected.example"})
+            ),
+            vec!["custom_deny_url"]
+        );
+        assert!(
+            access_exact_snapshot_optional_absence_mismatches(
+                &launcher,
+                &planned,
+                &json!({"allowed_idps":["id-a"]})
+            )
+            .is_empty()
+        );
+        let mut missing_contract = launcher.clone();
+        missing_contract.same_path_read = None;
+        assert_eq!(
+            access_exact_snapshot_optional_absence_mismatches(
+                &missing_contract,
+                &planned,
+                &json!({"allowed_idps":["id-a"]})
+            ),
+            vec!["same_path_read"]
+        );
+
+        launcher.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{
+                "custom_deny_url":{"type":"string"}
+            }
+        }));
+        let requested = serde_json::Map::from_iter([(
+            "custom_deny_url".to_owned(),
+            json!("https://expected.example"),
+        )]);
+        assert_eq!(
+            super::mismatched_verifiable_planned_fields(&launcher, &requested, &json!({})),
+            vec!["custom_deny_url"]
+        );
     }
 }
 
