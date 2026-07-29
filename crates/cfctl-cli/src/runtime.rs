@@ -72,6 +72,9 @@ use crate::{
 };
 
 const API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
+const WRANGLER_ACCOUNT_ENV: &str = "CLOUDFLARE_ACCOUNT_ID";
+const WRANGLER_CACHE_ENV: &str = "WRANGLER_CACHE_DIR";
+const WRANGLER_CACHE_SUBDIRECTORY: &str = "wrangler";
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -4632,13 +4635,27 @@ fn governed_cli_workspace_env(
         return Vec::new();
     }
     let mut environment = vec![(
-        "WRANGLER_CACHE_DIR",
-        cache_dir.join("wrangler").into_os_string(),
+        WRANGLER_CACHE_ENV,
+        cache_dir.join(WRANGLER_CACHE_SUBDIRECTORY).into_os_string(),
     )];
     if let Some(account_id) = account_id.filter(|value| !value.is_empty()) {
-        environment.push(("CLOUDFLARE_ACCOUNT_ID", OsString::from(account_id)));
+        environment.push((WRANGLER_ACCOUNT_ENV, OsString::from(account_id)));
     }
     environment
+}
+
+fn governed_cli_environment_contract(cache_dir: &Path) -> Value {
+    json!({
+        "schema_version": 1,
+        "wrangler": {
+            "account_binding": "selected_cfctl_account",
+            "account_env": WRANGLER_ACCOUNT_ENV,
+            "cache_binding": "cfctl_platform_cache",
+            "cache_env": WRANGLER_CACHE_ENV,
+            "cache_dir": cache_dir.join(WRANGLER_CACHE_SUBDIRECTORY),
+            "survives_env_clear": true,
+        },
+    })
 }
 
 fn append_cli_input(command: &mut ProcessCommand, input: &Value) -> Result<()> {
@@ -14711,6 +14728,9 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "config_dir": store.paths().config_dir,
             "data_dir": store.paths().data_dir,
             "cache_dir": store.paths().cache_dir,
+            "delegated_cli_environment": governed_cli_environment_contract(
+                &store.paths().cache_dir
+            ),
             "catalog": catalog,
             "profile_count": profiles.profiles.len(),
             "current_profile": profiles.current_profile,
@@ -17114,11 +17134,12 @@ mod tests {
         call_command, cancel_plan, capability_call_argv, compensation_request,
         credential_generation_for_read, delegated_read_envelope, entitlement_probe_selectors,
         execute_native_workflow, execute_read, find_secret_value, force_ipv4_from,
-        governed_cli_workspace_env, guide_document, guide_stage_commands, http_client,
-        is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
-        key_policy_list, key_policy_revoke, list_security_action_state_receipt,
-        non_readback_verification_basis, operational_proof_coverage, permission_inventory_call,
-        permission_inventory_envelope, persist_prepared_plan, persist_secret_lifecycle,
+        governed_cli_environment_contract, governed_cli_workspace_env, guide_document,
+        guide_stage_commands, http_client, is_live_plan_precondition_hash,
+        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
+        list_security_action_state_receipt, non_readback_verification_basis,
+        operational_proof_coverage, permission_inventory_call, permission_inventory_envelope,
+        persist_prepared_plan, persist_secret_lifecycle,
         persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
         preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
@@ -18123,6 +18144,20 @@ mod tests {
             )
             .is_empty(),
             "non-Wrangler subprocesses must not inherit Wrangler-specific state"
+        );
+        assert_eq!(
+            governed_cli_environment_contract(PathBuf::from("/platform/cache").as_path()),
+            json!({
+                "schema_version": 1,
+                "wrangler": {
+                    "account_binding": "selected_cfctl_account",
+                    "account_env": "CLOUDFLARE_ACCOUNT_ID",
+                    "cache_binding": "cfctl_platform_cache",
+                    "cache_env": "WRANGLER_CACHE_DIR",
+                    "cache_dir": "/platform/cache/wrangler",
+                    "survives_env_clear": true,
+                },
+            })
         );
     }
 
