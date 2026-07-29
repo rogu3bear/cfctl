@@ -611,10 +611,13 @@ impl SecretStore for FileSecretStore {
     }
 }
 
-/// Platform keyring first, with a durable file fallback so a broken keyring
-/// (for example `errSecAuthFailed` from a desynchronized login keychain)
-/// degrades to governed mode-0600 files instead of blocking credential
-/// import. `cfctl doctor` reports which backend is active.
+/// Platform keyring preferred for writes, with a durable file fallback so a
+/// broken keyring (for example `errSecAuthFailed` from a desynchronized login
+/// keychain) degrades to governed mode-0600 files instead of blocking
+/// credential import. A present fallback wins on reads because every
+/// successful keyring write deletes it; its presence therefore records the
+/// newer successful write when an older keyring value could not be replaced.
+/// `cfctl doctor` reports which backend is active.
 #[derive(Debug, Clone)]
 pub struct PlatformSecretStore {
     keyring: KeyringSecretStore,
@@ -675,10 +678,10 @@ impl SecretStore for PlatformSecretStore {
     }
 
     fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
-        if matches!(self.keyring.get(key), Ok(Some(_))) {
-            return Ok(Some(SecretBackend::PlatformKeyring));
+        if self.fallback.locate(key)?.is_some() {
+            return Ok(Some(SecretBackend::FallbackFile));
         }
-        self.fallback.locate(key)
+        self.keyring.locate(key)
     }
 }
 
@@ -691,7 +694,17 @@ fn chained_put(
     match primary.put(key, value) {
         // Drop any stale fallback copy so a later fallback read can never
         // resurrect an old secret.
-        Ok(()) => fallback.delete(key),
+        Ok(()) => match fallback.delete(key) {
+            Ok(()) => Ok(()),
+            Err(cleanup_error) => match primary.delete(key) {
+                Ok(()) => Err(AuthError::SecretStore(format!(
+                    "primary secret store write succeeded, but fallback cleanup failed ({cleanup_error}); the primary write was rolled back so a stale fallback cannot shadow it"
+                ))),
+                Err(rollback_error) => Err(AuthError::SecretStore(format!(
+                    "primary secret store write succeeded, but fallback cleanup failed ({cleanup_error}) and primary rollback also failed ({rollback_error}); credential state is ambiguous and must be repaired before use"
+                ))),
+            },
+        },
         Err(primary_error) => fallback.put(key, value).map_err(|fallback_error| {
             AuthError::SecretStore(format!(
                 "primary secret store write failed ({primary_error}); fallback write also failed ({fallback_error})"
@@ -705,16 +718,9 @@ fn chained_get(
     fallback: &dyn SecretStore,
     key: &str,
 ) -> Result<Option<String>> {
-    match primary.get(key) {
-        Ok(Some(value)) => Ok(Some(value)),
-        Ok(None) => fallback.get(key),
-        Err(primary_error) => match fallback.get(key) {
-            Ok(Some(value)) => Ok(Some(value)),
-            Ok(None) => Err(primary_error),
-            Err(fallback_error) => Err(AuthError::SecretStore(format!(
-                "primary secret store read failed ({primary_error}); fallback read also failed ({fallback_error})"
-            ))),
-        },
+    match fallback.get(key)? {
+        Some(value) => Ok(Some(value)),
+        None => primary.get(key),
     }
 }
 
@@ -859,6 +865,31 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct DeleteRejectingSecretStore {
+        inner: MemorySecretStore,
+    }
+
+    impl SecretStore for DeleteRejectingSecretStore {
+        fn put(&self, key: &str, value: &str) -> Result<()> {
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.inner.get(key)
+        }
+
+        fn delete(&self, _key: &str) -> Result<()> {
+            Err(AuthError::SecretStore(
+                "fallback store rejected the delete".to_owned(),
+            ))
+        }
+
+        fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
+            self.inner.locate(key)
+        }
+    }
+
     #[test]
     fn chained_put_prefers_primary_and_clears_stale_fallback_copies() {
         let primary = MemorySecretStore::default();
@@ -885,6 +916,29 @@ mod tests {
     }
 
     #[test]
+    fn chained_put_rolls_back_primary_when_stale_fallback_cannot_be_cleared() {
+        let primary = MemorySecretStore::default();
+        let fallback = DeleteRejectingSecretStore::default();
+        fallback
+            .put("k", "stale")
+            .expect("seed authoritative fallback");
+
+        let error = chained_put(&primary, &fallback, "k", "fresh")
+            .expect_err("uncleared fallback must fail closed");
+
+        assert!(error.to_string().contains("fallback cleanup failed"));
+        assert_eq!(
+            primary.get("k").expect("primary rollback read"),
+            None,
+            "the newer primary value must not survive behind an authoritative stale fallback"
+        );
+        assert_eq!(
+            fallback.get("k").expect("fallback read"),
+            Some("stale".to_owned())
+        );
+    }
+
+    #[test]
     fn chained_put_reports_both_failures_when_no_store_accepts_the_secret() {
         let error = chained_put(&RejectingSecretStore, &RejectingSecretStore, "k", "v")
             .expect_err("double failure");
@@ -894,15 +948,15 @@ mod tests {
     }
 
     #[test]
-    fn chained_get_prefers_primary_and_surfaces_primary_error_on_double_miss() {
+    fn chained_get_prefers_newer_fallback_and_surfaces_primary_error_on_double_miss() {
         let primary = MemorySecretStore::default();
         let fallback = MemorySecretStore::default();
         primary.put("k", "primary-value").expect("seed primary");
         fallback.put("k", "fallback-value").expect("seed fallback");
 
         assert_eq!(
-            chained_get(&primary, &fallback, "k").expect("primary wins"),
-            Some("primary-value".to_owned())
+            chained_get(&primary, &fallback, "k").expect("fallback wins"),
+            Some("fallback-value".to_owned())
         );
         let miss = chained_get(&RejectingSecretStore, &MemorySecretStore::default(), "k")
             .expect_err("primary error surfaces when fallback misses");
