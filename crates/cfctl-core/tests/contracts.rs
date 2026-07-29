@@ -3015,6 +3015,37 @@ fn redaction_recurses_through_objects_and_arrays() {
     assert_eq!(redacted["safe"], "visible");
 }
 
+#[test]
+fn redaction_preserves_only_the_typed_access_binding_cookie_toggle() {
+    let value = json!({
+        "enable_binding_cookie": true,
+        "schema": {
+            "enable_binding_cookie": {
+                "type": "boolean",
+                "description": "non-secret configuration"
+            }
+        },
+        "invalid_value": {
+            "enable_binding_cookie": "opaque-value"
+        },
+        "session_cookie": "secret-a",
+        "cookie": "secret-b"
+    });
+
+    let redacted = redact_json(&value);
+    assert_eq!(redacted["enable_binding_cookie"], true);
+    assert_eq!(
+        redacted["schema"]["enable_binding_cookie"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        redacted["invalid_value"]["enable_binding_cookie"],
+        "[REDACTED]"
+    );
+    assert_eq!(redacted["session_cookie"], "[REDACTED]");
+    assert_eq!(redacted["cookie"], "[REDACTED]");
+}
+
 fn standing_authority_fixture() -> StandingAuthorityV1 {
     StandingAuthorityV1::draft(
         "account-a",

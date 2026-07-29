@@ -5985,7 +5985,7 @@ pub fn redact_json(value: &Value) -> Value {
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(key, item)| {
-                    if is_sensitive_key(key) {
+                    if is_sensitive_key(key) && !is_non_secret_boolean_configuration(key, item) {
                         (key.clone(), Value::String("[REDACTED]".to_owned()))
                     } else {
                         (key.clone(), redact_json(item))
@@ -5996,6 +5996,16 @@ pub fn redact_json(value: &Value) -> Value {
         Value::Array(items) => Value::Array(items.iter().map(redact_json).collect()),
         _ => value.clone(),
     }
+}
+
+fn is_non_secret_boolean_configuration(key: &str, value: &Value) -> bool {
+    key.eq_ignore_ascii_case("enable_binding_cookie")
+        && (value.is_boolean()
+            || value
+                .as_object()
+                .and_then(|schema| schema.get("type"))
+                .and_then(Value::as_str)
+                == Some("boolean"))
 }
 
 fn is_sensitive_key(key: &str) -> bool {
