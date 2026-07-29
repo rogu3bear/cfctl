@@ -7851,12 +7851,28 @@ fn validate_string_format(schema: &Value, value: &str, path: &str) -> Result<()>
         "hostname" => is_valid_hostname(value),
         "ipv4" => value.parse::<Ipv4Addr>().is_ok(),
         "ipv6" => value.parse::<Ipv6Addr>().is_ok(),
+        "cloudflare-uuid" => is_valid_cloudflare_uuid(value),
         _ => true,
     };
     if valid {
         return Ok(());
     }
     invalid_request_bound(path, &format!("does not match the pinned {format} format"))
+}
+
+fn is_valid_cloudflare_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    match bytes.len() {
+        32 => bytes.iter().all(u8::is_ascii_hexdigit),
+        36 => bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        }),
+        _ => false,
+    }
 }
 
 fn is_valid_hostname(value: &str) -> bool {

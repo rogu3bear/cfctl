@@ -1152,12 +1152,13 @@ fn unchecked_request_enforces_executable_string_formats() {
     let mut capability = CapabilityV1::new("formatted-create", "Create", "POST", "/formatted");
     capability.request_schema = Some(json!({
         "type": "object",
-        "required": ["timestamp", "hostname", "ipv4", "ipv6"],
+        "required": ["timestamp", "hostname", "ipv4", "ipv6", "cloudflare_uuid"],
         "properties": {
             "timestamp": {"type": "string", "format": "date-time"},
             "hostname": {"type": "string", "format": "hostname"},
             "ipv4": {"type": "string", "format": "ipv4"},
-            "ipv6": {"type": "string", "format": "ipv6"}
+            "ipv6": {"type": "string", "format": "ipv6"},
+            "cloudflare_uuid": {"type": "string", "format": "cloudflare-uuid"}
         }
     }));
     let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
@@ -1166,7 +1167,8 @@ fn unchecked_request_enforces_executable_string_formats() {
             "timestamp": "2026-07-15T03:45:00-05:00",
             "hostname": "service.example.com.",
             "ipv4": "192.0.2.1",
-            "ipv6": "2001:db8::1"
+            "ipv6": "2001:db8::1",
+            "cloudflare_uuid": "699d98642c564d2e855e9661899b7252"
         })),
         ..CallInput::default()
     };
@@ -1174,12 +1176,21 @@ fn unchecked_request_enforces_executable_string_formats() {
     let mut root_hostname = valid.clone();
     root_hostname.body.as_mut().expect("valid body")["hostname"] = json!(".");
     assert!(builder.build_unchecked(&capability, &root_hostname).is_ok());
+    let mut canonical_uuid = valid.clone();
+    canonical_uuid.body.as_mut().expect("valid body")["cloudflare_uuid"] =
+        json!("7b0bc477-5d42-4dab-b0ea-c97d0aef7810");
+    assert!(
+        builder
+            .build_unchecked(&capability, &canonical_uuid)
+            .is_ok()
+    );
 
     for (field, value) in [
         ("timestamp", "2026-07-15 03:45:00"),
         ("hostname", "_invalid.example.com"),
         ("ipv4", "999.0.2.1"),
         ("ipv6", "2001:db8::1::1"),
+        ("cloudflare_uuid", "7b0bc4775-d42-4dab-b0ea-c97d0aef7810"),
     ] {
         let mut body = valid.body.clone().expect("valid body");
         body[field] = json!(value);

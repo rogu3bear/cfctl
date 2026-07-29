@@ -13310,6 +13310,31 @@ const ACCESS_POLICY_READ_CAPABILITY_ID: &str = "access-policies-get-an-access-po
 const ACCESS_POLICY_DETAIL_PATH: &str =
     "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
 
+/// Exact Cloudflare Access identity-provider identifier renderings accepted by
+/// the API: 32 hexadecimal characters or the canonical 36-character
+/// hyphenated UUID form.
+#[must_use]
+pub fn access_identity_provider_id_schema() -> Value {
+    serde_json::json!({
+        "oneOf":[
+            {
+                "type":"string",
+                "minLength":32,
+                "maxLength":32,
+                "format":"cloudflare-uuid",
+                "pattern":"^[0-9A-Fa-f]{32}$"
+            },
+            {
+                "type":"string",
+                "minLength":36,
+                "maxLength":36,
+                "format":"cloudflare-uuid",
+                "pattern":"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+            }
+        ]
+    })
+}
+
 fn access_application_login_methods_schema() -> Value {
     serde_json::json!({
         "type":"object",
@@ -13335,7 +13360,7 @@ fn access_application_login_methods_schema() -> Value {
                 "minItems":1,
                 "maxItems":25,
                 "uniqueItems":true,
-                "items":{"type":"string","minLength":36,"maxLength":36}
+                "items":access_identity_provider_id_schema()
             },
             "app_launcher_visible":{"type":"boolean"},
             "auto_redirect_to_identity":{"type":"boolean"},
@@ -13407,7 +13432,7 @@ fn access_app_launcher_login_methods_schema() -> Value {
                 "minItems":1,
                 "maxItems":25,
                 "uniqueItems":true,
-                "items":{"type":"string","minLength":36,"maxLength":36}
+                "items":access_identity_provider_id_schema()
             },
             "app_launcher_logo_url":{"type":"string"},
             "auto_redirect_to_identity":{"type":"boolean"},

@@ -4948,7 +4948,7 @@ fn access_application_login_methods_desired_schema() -> Value {
                 "minItems":1,
                 "maxItems":25,
                 "uniqueItems":true,
-                "items":{"type":"string","minLength":36,"maxLength":36}
+                "items":cfctl_catalog::access_identity_provider_id_schema()
             }
         },
         "x-cfctl-body-required":true
@@ -4970,6 +4970,24 @@ fn validate_access_application_login_methods_desired_input(
     validate_request_contract(&desired_capability, input)?;
     access_application_desired_idps(input)?;
     Ok(())
+}
+
+fn parse_access_identity_provider_id(value: &str) -> Option<Uuid> {
+    let bytes = value.as_bytes();
+    let valid_rendering = match bytes.len() {
+        32 => bytes.iter().all(u8::is_ascii_hexdigit),
+        36 => bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        }),
+        _ => false,
+    };
+    valid_rendering
+        .then(|| Uuid::parse_str(value).ok())
+        .flatten()
 }
 
 fn access_application_desired_idps(input: &CallInput) -> Result<Vec<String>> {
@@ -4997,10 +5015,11 @@ fn access_application_desired_idps(input: &CallInput) -> Result<Vec<String>> {
     let mut desired = values
         .iter()
         .map(|value| {
-            value
-                .as_str()
-                .filter(|value| Uuid::parse_str(value).is_ok())
-                .map(str::to_owned)
+            let value = value.as_str().ok_or_else(|| {
+                CliError::Input("every Access identity-provider ID must be a valid UUID".to_owned())
+            })?;
+            parse_access_identity_provider_id(value)
+                .map(|id| id.hyphenated().to_string())
                 .ok_or_else(|| {
                     CliError::Input(
                         "every Access identity-provider ID must be a valid UUID".to_owned(),
@@ -5082,7 +5101,7 @@ fn normalize_access_application_policies(value: &Value) -> Result<Value> {
     Ok(Value::Array(normalized))
 }
 
-fn normalized_access_application_idps(value: &Value) -> Result<Value> {
+fn normalized_access_application_idps(value: &Value) -> Result<Vec<String>> {
     let mut idps = value
         .as_array()
         .filter(|idps| !idps.is_empty())
@@ -5094,9 +5113,14 @@ fn normalized_access_application_idps(value: &Value) -> Result<Value> {
         })?
         .iter()
         .map(|idp| {
-            idp.as_str()
-                .filter(|idp| Uuid::parse_str(idp).is_ok())
-                .map(str::to_owned)
+            let idp = idp.as_str().ok_or_else(|| {
+                CliError::Input(
+                    "live Access application returned an invalid identity-provider ID; the mutation boundary was not crossed"
+                        .to_owned(),
+                )
+            })?;
+            parse_access_identity_provider_id(idp)
+                .map(|id| id.hyphenated().to_string())
                 .ok_or_else(|| {
                     CliError::Input(
                         "live Access application returned an invalid identity-provider ID; the mutation boundary was not crossed"
@@ -5112,7 +5136,7 @@ fn normalized_access_application_idps(value: &Value) -> Result<Value> {
                 .to_owned(),
         ));
     }
-    Ok(json!(idps))
+    Ok(idps)
 }
 
 fn access_application_mutable_body(
@@ -5272,7 +5296,7 @@ async fn prepare_access_application_login_methods_plan_input(
     let current_idps = normalized_access_application_idps(
         response.result.get("allowed_idps").unwrap_or(&Value::Null),
     )?;
-    if current_idps == json!(desired_idps) {
+    if current_idps == desired_idps {
         return Err(CliError::Input(
             "Access application already has the exact requested identity-provider allowlist; no mutation plan was created"
                 .to_owned(),
@@ -6534,6 +6558,45 @@ fn project_same_path_prior_state(
         })?;
         return Ok(prior);
     }
+    if is_access_application_login_methods_mutation(capability) {
+        let app_id = input
+            .selectors
+            .get("app_id")
+            .and_then(Value::as_str)
+            .filter(|app_id| !app_id.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "Access application prior-state read omitted its exact app selector".to_owned(),
+                )
+            })?;
+        let variant =
+            access_application_login_methods_variant(&capability.id).ok_or_else(|| {
+                CliError::Input(
+                    "Access application prior-state contract omitted its exact application variant"
+                        .to_owned(),
+                )
+            })?;
+        if result.get("id").and_then(Value::as_str) != Some(app_id)
+            || result.get("type").and_then(Value::as_str) != Some(variant.app_type)
+        {
+            return Err(CliError::Input(format!(
+                "Access application prior-state read returned a different app or a non-{} app; the mutation boundary was not crossed",
+                variant.app_type
+            )));
+        }
+        let current_idps =
+            normalized_access_application_idps(result.get("allowed_idps").unwrap_or(&Value::Null))?;
+        let prior = access_application_mutable_body(result, &current_idps, variant)?;
+        let mut restore_input = input.clone();
+        restore_input.query = json!({});
+        restore_input.body = Some(prior.clone());
+        preflight_call_input(capability, &restore_input, None).map_err(|error| {
+            CliError::Input(format!(
+                "live Access application is outside the exact restorable request contract; the mutation boundary was not crossed: {error}"
+            ))
+        })?;
+        return Ok(prior);
+    }
     let mut prior = serde_json::Map::new();
     for field in same_path_prior_state_fields(capability, input)? {
         let response_field = capability
@@ -6544,15 +6607,6 @@ fn project_same_path_prior_state(
                 "same-path state read omitted restorable field `{response_field}`; the mutation boundary was not crossed"
             ))
         })?;
-        let value = if is_access_application_login_methods_mutation(capability) {
-            match field.as_str() {
-                "allowed_idps" => normalized_access_application_idps(&value)?,
-                "policies" => normalize_access_application_policies(&value)?,
-                _ => value,
-            }
-        } else {
-            value
-        };
         prior.insert(field, value);
     }
     let prior = Value::Object(prior);
@@ -12189,6 +12243,29 @@ fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Res
     let valid_state_shape = if is_access_human_policy_mutation(&plan.capability) {
         access_human_policy_prior_state(&prior_state)
             .is_ok_and(|normalized| normalized == prior_state)
+    } else if is_access_application_login_methods_mutation(&plan.capability) {
+        let expected_fields = same_path_prior_state_fields(&plan.capability, &input)?;
+        let observed_fields = prior_state
+            .as_object()
+            .map(|state| state.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let variant = access_application_login_methods_variant(&plan.capability.id);
+        let current_idps = prior_state
+            .get("allowed_idps")
+            .ok_or_else(|| {
+                CliError::Input(
+                    "same-path Access application receipt omitted `allowed_idps`; create a new plan"
+                        .to_owned(),
+                )
+            })
+            .and_then(normalized_access_application_idps);
+        observed_fields == expected_fields
+            && variant
+                .zip(current_idps.ok())
+                .is_some_and(|(variant, current_idps)| {
+                    access_application_mutable_body(&prior_state, &current_idps, variant)
+                        .is_ok_and(|normalized| normalized == prior_state)
+                })
     } else {
         let expected_fields = same_path_prior_state_fields(&plan.capability, &input)?;
         let observed_fields = prior_state
@@ -12270,6 +12347,19 @@ fn same_path_prior_snapshot(plan: &PlanV1) -> Result<Value> {
     validate_same_path_prior_state_receipt(plan, receipt)
 }
 
+fn validate_same_path_prior_state_receipt_precondition(
+    expected_hash: &str,
+    current_receipt: &Value,
+) -> Result<()> {
+    if hash_value(current_receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live same-path state drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 async fn validate_live_same_path_prior_state_precondition(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -12289,12 +12379,7 @@ async fn validate_live_same_path_prior_state_precondition(
         credential,
     )
     .await?;
-    if hash_value(&receipt)? != expected_hash {
-        return Err(CliError::Input(
-            "live same-path state drifted after planning; the mutation boundary was not crossed and a new plan is required"
-                .to_owned(),
-        ));
-    }
+    validate_same_path_prior_state_receipt_precondition(expected_hash, &receipt)?;
     Ok(Some(evidence))
 }
 
@@ -28433,6 +28518,175 @@ mod tests {
     }
 
     #[test]
+    fn access_application_precondition_distinguishes_absence_from_empty_optional_state() {
+        let capability = access_application_login_methods_capability();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut planned_source = access_application_live_result();
+        planned_source
+            .as_object_mut()
+            .expect("application object")
+            .remove("tags");
+        planned_source
+            .as_object_mut()
+            .expect("application object")
+            .remove("same_site_cookie_attribute");
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(
+                super::access_application_mutable_body(
+                    &planned_source,
+                    &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
+                    variant,
+                )
+                .expect("preservation-safe full PUT body"),
+            ),
+            ..CallInput::default()
+        };
+        let planned = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: planned_source.clone(),
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect("planned absence receipt");
+        assert!(planned["prior_state"].get("tags").is_none());
+
+        let mut drifted_source = planned_source;
+        drifted_source["tags"] = json!([]);
+        let drifted = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: drifted_source,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect("drifted empty-state receipt");
+        assert_eq!(drifted["prior_state"]["tags"], json!([]));
+        let planned_hash = hash_value(&planned).expect("planned hash");
+        let error =
+            super::validate_same_path_prior_state_receipt_precondition(&planned_hash, &drifted);
+        assert!(
+            error
+                .expect_err("an optional field appearing after planning must block execution")
+                .to_string()
+                .contains("drifted after planning")
+        );
+    }
+
+    #[test]
+    fn access_application_precondition_rejects_new_null_optional_state() {
+        let capability = access_application_login_methods_capability();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut planned_source = access_application_live_result();
+        planned_source
+            .as_object_mut()
+            .expect("application object")
+            .remove("same_site_cookie_attribute");
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(
+                super::access_application_mutable_body(
+                    &planned_source,
+                    &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
+                    variant,
+                )
+                .expect("preservation-safe full PUT body"),
+            ),
+            ..CallInput::default()
+        };
+        planned_source["same_site_cookie_attribute"] = Value::Null;
+        let error = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: planned_source,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect_err("null is present state, not absence");
+        assert!(
+            error.to_string().contains("same_site_cookie_attribute"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn access_application_execution_precondition_rejects_new_unclassified_state() {
+        let capability = access_application_login_methods_capability();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let planned_source = access_application_live_result();
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(
+                super::access_application_mutable_body(
+                    &planned_source,
+                    &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
+                    variant,
+                )
+                .expect("preservation-safe full PUT body"),
+            ),
+            ..CallInput::default()
+        };
+        let mut drifted_source = planned_source;
+        drifted_source["future_writable_field"] = json!({"must_be_preserved":true});
+        let error = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: drifted_source,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect_err("new unclassified state must block execution");
+        assert!(error.to_string().contains("future_writable_field"));
+    }
+
+    #[test]
     fn access_application_policy_projection_rejects_duplicate_stable_identity() {
         let policies = json!([
             {"id":"policy-a","precedence":1},
@@ -28449,9 +28703,42 @@ mod tests {
     #[test]
     fn access_application_desired_idps_rejects_empty_duplicate_and_non_uuid_sets() {
         let input = |allowed_idps: Value| CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
             body: Some(json!({"allowed_idps":allowed_idps})),
             ..CallInput::default()
         };
+        let capability = access_application_login_methods_capability();
+        let mut desired_schema_capability = capability.clone();
+        desired_schema_capability.request_schema =
+            Some(super::access_application_login_methods_desired_schema());
+        assert_eq!(
+            desired_schema_capability
+                .request_schema
+                .as_ref()
+                .and_then(|schema| schema.pointer("/properties/allowed_idps/items")),
+            Some(&cfctl_catalog::access_identity_provider_id_schema()),
+            "runtime and catalog must share the exact identity-provider schema"
+        );
+        for documented_id in [
+            "699d98642c564d2e855e9661899b7252",
+            "7b0bc477-5d42-4dab-b0ea-c97d0aef7810",
+        ] {
+            super::validate_request_contract(
+                &desired_schema_capability,
+                &input(json!([documented_id])),
+            )
+            .unwrap_or_else(|error| {
+                panic!("schema should accept documented ID {documented_id}: {error}")
+            });
+            super::validate_access_application_login_methods_desired_input(
+                &capability,
+                &input(json!([documented_id])),
+            )
+            .unwrap_or_else(|error| panic!("{documented_id} should be accepted: {error}"));
+        }
         assert!(super::access_application_desired_idps(&input(json!([]))).is_err());
         assert!(
             super::access_application_desired_idps(&input(json!([
@@ -28460,7 +28747,40 @@ mod tests {
             ])))
             .is_err()
         );
+        assert!(
+            super::access_application_desired_idps(&input(json!([
+                "7b0bc4775d424dabb0eac97d0aef7810",
+                "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+            ])))
+            .is_err(),
+            "one stable IdP identity rendered two ways must remain a duplicate"
+        );
         assert!(super::access_application_desired_idps(&input(json!(["github"]))).is_err());
+        for malformed in [
+            "699d98642c564d2e855e9661899b725",
+            "699d98642c564d2e855e9661899b72520",
+            "7b0bc477-5d42-4dab-b0ea-c97d0aef781",
+            "g99d98642c564d2e855e9661899b7252",
+            "7b0bc477-5d42-4dab-b0ea-c97d0aef781z",
+            "7b0bc4775-d42-4dab-b0ea-c97d0aef7810",
+        ] {
+            assert!(
+                super::validate_request_contract(
+                    &desired_schema_capability,
+                    &input(json!([malformed])),
+                )
+                .is_err(),
+                "pinned schema accepted malformed identity-provider ID: {malformed}"
+            );
+            assert!(
+                super::validate_access_application_login_methods_desired_input(
+                    &capability,
+                    &input(json!([malformed])),
+                )
+                .is_err(),
+                "malformed identity-provider ID was accepted: {malformed}"
+            );
+        }
     }
 
     fn access_human_policy_live_result() -> Value {

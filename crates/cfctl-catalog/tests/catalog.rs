@@ -5367,6 +5367,15 @@ fn access_application_login_methods_update_is_full_snapshot_governed() {
             }),
         "cookie and tag fields are writable and verifiable when present, but optional on live self-hosted applications"
     );
+    let allowed_idp_schema = update
+        .request_schema
+        .as_ref()
+        .and_then(|schema| schema.pointer("/properties/allowed_idps/items"))
+        .expect("allowed identity-provider item schema");
+    assert_eq!(
+        allowed_idp_schema,
+        &cfctl_catalog::access_identity_provider_id_schema()
+    );
     assert!(update.mutation_contract_gaps().is_empty());
 
     let generic = snapshot
@@ -5422,6 +5431,15 @@ fn access_app_launcher_login_methods_update_is_full_snapshot_governed() {
             "skip_app_launcher_login_page",
             "type",
         ]
+    );
+    let allowed_idp_schema = launcher
+        .request_schema
+        .as_ref()
+        .and_then(|schema| schema.pointer("/properties/allowed_idps/items"))
+        .expect("allowed identity-provider item schema");
+    assert_eq!(
+        allowed_idp_schema,
+        &cfctl_catalog::access_identity_provider_id_schema()
     );
     assert!(launcher.mutation_contract_gaps().is_empty());
 }
