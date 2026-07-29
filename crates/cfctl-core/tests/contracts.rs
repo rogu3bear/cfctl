@@ -13,7 +13,7 @@ use cfctl_core::{
     SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
     StandingAuthorityV1, TimeRangeContractV1, TimestampFormatV1, TransactionStageV1,
     UpdatedResourceContractV1, guide_stages, guide_topic_document, hash_value, redact_json,
-    render_guide_topic_markdown,
+    redact_json_schema, render_guide_topic_markdown,
 };
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
@@ -4063,5 +4063,49 @@ fn asynchronous_list_security_action_pins_poll_correlation_and_exact_removal() {
             .mutation_contract_gaps()
             .iter()
             .any(|gap| gap.contains("verification strategy"))
+    );
+}
+
+#[test]
+fn schema_redaction_preserves_property_names_without_exempting_secret_values() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "token": {"type": "string", "writeOnly": true},
+            "client_secret": {"type": "string", "writeOnly": true},
+            "nested": {
+                "type": "object",
+                "properties": {
+                    "password": {"type": "string", "writeOnly": true}
+                }
+            }
+        },
+        "metadata": {
+            "client_secret": "must-not-survive"
+        }
+    });
+
+    let redacted = redact_json_schema(&schema);
+    assert_eq!(
+        redacted["properties"]["token"],
+        schema["properties"]["token"]
+    );
+    assert_eq!(
+        redacted["properties"]["client_secret"],
+        schema["properties"]["client_secret"]
+    );
+    assert_eq!(
+        redacted["properties"]["nested"]["properties"]["password"],
+        schema["properties"]["nested"]["properties"]["password"]
+    );
+    assert_eq!(
+        redacted["metadata"]["client_secret"],
+        Value::String("[REDACTED]".to_owned())
+    );
+
+    let malformed = json!({"properties":{"token":"plaintext-secret"}});
+    assert_eq!(
+        redact_json_schema(&malformed)["properties"]["token"],
+        Value::String("[REDACTED]".to_owned())
     );
 }

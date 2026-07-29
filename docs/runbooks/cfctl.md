@@ -632,22 +632,14 @@ preview, apply, and post-change verification evidence.
 
 ## Known limitations
 
-- **Access application and identity-provider create/update cannot yet be
-  planned**, even though their mutation contracts are complete. The plan
-  storage redaction guard (`redact_json` / `is_sensitive_key`) matches on field
-  *names* — `client_secret`, `token`, `secret`, `password` — and those five
-  Access capabilities embed their large request *schemas* in the plan, where
-  those names appear as legitimate SaaS/IdP configuration property keys, not as
-  secret values. Storage refuses the plan as `SensitiveData`. The fix is to
-  teach the redaction equality check to distinguish a schema key describing a
-  field from a document carrying a secret value; it touches a load-bearing
-  invariant used at 15 sites and is deferred to its own change. Until then,
-  `access-applications-add-an-application` reports governed in the catalog but
-  fails at plan storage. Governing that capability did not change this: the
-  curated contract sets risk, cost, verification, and rollback but deliberately
-  leaves `request_schema` as the live-synced upstream schema, which is where the
-  property names come from. Only Access *service token* create and update carry
-  hand-curated request schemas, which is why they plan and these do not.
+- **Access application and identity-provider plan storage uses schema-aware
+  redaction.** Secret-shaped JSON Schema property names such as
+  `client_secret`, `token`, and `password` are public catalog metadata only
+  beneath schema name maps such as `properties` and `$defs`. Submitted payloads
+  and every other plan field still pass through generic fail-closed redaction,
+  and malformed schema entries carrying plaintext secret values remain blocked.
+  Regression coverage proves both request-schema persistence and rejection of
+  an actual submitted `client_secret`.
 
 - **Arbitrary KV namespace deletion stays blocked.**
   `workers-kv-namespace-remove-a-namespace` cannot be called directly: Cloudflare
