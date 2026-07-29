@@ -28182,6 +28182,51 @@ mod tests {
         capability
     }
 
+    fn access_human_policy_materialized_input(policy_id: &str) -> CallInput {
+        CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+                "policy_id":policy_id
+            }),
+            body: Some(json!({
+                "decision":"allow",
+                "exclude":[{"email":{"email":"founders@mlnavigator.com"}}],
+                "include":[
+                    {"email_domain":{"domain":"mlnavigator.com"}},
+                    {"email":{"email":"advisor@mlnavigator.com"}}
+                ],
+                "mfa_config":{
+                    "allowed_authenticators":["biometrics","totp"],
+                    "mfa_disabled":false
+                },
+                "name":"Allow MLNavigator Investor Staff",
+                "precedence":1,
+                "require":[]
+            })),
+            ..CallInput::default()
+        }
+    }
+
+    fn access_human_policy_response_without_optional_fields() -> CloudflareResponseV1 {
+        let mut live = access_human_policy_live_result();
+        live.as_object_mut()
+            .expect("policy object")
+            .remove("mfa_config");
+        live.as_object_mut()
+            .expect("policy object")
+            .remove("session_duration");
+        CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: live,
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        }
+    }
+
     #[test]
     fn access_human_policy_body_preserves_live_state_and_applies_narrow_eligibility_change() {
         let input = CallInput {
@@ -28333,45 +28378,8 @@ mod tests {
             capability.mutation_contract_gaps()
         );
         let policy_id = "45e44306-0e2a-460a-94aa-34c21eefdb4a";
-        let input = CallInput {
-            selectors: json!({
-                "account_id":"account-a",
-                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
-                "policy_id":policy_id
-            }),
-            body: Some(json!({
-                "decision":"allow",
-                "exclude":[{"email":{"email":"founders@mlnavigator.com"}}],
-                "include":[
-                    {"email_domain":{"domain":"mlnavigator.com"}},
-                    {"email":{"email":"advisor@mlnavigator.com"}}
-                ],
-                "mfa_config":{
-                    "allowed_authenticators":["biometrics","totp"],
-                    "mfa_disabled":false
-                },
-                "name":"Allow MLNavigator Investor Staff",
-                "precedence":1,
-                "require":[]
-            })),
-            ..CallInput::default()
-        };
-        let mut live = access_human_policy_live_result();
-        live.as_object_mut()
-            .expect("policy object")
-            .remove("mfa_config");
-        live.as_object_mut()
-            .expect("policy object")
-            .remove("session_duration");
-        let response = CloudflareResponseV1 {
-            status: 200,
-            success: true,
-            result: live,
-            errors: Vec::new(),
-            result_info: None,
-            etag: None,
-            cf_ray: None,
-        };
+        let input = access_human_policy_materialized_input(policy_id);
+        let response = access_human_policy_response_without_optional_fields();
         let receipt = super::apply_same_path_prior_state_response(
             &capability,
             &input,
@@ -28430,8 +28438,14 @@ mod tests {
                 .to_string()
                 .contains("does not match")
         );
+    }
 
-        let mut wrong_resource = response;
+    #[test]
+    fn access_human_policy_snapshot_requires_exact_policy_identity() {
+        let capability = access_human_policy_capability();
+        let policy_id = "45e44306-0e2a-460a-94aa-34c21eefdb4a";
+        let input = access_human_policy_materialized_input(policy_id);
+        let mut wrong_resource = access_human_policy_response_without_optional_fields();
         wrong_resource.result["id"] = json!("different-policy");
         assert!(
             super::apply_same_path_prior_state_response(
