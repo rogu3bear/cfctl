@@ -5019,6 +5019,8 @@ fn access_human_policy_fixture() -> serde_json::Value {
         "session_duration":{"type":"string"},
         "mfa_config":{"type":"object"}
     });
+    document["paths"][case.detail_path]["put"]["requestBody"]["content"]["application/json"]["schema"] =
+        compatible_access_human_policy_put_schema();
     document
 }
 
@@ -5073,6 +5075,12 @@ fn access_human_policy_update_is_closed_and_exact_resource_verified() {
     assert_eq!(schema["properties"]["decision"]["enum"], json!(["allow"]));
     assert_eq!(schema["properties"]["require"]["maxItems"], 0);
     assert_eq!(
+        schema.pointer(
+            "/properties/include/items/oneOf/1/properties/email_domain/properties/domain/format"
+        ),
+        Some(&json!("hostname"))
+    );
+    assert_eq!(
         schema["properties"]["mfa_config"]["properties"]["allowed_authenticators"]["items"]["enum"],
         json!(["totp", "biometrics", "security_key"])
     );
@@ -5099,6 +5107,103 @@ fn access_human_policy_update_blocks_on_readback_schema_drift() {
             .blocked_reason
             .as_deref()
             .is_some_and(|reason| reason.starts_with("schema drift:"))
+    );
+}
+
+fn compatible_access_human_policy_put_schema() -> serde_json::Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["name","decision","include","exclude","require","precedence"],
+        "properties":{
+            "name":{"type":"string"},
+            "decision":{"type":"string"},
+            "include":{"type":"array","items":{"type":"object"}},
+            "exclude":{"type":"array","items":{"type":"object"}},
+            "require":{"type":"array","maxItems":0},
+            "precedence":{"type":"integer"},
+            "session_duration":{"type":"string"},
+            "mfa_config":{"type":"object"}
+        }
+    })
+}
+
+#[test]
+fn access_human_policy_derivation_fails_closed_on_source_put_schema_drift() {
+    const DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
+    const CAPABILITY_ID: &str = "access-policies-update-human-access-controls";
+
+    let mut compatible = access_human_policy_fixture();
+    compatible["paths"][DETAIL_PATH]["put"]["requestBody"]["content"]["application/json"]["schema"] =
+        compatible_access_human_policy_put_schema();
+    let baseline = normalize_openapi(&compatible).expect("compatible human policy catalog");
+    let baseline_capability = baseline
+        .get(CAPABILITY_ID)
+        .expect("compatible derived human policy update");
+    assert_eq!(
+        baseline_capability.adapter_status,
+        AdapterStatus::DynamicApi,
+        "compatible raw PUT schema must preserve the curated capability: {:?}",
+        baseline_capability.blocked_reason
+    );
+
+    let mut missing_body = compatible.clone();
+    missing_body["paths"][DETAIL_PATH]["put"]
+        .as_object_mut()
+        .expect("PUT operation")
+        .remove("requestBody");
+
+    let mut split_variant = compatible.clone();
+    let mut without_mfa = compatible_access_human_policy_put_schema();
+    without_mfa["properties"]
+        .as_object_mut()
+        .expect("source properties")
+        .remove("mfa_config");
+    split_variant["paths"][DETAIL_PATH]["put"]["requestBody"]["content"]["application/json"]["schema"] = json!({
+        "oneOf":[
+            without_mfa,
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["mfa_config"],
+                "properties":{"mfa_config":{"type":"object"}}
+            }
+        ]
+    });
+
+    let mut missing_include = compatible.clone();
+    missing_include["paths"][DETAIL_PATH]["put"]["requestBody"]["content"]["application/json"]
+        ["schema"]["properties"]
+        .as_object_mut()
+        .expect("source properties")
+        .remove("include");
+
+    let mut retyped_mfa = compatible.clone();
+    retyped_mfa["paths"][DETAIL_PATH]["put"]["requestBody"]["content"]["application/json"]["schema"]
+        ["properties"]["mfa_config"] = json!({"type":"string"});
+
+    let mut unsafe_derivations = Vec::new();
+    for (case, fixture) in [
+        ("missing request body", missing_body),
+        ("split oneOf body", split_variant),
+        ("removed include", missing_include),
+        ("retyped mfa_config", retyped_mfa),
+    ] {
+        let snapshot = normalize_openapi(&fixture).expect("drifted human policy catalog");
+        let capability = snapshot
+            .get(CAPABILITY_ID)
+            .expect("derived human policy update");
+        if capability.adapter_status != AdapterStatus::Blocked {
+            unsafe_derivations.push(format!(
+                "{case}: status={:?}, reason={:?}",
+                capability.adapter_status, capability.blocked_reason
+            ));
+        }
+    }
+
+    assert!(
+        unsafe_derivations.is_empty(),
+        "human-policy derivation survived incompatible raw PUT schema forms: {unsafe_derivations:?}"
     );
 }
 

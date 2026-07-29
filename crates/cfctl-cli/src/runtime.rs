@@ -5441,6 +5441,7 @@ fn access_human_policy_identity_rule_schema() -> Value {
                         "properties":{
                             "domain":{
                                 "type":"string",
+                                "format":"hostname",
                                 "minLength":3,
                                 "maxLength":253
                             }
@@ -29503,6 +29504,45 @@ mod tests {
         assert!(
             super::validate_access_human_policy_desired_input(&capability, &input).is_err(),
             "malformed email selector reached approval-ready plan input"
+        );
+    }
+
+    #[test]
+    fn access_human_policy_desired_input_rejects_malformed_email_domain_before_plan_creation() {
+        let capability = access_human_policy_capability();
+        assert_eq!(
+            capability.request_schema.as_ref().and_then(|schema| {
+                schema.pointer(
+                    "/properties/include/items/oneOf/1/properties/email_domain/properties/domain/format",
+                )
+            }),
+            Some(&json!("hostname")),
+            "runtime schema must mirror the catalog hostname contract"
+        );
+        let input = |domain: &str| CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+                "policy_id":"45e44306-0e2a-460a-94aa-34c21eefdb4a"
+            }),
+            body: Some(json!({
+                "include":[{"email_domain":{"domain":domain}}]
+            })),
+            ..CallInput::default()
+        };
+
+        assert!(
+            super::validate_access_human_policy_desired_input(
+                &capability,
+                &input("advisors.mlnavigator.com"),
+            )
+            .is_ok(),
+            "ordinary hostname selector must remain valid"
+        );
+        assert!(
+            super::validate_access_human_policy_desired_input(&capability, &input("not a domain"),)
+                .is_err(),
+            "malformed email-domain selector reached approval-ready plan input"
         );
     }
 

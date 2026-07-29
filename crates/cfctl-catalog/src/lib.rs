@@ -13310,6 +13310,7 @@ const ACCESS_POLICY_UPDATE_CAPABILITY_ID: &str = "access-policies-update-an-acce
 const ACCESS_POLICY_READ_CAPABILITY_ID: &str = "access-policies-get-an-access-policy";
 const ACCESS_POLICY_DETAIL_PATH: &str =
     "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
+const ACCESS_POLICY_UPDATE_REQUEST_SCHEMA_POINTER: &str = "/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}~1policies~1{policy_id}/put/requestBody/content/application~1json/schema";
 
 /// Exact Cloudflare Access identity-provider identifier renderings accepted by
 /// the API: 32 hexadecimal characters or the canonical 36-character
@@ -14982,6 +14983,7 @@ fn access_human_policy_identity_rule_schema() -> Value {
                         "properties":{
                             "domain":{
                                 "type":"string",
+                                "format":"hostname",
                                 "minLength":3,
                                 "maxLength":253
                             }
@@ -15157,8 +15159,18 @@ fn finalize_access_human_policy_contract(
 
     let source_identity_supported = access_policy_update_identity_supported(&capability);
     let read_identity_supported = access_policy_read_identity_supported(capabilities);
+    let curated_request_schema = access_human_policy_schema();
+    let source_request_schema = document.pointer(ACCESS_POLICY_UPDATE_REQUEST_SCHEMA_POINTER);
+    let source_request_schema_present = source_request_schema.is_some();
+    let source_request_body_compatible = source_request_schema.is_some_and(|source_schema| {
+        access_application_source_request_body_compatible(
+            document,
+            source_schema,
+            &curated_request_schema,
+        )
+    });
 
-    capability.request_schema = Some(access_human_policy_schema());
+    capability.request_schema = Some(curated_request_schema);
     let verified_response_fields = capability
         .verifiable_request_object_fields()
         .unwrap_or_default();
@@ -15167,6 +15179,8 @@ fn finalize_access_human_policy_contract(
 
     if !source_identity_supported
         || !read_identity_supported
+        || !source_request_schema_present
+        || !source_request_body_compatible
         || verified_response_fields.is_empty()
         || !missing_readback_fields.is_empty()
     {
@@ -15176,6 +15190,12 @@ fn finalize_access_human_policy_contract(
         }
         if !read_identity_supported {
             drift.push("detail-read identity".to_owned());
+        }
+        if !source_request_schema_present {
+            drift.push("source PUT request body".to_owned());
+        }
+        if source_request_schema_present && !source_request_body_compatible {
+            drift.push("source PUT request body incompatibility".to_owned());
         }
         if verified_response_fields.is_empty() {
             drift.push("closed human policy fields".to_owned());

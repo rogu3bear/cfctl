@@ -4736,7 +4736,7 @@ fn access_application_complete_snapshot_mismatches(
     planned: &serde_json::Map<String, Value>,
     actual: &Value,
 ) -> Vec<String> {
-    const RESPONSE_ONLY_FIELDS: &[&str] = &["aud", "created_at", "id", "uid", "updated_at"];
+    const COMMON_RESPONSE_ONLY_FIELDS: &[&str] = &["aud", "created_at", "id", "uid", "updated_at"];
     match (
         capability.id.as_str(),
         capability.method.as_str(),
@@ -4756,7 +4756,12 @@ fn access_application_complete_snapshot_mismatches(
     let mut mismatches = actual
         .keys()
         .filter(|field| {
-            !planned.contains_key(field.as_str()) && !RESPONSE_ONLY_FIELDS.contains(&field.as_str())
+            let launcher_response_only = capability.id
+                == "access-applications-update-app-launcher-login-methods"
+                && matches!(field.as_str(), "domain" | "name");
+            !planned.contains_key(field.as_str())
+                && !COMMON_RESPONSE_ONLY_FIELDS.contains(&field.as_str())
+                && !launcher_response_only
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -5526,6 +5531,52 @@ mod access_application_projection_tests {
         assert!(
             certified_drift.is_empty(),
             "closed Access application verification certified drifted readbacks: {certified_drift:?}"
+        );
+    }
+
+    #[test]
+    fn access_app_launcher_readback_allows_documented_response_only_domain_and_name() {
+        let mut capability = CapabilityV1::new(
+            "access-applications-update-app-launcher-login-methods",
+            "Update Access App Launcher login methods",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}",
+        );
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{
+                "allowed_idps":{"type":"array","items":{"type":"string"}},
+                "landing_page_design":{"type":"object"}
+            }
+        }));
+        capability.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+            path: capability.path.clone(),
+            read_capability_id: "access-applications-get-an-access-application".to_owned(),
+            verified_response_fields: vec![
+                "allowed_idps".to_owned(),
+                "landing_page_design".to_owned(),
+            ],
+        });
+        let planned = serde_json::Map::from_iter([
+            (
+                "allowed_idps".to_owned(),
+                json!(["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"]),
+            ),
+            ("landing_page_design".to_owned(), json!({})),
+        ]);
+        let readback = json!({
+            "allowed_idps":["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"],
+            "domain":"launcher.mlnavigator.com",
+            "landing_page_design":{},
+            "name":"MLNavigator App Launcher"
+        });
+
+        let mismatches =
+            super::mismatched_verifiable_planned_fields(&capability, &planned, &readback);
+        assert!(
+            mismatches.is_empty(),
+            "documented App Launcher response-only fields were rejected: {mismatches:?}"
         );
     }
 

@@ -814,7 +814,11 @@ fn chained_get(
 fn chained_delete(primary: &dyn SecretStore, fallback: &dyn SecretStore, key: &str) -> Result<()> {
     let primary_result = primary.delete(key);
     let fallback_result = fallback.delete(key);
-    let journal_result = fallback.delete(fallback_journal_key(key).as_str());
+    let journal_result = if fallback_result.is_ok() {
+        fallback.delete(fallback_journal_key(key).as_str())
+    } else {
+        Ok(())
+    };
     primary_result?;
     fallback_result?;
     journal_result
@@ -1061,6 +1065,48 @@ mod tests {
             Err(AuthError::SecretStore(
                 "fallback store rejected the delete".to_owned(),
             ))
+        }
+
+        fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
+            self.inner.locate(key)
+        }
+    }
+
+    #[derive(Default)]
+    struct LegacyDeleteRejectingSecretStore {
+        inner: MemorySecretStore,
+        delete_attempts: Mutex<Vec<String>>,
+    }
+
+    impl LegacyDeleteRejectingSecretStore {
+        fn delete_attempts(&self) -> Vec<String> {
+            self.delete_attempts
+                .lock()
+                .expect("delete-attempt lock")
+                .clone()
+        }
+    }
+
+    impl SecretStore for LegacyDeleteRejectingSecretStore {
+        fn put(&self, key: &str, value: &str) -> Result<()> {
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.inner.get(key)
+        }
+
+        fn delete(&self, key: &str) -> Result<()> {
+            self.delete_attempts
+                .lock()
+                .expect("delete-attempt lock")
+                .push(key.to_owned());
+            if key == "k" {
+                return Err(AuthError::SecretStore(
+                    "legacy fallback delete rejected".to_owned(),
+                ));
+            }
+            self.inner.delete(key)
         }
 
         fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
@@ -1593,6 +1639,64 @@ mod tests {
                 .get(fallback_journal_key("k").as_str())
                 .expect("journal"),
             None
+        );
+    }
+
+    #[test]
+    fn chained_delete_clears_primary_legacy_and_journal_on_success() {
+        let primary = MemorySecretStore::default();
+        let fallback = MemorySecretStore::default();
+        let journal_key = fallback_journal_key("k");
+        primary.put("k", "fresh").expect("seed primary");
+        fallback.put("k", "fresh").expect("seed legacy fallback");
+        fallback
+            .put(journal_key.as_str(), "fresh")
+            .expect("seed journal");
+
+        chained_delete(&primary, &fallback, "k").expect("ordinary chained delete");
+
+        assert_eq!(primary.get("k").expect("primary state"), None);
+        assert_eq!(fallback.get("k").expect("legacy fallback state"), None);
+        assert_eq!(
+            fallback.get(journal_key.as_str()).expect("journal state"),
+            None
+        );
+    }
+
+    #[test]
+    fn chained_delete_preserves_fresh_journal_when_legacy_cleanup_fails() {
+        let primary = MemorySecretStore::default();
+        let fallback = LegacyDeleteRejectingSecretStore::default();
+        let journal_key = fallback_journal_key("k");
+        primary.put("k", "fresh").expect("seed fresh primary");
+        fallback.put("k", "stale").expect("seed stale fallback");
+        fallback
+            .put(journal_key.as_str(), "fresh")
+            .expect("seed fresh journal");
+
+        let error = chained_delete(&primary, &fallback, "k")
+            .expect_err("legacy fallback cleanup failure must surface");
+
+        assert!(
+            error
+                .to_string()
+                .contains("legacy fallback delete rejected")
+        );
+        assert_eq!(primary.get("k").expect("primary state"), None);
+        assert_eq!(
+            fallback.get(journal_key.as_str()).expect("journal state"),
+            Some("fresh".to_owned()),
+            "fresh journal must survive until stale legacy fallback cleanup succeeds"
+        );
+        assert_eq!(
+            chained_get(&primary, &fallback, "k").expect("recoverable credential"),
+            Some("fresh".to_owned()),
+            "failed logout must not make stale legacy state authoritative"
+        );
+        assert_eq!(
+            fallback.delete_attempts(),
+            vec!["k".to_owned()],
+            "primary and legacy cleanup must be attempted without deleting the authoritative journal"
         );
     }
 
