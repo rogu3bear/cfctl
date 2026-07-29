@@ -4720,12 +4720,84 @@ fn mismatched_verifiable_planned_fields(
     mismatches.extend(access_exact_snapshot_optional_absence_mismatches(
         capability, planned, actual,
     ));
+    mismatches.extend(access_application_complete_snapshot_mismatches(
+        capability, planned, actual,
+    ));
     mismatches.extend(access_human_policy_complete_snapshot_mismatches(
         capability, actual,
     ));
     mismatches.sort();
     mismatches.dedup();
     mismatches
+}
+
+fn access_application_complete_snapshot_mismatches(
+    capability: &CapabilityV1,
+    planned: &serde_json::Map<String, Value>,
+    actual: &Value,
+) -> Vec<String> {
+    const RESPONSE_ONLY_FIELDS: &[&str] = &["aud", "created_at", "id", "uid", "updated_at"];
+    match (
+        capability.id.as_str(),
+        capability.method.as_str(),
+        capability.path.as_str(),
+    ) {
+        (
+            "access-applications-update-self-hosted-login-methods",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}",
+        )
+        | (
+            "access-applications-update-app-launcher-login-methods",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}",
+        ) => {}
+        _ => return Vec::new(),
+    }
+    let Some(actual) = actual.as_object() else {
+        return vec!["access_application_snapshot".to_owned()];
+    };
+    let mut mismatches = actual
+        .keys()
+        .filter(|field| {
+            !planned.contains_key(field.as_str()) && !RESPONSE_ONLY_FIELDS.contains(&field.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for (name, planned_value) in planned {
+        if matches!(name.as_str(), "allowed_idps" | "policies") {
+            continue;
+        }
+        let response_field =
+            verification_response_field(capability, name).unwrap_or_else(|| name.clone());
+        if actual
+            .get(response_field.as_str())
+            .is_some_and(|actual_value| {
+                has_unplanned_recursive_members(actual_value, planned_value)
+            })
+        {
+            mismatches.push(name.clone());
+        }
+    }
+    mismatches
+}
+
+fn has_unplanned_recursive_members(actual: &Value, planned: &Value) -> bool {
+    match (actual, planned) {
+        (Value::Object(actual), Value::Object(planned)) => actual.iter().any(|(name, value)| {
+            planned
+                .get(name)
+                .is_none_or(|planned| has_unplanned_recursive_members(value, planned))
+        }),
+        (Value::Array(actual), Value::Array(planned)) => {
+            actual.len() != planned.len()
+                || actual
+                    .iter()
+                    .zip(planned)
+                    .any(|(actual, planned)| has_unplanned_recursive_members(actual, planned))
+        }
+        _ => false,
+    }
 }
 
 fn access_human_policy_complete_snapshot_mismatches(
@@ -5360,6 +5432,104 @@ mod access_application_projection_tests {
         assert_eq!(
             super::mismatched_verifiable_planned_fields(&launcher, &requested, &json!({})),
             vec!["custom_deny_url"]
+        );
+    }
+
+    #[test]
+    fn access_application_complete_readback_rejects_unplanned_top_level_and_nested_drift() {
+        let variants = [
+            (
+                "access-applications-update-self-hosted-login-methods",
+                "destinations",
+                json!([{"type":"public","uri":"investors.mlnavigator.com"}]),
+                json!([{
+                    "type":"public",
+                    "uri":"investors.mlnavigator.com",
+                    "future_routing_flag":true
+                }]),
+                "tags",
+                json!(["customer:unexpected"]),
+            ),
+            (
+                "access-applications-update-app-launcher-login-methods",
+                "landing_page_design",
+                json!({}),
+                json!({"future_layout_mode":"provider-materialized"}),
+                "bg_color",
+                json!("#000000"),
+            ),
+        ];
+        let mut certified_drift = Vec::new();
+
+        for (
+            capability_id,
+            nested_field,
+            planned_nested,
+            drifted_nested,
+            known_unplanned_field,
+            known_unplanned_value,
+        ) in variants
+        {
+            let mut capability = CapabilityV1::new(
+                capability_id,
+                "Update Access application login methods",
+                "PUT",
+                "/accounts/{account_id}/access/apps/{app_id}",
+            );
+            capability.request_schema = Some(json!({
+                "type":"object",
+                "additionalProperties":false,
+                "properties":{
+                    "allowed_idps":{"type":"array","items":{"type":"string"}},
+                    nested_field: {}
+                }
+            }));
+            capability.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+                path: capability.path.clone(),
+                read_capability_id: "access-applications-get-an-access-application".to_owned(),
+                verified_response_fields: vec!["allowed_idps".to_owned(), nested_field.to_owned()],
+            });
+            let planned = serde_json::Map::from_iter([
+                (
+                    "allowed_idps".to_owned(),
+                    json!(["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"]),
+                ),
+                (nested_field.to_owned(), planned_nested.clone()),
+            ]);
+            let matching = json!({
+                "allowed_idps":["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"],
+                nested_field:planned_nested
+            });
+            assert!(
+                super::mismatched_verifiable_planned_fields(&capability, &planned, &matching)
+                    .is_empty(),
+                "{capability_id} matching readback must remain valid"
+            );
+
+            let mut top_level_drift = matching.clone();
+            top_level_drift["future_writable_field"] = json!({"must_be_preserved":true});
+            let mut known_top_level_drift = matching.clone();
+            known_top_level_drift[known_unplanned_field] = known_unplanned_value;
+            let nested_drift = json!({
+                "allowed_idps":["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"],
+                nested_field:drifted_nested
+            });
+            for (kind, readback) in [
+                ("unplanned top-level field", top_level_drift),
+                ("known but unplanned mutable field", known_top_level_drift),
+                ("unplanned nested field", nested_drift),
+            ] {
+                if super::mismatched_verifiable_planned_fields(&capability, &planned, &readback)
+                    .is_empty()
+                {
+                    certified_drift.push(format!("{capability_id}: {kind}"));
+                }
+            }
+        }
+
+        assert!(
+            certified_drift.is_empty(),
+            "closed Access application verification certified drifted readbacks: {certified_drift:?}"
         );
     }
 

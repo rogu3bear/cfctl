@@ -13297,6 +13297,7 @@ const QUEUE_CONFIGURATION_CONTRACTS: &[QueueConfigurationContract] = &[
 
 const ACCESS_APP_COLLECTION_PATH: &str = "/accounts/{account_id}/access/apps";
 const ACCESS_APP_DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}";
+const ACCESS_APP_UPDATE_REQUEST_SCHEMA_POINTER: &str = "/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}/put/requestBody/content/application~1json/schema";
 const ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID: &str =
     "access-applications-update-self-hosted-login-methods";
 const ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID: &str =
@@ -13584,6 +13585,1224 @@ struct AccessApplicationLoginMethodsContractSpec {
     request_schema: Value,
 }
 
+fn access_application_source_request_body_compatible(
+    document: &Value,
+    source_schema: &Value,
+    curated_schema: &Value,
+) -> bool {
+    let Some(curated_properties) = curated_schema.get("properties").and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let mut active_references = BTreeSet::new();
+    if !access_source_schema_is_supported(document, source_schema, 0, &mut active_references) {
+        return false;
+    }
+    curated_properties.keys().all(|field| {
+        source_schema_declares_top_level_field(
+            document,
+            source_schema,
+            field,
+            0,
+            &mut active_references,
+        )
+    }) && source_schema_accepts_curated(
+        document,
+        source_schema,
+        curated_schema,
+        0,
+        &mut active_references,
+    )
+}
+
+fn access_source_schema_is_supported(
+    document: &Value,
+    source_schema: &Value,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if depth >= MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
+        return false;
+    }
+    let Some(source) = source_schema.as_object() else {
+        return false;
+    };
+    let Ok(reference) = access_source_reference_target(document, source) else {
+        return false;
+    };
+    if let Some((reference, target)) = reference {
+        if !active_references.insert(reference.clone()) {
+            return false;
+        }
+        let supported =
+            access_source_schema_is_supported(document, target, depth + 1, active_references);
+        active_references.remove(&reference);
+        return supported;
+    }
+    if !access_source_schema_uses_supported_keywords(source) {
+        return false;
+    }
+    for composition in ["allOf", "oneOf", "anyOf"] {
+        if let Some(members) = source.get(composition) {
+            let Some(members) = members.as_array().filter(|members| !members.is_empty()) else {
+                return false;
+            };
+            if !members.iter().all(|member| {
+                access_source_schema_is_supported(document, member, depth + 1, active_references)
+            }) {
+                return false;
+            }
+        }
+    }
+    if let Some(properties) = source.get("properties") {
+        let Some(properties) = properties.as_object() else {
+            return false;
+        };
+        if !properties.values().all(|property| {
+            access_source_schema_is_supported(document, property, depth + 1, active_references)
+        }) {
+            return false;
+        }
+    }
+    for nested in ["items", "additionalProperties"] {
+        if let Some(schema) = source.get(nested) {
+            match schema {
+                Value::Bool(_) => {}
+                Value::Object(_) => {
+                    if !access_source_schema_is_supported(
+                        document,
+                        schema,
+                        depth + 1,
+                        active_references,
+                    ) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+fn access_source_annotation_keyword(key: &str) -> bool {
+    key.starts_with("x-")
+        || matches!(
+            key,
+            "$comment"
+                | "default"
+                | "deprecated"
+                | "description"
+                | "discriminator"
+                | "example"
+                | "examples"
+                | "externalDocs"
+                | "readOnly"
+                | "title"
+                | "writeOnly"
+                | "xml"
+        )
+}
+
+fn access_source_schema_uses_supported_keywords(source: &Map<String, Value>) -> bool {
+    source.keys().all(|key| {
+        access_source_annotation_keyword(key)
+            || matches!(
+                key.as_str(),
+                "type"
+                    | "enum"
+                    | "const"
+                    | "format"
+                    | "pattern"
+                    | "nullable"
+                    | "minimum"
+                    | "maximum"
+                    | "exclusiveMinimum"
+                    | "exclusiveMaximum"
+                    | "multipleOf"
+                    | "minLength"
+                    | "maxLength"
+                    | "minItems"
+                    | "maxItems"
+                    | "uniqueItems"
+                    | "items"
+                    | "minProperties"
+                    | "maxProperties"
+                    | "required"
+                    | "properties"
+                    | "additionalProperties"
+                    | "allOf"
+                    | "oneOf"
+                    | "anyOf"
+            )
+    })
+}
+
+fn access_source_reference_target<'a>(
+    document: &'a Value,
+    source: &'a Map<String, Value>,
+) -> std::result::Result<Option<(String, &'a Value)>, ()> {
+    let Some(reference) = source.get("$ref") else {
+        return Ok(None);
+    };
+    if source
+        .keys()
+        .any(|key| key != "$ref" && !access_source_annotation_keyword(key))
+    {
+        return Err(());
+    }
+    let reference = reference.as_str().ok_or(())?;
+    let pointer = reference
+        .strip_prefix('#')
+        .filter(|pointer| pointer.starts_with('/'))
+        .ok_or(())?;
+    let target = document.pointer(pointer).ok_or(())?;
+    Ok(Some((reference.to_owned(), target)))
+}
+
+fn source_schema_declares_top_level_field(
+    document: &Value,
+    source_schema: &Value,
+    field: &str,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if depth >= MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
+        return false;
+    }
+    let Some(source) = source_schema.as_object() else {
+        return false;
+    };
+    let Ok(reference) = access_source_reference_target(document, source) else {
+        return false;
+    };
+    if let Some((reference, target)) = reference {
+        if !active_references.insert(reference.clone()) {
+            return false;
+        }
+        let declared = source_schema_declares_top_level_field(
+            document,
+            target,
+            field,
+            depth + 1,
+            active_references,
+        );
+        active_references.remove(&reference);
+        return declared;
+    }
+    if !access_source_schema_uses_supported_keywords(source) {
+        return false;
+    }
+    if source_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| properties.contains_key(field))
+    {
+        return true;
+    }
+    ["allOf", "oneOf", "anyOf"].into_iter().any(|composition| {
+        source_schema
+            .get(composition)
+            .and_then(Value::as_array)
+            .is_some_and(|members| {
+                !members.is_empty()
+                    && members.iter().any(|member| {
+                        source_schema_declares_top_level_field(
+                            document,
+                            member,
+                            field,
+                            depth + 1,
+                            active_references,
+                        )
+                    })
+            })
+    })
+}
+
+fn source_schema_accepts_curated(
+    document: &Value,
+    source_schema: &Value,
+    curated_schema: &Value,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if depth >= MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
+        return false;
+    }
+    let Some(source) = source_schema.as_object() else {
+        return false;
+    };
+    let Ok(reference) = access_source_reference_target(document, source) else {
+        return false;
+    };
+    if let Some((reference, target)) = reference {
+        if !active_references.insert(reference.clone()) {
+            return false;
+        }
+        let accepted = source_schema_accepts_curated(
+            document,
+            target,
+            curated_schema,
+            depth + 1,
+            active_references,
+        );
+        active_references.remove(&reference);
+        return accepted;
+    }
+    if !access_source_schema_uses_supported_keywords(source) {
+        return false;
+    }
+    let Some(curated) = curated_schema.as_object() else {
+        return false;
+    };
+
+    let curated_one_of = schema_composition_members(curated, "oneOf");
+    let curated_any_of = schema_composition_members(curated, "anyOf");
+    if curated_one_of.is_err()
+        || curated_any_of.is_err()
+        || (curated_one_of.as_ref().is_ok_and(Option::is_some)
+            && curated_any_of.as_ref().is_ok_and(Option::is_some))
+    {
+        return false;
+    }
+    if let Some(members) = curated_one_of
+        .ok()
+        .flatten()
+        .or_else(|| curated_any_of.ok().flatten())
+    {
+        return curated_composition_is_accepted(
+            document,
+            source_schema,
+            curated,
+            members,
+            depth,
+            active_references,
+        );
+    }
+    if curated.get("allOf").is_some() {
+        return false;
+    }
+    source_direct_constraints_accept_curated(document, source, curated, depth, active_references)
+        && source_compositions_accept_curated(
+            document,
+            source,
+            curated_schema,
+            depth,
+            active_references,
+        )
+}
+
+fn curated_composition_is_accepted(
+    document: &Value,
+    source_schema: &Value,
+    curated: &Map<String, Value>,
+    members: &[Value],
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    !members.is_empty()
+        && !schema_has_direct_constraints(curated)
+        && members.iter().all(|member| {
+            source_schema_accepts_curated(
+                document,
+                source_schema,
+                member,
+                depth + 1,
+                active_references,
+            )
+        })
+}
+
+fn source_compositions_accept_curated(
+    document: &Value,
+    source: &Map<String, Value>,
+    curated_schema: &Value,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    let Ok(source_all_of) = schema_composition_members(source, "allOf") else {
+        return false;
+    };
+    if source_all_of.is_some_and(|members| {
+        members.is_empty()
+            || !members.iter().all(|member| {
+                source_schema_accepts_curated(
+                    document,
+                    member,
+                    curated_schema,
+                    depth + 1,
+                    active_references,
+                )
+            })
+    }) {
+        return false;
+    }
+
+    let source_one_of = schema_composition_members(source, "oneOf");
+    let source_any_of = schema_composition_members(source, "anyOf");
+    if source_one_of.is_err()
+        || source_any_of.is_err()
+        || (source_one_of.as_ref().is_ok_and(Option::is_some)
+            && source_any_of.as_ref().is_ok_and(Option::is_some))
+    {
+        return false;
+    }
+    if let Some(members) = source_one_of.ok().flatten() {
+        return source_one_of_accepts_curated(
+            document,
+            members,
+            curated_schema,
+            depth + 1,
+            active_references,
+        );
+    }
+    source_any_of.ok().flatten().is_none_or(|members| {
+        !members.is_empty()
+            && members.iter().any(|member| {
+                source_schema_accepts_curated(
+                    document,
+                    member,
+                    curated_schema,
+                    depth + 1,
+                    active_references,
+                )
+            })
+    })
+}
+
+fn source_one_of_accepts_curated(
+    document: &Value,
+    members: &[Value],
+    curated_schema: &Value,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if members.is_empty() {
+        return false;
+    }
+    let mut accepting_member = None;
+    for (index, member) in members.iter().enumerate() {
+        if source_schema_accepts_curated(document, member, curated_schema, depth, active_references)
+            && accepting_member.replace(index).is_some()
+        {
+            return false;
+        }
+    }
+    let Some(accepting_member) = accepting_member else {
+        return false;
+    };
+    members.iter().enumerate().all(|(index, member)| {
+        index == accepting_member
+            || source_schema_is_provably_disjoint(
+                document,
+                member,
+                curated_schema,
+                depth,
+                active_references,
+            )
+    })
+}
+
+fn source_schema_is_provably_disjoint(
+    document: &Value,
+    source_schema: &Value,
+    curated_schema: &Value,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if depth >= MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
+        return false;
+    }
+    let Some(source) = source_schema.as_object() else {
+        return false;
+    };
+    let Ok(reference) = access_source_reference_target(document, source) else {
+        return false;
+    };
+    if let Some((reference, target)) = reference {
+        if !active_references.insert(reference.clone()) {
+            return false;
+        }
+        let disjoint = source_schema_is_provably_disjoint(
+            document,
+            target,
+            curated_schema,
+            depth + 1,
+            active_references,
+        );
+        active_references.remove(&reference);
+        return disjoint;
+    }
+    if !access_source_schema_uses_supported_keywords(source) {
+        return false;
+    }
+    let Some(curated) = curated_schema.as_object() else {
+        return false;
+    };
+
+    if ["oneOf", "anyOf"]
+        .into_iter()
+        .any(|composition| curated.contains_key(composition))
+    {
+        return curated_union_compositions_prove_disjoint(
+            document,
+            source_schema,
+            curated,
+            depth,
+            active_references,
+        );
+    }
+    if let Some(members) = curated.get("allOf") {
+        let Some(members) = members.as_array().filter(|members| !members.is_empty()) else {
+            return false;
+        };
+        if curated_all_of_proves_disjoint(
+            document,
+            source_schema,
+            members,
+            depth,
+            active_references,
+        ) {
+            return true;
+        }
+    }
+    if !scalar_constraints_are_well_formed(source, curated) {
+        return false;
+    }
+    if scalar_constraints_prove_disjoint(source, curated) {
+        return true;
+    }
+    if source_union_composition_is_empty(source) {
+        return false;
+    }
+    if source_compositions_prove_disjoint(
+        document,
+        source,
+        curated_schema,
+        depth,
+        active_references,
+    ) {
+        return true;
+    }
+    required_object_property_proves_disjoint(document, source, curated, depth, active_references)
+}
+
+fn curated_union_compositions_prove_disjoint(
+    document: &Value,
+    source_schema: &Value,
+    curated: &Map<String, Value>,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    for composition in ["oneOf", "anyOf"] {
+        if let Some(members) = curated.get(composition) {
+            let Some(members) = members.as_array().filter(|members| !members.is_empty()) else {
+                return false;
+            };
+            return members.iter().all(|member| {
+                source_schema_is_provably_disjoint(
+                    document,
+                    source_schema,
+                    member,
+                    depth + 1,
+                    active_references,
+                )
+            });
+        }
+    }
+    false
+}
+
+fn curated_all_of_proves_disjoint(
+    document: &Value,
+    source_schema: &Value,
+    members: &[Value],
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    members.iter().any(|member| {
+        source_schema_is_provably_disjoint(
+            document,
+            source_schema,
+            member,
+            depth + 1,
+            active_references,
+        )
+    })
+}
+
+fn scalar_constraints_are_well_formed(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+) -> bool {
+    schema_possible_types(source).is_ok()
+        && schema_possible_types(curated).is_ok()
+        && schema_finite_values(source).is_ok()
+        && schema_finite_values(curated).is_ok()
+}
+
+fn scalar_constraints_prove_disjoint(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+) -> bool {
+    let (Ok(source_types), Ok(curated_types)) = (
+        schema_possible_types(source),
+        schema_possible_types(curated),
+    ) else {
+        return false;
+    };
+    if let (Some(source_types), Some(curated_types)) =
+        (source_types.as_ref(), curated_types.as_ref())
+        && !json_schema_type_sets_overlap(source_types, curated_types)
+    {
+        return true;
+    }
+
+    let (Ok(source_values), Ok(curated_values)) =
+        (schema_finite_values(source), schema_finite_values(curated))
+    else {
+        return false;
+    };
+    matches!(
+        (source_values.as_ref(), curated_values.as_ref()),
+        (Some(source_values), Some(curated_values))
+            if source_values
+                .iter()
+                .all(|source_value| !curated_values.contains(source_value))
+    )
+}
+
+fn source_union_composition_is_empty(source: &Map<String, Value>) -> bool {
+    ["oneOf", "anyOf"].into_iter().any(|composition| {
+        matches!(
+            schema_composition_members(source, composition),
+            Ok(Some(members)) if members.is_empty()
+        )
+    })
+}
+
+fn source_compositions_prove_disjoint(
+    document: &Value,
+    source: &Map<String, Value>,
+    curated_schema: &Value,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if let Ok(Some(members)) = schema_composition_members(source, "allOf")
+        && !members.is_empty()
+        && members.iter().any(|member| {
+            source_schema_is_provably_disjoint(
+                document,
+                member,
+                curated_schema,
+                depth + 1,
+                active_references,
+            )
+        })
+    {
+        return true;
+    }
+    for composition in ["oneOf", "anyOf"] {
+        if let Ok(Some(members)) = schema_composition_members(source, composition)
+            && members.iter().all(|member| {
+                source_schema_is_provably_disjoint(
+                    document,
+                    member,
+                    curated_schema,
+                    depth + 1,
+                    active_references,
+                )
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn required_object_property_proves_disjoint(
+    document: &Value,
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    let Ok(curated_types) = schema_possible_types(curated) else {
+        return false;
+    };
+    if curated_types
+        .as_ref()
+        .is_none_or(|types| types != &BTreeSet::from(["object".to_owned()]))
+    {
+        return false;
+    }
+    let Ok(curated_required) = schema_required_fields(curated) else {
+        return false;
+    };
+    let source_properties = match source.get("properties") {
+        None => None,
+        Some(Value::Object(properties)) => Some(properties),
+        Some(_) => return false,
+    };
+    let curated_properties = match curated.get("properties") {
+        None => None,
+        Some(Value::Object(properties)) => Some(properties),
+        Some(_) => return false,
+    };
+    let (Ok(source_additional), Ok(curated_additional)) = (
+        schema_allowance(source.get("additionalProperties")),
+        schema_allowance(curated.get("additionalProperties")),
+    ) else {
+        return false;
+    };
+    curated_required.iter().any(|field| {
+        let source_property = source_properties
+            .and_then(|properties| properties.get(field))
+            .map_or(source_additional, SchemaAllowance::Schema);
+        let curated_property = curated_properties
+            .and_then(|properties| properties.get(field))
+            .map_or(curated_additional, SchemaAllowance::Schema);
+        match (source_property, curated_property) {
+            (SchemaAllowance::Forbidden, SchemaAllowance::Schema(_)) => true,
+            (
+                SchemaAllowance::Schema(source_property),
+                SchemaAllowance::Schema(curated_property),
+            ) => source_schema_is_provably_disjoint(
+                document,
+                source_property,
+                curated_property,
+                depth + 1,
+                active_references,
+            ),
+            _ => false,
+        }
+    })
+}
+
+fn json_schema_type_sets_overlap(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
+    left.iter().any(|left_type| {
+        right.iter().any(|right_type| {
+            left_type == right_type
+                || matches!(
+                    (left_type.as_str(), right_type.as_str()),
+                    ("number", "integer") | ("integer", "number")
+                )
+        })
+    })
+}
+
+fn schema_composition_members<'a>(
+    schema: &'a Map<String, Value>,
+    key: &str,
+) -> std::result::Result<Option<&'a [Value]>, ()> {
+    schema
+        .get(key)
+        .map(|value| value.as_array().map(Vec::as_slice).ok_or(()))
+        .transpose()
+}
+
+fn schema_has_direct_constraints(schema: &Map<String, Value>) -> bool {
+    [
+        "type",
+        "enum",
+        "const",
+        "format",
+        "pattern",
+        "nullable",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minProperties",
+        "maxProperties",
+        "required",
+        "properties",
+        "additionalProperties",
+        "items",
+    ]
+    .iter()
+    .any(|key| schema.contains_key(*key))
+}
+
+fn source_direct_constraints_accept_curated(
+    document: &Value,
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    let Ok(source_types) = schema_possible_types(source) else {
+        return false;
+    };
+    let Ok(curated_types) = schema_possible_types(curated) else {
+        return false;
+    };
+    if source_types.as_ref().is_some_and(|source_types| {
+        curated_types.as_ref().is_none_or(|curated_types| {
+            curated_types.iter().any(|curated_type| {
+                !(source_types.contains(curated_type)
+                    || curated_type == "integer" && source_types.contains("number"))
+            })
+        })
+    }) {
+        return false;
+    }
+
+    let Ok(source_values) = schema_finite_values(source) else {
+        return false;
+    };
+    let Ok(curated_values) = schema_finite_values(curated) else {
+        return false;
+    };
+    if source_values.as_ref().is_some_and(|source_values| {
+        curated_values.as_ref().is_none_or(|curated_values| {
+            curated_values
+                .iter()
+                .any(|curated_value| !source_values.contains(curated_value))
+        })
+    }) {
+        return false;
+    }
+
+    let curated_may_be_string = schema_may_include_type(curated_types.as_ref(), "string");
+    if curated_may_be_string
+        && (!source_exact_constraint_accepts_curated(source, curated, "format")
+            || !source_exact_constraint_accepts_curated(source, curated, "pattern")
+            || !source_minimum_u64_accepts_curated(source, curated, "minLength")
+            || !source_maximum_u64_accepts_curated(source, curated, "maxLength"))
+    {
+        return false;
+    }
+
+    let curated_may_be_number = schema_may_include_type(curated_types.as_ref(), "number")
+        || schema_may_include_type(curated_types.as_ref(), "integer");
+    if curated_may_be_number
+        && (!source_numeric_lower_bound_accepts_curated(source, curated)
+            || !source_numeric_upper_bound_accepts_curated(source, curated)
+            || !source_exact_constraint_accepts_curated(source, curated, "multipleOf"))
+    {
+        return false;
+    }
+
+    let source_has_array_constraints = ["minItems", "maxItems", "uniqueItems", "items"]
+        .iter()
+        .any(|key| source.contains_key(*key));
+    if source_has_array_constraints
+        && schema_may_include_type(curated_types.as_ref(), "array")
+        && !source_array_constraints_accept_curated(
+            document,
+            source,
+            curated,
+            depth,
+            active_references,
+        )
+    {
+        return false;
+    }
+
+    let source_has_object_constraints = [
+        "minProperties",
+        "maxProperties",
+        "required",
+        "properties",
+        "additionalProperties",
+    ]
+    .iter()
+    .any(|key| source.contains_key(*key));
+    !source_has_object_constraints
+        || !schema_may_include_type(curated_types.as_ref(), "object")
+        || source_object_constraints_accept_curated(
+            document,
+            source,
+            curated,
+            depth,
+            active_references,
+        )
+}
+
+fn schema_possible_types(
+    schema: &Map<String, Value>,
+) -> std::result::Result<Option<BTreeSet<String>>, ()> {
+    let mut types = match schema.get("type") {
+        None => None,
+        Some(Value::String(value)) => Some(BTreeSet::from([value.clone()])),
+        Some(Value::Array(values)) if !values.is_empty() => {
+            let types = values
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()
+                .ok_or(())?;
+            Some(types.into_iter().map(str::to_owned).collect())
+        }
+        Some(_) => return Err(()),
+    };
+    if let Some(nullable) = schema.get("nullable") {
+        let nullable = nullable.as_bool().ok_or(())?;
+        if nullable && let Some(types) = types.as_mut() {
+            types.insert("null".to_owned());
+        }
+    }
+    Ok(types)
+}
+
+fn schema_may_include_type(types: Option<&BTreeSet<String>>, expected: &str) -> bool {
+    types.is_none_or(|types| types.contains(expected))
+}
+
+fn schema_finite_values(
+    schema: &Map<String, Value>,
+) -> std::result::Result<Option<Vec<&Value>>, ()> {
+    let enumeration = schema
+        .get("enum")
+        .map(|value| {
+            value
+                .as_array()
+                .filter(|values| !values.is_empty())
+                .ok_or(())
+        })
+        .transpose()?;
+    if let Some(constant) = schema.get("const") {
+        if enumeration.is_some_and(|values| !values.contains(constant)) {
+            return Err(());
+        }
+        return Ok(Some(vec![constant]));
+    }
+    Ok(enumeration.map(|values| values.iter().collect()))
+}
+
+fn source_exact_constraint_accepts_curated(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    key: &str,
+) -> bool {
+    source
+        .get(key)
+        .is_none_or(|source_value| curated.get(key) == Some(source_value))
+}
+
+fn source_minimum_u64_accepts_curated(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    key: &str,
+) -> bool {
+    let Some(source_minimum) = source.get(key) else {
+        return true;
+    };
+    let Some(source_minimum) = source_minimum.as_u64() else {
+        return false;
+    };
+    curated
+        .get(key)
+        .and_then(Value::as_u64)
+        .is_some_and(|curated_minimum| curated_minimum >= source_minimum)
+        || source_minimum == 0
+}
+
+fn source_maximum_u64_accepts_curated(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    key: &str,
+) -> bool {
+    let Some(source_maximum) = source.get(key) else {
+        return true;
+    };
+    let Some(source_maximum) = source_maximum.as_u64() else {
+        return false;
+    };
+    curated
+        .get(key)
+        .and_then(Value::as_u64)
+        .is_some_and(|curated_maximum| curated_maximum <= source_maximum)
+}
+
+fn schema_numeric_lower_bound(
+    schema: &Map<String, Value>,
+) -> std::result::Result<Option<(f64, bool)>, ()> {
+    let minimum = schema
+        .get("minimum")
+        .map(|value| value.as_f64().ok_or(()))
+        .transpose()?;
+    let exclusive = match schema.get("exclusiveMinimum") {
+        None | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some((minimum.ok_or(())?, true)),
+        Some(value) => Some((value.as_f64().ok_or(())?, true)),
+    };
+    Ok(stricter_numeric_lower_bound(
+        minimum.map(|minimum| (minimum, false)),
+        exclusive,
+    ))
+}
+
+fn schema_numeric_upper_bound(
+    schema: &Map<String, Value>,
+) -> std::result::Result<Option<(f64, bool)>, ()> {
+    let maximum = schema
+        .get("maximum")
+        .map(|value| value.as_f64().ok_or(()))
+        .transpose()?;
+    let exclusive = match schema.get("exclusiveMaximum") {
+        None | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some((maximum.ok_or(())?, true)),
+        Some(value) => Some((value.as_f64().ok_or(())?, true)),
+    };
+    Ok(stricter_numeric_upper_bound(
+        maximum.map(|maximum| (maximum, false)),
+        exclusive,
+    ))
+}
+
+fn stricter_numeric_lower_bound(
+    left: Option<(f64, bool)>,
+    right: Option<(f64, bool)>,
+) -> Option<(f64, bool)> {
+    match (left, right) {
+        (None, bound) | (bound, None) => bound,
+        (Some((left, left_exclusive)), Some((right, right_exclusive))) => {
+            if left > right {
+                Some((left, left_exclusive))
+            } else if right > left {
+                Some((right, right_exclusive))
+            } else {
+                Some((left, left_exclusive || right_exclusive))
+            }
+        }
+    }
+}
+
+fn stricter_numeric_upper_bound(
+    left: Option<(f64, bool)>,
+    right: Option<(f64, bool)>,
+) -> Option<(f64, bool)> {
+    match (left, right) {
+        (None, bound) | (bound, None) => bound,
+        (Some((left, left_exclusive)), Some((right, right_exclusive))) => {
+            if left < right {
+                Some((left, left_exclusive))
+            } else if right < left {
+                Some((right, right_exclusive))
+            } else {
+                Some((left, left_exclusive || right_exclusive))
+            }
+        }
+    }
+}
+
+fn source_numeric_lower_bound_accepts_curated(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+) -> bool {
+    let (Ok(source), Ok(curated)) = (
+        schema_numeric_lower_bound(source),
+        schema_numeric_lower_bound(curated),
+    ) else {
+        return false;
+    };
+    source.is_none_or(|(source_value, source_exclusive)| {
+        curated.is_some_and(|(curated_value, curated_exclusive)| {
+            match curated_value.partial_cmp(&source_value) {
+                Some(std::cmp::Ordering::Greater) => true,
+                Some(std::cmp::Ordering::Equal) => !source_exclusive || curated_exclusive,
+                Some(std::cmp::Ordering::Less) | None => false,
+            }
+        })
+    })
+}
+
+fn source_numeric_upper_bound_accepts_curated(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+) -> bool {
+    let (Ok(source), Ok(curated)) = (
+        schema_numeric_upper_bound(source),
+        schema_numeric_upper_bound(curated),
+    ) else {
+        return false;
+    };
+    source.is_none_or(|(source_value, source_exclusive)| {
+        curated.is_some_and(|(curated_value, curated_exclusive)| {
+            match curated_value.partial_cmp(&source_value) {
+                Some(std::cmp::Ordering::Less) => true,
+                Some(std::cmp::Ordering::Equal) => !source_exclusive || curated_exclusive,
+                Some(std::cmp::Ordering::Greater) | None => false,
+            }
+        })
+    })
+}
+
+fn source_array_constraints_accept_curated(
+    document: &Value,
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if !source_minimum_u64_accepts_curated(source, curated, "minItems")
+        || !source_maximum_u64_accepts_curated(source, curated, "maxItems")
+    {
+        return false;
+    }
+    if let Some(unique) = source.get("uniqueItems") {
+        let Some(unique) = unique.as_bool() else {
+            return false;
+        };
+        if unique && curated.get("uniqueItems").and_then(Value::as_bool) != Some(true) {
+            return false;
+        }
+    }
+    match source.get("items") {
+        None | Some(Value::Bool(true)) => true,
+        Some(Value::Bool(false)) => false,
+        Some(source_items) if source_items.is_object() => {
+            curated.get("items").is_some_and(|curated_items| {
+                curated_items.is_object()
+                    && source_schema_accepts_curated(
+                        document,
+                        source_items,
+                        curated_items,
+                        depth + 1,
+                        active_references,
+                    )
+            })
+        }
+        Some(_) => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SchemaAllowance<'a> {
+    Any,
+    Forbidden,
+    Schema(&'a Value),
+}
+
+fn schema_allowance(value: Option<&Value>) -> std::result::Result<SchemaAllowance<'_>, ()> {
+    match value {
+        None | Some(Value::Bool(true)) => Ok(SchemaAllowance::Any),
+        Some(Value::Bool(false)) => Ok(SchemaAllowance::Forbidden),
+        Some(value) if value.is_object() => Ok(SchemaAllowance::Schema(value)),
+        Some(_) => Err(()),
+    }
+}
+
+fn source_allowance_accepts_curated(
+    document: &Value,
+    source: SchemaAllowance<'_>,
+    curated: SchemaAllowance<'_>,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    match (source, curated) {
+        (SchemaAllowance::Any, _) | (_, SchemaAllowance::Forbidden) => true,
+        (SchemaAllowance::Forbidden, _) | (SchemaAllowance::Schema(_), SchemaAllowance::Any) => {
+            false
+        }
+        (SchemaAllowance::Schema(source), SchemaAllowance::Schema(curated)) => {
+            source_schema_accepts_curated(document, source, curated, depth + 1, active_references)
+        }
+    }
+}
+
+fn schema_required_fields(
+    schema: &Map<String, Value>,
+) -> std::result::Result<BTreeSet<String>, ()> {
+    schema.get("required").map_or_else(
+        || Ok(BTreeSet::new()),
+        |required| {
+            required
+                .as_array()
+                .ok_or(())?
+                .iter()
+                .map(|field| field.as_str().map(str::to_owned).ok_or(()))
+                .collect()
+        },
+    )
+}
+
+fn source_object_constraints_accept_curated(
+    document: &Value,
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if !source_minimum_u64_accepts_curated(source, curated, "minProperties")
+        || !source_maximum_u64_accepts_curated(source, curated, "maxProperties")
+    {
+        return false;
+    }
+    let (Ok(source_required), Ok(curated_required)) = (
+        schema_required_fields(source),
+        schema_required_fields(curated),
+    ) else {
+        return false;
+    };
+    if !source_required.is_subset(&curated_required) {
+        return false;
+    }
+    let source_properties = match source.get("properties") {
+        None => None,
+        Some(Value::Object(properties)) => Some(properties),
+        Some(_) => return false,
+    };
+    let curated_properties = match curated.get("properties") {
+        None => None,
+        Some(Value::Object(properties)) => Some(properties),
+        Some(_) => return false,
+    };
+    let (Ok(source_additional), Ok(curated_additional)) = (
+        schema_allowance(source.get("additionalProperties")),
+        schema_allowance(curated.get("additionalProperties")),
+    ) else {
+        return false;
+    };
+
+    if curated_properties.is_some_and(|properties| {
+        properties.iter().any(|(name, curated_property)| {
+            let source_allowance = source_properties
+                .and_then(|properties| properties.get(name))
+                .map_or(source_additional, SchemaAllowance::Schema);
+            !source_allowance_accepts_curated(
+                document,
+                source_allowance,
+                SchemaAllowance::Schema(curated_property),
+                depth,
+                active_references,
+            )
+        })
+    }) {
+        return false;
+    }
+
+    if source_properties.is_some_and(|properties| {
+        properties.iter().any(|(name, source_property)| {
+            curated_properties.is_none_or(|properties| !properties.contains_key(name))
+                && !source_allowance_accepts_curated(
+                    document,
+                    SchemaAllowance::Schema(source_property),
+                    curated_additional,
+                    depth,
+                    active_references,
+                )
+        })
+    }) {
+        return false;
+    }
+
+    source_allowance_accepts_curated(
+        document,
+        source_additional,
+        curated_additional,
+        depth,
+        active_references,
+    )
+}
+
 fn insert_access_application_login_methods_contract(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
@@ -13602,6 +14821,15 @@ fn insert_access_application_login_methods_contract(
 
     let source_identity_supported = access_application_update_identity_supported(&capability);
     let read_identity_supported = access_application_read_identity_supported(capabilities);
+    let source_request_schema = document.pointer(ACCESS_APP_UPDATE_REQUEST_SCHEMA_POINTER);
+    let source_request_schema_present = source_request_schema.is_some();
+    let source_request_body_compatible = source_request_schema.is_some_and(|source_schema| {
+        access_application_source_request_body_compatible(
+            document,
+            source_schema,
+            &spec.request_schema,
+        )
+    });
 
     capability.request_schema = Some(spec.request_schema);
     let verified_response_fields = capability
@@ -13612,6 +14840,8 @@ fn insert_access_application_login_methods_contract(
 
     if !source_identity_supported
         || !read_identity_supported
+        || !source_request_schema_present
+        || !source_request_body_compatible
         || verified_response_fields.is_empty()
         || !missing_readback_fields.is_empty()
     {
@@ -13621,6 +14851,12 @@ fn insert_access_application_login_methods_contract(
         }
         if !read_identity_supported {
             drift.push("detail-read identity".to_owned());
+        }
+        if !source_request_schema_present {
+            drift.push("source PUT request body".to_owned());
+        }
+        if source_request_schema_present && !source_request_body_compatible {
+            drift.push("source PUT request body incompatibility".to_owned());
         }
         if verified_response_fields.is_empty() {
             drift.push("closed mutable request fields".to_owned());

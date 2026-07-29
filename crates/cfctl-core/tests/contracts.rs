@@ -3019,10 +3019,10 @@ fn redaction_recurses_through_objects_and_arrays() {
 fn redaction_preserves_only_the_typed_access_binding_cookie_toggle() {
     let value = json!({
         "enable_binding_cookie": true,
-        "schema": {
+        "object_value": {
             "enable_binding_cookie": {
                 "type": "boolean",
-                "description": "non-secret configuration"
+                "value": "opaque"
             }
         },
         "invalid_value": {
@@ -3035,8 +3035,8 @@ fn redaction_preserves_only_the_typed_access_binding_cookie_toggle() {
     let redacted = redact_json(&value);
     assert_eq!(redacted["enable_binding_cookie"], true);
     assert_eq!(
-        redacted["schema"]["enable_binding_cookie"]["type"],
-        "boolean"
+        redacted["object_value"]["enable_binding_cookie"],
+        "[REDACTED]"
     );
     assert_eq!(
         redacted["invalid_value"]["enable_binding_cookie"],

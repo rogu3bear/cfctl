@@ -4774,6 +4774,7 @@ const ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID: &str =
     "access-applications-update-app-launcher-login-methods";
 const ACCESS_APP_READ_CAPABILITY_ID: &str = "access-applications-get-an-access-application";
 const ACCESS_APP_DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}";
+const ACCESS_APP_IMPLICIT_OPEN_ROLLBACK_WARNING: &str = "the prior implicit-open identity-provider state cannot be restored automatically; manual rollback requires a separately reviewed Cloudflare Access application change";
 const ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID: &str =
     "access-policies-update-human-access-controls";
 const ACCESS_POLICY_READ_CAPABILITY_ID: &str = "access-policies-get-an-access-policy";
@@ -4906,7 +4907,7 @@ fn access_application_login_methods_variant(
     }
 }
 
-fn is_access_application_login_methods_mutation(capability: &CapabilityV1) -> bool {
+fn access_application_login_methods_contract_supported(capability: &CapabilityV1) -> bool {
     let Some(variant) = access_application_login_methods_variant(&capability.id) else {
         return false;
     };
@@ -4932,9 +4933,22 @@ fn is_access_application_login_methods_mutation(capability: &CapabilityV1) -> bo
                         .map(|field| (*field).to_owned())
                         .collect::<Vec<_>>()
         })
-        && capability.rollback.strategy.as_deref() == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
         && capability.verification_contract_supported()
+}
+
+fn is_access_application_login_methods_mutation(capability: &CapabilityV1) -> bool {
+    access_application_login_methods_contract_supported(capability)
+        && capability.rollback.supported
+        && capability.rollback.strategy.as_deref() == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
         && capability.rollback_contract_supported()
+}
+
+fn is_access_application_implicit_open_concurrency_plan(capability: &CapabilityV1) -> bool {
+    access_application_login_methods_contract_supported(capability)
+        && !capability.rollback.supported
+        && capability.rollback.strategy.is_none()
+        && capability.rollback.warning.as_deref() == Some(ACCESS_APP_IMPLICIT_OPEN_ROLLBACK_WARNING)
+        && capability.mutation_contract_gaps().is_empty()
 }
 
 fn access_application_login_methods_desired_schema() -> Value {
@@ -5104,10 +5118,9 @@ fn normalize_access_application_policies(value: &Value) -> Result<Value> {
 fn normalized_access_application_idps(value: &Value) -> Result<Vec<String>> {
     let mut idps = value
         .as_array()
-        .filter(|idps| !idps.is_empty())
         .ok_or_else(|| {
             CliError::Input(
-                "live Access application has an empty identity-provider allowlist; the mutation boundary was not crossed"
+                "live Access application returned an invalid identity-provider allowlist; the mutation boundary was not crossed"
                     .to_owned(),
             )
         })?
@@ -5133,6 +5146,19 @@ fn normalized_access_application_idps(value: &Value) -> Result<Vec<String>> {
     if idps.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(CliError::Input(
             "live Access application returned duplicate identity-provider IDs; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    Ok(idps)
+}
+
+/// Rollback-only validation keeps an implicit-open prior state from being
+/// represented as a restorable empty allowlist.
+fn access_application_rollback_idps(value: &Value) -> Result<Vec<String>> {
+    let idps = normalized_access_application_idps(value)?;
+    if idps.is_empty() {
+        return Err(CliError::Input(
+            "live Access application has an empty identity-provider allowlist; the mutation boundary was not crossed"
                 .to_owned(),
         ));
     }
@@ -5221,7 +5247,7 @@ fn access_application_read_contract_supported(capability: &CapabilityV1) -> bool
 async fn prepare_access_application_login_methods_plan_input(
     store: &StateStore,
     catalog: &CatalogSnapshot,
-    capability: &CapabilityV1,
+    capability: &mut CapabilityV1,
     input: &mut CallInput,
     account_id: &str,
     credential: &AuthCredential,
@@ -5249,7 +5275,7 @@ async fn prepare_access_application_login_methods_plan_input(
         .map(Some);
     }
     let desired_idps = access_application_desired_idps(input)?;
-    let app_id = input
+    input
         .selectors
         .get("app_id")
         .and_then(Value::as_str)
@@ -5279,13 +5305,47 @@ async fn prepare_access_application_login_methods_plan_input(
             credential,
         )
         .await?;
+    let Some(receipt) = finalize_access_application_login_methods_plan_input(
+        capability,
+        input,
+        &desired_idps,
+        variant,
+        account_id,
+        &response,
+    )?
+    else {
+        return Ok(None);
+    };
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok(Some((receipt, evidence)))
+}
+
+fn finalize_access_application_login_methods_plan_input(
+    capability: &mut CapabilityV1,
+    input: &mut CallInput,
+    desired_idps: &[String],
+    variant: AccessApplicationLoginMethodsVariant,
+    account_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Option<Value>> {
     if !response.success || response.status != 200 {
         return Err(CliError::Input(format!(
             "Cloudflare rejected the Access application state read with HTTP {}; the mutation boundary was not crossed",
             response.status
         )));
     }
-    if response.result.get("id").and_then(Value::as_str) != Some(app_id)
+    let app_id = input
+        .selectors
+        .get("app_id")
+        .and_then(Value::as_str)
+        .filter(|app_id| !app_id.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Access login-method plan requires an exact `app_id` selector".to_owned(),
+            )
+        })?
+        .to_owned();
+    if response.result.get("id").and_then(Value::as_str) != Some(app_id.as_str())
         || response.result.get("type").and_then(Value::as_str) != Some(variant.app_type)
     {
         return Err(CliError::Input(format!(
@@ -5308,9 +5368,14 @@ async fn prepare_access_application_login_methods_plan_input(
         variant,
     )?);
     preflight_call_input(capability, input, None)?;
-    let receipt = apply_same_path_prior_state_response(capability, input, account_id, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
-    Ok(Some((receipt, evidence)))
+    if current_idps.is_empty() {
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(ACCESS_APP_IMPLICIT_OPEN_ROLLBACK_WARNING.to_owned());
+        return apply_same_path_prior_state_response(capability, input, account_id, response)
+            .map(Some);
+    }
+    apply_same_path_prior_state_response(capability, input, account_id, response).map(Some)
 }
 
 fn is_access_human_policy_mutation(capability: &CapabilityV1) -> bool {
@@ -6486,6 +6551,11 @@ fn should_bind_same_path_prior_state(capability: &CapabilityV1) -> bool {
         && capability.rollback_contract_supported()
 }
 
+fn requires_same_path_state_precondition(capability: &CapabilityV1) -> bool {
+    should_bind_same_path_prior_state(capability)
+        || is_access_application_implicit_open_concurrency_plan(capability)
+}
+
 fn same_path_read_source_contract_supported(
     capability: &CapabilityV1,
     source: &CapabilityV1,
@@ -6602,7 +6672,7 @@ fn project_same_path_prior_state(
         })?;
         return Ok(prior);
     }
-    if is_access_application_login_methods_mutation(capability) {
+    if access_application_login_methods_contract_supported(capability) {
         let app_id = input
             .selectors
             .get("app_id")
@@ -6628,9 +6698,16 @@ fn project_same_path_prior_state(
                 variant.app_type
             )));
         }
-        let current_idps =
-            normalized_access_application_idps(result.get("allowed_idps").unwrap_or(&Value::Null))?;
+        let concurrency_only = is_access_application_implicit_open_concurrency_plan(capability);
+        let current_idps = if concurrency_only {
+            normalized_access_application_idps(result.get("allowed_idps").unwrap_or(&Value::Null))?
+        } else {
+            access_application_rollback_idps(result.get("allowed_idps").unwrap_or(&Value::Null))?
+        };
         let prior = access_application_mutable_body(result, &current_idps, variant)?;
+        if concurrency_only && current_idps.is_empty() {
+            return Ok(prior);
+        }
         let mut restore_input = input.clone();
         restore_input.query = json!({});
         restore_input.body = Some(prior.clone());
@@ -6705,7 +6782,7 @@ async fn read_live_same_path_prior_state(
     account_id: &str,
     credential: &AuthCredential,
 ) -> Result<(Value, EvidenceV1)> {
-    if !should_bind_same_path_prior_state(capability) {
+    if !requires_same_path_state_precondition(capability) {
         return Err(CliError::Input(
             "mutation drifted from its governed same-path prior-state contract".to_owned(),
         ));
@@ -8169,7 +8246,7 @@ async fn create_plan(
         prepare_access_application_login_methods_plan_input(
             store,
             catalog,
-            &capability,
+            &mut capability,
             &mut input,
             account_id,
             credential,
@@ -12282,12 +12359,14 @@ fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Res
                 "same-path prior-state receipt omitted its restorable object snapshot; create a new plan"
                     .to_owned(),
             )
-        })?;
+    })?;
     let prior_state = Value::Object(prior_state);
+    let access_application_concurrency_only =
+        is_access_application_implicit_open_concurrency_plan(&plan.capability);
     let valid_state_shape = if is_access_human_policy_mutation(&plan.capability) {
         access_human_policy_restorable_body(&prior_state)
             .is_ok_and(|normalized| normalized == prior_state)
-    } else if is_access_application_login_methods_mutation(&plan.capability) {
+    } else if access_application_login_methods_contract_supported(&plan.capability) {
         let expected_fields = same_path_prior_state_fields(&plan.capability, &input)?;
         let observed_fields = prior_state
             .as_object()
@@ -12302,7 +12381,21 @@ fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Res
                         .to_owned(),
                 )
             })
-            .and_then(normalized_access_application_idps);
+            .and_then(|allowed_idps| {
+                if access_application_concurrency_only {
+                    let idps = normalized_access_application_idps(allowed_idps)?;
+                    if idps.is_empty() {
+                        Ok(idps)
+                    } else {
+                        Err(CliError::Input(
+                            "implicit-open Access application receipt contains a non-empty identity-provider allowlist; create a new plan"
+                                .to_owned(),
+                        ))
+                    }
+                } else {
+                    access_application_rollback_idps(allowed_idps)
+                }
+            });
         observed_fields == expected_fields
             && variant
                 .zip(current_idps.ok())
@@ -12327,6 +12420,9 @@ fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Res
     let mut restore_input = input;
     restore_input.query = json!({});
     restore_input.body = Some(prior_state.clone());
+    if access_application_concurrency_only {
+        return Ok(prior_state);
+    }
     preflight_call_input(&plan.capability, &restore_input, None).map_err(|error| {
         CliError::Input(format!(
             "same-path prior-state receipt is outside the exact restorable request contract; create a new plan: {error}"
@@ -12336,11 +12432,15 @@ fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Res
 }
 
 fn required_same_path_prior_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
-    if plan.capability.rollback.strategy.as_deref() != Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
-    {
+    let declares_same_path_state = plan.capability.rollback.strategy.as_deref()
+        == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
+        || (access_application_login_methods_contract_supported(&plan.capability)
+            && !plan.capability.rollback.supported
+            && plan.capability.rollback.strategy.is_none());
+    if !declares_same_path_state {
         return Ok(None);
     }
-    if !should_bind_same_path_prior_state(&plan.capability) {
+    if !requires_same_path_state_precondition(&plan.capability) {
         return Err(CliError::Input(
             "plan is inconsistent with its hash-bound same-path prior-state contract; create a new plan"
                 .to_owned(),
@@ -12375,6 +12475,11 @@ fn required_same_path_prior_state_precondition(plan: &PlanV1) -> Result<Option<&
 }
 
 fn same_path_prior_snapshot(plan: &PlanV1) -> Result<Value> {
+    if !should_bind_same_path_prior_state(&plan.capability) {
+        return Err(CliError::Input(
+            "same-path compensation requires a supported automatic rollback contract".to_owned(),
+        ));
+    }
     required_same_path_prior_state_precondition(plan)?.ok_or_else(|| {
         CliError::Input(
             "same-path compensation requires a hash-bound prior-state precondition".to_owned(),
@@ -28741,6 +28846,209 @@ mod tests {
                 .expect_err("one policy identity cannot occupy two precedences")
                 .to_string()
                 .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn access_application_forward_pinning_accepts_implicit_open_current_state_without_weakening_guards()
+     {
+        let desired_idp = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned();
+        let desired_input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(json!({"allowed_idps":[desired_idp.clone()]})),
+            ..CallInput::default()
+        };
+        let empty_desired_input = CallInput {
+            body: Some(json!({"allowed_idps":[]})),
+            ..desired_input.clone()
+        };
+        assert!(
+            super::access_application_desired_idps(&empty_desired_input).is_err(),
+            "an empty desired IdP set must continue to fail closed"
+        );
+
+        let capability = access_application_login_methods_capability();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut implicit_open = access_application_live_result();
+        implicit_open["allowed_idps"] = json!([]);
+        let planned_body = super::access_application_mutable_body(
+            &implicit_open,
+            std::slice::from_ref(&desired_idp),
+            variant,
+        )
+        .expect("non-empty desired IdP set produces a preservation-safe forward body");
+        assert_eq!(planned_body["allowed_idps"], json!([desired_idp]));
+
+        let rollback_error = super::apply_same_path_prior_state_response(
+            &capability,
+            &CallInput {
+                body: Some(planned_body),
+                ..desired_input
+            },
+            "account-a",
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: implicit_open.clone(),
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect_err("an implicit-open prior state must retain an explicit rollback limitation");
+        assert!(
+            rollback_error
+                .to_string()
+                .contains("empty identity-provider allowlist"),
+            "{rollback_error}"
+        );
+
+        assert_eq!(
+            super::normalized_access_application_idps(&implicit_open["allowed_idps"])
+                .expect("forward pinning must accept an implicit-open current IdP set"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn access_application_implicit_open_plan_is_concurrency_guarded_without_automatic_rollback() {
+        let desired_idp = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned();
+        let mut input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(json!({"allowed_idps":[desired_idp.clone()]})),
+            ..CallInput::default()
+        };
+        let desired_idps = super::access_application_desired_idps(&input)
+            .expect("a non-empty UUID-validated desired IdP set");
+        let mut capability = access_application_login_methods_capability();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut implicit_open = access_application_live_result();
+        implicit_open["allowed_idps"] = json!([]);
+        let expected_current_state =
+            super::access_application_mutable_body(&implicit_open, &[], variant)
+                .expect("the implicit-open application state has a closed mutable projection");
+        let expected_body =
+            super::access_application_mutable_body(&implicit_open, &desired_idps, variant)
+                .expect("the desired IdP set materializes a preservation-safe full PUT body");
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: implicit_open,
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+
+        let prior_state = super::finalize_access_application_login_methods_plan_input(
+            &mut capability,
+            &mut input,
+            &desired_idps,
+            variant,
+            "account-a",
+            &response,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "an implicit-open current IdP state must produce a plan with explicit non-restorable rollback metadata: {error}"
+            )
+        });
+
+        assert_eq!(
+            input.body.as_ref(),
+            Some(&expected_body),
+            "plan preparation must retain the fully materialized desired application body"
+        );
+        assert!(!capability.rollback.supported);
+        assert!(capability.rollback.strategy.is_none());
+        assert_eq!(
+            capability.rollback.warning.as_deref(),
+            Some(
+                "the prior implicit-open identity-provider state cannot be restored automatically; manual rollback requires a separately reviewed Cloudflare Access application change"
+            )
+        );
+        assert!(
+            capability.mutation_contract_gaps().is_empty(),
+            "explicitly unsupported rollback must remain a complete mutation contract: {:?}",
+            capability.mutation_contract_gaps()
+        );
+
+        let receipt = prior_state.expect(
+            "implicit-open plans still need a hash-bound closed current-state receipt for apply-time concurrency checks",
+        );
+        assert_eq!(
+            receipt.get("prior_state"),
+            Some(&expected_current_state),
+            "the concurrency receipt must retain the exact closed mutable snapshot"
+        );
+        let receipt_hash = hash_value(&receipt).expect("concurrency receipt hash");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({
+                "selectors":input.selectors,
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{
+                    "same_path_prior_state":receipt.clone()
+                }
+            }),
+        )
+        .expect("implicit-open plan");
+        plan.input = serde_json::to_value(&input).expect("plan input");
+        plan.precondition_hashes.insert(
+            super::SAME_PATH_PRIOR_STATE_PRECONDITION.to_owned(),
+            receipt_hash.clone(),
+        );
+        assert_eq!(
+            super::required_same_path_prior_state_precondition(&plan)
+                .expect("apply must require the concurrency precondition"),
+            Some(receipt_hash.as_str()),
+            "unsupported rollback must not disable apply-time live re-read"
+        );
+
+        let mut drifted_receipt = receipt.clone();
+        drifted_receipt["prior_state"]["name"] = json!("Concurrent application rename");
+        let drift_error = super::validate_same_path_prior_state_receipt_precondition(
+            &receipt_hash,
+            &drifted_receipt,
+        )
+        .expect_err("a mutable-field change between plan and apply must block execution");
+        assert!(
+            drift_error.to_string().contains("drifted after planning"),
+            "{drift_error}"
+        );
+
+        plan.refresh_hash().expect("bind concurrency precondition");
+        plan.approve(true, None).expect("approve test plan");
+        plan.mark_consumed().expect("consume test plan");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("record boundary attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"success":true,"http_status":200}),
+        )
+        .expect("record successful boundary response");
+        assert!(
+            super::compensation_request(&plan)
+                .expect("compensation selection")
+                .is_none(),
+            "the concurrency receipt must not become automatic rollback authority"
         );
     }
 

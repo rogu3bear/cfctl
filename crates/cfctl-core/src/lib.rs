@@ -5999,13 +5999,7 @@ pub fn redact_json(value: &Value) -> Value {
 }
 
 fn is_non_secret_boolean_configuration(key: &str, value: &Value) -> bool {
-    key.eq_ignore_ascii_case("enable_binding_cookie")
-        && (value.is_boolean()
-            || value
-                .as_object()
-                .and_then(|schema| schema.get("type"))
-                .and_then(Value::as_str)
-                == Some("boolean"))
+    key.eq_ignore_ascii_case("enable_binding_cookie") && value.is_boolean()
 }
 
 fn is_sensitive_key(key: &str) -> bool {

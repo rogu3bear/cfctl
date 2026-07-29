@@ -869,7 +869,7 @@ const FALLBACK_JOURNAL_KEY_PREFIX: &str = "__cfctl_internal__/credential-journal
 fn fallback_journal_key(key: &str) -> String {
     format!(
         "{FALLBACK_JOURNAL_KEY_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(key.as_bytes())
+        URL_SAFE_NO_PAD.encode(Sha256::digest(key.as_bytes()))
     )
 }
 
@@ -1798,6 +1798,33 @@ mod tests {
                 "profile/default/api-token"
             )
             .expect("journal read"),
+            Some("fresh".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chained_fallback_journal_staging_fits_name_max_for_long_profile_id() {
+        const NAME_MAX: usize = 255;
+        let root = tempfile::tempdir().expect("tempdir");
+        let fallback = FileSecretStore::new(root.path().join("secrets"));
+        let profile_id = "p".repeat(108);
+        let key = api_token_key(&profile_id);
+        fallback
+            .put(&key, "old")
+            .expect("the legacy fallback key fits before journal expansion");
+
+        let journal_key = fallback_journal_key(&key);
+        let staged_component_len =
+            format!("{}.tmp-{}", secret_file_name(&journal_key), Uuid::nil()).len();
+        let result = chained_put(&RejectingSecretStore, &fallback, &key, "fresh");
+        assert!(
+            result.is_ok() && staged_component_len <= NAME_MAX,
+            "keyring-failure journal staging exceeded NAME_MAX: component_len={staged_component_len}, result={result:?}"
+        );
+        assert_eq!(
+            chained_get(&RejectingSecretStore, &fallback, &key)
+                .expect("bounded journal remains authoritative"),
             Some("fresh".to_owned())
         );
     }
