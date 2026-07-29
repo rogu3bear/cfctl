@@ -4787,7 +4787,7 @@ const OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION: &str = "oauth_client_key_overlap";
 const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str = "zone-subscription-zone-subscription-details";
 
-const ACCESS_APP_MUTABLE_FIELDS: [&str; 16] = [
+const ACCESS_APP_MUTABLE_FIELDS: [&str; 17] = [
     "allowed_idps",
     "app_launcher_visible",
     "auto_redirect_to_identity",
@@ -4798,6 +4798,7 @@ const ACCESS_APP_MUTABLE_FIELDS: [&str; 16] = [
     "http_only_cookie_attribute",
     "name",
     "options_preflight_bypass",
+    "path_cookie_attribute",
     "policies",
     "same_site_cookie_attribute",
     "self_hosted_domains",
@@ -28529,6 +28530,7 @@ mod tests {
             "http_only_cookie_attribute":{"type":"boolean"},
             "name":{"type":"string"},
             "options_preflight_bypass":{"type":"boolean"},
+            "path_cookie_attribute":{"type":"boolean"},
             "policies":{"type":"array","items":{"type":"object"}},
             "same_site_cookie_attribute":{"type":"string"},
             "self_hosted_domains":{"type":"array","items":{"type":"string"}},
@@ -28545,7 +28547,10 @@ mod tests {
             .filter(|field| {
                 !matches!(
                     **field,
-                    "eager_redirect_cookie_setting" | "same_site_cookie_attribute" | "tags"
+                    "eager_redirect_cookie_setting"
+                        | "path_cookie_attribute"
+                        | "same_site_cookie_attribute"
+                        | "tags"
                 )
             })
             .copied()
@@ -28636,6 +28641,73 @@ mod tests {
                 .iter()
                 .any(|field| field == "eager_redirect_cookie_setting")
         );
+    }
+
+    #[test]
+    fn access_application_path_cookie_round_trips_through_snapshot_contract() {
+        let capability = access_application_login_methods_capability();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut live = access_application_live_result();
+        live["path_cookie_attribute"] = json!(true);
+        let body = super::access_application_mutable_body(
+            &live,
+            &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
+            variant,
+        )
+        .expect("path-scoped cookie configuration must be preserved");
+        assert_eq!(body["path_cookie_attribute"], json!(true));
+
+        let materialized_schema =
+            cfctl_catalog::access_application_login_methods_materialized_schema();
+        assert_eq!(
+            materialized_schema["properties"]["path_cookie_attribute"]["type"],
+            "boolean"
+        );
+        assert!(
+            !materialized_schema["required"]
+                .as_array()
+                .expect("required fields")
+                .iter()
+                .any(|field| field == "path_cookie_attribute"),
+            "path-scoped cookies are an optional provider field"
+        );
+        assert!(
+            capability
+                .same_path_read
+                .as_ref()
+                .expect("same-path read")
+                .verified_response_fields
+                .iter()
+                .any(|field| field == "path_cookie_attribute")
+        );
+
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(body),
+            ..CallInput::default()
+        };
+        let receipt = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: live,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect("path-scoped cookie configuration must enter the concurrency receipt");
+        assert_eq!(receipt["prior_state"]["path_cookie_attribute"], json!(true));
     }
 
     #[test]

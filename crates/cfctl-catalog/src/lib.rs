@@ -13387,6 +13387,7 @@ pub fn access_application_login_methods_materialized_schema() -> Value {
             "http_only_cookie_attribute":{"type":"boolean"},
             "name":{"type":"string","minLength":1},
             "options_preflight_bypass":{"type":"boolean"},
+            "path_cookie_attribute":{"type":"boolean"},
             "policies":{
                 "type":"array",
                 "minItems":1,
@@ -13687,69 +13688,103 @@ fn access_application_schema_matches_type(
     app_type: &str,
     depth: usize,
 ) -> bool {
-    if depth > 32 {
-        return false;
-    }
-    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-        return reference
-            .strip_prefix('#')
-            .and_then(|pointer| document.pointer(pointer))
-            .is_some_and(|resolved| {
-                access_application_schema_matches_type(document, resolved, app_type, depth + 1)
-            });
-    }
-    if schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .and_then(|properties| properties.get("type"))
-        .is_some_and(|type_schema| {
-            access_application_type_schema_matches(document, type_schema, app_type, depth + 1)
-        })
-    {
-        return true;
-    }
-    schema
-        .get("allOf")
-        .and_then(Value::as_array)
-        .is_some_and(|members| {
-            members.iter().any(|member| {
-                access_application_schema_matches_type(document, member, app_type, depth + 1)
-            })
-        })
+    access_application_schema_type_annotation(document, schema, app_type, depth).unwrap_or(false)
 }
 
-fn access_application_type_schema_matches(
+fn access_application_schema_type_annotation(
     document: &Value,
     schema: &Value,
     app_type: &str,
     depth: usize,
-) -> bool {
+) -> Option<bool> {
     if depth > 32 {
-        return false;
+        return None;
     }
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         return reference
             .strip_prefix('#')
             .and_then(|pointer| document.pointer(pointer))
-            .is_some_and(|resolved| {
-                access_application_type_schema_matches(document, resolved, app_type, depth + 1)
+            .and_then(|resolved| {
+                access_application_schema_type_annotation(document, resolved, app_type, depth + 1)
             });
     }
-    if schema.get("const").and_then(Value::as_str) == Some(app_type)
-        || schema.get("example").and_then(Value::as_str) == Some(app_type)
-        || schema
-            .get("enum")
-            .and_then(Value::as_array)
-            .is_some_and(|values| values.as_slice() == [Value::String(app_type.to_owned())])
+    if let Some(matches) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get("type"))
+        .and_then(|type_schema| {
+            access_application_type_schema_annotation(
+                document,
+                type_schema,
+                app_type,
+                depth + 1,
+                true,
+            )
+        })
     {
-        return true;
+        return Some(matches);
     }
     schema
         .get("allOf")
         .and_then(Value::as_array)
-        .is_some_and(|members| {
-            members.iter().any(|member| {
-                access_application_type_schema_matches(document, member, app_type, depth + 1)
+        .and_then(|members| {
+            members.iter().rev().find_map(|member| {
+                access_application_schema_type_annotation(document, member, app_type, depth + 1)
+            })
+        })
+}
+
+fn access_application_type_schema_annotation(
+    document: &Value,
+    schema: &Value,
+    app_type: &str,
+    depth: usize,
+    allow_local_example: bool,
+) -> Option<bool> {
+    if depth > 32 {
+        return None;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .and_then(|resolved| {
+                access_application_type_schema_annotation(
+                    document,
+                    resolved,
+                    app_type,
+                    depth + 1,
+                    false,
+                )
+            });
+    }
+    if let Some(constant) = schema.get("const") {
+        return Some(constant.as_str() == Some(app_type));
+    }
+    if let Some(values) = schema.get("enum") {
+        let values = values.as_array()?;
+        if !values.iter().any(|value| value.as_str() == Some(app_type)) {
+            return Some(false);
+        }
+        if values.len() == 1 {
+            return Some(true);
+        }
+    }
+    if allow_local_example && let Some(example) = schema.get("example") {
+        return Some(example.as_str() == Some(app_type));
+    }
+    schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .and_then(|members| {
+            members.iter().rev().find_map(|member| {
+                access_application_type_schema_annotation(
+                    document,
+                    member,
+                    app_type,
+                    depth + 1,
+                    allow_local_example,
+                )
             })
         })
 }

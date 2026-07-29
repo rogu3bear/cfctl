@@ -5374,6 +5374,7 @@ fn access_application_login_methods_fixture() -> serde_json::Value {
             "landing_page_design":{"type":"object"},
             "name":{"type":"string"},
             "options_preflight_bypass":{"type":"boolean"},
+            "path_cookie_attribute":{"type":"boolean"},
             "policies":{"type":"array","items":{"type":"object"}},
             "same_site_cookie_attribute":{"type":"string"},
             "self_hosted_domains":{"type":"array","items":{"type":"string"}},
@@ -5405,6 +5406,7 @@ fn access_application_login_methods_fixture() -> serde_json::Value {
         "landing_page_design":{"type":"object"},
         "name":{"type":"string"},
         "options_preflight_bypass":{"type":"boolean"},
+        "path_cookie_attribute":{"type":"boolean"},
         "policies":{"type":"array","items":{"type":"object"}},
         "same_site_cookie_attribute":{"type":"string"},
         "self_hosted_domains":{"type":"array","items":{"type":"string"}},
@@ -5501,6 +5503,7 @@ fn access_application_login_methods_update_is_full_snapshot_governed() {
             "http_only_cookie_attribute",
             "name",
             "options_preflight_bypass",
+            "path_cookie_attribute",
             "policies",
             "same_site_cookie_attribute",
             "self_hosted_domains",
@@ -5528,7 +5531,10 @@ fn access_application_login_methods_update_is_full_snapshot_governed() {
                     !matches!(
                         field.as_str(),
                         Some(
-                            "eager_redirect_cookie_setting" | "same_site_cookie_attribute" | "tags"
+                            "eager_redirect_cookie_setting"
+                                | "path_cookie_attribute"
+                                | "same_site_cookie_attribute"
+                                | "tags"
                         )
                     )
                 })
@@ -5709,6 +5715,65 @@ fn access_application_login_methods_update_checks_the_matching_readback_variant(
             .as_deref()
             .is_some_and(|reason| reason.contains("tags"))
     );
+}
+
+#[test]
+fn access_application_readback_variant_ignores_shared_type_example() {
+    let mut fixture = access_application_login_methods_fixture();
+    fixture["components"]["schemas"]["shared_access_type"] =
+        json!({"type":"string","example":"self_hosted"});
+    let result_schema =
+        fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["properties"]["result"]
+            .clone();
+    let mut self_hosted = result_schema.clone();
+    self_hosted["properties"]["type"] = json!({
+        "allOf":[
+            {"$ref":"#/components/schemas/shared_access_type"},
+            {"example":"self_hosted"}
+        ]
+    });
+    fixture["components"]["schemas"]["self_hosted_variant_props"] = self_hosted;
+    fixture["components"]["schemas"]["ssh_variant_props"] = json!({
+        "allOf":[
+            {"$ref":"#/components/schemas/self_hosted_variant_props"},
+            {"properties":{"type":{"allOf":[
+                {"$ref":"#/components/schemas/shared_access_type"},
+                {"example":"ssh"}
+            ]}}}
+        ]
+    });
+    let mut app_launcher = result_schema;
+    app_launcher["properties"]["type"] = json!({
+        "allOf":[
+            {"$ref":"#/components/schemas/shared_access_type"},
+            {"example":"app_launcher"}
+        ]
+    });
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["properties"]["result"] = json!({
+        "anyOf":[
+            {"allOf":[{"$ref":"#/components/schemas/self_hosted_variant_props"}]},
+            {"allOf":[{"$ref":"#/components/schemas/ssh_variant_props"}]},
+            {"allOf":[app_launcher]}
+        ]
+    });
+
+    let snapshot = normalize_openapi(&fixture).expect("official-shaped Access catalog");
+    for capability_id in [
+        "access-applications-update-self-hosted-login-methods",
+        "access-applications-update-app-launcher-login-methods",
+    ] {
+        let capability = snapshot
+            .get(capability_id)
+            .expect("derived login-method capability");
+        assert_eq!(
+            capability.adapter_status,
+            AdapterStatus::DynamicApi,
+            "{capability_id} must use the branch-local type annotation instead of the shared example: {:?}",
+            capability.blocked_reason
+        );
+    }
 }
 
 #[test]
