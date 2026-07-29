@@ -29164,6 +29164,27 @@ mod tests {
     }
 
     #[test]
+    fn access_human_policy_desired_input_rejects_malformed_email_before_plan_creation() {
+        let capability = access_human_policy_capability();
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+                "policy_id":"45e44306-0e2a-460a-94aa-34c21eefdb4a"
+            }),
+            body: Some(json!({
+                "include":[{"email":{"email":"abc"}}]
+            })),
+            ..CallInput::default()
+        };
+
+        assert!(
+            super::validate_access_human_policy_desired_input(&capability, &input).is_err(),
+            "malformed email selector reached approval-ready plan input"
+        );
+    }
+
+    #[test]
     fn access_human_policy_snapshot_is_hash_bound_exact_and_reconstructs_rollback() {
         let capability = access_human_policy_capability();
         assert!(

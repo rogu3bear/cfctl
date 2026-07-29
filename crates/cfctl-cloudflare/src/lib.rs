@@ -4720,8 +4720,52 @@ fn mismatched_verifiable_planned_fields(
     mismatches.extend(access_exact_snapshot_optional_absence_mismatches(
         capability, planned, actual,
     ));
+    mismatches.extend(access_human_policy_complete_snapshot_mismatches(
+        capability, actual,
+    ));
     mismatches.sort();
     mismatches.dedup();
+    mismatches
+}
+
+fn access_human_policy_complete_snapshot_mismatches(
+    capability: &CapabilityV1,
+    actual: &Value,
+) -> Vec<String> {
+    if capability.id != "access-policies-update-human-access-controls"
+        || capability.method != "PUT"
+        || capability.path != "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}"
+    {
+        return Vec::new();
+    }
+    let Some(actual) = actual.as_object() else {
+        return vec!["human_policy_snapshot".to_owned(), "reusable".to_owned()];
+    };
+    let mut mismatches = actual
+        .keys()
+        .filter(|field| {
+            !matches!(
+                field.as_str(),
+                "created_at"
+                    | "decision"
+                    | "exclude"
+                    | "id"
+                    | "include"
+                    | "mfa_config"
+                    | "name"
+                    | "precedence"
+                    | "require"
+                    | "reusable"
+                    | "session_duration"
+                    | "uid"
+                    | "updated_at"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if actual.get("reusable").and_then(Value::as_bool) != Some(false) {
+        mismatches.push("reusable".to_owned());
+    }
     mismatches
 }
 
@@ -4960,7 +5004,7 @@ mod access_application_projection_tests {
         exact_resource_readback_identity_matches,
     };
     use cfctl_core::CapabilityV1;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn identity_provider_and_policy_sets_verify_without_order_dependence() {
@@ -5127,6 +5171,73 @@ mod access_application_projection_tests {
     }
 
     #[test]
+    fn human_policy_complete_readback_rejects_reusable_or_unclassified_snapshot() {
+        let mut policy = CapabilityV1::new(
+            "access-policies-update-human-access-controls",
+            "Update human Access eligibility and independent MFA",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}",
+        );
+        policy.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+            path: policy.path.clone(),
+            read_capability_id: "access-policies-get-an-access-policy".to_owned(),
+            verified_response_fields: [
+                "decision",
+                "exclude",
+                "include",
+                "mfa_config",
+                "name",
+                "precedence",
+                "require",
+                "session_duration",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        });
+        let Value::Object(planned) = json!({
+            "decision":"allow",
+            "exclude":[],
+            "include":[{"email_domain":{"domain":"example.com"}}],
+            "mfa_config":{
+                "allowed_authenticators":["biometrics","totp"],
+                "mfa_disabled":false
+            },
+            "name":"Allow Example Humans",
+            "precedence":1,
+            "require":[],
+            "session_duration":"24h"
+        }) else {
+            unreachable!("literal human policy body must be an object");
+        };
+        let mut classified = Value::Object(planned.clone());
+        classified["reusable"] = json!(false);
+        assert!(
+            super::mismatched_verifiable_planned_fields(&policy, &planned, &classified).is_empty(),
+            "fully classified matching human-policy readback must verify"
+        );
+        let mut reusable = classified.clone();
+        reusable["reusable"] = json!(true);
+        let mut unclassified = classified;
+        unclassified["approval_groups"] = json!([{"email_list_uuid":"list-id"}]);
+
+        for (case, readback, expected) in [
+            ("reusable routing drift", reusable, "reusable"),
+            (
+                "unclassified top-level field",
+                unclassified,
+                "approval_groups",
+            ),
+        ] {
+            assert_eq!(
+                super::mismatched_verifiable_planned_fields(&policy, &planned, &readback),
+                vec![expected],
+                "complete human-policy verification accepted {case}"
+            );
+        }
+    }
+
+    #[test]
     fn human_policy_readback_treats_empty_session_duration_as_absent_without_masking_drift() {
         let mut policy = CapabilityV1::new(
             "access-policies-update-human-access-controls",
@@ -5145,7 +5256,7 @@ mod access_application_projection_tests {
             super::mismatched_verifiable_planned_fields(
                 &policy,
                 &planned,
-                &json!({"session_duration":""})
+                &json!({"reusable":false,"session_duration":""})
             )
             .is_empty(),
             "Cloudflare's empty optional-duration sentinel must equal absence"
@@ -5154,7 +5265,7 @@ mod access_application_projection_tests {
             super::mismatched_verifiable_planned_fields(
                 &policy,
                 &planned,
-                &json!({"session_duration":"24h"})
+                &json!({"reusable":false,"session_duration":"24h"})
             ),
             vec!["session_duration"]
         );
@@ -7918,6 +8029,7 @@ fn validate_string_format(schema: &Value, value: &str, path: &str) -> Result<()>
     };
     let valid = match format {
         "date-time" => DateTime::parse_from_rfc3339(value).is_ok(),
+        "email" => is_valid_ascii_email(value),
         "hostname" => is_valid_hostname(value),
         "ipv4" => value.parse::<Ipv4Addr>().is_ok(),
         "ipv6" => value.parse::<Ipv6Addr>().is_ok(),
@@ -7943,6 +8055,58 @@ fn is_valid_cloudflare_uuid(value: &str) -> bool {
         }),
         _ => false,
     }
+}
+
+fn is_valid_ascii_email(value: &str) -> bool {
+    if !value.is_ascii()
+        || value.len() > 254
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        return false;
+    }
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || local.len() > 64
+        || domain.is_empty()
+        || domain.contains('@')
+        || domain == "."
+        || domain.ends_with('.')
+    {
+        return false;
+    }
+    local
+        .split('.')
+        .all(|atom| !atom.is_empty() && atom.bytes().all(is_ascii_email_atext))
+        && is_valid_hostname(domain)
+}
+
+fn is_ascii_email_atext(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'/'
+                | b'='
+                | b'?'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'{'
+                | b'|'
+                | b'}'
+                | b'~'
+        )
 }
 
 fn is_valid_hostname(value: &str) -> bool {

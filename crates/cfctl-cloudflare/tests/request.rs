@@ -1212,6 +1212,101 @@ fn unchecked_request_enforces_executable_string_formats() {
 }
 
 #[test]
+fn unchecked_request_enforces_bounded_ascii_email_format() {
+    let mut capability = CapabilityV1::new("email-create", "Create", "POST", "/email");
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "required":["email"],
+        "properties":{"email":{"type":"string","format":"email"}}
+    }));
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    for email in ["person@example.com", "o'connor+founder@sub.example.com"] {
+        assert!(
+            builder
+                .build_unchecked(
+                    &capability,
+                    &CallInput {
+                        body: Some(json!({"email":email})),
+                        ..CallInput::default()
+                    }
+                )
+                .is_ok(),
+            "ordinary ASCII mailbox was rejected: {email}"
+        );
+    }
+    let local = "a".repeat(64);
+    let domain = |last_label_length| {
+        format!(
+            "{}.{}.{}",
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(last_label_length)
+        )
+    };
+    let at_limit = format!("{local}@{}", domain(61));
+    let over_limit = format!("{local}@{}", domain(62));
+    assert_eq!(at_limit.len(), 254);
+    assert_eq!(over_limit.len(), 255);
+    assert!(
+        builder
+            .build_unchecked(
+                &capability,
+                &CallInput {
+                    body: Some(json!({"email":at_limit})),
+                    ..CallInput::default()
+                }
+            )
+            .is_ok(),
+        "a valid 254-byte mailbox must remain inside the pinned schema"
+    );
+    assert!(
+        builder
+            .build_unchecked(
+                &capability,
+                &CallInput {
+                    body: Some(json!({"email":over_limit})),
+                    ..CallInput::default()
+                }
+            )
+            .is_err(),
+        "a valid-shape 255-byte mailbox must exceed the pinned schema"
+    );
+
+    let oversized_local = format!("{}@example.com", "a".repeat(65));
+    for email in [
+        oversized_local.as_str(),
+        "pérson@example.com",
+        "person.example.com",
+        "person@@example.com",
+        "@example.com",
+        "person@",
+        ".person@example.com",
+        "person.@example.com",
+        "person..tag@example.com",
+        "person tag@example.com",
+        "person@example..com",
+        "person@-example.com",
+        "person@example.com.",
+        "person@.",
+    ] {
+        let error = builder
+            .build_unchecked(
+                &capability,
+                &CallInput {
+                    body: Some(json!({"email":email})),
+                    ..CallInput::default()
+                },
+            )
+            .expect_err("malformed email must fail before request construction");
+        assert!(matches!(
+            error,
+            CloudflareError::InvalidRequestBody(reason)
+                if reason.contains("pinned email format") && !reason.contains(email)
+        ));
+    }
+}
+
+#[test]
 fn unchecked_request_treats_equivalent_json_numbers_as_duplicate_items() {
     let mut capability = CapabilityV1::new("unique-create", "Create", "POST", "/unique");
     capability.request_schema = Some(json!({
