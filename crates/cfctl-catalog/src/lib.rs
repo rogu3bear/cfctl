@@ -13378,6 +13378,10 @@ fn access_application_login_methods_schema() -> Value {
                 "items":{"type":"string","minLength":1}
             },
             "session_duration":{"type":"string","minLength":1},
+            "tags":{
+                "type":"array",
+                "items":{"type":"string"}
+            },
             "type":{"type":"string","enum":["self_hosted"]}
         },
         "x-cfctl-body-required":true

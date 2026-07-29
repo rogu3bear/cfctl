@@ -5218,6 +5218,7 @@ fn access_application_login_methods_fixture() -> serde_json::Value {
             "same_site_cookie_attribute":{"type":"string"},
             "self_hosted_domains":{"type":"array","items":{"type":"string"}},
             "session_duration":{"type":"string"},
+            "tags":{"type":"array","items":{"type":"string"}},
             "type":{"type":"string","enum":["self_hosted"]}
         }
     });
@@ -5247,6 +5248,7 @@ fn access_application_login_methods_fixture() -> serde_json::Value {
         "self_hosted_domains":{"type":"array","items":{"type":"string"}},
         "session_duration":{"type":"string"},
         "skip_app_launcher_login_page":{"type":"boolean"},
+        "tags":{"type":"array","items":{"type":"string"}},
         "type":{"type":"string"}
     });
     for method in ["get", "put"] {
@@ -5340,6 +5342,7 @@ fn access_application_login_methods_update_is_full_snapshot_governed() {
             "same_site_cookie_attribute",
             "self_hosted_domains",
             "session_duration",
+            "tags",
             "type",
         ]
     );
@@ -5358,11 +5361,11 @@ fn access_application_login_methods_update_is_full_snapshot_governed() {
             .and_then(|schema| schema.get("required"))
             .and_then(serde_json::Value::as_array)
             .is_some_and(|required| {
-                required
-                    .iter()
-                    .all(|field| field.as_str() != Some("same_site_cookie_attribute"))
+                required.iter().all(|field| {
+                    !matches!(field.as_str(), Some("same_site_cookie_attribute" | "tags"))
+                })
             }),
-        "the cookie field is writable and verifiable when present, but optional on live self-hosted applications"
+        "cookie and tag fields are writable and verifiable when present, but optional on live self-hosted applications"
     );
     assert!(update.mutation_contract_gaps().is_empty());
 
@@ -5462,6 +5465,27 @@ fn access_application_login_methods_update_blocks_when_cookie_readback_disappear
             .blocked_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("same_site_cookie_attribute"))
+    );
+}
+
+#[test]
+fn access_application_login_methods_update_blocks_when_tag_readback_disappears() {
+    let mut fixture = access_application_login_methods_fixture();
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("result properties")
+        .remove("tags");
+    let snapshot = normalize_openapi(&fixture).expect("drifted Access catalog");
+    let update = snapshot
+        .get("access-applications-update-self-hosted-login-methods")
+        .expect("derived login-method update");
+    assert_eq!(update.adapter_status, AdapterStatus::Blocked);
+    assert!(
+        update
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("tags"))
     );
 }
 

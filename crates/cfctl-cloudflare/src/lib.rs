@@ -5219,6 +5219,67 @@ mod access_application_projection_tests {
             );
         }
     }
+
+    #[test]
+    fn self_hosted_tags_readback_preserves_presence_value_and_empty_state() {
+        let mut application = CapabilityV1::new(
+            "access-applications-update-self-hosted-login-methods",
+            "Update self-hosted Access application login methods",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}",
+        );
+        application.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{
+                "tags":{"type":"array","items":{"type":"string"}}
+            }
+        }));
+        application.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+            path: application.path.clone(),
+            read_capability_id: "access-applications-get-an-access-application".to_owned(),
+            verified_response_fields: vec!["tags".to_owned()],
+        });
+
+        let populated =
+            serde_json::Map::from_iter([("tags".to_owned(), json!(["customer:a", "env:b"]))]);
+        assert!(
+            super::mismatched_verifiable_planned_fields(
+                &application,
+                &populated,
+                &json!({"tags":["customer:a","env:b"]})
+            )
+            .is_empty()
+        );
+        for readback in [
+            json!({}),
+            json!({"tags":[]}),
+            json!({"tags":["env:b","customer:a"]}),
+        ] {
+            assert_eq!(
+                super::mismatched_verifiable_planned_fields(&application, &populated, &readback),
+                vec!["tags"]
+            );
+        }
+
+        let empty = serde_json::Map::from_iter([("tags".to_owned(), json!([]))]);
+        assert!(
+            super::mismatched_verifiable_planned_fields(&application, &empty, &json!({"tags":[]}))
+                .is_empty()
+        );
+        assert_eq!(
+            super::mismatched_verifiable_planned_fields(&application, &empty, &json!({})),
+            vec!["tags"]
+        );
+        assert_eq!(
+            access_exact_snapshot_optional_absence_mismatches(
+                &application,
+                &serde_json::Map::new(),
+                &json!({"tags":[]})
+            ),
+            vec!["tags"]
+        );
+    }
 }
 
 fn verification_response_field(capability: &CapabilityV1, request_field: &str) -> Option<String> {

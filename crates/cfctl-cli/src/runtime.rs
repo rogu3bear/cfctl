@@ -4708,7 +4708,7 @@ const OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION: &str = "oauth_client_key_overlap";
 const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str = "zone-subscription-zone-subscription-details";
 
-const ACCESS_APP_MUTABLE_FIELDS: [&str; 14] = [
+const ACCESS_APP_MUTABLE_FIELDS: [&str; 15] = [
     "allowed_idps",
     "app_launcher_visible",
     "auto_redirect_to_identity",
@@ -4722,6 +4722,7 @@ const ACCESS_APP_MUTABLE_FIELDS: [&str; 14] = [
     "same_site_cookie_attribute",
     "self_hosted_domains",
     "session_duration",
+    "tags",
     "type",
 ];
 const ACCESS_APP_REQUIRED_FIELDS: [&str; 13] = [
@@ -4739,8 +4740,7 @@ const ACCESS_APP_REQUIRED_FIELDS: [&str; 13] = [
     "session_duration",
     "type",
 ];
-const ACCESS_APP_READ_ONLY_FIELDS: [&str; 6] =
-    ["aud", "created_at", "id", "tags", "uid", "updated_at"];
+const ACCESS_APP_READ_ONLY_FIELDS: [&str; 5] = ["aud", "created_at", "id", "uid", "updated_at"];
 
 const ACCESS_APP_LAUNCHER_MUTABLE_FIELDS: [&str; 14] = [
     "allowed_idps",
@@ -27973,7 +27973,7 @@ mod tests {
             "same_site_cookie_attribute":"lax",
             "self_hosted_domains":["investors.mlnavigator.com"],
             "session_duration":"24h",
-            "tags":[],
+            "tags":["customer:investors","env:production"],
             "type":"self_hosted",
             "uid":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
             "updated_at":"2026-07-14T09:51:47Z"
@@ -28039,6 +28039,36 @@ mod tests {
         assert!(body.get("aud").is_none());
         assert!(body.get("created_at").is_none());
         assert!(body.get("updated_at").is_none());
+        assert_eq!(
+            body["tags"],
+            json!(["customer:investors", "env:production"])
+        );
+    }
+
+    #[test]
+    fn access_application_empty_tags_remain_distinct_from_absence() {
+        let otp = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut with_empty_tags = access_application_live_result();
+        with_empty_tags["tags"] = json!([]);
+        let body = super::access_application_mutable_body(
+            &with_empty_tags,
+            std::slice::from_ref(&otp),
+            variant,
+        )
+        .expect("explicit empty tags remain in the full PUT");
+        assert_eq!(body.get("tags"), Some(&json!([])));
+
+        let mut without_tags = access_application_live_result();
+        without_tags
+            .as_object_mut()
+            .expect("application object")
+            .remove("tags");
+        let body = super::access_application_mutable_body(&without_tags, &[otp], variant)
+            .expect("absent optional tags remain absent");
         assert!(body.get("tags").is_none());
     }
 
@@ -28079,10 +28109,7 @@ mod tests {
     #[test]
     fn access_application_login_method_body_fails_closed_on_unclassified_live_state() {
         let mut result = access_application_live_result();
-        result["mfa_config"] = json!({
-            "allowed_authenticators":["security_key"],
-            "mfa_disabled":false
-        });
+        result["future_writable_field"] = json!({"must_be_preserved":true});
         let variant = super::access_application_login_methods_variant(
             super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
         )
@@ -28093,7 +28120,7 @@ mod tests {
             variant,
         )
         .expect_err("unclassified app override must block");
-        assert!(error.to_string().contains("mfa_config"));
+        assert!(error.to_string().contains("future_writable_field"));
     }
 
     fn access_application_login_methods_capability() -> CapabilityV1 {
@@ -28111,6 +28138,7 @@ mod tests {
             "same_site_cookie_attribute":{"type":"string"},
             "self_hosted_domains":{"type":"array","items":{"type":"string"}},
             "session_duration":{"type":"string"},
+            "tags":{"type":"array","items":{"type":"string"}},
             "type":{"type":"string","enum":["self_hosted"]}
         })
         .as_object()
@@ -28119,7 +28147,7 @@ mod tests {
         properties.retain(|field, _| super::ACCESS_APP_MUTABLE_FIELDS.contains(&field.as_str()));
         let required = super::ACCESS_APP_MUTABLE_FIELDS
             .iter()
-            .filter(|field| **field != "same_site_cookie_attribute")
+            .filter(|field| !matches!(**field, "same_site_cookie_attribute" | "tags"))
             .copied()
             .collect::<Vec<_>>();
         let mut capability = CapabilityV1::new(
@@ -28232,6 +28260,10 @@ mod tests {
             receipt["prior_state"]["same_site_cookie_attribute"],
             json!("lax")
         );
+        assert_eq!(
+            receipt["prior_state"]["tags"],
+            json!(["customer:investors", "env:production"])
+        );
 
         let receipt_hash = hash_value(&receipt).expect("receipt hash");
         let mut plan = PlanV1::draft(
@@ -28263,6 +28295,14 @@ mod tests {
                 .as_ref()
                 .and_then(|body| body.get("same_site_cookie_attribute")),
             Some(&json!("lax"))
+        );
+        assert_eq!(
+            compensation
+                .input
+                .body
+                .as_ref()
+                .and_then(|body| body.get("tags")),
+            Some(&json!(["customer:investors", "env:production"]))
         );
     }
 
