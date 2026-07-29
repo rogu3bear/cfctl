@@ -4743,12 +4743,8 @@ fn access_application_complete_snapshot_mismatches(
         capability.path.as_str(),
     ) {
         (
-            "access-applications-update-self-hosted-login-methods",
-            "PUT",
-            "/accounts/{account_id}/access/apps/{app_id}",
-        )
-        | (
-            "access-applications-update-app-launcher-login-methods",
+            "access-applications-update-self-hosted-login-methods"
+            | "access-applications-update-app-launcher-login-methods",
             "PUT",
             "/accounts/{account_id}/access/apps/{app_id}",
         ) => {}
