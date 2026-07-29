@@ -4787,12 +4787,13 @@ const OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION: &str = "oauth_client_key_overlap";
 const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str = "zone-subscription-zone-subscription-details";
 
-const ACCESS_APP_MUTABLE_FIELDS: [&str; 15] = [
+const ACCESS_APP_MUTABLE_FIELDS: [&str; 16] = [
     "allowed_idps",
     "app_launcher_visible",
     "auto_redirect_to_identity",
     "destinations",
     "domain",
+    "eager_redirect_cookie_setting",
     "enable_binding_cookie",
     "http_only_cookie_attribute",
     "name",
@@ -16747,8 +16748,7 @@ fn guide_document(capability: &CapabilityV1) -> CapabilityGuideV1 {
     let blocking_gaps = capability.mutation_contract_gaps();
     let contract_ready =
         capability.adapter_status != AdapterStatus::Blocked && blocking_gaps.is_empty();
-    let capability = caller_facing_capability(capability);
-    let post_resolution_call_argv = capability_call_argv(&capability);
+    let post_resolution_call_argv = capability_call_argv(capability);
     let call_argv = contract_ready.then(|| post_resolution_call_argv.clone());
     let stages = guide_stages()
         .iter()
@@ -16757,7 +16757,7 @@ fn guide_document(capability: &CapabilityV1) -> CapabilityGuideV1 {
             guide_stage_document(
                 index + 1,
                 *stage,
-                &capability,
+                capability,
                 contract_ready,
                 &blocking_gaps,
                 Some(&post_resolution_call_argv),
@@ -16765,11 +16765,9 @@ fn guide_document(capability: &CapabilityV1) -> CapabilityGuideV1 {
         })
         .collect::<Vec<_>>();
     let blocked_reason = capability.blocked_reason.clone();
-    let next_action = guide_next_action(
-        &capability,
-        contract_ready,
-        Some(&post_resolution_call_argv),
-    );
+    let next_action =
+        guide_next_action(capability, contract_ready, Some(&post_resolution_call_argv));
+    let capability = caller_facing_capability(capability);
 
     CapabilityGuideV1 {
         capability,
@@ -28526,6 +28524,7 @@ mod tests {
             "auto_redirect_to_identity":{"type":"boolean"},
             "destinations":{"type":"array","items":{"type":"object"}},
             "domain":{"type":"string"},
+            "eager_redirect_cookie_setting":{"type":"boolean"},
             "enable_binding_cookie":{"type":"boolean"},
             "http_only_cookie_attribute":{"type":"boolean"},
             "name":{"type":"string"},
@@ -28543,7 +28542,12 @@ mod tests {
         properties.retain(|field, _| super::ACCESS_APP_MUTABLE_FIELDS.contains(&field.as_str()));
         let required = super::ACCESS_APP_MUTABLE_FIELDS
             .iter()
-            .filter(|field| !matches!(**field, "same_site_cookie_attribute" | "tags"))
+            .filter(|field| {
+                !matches!(
+                    **field,
+                    "eager_redirect_cookie_setting" | "same_site_cookie_attribute" | "tags"
+                )
+            })
             .copied()
             .collect::<Vec<_>>();
         let mut capability = CapabilityV1::new(
@@ -28599,6 +28603,41 @@ mod tests {
         capability
     }
 
+    fn assert_access_application_optional_fields(body: &Value) {
+        assert_eq!(body["same_site_cookie_attribute"], json!("lax"));
+        assert_eq!(body["eager_redirect_cookie_setting"], json!(true));
+        assert_eq!(
+            body["tags"],
+            json!(["customer:investors", "env:production"])
+        );
+    }
+
+    fn assert_eager_redirect_cookie_contract(capability: &CapabilityV1) {
+        let materialized_schema =
+            cfctl_catalog::access_application_login_methods_materialized_schema();
+        assert_eq!(
+            materialized_schema["properties"]["eager_redirect_cookie_setting"]["type"],
+            "boolean"
+        );
+        assert!(
+            !materialized_schema["required"]
+                .as_array()
+                .expect("required fields")
+                .iter()
+                .any(|field| field == "eager_redirect_cookie_setting"),
+            "eager redirect is an optional provider field"
+        );
+        assert!(
+            capability
+                .same_path_read
+                .as_ref()
+                .expect("same-path read")
+                .verified_response_fields
+                .iter()
+                .any(|field| field == "eager_redirect_cookie_setting")
+        );
+    }
+
     #[test]
     fn access_application_same_site_cookie_round_trips_through_rollback() {
         let capability = access_application_login_methods_capability();
@@ -28612,6 +28651,7 @@ mod tests {
         )
         .expect("self-hosted variant");
         let mut planned_source = access_application_live_result();
+        planned_source["eager_redirect_cookie_setting"] = json!(true);
         if !variant
             .mutable_fields
             .contains(&"same_site_cookie_attribute")
@@ -28636,10 +28676,12 @@ mod tests {
             ),
             ..CallInput::default()
         };
+        assert_access_application_optional_fields(input.body.as_ref().expect("materialized body"));
+        assert_eager_redirect_cookie_contract(&capability);
         let response = CloudflareResponseV1 {
             status: 200,
             success: true,
-            result: access_application_live_result(),
+            result: planned_source,
             errors: Vec::new(),
             result_info: None,
             etag: None,
@@ -28652,14 +28694,7 @@ mod tests {
             &response,
         )
         .expect("exact prior-state receipt");
-        assert_eq!(
-            receipt["prior_state"]["same_site_cookie_attribute"],
-            json!("lax")
-        );
-        assert_eq!(
-            receipt["prior_state"]["tags"],
-            json!(["customer:investors", "env:production"])
-        );
+        assert_access_application_optional_fields(&receipt["prior_state"]);
 
         let receipt_hash = hash_value(&receipt).expect("receipt hash");
         let mut plan = PlanV1::draft(
@@ -28684,21 +28719,8 @@ mod tests {
         );
         let compensation =
             super::same_path_prior_state_compensation_request(&plan).expect("restoration request");
-        assert_eq!(
-            compensation
-                .input
-                .body
-                .as_ref()
-                .and_then(|body| body.get("same_site_cookie_attribute")),
-            Some(&json!("lax"))
-        );
-        assert_eq!(
-            compensation
-                .input
-                .body
-                .as_ref()
-                .and_then(|body| body.get("tags")),
-            Some(&json!(["customer:investors", "env:production"]))
+        assert_access_application_optional_fields(
+            compensation.input.body.as_ref().expect("restoration body"),
         );
     }
 
@@ -29382,6 +29404,23 @@ mod tests {
             guide["call_argv"].as_array().is_some(),
             "an available human-policy guide must expose its governed call"
         );
+        let stages = guide["stages"].as_array().expect("guide stages");
+        for stage_name in ["verify", "rectify"] {
+            let stage = stages
+                .iter()
+                .find(|stage| stage["name"] == stage_name)
+                .expect("governed lifecycle stage");
+            assert_eq!(
+                stage["contract_state"], "available",
+                "{stage_name} must be evaluated against the canonical executable contract"
+            );
+            assert!(
+                stage["commands"]
+                    .as_array()
+                    .is_some_and(|commands| !commands.is_empty()),
+                "{stage_name} must retain its governed command"
+            );
+        }
     }
 
     #[tokio::test]

@@ -13382,6 +13382,7 @@ pub fn access_application_login_methods_materialized_schema() -> Value {
                 }
             },
             "domain":{"type":"string","minLength":1},
+            "eager_redirect_cookie_setting":{"type":"boolean"},
             "enable_binding_cookie":{"type":"boolean"},
             "http_only_cookie_attribute":{"type":"boolean"},
             "name":{"type":"string","minLength":1},
@@ -13547,27 +13548,210 @@ fn access_application_read_identity_supported(
 
 fn access_application_missing_readback_fields(
     document: &Value,
+    app_type: &str,
     verified_response_fields: &[String],
 ) -> Vec<String> {
     let read_operation =
         document.pointer("/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}/get");
-    // The GET result is the same 13-variant application union as the PUT.
-    // Catalog proof therefore requires each curated field to exist somewhere
-    // in that declared union; runtime planning then requires the selected
-    // application variant to carry every required field before it can
-    // materialize or persist a plan.
     read_operation.map_or_else(
         || verified_response_fields.to_vec(),
         |operation| {
             verified_response_fields
                 .iter()
                 .filter(|field| {
-                    !success_response_declares_result_field_union(document, operation, &[field])
+                    !success_response_declares_access_application_variant_field(
+                        document, operation, app_type, field,
+                    )
                 })
                 .cloned()
                 .collect()
         },
     )
+}
+
+fn success_response_declares_access_application_variant_field(
+    document: &Value,
+    operation: &Value,
+    app_type: &str,
+    field: &str,
+) -> bool {
+    operation
+        .get("responses")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(status, _)| status.starts_with('2'))
+        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
+        .any(|schema| {
+            access_application_response_declares_variant_field(document, schema, app_type, field, 0)
+        })
+}
+
+fn access_application_response_declares_variant_field(
+    document: &Value,
+    schema: &Value,
+    app_type: &str,
+    field: &str,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                access_application_response_declares_variant_field(
+                    document,
+                    resolved,
+                    app_type,
+                    field,
+                    depth + 1,
+                )
+            });
+    }
+    if let Some(result) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get("result"))
+    {
+        return access_application_result_variant_declares_field(
+            document,
+            result,
+            app_type,
+            field,
+            depth + 1,
+        );
+    }
+    schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members.iter().any(|member| {
+                access_application_response_declares_variant_field(
+                    document,
+                    member,
+                    app_type,
+                    field,
+                    depth + 1,
+                )
+            })
+        })
+}
+
+fn access_application_result_variant_declares_field(
+    document: &Value,
+    schema: &Value,
+    app_type: &str,
+    field: &str,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                access_application_result_variant_declares_field(
+                    document,
+                    resolved,
+                    app_type,
+                    field,
+                    depth + 1,
+                )
+            });
+    }
+    for composition in ["oneOf", "anyOf"] {
+        if let Some(members) = schema.get(composition).and_then(Value::as_array) {
+            let matching = members
+                .iter()
+                .filter(|member| {
+                    access_application_schema_matches_type(document, member, app_type, depth + 1)
+                })
+                .collect::<Vec<_>>();
+            let [matching] = matching.as_slice() else {
+                return false;
+            };
+            return schema_declares_path(document, matching, &[field], depth + 1);
+        }
+    }
+    schema_declares_path(document, schema, &[field], depth + 1)
+}
+
+fn access_application_schema_matches_type(
+    document: &Value,
+    schema: &Value,
+    app_type: &str,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                access_application_schema_matches_type(document, resolved, app_type, depth + 1)
+            });
+    }
+    if schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get("type"))
+        .is_some_and(|type_schema| {
+            access_application_type_schema_matches(document, type_schema, app_type, depth + 1)
+        })
+    {
+        return true;
+    }
+    schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members.iter().any(|member| {
+                access_application_schema_matches_type(document, member, app_type, depth + 1)
+            })
+        })
+}
+
+fn access_application_type_schema_matches(
+    document: &Value,
+    schema: &Value,
+    app_type: &str,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                access_application_type_schema_matches(document, resolved, app_type, depth + 1)
+            });
+    }
+    if schema.get("const").and_then(Value::as_str) == Some(app_type)
+        || schema.get("example").and_then(Value::as_str) == Some(app_type)
+        || schema
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.as_slice() == [Value::String(app_type.to_owned())])
+    {
+        return true;
+    }
+    schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members.iter().any(|member| {
+                access_application_type_schema_matches(document, member, app_type, depth + 1)
+            })
+        })
 }
 
 /// Derives one narrow Access application update from the polymorphic generic
@@ -13581,6 +13765,7 @@ fn access_application_missing_readback_fields(
 /// replayed and verified by the same-path GET.
 struct AccessApplicationLoginMethodsContractSpec {
     capability_id: &'static str,
+    app_type: &'static str,
     title: &'static str,
     description: &'static str,
     aliases: &'static [&'static str],
@@ -14794,8 +14979,11 @@ fn insert_access_application_login_methods_contract(
     let verified_response_fields = capability
         .verifiable_request_object_fields()
         .unwrap_or_default();
-    let missing_readback_fields =
-        access_application_missing_readback_fields(document, &verified_response_fields);
+    let missing_readback_fields = access_application_missing_readback_fields(
+        document,
+        spec.app_type,
+        &verified_response_fields,
+    );
 
     if !source_identity_supported
         || !read_identity_supported
@@ -14878,6 +15066,7 @@ fn finalize_access_application_login_methods_contract(
         &source,
         AccessApplicationLoginMethodsContractSpec {
             capability_id: ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+            app_type: "self_hosted",
             title: "Update self-hosted Access application login methods",
             description: "Sets the non-empty identity-provider allowlist on one exact public self-hosted Access application. cfctl first reads the live application and builds a full mutable PUT body so policies, domains, cookie settings, launcher visibility, and redirect behavior are preserved.",
             aliases: &[
@@ -14894,6 +15083,7 @@ fn finalize_access_application_login_methods_contract(
         &source,
         AccessApplicationLoginMethodsContractSpec {
             capability_id: ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID,
+            app_type: "app_launcher",
             title: "Update Access App Launcher login methods",
             description: "Sets the non-empty identity-provider allowlist on the exact account App Launcher. cfctl first reads the live launcher and builds a preservation-safe PUT body so authentication routing, policy links, session duration, and configured launcher design remain unchanged.",
             aliases: &[

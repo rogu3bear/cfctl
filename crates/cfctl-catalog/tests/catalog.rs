@@ -5366,6 +5366,7 @@ fn access_application_login_methods_fixture() -> serde_json::Value {
             "custom_pages":{"type":"array","items":{"type":"string"}},
             "destinations":{"type":"array","items":{"type":"object"}},
             "domain":{"type":"string"},
+            "eager_redirect_cookie_setting":{"type":"boolean"},
             "enable_binding_cookie":{"type":"boolean"},
             "footer_links":{"type":"array","items":{"type":"object"}},
             "header_bg_color":{"type":"string"},
@@ -5396,6 +5397,7 @@ fn access_application_login_methods_fixture() -> serde_json::Value {
         "custom_pages":{"type":"array","items":{"type":"string"}},
         "destinations":{"type":"array","items":{"type":"object"}},
         "domain":{"type":"string"},
+        "eager_redirect_cookie_setting":{"type":"boolean"},
         "enable_binding_cookie":{"type":"boolean"},
         "footer_links":{"type":"array","items":{"type":"object"}},
         "header_bg_color":{"type":"string"},
@@ -5494,6 +5496,7 @@ fn access_application_login_methods_update_is_full_snapshot_governed() {
             "auto_redirect_to_identity",
             "destinations",
             "domain",
+            "eager_redirect_cookie_setting",
             "enable_binding_cookie",
             "http_only_cookie_attribute",
             "name",
@@ -5522,10 +5525,15 @@ fn access_application_login_methods_update_is_full_snapshot_governed() {
             .and_then(serde_json::Value::as_array)
             .is_some_and(|required| {
                 required.iter().all(|field| {
-                    !matches!(field.as_str(), Some("same_site_cookie_attribute" | "tags"))
+                    !matches!(
+                        field.as_str(),
+                        Some(
+                            "eager_redirect_cookie_setting" | "same_site_cookie_attribute" | "tags"
+                        )
+                    )
                 })
             }),
-        "cookie and tag fields are writable and verifiable when present, but optional on live self-hosted applications"
+        "optional cookie and tag fields are writable and verifiable when present"
     );
     let allowed_idp_schema = update
         .request_schema
@@ -5659,6 +5667,42 @@ fn access_application_login_methods_update_blocks_when_tag_readback_disappears()
         .get("access-applications-update-self-hosted-login-methods")
         .expect("derived login-method update");
     assert_eq!(update.adapter_status, AdapterStatus::Blocked);
+    assert!(
+        update
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("tags"))
+    );
+}
+
+#[test]
+fn access_application_login_methods_update_checks_the_matching_readback_variant() {
+    let mut fixture = access_application_login_methods_fixture();
+    let result_schema =
+        fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["properties"]["result"]
+            .clone();
+    let mut self_hosted = result_schema.clone();
+    self_hosted["properties"]["type"] = json!({"type":"string","enum":["self_hosted"]});
+    self_hosted["properties"]
+        .as_object_mut()
+        .expect("self-hosted result properties")
+        .remove("tags");
+    let mut saas = result_schema;
+    saas["properties"]["type"] = json!({"type":"string","enum":["saas"]});
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["properties"]["result"] =
+        json!({"anyOf":[self_hosted,saas]});
+
+    let snapshot = normalize_openapi(&fixture).expect("variant-shaped Access catalog");
+    let update = snapshot
+        .get("access-applications-update-self-hosted-login-methods")
+        .expect("derived login-method update");
+    assert_eq!(
+        update.adapter_status,
+        AdapterStatus::Blocked,
+        "a field on another application variant must not certify the self-hosted readback"
+    );
     assert!(
         update
             .blocked_reason
