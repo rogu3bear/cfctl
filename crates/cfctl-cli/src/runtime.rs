@@ -1208,7 +1208,13 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     let mut prepared = call_input(&capability, &arguments)?;
     prepare_r2_temporary_credentials_input(&capability, &mut prepared.input)?;
     let security_action = prepare_security_action_input(&capability, &mut prepared.input)?;
-    preflight_call_input(&capability, &prepared.input, prepared.secret_body.as_ref())?;
+    if is_access_application_login_methods_mutation(&capability) {
+        validate_access_application_login_methods_desired_input(&capability, &prepared.input)?;
+    } else if is_access_human_policy_mutation(&capability) {
+        validate_access_human_policy_desired_input(&capability, &prepared.input)?;
+    } else {
+        preflight_call_input(&capability, &prepared.input, prepared.secret_body.as_ref())?;
+    }
     if !capability.mutating {
         if prepared.secret_body.is_some() {
             return Err(CliError::Input(
@@ -4685,11 +4691,1057 @@ const DNS_RECORD_STATE_PRECONDITION: &str = "dns_record_state";
 const DNS_RECORD_RESTORE_CAPABILITY_ID: &str = "dns-records-for-a-zone-update-dns-record";
 const SAME_PATH_PRIOR_STATE_PRECONDITION: &str = "same_path_prior_state";
 const SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY: &str = "restore_same_path_prior_snapshot";
+const ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID: &str =
+    "access-applications-update-self-hosted-login-methods";
+const ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID: &str =
+    "access-applications-update-app-launcher-login-methods";
+const ACCESS_APP_READ_CAPABILITY_ID: &str = "access-applications-get-an-access-application";
+const ACCESS_APP_DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}";
+const ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID: &str =
+    "access-policies-update-human-access-controls";
+const ACCESS_POLICY_READ_CAPABILITY_ID: &str = "access-policies-get-an-access-policy";
+const ACCESS_POLICY_DETAIL_PATH: &str =
+    "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
 const OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID: &str = "oauth-clients-get";
 const OAUTH_CLIENT_DETAIL_PATH: &str = "/accounts/{account_id}/oauth_clients/{oauth_client_id}";
 const OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION: &str = "oauth_client_key_overlap";
 const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str = "zone-subscription-zone-subscription-details";
+
+const ACCESS_APP_MUTABLE_FIELDS: [&str; 13] = [
+    "allowed_idps",
+    "app_launcher_visible",
+    "auto_redirect_to_identity",
+    "destinations",
+    "domain",
+    "enable_binding_cookie",
+    "http_only_cookie_attribute",
+    "name",
+    "options_preflight_bypass",
+    "policies",
+    "self_hosted_domains",
+    "session_duration",
+    "type",
+];
+const ACCESS_APP_READ_ONLY_FIELDS: [&str; 6] =
+    ["aud", "created_at", "id", "tags", "uid", "updated_at"];
+
+const ACCESS_APP_LAUNCHER_MUTABLE_FIELDS: [&str; 14] = [
+    "allowed_idps",
+    "app_launcher_logo_url",
+    "auto_redirect_to_identity",
+    "bg_color",
+    "custom_deny_url",
+    "custom_non_identity_deny_url",
+    "custom_pages",
+    "footer_links",
+    "header_bg_color",
+    "landing_page_design",
+    "policies",
+    "session_duration",
+    "skip_app_launcher_login_page",
+    "type",
+];
+const ACCESS_APP_LAUNCHER_REQUIRED_FIELDS: [&str; 7] = [
+    "allowed_idps",
+    "auto_redirect_to_identity",
+    "landing_page_design",
+    "policies",
+    "session_duration",
+    "skip_app_launcher_login_page",
+    "type",
+];
+const ACCESS_APP_LAUNCHER_READ_ONLY_FIELDS: [&str; 7] = [
+    "aud",
+    "created_at",
+    "domain",
+    "id",
+    "name",
+    "uid",
+    "updated_at",
+];
+
+const ACCESS_HUMAN_POLICY_MUTABLE_FIELDS: [&str; 8] = [
+    "decision",
+    "exclude",
+    "include",
+    "mfa_config",
+    "name",
+    "precedence",
+    "require",
+    "session_duration",
+];
+const ACCESS_HUMAN_POLICY_REQUIRED_FIELDS: [&str; 6] = [
+    "decision",
+    "exclude",
+    "include",
+    "name",
+    "precedence",
+    "require",
+];
+const ACCESS_HUMAN_POLICY_DESIRED_FIELDS: [&str; 3] = ["exclude", "include", "mfa_config"];
+const ACCESS_HUMAN_POLICY_READ_ONLY_FIELDS: [&str; 5] =
+    ["created_at", "id", "reusable", "uid", "updated_at"];
+
+#[derive(Clone, Copy)]
+struct AccessApplicationLoginMethodsVariant {
+    app_type: &'static str,
+    mutable_fields: &'static [&'static str],
+    required_fields: &'static [&'static str],
+    read_only_fields: &'static [&'static str],
+}
+
+fn access_application_login_methods_variant(
+    capability_id: &str,
+) -> Option<AccessApplicationLoginMethodsVariant> {
+    match capability_id {
+        ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID => Some(AccessApplicationLoginMethodsVariant {
+            app_type: "self_hosted",
+            mutable_fields: &ACCESS_APP_MUTABLE_FIELDS,
+            required_fields: &ACCESS_APP_MUTABLE_FIELDS,
+            read_only_fields: &ACCESS_APP_READ_ONLY_FIELDS,
+        }),
+        ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID => {
+            Some(AccessApplicationLoginMethodsVariant {
+                app_type: "app_launcher",
+                mutable_fields: &ACCESS_APP_LAUNCHER_MUTABLE_FIELDS,
+                required_fields: &ACCESS_APP_LAUNCHER_REQUIRED_FIELDS,
+                read_only_fields: &ACCESS_APP_LAUNCHER_READ_ONLY_FIELDS,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn is_access_application_login_methods_mutation(capability: &CapabilityV1) -> bool {
+    let Some(variant) = access_application_login_methods_variant(&capability.id) else {
+        return false;
+    };
+    capability.method == "PUT"
+        && capability.path == ACCESS_APP_DETAIL_PATH
+        && capability.product == "Access applications"
+        && capability.account_scope == "account"
+        && capability.mutating
+        && capability.permissions == ["Access: Apps and Policies Write"]
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.verification.strategy
+            == "same_path_result_contains_planned_fields_after_update"
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path == ACCESS_APP_DETAIL_PATH
+                && read.read_capability_id == ACCESS_APP_READ_CAPABILITY_ID
+                && read.verified_response_fields
+                    == variant
+                        .mutable_fields
+                        .iter()
+                        .map(|field| (*field).to_owned())
+                        .collect::<Vec<_>>()
+        })
+        && capability.rollback.strategy.as_deref() == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
+        && capability.verification_contract_supported()
+        && capability.rollback_contract_supported()
+}
+
+fn access_application_login_methods_desired_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["allowed_idps"],
+        "properties":{
+            "allowed_idps":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":25,
+                "uniqueItems":true,
+                "items":{"type":"string","minLength":36,"maxLength":36}
+            }
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn validate_access_application_login_methods_desired_input(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    if !is_access_application_login_methods_mutation(capability) {
+        return Err(CliError::Input(
+            "Access application login-method capability drifted from its governed exact-update contract"
+                .to_owned(),
+        ));
+    }
+    let mut desired_capability = capability.clone();
+    desired_capability.request_schema = Some(access_application_login_methods_desired_schema());
+    validate_request_contract(&desired_capability, input)?;
+    access_application_desired_idps(input)?;
+    Ok(())
+}
+
+fn access_application_desired_idps(input: &CallInput) -> Result<Vec<String>> {
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|body| body.len() == 1)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Access login-method input must contain only a non-empty `allowed_idps` array"
+                    .to_owned(),
+            )
+        })?;
+    let values = body
+        .get("allowed_idps")
+        .and_then(Value::as_array)
+        .filter(|values| !values.is_empty() && values.len() <= 25)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Access login-method input requires between 1 and 25 identity-provider IDs; an empty list would allow every login method"
+                    .to_owned(),
+            )
+        })?;
+    let mut desired = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| Uuid::parse_str(value).is_ok())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "every Access identity-provider ID must be a valid UUID".to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    desired.sort();
+    if desired.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(CliError::Input(
+            "Access identity-provider IDs must be unique".to_owned(),
+        ));
+    }
+    Ok(desired)
+}
+
+fn normalize_access_application_policies(value: &Value) -> Result<Value> {
+    let policies = value
+        .as_array()
+        .filter(|policies| !policies.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "live Access application has no restorable policy references; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+    let mut normalized = policies
+        .iter()
+        .map(|policy| {
+            let id = policy
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "live Access application policy omitted its identity; the mutation boundary was not crossed"
+                            .to_owned(),
+                    )
+                })?;
+            let precedence = policy
+                .get("precedence")
+                .and_then(Value::as_u64)
+                .filter(|precedence| *precedence > 0)
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "live Access application policy omitted a positive precedence; the mutation boundary was not crossed"
+                            .to_owned(),
+                    )
+                })?;
+            Ok(json!({"id":id,"precedence":precedence}))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    normalized.sort_by(|left, right| {
+        let left_precedence = left
+            .get("precedence")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let right_precedence = right
+            .get("precedence")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        left_precedence.cmp(&right_precedence).then_with(|| {
+            left.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .cmp(right.get("id").and_then(Value::as_str).unwrap_or_default())
+        })
+    });
+    Ok(Value::Array(normalized))
+}
+
+fn normalized_access_application_idps(value: &Value) -> Result<Value> {
+    let mut idps = value
+        .as_array()
+        .filter(|idps| !idps.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "live Access application has an empty identity-provider allowlist; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?
+        .iter()
+        .map(|idp| {
+            idp.as_str()
+                .filter(|idp| Uuid::parse_str(idp).is_ok())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "live Access application returned an invalid identity-provider ID; the mutation boundary was not crossed"
+                            .to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    idps.sort();
+    if idps.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(CliError::Input(
+            "live Access application returned duplicate identity-provider IDs; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    Ok(json!(idps))
+}
+
+fn access_application_mutable_body(
+    result: &Value,
+    desired_idps: &[String],
+    variant: AccessApplicationLoginMethodsVariant,
+) -> Result<Value> {
+    let result = result.as_object().ok_or_else(|| {
+        CliError::Input(
+            "live Access application read did not return an object; the mutation boundary was not crossed"
+                .to_owned(),
+        )
+    })?;
+    let known_fields = variant
+        .mutable_fields
+        .iter()
+        .chain(variant.read_only_fields.iter())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let unknown_fields = result
+        .keys()
+        .filter(|field| !known_fields.contains(field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown_fields.is_empty() {
+        return Err(CliError::Input(format!(
+            "live Access application contains unclassified field(s) {}; the preservation-safe mutation boundary was not crossed",
+            unknown_fields.join(",")
+        )));
+    }
+    let mut body = Map::new();
+    for &field in variant.mutable_fields {
+        let Some(value) = result.get(field).cloned() else {
+            if variant.required_fields.contains(&field) {
+                return Err(CliError::Input(format!(
+                    "live Access application omitted required mutable field `{field}`; the mutation boundary was not crossed"
+                )));
+            }
+            continue;
+        };
+        let value = match field {
+            "allowed_idps" => json!(desired_idps),
+            "policies" => normalize_access_application_policies(&value)?,
+            _ => value,
+        };
+        body.insert(field.to_owned(), value);
+    }
+    Ok(Value::Object(body))
+}
+
+fn access_application_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == ACCESS_APP_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == ACCESS_APP_DETAIL_PATH
+        && capability.product == "Access applications"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.selectors.len() == 2
+        && ["account_id", "app_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.body_mode == cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                    && response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+            })
+}
+
+async fn prepare_access_application_login_methods_plan_input(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &mut CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !is_access_application_login_methods_mutation(capability) {
+        return Ok(None);
+    }
+    let variant = access_application_login_methods_variant(&capability.id).ok_or_else(|| {
+        CliError::Input(
+            "Access application login-method capability omitted its exact application variant"
+                .to_owned(),
+        )
+    })?;
+    let body_field_count = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .map_or(0, serde_json::Map::len);
+    if body_field_count != 1 {
+        preflight_call_input(capability, input, None)?;
+        return read_live_same_path_prior_state(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await
+        .map(Some);
+    }
+    let desired_idps = access_application_desired_idps(input)?;
+    let app_id = input
+        .selectors
+        .get("app_id")
+        .and_then(Value::as_str)
+        .filter(|app_id| !app_id.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Access login-method plan requires an exact `app_id` selector".to_owned(),
+            )
+        })?;
+    let source = catalog
+        .get(ACCESS_APP_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(ACCESS_APP_READ_CAPABILITY_ID))?;
+    if !access_application_read_contract_supported(source) {
+        return Err(CliError::Input(
+            "Access application state source drifted from the governed exact-app read".to_owned(),
+        ));
+    }
+    let response = Executor::new(http_client()?, API_BASE_URL)?
+        .execute_read(
+            source,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    if !response.success || response.status != 200 {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the Access application state read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    if response.result.get("id").and_then(Value::as_str) != Some(app_id)
+        || response.result.get("type").and_then(Value::as_str) != Some(variant.app_type)
+    {
+        return Err(CliError::Input(format!(
+            "Access application state read returned a different app or a non-{} app; the mutation boundary was not crossed",
+            variant.app_type
+        )));
+    }
+    let current_idps = normalized_access_application_idps(
+        response.result.get("allowed_idps").unwrap_or(&Value::Null),
+    )?;
+    if current_idps == json!(desired_idps) {
+        return Err(CliError::Input(
+            "Access application already has the exact requested identity-provider allowlist; no mutation plan was created"
+                .to_owned(),
+        ));
+    }
+    input.body = Some(access_application_mutable_body(
+        &response.result,
+        &desired_idps,
+        variant,
+    )?);
+    preflight_call_input(capability, input, None)?;
+    let receipt = apply_same_path_prior_state_response(capability, input, account_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok(Some((receipt, evidence)))
+}
+
+fn is_access_human_policy_mutation(capability: &CapabilityV1) -> bool {
+    capability.id == ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID
+        && capability.method == "PUT"
+        && capability.path == ACCESS_POLICY_DETAIL_PATH
+        && capability.product == "Access application-scoped policies"
+        && capability.account_scope == "account"
+        && capability.mutating
+        && capability.permissions == ["Access: Apps and Policies Write"]
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.verification.strategy
+            == "same_path_result_contains_planned_fields_after_update"
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path == ACCESS_POLICY_DETAIL_PATH
+                && read.read_capability_id == ACCESS_POLICY_READ_CAPABILITY_ID
+                && read.verified_response_fields
+                    == ACCESS_HUMAN_POLICY_MUTABLE_FIELDS
+                        .iter()
+                        .map(|field| (*field).to_owned())
+                        .collect::<Vec<_>>()
+        })
+        && capability.rollback.strategy.as_deref() == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
+        && capability.verification_contract_supported()
+        && capability.rollback_contract_supported()
+}
+
+fn access_human_policy_identity_rule_schema() -> Value {
+    json!({
+        "oneOf":[
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["email"],
+                "properties":{
+                    "email":{
+                        "type":"object",
+                        "additionalProperties":false,
+                        "required":["email"],
+                        "properties":{
+                            "email":{
+                                "type":"string",
+                                "format":"email",
+                                "minLength":3,
+                                "maxLength":254
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["email_domain"],
+                "properties":{
+                    "email_domain":{
+                        "type":"object",
+                        "additionalProperties":false,
+                        "required":["domain"],
+                        "properties":{
+                            "domain":{
+                                "type":"string",
+                                "minLength":3,
+                                "maxLength":253
+                            }
+                        }
+                    }
+                }
+            }
+        ]
+    })
+}
+
+fn access_human_policy_mfa_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["allowed_authenticators","mfa_disabled"],
+        "properties":{
+            "allowed_authenticators":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":3,
+                "uniqueItems":true,
+                "items":{
+                    "type":"string",
+                    "enum":["totp","biometrics","security_key"]
+                }
+            },
+            "mfa_disabled":{"type":"boolean"},
+            "session_duration":{"type":"string","minLength":2,"maxLength":16}
+        }
+    })
+}
+
+fn access_human_policy_desired_schema() -> Value {
+    let identity_rule = access_human_policy_identity_rule_schema();
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "minProperties":1,
+        "properties":{
+            "include":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":100,
+                "uniqueItems":true,
+                "items":identity_rule.clone()
+            },
+            "exclude":{
+                "type":"array",
+                "maxItems":100,
+                "uniqueItems":true,
+                "items":identity_rule
+            },
+            "mfa_config":access_human_policy_mfa_schema()
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn validate_access_human_policy_desired_input(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    if !is_access_human_policy_mutation(capability) {
+        return Err(CliError::Input(
+            "human Access policy capability drifted from its governed preservation-safe contract"
+                .to_owned(),
+        ));
+    }
+    let mut desired_capability = capability.clone();
+    desired_capability.request_schema = Some(access_human_policy_desired_schema());
+    validate_request_contract(&desired_capability, input)?;
+    access_human_policy_desired_changes(input)?;
+    Ok(())
+}
+
+fn normalized_access_human_identity_rules(value: &Value, require_nonempty: bool) -> Result<Value> {
+    let values = value.as_array().ok_or_else(|| {
+        CliError::Input("human Access identity rules must be an array".to_owned())
+    })?;
+    if require_nonempty && values.is_empty() {
+        return Err(CliError::Input(
+            "human Access policy include rules must not be empty".to_owned(),
+        ));
+    }
+    if values.len() > 100 {
+        return Err(CliError::Input(
+            "human Access policy identity rules exceed the bounded 100-rule contract".to_owned(),
+        ));
+    }
+    let mut normalized = values
+        .iter()
+        .map(|value| {
+            let rule = value.as_object().filter(|rule| rule.len() == 1).ok_or_else(|| {
+                CliError::Input(
+                    "human Access policy rules must contain exactly one email or email_domain selector"
+                        .to_owned(),
+                )
+            })?;
+            if let Some(email) = rule.get("email") {
+                let email = email
+                    .as_object()
+                    .filter(|email| email.len() == 1)
+                    .and_then(|email| email.get("email"))
+                    .and_then(Value::as_str)
+                    .filter(|email| !email.is_empty())
+                    .ok_or_else(|| {
+                        CliError::Input(
+                            "human Access email rules require one non-empty email value".to_owned(),
+                        )
+                    })?;
+                return Ok(("email".to_owned(), email.to_owned()));
+            }
+            let domain = rule
+                .get("email_domain")
+                .and_then(Value::as_object)
+                .filter(|domain| domain.len() == 1)
+                .and_then(|domain| domain.get("domain"))
+                .and_then(Value::as_str)
+                .filter(|domain| !domain.is_empty())
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "human Access policy rules admit only one non-empty email or email_domain selector"
+                            .to_owned(),
+                    )
+                })?;
+            Ok(("email_domain".to_owned(), domain.to_owned()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    normalized.sort();
+    if normalized.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(CliError::Input(
+            "human Access policy identity rules must be unique".to_owned(),
+        ));
+    }
+    Ok(Value::Array(
+        normalized
+            .into_iter()
+            .map(|(kind, value)| match kind.as_str() {
+                "email" => json!({"email":{"email":value}}),
+                _ => json!({"email_domain":{"domain":value}}),
+            })
+            .collect(),
+    ))
+}
+
+fn normalized_access_human_mfa_config(
+    value: &Value,
+    tolerate_empty_provider_duration: bool,
+) -> Result<Value> {
+    let config = value.as_object().ok_or_else(|| {
+        CliError::Input("human Access MFA configuration must be an object".to_owned())
+    })?;
+    let known_fields = ["allowed_authenticators", "mfa_disabled", "session_duration"];
+    let unknown_fields = config
+        .keys()
+        .filter(|field| !known_fields.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown_fields.is_empty() {
+        return Err(CliError::Input(format!(
+            "human Access MFA configuration contains unclassified field(s) {}",
+            unknown_fields.join(",")
+        )));
+    }
+    let mut authenticators = config
+        .get("allowed_authenticators")
+        .and_then(Value::as_array)
+        .filter(|values| !values.is_empty() && values.len() <= 3)
+        .ok_or_else(|| {
+            CliError::Input(
+                "human Access MFA requires between one and three authenticators".to_owned(),
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| matches!(*value, "totp" | "biometrics" | "security_key"))
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "human Access MFA admits only totp, biometrics, and security_key"
+                            .to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    authenticators.sort();
+    if authenticators.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(CliError::Input(
+            "human Access MFA authenticators must be unique".to_owned(),
+        ));
+    }
+    let mfa_disabled = config
+        .get("mfa_disabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            CliError::Input(
+                "human Access MFA configuration requires a boolean mfa_disabled value".to_owned(),
+            )
+        })?;
+    let mut normalized = Map::new();
+    normalized.insert("allowed_authenticators".to_owned(), json!(authenticators));
+    normalized.insert("mfa_disabled".to_owned(), json!(mfa_disabled));
+    if let Some(duration) = config.get("session_duration") {
+        let duration = duration.as_str().ok_or_else(|| {
+            CliError::Input("human Access MFA session duration must be a string".to_owned())
+        })?;
+        if duration.is_empty() && tolerate_empty_provider_duration {
+            return Ok(Value::Object(normalized));
+        }
+        if duration.is_empty() {
+            return Err(CliError::Input(
+                "human Access MFA session duration must not be empty".to_owned(),
+            ));
+        }
+        normalized.insert("session_duration".to_owned(), json!(duration));
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn access_human_policy_desired_changes(input: &CallInput) -> Result<Map<String, Value>> {
+    let desired = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|desired| !desired.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "human Access policy input requires at least one eligibility or MFA change"
+                    .to_owned(),
+            )
+        })?;
+    let unknown_fields = desired
+        .keys()
+        .filter(|field| !ACCESS_HUMAN_POLICY_DESIRED_FIELDS.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown_fields.is_empty() {
+        return Err(CliError::Input(format!(
+            "human Access policy desired input contains unclassified field(s) {}",
+            unknown_fields.join(",")
+        )));
+    }
+    let mut normalized = Map::new();
+    for (field, value) in desired {
+        let value = match field.as_str() {
+            "include" => normalized_access_human_identity_rules(value, true)?,
+            "exclude" => normalized_access_human_identity_rules(value, false)?,
+            "mfa_config" => normalized_access_human_mfa_config(value, false)?,
+            _ => unreachable!("unknown desired fields were rejected"),
+        };
+        normalized.insert(field.clone(), value);
+    }
+    Ok(normalized)
+}
+
+fn access_human_policy_mutable_body(result: &Value, desired: &Map<String, Value>) -> Result<Value> {
+    let result = result.as_object().ok_or_else(|| {
+        CliError::Input(
+            "live human Access policy read did not return an object; the mutation boundary was not crossed"
+                .to_owned(),
+        )
+    })?;
+    let known_fields = ACCESS_HUMAN_POLICY_MUTABLE_FIELDS
+        .iter()
+        .chain(ACCESS_HUMAN_POLICY_READ_ONLY_FIELDS.iter())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let unknown_fields = result
+        .keys()
+        .filter(|field| !known_fields.contains(field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown_fields.is_empty() {
+        return Err(CliError::Input(format!(
+            "live human Access policy contains unclassified field(s) {}; the preservation-safe mutation boundary was not crossed",
+            unknown_fields.join(",")
+        )));
+    }
+    if result.get("decision").and_then(Value::as_str) != Some("allow") {
+        return Err(CliError::Input(
+            "live Access policy is not a human allow policy; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    if result
+        .get("require")
+        .and_then(Value::as_array)
+        .is_none_or(|rules| !rules.is_empty())
+    {
+        return Err(CliError::Input(
+            "live Access policy has non-empty require rules; the human-only mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+
+    let mut body = Map::new();
+    for field in ACCESS_HUMAN_POLICY_MUTABLE_FIELDS {
+        let value = desired.get(field).or_else(|| result.get(field));
+        let Some(value) = value else {
+            if ACCESS_HUMAN_POLICY_REQUIRED_FIELDS.contains(&field) {
+                return Err(CliError::Input(format!(
+                    "live human Access policy omitted required mutable field `{field}`; the mutation boundary was not crossed"
+                )));
+            }
+            continue;
+        };
+        let value = match field {
+            "include" => normalized_access_human_identity_rules(value, true)?,
+            "exclude" => normalized_access_human_identity_rules(value, false)?,
+            "mfa_config" => {
+                normalized_access_human_mfa_config(value, !desired.contains_key(field))?
+            }
+            "session_duration" => {
+                let duration = value.as_str().ok_or_else(|| {
+                    CliError::Input(
+                        "live human Access policy session duration is not a string; the mutation boundary was not crossed"
+                            .to_owned(),
+                    )
+                })?;
+                if duration.is_empty() {
+                    continue;
+                }
+                json!(duration)
+            }
+            "name" => {
+                let name = value
+                    .as_str()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        CliError::Input(
+                            "live human Access policy omitted its name; the mutation boundary was not crossed"
+                                .to_owned(),
+                        )
+                    })?;
+                json!(name)
+            }
+            "precedence" => {
+                let precedence = value
+                    .as_u64()
+                    .filter(|precedence| *precedence > 0)
+                    .ok_or_else(|| {
+                        CliError::Input(
+                            "live human Access policy omitted a positive precedence; the mutation boundary was not crossed"
+                                .to_owned(),
+                        )
+                    })?;
+                json!(precedence)
+            }
+            "decision" => json!("allow"),
+            "require" => json!([]),
+            _ => unreachable!("human Access policy field set is closed"),
+        };
+        body.insert(field.to_owned(), value);
+    }
+    Ok(Value::Object(body))
+}
+
+fn access_human_policy_prior_state(result: &Value) -> Result<Value> {
+    access_human_policy_mutable_body(result, &Map::new())
+}
+
+fn access_human_policy_desired_matches_live(
+    result: &Value,
+    desired: &Map<String, Value>,
+) -> Result<bool> {
+    let current = access_human_policy_prior_state(result)?;
+    let updated = access_human_policy_mutable_body(result, desired)?;
+    Ok(desired
+        .keys()
+        .all(|field| current.get(field) == updated.get(field)))
+}
+
+fn access_policy_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == ACCESS_POLICY_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == ACCESS_POLICY_DETAIL_PATH
+        && capability.product == "Access application-scoped policies"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.selectors.len() == 3
+        && ["account_id", "app_id", "policy_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.body_mode == cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                    && response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+            })
+}
+
+async fn prepare_access_human_policy_plan_input(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &mut CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !is_access_human_policy_mutation(capability) {
+        return Ok(None);
+    }
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input("human Access policy plan requires an object body".to_owned())
+        })?;
+    let materialized_body = body
+        .keys()
+        .any(|field| !ACCESS_HUMAN_POLICY_DESIRED_FIELDS.contains(&field.as_str()));
+    let desired = if materialized_body {
+        preflight_call_input(capability, input, None)?;
+        None
+    } else {
+        Some(access_human_policy_desired_changes(input)?)
+    };
+    let policy_id = input
+        .selectors
+        .get("policy_id")
+        .and_then(Value::as_str)
+        .filter(|policy_id| !policy_id.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "human Access policy plan requires an exact `policy_id` selector".to_owned(),
+            )
+        })?;
+    let source = catalog
+        .get(ACCESS_POLICY_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(ACCESS_POLICY_READ_CAPABILITY_ID))?;
+    if !access_policy_read_contract_supported(source) {
+        return Err(CliError::Input(
+            "Access policy state source drifted from the governed exact-policy read".to_owned(),
+        ));
+    }
+    let response = Executor::new(http_client()?, API_BASE_URL)?
+        .execute_read(
+            source,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    if !response.success || response.status != 200 {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the human Access policy state read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    if response.result.get("id").and_then(Value::as_str) != Some(policy_id) {
+        return Err(CliError::Input(
+            "Access policy state read returned a different or missing policy id; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    access_human_policy_prior_state(&response.result)?;
+    if let Some(desired) = desired {
+        if access_human_policy_desired_matches_live(&response.result, &desired)? {
+            return Err(CliError::Input(
+                "human Access policy already has the exact requested eligibility and MFA state; no mutation plan was created"
+                    .to_owned(),
+            ));
+        }
+        input.body = Some(access_human_policy_mutable_body(
+            &response.result,
+            &desired,
+        )?);
+        preflight_call_input(capability, input, None)?;
+    }
+    let receipt = apply_same_path_prior_state_response(capability, input, account_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok(Some((receipt, evidence)))
+}
 
 fn oauth_client_secret_expected_prior_state(capability: &CapabilityV1) -> Option<bool> {
     match (
@@ -5350,6 +6402,35 @@ fn project_same_path_prior_state(
     input: &CallInput,
     result: &Value,
 ) -> Result<Value> {
+    if is_access_human_policy_mutation(capability) {
+        let policy_id = input
+            .selectors
+            .get("policy_id")
+            .and_then(Value::as_str)
+            .filter(|policy_id| !policy_id.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "human Access policy prior-state read omitted its exact policy selector"
+                        .to_owned(),
+                )
+            })?;
+        if result.get("id").and_then(Value::as_str) != Some(policy_id) {
+            return Err(CliError::Input(
+                "human Access policy prior-state read returned a different or missing policy id; the mutation boundary was not crossed"
+                    .to_owned(),
+            ));
+        }
+        let prior = access_human_policy_prior_state(result)?;
+        let mut restore_input = input.clone();
+        restore_input.query = json!({});
+        restore_input.body = Some(prior.clone());
+        preflight_call_input(capability, &restore_input, None).map_err(|error| {
+            CliError::Input(format!(
+                "live human Access policy is outside the exact restorable request contract; the mutation boundary was not crossed: {error}"
+            ))
+        })?;
+        return Ok(prior);
+    }
     let mut prior = serde_json::Map::new();
     for field in same_path_prior_state_fields(capability, input)? {
         let response_field = capability
@@ -5360,6 +6441,15 @@ fn project_same_path_prior_state(
                 "same-path state read omitted restorable field `{response_field}`; the mutation boundary was not crossed"
             ))
         })?;
+        let value = if is_access_application_login_methods_mutation(capability) {
+            match field.as_str() {
+                "allowed_idps" => normalized_access_application_idps(&value)?,
+                "policies" => normalize_access_application_policies(&value)?,
+                _ => value,
+            }
+        } else {
+            value
+        };
         prior.insert(field, value);
     }
     let prior = Value::Object(prior);
@@ -6833,6 +7923,8 @@ fn plan_requires_live_credential(capability: &CapabilityV1, adapter_targets: &Va
         || should_bind_security_action_state(capability, adapter_targets)
         || should_bind_oauth_client_secret_state(capability)
         || should_bind_r2_parent_token(capability)
+        || is_access_application_login_methods_mutation(capability)
+        || is_access_human_policy_mutation(capability)
 }
 
 #[expect(
@@ -6864,6 +7956,39 @@ async fn create_plan(
     let resolve_entitlement = should_resolve_zone_entitlement(&capability);
     let credential = if plan_requires_live_credential(&capability, &adapter_targets) {
         Some(fresh_credential(profile, &platform_secrets(store)).await?)
+    } else {
+        None
+    };
+    let access_state_precondition = if is_access_application_login_methods_mutation(&capability) {
+        let credential = credential.as_ref().ok_or_else(|| {
+            CliError::Input(
+                "Access application state precondition credential was not resolved".to_owned(),
+            )
+        })?;
+        prepare_access_application_login_methods_plan_input(
+            store,
+            catalog,
+            &capability,
+            &mut input,
+            account_id,
+            credential,
+        )
+        .await?
+    } else if is_access_human_policy_mutation(&capability) {
+        let credential = credential.as_ref().ok_or_else(|| {
+            CliError::Input(
+                "human Access policy state precondition credential was not resolved".to_owned(),
+            )
+        })?;
+        prepare_access_human_policy_plan_input(
+            store,
+            catalog,
+            &capability,
+            &mut input,
+            account_id,
+            credential,
+        )
+        .await?
     } else {
         None
     };
@@ -6938,6 +8063,8 @@ async fn create_plan(
     live_preconditions.entitlement = entitlement_precondition;
     live_preconditions.zone_account = zone_account_precondition;
     live_preconditions.r2_parent_token = r2_parent_token_precondition;
+    live_preconditions.same_path_prior_state =
+        access_state_precondition.or(live_preconditions.same_path_prior_state);
     resolve_kv_empty_namespace_delete_cost(&mut capability, &live_preconditions);
     persist_prepared_plan(
         store,
@@ -7452,7 +8579,10 @@ async fn prepare_same_path_prior_state_precondition(
     account_id: &str,
     credential: Option<&AuthCredential>,
 ) -> Result<Option<(Value, EvidenceV1)>> {
-    if !should_bind_same_path_prior_state(capability) {
+    if !should_bind_same_path_prior_state(capability)
+        || is_access_application_login_methods_mutation(capability)
+        || is_access_human_policy_mutation(capability)
+    {
         return Ok(None);
     }
     let credential = credential.ok_or_else(|| {
@@ -10952,15 +12082,24 @@ fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Res
                     .to_owned(),
             )
         })?;
-    let expected_fields = same_path_prior_state_fields(&plan.capability, &input)?;
-    let observed_fields = prior_state.keys().cloned().collect::<Vec<_>>();
-    if !exact_identity || observed_fields != expected_fields {
+    let prior_state = Value::Object(prior_state);
+    let valid_state_shape = if is_access_human_policy_mutation(&plan.capability) {
+        access_human_policy_prior_state(&prior_state)
+            .is_ok_and(|normalized| normalized == prior_state)
+    } else {
+        let expected_fields = same_path_prior_state_fields(&plan.capability, &input)?;
+        let observed_fields = prior_state
+            .as_object()
+            .map(|state| state.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        observed_fields == expected_fields
+    };
+    if !exact_identity || !valid_state_shape {
         return Err(CliError::Input(
             "same-path prior-state receipt has an invalid source, target, selector, or field set; create a new plan"
                 .to_owned(),
         ));
     }
-    let prior_state = Value::Object(prior_state);
     let mut restore_input = input;
     restore_input.query = json!({});
     restore_input.body = Some(prior_state.clone());
@@ -26777,6 +27916,534 @@ mod tests {
             .collect();
         let (result, _error) = super::resolve_result("cap", &ranked, None, 3);
         assert_eq!(result["matched"].as_array().map(Vec::len), Some(3));
+    }
+
+    fn access_application_live_result() -> Value {
+        json!({
+            "allowed_idps":[
+                "7b0bc477-5d42-4dab-b0ea-c97d0aef7810",
+                "6f88b4fc-0ed2-48fa-95ea-3f7336c90053"
+            ],
+            "app_launcher_visible":true,
+            "aud":"aud-value",
+            "auto_redirect_to_identity":false,
+            "created_at":"2026-03-24T02:31:11Z",
+            "destinations":[{"type":"public","uri":"investors.mlnavigator.com"}],
+            "domain":"investors.mlnavigator.com",
+            "enable_binding_cookie":true,
+            "http_only_cookie_attribute":true,
+            "id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+            "name":"MLNavigator Investor Portal",
+            "options_preflight_bypass":false,
+            "policies":[{
+                "created_at":"2026-07-14T09:51:08Z",
+                "decision":"allow",
+                "id":"45e44306-0e2a-460a-94aa-34c21eefdb4a",
+                "include":[{"email_domain":{"domain":"mlnavigator.com"}}],
+                "name":"Allow MLNavigator Investor Staff",
+                "precedence":1,
+                "updated_at":"2026-07-14T09:51:08Z"
+            }],
+            "self_hosted_domains":["investors.mlnavigator.com"],
+            "session_duration":"24h",
+            "tags":[],
+            "type":"self_hosted",
+            "uid":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+            "updated_at":"2026-07-14T09:51:47Z"
+        })
+    }
+
+    fn access_app_launcher_live_result() -> Value {
+        json!({
+            "allowed_idps":["6f88b4fc-0ed2-48fa-95ea-3f7336c90053"],
+            "aud":"aud-value",
+            "auto_redirect_to_identity":false,
+            "created_at":"2026-04-17T15:14:52Z",
+            "domain":"auch-id.cloudflareaccess.com",
+            "id":"564ba110-aca0-401a-850d-b706c2c1a642",
+            "landing_page_design":{},
+            "name":"App Launcher",
+            "policies":[{
+                "created_at":"2026-04-28T20:10:14Z",
+                "decision":"allow",
+                "id":"89cae51e-3bb6-480f-a9a1-9abdf0964b82",
+                "include":[{"email_domain":{"domain":"mlnavigator.com"}}],
+                "name":"Allow MLNavigator Staff",
+                "precedence":1,
+                "updated_at":"2026-04-28T20:10:14Z"
+            }],
+            "session_duration":"24h",
+            "skip_app_launcher_login_page":false,
+            "type":"app_launcher",
+            "uid":"564ba110-aca0-401a-850d-b706c2c1a642",
+            "updated_at":"2026-07-03T03:57:20Z"
+        })
+    }
+
+    #[test]
+    fn access_application_login_method_body_preserves_mutable_state_and_normalizes_policies() {
+        let otp = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let body = super::access_application_mutable_body(
+            &access_application_live_result(),
+            &[otp],
+            variant,
+        )
+        .expect("preservation-safe body");
+        assert_eq!(
+            body["allowed_idps"],
+            json!(["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"])
+        );
+        assert_eq!(
+            body["policies"],
+            json!([{
+                "id":"45e44306-0e2a-460a-94aa-34c21eefdb4a",
+                "precedence":1
+            }])
+        );
+        assert_eq!(body["auto_redirect_to_identity"], json!(false));
+        assert_eq!(body["enable_binding_cookie"], json!(true));
+        assert_eq!(body["domain"], json!("investors.mlnavigator.com"));
+        assert!(body.get("id").is_none());
+        assert!(body.get("aud").is_none());
+        assert!(body.get("created_at").is_none());
+        assert!(body.get("updated_at").is_none());
+        assert!(body.get("tags").is_none());
+    }
+
+    #[test]
+    fn access_app_launcher_login_method_body_preserves_launcher_state() {
+        let otp = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("App Launcher variant");
+        let body = super::access_application_mutable_body(
+            &access_app_launcher_live_result(),
+            &[otp],
+            variant,
+        )
+        .expect("preservation-safe App Launcher body");
+        assert_eq!(
+            body["allowed_idps"],
+            json!(["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"])
+        );
+        assert_eq!(
+            body["policies"],
+            json!([{
+                "id":"89cae51e-3bb6-480f-a9a1-9abdf0964b82",
+                "precedence":1
+            }])
+        );
+        assert_eq!(body["auto_redirect_to_identity"], json!(false));
+        assert_eq!(body["landing_page_design"], json!({}));
+        assert_eq!(body["skip_app_launcher_login_page"], json!(false));
+        assert_eq!(body["type"], json!("app_launcher"));
+        assert!(body.get("domain").is_none());
+        assert!(body.get("name").is_none());
+        assert!(body.get("aud").is_none());
+        assert!(body.get("id").is_none());
+    }
+
+    #[test]
+    fn access_application_login_method_body_fails_closed_on_unclassified_live_state() {
+        let mut result = access_application_live_result();
+        result["mfa_config"] = json!({
+            "allowed_authenticators":["security_key"],
+            "mfa_disabled":false
+        });
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let error = super::access_application_mutable_body(
+            &result,
+            &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
+            variant,
+        )
+        .expect_err("unclassified app override must block");
+        assert!(error.to_string().contains("mfa_config"));
+    }
+
+    #[test]
+    fn access_application_desired_idps_rejects_empty_duplicate_and_non_uuid_sets() {
+        let input = |allowed_idps: Value| CallInput {
+            body: Some(json!({"allowed_idps":allowed_idps})),
+            ..CallInput::default()
+        };
+        assert!(super::access_application_desired_idps(&input(json!([]))).is_err());
+        assert!(
+            super::access_application_desired_idps(&input(json!([
+                "7b0bc477-5d42-4dab-b0ea-c97d0aef7810",
+                "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+            ])))
+            .is_err()
+        );
+        assert!(super::access_application_desired_idps(&input(json!(["github"]))).is_err());
+    }
+
+    fn access_human_policy_live_result() -> Value {
+        json!({
+            "created_at":"2026-07-14T09:51:08Z",
+            "decision":"allow",
+            "exclude":[{"email":{"email":"founders@mlnavigator.com"}}],
+            "id":"45e44306-0e2a-460a-94aa-34c21eefdb4a",
+            "include":[{"email_domain":{"domain":"mlnavigator.com"}}],
+            "mfa_config":{
+                "allowed_authenticators":["biometrics","totp"],
+                "mfa_disabled":false,
+                "session_duration":""
+            },
+            "name":"Allow MLNavigator Investor Staff",
+            "precedence":1,
+            "require":[],
+            "reusable":false,
+            "session_duration":"24h",
+            "uid":"45e44306-0e2a-460a-94aa-34c21eefdb4a",
+            "updated_at":"2026-07-29T02:40:54Z"
+        })
+    }
+
+    fn access_human_policy_capability() -> CapabilityV1 {
+        let identity_rule = super::access_human_policy_identity_rule_schema();
+        let mut capability = CapabilityV1::new(
+            super::ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID,
+            "Update human Access eligibility and independent MFA",
+            "PUT",
+            super::ACCESS_POLICY_DETAIL_PATH,
+        );
+        capability.product = "Access application-scoped policies".to_owned();
+        capability.account_scope = "account".to_owned();
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.permissions = vec!["Access: Apps and Policies Write".to_owned()];
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::IdentityOrOwnership;
+        capability.cost.known = true;
+        capability.cost.maximum = Some(0.0);
+        capability.entitlement.available = Some(true);
+        capability.selectors = ["account_id", "app_id", "policy_id"]
+            .into_iter()
+            .map(|name| SelectorV1 {
+                name: name.to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            })
+            .collect();
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":["name","decision","include","exclude","require","precedence"],
+            "properties":{
+                "name":{"type":"string","minLength":1,"maxLength":350},
+                "decision":{"type":"string","enum":["allow"]},
+                "include":{
+                    "type":"array",
+                    "minItems":1,
+                    "maxItems":100,
+                    "uniqueItems":true,
+                    "items":identity_rule.clone()
+                },
+                "exclude":{
+                    "type":"array",
+                    "maxItems":100,
+                    "uniqueItems":true,
+                    "items":identity_rule
+                },
+                "require":{"type":"array","maxItems":0},
+                "precedence":{"type":"integer","minimum":1},
+                "session_duration":{"type":"string","minLength":2,"maxLength":16},
+                "mfa_config":super::access_human_policy_mfa_schema()
+            },
+            "x-cfctl-body-required":true
+        }));
+        capability.verification.required = true;
+        capability.verification.strategy =
+            "same_path_result_contains_planned_fields_after_update".to_owned();
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: super::ACCESS_POLICY_DETAIL_PATH.to_owned(),
+            read_capability_id: super::ACCESS_POLICY_READ_CAPABILITY_ID.to_owned(),
+            verified_response_fields: super::ACCESS_HUMAN_POLICY_MUTABLE_FIELDS
+                .iter()
+                .map(|field| (*field).to_owned())
+                .collect(),
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy =
+            Some(super::SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY.to_owned());
+        capability.rollback.warning =
+            Some("restoration requires a separate approved plan".to_owned());
+        capability
+    }
+
+    #[test]
+    fn access_human_policy_body_preserves_live_state_and_applies_narrow_eligibility_change() {
+        let input = CallInput {
+            body: Some(json!({
+                "include":[
+                    {"email_domain":{"domain":"mlnavigator.com"}},
+                    {"email":{"email":"advisor@mlnavigator.com"}}
+                ]
+            })),
+            ..CallInput::default()
+        };
+        let desired =
+            super::access_human_policy_desired_changes(&input).expect("narrow desired state");
+        let body =
+            super::access_human_policy_mutable_body(&access_human_policy_live_result(), &desired)
+                .expect("preservation-safe human policy body");
+
+        assert_eq!(
+            body["include"],
+            json!([
+                {"email":{"email":"advisor@mlnavigator.com"}},
+                {"email_domain":{"domain":"mlnavigator.com"}}
+            ])
+        );
+        assert_eq!(
+            body["exclude"],
+            json!([{"email":{"email":"founders@mlnavigator.com"}}])
+        );
+        assert_eq!(
+            body["mfa_config"],
+            json!({
+                "allowed_authenticators":["biometrics","totp"],
+                "mfa_disabled":false
+            })
+        );
+        assert_eq!(body["name"], json!("Allow MLNavigator Investor Staff"));
+        assert_eq!(body["decision"], json!("allow"));
+        assert_eq!(body["require"], json!([]));
+        assert_eq!(body["precedence"], json!(1));
+        assert_eq!(body["session_duration"], json!("24h"));
+        assert!(body.get("id").is_none());
+        assert!(body.get("uid").is_none());
+        assert!(body.get("created_at").is_none());
+        assert!(body.get("updated_at").is_none());
+        assert!(body.get("reusable").is_none());
+    }
+
+    #[test]
+    fn access_human_policy_body_replaces_only_requested_mfa_state() {
+        let input = CallInput {
+            body: Some(json!({
+                "mfa_config":{
+                    "allowed_authenticators":["totp","biometrics"],
+                    "mfa_disabled":false,
+                    "session_duration":"12h"
+                }
+            })),
+            ..CallInput::default()
+        };
+        let desired =
+            super::access_human_policy_desired_changes(&input).expect("narrow desired state");
+        let body =
+            super::access_human_policy_mutable_body(&access_human_policy_live_result(), &desired)
+                .expect("preservation-safe human policy body");
+
+        assert_eq!(
+            body["include"],
+            json!([{"email_domain":{"domain":"mlnavigator.com"}}])
+        );
+        assert_eq!(
+            body["exclude"],
+            json!([{"email":{"email":"founders@mlnavigator.com"}}])
+        );
+        assert_eq!(
+            body["mfa_config"],
+            json!({
+                "allowed_authenticators":["biometrics","totp"],
+                "mfa_disabled":false,
+                "session_duration":"12h"
+            })
+        );
+    }
+
+    #[test]
+    fn access_human_policy_body_fails_closed_on_nonhuman_or_unclassified_live_state() {
+        let input = CallInput {
+            body: Some(json!({"exclude":[]})),
+            ..CallInput::default()
+        };
+        let desired =
+            super::access_human_policy_desired_changes(&input).expect("narrow desired state");
+
+        let mut nonhuman = access_human_policy_live_result();
+        nonhuman["decision"] = json!("bypass");
+        assert!(
+            super::access_human_policy_mutable_body(&nonhuman, &desired)
+                .expect_err("bypass policy must not enter the human mutation lane")
+                .to_string()
+                .contains("allow")
+        );
+
+        let mut unknown = access_human_policy_live_result();
+        unknown["approval_groups"] = json!([{"email_list_uuid":"list-id"}]);
+        assert!(
+            super::access_human_policy_mutable_body(&unknown, &desired)
+                .expect_err("unknown policy fields must block")
+                .to_string()
+                .contains("approval_groups")
+        );
+    }
+
+    #[test]
+    fn access_human_policy_prior_state_preserves_optional_field_absence_for_rollback() {
+        let mut live = access_human_policy_live_result();
+        live.as_object_mut()
+            .expect("policy object")
+            .remove("mfa_config");
+        live.as_object_mut()
+            .expect("policy object")
+            .remove("session_duration");
+
+        let prior =
+            super::access_human_policy_prior_state(&live).expect("restorable policy snapshot");
+        assert!(prior.get("mfa_config").is_none());
+        assert!(prior.get("session_duration").is_none());
+        assert_eq!(prior["name"], json!("Allow MLNavigator Investor Staff"));
+        assert_eq!(prior["decision"], json!("allow"));
+        assert_eq!(prior["require"], json!([]));
+    }
+
+    #[test]
+    fn access_human_policy_desired_input_rejects_empty_or_unclassified_changes() {
+        let input = |body: Value| CallInput {
+            body: Some(body),
+            ..CallInput::default()
+        };
+        assert!(super::access_human_policy_desired_changes(&input(json!({}))).is_err());
+        assert!(
+            super::access_human_policy_desired_changes(&input(json!({"name":"rename"}))).is_err()
+        );
+    }
+
+    #[test]
+    fn access_human_policy_snapshot_is_hash_bound_exact_and_reconstructs_rollback() {
+        let capability = access_human_policy_capability();
+        assert!(
+            super::is_access_human_policy_mutation(&capability),
+            "gaps: {:?}",
+            capability.mutation_contract_gaps()
+        );
+        let policy_id = "45e44306-0e2a-460a-94aa-34c21eefdb4a";
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+                "policy_id":policy_id
+            }),
+            body: Some(json!({
+                "decision":"allow",
+                "exclude":[{"email":{"email":"founders@mlnavigator.com"}}],
+                "include":[
+                    {"email_domain":{"domain":"mlnavigator.com"}},
+                    {"email":{"email":"advisor@mlnavigator.com"}}
+                ],
+                "mfa_config":{
+                    "allowed_authenticators":["biometrics","totp"],
+                    "mfa_disabled":false
+                },
+                "name":"Allow MLNavigator Investor Staff",
+                "precedence":1,
+                "require":[]
+            })),
+            ..CallInput::default()
+        };
+        let mut live = access_human_policy_live_result();
+        live.as_object_mut()
+            .expect("policy object")
+            .remove("mfa_config");
+        live.as_object_mut()
+            .expect("policy object")
+            .remove("session_duration");
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: live,
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let receipt = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &response,
+        )
+        .expect("exact prior-state receipt");
+        assert!(receipt["prior_state"].get("mfa_config").is_none());
+        assert!(receipt["prior_state"].get("session_duration").is_none());
+
+        let receipt_hash = hash_value(&receipt).expect("receipt hash");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability.clone(),
+            json!({
+                "selectors":input.selectors,
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{
+                    "same_path_prior_state":receipt
+                }
+            }),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(&input).expect("plan input");
+        plan.precondition_hashes.insert(
+            super::SAME_PATH_PRIOR_STATE_PRECONDITION.to_owned(),
+            receipt_hash.clone(),
+        );
+        assert_eq!(
+            super::required_same_path_prior_state_precondition(&plan).expect("bound prior state"),
+            Some(receipt_hash.as_str())
+        );
+        let compensation =
+            super::same_path_prior_state_compensation_request(&plan).expect("restoration request");
+        assert_eq!(
+            compensation.input.body,
+            Some(json!({
+                "decision":"allow",
+                "exclude":[{"email":{"email":"founders@mlnavigator.com"}}],
+                "include":[{"email_domain":{"domain":"mlnavigator.com"}}],
+                "name":"Allow MLNavigator Investor Staff",
+                "precedence":1,
+                "require":[]
+            }))
+        );
+
+        let mut drifted = plan.targets["live_preconditions"]["same_path_prior_state"].clone();
+        drifted["prior_state"]["exclude"] = json!([]);
+        plan.targets["live_preconditions"]["same_path_prior_state"] = drifted;
+        assert!(
+            super::required_same_path_prior_state_precondition(&plan)
+                .expect_err("drifted state must not reuse the original hash")
+                .to_string()
+                .contains("does not match")
+        );
+
+        let mut wrong_resource = response;
+        wrong_resource.result["id"] = json!("different-policy");
+        assert!(
+            super::apply_same_path_prior_state_response(
+                &capability,
+                &input,
+                "account-a",
+                &wrong_resource
+            )
+            .expect_err("wrong policy identity must fail")
+            .to_string()
+            .contains("different or missing policy id")
+        );
     }
 
     #[test]

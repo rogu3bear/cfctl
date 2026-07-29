@@ -5797,6 +5797,8 @@ fn apply_post_normalization_contracts(
     finalize_queue_consumer_contracts(document, capabilities);
     finalize_worker_script_delete_contract(capabilities);
     finalize_access_application_create_contract(document, capabilities);
+    finalize_access_application_login_methods_contract(document, capabilities);
+    finalize_access_human_policy_contract(document, capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
@@ -13295,6 +13297,665 @@ const QUEUE_CONFIGURATION_CONTRACTS: &[QueueConfigurationContract] = &[
 
 const ACCESS_APP_COLLECTION_PATH: &str = "/accounts/{account_id}/access/apps";
 const ACCESS_APP_DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}";
+const ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID: &str =
+    "access-applications-update-self-hosted-login-methods";
+const ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID: &str =
+    "access-applications-update-app-launcher-login-methods";
+const ACCESS_APP_UPDATE_CAPABILITY_ID: &str = "access-applications-update-an-access-application";
+const ACCESS_APP_READ_CAPABILITY_ID: &str = "access-applications-get-an-access-application";
+const ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID: &str =
+    "access-policies-update-human-access-controls";
+const ACCESS_POLICY_UPDATE_CAPABILITY_ID: &str = "access-policies-update-an-access-policy";
+const ACCESS_POLICY_READ_CAPABILITY_ID: &str = "access-policies-get-an-access-policy";
+const ACCESS_POLICY_DETAIL_PATH: &str =
+    "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
+
+fn access_application_login_methods_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":[
+            "allowed_idps",
+            "app_launcher_visible",
+            "auto_redirect_to_identity",
+            "destinations",
+            "domain",
+            "enable_binding_cookie",
+            "http_only_cookie_attribute",
+            "name",
+            "options_preflight_bypass",
+            "policies",
+            "self_hosted_domains",
+            "session_duration",
+            "type"
+        ],
+        "properties":{
+            "allowed_idps":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":25,
+                "uniqueItems":true,
+                "items":{"type":"string","minLength":36,"maxLength":36}
+            },
+            "app_launcher_visible":{"type":"boolean"},
+            "auto_redirect_to_identity":{"type":"boolean"},
+            "destinations":{
+                "type":"array",
+                "minItems":1,
+                "items":{
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["type","uri"],
+                    "properties":{
+                        "type":{"type":"string","enum":["public"]},
+                        "uri":{"type":"string","minLength":1}
+                    }
+                }
+            },
+            "domain":{"type":"string","minLength":1},
+            "enable_binding_cookie":{"type":"boolean"},
+            "http_only_cookie_attribute":{"type":"boolean"},
+            "name":{"type":"string","minLength":1},
+            "options_preflight_bypass":{"type":"boolean"},
+            "policies":{
+                "type":"array",
+                "minItems":1,
+                "items":{
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["id","precedence"],
+                    "properties":{
+                        "id":{"type":"string","minLength":1},
+                        "precedence":{"type":"integer","minimum":1}
+                    }
+                }
+            },
+            "self_hosted_domains":{
+                "type":"array",
+                "minItems":1,
+                "uniqueItems":true,
+                "items":{"type":"string","minLength":1}
+            },
+            "session_duration":{"type":"string","minLength":1},
+            "type":{"type":"string","enum":["self_hosted"]}
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn access_app_launcher_login_methods_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":[
+            "allowed_idps",
+            "auto_redirect_to_identity",
+            "landing_page_design",
+            "policies",
+            "session_duration",
+            "skip_app_launcher_login_page",
+            "type"
+        ],
+        "properties":{
+            "allowed_idps":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":25,
+                "uniqueItems":true,
+                "items":{"type":"string","minLength":36,"maxLength":36}
+            },
+            "app_launcher_logo_url":{"type":"string"},
+            "auto_redirect_to_identity":{"type":"boolean"},
+            "bg_color":{"type":"string"},
+            "custom_deny_url":{"type":"string"},
+            "custom_non_identity_deny_url":{"type":"string"},
+            "custom_pages":{
+                "type":"array",
+                "uniqueItems":true,
+                "items":{"type":"string","minLength":1}
+            },
+            "footer_links":{
+                "type":"array",
+                "items":{
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["name","url"],
+                    "properties":{
+                        "name":{"type":"string","minLength":1},
+                        "url":{"type":"string","minLength":1}
+                    }
+                }
+            },
+            "header_bg_color":{"type":"string"},
+            "landing_page_design":{
+                "type":"object",
+                "additionalProperties":false,
+                "properties":{
+                    "button_color":{"type":"string"},
+                    "button_text_color":{"type":"string"},
+                    "image_url":{"type":"string"},
+                    "message":{"type":"string"},
+                    "title":{"type":"string"}
+                }
+            },
+            "policies":{
+                "type":"array",
+                "minItems":1,
+                "items":{
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["id","precedence"],
+                    "properties":{
+                        "id":{"type":"string","minLength":1},
+                        "precedence":{"type":"integer","minimum":1}
+                    }
+                }
+            },
+            "session_duration":{"type":"string","minLength":1},
+            "skip_app_launcher_login_page":{"type":"boolean"},
+            "type":{"type":"string","enum":["app_launcher"]}
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn access_application_update_identity_supported(capability: &CapabilityV1) -> bool {
+    capability.method == "PUT"
+        && capability.path == ACCESS_APP_DETAIL_PATH
+        && capability.product == "Access applications"
+        && capability.account_scope == "account"
+        && capability.permissions == ["Access: Apps and Policies Write"]
+        && capability.selectors.len() == 2
+        && ["account_id", "app_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                    && response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+            })
+}
+
+fn access_application_read_identity_supported(
+    capabilities: &BTreeMap<String, CapabilityV1>,
+) -> bool {
+    capabilities
+        .get(ACCESS_APP_READ_CAPABILITY_ID)
+        .is_some_and(|read| {
+            read.method == "GET"
+                && read.path == ACCESS_APP_DETAIL_PATH
+                && read.product == "Access applications"
+                && !read.mutating
+                && read.request_schema.is_none()
+                && read.selectors.len() == 2
+                && ["account_id", "app_id"].iter().all(|name| {
+                    read.selectors.iter().any(|selector| {
+                        selector.name == *name
+                            && selector.location == "path"
+                            && selector.required
+                            && selector.value_type == "string"
+                    })
+                })
+                && read.response_contract.as_ref().is_some_and(|response| {
+                    response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                        && response.success_statuses == ["200"]
+                        && response.success_media_types == ["application/json"]
+                })
+        })
+}
+
+fn access_application_missing_readback_fields(
+    document: &Value,
+    verified_response_fields: &[String],
+) -> Vec<String> {
+    let read_operation =
+        document.pointer("/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}/get");
+    // The GET result is the same 13-variant application union as the PUT.
+    // Catalog proof therefore requires each curated field to exist somewhere
+    // in that declared union; runtime planning then requires the selected
+    // application variant to carry every required field before it can
+    // materialize or persist a plan.
+    read_operation.map_or_else(
+        || verified_response_fields.to_vec(),
+        |operation| {
+            verified_response_fields
+                .iter()
+                .filter(|field| {
+                    !success_response_declares_result_field_union(document, operation, &[field])
+                })
+                .cloned()
+                .collect()
+        },
+    )
+}
+
+/// Derives one narrow Access application update from the polymorphic generic
+/// PUT. The runtime accepts only a desired non-empty `allowed_idps` set from
+/// the caller, reads the exact live application variant, and materializes the
+/// variant's closed full-body schema before a plan is persisted.
+///
+/// This keeps the generic 13-variant update blocked while restoring the v1
+/// preservation invariant: read-only fields are dropped, policy objects are
+/// reduced to `{id, precedence}`, and every other configured mutable field is
+/// replayed and verified by the same-path GET.
+struct AccessApplicationLoginMethodsContractSpec {
+    capability_id: &'static str,
+    title: &'static str,
+    description: &'static str,
+    aliases: &'static [&'static str],
+    request_schema: Value,
+}
+
+fn insert_access_application_login_methods_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+    source: &CapabilityV1,
+    spec: AccessApplicationLoginMethodsContractSpec,
+) {
+    let mut capability = source.clone();
+    spec.capability_id.clone_into(&mut capability.id);
+    spec.title.clone_into(&mut capability.title);
+    capability.description = Some(spec.description.to_owned());
+    capability.aliases = spec
+        .aliases
+        .iter()
+        .map(|alias| (*alias).to_owned())
+        .collect();
+
+    let source_identity_supported = access_application_update_identity_supported(&capability);
+    let read_identity_supported = access_application_read_identity_supported(capabilities);
+
+    capability.request_schema = Some(spec.request_schema);
+    let verified_response_fields = capability
+        .verifiable_request_object_fields()
+        .unwrap_or_default();
+    let missing_readback_fields =
+        access_application_missing_readback_fields(document, &verified_response_fields);
+
+    if !source_identity_supported
+        || !read_identity_supported
+        || verified_response_fields.is_empty()
+        || !missing_readback_fields.is_empty()
+    {
+        let mut drift = Vec::new();
+        if !source_identity_supported {
+            drift.push("update identity".to_owned());
+        }
+        if !read_identity_supported {
+            drift.push("detail-read identity".to_owned());
+        }
+        if verified_response_fields.is_empty() {
+            drift.push("closed mutable request fields".to_owned());
+        }
+        if !missing_readback_fields.is_empty() {
+            drift.push(format!(
+                "readback field(s) {}",
+                missing_readback_fields.join(",")
+            ));
+        }
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(format!(
+            "schema drift: the Access application update/read pair no longer exposes the preservation-safe login-method contract ({})",
+            drift.join("; ")
+        ));
+        capabilities.insert(spec.capability_id.to_owned(), capability);
+        return;
+    }
+
+    capability.risk = RiskClass::IdentityOrOwnership;
+    capability.effect = EffectClass::IdentityOrOwnership;
+    zero_cost_mutation(
+        &mut capability,
+        "changing an Access application identity-provider allowlist has no per-operation charge; Access seat and plan billing are unchanged",
+        official_reference(
+            "Update an Access application",
+            "https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/applications/methods/update/",
+        ),
+    );
+    capability.verification.required = true;
+    "same_path_result_contains_planned_fields_after_update"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: ACCESS_APP_DETAIL_PATH.to_owned(),
+        read_capability_id: ACCESS_APP_READ_CAPABILITY_ID.to_owned(),
+        verified_response_fields,
+    });
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+    capability.rollback.warning = Some(
+        "cfctl binds and rechecks the exact pre-change application snapshot; rollback is a separate approval-required restoration plan and does not invalidate sessions already issued"
+            .to_owned(),
+    );
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    capability.blocked_reason = None;
+    refresh_dynamic_mutation_contract(&mut capability);
+    capabilities.insert(spec.capability_id.to_owned(), capability);
+}
+
+fn finalize_access_application_login_methods_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let Some(source) = capabilities.get(ACCESS_APP_UPDATE_CAPABILITY_ID).cloned() else {
+        return;
+    };
+    insert_access_application_login_methods_contract(
+        document,
+        capabilities,
+        &source,
+        AccessApplicationLoginMethodsContractSpec {
+            capability_id: ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+            title: "Update self-hosted Access application login methods",
+            description: "Sets the non-empty identity-provider allowlist on one exact public self-hosted Access application. cfctl first reads the live application and builds a full mutable PUT body so policies, domains, cookie settings, launcher visibility, and redirect behavior are preserved.",
+            aliases: &[
+                "set Access application identity providers",
+                "remove GitHub login from Access application",
+                "allow Access one-time PIN login",
+            ],
+            request_schema: access_application_login_methods_schema(),
+        },
+    );
+    insert_access_application_login_methods_contract(
+        document,
+        capabilities,
+        &source,
+        AccessApplicationLoginMethodsContractSpec {
+            capability_id: ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID,
+            title: "Update Access App Launcher login methods",
+            description: "Sets the non-empty identity-provider allowlist on the exact account App Launcher. cfctl first reads the live launcher and builds a preservation-safe PUT body so authentication routing, policy links, session duration, and configured launcher design remain unchanged.",
+            aliases: &[
+                "set App Launcher identity providers",
+                "allow one-time PIN for MFA enrollment",
+                "remove GitHub login from App Launcher",
+            ],
+            request_schema: access_app_launcher_login_methods_schema(),
+        },
+    );
+}
+
+fn access_human_policy_identity_rule_schema() -> Value {
+    serde_json::json!({
+        "oneOf":[
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["email"],
+                "properties":{
+                    "email":{
+                        "type":"object",
+                        "additionalProperties":false,
+                        "required":["email"],
+                        "properties":{
+                            "email":{
+                                "type":"string",
+                                "format":"email",
+                                "minLength":3,
+                                "maxLength":254
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["email_domain"],
+                "properties":{
+                    "email_domain":{
+                        "type":"object",
+                        "additionalProperties":false,
+                        "required":["domain"],
+                        "properties":{
+                            "domain":{
+                                "type":"string",
+                                "minLength":3,
+                                "maxLength":253
+                            }
+                        }
+                    }
+                }
+            }
+        ]
+    })
+}
+
+fn access_human_policy_schema() -> Value {
+    let identity_rule = access_human_policy_identity_rule_schema();
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":[
+            "name",
+            "decision",
+            "include",
+            "exclude",
+            "require",
+            "precedence"
+        ],
+        "properties":{
+            "name":{"type":"string","minLength":1,"maxLength":350},
+            "decision":{"type":"string","enum":["allow"]},
+            "include":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":100,
+                "uniqueItems":true,
+                "items":identity_rule.clone()
+            },
+            "exclude":{
+                "type":"array",
+                "maxItems":100,
+                "uniqueItems":true,
+                "items":identity_rule
+            },
+            "require":{"type":"array","maxItems":0},
+            "precedence":{"type":"integer","minimum":1},
+            "session_duration":{"type":"string","minLength":2,"maxLength":16},
+            "mfa_config":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["allowed_authenticators","mfa_disabled"],
+                "properties":{
+                    "allowed_authenticators":{
+                        "type":"array",
+                        "minItems":1,
+                        "maxItems":3,
+                        "uniqueItems":true,
+                        "items":{
+                            "type":"string",
+                            "enum":["totp","biometrics","security_key"]
+                        }
+                    },
+                    "mfa_disabled":{"type":"boolean"},
+                    "session_duration":{"type":"string","minLength":2,"maxLength":16}
+                }
+            }
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn access_policy_update_identity_supported(capability: &CapabilityV1) -> bool {
+    capability.method == "PUT"
+        && capability.path == ACCESS_POLICY_DETAIL_PATH
+        && capability.product == "Access application-scoped policies"
+        && capability.account_scope == "account"
+        && capability.permissions == ["Access: Apps and Policies Write"]
+        && capability.selectors.len() == 3
+        && ["account_id", "app_id", "policy_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                    && response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+            })
+}
+
+fn access_policy_read_identity_supported(capabilities: &BTreeMap<String, CapabilityV1>) -> bool {
+    capabilities
+        .get(ACCESS_POLICY_READ_CAPABILITY_ID)
+        .is_some_and(|read| {
+            read.method == "GET"
+                && read.path == ACCESS_POLICY_DETAIL_PATH
+                && read.product == "Access application-scoped policies"
+                && !read.mutating
+                && read.request_schema.is_none()
+                && read.selectors.len() == 3
+                && ["account_id", "app_id", "policy_id"].iter().all(|name| {
+                    read.selectors.iter().any(|selector| {
+                        selector.name == *name
+                            && selector.location == "path"
+                            && selector.required
+                            && selector.value_type == "string"
+                    })
+                })
+                && read.response_contract.as_ref().is_some_and(|response| {
+                    response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                        && response.success_statuses == ["200"]
+                        && response.success_media_types == ["application/json"]
+                })
+        })
+}
+
+fn access_policy_missing_readback_fields(
+    document: &Value,
+    verified_response_fields: &[String],
+) -> Vec<String> {
+    let read_operation = document.pointer(
+        "/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}~1policies~1{policy_id}/get",
+    );
+    read_operation.map_or_else(
+        || verified_response_fields.to_vec(),
+        |operation| {
+            verified_response_fields
+                .iter()
+                .filter(|field| {
+                    !success_response_declares_result_field_union(document, operation, &[field])
+                })
+                .cloned()
+                .collect()
+        },
+    )
+}
+
+/// Derives a closed, application-scoped Access policy update for human
+/// eligibility and independent MFA. The broad Cloudflare policy union remains
+/// available for other callers, while this contract admits only allow
+/// policies composed of email/domain selectors, an empty `require` set, and
+/// the documented TOTP/biometric/security-key MFA controls.
+///
+/// The runtime accepts only the intended eligibility/MFA subset from a caller,
+/// reads the exact live policy, rejects unclassified fields, and materializes
+/// the full closed PUT body. Its prior-state projection preserves optional
+/// field absence, making a separately approved restoration plan honest.
+fn finalize_access_human_policy_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let Some(source) = capabilities
+        .get(ACCESS_POLICY_UPDATE_CAPABILITY_ID)
+        .cloned()
+    else {
+        return;
+    };
+    let mut capability = source;
+    ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID.clone_into(&mut capability.id);
+    "Update human Access eligibility and independent MFA".clone_into(&mut capability.title);
+    capability.description = Some(
+        "Updates one exact application-scoped human allow policy. cfctl first reads the live policy and builds a preservation-safe full body from the requested email/domain eligibility or independent MFA changes; service tokens, bypass/non-identity decisions, device rules, external evaluation, arbitrary rule variants, and unclassified live fields are rejected."
+            .to_owned(),
+    );
+    capability.aliases = vec![
+        "allow Access OTP users to enroll MFA".to_owned(),
+        "enable Access TOTP and biometrics".to_owned(),
+        "add human email to App Launcher policy".to_owned(),
+    ];
+    "cfctl-safe-human-access-policy-v1+cloudflare-access-api".clone_into(&mut capability.source);
+
+    let source_identity_supported = access_policy_update_identity_supported(&capability);
+    let read_identity_supported = access_policy_read_identity_supported(capabilities);
+
+    capability.request_schema = Some(access_human_policy_schema());
+    let verified_response_fields = capability
+        .verifiable_request_object_fields()
+        .unwrap_or_default();
+    let missing_readback_fields =
+        access_policy_missing_readback_fields(document, &verified_response_fields);
+
+    if !source_identity_supported
+        || !read_identity_supported
+        || verified_response_fields.is_empty()
+        || !missing_readback_fields.is_empty()
+    {
+        let mut drift = Vec::new();
+        if !source_identity_supported {
+            drift.push("update identity".to_owned());
+        }
+        if !read_identity_supported {
+            drift.push("detail-read identity".to_owned());
+        }
+        if verified_response_fields.is_empty() {
+            drift.push("closed human policy fields".to_owned());
+        }
+        if !missing_readback_fields.is_empty() {
+            drift.push(format!(
+                "readback field(s) {}",
+                missing_readback_fields.join(",")
+            ));
+        }
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(format!(
+            "schema drift: the Access policy update/read pair no longer exposes the closed human eligibility and MFA contract ({})",
+            drift.join("; ")
+        ));
+        capabilities.insert(
+            ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID.to_owned(),
+            capability,
+        );
+        return;
+    }
+
+    capability.risk = RiskClass::IdentityOrOwnership;
+    capability.effect = EffectClass::IdentityOrOwnership;
+    capability.verification.required = true;
+    "same_path_result_contains_planned_fields_after_update"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: ACCESS_POLICY_DETAIL_PATH.to_owned(),
+        read_capability_id: ACCESS_POLICY_READ_CAPABILITY_ID.to_owned(),
+        verified_response_fields,
+    });
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+    capability.rollback.warning = Some(
+        "cfctl binds and rechecks the exact pre-change human policy snapshot, including optional-field absence; rollback is a separate approval-required restoration plan and does not invalidate sessions already issued"
+            .to_owned(),
+    );
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    capability.blocked_reason = None;
+    refresh_dynamic_mutation_contract(&mut capability);
+    capabilities.insert(
+        ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID.to_owned(),
+        capability,
+    );
+}
 
 /// Govern Access application creation. The delete side is already governed by
 /// the generic exact-resource path; the get and list readbacks exist. Create
