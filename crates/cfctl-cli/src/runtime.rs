@@ -5635,29 +5635,36 @@ fn access_human_policy_desired_changes(input: &CallInput) -> Result<Map<String, 
 }
 
 fn access_human_policy_mutable_body(result: &Value, desired: &Map<String, Value>) -> Result<Value> {
-    access_human_policy_projected_body(result, desired, true)
+    access_human_policy_projected_body(
+        result,
+        desired,
+        AccessHumanPolicySnapshotMode::LiveApplicationScoped,
+    )
 }
 
 fn access_human_policy_restorable_body(result: &Value) -> Result<Value> {
-    access_human_policy_projected_body(result, &Map::new(), false)
+    access_human_policy_projected_body(
+        result,
+        &Map::new(),
+        AccessHumanPolicySnapshotMode::CuratedRollback,
+    )
 }
 
-fn access_human_policy_projected_body(
-    result: &Value,
-    desired: &Map<String, Value>,
-    require_application_scoped_classification: bool,
-) -> Result<Value> {
-    let result = result.as_object().ok_or_else(|| {
-        CliError::Input(
-            "live human Access policy read did not return an object; the mutation boundary was not crossed"
-                .to_owned(),
-        )
-    })?;
+#[derive(Clone, Copy)]
+enum AccessHumanPolicySnapshotMode {
+    LiveApplicationScoped,
+    CuratedRollback,
+}
+
+fn validate_access_human_policy_snapshot(
+    result: &Map<String, Value>,
+    mode: AccessHumanPolicySnapshotMode,
+) -> Result<()> {
     let mut known_fields = ACCESS_HUMAN_POLICY_MUTABLE_FIELDS
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
-    if require_application_scoped_classification {
+    if matches!(mode, AccessHumanPolicySnapshotMode::LiveApplicationScoped) {
         known_fields.extend(ACCESS_HUMAN_POLICY_READ_ONLY_FIELDS);
     }
     let unknown_fields = result
@@ -5671,7 +5678,7 @@ fn access_human_policy_projected_body(
             unknown_fields.join(",")
         )));
     }
-    if require_application_scoped_classification
+    if matches!(mode, AccessHumanPolicySnapshotMode::LiveApplicationScoped)
         && result.get("reusable").and_then(Value::as_bool) != Some(false)
     {
         return Err(CliError::Input(
@@ -5679,6 +5686,21 @@ fn access_human_policy_projected_body(
                 .to_owned(),
         ));
     }
+    Ok(())
+}
+
+fn access_human_policy_projected_body(
+    result: &Value,
+    desired: &Map<String, Value>,
+    mode: AccessHumanPolicySnapshotMode,
+) -> Result<Value> {
+    let result = result.as_object().ok_or_else(|| {
+        CliError::Input(
+            "live human Access policy read did not return an object; the mutation boundary was not crossed"
+                .to_owned(),
+        )
+    })?;
+    validate_access_human_policy_snapshot(result, mode)?;
     if result.get("decision").and_then(Value::as_str) != Some("allow") {
         return Err(CliError::Input(
             "live Access policy is not a human allow policy; the mutation boundary was not crossed"
