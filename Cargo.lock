@@ -432,6 +432,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "libc",
  "memchr",
  "reqwest",
  "serde",

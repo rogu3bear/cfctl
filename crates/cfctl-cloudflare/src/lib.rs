@@ -31,6 +31,9 @@ use url::Url;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const _: () = assert!(libc::O_NOFOLLOW == 0x8000);
+
 #[derive(Debug, Error)]
 pub enum CloudflareError {
     #[error("invalid Cloudflare API base URL: {0}")]
@@ -4493,7 +4496,7 @@ async fn stream_d1_export_response(
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    options.mode(0o600).custom_flags(o_nofollow());
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     let file = options
         .open(output_path)
         .map_err(|source| CloudflareError::OutputFile {
@@ -6718,16 +6721,6 @@ impl Drop for CreatedOutputGuard {
             let _cleanup = std::fs::remove_file(&self.path);
         }
     }
-}
-
-#[cfg(target_os = "macos")]
-const fn o_nofollow() -> i32 {
-    0x0000_0100
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-const fn o_nofollow() -> i32 {
-    0x0002_0000
 }
 
 fn validate_response_contract(capability: &CapabilityV1) -> Result<()> {
