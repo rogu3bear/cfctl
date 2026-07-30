@@ -13491,18 +13491,44 @@ fn exact_linear_poll_child_provider_complete(
                 || current.pins.credential_generation_id.is_empty()
                 || current.plan.capability.id != "d1-resume-approved-mln-import-poll"
                 || current.plan.approval.is_none()
-                || current
-                    .plan
-                    .transaction_artifact(TransactionStageV1::ConsumptionPersisted)
-                    .is_none()
-                || current
-                    .plan
-                    .transaction_artifact(TransactionStageV1::BoundaryAttemptPersisted)
-                    .is_none()
+                || current.plan.validate_transaction_journal().is_err()
+                || ![
+                    (
+                        TransactionStageV1::ApprovalPersisted,
+                        PlanStatus::Approved,
+                    ),
+                    (
+                        TransactionStageV1::ConsumptionPersisted,
+                        PlanStatus::Consumed,
+                    ),
+                    (
+                        TransactionStageV1::BoundaryAttemptPersisted,
+                        PlanStatus::Consumed,
+                    ),
+                    (
+                        TransactionStageV1::BoundaryResponsePersisted,
+                        PlanStatus::Consumed,
+                    ),
+                ]
+                .into_iter()
+                .all(|(stage, status)| {
+                    current
+                        .plan
+                        .transaction_journal
+                        .iter()
+                        .filter(|checkpoint| {
+                            checkpoint.stage == stage && checkpoint.plan_status == status
+                        })
+                        .count()
+                        == 1
+                })
                 || current
                     .plan
                     .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
                     .is_none()
+                || current.plan.transaction_stage
+                    != TransactionStageV1::BoundaryResponsePersisted
+                || current.plan.status != PlanStatus::Consumed
             {
                 return Err(CliError::Input(
                     "poll child PlanV2 projection, pins, approval, consumption, or boundary lifecycle is invalid"
@@ -22742,6 +22768,569 @@ mod tests {
         store
             .save_plan_v2(&document)
             .expect("persist current PlanV2 fixture");
+    }
+
+    struct PollChildLineageFixture {
+        _root: tempfile::TempDir,
+        store: StateStore,
+        root_plan: PlanV1,
+        children: Vec<PlanV1>,
+    }
+
+    fn persist_poll_lineage_checkpoint(
+        store: &StateStore,
+        operation_id: &str,
+        checkpoint: &Value,
+    ) -> String {
+        let hash = store
+            .record_d1_import_checkpoint(operation_id, checkpoint)
+            .expect("persist lineage checkpoint");
+        assert_eq!(
+            store
+                .write_evidence(EvidenceClass::Apply, checkpoint)
+                .expect("persist lineage evidence")
+                .content_hash,
+            hash
+        );
+        hash
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fixture builds the exact root exhaustion and immutable child lifecycle"
+    )]
+    fn build_poll_child_lineage(generations: usize) -> PollChildLineageFixture {
+        assert!((1..=2).contains(&generations));
+        let root = tempfile::tempdir().expect("poll lineage root");
+        let store =
+            StateStore::open(RuntimePaths::from_root(root.path())).expect("poll lineage store");
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://native".to_owned(),
+            source_hash: "sha256:test".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native overlay");
+        let mut root_capability = catalog
+            .capabilities
+            .remove("d1-import-approved-mln-migration")
+            .expect("root import capability");
+        root_capability
+            .d1_approved_mln_import
+            .as_mut()
+            .expect("root contract")
+            .max_poll_attempts = 1;
+        let mut child_capability = catalog
+            .capabilities
+            .remove("d1-resume-approved-mln-import-poll")
+            .expect("child poll capability");
+        child_capability
+            .d1_approved_mln_import_poll_resume
+            .as_mut()
+            .expect("child contract")
+            .max_poll_attempts = 1;
+        let root_contract = root_capability
+            .d1_approved_mln_import
+            .clone()
+            .expect("root contract");
+        let migration = root_contract
+            .migrations
+            .iter()
+            .find(|migration| migration.migration_id == "0143")
+            .expect("0143 migration");
+        let mut root_plan = PlanV1::draft(
+            "profile-a",
+            &root_contract.account_id,
+            "catalog-sha",
+            root_capability,
+            json!({}),
+        )
+        .expect("root plan");
+        root_plan.input = serde_json::to_value(CallInput {
+            selectors: json!({
+                "account_id":root_contract.account_id,
+                "database_id":root_contract.database_id,
+            }),
+            body: Some(json!({"migration_id":"0143"})),
+            ..CallInput::default()
+        })
+        .expect("root input");
+        let source_authority = json!({
+            "schema_version":1,
+            "repository_id":root_contract.repository_id,
+            "observed_worktree_root":"/reviewed/mln-web",
+            "observed_git_common_dir":"/reviewed/mln-web/.git",
+            "head":root_contract.repository_head,
+            "repository_relative_path":migration.repository_relative_path,
+            "git_blob_oid":migration.git_blob_oid,
+        });
+        let root_stage = json!({
+            "schema_version":1,
+            "migration_id":"0143",
+            "catalog_basename":migration.basename,
+            "source_authority":source_authority,
+            "source_authority_hash":hash_value(&source_authority).expect("authority hash"),
+            "bytes":migration.bytes,
+            "sha256":format!("sha256:{}",migration.sha256),
+            "md5":migration.md5,
+            "stage_path":"/managed/0143.sql",
+            "stage_lifecycle":"preserve_until_verified_or_explicitly_retired",
+            "target":{
+                "account_id":root_contract.account_id,
+                "database_id":root_contract.database_id,
+            },
+            "prerequisites":root_plan.input.get("body"),
+        });
+        root_plan.targets = json!({"adapter":{"approved_mln_import":root_stage}});
+        root_plan.refresh_hash().expect("root plan hash");
+        save_current_test_plan(&store, &root_plan);
+
+        let target = json!({
+            "account_id":root_contract.account_id,
+            "database_id":root_contract.database_id,
+        });
+        let root_input_hash = hash_value(&root_plan.input).expect("root input hash");
+        let accepted = json!({
+            "schema_version":1,
+            "operation_id":root_plan.operation_id,
+            "step":"ingest_response",
+            "performed":true,
+            "rectification_required":false,
+            "receipt":{
+                "http_status":200,
+                "success":true,
+                "response_action":"ingest",
+                "provider":"cloudflare",
+                "effect":"d1_import_ingest_accepted",
+                "migration_id":"0143",
+                "target":target,
+                "plan_input_hash":root_input_hash,
+                "no_replay":false,
+                "result":{
+                    "type":"import",
+                    "status":"active",
+                    "success":true,
+                    "at_bookmark":"accepted",
+                },
+                "errors":[],
+            }
+        });
+        let accepted_hash =
+            persist_poll_lineage_checkpoint(&store, &root_plan.operation_id, &accepted);
+        let root_poll = json!({
+            "schema_version":1,
+            "operation_id":root_plan.operation_id,
+            "step":"poll_response_1",
+            "performed":true,
+            "rectification_required":false,
+            "receipt":{
+                "http_status":200,"success":true,"response_action":"poll",
+                "provider":"cloudflare","effect":"d1_import_response",
+                "migration_id":"0143","target":target,"plan_input_hash":root_input_hash,
+                "result":{"type":"import","status":"active","success":true,
+                    "at_bookmark":"accepted","result":{"final_bookmark":null},
+                    "provider_error_present":false},
+                "errors":[],"provider_errors_present":false,"no_replay":false,
+                "etag_present":false,"etag_sha256":null,"cf_ray":null
+            }
+        });
+        persist_poll_lineage_checkpoint(&store, &root_plan.operation_id, &root_poll);
+        let root_exhaustion = json!({
+            "schema_version":1,
+            "operation_id":root_plan.operation_id,
+            "step":"poll_in_progress_exhausted",
+            "performed":true,
+            "rectification_required":true,
+            "receipt":{
+                "provider":"cloudflare","effect":"d1_import_poll_in_progress_exhausted",
+                "migration_id":"0143","target":target,"plan_input_hash":root_input_hash,
+                "source_sha256":root_stage["sha256"],"at_bookmark":"accepted",
+                "attempt_count":1,"attempt_bound":1,
+                "outcome":"poll_in_progress_exhausted","receipt_available":true,"no_replay":true
+            }
+        });
+        let mut parent_exhaustion_hash =
+            persist_poll_lineage_checkpoint(&store, &root_plan.operation_id, &root_exhaustion);
+        let mut parent = root_plan.clone();
+        let mut children = Vec::new();
+        for generation in 1..=generations {
+            let mut child = PlanV1::draft(
+                "profile-a",
+                &root_contract.account_id,
+                "catalog-sha",
+                child_capability.clone(),
+                json!({}),
+            )
+            .expect("child plan");
+            child.created_at = parent.created_at + ChronoDuration::seconds(1);
+            child.expires_at = child.created_at + ChronoDuration::hours(1);
+            child.input = serde_json::to_value(CallInput {
+                selectors: json!({
+                    "account_id":root_contract.account_id,
+                    "database_id":root_contract.database_id,
+                }),
+                body: Some(json!({
+                    "parent_operation_id":parent.operation_id,
+                    "parent_plan_hash":parent.content_hash,
+                    "exhaustion_evidence_hash":parent_exhaustion_hash,
+                    "accepted_ingest_evidence_hash":accepted_hash,
+                    "accepted_bookmark_hash":hash_value(&json!("accepted"))
+                        .expect("bookmark hash"),
+                })),
+                ..CallInput::default()
+            })
+            .expect("child input");
+            child.targets = json!({"adapter":{"approved_mln_import_poll_resume":{
+                "root_operation_id":root_plan.operation_id,
+                "root_plan_hash":root_plan.content_hash,
+                "parent_operation_id":parent.operation_id,
+                "parent_plan_hash":parent.content_hash,
+                "parent_exhaustion_evidence_hash":parent_exhaustion_hash,
+                "accepted_ingest_evidence_hash":accepted_hash,
+                "accepted_bookmark":"accepted",
+                "accepted_bookmark_hash":hash_value(&json!("accepted")).expect("bookmark hash"),
+                "root_input":root_plan.input,
+                "root_stage":root_stage,
+            }}});
+            child.refresh_hash().expect("child hash");
+            child.approve(true, None).expect("approve child");
+            child.mark_consumed().expect("consume child");
+            child
+                .record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+                .expect("child boundary attempt");
+            let child_input_hash = hash_value(&child.input).expect("child input hash");
+            if generation == generations {
+                let completion = json!({
+                    "schema_version":1,
+                    "operation_id":child.operation_id,
+                    "step":"provider_complete",
+                    "performed":true,
+                    "rectification_required":false,
+                    "receipt":{
+                        "provider":"cloudflare","effect":"d1_import_provider_complete",
+                        "response_action":"poll","migration_id":"0143","target":target,
+                        "plan_input_hash":child_input_hash,
+                        "source_sha256":root_stage["sha256"],
+                        "source_md5":root_stage["md5"],
+                        "source_bytes":root_stage["bytes"],
+                        "source_authority_hash":root_stage["source_authority_hash"],
+                        "stage_identity_hash":hash_value(&root_stage).expect("stage hash"),
+                        "at_bookmark":"accepted","final_bookmark":"completed",
+                        "root_operation_id":root_plan.operation_id,
+                        "root_plan_hash":root_plan.content_hash,
+                        "parent_operation_id":parent.operation_id,
+                        "parent_exhaustion_evidence_hash":parent_exhaustion_hash,
+                    }
+                });
+                persist_poll_lineage_checkpoint(&store, &child.operation_id, &completion);
+                child
+                    .record_transaction_stage_with_artifact(
+                        TransactionStageV1::BoundaryResponsePersisted,
+                        completion,
+                    )
+                    .expect("child completion response");
+            } else {
+                let child_poll = json!({
+                    "schema_version":1,
+                    "operation_id":child.operation_id,
+                    "step":"poll_response_1",
+                    "performed":true,
+                    "rectification_required":false,
+                    "receipt":{
+                        "http_status":200,"success":true,"response_action":"poll",
+                        "provider":"cloudflare","effect":"d1_import_response",
+                        "migration_id":"0143","target":target,"plan_input_hash":child_input_hash,
+                        "result":{"type":"import","status":"active","success":true,
+                            "at_bookmark":"accepted","result":{"final_bookmark":null},
+                            "provider_error_present":false},
+                        "errors":[],"provider_errors_present":false,"no_replay":false,
+                        "etag_present":false,"etag_sha256":null,"cf_ray":null
+                    }
+                });
+                persist_poll_lineage_checkpoint(&store, &child.operation_id, &child_poll);
+                let exhaustion = json!({
+                    "schema_version":1,
+                    "operation_id":child.operation_id,
+                    "step":"poll_in_progress_exhausted",
+                    "performed":true,
+                    "rectification_required":true,
+                    "receipt":{
+                        "provider":"cloudflare","effect":"d1_import_poll_in_progress_exhausted",
+                        "migration_id":"0143","target":target,"plan_input_hash":child_input_hash,
+                        "source_sha256":root_stage["sha256"],"at_bookmark":"accepted",
+                        "attempt_count":1,"attempt_bound":1,
+                        "outcome":"poll_in_progress_exhausted","receipt_available":true,
+                        "no_replay":true
+                    }
+                });
+                parent_exhaustion_hash =
+                    persist_poll_lineage_checkpoint(&store, &child.operation_id, &exhaustion);
+                child
+                    .record_transaction_stage_with_artifact(
+                        TransactionStageV1::BoundaryResponsePersisted,
+                        exhaustion,
+                    )
+                    .expect("child exhaustion response");
+            }
+            save_current_test_plan(&store, &child);
+            parent = child.clone();
+            children.push(child);
+        }
+        PollChildLineageFixture {
+            _root: root,
+            store,
+            root_plan,
+            children,
+        }
+    }
+
+    #[test]
+    fn poll_child_resolver_accepts_exact_one_and_two_generation_plan_v2_lineages() {
+        for generations in [1, 2] {
+            let fixture = build_poll_child_lineage(generations);
+            let boundary = super::exact_linear_poll_child_provider_complete(
+                &fixture.store,
+                &fixture.root_plan,
+            )
+            .expect("exact child lineage");
+            assert_eq!(
+                boundary
+                    .checkpoint
+                    .pointer("/receipt/final_bookmark")
+                    .and_then(Value::as_str),
+                Some("completed")
+            );
+            assert_eq!(fixture.children.len(), generations);
+        }
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_required_plan_v2_sidecar_missing() {
+        let fixture = build_poll_child_lineage(1);
+        let child = fixture.children.first().expect("poll child");
+        fs::remove_file(
+            fixture
+                .store
+                .paths()
+                .data_dir
+                .join("plans-v2")
+                .join(format!("{}.json", child.operation_id)),
+        )
+        .expect("remove required PlanV2 sidecar");
+        let error =
+            super::exact_linear_poll_child_provider_complete(&fixture.store, &fixture.root_plan)
+                .expect_err("missing PlanV2 sidecar must fail closed");
+        assert!(
+            error.to_string().contains("authentic PlanV2 sidecar"),
+            "{error}"
+        );
+    }
+
+    fn reset_poll_child_to_draft(child: &mut PlanV1) {
+        child.status = PlanStatus::Draft;
+        child.approval = None;
+        child.transaction_stage = TransactionStageV1::PlanPrepared;
+        child.transaction_journal.clear();
+        child.transaction_artifacts.clear();
+        child
+            .record_transaction_stage(TransactionStageV1::PlanPrepared)
+            .expect("restore prepared draft lifecycle");
+    }
+
+    fn persist_rebound_poll_child(store: &StateStore, child: &PlanV1) {
+        store
+            .save_plan(child)
+            .expect("persist rebound canonical child and projection");
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_projection_drift() {
+        let fixture = build_poll_child_lineage(1);
+        let mut projection = fixture.children[0].clone();
+        projection
+            .verification_steps
+            .push("projection drift".to_owned());
+        projection
+            .refresh_hash()
+            .expect("refresh drifted projection");
+        let path = fixture
+            .store
+            .paths()
+            .data_dir
+            .join("plans")
+            .join(format!("{}.json", projection.operation_id));
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&projection).expect("encode drifted projection"),
+        )
+        .expect("write drifted compatibility projection");
+        assert!(
+            super::exact_linear_poll_child_provider_complete(&fixture.store, &fixture.root_plan)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_unapproved_unconsumed_and_missing_attempt_lifecycles() {
+        let unapproved = build_poll_child_lineage(1);
+        let mut unapproved_child = unapproved.children[0].clone();
+        reset_poll_child_to_draft(&mut unapproved_child);
+        persist_rebound_poll_child(&unapproved.store, &unapproved_child);
+        assert!(
+            super::exact_linear_poll_child_provider_complete(
+                &unapproved.store,
+                &unapproved.root_plan
+            )
+            .is_err()
+        );
+
+        let unconsumed = build_poll_child_lineage(1);
+        let mut unconsumed_child = unconsumed.children[0].clone();
+        reset_poll_child_to_draft(&mut unconsumed_child);
+        unconsumed_child
+            .approve(true, None)
+            .expect("approve unconsumed child");
+        persist_rebound_poll_child(&unconsumed.store, &unconsumed_child);
+        assert!(
+            super::exact_linear_poll_child_provider_complete(
+                &unconsumed.store,
+                &unconsumed.root_plan
+            )
+            .is_err()
+        );
+
+        let missing_attempt = build_poll_child_lineage(1);
+        let mut missing_attempt_child = missing_attempt.children[0].clone();
+        reset_poll_child_to_draft(&mut missing_attempt_child);
+        missing_attempt_child
+            .approve(true, None)
+            .expect("approve missing-attempt child");
+        missing_attempt_child
+            .mark_consumed()
+            .expect("consume missing-attempt child");
+        persist_rebound_poll_child(&missing_attempt.store, &missing_attempt_child);
+        assert!(
+            super::exact_linear_poll_child_provider_complete(
+                &missing_attempt.store,
+                &missing_attempt.root_plan
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_missing_or_mismatched_boundary_response_artifacts() {
+        for replacement in [None, Some(json!({"outcome":"grafted"}))] {
+            let fixture = build_poll_child_lineage(1);
+            let child = fixture.children.first().expect("poll child");
+            let v2_path = fixture
+                .store
+                .paths()
+                .data_dir
+                .join("plans-v2")
+                .join(format!("{}.json", child.operation_id));
+            let projection_path = fixture
+                .store
+                .paths()
+                .data_dir
+                .join("plans")
+                .join(format!("{}.json", child.operation_id));
+            let mut current = fixture
+                .store
+                .load_plan_v2(&child.operation_id)
+                .expect("canonical child");
+            match replacement.clone() {
+                Some(value) => {
+                    current.plan.transaction_artifacts.insert(
+                        TransactionStageV1::BoundaryResponsePersisted
+                            .as_str()
+                            .to_owned(),
+                        value,
+                    );
+                }
+                None => {
+                    current
+                        .plan
+                        .transaction_artifacts
+                        .remove(TransactionStageV1::BoundaryResponsePersisted.as_str());
+                }
+            }
+            fs::write(
+                &v2_path,
+                serde_json::to_vec_pretty(&current).expect("encode corrupt canonical child"),
+            )
+            .expect("write corrupt canonical child");
+            fs::write(
+                &projection_path,
+                serde_json::to_vec_pretty(&current.plan).expect("encode corrupt child projection"),
+            )
+            .expect("write corrupt child projection");
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_duplicate_completion_and_lineage_grafts() {
+        let duplicate = build_poll_child_lineage(1);
+        let child = duplicate.children.first().expect("poll child");
+        let (_, completion) = duplicate
+            .store
+            .read_d1_import_checkpoints(&child.operation_id)
+            .expect("child checkpoints")
+            .into_iter()
+            .find(|(_, checkpoint)| {
+                checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+            })
+            .expect("provider completion");
+        persist_poll_lineage_checkpoint(&duplicate.store, &child.operation_id, &completion);
+        assert!(
+            super::exact_linear_poll_child_provider_complete(
+                &duplicate.store,
+                &duplicate.root_plan
+            )
+            .is_err()
+        );
+
+        for pointer in [
+            "/adapter/approved_mln_import_poll_resume/parent_operation_id",
+            "/adapter/approved_mln_import_poll_resume/root_operation_id",
+        ] {
+            let fixture = build_poll_child_lineage(1);
+            let mut grafted = fixture.children[0].clone();
+            reset_poll_child_to_draft(&mut grafted);
+            *grafted
+                .targets
+                .pointer_mut(pointer)
+                .expect("lineage graft pointer") = json!(grafted.operation_id);
+            grafted.refresh_hash().expect("refresh grafted child");
+            grafted.approve(true, None).expect("approve grafted child");
+            grafted.mark_consumed().expect("consume grafted child");
+            grafted
+                .record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+                .expect("grafted child attempt");
+            grafted
+                .record_transaction_stage_with_artifact(
+                    TransactionStageV1::BoundaryResponsePersisted,
+                    json!({"outcome":"grafted"}),
+                )
+                .expect("grafted child response");
+            persist_rebound_poll_child(&fixture.store, &grafted);
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
