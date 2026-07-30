@@ -2599,24 +2599,15 @@ impl Executor {
                 plan.status = PlanStatus::RectificationRequired;
                 return Ok(poll);
             }
-            match poll
-                .result
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-            {
-                "complete" => {
-                    let Some(final_bookmark) = poll
-                        .result
-                        .get("final_bookmark")
-                        .and_then(Value::as_str)
-                        .filter(|value| !value.is_empty())
-                    else {
-                        plan.status = PlanStatus::RectificationRequired;
-                        return Err(CloudflareError::InvalidRequestBody(
-                            "completed D1 import omitted final_bookmark; do not replay".to_owned(),
-                        ));
-                    };
+            let poll_outcome = match validate_d1_import_poll_response(&poll, &at_bookmark) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    plan.status = PlanStatus::RectificationRequired;
+                    return Err(error);
+                }
+            };
+            match poll_outcome {
+                D1ImportPollOutcome::Complete(final_bookmark) => {
                     let boundary = D1ImportCheckpointV1 {
                         schema_version: 1,
                         operation_id: plan.operation_id.clone(),
@@ -2642,17 +2633,11 @@ impl Executor {
                     plan.status = PlanStatus::Running;
                     return Ok(completed);
                 }
-                "error" => {
+                D1ImportPollOutcome::ProviderError => {
                     plan.status = PlanStatus::RectificationRequired;
                     return Ok(poll);
                 }
-                "active" | "pending" => {}
-                _ => {
-                    plan.status = PlanStatus::RectificationRequired;
-                    return Err(CloudflareError::InvalidRequestBody(
-                        "D1 import poll returned unknown status; do not replay".to_owned(),
-                    ));
-                }
+                D1ImportPollOutcome::InProgress => {}
             }
         }
         persist_import_uncertainty(&mut persist, plan, "poll_exhausted")?;
@@ -8651,6 +8636,59 @@ fn validate_d1_import_upload_url(
     Ok(url)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum D1ImportPollOutcome<'a> {
+    InProgress,
+    Complete(&'a str),
+    ProviderError,
+}
+
+fn validate_d1_import_poll_response<'a>(
+    response: &'a CloudflareResponseV1,
+    expected_at_bookmark: &str,
+) -> Result<D1ImportPollOutcome<'a>> {
+    let invalid = |detail: &str| {
+        CloudflareError::InvalidRequestBody(format!("D1 import poll {detail}; do not replay"))
+    };
+    if response.result.get("type").and_then(Value::as_str) != Some("import") {
+        return Err(invalid("omitted or changed type"));
+    }
+    let status = response
+        .result
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("omitted status"))?;
+    let provider_success = response
+        .result
+        .get("success")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| invalid("omitted nested success"))?;
+    let at_bookmark = response
+        .result
+        .get("at_bookmark")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid("omitted at_bookmark"))?;
+    if at_bookmark != expected_at_bookmark {
+        return Err(invalid("changed at_bookmark"));
+    }
+    match (status, provider_success) {
+        ("active" | "pending", true) => Ok(D1ImportPollOutcome::InProgress),
+        ("error", false) => Ok(D1ImportPollOutcome::ProviderError),
+        ("complete", true) => response
+            .result
+            .pointer("/result/final_bookmark")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(D1ImportPollOutcome::Complete)
+            .ok_or_else(|| invalid("omitted nested result.final_bookmark")),
+        ("complete", false) => Err(invalid("reported complete with success false")),
+        ("error", true) => Err(invalid("reported error with success true")),
+        ("active" | "pending", false) => Err(invalid("reported progress with success false")),
+        _ => Err(invalid("returned unknown status")),
+    }
+}
+
 fn persist_import_response<F>(
     persist: &mut F,
     plan: &PlanV1,
@@ -8700,8 +8738,12 @@ where
 
 #[cfg(test)]
 mod approved_mln_import_tests {
-    use super::validate_d1_import_upload_url;
+    use super::{
+        D1ImportPollOutcome, parse_response, validate_d1_import_poll_response,
+        validate_d1_import_upload_url,
+    };
     use cfctl_core::D1ApprovedMlnImportContractV1;
+    use serde_json::json;
 
     fn contract() -> D1ApprovedMlnImportContractV1 {
         D1ApprovedMlnImportContractV1 {
@@ -8746,6 +8788,101 @@ mod approved_mln_import_tests {
                 "{rejected}"
             );
         }
+    }
+
+    #[test]
+    fn approved_import_poll_accepts_only_the_official_nested_completion_envelope() {
+        let official = parse_response(
+            200,
+            &json!({
+                "success":true,
+                "result":{
+                    "type":"import",
+                    "status":"complete",
+                    "success":true,
+                    "at_bookmark":"before",
+                    "result":{"final_bookmark":"after"}
+                }
+            }),
+            None,
+            None,
+        );
+        assert!(matches!(
+            validate_d1_import_poll_response(&official, "before"),
+            Ok(D1ImportPollOutcome::Complete("after"))
+        ));
+
+        let invalid_results = [
+            json!({
+                "type":"import",
+                "status":"complete",
+                "success":true,
+                "at_bookmark":"before"
+            }),
+            json!({
+                "type":"import",
+                "status":"complete",
+                "success":true,
+                "at_bookmark":"before",
+                "final_bookmark":"legacy-direct"
+            }),
+            json!({
+                "type":"export",
+                "status":"complete",
+                "success":true,
+                "at_bookmark":"before",
+                "result":{"final_bookmark":"after"}
+            }),
+            json!({
+                "type":"import",
+                "status":"complete",
+                "success":"true",
+                "at_bookmark":"before",
+                "result":{"final_bookmark":"after"}
+            }),
+            json!({
+                "type":"import",
+                "status":"complete",
+                "success":true,
+                "at_bookmark":"different",
+                "result":{"final_bookmark":"after"}
+            }),
+            json!({
+                "type":"import",
+                "status":"complete",
+                "success":true,
+                "at_bookmark":"before",
+                "result":{"final_bookmark":42}
+            }),
+        ];
+        for result in invalid_results {
+            let response =
+                parse_response(200, &json!({"success":true,"result":result}), None, None);
+            assert!(
+                validate_d1_import_poll_response(&response, "before").is_err(),
+                "{result}"
+            );
+        }
+
+        let nested_error = parse_response(
+            200,
+            &json!({
+                "success":true,
+                "result":{
+                    "type":"import",
+                    "status":"error",
+                    "success":false,
+                    "at_bookmark":"before",
+                    "error":"provider rejected import"
+                }
+            }),
+            None,
+            None,
+        );
+        assert!(matches!(
+            validate_d1_import_poll_response(&nested_error, "before"),
+            Ok(D1ImportPollOutcome::ProviderError)
+        ));
     }
 }
 
