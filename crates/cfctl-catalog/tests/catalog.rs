@@ -10557,6 +10557,23 @@ fn telemetry_overlay_closes_bounded_sql_graphql_and_workers_read_contracts() {
         );
     }
 
+    for id in [
+        "graphql-analytics-account-rum-pageload-visits",
+        "graphql-analytics-account-rum-dataset-settings",
+    ] {
+        let capability = snapshot.get(id).unwrap_or_else(|| panic!("{id} present"));
+        assert_eq!(capability.adapter_status, AdapterStatus::Native);
+        assert_eq!(capability.account_scope, "account");
+        assert_eq!(capability.permissions, ["Account Analytics Read"]);
+        assert!(!capability.mutating);
+        capability
+            .graphql
+            .as_ref()
+            .expect("fixed RUM GraphQL contract")
+            .validate_schema_fingerprint()
+            .expect("RUM schema fingerprint");
+    }
+
     let daily_visitors = snapshot
         .get("graphql-analytics-zone-http-unique-ips-daily")
         .expect("daily zone visitor capability");
@@ -10620,6 +10637,65 @@ fn telemetry_overlay_closes_bounded_sql_graphql_and_workers_read_contracts() {
         .expect("dataset settings GraphQL contract");
     assert!(settings.document.contains("httpRequests1dGroups"));
     assert!(settings.document.contains("availableFields"));
+
+    let rum_visits = snapshot
+        .get("graphql-analytics-account-rum-pageload-visits")
+        .expect("hostname-bound RUM visits capability");
+    let rum_query = rum_visits
+        .analytics_query
+        .as_ref()
+        .expect("RUM analytics contract");
+    assert_eq!(
+        rum_query.dataset.as_deref(),
+        Some("rumPageloadEventsAdaptiveGroups")
+    );
+    assert_eq!(
+        rum_query
+            .time_range
+            .as_ref()
+            .map(|range| range.timestamp_format),
+        Some(TimestampFormatV1::Date)
+    );
+    assert!(
+        rum_query
+            .sampling
+            .as_deref()
+            .is_some_and(|value| value.contains("does not identify unique people"))
+    );
+    let rum_graphql = rum_visits.graphql.as_ref().expect("RUM GraphQL contract");
+    assert!(rum_graphql.document.contains("requestHost: $hostname"));
+    assert!(rum_graphql.document.contains("bot: 0"));
+    assert!(rum_graphql.document.contains("sum { visits }"));
+    assert!(
+        rum_graphql
+            .document
+            .contains("dimensions { date requestHost }")
+    );
+    assert_eq!(
+        rum_visits
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.pointer("/properties/hostname/format")),
+        Some(&json!("hostname"))
+    );
+    assert_eq!(
+        rum_visits
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("x-cfctl-result-scope")),
+        Some(&json!("exact_request_host_non_bot_rum"))
+    );
+
+    let rum_settings = snapshot
+        .get("graphql-analytics-account-rum-dataset-settings")
+        .and_then(|capability| capability.graphql.as_ref())
+        .expect("account RUM settings GraphQL contract");
+    assert!(
+        rum_settings
+            .document
+            .contains("rumPageloadEventsAdaptiveGroups")
+    );
+    assert!(rum_settings.document.contains("availableFields"));
 
     let firewall = snapshot
         .get("graphql-analytics-zone-firewall-events")

@@ -2996,6 +2996,59 @@ fn graphql_daily_unique_ips_capability() -> CapabilityV1 {
     capability
 }
 
+fn graphql_rum_pageload_visits_capability() -> CapabilityV1 {
+    let mut capability = graphql_daily_unique_ips_capability();
+    "graphql-analytics-account-rum-pageload-visits".clone_into(&mut capability.id);
+    "account".clone_into(&mut capability.account_scope);
+    capability.selectors = vec![SelectorV1 {
+        name: "account_id".to_owned(),
+        location: "graphql".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }];
+    let query = capability
+        .analytics_query
+        .as_mut()
+        .expect("analytics contract");
+    query.dataset = Some("rumPageloadEventsAdaptiveGroups".to_owned());
+    query.sampling =
+        Some("adaptive RUM visits; page views, not unique people, with sample interval".to_owned());
+    let graphql = capability.graphql.as_mut().expect("GraphQL contract");
+    "CfctlAccountRumPageloadVisits".clone_into(&mut graphql.operation_name);
+    "query CfctlAccountRumPageloadVisits($accountTag: string!, $hostname: string!, $start: Date!, $end: Date!, $limit: Int!) { viewer { accounts(filter: {accountTag: $accountTag}) { series: rumPageloadEventsAdaptiveGroups(filter: {bot: 0, date_geq: $start, date_leq: $end, requestHost: $hostname}, limit: $limit, orderBy: [date_ASC]) { avg { sampleInterval } count dimensions { date requestHost } sum { visits } } } } }".clone_into(&mut graphql.document);
+    "rumPageloadEventsAdaptiveGroups".clone_into(&mut graphql.dataset);
+    graphql.selector_variables = [("account_id".to_owned(), "accountTag".to_owned())]
+        .into_iter()
+        .collect();
+    graphql
+        .body_variables
+        .insert("hostname".to_owned(), "hostname".to_owned());
+    "/viewer/accounts/0/series".clone_into(&mut graphql.response_data_pointer);
+    graphql.expected_row_fields = vec![
+        "avg".to_owned(),
+        "count".to_owned(),
+        "dimensions".to_owned(),
+        "sum".to_owned(),
+    ];
+    graphql.refresh_schema_fingerprint().expect("fingerprint");
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["dataset","hostname","start","end","limit"],
+        "properties":{
+            "dataset":{"type":"string","enum":["rumPageloadEventsAdaptiveGroups"]},
+            "hostname":{"type":"string","format":"hostname","minLength":1,"maxLength":253},
+            "start":{"type":"string","format":"date"},
+            "end":{"type":"string","format":"date"},
+            "limit":{"type":"integer","minimum":1,"maximum":31}
+        },
+        "x-cfctl-body-required":true
+    }));
+    capability
+}
+
 fn graphql_firewall_capability() -> CapabilityV1 {
     let mut capability = graphql_http_capability();
     "graphql-analytics-zone-firewall-events".clone_into(&mut capability.id);
@@ -3258,6 +3311,82 @@ async fn daily_unique_ips_use_inclusive_dates_and_a_pinned_daily_rollup() {
         Err(CloudflareError::InvalidAnalyticsQuery(message))
             if message.contains("YYYY-MM-DD")
     ));
+}
+
+#[tokio::test]
+async fn rum_pageload_visits_bind_exact_hostname_account_and_date_window() {
+    let capability = graphql_rum_pageload_visits_capability();
+    let end = Utc::now().date_naive();
+    let start = end - Duration::days(6);
+    let start = start.format("%Y-%m-%d").to_string();
+    let end = end.format("%Y-%m-%d").to_string();
+    let input = CallInput {
+        selectors: json!({"account_id":"account-1"}),
+        body: Some(json!({
+            "dataset":"rumPageloadEventsAdaptiveGroups",
+            "hostname":"jkca.me",
+            "start":start,
+            "end":end,
+            "limit":7
+        })),
+        ..CallInput::default()
+    };
+    let (address, server) = json_response_sequence_server(vec![
+        json!({
+            "data":{"viewer":{"accounts":[{"series":[
+                {
+                    "avg":{"sampleInterval":1.0},
+                    "count":24,
+                    "dimensions":{"date":start,"requestHost":"jkca.me"},
+                    "sum":{"visits":11}
+                },
+                {
+                    "avg":{"sampleInterval":1.0},
+                    "count":16,
+                    "dimensions":{"date":end,"requestHost":"jkca.me"},
+                    "sum":{"visits":7}
+                }
+            ]}]}}
+        })
+        .to_string(),
+    ])
+    .await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &input,
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("hostname-bound RUM response");
+    assert_eq!(response.result.as_array().map(Vec::len), Some(2));
+    let requests = server.await.expect("server joins");
+    assert!(requests[0].contains("CfctlAccountRumPageloadVisits"));
+    assert!(requests[0].contains("rumPageloadEventsAdaptiveGroups"));
+    assert!(requests[0].contains("requestHost"));
+    assert!(requests[0].contains("\"hostname\":\"jkca.me\""));
+    assert!(requests[0].contains("\"accountTag\":\"account-1\""));
+    assert!(requests[0].contains("bot: 0"));
+    assert!(!requests[0].contains("mutation"));
+
+    let invalid_hostname = CallInput {
+        selectors: json!({"account_id":"account-1"}),
+        body: Some(json!({
+            "dataset":"rumPageloadEventsAdaptiveGroups",
+            "hostname":"https://jkca.me/path",
+            "start":start,
+            "end":end,
+            "limit":7
+        })),
+        ..CallInput::default()
+    };
+    assert!(validate_request_contract(&capability, &invalid_hostname).is_err());
 }
 
 #[tokio::test]

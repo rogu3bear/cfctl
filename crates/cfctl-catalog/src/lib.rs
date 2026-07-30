@@ -602,6 +602,24 @@ fn telemetry_coverage_specs() -> Vec<TelemetryCoverageSpec> {
         ),
         telemetry_spec(
             "analytics",
+            "Web Analytics and RUM",
+            "rumPageloadEventsAdaptiveGroups hostname visits",
+            Some("graphql-analytics-account-rum-pageload-visits"),
+            "read",
+            "graphql_contract_and_response_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "Web Analytics and RUM",
+            "account RUM dataset settings",
+            Some("graphql-analytics-account-rum-dataset-settings"),
+            "read",
+            "graphql_contract_and_response_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
             "GraphQL HTTP analytics",
             "httpRequestsAdaptiveGroups selected account zones",
             Some("graphql-analytics-account-http-requests"),
@@ -6042,6 +6060,8 @@ fn graphql_analytics_capabilities() -> Result<Vec<CapabilityV1>> {
     Ok(vec![
         zone_http_graphql_capability()?,
         zone_http_unique_ips_daily_graphql_capability()?,
+        account_rum_pageload_visits_graphql_capability()?,
+        account_rum_dataset_settings_graphql_capability()?,
         account_http_graphql_capability()?,
         zone_firewall_graphql_capability()?,
         zone_dataset_settings_graphql_capability()?,
@@ -6115,6 +6135,99 @@ fn zone_http_unique_ips_daily_graphql_capability() -> Result<CapabilityV1> {
                 .to_owned(),
         );
     }
+    Ok(capability)
+}
+
+fn account_rum_pageload_visits_graphql_capability() -> Result<CapabilityV1> {
+    let document = "query CfctlAccountRumPageloadVisits($accountTag: string!, $hostname: string!, $start: Date!, $end: Date!, $limit: Int!) { viewer { accounts(filter: {accountTag: $accountTag}) { series: rumPageloadEventsAdaptiveGroups(filter: {bot: 0, date_geq: $start, date_leq: $end, requestHost: $hostname}, limit: $limit, orderBy: [date_ASC]) { avg { sampleInterval } count dimensions { date requestHost } sum { visits } } } } }";
+    let mut capability = graphql_capability(GraphqlCapabilitySpec {
+        id: "graphql-analytics-account-rum-pageload-visits",
+        title: "Query hostname-bound daily Web Analytics visits",
+        aliases: &[
+            "hostname Web Analytics visits month to date",
+            "RUM page loads visits by host",
+            "daily non-bot browser visits",
+        ],
+        operation_name: "CfctlAccountRumPageloadVisits",
+        document,
+        dataset: "rumPageloadEventsAdaptiveGroups",
+        selectors: vec![graphql_selector(
+            "account_id",
+            "Exact account governance and GraphQL scope",
+        )],
+        selector_variables: &[("account_id", "accountTag")],
+        body_variables: &[
+            ("hostname", "hostname"),
+            ("start", "start"),
+            ("end", "end"),
+            ("limit", "limit"),
+        ],
+        response_pointer: "/viewer/accounts/0/series",
+        expected_fields: &["avg", "count", "dimensions", "sum"],
+        cursor_fields: &[],
+        cursor_input_pointers: &[],
+        request_schema: graphql_rum_visits_request_schema(),
+        max_rows: 31,
+        pagination: PaginationModeV1::BoundedResult,
+    })?;
+    capability.description = Some(
+        "Returns Cloudflare Web Analytics page views and visits for one exact requestHost, grouped by inclusive calendar date and excluding rows Cloudflare classifies as bots. It covers only instrumented RUM traffic; `sum.visits` is not a unique-person or unique-IP metric."
+            .to_owned(),
+    );
+    capability.permissions = vec!["Account Analytics Read".to_owned()];
+    if let Some(query) = capability.analytics_query.as_mut() {
+        query.time_range = Some(TimeRangeContractV1 {
+            start_pointer: "/start".to_owned(),
+            end_pointer: "/end".to_owned(),
+            timestamp_format: TimestampFormatV1::Date,
+            max_lookback_seconds: 31 * 24 * 60 * 60,
+            max_window_seconds: 31 * 24 * 60 * 60,
+        });
+        query.freshness = Some(
+            "inspect the account RUM dataset settings capability before relying on current-day completeness"
+                .to_owned(),
+        );
+        query.sampling = Some(
+            "rumPageloadEventsAdaptiveGroups uses adaptive sampling and reports avg.sampleInterval; sum.visits counts page views whose document referrer does not match the hostname and does not identify unique people"
+                .to_owned(),
+        );
+    }
+    Ok(capability)
+}
+
+fn account_rum_dataset_settings_graphql_capability() -> Result<CapabilityV1> {
+    let document = "query CfctlAccountRumAnalyticsSettings($accountTag: string!) { viewer { accounts(filter: {accountTag: $accountTag}) { settings { rumPageloadEventsAdaptiveGroups { availableFields enabled maxDuration maxNumberOfFields maxPageSize notOlderThan } } } } }";
+    let mut capability = graphql_capability(GraphqlCapabilitySpec {
+        id: "graphql-analytics-account-rum-dataset-settings",
+        title: "Inspect Web Analytics RUM retention and query limits",
+        aliases: &[
+            "RUM retention sampling freshness limits",
+            "Web Analytics GraphQL dataset settings",
+            "RUM available fields page size lookback",
+        ],
+        operation_name: "CfctlAccountRumAnalyticsSettings",
+        document,
+        dataset: "settings",
+        selectors: vec![graphql_selector(
+            "account_id",
+            "Exact account governance and GraphQL scope",
+        )],
+        selector_variables: &[("account_id", "accountTag")],
+        body_variables: &[],
+        response_pointer: "/viewer/accounts/0/settings",
+        expected_fields: &["rumPageloadEventsAdaptiveGroups"],
+        cursor_fields: &[],
+        cursor_input_pointers: &[],
+        request_schema: serde_json::json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{},
+            "x-cfctl-body-required":true
+        }),
+        max_rows: 1,
+        pagination: PaginationModeV1::BoundedResult,
+    })?;
+    capability.permissions = vec!["Account Analytics Read".to_owned()];
     Ok(capability)
 }
 
@@ -6409,6 +6522,24 @@ fn graphql_date_request_schema(dataset: &str, max_rows: u64) -> Value {
         },
         "x-cfctl-body-required":true,
         "x-cfctl-result-scope":"entire_zone_no_hostname_filter"
+    })
+}
+
+fn graphql_rum_visits_request_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["dataset","hostname","start","end","limit"],
+        "properties":{
+            "dataset":{"type":"string","enum":["rumPageloadEventsAdaptiveGroups"]},
+            "hostname":{"type":"string","format":"hostname","minLength":1,"maxLength":253},
+            "start":{"type":"string","format":"date"},
+            "end":{"type":"string","format":"date"},
+            "limit":{"type":"integer","minimum":1,"maximum":31},
+            "timeout_seconds":{"type":"integer","minimum":1,"maximum":30}
+        },
+        "x-cfctl-body-required":true,
+        "x-cfctl-result-scope":"exact_request_host_non_bot_rum"
     })
 }
 

@@ -42,6 +42,14 @@ First-class GraphQL Analytics capabilities:
   be labeled as a period-deduplicated monthly visitor count.
 - `graphql-analytics-account-http-requests` — the same bounded view across an
   explicit list of zones in one account.
+- `graphql-analytics-account-rum-pageload-visits` — exact-hostname, non-bot
+  Web Analytics page views and Cloudflare-defined visits, grouped by up to 31
+  inclusive calendar dates. This account-scoped RUM read uses
+  `requestHost` as a fixed typed variable and returns that dimension as a
+  scope witness.
+- `graphql-analytics-account-rum-dataset-settings` — live
+  `rumPageloadEventsAdaptiveGroups` availability, fields, retention, duration,
+  and page-size limits for the selected account.
 - `graphql-analytics-zone-firewall-events` — one bounded, sampled firewall and
   Security Events page. Cloudflare can emit multiple events for one request,
   so `(datetime, rayName)` is not unique. cfctl deliberately issues no
@@ -64,10 +72,36 @@ printf '%s' '{"dataset":"httpRequests1dGroups","start":"2026-07-01","end":"2026-
 ```
 
 That command is intentionally zone-wide. For a hostname such as `jkca.me`,
-continue using the hostname-filtered adaptive capability within its reported
-retention. If the daily dataset's `availableFields` does not gain a hostname
-filter, cfctl cannot truthfully supply hostname-specific month-to-date traffic
-from `httpRequests1dGroups`.
+use the hostname-bound RUM capability when the account's live settings prove
+the dataset is enabled with the required fields and month window:
+
+```bash
+printf '{}' |
+  cfctl call graphql-analytics-account-rum-dataset-settings \
+    --profile <analytics-profile> \
+    --selector account_id=<account-id> \
+    --body-stdin --json
+
+printf '%s' '{"dataset":"rumPageloadEventsAdaptiveGroups","hostname":"jkca.me","start":"2026-07-01","end":"2026-07-30","limit":30}' |
+  cfctl call graphql-analytics-account-rum-pageload-visits \
+    --profile <analytics-profile> \
+    --selector account_id=<account-id> \
+    --body-stdin --json
+```
+
+The second call returns one row per date. Its `count` is instrumented page
+views and `sum.visits` is Cloudflare's visit count: page views whose document
+referrer does not match the hostname. It is not a unique-person or unique-IP
+count. A month-to-date call can supply today, trailing-week, and month visit
+totals by selecting or summing the corresponding daily `sum.visits` rows.
+`avg.sampleInterval` remains visible because the RUM dataset uses adaptive
+sampling. An empty result proves no collected rows in that bounded RUM query;
+it does not prove the hostname had no HTTP traffic.
+
+If the RUM settings read reports the dataset disabled, insufficient retention,
+or missing `dimensions_requestHost`, `dimensions_date`, `sum_visits`, or
+`avg_sampleInterval`, cfctl cannot truthfully supply hostname-specific
+month-to-date visits. The zone daily rollup remains an invalid substitute.
 
 Each document is fixed in the catalog. Callers can supply only the selectors
 and variables declared by the request schema. GraphQL mutations, fragments or
