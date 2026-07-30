@@ -6034,25 +6034,92 @@ fn is_sensitive_key(key: &str) -> bool {
 /// [`redact_json`]: runtime payloads must never opt into schema semantics.
 #[must_use]
 pub fn redact_json_schema(value: &Value) -> Value {
-    redact_json_schema_inner(value, false, false)
+    let mut sensitive_references = BTreeSet::new();
+    collect_sensitive_schema_references(value, value, false, false, &mut sensitive_references);
+    redact_json_schema_inner(value, "", false, false, &sensitive_references)
+}
+
+fn collect_sensitive_schema_references(
+    document: &Value,
+    value: &Value,
+    schema_names: bool,
+    sensitive_instance_schema: bool,
+    sensitive_references: &mut BTreeSet<String>,
+) {
+    match value {
+        Value::Object(map) => {
+            if sensitive_instance_schema
+                && let Some(reference) = map.get("$ref").and_then(Value::as_str)
+                && let Some(pointer) = reference.strip_prefix('#')
+                && sensitive_references.insert(pointer.to_owned())
+                && let Some(resolved) = document.pointer(pointer)
+            {
+                collect_sensitive_schema_references(
+                    document,
+                    resolved,
+                    false,
+                    true,
+                    sensitive_references,
+                );
+            }
+            for (key, item) in map {
+                if schema_names && matches!(item, Value::Object(_) | Value::Bool(_)) {
+                    collect_sensitive_schema_references(
+                        document,
+                        item,
+                        false,
+                        sensitive_instance_schema || is_sensitive_key(key),
+                        sensitive_references,
+                    );
+                } else {
+                    collect_sensitive_schema_references(
+                        document,
+                        item,
+                        is_json_schema_name_map(key),
+                        sensitive_instance_schema,
+                        sensitive_references,
+                    );
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_sensitive_schema_references(
+                    document,
+                    item,
+                    false,
+                    sensitive_instance_schema,
+                    sensitive_references,
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 fn redact_json_schema_inner(
     value: &Value,
+    pointer: &str,
     schema_names: bool,
-    sensitive_instance_schema: bool,
+    mut sensitive_instance_schema: bool,
+    sensitive_references: &BTreeSet<String>,
 ) -> Value {
+    sensitive_instance_schema |= sensitive_references.contains(pointer);
     match value {
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(key, item)| {
+                    let item_pointer =
+                        format!("{pointer}/{}", json_pointer_escape_token(key.as_str()));
                     if schema_names && matches!(item, Value::Object(_) | Value::Bool(_)) {
                         (
                             key.clone(),
                             redact_json_schema_inner(
                                 item,
+                                &item_pointer,
                                 false,
                                 sensitive_instance_schema || is_sensitive_key(key),
+                                sensitive_references,
                             ),
                         )
                     } else if (sensitive_instance_schema && is_json_schema_instance_annotation(key))
@@ -6064,8 +6131,10 @@ fn redact_json_schema_inner(
                             key.clone(),
                             redact_json_schema_inner(
                                 item,
+                                &item_pointer,
                                 is_json_schema_name_map(key),
                                 sensitive_instance_schema,
+                                sensitive_references,
                             ),
                         )
                     }
@@ -6075,11 +6144,24 @@ fn redact_json_schema_inner(
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|item| redact_json_schema_inner(item, false, sensitive_instance_schema))
+                .enumerate()
+                .map(|(index, item)| {
+                    redact_json_schema_inner(
+                        item,
+                        &format!("{pointer}/{index}"),
+                        false,
+                        sensitive_instance_schema,
+                        sensitive_references,
+                    )
+                })
                 .collect(),
         ),
         _ => value.clone(),
     }
+}
+
+fn json_pointer_escape_token(token: &str) -> String {
+    token.replace('~', "~0").replace('/', "~1")
 }
 
 fn is_json_schema_name_map(key: &str) -> bool {

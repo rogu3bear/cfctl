@@ -4108,4 +4108,41 @@ fn schema_redaction_preserves_property_names_without_exempting_secret_values() {
         redact_json_schema(&malformed)["properties"]["token"],
         Value::String("[REDACTED]".to_owned())
     );
+
+    let referenced = json!({
+        "type": "object",
+        "properties": {
+            "client_secret": {"$ref": "#/$defs/Credential"}
+        },
+        "$defs": {
+            "Credential": {
+                "type": "string",
+                "default": "referenced-secret-must-not-survive"
+            }
+        }
+    });
+    assert_ne!(
+        redact_json_schema(&referenced),
+        referenced,
+        "secret-bearing annotations reached through a local schema reference must be rejected"
+    );
+
+    let cyclic = json!({
+        "type": "object",
+        "properties": {
+            "token": {"$ref": "#/$defs/A"}
+        },
+        "$defs": {
+            "A": {"$ref": "#/$defs/B"},
+            "B": {
+                "$ref": "#/$defs/A",
+                "examples": ["cyclic-secret-must-not-survive"]
+            }
+        }
+    });
+    assert_ne!(
+        redact_json_schema(&cyclic),
+        cyclic,
+        "cyclic local references must terminate and retain the sensitive-property context"
+    );
 }

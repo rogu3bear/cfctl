@@ -745,37 +745,50 @@ where
         // from an untyped legacy fallback whose freshness is unknowable.
         fallback.put(journal_key.as_str(), value)?;
         checkpoint(CredentialWriteCheckpoint::FallbackJournalCommitted)?;
-        if let Ok(()) = primary.put(key, value) {
-            checkpoint(CredentialWriteCheckpoint::PrimaryWriteCommitted)?;
-            if let Err(cleanup_error) = fallback.delete(key) {
-                checkpoint(CredentialWriteCheckpoint::LegacyFallbackCleanupFailed)?;
-                return recover_with_required_fresh_journal(
-                    fallback,
-                    journal_key.as_str(),
-                    value,
-                    "legacy fallback",
-                    &cleanup_error,
-                );
-            }
-            checkpoint(CredentialWriteCheckpoint::LegacyFallbackCleared)?;
-            match fallback.delete(journal_key.as_str()) {
-                Ok(()) => {
-                    checkpoint(CredentialWriteCheckpoint::FallbackJournalCleared)?;
-                    Ok(())
-                }
-                Err(cleanup_error) => {
-                    checkpoint(CredentialWriteCheckpoint::FallbackJournalCleanupFailed)?;
-                    recover_after_journal_cleanup_failure(
+        match primary.put(key, value) {
+            Ok(()) => {
+                checkpoint(CredentialWriteCheckpoint::PrimaryWriteCommitted)?;
+                if let Err(cleanup_error) = fallback.delete(key) {
+                    checkpoint(CredentialWriteCheckpoint::LegacyFallbackCleanupFailed)?;
+                    return recover_with_required_fresh_journal(
                         fallback,
                         journal_key.as_str(),
                         value,
+                        "legacy fallback",
                         &cleanup_error,
-                    )
+                    );
+                }
+                checkpoint(CredentialWriteCheckpoint::LegacyFallbackCleared)?;
+                match fallback.delete(journal_key.as_str()) {
+                    Ok(()) => {
+                        checkpoint(CredentialWriteCheckpoint::FallbackJournalCleared)?;
+                        Ok(())
+                    }
+                    Err(cleanup_error) => {
+                        checkpoint(CredentialWriteCheckpoint::FallbackJournalCleanupFailed)?;
+                        recover_after_journal_cleanup_failure(
+                            fallback,
+                            journal_key.as_str(),
+                            value,
+                            &cleanup_error,
+                        )
+                    }
                 }
             }
-        } else {
-            checkpoint(CredentialWriteCheckpoint::PrimaryWriteRejected)?;
-            Ok(())
+            Err(primary_error) => {
+                checkpoint(CredentialWriteCheckpoint::PrimaryWriteRejected)?;
+                if fallback.get(journal_key.as_str())?.as_deref() != Some(value) {
+                    fallback
+                        .put(journal_key.as_str(), value)
+                        .map_err(|fallback_error| {
+                            AuthError::SecretStore(format!(
+                                "primary secret store write failed ({primary_error}); fallback journal reconfirmation also failed ({fallback_error})"
+                            ))
+                        })?;
+                    checkpoint(CredentialWriteCheckpoint::FallbackJournalCommitted)?;
+                }
+                Ok(())
+            }
         }
     } else {
         match primary.put(key, value) {
@@ -1273,6 +1286,33 @@ mod tests {
         }
     }
 
+    struct ConcurrentJournalRemovingRejectingPrimary<'a> {
+        inner: MemorySecretStore,
+        fallback: &'a dyn SecretStore,
+    }
+
+    impl SecretStore for ConcurrentJournalRemovingRejectingPrimary<'_> {
+        fn put(&self, key: &str, _value: &str) -> Result<()> {
+            self.inner.put(key, "concurrent-value")?;
+            self.fallback.delete(fallback_journal_key(key).as_str())?;
+            Err(AuthError::SecretStore(
+                "primary store rejected this writer after a concurrent write crossed".to_owned(),
+            ))
+        }
+
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.inner.get(key)
+        }
+
+        fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key)
+        }
+
+        fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
+            self.inner.locate(key)
+        }
+    }
+
     #[test]
     fn chained_put_prefers_primary_and_clears_stale_fallback_copies() {
         let primary = MemorySecretStore::default();
@@ -1343,6 +1383,31 @@ mod tests {
             chained_get(&primary, &fallback, "k").expect("recovered credential"),
             Some("newer".to_owned()),
             "an older journal created after clean-path inspection must not remain authoritative"
+        );
+    }
+
+    #[test]
+    fn rejected_primary_write_reconfirms_its_fallback_journal_after_concurrent_cleanup() {
+        let fallback = MemorySecretStore::default();
+        fallback.put("k", "old").expect("seed fallback");
+        let primary = ConcurrentJournalRemovingRejectingPrimary {
+            inner: MemorySecretStore::default(),
+            fallback: &fallback,
+        };
+
+        chained_put(&primary, &fallback, "k", "requested")
+            .expect("the rejected primary write must retain its requested fallback value");
+
+        assert_eq!(
+            fallback
+                .get(fallback_journal_key("k").as_str())
+                .expect("journal"),
+            Some("requested".to_owned()),
+            "a concurrent cleanup must not erase an acknowledged fallback write"
+        );
+        assert_eq!(
+            chained_get(&primary, &fallback, "k").expect("authoritative credential"),
+            Some("requested".to_owned())
         );
     }
 
