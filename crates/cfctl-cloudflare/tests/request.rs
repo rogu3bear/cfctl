@@ -2956,6 +2956,46 @@ fn graphql_http_capability() -> CapabilityV1 {
     capability
 }
 
+fn graphql_daily_unique_ips_capability() -> CapabilityV1 {
+    let mut capability = graphql_http_capability();
+    "graphql-analytics-zone-http-unique-ips-daily".clone_into(&mut capability.id);
+    let query = capability
+        .analytics_query
+        .as_mut()
+        .expect("analytics contract");
+    query.dataset = Some("httpRequests1dGroups".to_owned());
+    query.max_rows = 31;
+    query.pagination = PaginationModeV1::BoundedResult;
+    query.time_range = Some(TimeRangeContractV1 {
+        start_pointer: "/start".to_owned(),
+        end_pointer: "/end".to_owned(),
+        timestamp_format: TimestampFormatV1::Date,
+        max_lookback_seconds: 366 * 24 * 60 * 60,
+        max_window_seconds: 31 * 24 * 60 * 60,
+    });
+    query.sampling =
+        Some("daily unique client IPs; summing rows does not deduplicate across days".to_owned());
+    let graphql = capability.graphql.as_mut().expect("GraphQL contract");
+    "CfctlZoneHttpUniqueIpsDaily".clone_into(&mut graphql.operation_name);
+    "query CfctlZoneHttpUniqueIpsDaily($zoneTag: string!, $start: Date!, $end: Date!, $limit: Int!) { viewer { zones(filter: {zoneTag: $zoneTag}) { series: httpRequests1dGroups(filter: {date_geq: $start, date_leq: $end}, limit: $limit, orderBy: [date_ASC]) { dimensions { date } uniq { uniques } } } } }".clone_into(&mut graphql.document);
+    "httpRequests1dGroups".clone_into(&mut graphql.dataset);
+    graphql.expected_row_fields = vec!["dimensions".to_owned(), "uniq".to_owned()];
+    graphql.refresh_schema_fingerprint().expect("fingerprint");
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["dataset","start","end","limit"],
+        "properties":{
+            "dataset":{"type":"string","enum":["httpRequests1dGroups"]},
+            "start":{"type":"string","format":"date"},
+            "end":{"type":"string","format":"date"},
+            "limit":{"type":"integer","minimum":1,"maximum":31}
+        },
+        "x-cfctl-body-required":true
+    }));
+    capability
+}
+
 fn graphql_firewall_capability() -> CapabilityV1 {
     let mut capability = graphql_http_capability();
     "graphql-analytics-zone-firewall-events".clone_into(&mut capability.id);
@@ -3129,6 +3169,95 @@ async fn executor_sends_only_the_pinned_graphql_document_and_detects_response_dr
     .expect_err("response schema drift must fail closed");
     assert!(matches!(error, CloudflareError::GraphqlSchemaDrift { .. }));
     server.await.expect("server joins");
+}
+
+#[tokio::test]
+async fn daily_unique_ips_use_inclusive_dates_and_a_pinned_daily_rollup() {
+    let capability = graphql_daily_unique_ips_capability();
+    let end = Utc::now().date_naive();
+    let start = end - Duration::days(29);
+    let start = start.format("%Y-%m-%d").to_string();
+    let end = end.format("%Y-%m-%d").to_string();
+    let input = CallInput {
+        selectors: json!({"zone_id":"zone-1"}),
+        body: Some(json!({
+            "dataset":"httpRequests1dGroups",
+            "start":start,
+            "end":end,
+            "limit":30
+        })),
+        ..CallInput::default()
+    };
+    let (address, server) = json_response_sequence_server(vec![
+        json!({
+            "data":{"viewer":{"zones":[{"series":[
+                {"dimensions":{"date":start},"uniq":{"uniques":42}},
+                {"dimensions":{"date":end},"uniq":{"uniques":17}}
+            ]}]}}
+        })
+        .to_string(),
+    ])
+    .await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &input,
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("daily visitor GraphQL response");
+    assert_eq!(
+        response.result,
+        json!([
+            {"dimensions":{"date":start},"uniq":{"uniques":42}},
+            {"dimensions":{"date":end},"uniq":{"uniques":17}}
+        ])
+    );
+    let requests = server.await.expect("server joins");
+    assert!(requests[0].contains("CfctlZoneHttpUniqueIpsDaily"));
+    assert!(requests[0].contains("httpRequests1dGroups"));
+    assert!(requests[0].contains("date_leq"));
+    assert!(requests[0].contains("\"zoneTag\":\"zone-1\""));
+    assert!(!requests[0].contains("mutation"));
+
+    let too_wide_start = Utc::now().date_naive() - Duration::days(31);
+    let too_wide = CallInput {
+        selectors: json!({"zone_id":"zone-1"}),
+        body: Some(json!({
+            "dataset":"httpRequests1dGroups",
+            "start":too_wide_start.format("%Y-%m-%d").to_string(),
+            "end":Utc::now().date_naive().format("%Y-%m-%d").to_string(),
+            "limit":31
+        })),
+        ..CallInput::default()
+    };
+    assert!(matches!(
+        validate_request_contract(&capability, &too_wide),
+        Err(CloudflareError::InvalidAnalyticsQuery(message))
+            if message.contains("31 day") || message.contains("2678400 second")
+    ));
+
+    let malformed = CallInput {
+        selectors: json!({"zone_id":"zone-1"}),
+        body: Some(json!({
+            "dataset":"httpRequests1dGroups",
+            "start":"2026-07-01T00:00:00Z",
+            "end":"2026-07-30",
+            "limit":30
+        })),
+        ..CallInput::default()
+    };
+    assert!(matches!(
+        validate_request_contract(&capability, &malformed),
+        Err(CloudflareError::InvalidAnalyticsQuery(message))
+            if message.contains("YYYY-MM-DD")
+    ));
 }
 
 #[tokio::test]

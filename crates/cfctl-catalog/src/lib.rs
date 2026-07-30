@@ -594,6 +594,15 @@ fn telemetry_coverage_specs() -> Vec<TelemetryCoverageSpec> {
         telemetry_spec(
             "analytics",
             "GraphQL HTTP analytics",
+            "httpRequests1dGroups zone-wide daily unique IPs",
+            Some("graphql-analytics-zone-http-unique-ips-daily"),
+            "read",
+            "graphql_contract_and_response_fixture",
+            None,
+        ),
+        telemetry_spec(
+            "analytics",
+            "GraphQL HTTP analytics",
             "httpRequestsAdaptiveGroups selected account zones",
             Some("graphql-analytics-account-http-requests"),
             "read",
@@ -6032,6 +6041,7 @@ fn workers_observability_aliases(id: &str) -> Vec<String> {
 fn graphql_analytics_capabilities() -> Result<Vec<CapabilityV1>> {
     Ok(vec![
         zone_http_graphql_capability()?,
+        zone_http_unique_ips_daily_graphql_capability()?,
         account_http_graphql_capability()?,
         zone_firewall_graphql_capability()?,
         zone_dataset_settings_graphql_capability()?,
@@ -6062,6 +6072,50 @@ fn zone_http_graphql_capability() -> Result<CapabilityV1> {
         max_rows: 5_000,
         pagination: PaginationModeV1::TimeWindow,
     })
+}
+
+fn zone_http_unique_ips_daily_graphql_capability() -> Result<CapabilityV1> {
+    let document = "query CfctlZoneHttpUniqueIpsDaily($zoneTag: string!, $start: Date!, $end: Date!, $limit: Int!) { viewer { zones(filter: {zoneTag: $zoneTag}) { series: httpRequests1dGroups(filter: {date_geq: $start, date_leq: $end}, limit: $limit, orderBy: [date_ASC]) { dimensions { date } uniq { uniques } } } } }";
+    let mut capability = graphql_capability(GraphqlCapabilitySpec {
+        id: "graphql-analytics-zone-http-unique-ips-daily",
+        title: "Query bounded zone-wide daily HTTP unique IP counts",
+        aliases: &[
+            "zone-wide daily unique IP rollup",
+            "month to date zone unique IP rows",
+            "GraphQL daily HTTP zone analytics",
+        ],
+        operation_name: "CfctlZoneHttpUniqueIpsDaily",
+        document,
+        dataset: "httpRequests1dGroups",
+        selectors: vec![graphql_selector("zone_id", "Exact zone scope")],
+        selector_variables: &[("zone_id", "zoneTag")],
+        body_variables: &[("start", "start"), ("end", "end"), ("limit", "limit")],
+        response_pointer: "/viewer/zones/0/series",
+        expected_fields: &["dimensions", "uniq"],
+        cursor_fields: &[],
+        cursor_input_pointers: &[],
+        request_schema: graphql_date_request_schema("httpRequests1dGroups", 31),
+        max_rows: 31,
+        pagination: PaginationModeV1::BoundedResult,
+    })?;
+    capability.description = Some(
+        "Returns daily unique-client-IP counts for the entire selected zone. Cloudflare's httpRequests1dGroups contract exposes only the date dimension and does not accept a hostname filter, so this capability cannot prove apex-only or subdomain-only traffic."
+            .to_owned(),
+    );
+    if let Some(query) = capability.analytics_query.as_mut() {
+        query.time_range = Some(TimeRangeContractV1 {
+            start_pointer: "/start".to_owned(),
+            end_pointer: "/end".to_owned(),
+            timestamp_format: TimestampFormatV1::Date,
+            max_lookback_seconds: 366 * 24 * 60 * 60,
+            max_window_seconds: 31 * 24 * 60 * 60,
+        });
+        query.sampling = Some(
+            "httpRequests1dGroups is a pre-aggregated zone-wide daily rollup; uniq.uniques is the number of unique client IPs within each day, summing rows does not deduplicate an IP seen on multiple days, and no hostname dimension or filter is available"
+                .to_owned(),
+        );
+    }
+    Ok(capability)
 }
 
 fn account_http_graphql_capability() -> Result<CapabilityV1> {
@@ -6143,7 +6197,7 @@ fn zone_firewall_graphql_capability() -> Result<CapabilityV1> {
 }
 
 fn zone_dataset_settings_graphql_capability() -> Result<CapabilityV1> {
-    let document = "query CfctlZoneAnalyticsSettings($zoneTag: string!) { viewer { zones(filter: {zoneTag: $zoneTag}) { settings { httpRequestsAdaptiveGroups { enabled maxDuration maxNumberOfFields maxPageSize notOlderThan } firewallEventsAdaptive { enabled maxDuration maxNumberOfFields maxPageSize notOlderThan } } } } }";
+    let document = "query CfctlZoneAnalyticsSettings($zoneTag: string!) { viewer { zones(filter: {zoneTag: $zoneTag}) { settings { httpRequestsAdaptiveGroups { availableFields enabled maxDuration maxNumberOfFields maxPageSize notOlderThan } httpRequests1dGroups { availableFields enabled maxDuration maxNumberOfFields maxPageSize notOlderThan } firewallEventsAdaptive { availableFields enabled maxDuration maxNumberOfFields maxPageSize notOlderThan } } } } }";
     graphql_capability(GraphqlCapabilitySpec {
         id: "graphql-analytics-zone-dataset-settings",
         title: "Inspect GraphQL analytics retention and query limits",
@@ -6159,7 +6213,11 @@ fn zone_dataset_settings_graphql_capability() -> Result<CapabilityV1> {
         selector_variables: &[("zone_id", "zoneTag")],
         body_variables: &[],
         response_pointer: "/viewer/zones/0/settings",
-        expected_fields: &["firewallEventsAdaptive", "httpRequestsAdaptiveGroups"],
+        expected_fields: &[
+            "firewallEventsAdaptive",
+            "httpRequests1dGroups",
+            "httpRequestsAdaptiveGroups",
+        ],
         cursor_fields: &[],
         cursor_input_pointers: &[],
         request_schema: serde_json::json!({
@@ -6216,7 +6274,10 @@ fn graphql_capability(spec: GraphqlCapabilitySpec<'_>) -> Result<CapabilityV1> {
     .clone_into(&mut capability.account_scope);
     capability.selectors = spec.selectors;
     capability.aliases = spec.aliases.iter().map(ToString::to_string).collect();
-    capability.permissions = vec!["Account Analytics Read".to_owned()];
+    capability.permissions = vec![
+        "Account Analytics Read".to_owned(),
+        "Analytics Read".to_owned(),
+    ];
     capability.mutating = false;
     capability.risk = RiskClass::Read;
     capability.effect = EffectClass::ReadOnly;
@@ -6331,6 +6392,23 @@ fn graphql_time_request_schema(dataset: &str, max_rows: u64, multi_zone: bool) -
         "required":required,
         "properties":properties,
         "x-cfctl-body-required":true
+    })
+}
+
+fn graphql_date_request_schema(dataset: &str, max_rows: u64) -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["dataset","start","end","limit"],
+        "properties":{
+            "dataset":{"type":"string","enum":[dataset]},
+            "start":{"type":"string","format":"date"},
+            "end":{"type":"string","format":"date"},
+            "limit":{"type":"integer","minimum":1,"maximum":max_rows},
+            "timeout_seconds":{"type":"integer","minimum":1,"maximum":30}
+        },
+        "x-cfctl-body-required":true,
+        "x-cfctl-result-scope":"entire_zone_no_hostname_filter"
     })
 }
 

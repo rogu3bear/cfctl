@@ -33,6 +33,13 @@ First-class GraphQL Analytics capabilities:
 
 - `graphql-analytics-zone-http-requests` — zone requests, data transfer, cache
   status, response status, hostname, and path dimensions.
+- `graphql-analytics-zone-http-unique-ips-daily` — up to 31 inclusive calendar
+  days from `httpRequests1dGroups`, returning each day's `uniq.uniques` count
+  for the entire selected zone. Cloudflare exposes only the date dimension and
+  date filters on this daily rollup: there is no hostname dimension or filter.
+  It must not be used for apex-only or subdomain-only reporting. Adding daily
+  rows also does not deduplicate a client IP seen on multiple days and must not
+  be labeled as a period-deduplicated monthly visitor count.
 - `graphql-analytics-account-http-requests` — the same bounded view across an
   explicit list of zones in one account.
 - `graphql-analytics-zone-firewall-events` — one bounded, sampled firewall and
@@ -41,7 +48,26 @@ First-class GraphQL Analytics capabilities:
   continuation cursor and never claims this read is exhaustive; narrow the
   requested window or use a retained log pipeline when completeness matters.
 - `graphql-analytics-zone-dataset-settings` — retention/lookback, page-size,
-  field, and dataset availability settings reported by Cloudflare.
+  field, and dataset availability settings reported by Cloudflare, including
+  `httpRequests1dGroups`.
+
+Cloudflare zone analytics reads require both `Account Analytics Read` and the
+zone-scoped `Analytics Read` permission. The daily visitor capability uses
+inclusive `YYYY-MM-DD` `start` and `end` values:
+
+```bash
+printf '%s' '{"dataset":"httpRequests1dGroups","start":"2026-07-01","end":"2026-07-30","limit":30}' |
+  cfctl call graphql-analytics-zone-http-unique-ips-daily \
+    --profile <analytics-profile> \
+    --selector zone_id=<zone-id> \
+    --body-stdin --json
+```
+
+That command is intentionally zone-wide. For a hostname such as `jkca.me`,
+continue using the hostname-filtered adaptive capability within its reported
+retention. If the daily dataset's `availableFields` does not gain a hostname
+filter, cfctl cannot truthfully supply hostname-specific month-to-date traffic
+from `httpRequests1dGroups`.
 
 Each document is fixed in the catalog. Callers can supply only the selectors
 and variables declared by the request schema. GraphQL mutations, fragments or

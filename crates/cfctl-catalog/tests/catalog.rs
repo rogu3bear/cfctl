@@ -9,7 +9,7 @@ use cfctl_core::{
     AdapterStatus, AnalyticsQueryKindV1, BillingModelV1, CapabilityV1, CostExposureV1,
     CreatedResourceContractV1, DeletedResourceContractV1, EffectClass, KnowledgeReferenceV1,
     PaginationModeV1, ResponseBodyModeV1, ResponseContractV1, RiskClass, SamePathReadContractV1,
-    SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorV1, hash_value,
+    SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorV1, TimestampFormatV1, hash_value,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -10524,6 +10524,7 @@ fn telemetry_overlay_closes_bounded_sql_graphql_and_workers_read_contracts() {
 
     for id in [
         "graphql-analytics-zone-http-requests",
+        "graphql-analytics-zone-http-unique-ips-daily",
         "graphql-analytics-account-http-requests",
         "graphql-analytics-zone-firewall-events",
         "graphql-analytics-zone-dataset-settings",
@@ -10531,7 +10532,10 @@ fn telemetry_overlay_closes_bounded_sql_graphql_and_workers_read_contracts() {
         let capability = snapshot.get(id).unwrap_or_else(|| panic!("{id} present"));
         assert_eq!(capability.adapter_status, AdapterStatus::Native);
         assert!(!capability.mutating);
-        assert_eq!(capability.permissions, ["Account Analytics Read"]);
+        assert_eq!(
+            capability.permissions,
+            ["Account Analytics Read", "Analytics Read"]
+        );
         assert!(!capability.verification.required);
         assert_eq!(capability.verification.strategy, "not_applicable");
         assert!(!capability.rollback.supported);
@@ -10552,6 +10556,70 @@ fn telemetry_overlay_closes_bounded_sql_graphql_and_workers_read_contracts() {
             "callers must not provide arbitrary documents"
         );
     }
+
+    let daily_visitors = snapshot
+        .get("graphql-analytics-zone-http-unique-ips-daily")
+        .expect("daily zone visitor capability");
+    let daily_query = daily_visitors
+        .analytics_query
+        .as_ref()
+        .expect("daily analytics contract");
+    assert_eq!(daily_query.dataset.as_deref(), Some("httpRequests1dGroups"));
+    assert_eq!(daily_query.max_rows, 31);
+    assert_eq!(
+        daily_query
+            .time_range
+            .as_ref()
+            .map(|range| range.timestamp_format),
+        Some(TimestampFormatV1::Date)
+    );
+    assert!(
+        daily_query
+            .sampling
+            .as_deref()
+            .is_some_and(|value| value.contains("no hostname dimension or filter"))
+    );
+    let daily_graphql = daily_visitors
+        .graphql
+        .as_ref()
+        .expect("daily GraphQL contract");
+    assert!(daily_graphql.document.contains("httpRequests1dGroups"));
+    assert!(daily_graphql.document.contains("date_leq: $end"));
+    assert!(daily_graphql.document.contains("uniq { uniques }"));
+    assert_eq!(
+        daily_visitors
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.pointer("/properties/start/format")),
+        Some(&json!("date"))
+    );
+    assert_eq!(
+        daily_visitors
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("x-cfctl-result-scope")),
+        Some(&json!("entire_zone_no_hostname_filter"))
+    );
+    assert!(
+        daily_visitors
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.pointer("/properties/hostname"))
+            .is_none()
+    );
+    assert!(
+        daily_visitors
+            .description
+            .as_deref()
+            .is_some_and(|value| value.contains("cannot prove apex-only"))
+    );
+
+    let settings = snapshot
+        .get("graphql-analytics-zone-dataset-settings")
+        .and_then(|capability| capability.graphql.as_ref())
+        .expect("dataset settings GraphQL contract");
+    assert!(settings.document.contains("httpRequests1dGroups"));
+    assert!(settings.document.contains("availableFields"));
 
     let firewall = snapshot
         .get("graphql-analytics-zone-firewall-events")

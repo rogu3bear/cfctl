@@ -18,7 +18,7 @@ use cfctl_core::{
     ResponseBodyModeV1, ResponseContractV1, RiskClass, SelectorContractV1, SelectorV1,
     TimestampFormatV1, TransactionStageV1, hash_value, request_header_is_reserved,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use md5::Md5;
@@ -11689,12 +11689,18 @@ fn validate_analytics_query_contract(capability: &CapabilityV1, input: &CallInpu
         let start = analytics_timestamp(start, time.timestamp_format)?;
         let end = analytics_timestamp(end, time.timestamp_format)?;
         let now = Utc::now();
-        if end <= start {
+        let date_range = time.timestamp_format == TimestampFormatV1::Date;
+        if (date_range && end < start) || (!date_range && end <= start) {
             return Err(CloudflareError::InvalidAnalyticsQuery(
-                "end time must be after start time".to_owned(),
+                if date_range {
+                    "end date must be on or after start date"
+                } else {
+                    "end time must be after start time"
+                }
+                .to_owned(),
             ));
         }
-        let window = (end - start).num_seconds();
+        let window = (end - start).num_seconds() + if date_range { 24 * 60 * 60 } else { 0 };
         if window > i64::try_from(time.max_window_seconds).unwrap_or(i64::MAX) {
             return Err(CloudflareError::InvalidAnalyticsQuery(format!(
                 "time window exceeds the {} second maximum",
@@ -12144,6 +12150,22 @@ fn dataset_is_bounded(value: &Value) -> bool {
 
 fn analytics_timestamp(value: &Value, format: TimestampFormatV1) -> Result<DateTime<Utc>> {
     match format {
+        TimestampFormatV1::Date => {
+            let value = value.as_str().ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(
+                    "date values must use YYYY-MM-DD strings".to_owned(),
+                )
+            })?;
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|datetime| datetime.and_utc())
+                .ok_or_else(|| {
+                    CloudflareError::InvalidAnalyticsQuery(
+                        "date values must be valid YYYY-MM-DD dates".to_owned(),
+                    )
+                })
+        }
         TimestampFormatV1::Rfc3339 => value
             .as_str()
             .ok_or_else(|| {
