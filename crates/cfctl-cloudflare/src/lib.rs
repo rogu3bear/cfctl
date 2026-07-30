@@ -13,9 +13,9 @@ use cfctl_auth::AuthCredential;
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1,
     D1FullExportContractV1, D1RestoreExactBookmarkContractV1, D1SchemaIntrospectionContractV1,
-    GraphqlAnalyticsContractV1, OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1,
-    R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1, RiskClass,
-    SelectorContractV1, SelectorV1, TimestampFormatV1, TransactionStageV1, hash_value,
+    GraphqlAnalyticsContractV1, Mln0143DataInvariantsContractV1, OutputFormatV1, PaginationModeV1,
+    PlanStatus, PlanV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
+    RiskClass, SelectorContractV1, SelectorV1, TimestampFormatV1, TransactionStageV1, hash_value,
     request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
@@ -201,6 +201,7 @@ pub struct PreparedRequest {
     pub response_contract: Option<ResponseContractV1>,
     pub analytics_query: Option<AnalyticsQueryContractV1>,
     pub d1_schema_introspection: Option<D1SchemaIntrospectionContractV1>,
+    pub mln_0143_data_invariants: Option<Mln0143DataInvariantsContractV1>,
     pub d1_full_export: Option<D1FullExportContractV1>,
     pub d1_restore_exact_bookmark: Option<D1RestoreExactBookmarkContractV1>,
     pub r2_log_retrieval: Option<R2LogRetrievalContractV1>,
@@ -322,6 +323,15 @@ impl RequestBuilder {
                 .and_then(Value::as_str)
                 .ok_or_else(|| CloudflareError::MissingRequestBody(capability.id.clone()))?;
             (Some(serde_json::json!({"bookmark":target})), None)
+        } else if capability.mln_0143_data_invariants.is_some() {
+            (
+                Some(render_mln_0143_data_invariants_body(
+                    input.body.as_ref().ok_or_else(|| {
+                        CloudflareError::MissingRequestBody(capability.id.clone())
+                    })?,
+                )?),
+                None,
+            )
         } else if capability.d1_schema_introspection.is_some() {
             (
                 Some(render_d1_schema_introspection_body(
@@ -381,6 +391,7 @@ impl RequestBuilder {
             response_contract: capability.response_contract.clone(),
             analytics_query: capability.analytics_query.clone(),
             d1_schema_introspection: capability.d1_schema_introspection.clone(),
+            mln_0143_data_invariants: capability.mln_0143_data_invariants.clone(),
             d1_full_export: capability.d1_full_export.clone(),
             d1_restore_exact_bookmark: capability.d1_restore_exact_bookmark.clone(),
             r2_log_retrieval: capability.r2_log_retrieval.clone(),
@@ -390,6 +401,7 @@ impl RequestBuilder {
             max_bytes,
             timeout_seconds,
             query_receipt: d1_full_export_receipt(capability, input)
+                .or_else(|| mln_0143_data_invariants_receipt(capability, input))
                 .or_else(|| d1_schema_introspection_receipt(capability, input))
                 .or_else(|| analytics_query_receipt(capability, input, output_format))
                 .or_else(|| r2_log_retrieval_receipt(capability, input)),
@@ -432,6 +444,86 @@ fn d1_schema_introspection_receipt(capability: &CapabilityV1, input: &CallInput)
 fn d1_schema_introspection_caller_sql(body: &Value) -> bool {
     body.as_object()
         .is_some_and(|body| body.contains_key("sql"))
+}
+
+const MLN_0143_QUERY: &str = r"WITH evidence_projection AS (
+ SELECT id,org_id,issuance_event_id,evidence_kind,document_id,company_event_id,document_hash,required,created_by,created_at,
+        COUNT(*) OVER() AS projection_total
+ FROM equity_issuance_evidence_links ORDER BY id LIMIT 257
+), evidence_payload AS (
+ SELECT COALESCE(json_group_array(json_object(
+   'id',id,'org_id',org_id,'issuance_event_id',issuance_event_id,'evidence_kind',evidence_kind,
+   'document_id',document_id,'company_event_id',company_event_id,'document_hash',document_hash,
+   'required',required,'created_by',created_by,'created_at',created_at)), '[]') AS evidence_rows,
+   COUNT(*) AS evidence_received, COALESCE(MAX(projection_total),0) AS evidence_window_total
+ FROM evidence_projection
+)
+SELECT evidence_rows,evidence_received,evidence_window_total,
+ (SELECT COUNT(*) FROM equity_issuance_evidence_links) AS evidence_total,
+ (SELECT COALESCE(json_group_array(json_object('evidence_kind',evidence_kind,'count',kind_count)),'[]')
+  FROM (SELECT evidence_kind,COUNT(*) AS kind_count FROM equity_issuance_evidence_links GROUP BY evidence_kind ORDER BY evidence_kind)) AS evidence_kind_counts,
+ (SELECT sql FROM sqlite_schema WHERE type='table' AND name='equity_issuance_evidence_links') AS table_sql,
+ (SELECT COALESCE(json_group_array(name),'[]') FROM (SELECT name FROM pragma_table_info('equity_issuance_evidence_links') ORDER BY cid)) AS column_names,
+ (SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='equity_issuance_evidence_links_0143_old') AS old_table_count,
+ (SELECT sql FROM sqlite_schema WHERE type='index' AND name='idx_equity_issuance_evidence_unique_hash') AS unique_hash_index_sql,
+ (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_equity_instrument_evidence_contract') AS trigger_contract_sql,
+ (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_equity_instrument_evidence_immutable') AS trigger_immutable_sql,
+ (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_grant_final_instrument_required') AS trigger_final_required_sql,
+ (SELECT COALESCE(json_group_array(json_object('evidence_kind',evidence_kind,'signature_required',signature_required,'sort_order',sort_order)),'[]')
+  FROM (SELECT evidence_kind,signature_required,sort_order FROM issuance_profile_packet_kinds WHERE profile='advisor_grant' ORDER BY evidence_kind)) AS advisor_packet_rows,
+ (SELECT COUNT(*) FROM pragma_foreign_key_check) AS foreign_key_violations,
+ (SELECT COUNT(*) FROM (SELECT 1 FROM equity_issuance_evidence_links WHERE document_hash IS NOT NULL GROUP BY org_id,issuance_event_id,evidence_kind,document_hash HAVING COUNT(*)>1)) AS duplicate_hash_groups,
+ (SELECT COUNT(*) FROM equity_issuance_evidence_links WHERE evidence_kind NOT IN (
+   'board_consent','stock_purchase_agreement','restricted_stock_purchase_agreement',
+   'advisor_equity_instrument','safe_agreement','advisor_agreement','election_83b',
+   'consideration','funds_evidence','signature','stock_ledger','document_hash','other'
+ )) AS invalid_evidence_kinds,
+ (SELECT COUNT(*) FROM equity_issuance_events event
+  WHERE event.issuance_profile='advisor_grant' AND event.status IN ('documents_generated','ready_to_execute','executed')
+  AND NOT EXISTS (SELECT 1 FROM equity_issuance_evidence_links evidence WHERE evidence.org_id=event.org_id
+    AND evidence.issuance_event_id=event.id AND evidence.evidence_kind='advisor_equity_instrument'
+    AND evidence.required=1 AND evidence.document_id IS NOT NULL AND COALESCE(trim(evidence.document_hash),'')<>'')) AS invalid_advanced_events
+FROM evidence_payload";
+
+fn render_mln_0143_data_invariants_body(body: &Value) -> Result<Value> {
+    let object = body.as_object().ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery(
+            "MLN 0143 invariant input must be an object".to_owned(),
+        )
+    })?;
+    let phase = object.get("phase").and_then(Value::as_str).ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery("MLN 0143 invariant phase is missing".to_owned())
+    })?;
+    if !matches!(phase, "pre_import" | "post_import" | "post_restore") {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "MLN 0143 invariant phase is unsupported".to_owned(),
+        ));
+    }
+    Ok(serde_json::json!({"sql":MLN_0143_QUERY,"params":[]}))
+}
+
+fn mln_0143_data_invariants_receipt(capability: &CapabilityV1, input: &CallInput) -> Option<Value> {
+    let contract = capability.mln_0143_data_invariants.as_ref()?;
+    let body = input.body.as_ref()?;
+    Some(serde_json::json!({
+        "capability_id":capability.id,
+        "kind":"mln_0143_data_invariants",
+        "migration_id":"0143",
+        "phase":body.get("phase"),
+        "pre_import_evidence_hash":body.get("pre_import_evidence_hash"),
+        "post_import_evidence_hash":body.get("post_import_evidence_hash"),
+        "migration_sha256":contract.migration_sha256,
+        "target_scope_hash":hash_value(&serde_json::json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        })).ok()?,
+        "row_limit":contract.max_evidence_rows,
+        "probe_rows":contract.probe_rows,
+        "byte_limit":contract.max_bytes,
+        "timeout_seconds":contract.max_timeout_seconds,
+        "read_only":true,
+        "caller_sql":false,
+    }))
 }
 
 fn r2_log_retrieval_receipt(capability: &CapabilityV1, input: &CallInput) -> Option<Value> {
@@ -487,6 +579,14 @@ fn read_runtime_options(
     capability: &CapabilityV1,
     input: &CallInput,
 ) -> Result<(OutputFormatV1, u64, u64, u64)> {
+    if let Some(contract) = capability.mln_0143_data_invariants.as_ref() {
+        return Ok((
+            OutputFormatV1::Json,
+            1,
+            contract.max_bytes,
+            contract.max_timeout_seconds,
+        ));
+    }
     if let Some(contract) = capability.d1_schema_introspection.as_ref() {
         return Ok((
             OutputFormatV1::Json,
@@ -682,6 +782,199 @@ mod d1_schema_introspection_tests {
         assert!(d1_schema_introspection_caller_sql(
             &json!({"assertion":"foreign_key_check_empty","sql":"SELECT 1"})
         ));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod mln_0143_invariant_tests {
+    use super::{
+        CloudflareResponseV1, Mln0143DataInvariantsContractV1, OutputFormatV1, PreparedRequest,
+        Url, normalized_sql_hash, sanitize_mln_0143_data_invariants_response,
+    };
+    use reqwest::header::HeaderMap;
+    use serde_json::{Value, json};
+
+    fn prepared(phase: &str) -> PreparedRequest {
+        PreparedRequest {
+            method: "POST".to_owned(),
+            url: Url::parse("https://example.invalid/query").expect("URL"),
+            headers: HeaderMap::new(),
+            body: None,
+            text_body: None,
+            response_contract: None,
+            analytics_query: None,
+            d1_schema_introspection: None,
+            mln_0143_data_invariants: Some(Mln0143DataInvariantsContractV1 {
+                account_id: "ca30e922fda7f5578e49873542e4aaca".to_owned(),
+                database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
+                migration_sha256:
+                    "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d".to_owned(),
+                trigger_definition_hashes: Vec::new(),
+                capability_version: 1,
+                max_evidence_rows: 256,
+                probe_rows: 257,
+                max_bytes: 1024 * 1024,
+                max_timeout_seconds: 30,
+            }),
+            d1_full_export: None,
+            d1_restore_exact_bookmark: None,
+            r2_log_retrieval: None,
+            graphql: None,
+            output_format: OutputFormatV1::Json,
+            max_rows: 1,
+            max_bytes: 1024 * 1024,
+            timeout_seconds: 30,
+            query_receipt: Some(json!({
+                "phase":phase,
+                "pre_import_evidence_hash":null,
+                "post_import_evidence_hash":null
+            })),
+        }
+    }
+
+    fn evidence_row(index: usize) -> Value {
+        json!({
+            "id":format!("private-id-{index}"),
+            "org_id":"private-org",
+            "issuance_event_id":"private-event",
+            "evidence_kind":"board_consent",
+            "document_id":"private-document",
+            "company_event_id":null,
+            "document_hash":"sha256:private",
+            "required":1,
+            "created_by":"private-user",
+            "created_at":"2026-07-30T00:00:00Z"
+        })
+    }
+
+    fn pre_response(count: usize) -> CloudflareResponseV1 {
+        let rows = (0..count).map(evidence_row).collect::<Vec<_>>();
+        let old_allowlist = "'board_consent','stock_purchase_agreement','restricted_stock_purchase_agreement','safe_agreement','advisor_agreement','election_83b','consideration','funds_evidence','signature','stock_ledger','document_hash','other'";
+        CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!([{
+                "success":true,
+                "meta":{"rows_read":count + 20,"rows_written":0,"duration":0.25},
+                "results":[{
+                    "evidence_rows":serde_json::to_string(&rows).expect("rows JSON"),
+                    "evidence_received":count,
+                    "evidence_window_total":count,
+                    "evidence_total":count,
+                    "evidence_kind_counts":"[{\"evidence_kind\":\"board_consent\",\"count\":1}]",
+                    "table_sql":format!("CREATE TABLE equity_issuance_evidence_links (evidence_kind TEXT CHECK (evidence_kind IN ({old_allowlist})))"),
+                    "column_names":"[\"id\",\"org_id\",\"issuance_event_id\",\"evidence_kind\",\"document_id\",\"company_event_id\",\"document_hash\",\"required\",\"created_by\",\"created_at\"]",
+                    "old_table_count":0,
+                    "unique_hash_index_sql":"CREATE UNIQUE INDEX idx_equity_issuance_evidence_unique_hash ON equity_issuance_evidence_links(org_id, issuance_event_id, evidence_kind, document_hash) WHERE document_hash IS NOT NULL",
+                    "trigger_contract_sql":null,
+                    "trigger_immutable_sql":null,
+                    "trigger_final_required_sql":null,
+                    "advisor_packet_rows":"[{\"evidence_kind\":\"advisor_agreement\",\"signature_required\":1,\"sort_order\":1},{\"evidence_kind\":\"board_consent\",\"signature_required\":1,\"sort_order\":0},{\"evidence_kind\":\"election_83b\",\"signature_required\":0,\"sort_order\":2}]",
+                    "foreign_key_violations":0,
+                    "duplicate_hash_groups":0,
+                    "invalid_evidence_kinds":0,
+                    "invalid_advanced_events":99
+                }]
+            }]),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        }
+    }
+
+    #[test]
+    fn pre_import_accepts_exactly_256_and_discards_private_rows() {
+        let request = prepared("pre_import");
+        let mut response = pre_response(256);
+        sanitize_mln_0143_data_invariants_response(&mut response, &request)
+            .expect("256 rows fit the safe bound");
+        let encoded = serde_json::to_string(&response).expect("response JSON");
+        for private in [
+            "private-id",
+            "private-org",
+            "private-event",
+            "private-document",
+            "private-user",
+            "sha256:private",
+        ] {
+            assert!(!encoded.contains(private), "{private}");
+        }
+        assert_eq!(response.result["projection"]["count"], 256);
+        assert_eq!(response.result["complete"], true);
+    }
+
+    #[test]
+    fn pre_import_rejects_the_257th_row_without_retaining_rows() {
+        let request = prepared("pre_import");
+        let mut response = pre_response(257);
+        let error = sanitize_mln_0143_data_invariants_response(&mut response, &request)
+            .expect_err("257 rows exceed the safe bound");
+        assert!(
+            error
+                .to_string()
+                .contains("invariant_not_feasible_under_safe_bounds")
+        );
+    }
+
+    #[test]
+    fn pre_import_rejects_provider_metadata_ambiguity() {
+        let request = prepared("pre_import");
+        let mut response = pre_response(0);
+        response.result[0]["meta"]
+            .as_object_mut()
+            .expect("meta")
+            .remove("rows_read");
+        assert!(sanitize_mln_0143_data_invariants_response(&mut response, &request).is_err());
+    }
+
+    #[test]
+    fn post_import_requires_the_new_packet_and_all_three_trigger_definitions() {
+        let mut request = prepared("post_import");
+        let trigger_sql = [
+            "CREATE TRIGGER trg_advisor_equity_instrument_evidence_contract BEFORE INSERT ON x BEGIN SELECT 1; END",
+            "CREATE TRIGGER trg_advisor_equity_instrument_evidence_immutable BEFORE UPDATE ON x BEGIN SELECT 1; END",
+            "CREATE TRIGGER trg_advisor_grant_final_instrument_required BEFORE UPDATE ON x BEGIN SELECT 1; END",
+        ];
+        request
+            .mln_0143_data_invariants
+            .as_mut()
+            .expect("contract")
+            .trigger_definition_hashes = trigger_sql
+            .iter()
+            .map(|sql| normalized_sql_hash(sql))
+            .collect();
+        let mut response = pre_response(0);
+        let post_allowlist = "'board_consent','stock_purchase_agreement','restricted_stock_purchase_agreement','advisor_equity_instrument','safe_agreement','advisor_agreement','election_83b','consideration','funds_evidence','signature','stock_ledger','document_hash','other'";
+        let row = response.result[0]["results"][0]
+            .as_object_mut()
+            .expect("result row");
+        row.insert(
+            "table_sql".to_owned(),
+            Value::String(format!("CREATE TABLE equity_issuance_evidence_links (evidence_kind TEXT CHECK (evidence_kind IN ({post_allowlist})))")),
+        );
+        row.insert(
+            "advisor_packet_rows".to_owned(),
+            Value::String("[{\"evidence_kind\":\"advisor_agreement\",\"signature_required\":1,\"sort_order\":1},{\"evidence_kind\":\"advisor_equity_instrument\",\"signature_required\":1,\"sort_order\":2},{\"evidence_kind\":\"board_consent\",\"signature_required\":1,\"sort_order\":0}]".to_owned()),
+        );
+        for (field, sql) in [
+            ("trigger_contract_sql", trigger_sql[0]),
+            ("trigger_immutable_sql", trigger_sql[1]),
+            ("trigger_final_required_sql", trigger_sql[2]),
+        ] {
+            row.insert(field.to_owned(), Value::String(sql.to_owned()));
+        }
+        row.insert("invalid_advanced_events".to_owned(), json!(0));
+        sanitize_mln_0143_data_invariants_response(&mut response, &request)
+            .expect("exact post-import state");
+        assert_eq!(
+            response.result["trigger_definition_hashes"]
+                .as_array()
+                .expect("trigger hashes")
+                .len(),
+            3
+        );
     }
 }
 
@@ -3930,7 +4223,10 @@ async fn parse_success_response(
             require_json_media(status, content_type.as_deref())?;
             let (bytes, truncated) = read_bounded_body(response, request.max_bytes).await?;
             if truncated {
-                if request.analytics_query.is_some() || request.d1_schema_introspection.is_some() {
+                if request.analytics_query.is_some()
+                    || request.d1_schema_introspection.is_some()
+                    || request.mln_0143_data_invariants.is_some()
+                {
                     return Ok(partial_output_response(
                         status,
                         Value::Null,
@@ -3951,7 +4247,10 @@ async fn parse_success_response(
                 return Err(CloudflareError::InvalidResponseEnvelope { status });
             }
             let parsed = parse_response(status, &body, etag, cf_ray);
-            if request.analytics_query.is_some() || request.d1_schema_introspection.is_some() {
+            if request.analytics_query.is_some()
+                || request.d1_schema_introspection.is_some()
+                || request.mln_0143_data_invariants.is_some()
+            {
                 bound_enveloped_query_response(parsed, request, bytes.len() as u64, output_path)
                     .await
             } else {
@@ -4020,6 +4319,14 @@ async fn bound_enveloped_query_response(
     bytes: u64,
     output_path: Option<&Path>,
 ) -> Result<CloudflareResponseV1> {
+    if request.mln_0143_data_invariants.is_some() {
+        if bytes >= request.max_bytes {
+            return Err(CloudflareError::InvalidAnalyticsQuery(
+                "invariant_not_feasible_under_safe_bounds".to_owned(),
+            ));
+        }
+        sanitize_mln_0143_data_invariants_response(&mut response, request)?;
+    }
     if request.d1_schema_introspection.is_some() {
         validate_d1_schema_assertion_response(&response)?;
     }
@@ -4077,6 +4384,281 @@ fn validate_d1_schema_assertion_response(response: &CloudflareResponseV1) -> Res
             status: response.status,
         });
     }
+    Ok(())
+}
+
+fn normalized_sql_hash(value: &str) -> String {
+    let normalized = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(normalized.as_bytes()))
+    )
+}
+
+fn invariant_response_error(status: u16) -> CloudflareError {
+    CloudflareError::InvalidResponseEnvelope { status }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the privacy boundary and every phase-specific invariant remain together and auditable"
+)]
+fn sanitize_mln_0143_data_invariants_response(
+    response: &mut CloudflareResponseV1,
+    request: &PreparedRequest,
+) -> Result<()> {
+    let contract = request
+        .mln_0143_data_invariants
+        .as_ref()
+        .ok_or_else(|| invariant_response_error(response.status))?;
+    let phase = request
+        .query_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.get("phase"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| invariant_response_error(response.status))?;
+    let statement = response
+        .result
+        .as_array()
+        .filter(|results| results.len() == 1)
+        .and_then(|results| results.first())
+        .ok_or_else(|| invariant_response_error(response.status))?;
+    let row = statement
+        .get("results")
+        .and_then(Value::as_array)
+        .filter(|rows| rows.len() == 1)
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_object)
+        .ok_or_else(|| invariant_response_error(response.status))?;
+    let meta = statement
+        .get("meta")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invariant_response_error(response.status))?;
+    let timeout_seconds = u32::try_from(contract.max_timeout_seconds).map_or(f64::MAX, f64::from);
+    let duration = meta
+        .get("duration")
+        .and_then(Value::as_f64)
+        .filter(|duration| duration.is_finite() && *duration >= 0.0 && *duration < timeout_seconds);
+    if statement.get("success").and_then(Value::as_bool) != Some(true)
+        || meta.get("rows_written").and_then(Value::as_u64) != Some(0)
+        || meta.get("rows_read").and_then(Value::as_u64).is_none()
+        || duration.is_none()
+    {
+        return Err(invariant_response_error(response.status));
+    }
+    let number = |name: &str| {
+        row.get(name)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| invariant_response_error(response.status))
+    };
+    let text = |name: &str| {
+        row.get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| invariant_response_error(response.status))
+    };
+    let evidence_rows: Value = serde_json::from_str(text("evidence_rows")?)
+        .map_err(|_| invariant_response_error(response.status))?;
+    let evidence_rows = evidence_rows
+        .as_array()
+        .ok_or_else(|| invariant_response_error(response.status))?;
+    let total = number("evidence_total")?;
+    let window_total = number("evidence_window_total")?;
+    let received = number("evidence_received")?;
+    if total > contract.max_evidence_rows
+        || window_total != total
+        || received != total
+        || received != evidence_rows.len() as u64
+        || received >= contract.probe_rows
+    {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "invariant_not_feasible_under_safe_bounds".to_owned(),
+        ));
+    }
+    let expected_fields = [
+        "id",
+        "org_id",
+        "issuance_event_id",
+        "evidence_kind",
+        "document_id",
+        "company_event_id",
+        "document_hash",
+        "required",
+        "created_by",
+        "created_at",
+    ];
+    if evidence_rows.iter().any(|row| {
+        row.as_object().is_none_or(|row| {
+            row.len() != expected_fields.len()
+                || expected_fields
+                    .iter()
+                    .any(|field| !row.contains_key(*field))
+        })
+    }) {
+        return Err(invariant_response_error(response.status));
+    }
+    let table_sql = text("table_sql")?;
+    let pre = matches!(phase, "pre_import" | "post_restore");
+    let old_kinds = [
+        "board_consent",
+        "stock_purchase_agreement",
+        "restricted_stock_purchase_agreement",
+        "safe_agreement",
+        "advisor_agreement",
+        "election_83b",
+        "consideration",
+        "funds_evidence",
+        "signature",
+        "stock_ledger",
+        "document_hash",
+        "other",
+    ];
+    let mut expected_kinds = old_kinds.to_vec();
+    if !pre {
+        expected_kinds.insert(3, "advisor_equity_instrument");
+    }
+    let table_normalized = table_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let allowlist = table_normalized
+        .split("evidence_kind IN (")
+        .nth(1)
+        .and_then(|tail| tail.split("))").next())
+        .map(|values| {
+            values
+                .split(',')
+                .map(|value| value.trim().trim_matches('\''))
+                .collect::<Vec<_>>()
+        })
+        .ok_or_else(|| invariant_response_error(response.status))?;
+    let columns: Value = serde_json::from_str(text("column_names")?)
+        .map_err(|_| invariant_response_error(response.status))?;
+    let expected_columns = serde_json::json!([
+        "id",
+        "org_id",
+        "issuance_event_id",
+        "evidence_kind",
+        "document_id",
+        "company_event_id",
+        "document_hash",
+        "required",
+        "created_by",
+        "created_at"
+    ]);
+    if allowlist != expected_kinds
+        || columns != expected_columns
+        || number("old_table_count")? != 0
+        || number("foreign_key_violations")? != 0
+        || number("duplicate_hash_groups")? != 0
+        || number("invalid_evidence_kinds")? != 0
+    {
+        return Err(invariant_response_error(response.status));
+    }
+    let index_sql = text("unique_hash_index_sql")?;
+    let index_normalized = index_sql
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if !index_normalized.contains("create unique index idx_equity_issuance_evidence_unique_hash")
+        || !index_normalized.contains("org_id, issuance_event_id, evidence_kind, document_hash")
+        || !index_normalized.contains("where document_hash is not null")
+    {
+        return Err(invariant_response_error(response.status));
+    }
+    let packet_rows: Value = serde_json::from_str(text("advisor_packet_rows")?)
+        .map_err(|_| invariant_response_error(response.status))?;
+    let expected_packet = if pre {
+        serde_json::json!([
+            {"evidence_kind":"advisor_agreement","signature_required":1,"sort_order":1},
+            {"evidence_kind":"board_consent","signature_required":1,"sort_order":0},
+            {"evidence_kind":"election_83b","signature_required":0,"sort_order":2}
+        ])
+    } else {
+        serde_json::json!([
+            {"evidence_kind":"advisor_agreement","signature_required":1,"sort_order":1},
+            {"evidence_kind":"advisor_equity_instrument","signature_required":1,"sort_order":2},
+            {"evidence_kind":"board_consent","signature_required":1,"sort_order":0}
+        ])
+    };
+    if packet_rows != expected_packet {
+        return Err(invariant_response_error(response.status));
+    }
+    let trigger_fields = [
+        "trigger_contract_sql",
+        "trigger_immutable_sql",
+        "trigger_final_required_sql",
+    ];
+    let trigger_hashes = if pre {
+        if trigger_fields
+            .iter()
+            .any(|field| !row.get(*field).is_none_or(Value::is_null))
+        {
+            return Err(invariant_response_error(response.status));
+        }
+        Vec::new()
+    } else {
+        if number("invalid_advanced_events")? != 0 {
+            return Err(invariant_response_error(response.status));
+        }
+        let hashes = trigger_fields
+            .iter()
+            .map(|field| text(field).map(normalized_sql_hash))
+            .collect::<Result<Vec<_>>>()?;
+        if hashes != contract.trigger_definition_hashes {
+            return Err(invariant_response_error(response.status));
+        }
+        hashes
+    };
+    let kind_counts: Value = serde_json::from_str(text("evidence_kind_counts")?)
+        .map_err(|_| invariant_response_error(response.status))?;
+    let manifest = serde_json::json!({
+        "schema_version":1,
+        "capability_id":"mln-0143-data-invariants",
+        "capability_version":contract.capability_version,
+        "migration_id":"0143",
+        "migration_sha256":contract.migration_sha256,
+        "phase":phase,
+        "target_scope_hash":hash_value(&serde_json::json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        }))?,
+        "complete":true,
+        "projection":{
+            "digest":hash_value(&Value::Array(evidence_rows.clone()))?,
+            "count":total,
+            "counts_by_kind":kind_counts,
+        },
+        "semantic_schema_hash":normalized_sql_hash(table_sql),
+        "packet_hash":hash_value(&packet_rows)?,
+        "trigger_definition_hashes":trigger_hashes,
+        "assertions":{
+            "old_table_absent":true,
+            "unique_hash_index_present":true,
+            "foreign_key_check_empty":true,
+            "duplicate_hash_groups_zero":true,
+            "invalid_evidence_kinds_zero":true,
+            "invalid_advanced_events_zero": if pre { Value::Null } else { Value::Bool(true) },
+        },
+        "query":{
+            "sha256":hash_value(&Value::String(MLN_0143_QUERY.to_owned()))?,
+            "row_limit":contract.max_evidence_rows,
+            "probe_rows":contract.probe_rows,
+            "byte_limit":contract.max_bytes,
+            "timeout_seconds":contract.max_timeout_seconds,
+            "received_rows":received,
+            "provider_rows_read":meta.get("rows_read"),
+            "provider_duration":duration,
+            "bounds_saturated":false,
+        },
+        "lineage":{
+            "pre_import_evidence_hash":request.query_receipt.as_ref().and_then(|v| v.get("pre_import_evidence_hash")),
+            "post_import_evidence_hash":request.query_receipt.as_ref().and_then(|v| v.get("post_import_evidence_hash")),
+        },
+        "privacy":"raw rows, row fingerprints, MLN identifiers, and document hashes were discarded before evidence persistence",
+    });
+    response.result = manifest;
     Ok(())
 }
 
@@ -4593,6 +5175,19 @@ fn output_result_info(
                 "classification": classification,
                 "limit_reached": limit_reached,
                 "dataset_completeness": "not_proven",
+            })
+        })
+        .or_else(|| {
+            request.mln_0143_data_invariants.as_ref().map(|_| {
+                serde_json::json!({
+                    "classification": if partial || truncated {
+                        "partial_response"
+                    } else {
+                        "complete_invariant_manifest"
+                    },
+                    "limit_reached":false,
+                    "dataset_completeness":"proven_under_closed_safe_bounds",
+                })
             })
         })
         .or_else(|| {
@@ -6802,8 +7397,108 @@ pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -
     validate_d1_full_export_contract(capability, input)?;
     validate_d1_restore_exact_bookmark_contract(capability, input)?;
     validate_d1_schema_introspection_contract(capability, input)?;
+    validate_mln_0143_data_invariants_contract(capability, input)?;
     validate_analytics_query_contract(capability, input)?;
     validate_r2_log_retrieval_contract(capability, input)
+}
+
+fn mln_0143_request_schema() -> Value {
+    let hash = serde_json::json!({
+        "type":"string",
+        "pattern":"^sha256:[0-9a-f]{64}$",
+        "minLength":71,
+        "maxLength":71
+    });
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "x-cfctl-body-required":true,
+        "oneOf":[
+            {
+                "type":"object","additionalProperties":false,
+                "required":["migration_id","phase"],
+                "properties":{
+                    "migration_id":{"type":"string","enum":["0143"]},
+                    "phase":{"type":"string","enum":["pre_import"]}
+                }
+            },
+            {
+                "type":"object","additionalProperties":false,
+                "required":["migration_id","phase","pre_import_evidence_hash"],
+                "properties":{
+                    "migration_id":{"type":"string","enum":["0143"]},
+                    "phase":{"type":"string","enum":["post_import"]},
+                    "pre_import_evidence_hash":hash
+                }
+            },
+            {
+                "type":"object","additionalProperties":false,
+                "required":["migration_id","phase","pre_import_evidence_hash","post_import_evidence_hash"],
+                "properties":{
+                    "migration_id":{"type":"string","enum":["0143"]},
+                    "phase":{"type":"string","enum":["post_restore"]},
+                    "pre_import_evidence_hash":hash,
+                    "post_import_evidence_hash":hash
+                }
+            }
+        ]
+    })
+}
+
+fn validate_mln_0143_data_invariants_contract(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let Some(contract) = capability.mln_0143_data_invariants.as_ref() else {
+        return Ok(());
+    };
+    let account = input.selectors.get("account_id").and_then(Value::as_str);
+    let database = input.selectors.get("database_id").and_then(Value::as_str);
+    let supported = capability.id == "mln-0143-data-invariants"
+        && capability.method == "POST"
+        && capability.path == "/accounts/{account_id}/d1/database/{database_id}/query"
+        && capability.product == "D1"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.risk == RiskClass::Read
+        && capability.effect == cfctl_core::EffectClass::ReadOnly
+        && capability.adapter_status == AdapterStatus::Native
+        && capability.permissions == ["D1 Read"]
+        && capability.request_schema.as_ref() == Some(&mln_0143_request_schema())
+        && capability.analytics_query.is_none()
+        && capability.d1_schema_introspection.is_none()
+        && capability.d1_full_export.is_none()
+        && capability.d1_restore_exact_bookmark.is_none()
+        && capability.r2_log_retrieval.is_none()
+        && account == Some(contract.account_id.as_str())
+        && database == Some(contract.database_id.as_str())
+        && contract.migration_sha256
+            == "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
+        && contract.trigger_definition_hashes
+            == [
+                "sha256:d858df9c22c19df241e5045eca9635c4fb786000428707a821090daeacc69072",
+                "sha256:e9205a4863c717c901ec3ac87089555a9af7eac14d5f38fbf40bff775ad8497c",
+                "sha256:3ca04f9fc717104d2ee0da719e2c473a756d3345f4e222d52c4d0f76237a184b",
+            ]
+        && contract.capability_version == 1
+        && contract.max_evidence_rows == 256
+        && contract.probe_rows == 257
+        && (1..=1024 * 1024).contains(&contract.max_bytes)
+        && (1..=30).contains(&contract.max_timeout_seconds)
+        && input
+            .query
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+    if !supported {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "MLN 0143 invariant identity, target, request schema, or safe bounds drifted"
+                .to_owned(),
+        ));
+    }
+    render_mln_0143_data_invariants_body(input.body.as_ref().ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery("MLN 0143 invariant body is missing".to_owned())
+    })?)?;
+    Ok(())
 }
 
 fn validate_d1_restore_exact_bookmark_contract(

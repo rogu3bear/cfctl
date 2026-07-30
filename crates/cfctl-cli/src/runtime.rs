@@ -3890,6 +3890,135 @@ struct ExecutedRead {
     credential_generation_id: Option<String>,
 }
 
+fn mln_0143_parent_manifests(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<Vec<(String, Value)>> {
+    let Some(contract) = capability.mln_0143_data_invariants.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("MLN 0143 invariant input must be an object".to_owned()))?;
+    let phase = body
+        .get("phase")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("MLN 0143 invariant phase is missing".to_owned()))?;
+    let required: &[(&str, &str)] = match phase {
+        "pre_import" => &[],
+        "post_import" => &[("pre_import_evidence_hash", "pre_import")],
+        "post_restore" => &[
+            ("pre_import_evidence_hash", "pre_import"),
+            ("post_import_evidence_hash", "post_import"),
+        ],
+        _ => {
+            return Err(CliError::Input(
+                "MLN 0143 invariant phase is unsupported".to_owned(),
+            ));
+        }
+    };
+    let target_scope_hash = hash_value(&json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    }))?;
+    required
+        .iter()
+        .map(|(field, expected_phase)| {
+            let evidence_hash = body.get(*field).and_then(Value::as_str).ok_or_else(|| {
+                CliError::Input(format!("MLN 0143 `{phase}` requires `{field}`"))
+            })?;
+            let stored = store.read_evidence_value(evidence_hash)?;
+            let manifest = stored.get("result").unwrap_or(&stored);
+            let valid = manifest.get("capability_id").and_then(Value::as_str)
+                == Some("mln-0143-data-invariants")
+                && manifest.get("capability_version").and_then(Value::as_u64)
+                    == Some(u64::from(contract.capability_version))
+                && manifest.get("migration_id").and_then(Value::as_str) == Some("0143")
+                && manifest.get("migration_sha256").and_then(Value::as_str)
+                    == Some(contract.migration_sha256.as_str())
+                && manifest.get("target_scope_hash").and_then(Value::as_str)
+                    == Some(target_scope_hash.as_str())
+                && manifest.get("phase").and_then(Value::as_str) == Some(*expected_phase)
+                && manifest.get("complete").and_then(Value::as_bool) == Some(true)
+                && manifest.pointer("/query/bounds_saturated").and_then(Value::as_bool)
+                    == Some(false);
+            if !valid {
+                return Err(CliError::Input(format!(
+                    "MLN 0143 parent evidence `{field}` does not match the required capability, migration, target, completeness, or phase"
+                )));
+            }
+            Ok((evidence_hash.to_owned(), manifest.clone()))
+        })
+        .collect()
+}
+
+fn validate_mln_0143_lineage_result(
+    input: &CallInput,
+    current: &Value,
+    parents: &[(String, Value)],
+) -> Result<()> {
+    let Some(phase) = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("phase"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    if phase == "pre_import" {
+        return Ok(());
+    }
+    let (_, pre) = parents.first().ok_or_else(|| {
+        CliError::Input("MLN 0143 post phase omitted its pre-import parent".to_owned())
+    })?;
+    for pointer in [
+        "/projection/digest",
+        "/projection/count",
+        "/projection/counts_by_kind",
+    ] {
+        if current.pointer(pointer) != pre.pointer(pointer) {
+            return Err(CliError::Input(
+                "MLN 0143 evidence projection drifted from the bound pre-import baseline"
+                    .to_owned(),
+            ));
+        }
+    }
+    if phase == "post_restore" {
+        let (post_hash, post) = parents.get(1).ok_or_else(|| {
+            CliError::Input("MLN 0143 post-restore omitted its post-import parent".to_owned())
+        })?;
+        let pre_hash = &parents[0].0;
+        if post
+            .pointer("/lineage/pre_import_evidence_hash")
+            .and_then(Value::as_str)
+            != Some(pre_hash)
+            || input
+                .body
+                .as_ref()
+                .and_then(|body| body.get("post_import_evidence_hash"))
+                .and_then(Value::as_str)
+                != Some(post_hash)
+        {
+            return Err(CliError::Input(
+                "MLN 0143 post-import evidence does not name the same pre-import baseline"
+                    .to_owned(),
+            ));
+        }
+        for pointer in ["/semantic_schema_hash", "/packet_hash"] {
+            if current.pointer(pointer) != pre.pointer(pointer) {
+                return Err(CliError::Input(
+                    "MLN 0143 restored schema or packet digest differs from the pre-import baseline"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ExecutedRead {
     fn without_credential(envelope: ResultEnvelopeV2) -> Self {
         Self {
@@ -3955,6 +4084,7 @@ async fn execute_read(
         }
         AdapterStatus::Native | AdapterStatus::DynamicApi => {}
     }
+    let mln_0143_parents = mln_0143_parent_manifests(store, capability, input)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
     let credential_generation_id = credential_generation_for_read(profile)?;
@@ -3982,6 +4112,9 @@ async fn execute_read(
             .execute_read(capability, input, &credential)
             .await?
     };
+    if capability.mln_0143_data_invariants.is_some() {
+        validate_mln_0143_lineage_result(input, &response.result, &mln_0143_parents)?;
+    }
     let mut sanitized =
         redact_response_for_capability(capability, &serde_json::to_value(&response)?);
     if let Some(object) = sanitized.as_object_mut() {
@@ -3997,7 +4130,21 @@ async fn execute_read(
     envelope.account_id = account_id;
     envelope.ok = response.success;
     envelope.performed = true;
-    if capability.d1_full_export.is_some() {
+    if capability.mln_0143_data_invariants.is_some() {
+        let verified = response.result.get("complete").and_then(Value::as_bool) == Some(true)
+            && response
+                .result
+                .pointer("/query/bounds_saturated")
+                .and_then(Value::as_bool)
+                == Some(false);
+        envelope.verification.state = if verified {
+            VerificationState::Passed
+        } else {
+            VerificationState::Failed
+        };
+        envelope.verification.basis =
+            Some("closed MLN 0143 phase assertions and bounded completeness manifest".to_owned());
+    } else if capability.d1_full_export.is_some() {
         let verified = response
             .result
             .pointer("/output_file/hash_matches")
@@ -17181,9 +17328,9 @@ mod tests {
         governed_cli_environment_contract, governed_cli_workspace_env, guide_document,
         guide_stage_commands, http_client, is_live_plan_precondition_hash,
         is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
-        list_security_action_state_receipt, non_readback_verification_basis,
-        operational_proof_coverage, permission_inventory_call, permission_inventory_envelope,
-        persist_prepared_plan, persist_secret_lifecycle,
+        list_security_action_state_receipt, mln_0143_parent_manifests,
+        non_readback_verification_basis, operational_proof_coverage, permission_inventory_call,
+        permission_inventory_envelope, persist_prepared_plan, persist_secret_lifecycle,
         persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
         preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
@@ -17207,7 +17354,7 @@ mod tests {
         should_resolve_zone_entitlement, sink_secret_result, store_imported_api_token,
         validate_api_token_creation_contract, validate_current_permission_groups,
         validate_entitlement_receipt_precondition,
-        validate_global_warp_override_state_receipt_precondition,
+        validate_global_warp_override_state_receipt_precondition, validate_mln_0143_lineage_result,
         validate_permission_group_resource_scope, validate_request_contract,
         validate_selected_permission_groups, validate_standing_authority_group_scopes,
         validate_standing_authority_permission_inventory, validate_token_policy_body,
@@ -17286,6 +17433,112 @@ mod tests {
         let encoded = serde_json::to_string(schema).expect("guide schema");
         assert!(!encoded.contains("\"sql\""));
         assert!(!encoded.contains("\"params\""));
+    }
+
+    #[test]
+    fn mln_0143_invariant_guide_exposes_only_pinned_phase_lineage_input() {
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let capability = catalog
+            .get("mln-0143-data-invariants")
+            .expect("MLN invariant capability");
+        let guide = guide_json(capability);
+        assert_eq!(guide["contract_state"], "available");
+        assert_eq!(
+            guide["call_argv"],
+            json!([
+                "cfctl",
+                "call",
+                "mln-0143-data-invariants",
+                "--selector",
+                "account_id=<account_id>",
+                "--selector",
+                "database_id=<database_id>",
+                "--body-stdin",
+                "--json"
+            ])
+        );
+        let encoded = serde_json::to_string(&guide).expect("guide JSON");
+        for forbidden in ["\"sql\"", "\"table\"", "\"document_hash\"", "\"output\""] {
+            assert!(!encoded.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn mln_0143_lineage_binds_post_restore_to_the_same_pre_baseline() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let capability = catalog
+            .get("mln-0143-data-invariants")
+            .expect("MLN invariant");
+        let contract = capability
+            .mln_0143_data_invariants
+            .as_ref()
+            .expect("typed contract");
+        let scope = hash_value(&json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        }))
+        .expect("scope hash");
+        let base = |phase: &str| {
+            json!({
+                "schema_version":1,
+                "capability_id":"mln-0143-data-invariants",
+                "capability_version":1,
+                "migration_id":"0143",
+                "migration_sha256":contract.migration_sha256,
+                "phase":phase,
+                "target_scope_hash":scope,
+                "complete":true,
+                "projection":{"digest":format!("sha256:{}", "a".repeat(64)),"count":2,"counts_by_kind":[]},
+                "semantic_schema_hash":format!("sha256:{}", "b".repeat(64)),
+                "packet_hash":format!("sha256:{}", "c".repeat(64)),
+                "query":{"bounds_saturated":false},
+                "lineage":{}
+            })
+        };
+        let pre = store
+            .write_evidence(EvidenceClass::LiveRead, &base("pre_import"))
+            .expect("pre evidence");
+        let mut post_manifest = base("post_import");
+        post_manifest["lineage"]["pre_import_evidence_hash"] =
+            Value::String(pre.content_hash.clone());
+        let post = store
+            .write_evidence(EvidenceClass::LiveRead, &post_manifest)
+            .expect("post evidence");
+        let input = CallInput {
+            body: Some(json!({
+                "migration_id":"0143",
+                "phase":"post_restore",
+                "pre_import_evidence_hash":pre.content_hash,
+                "post_import_evidence_hash":post.content_hash
+            })),
+            ..CallInput::default()
+        };
+        let parents =
+            mln_0143_parent_manifests(&store, capability, &input).expect("valid parent lineage");
+        validate_mln_0143_lineage_result(&input, &base("post_restore"), &parents)
+            .expect("restored result equals pre baseline");
+
+        let mut drifted = base("post_restore");
+        drifted["packet_hash"] = Value::String(format!("sha256:{}", "d".repeat(64)));
+        assert!(validate_mln_0143_lineage_result(&input, &drifted, &parents).is_err());
     }
 
     #[test]

@@ -13,11 +13,11 @@ use cfctl_core::{
     CreatedResourceContractV1, D1FullExportContractV1, D1SchemaIntrospectionContractV1,
     DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass, EntitlementProbeV1,
     EntitlementV1, EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1,
-    Maturity, OutputFormatV1, PaginationModeV1, QuerySerializationV1, R2LogRetrievalContractV1,
-    ResponseBodyModeV1, ResponseContractV1, RiskClass, SamePathReadContractV1,
-    SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
-    SelectorContractV1, SelectorV1, TimeRangeContractV1, TimestampFormatV1,
-    UpdatedResourceContractV1, WorkflowContractV1, WorkflowStepV1, hash_value,
+    Maturity, Mln0143DataInvariantsContractV1, OutputFormatV1, PaginationModeV1,
+    QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
+    RiskClass, SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
+    TimestampFormatV1, UpdatedResourceContractV1, WorkflowContractV1, WorkflowStepV1, hash_value,
     request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
@@ -1757,6 +1757,7 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
 /// they never expose the underlying generic provider operation.
 pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
     for capability in [
+        mln_0143_data_invariants_capability(),
         d1_schema_introspection_capability(),
         d1_full_export_capability(),
         d1_restore_exact_bookmark_capability(),
@@ -1766,6 +1767,131 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
             .insert(capability.id.clone(), capability);
     }
     snapshot.refresh_hash()
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the closed MLN phase and lineage schema stays visible beside its pinned target contract"
+)]
+fn mln_0143_data_invariants_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "mln-0143-data-invariants",
+        "Prove MLNavigator migration 0143 data invariants",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/query",
+    );
+    capability.description = Some(
+        "Run fixed compiler-owned reads for the bounded pre-import, post-import, or post-restore MLNavigator 0143 boundary. Raw evidence rows and identifiers are digested in volatile memory and never persisted."
+            .to_owned(),
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native closed MLN 0143 invariant adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![
+        "verify MLN advisor instrument migration data".to_owned(),
+        "prove MLN 0143 restore boundary".to_owned(),
+    ];
+    capability.permissions = vec!["D1 Read".to_owned()];
+    capability.mutating = false;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.cost = CostV1 {
+        incremental:false,
+        currency:None,
+        maximum:None,
+        basis:Some("one bounded fixed D1 read has no separate operation charge; ordinary rows-read accounting may apply".to_owned()),
+        known:true,
+        billing_model:BillingModelV1::UsageBased,
+        exposure:CostExposureV1::DownstreamUsage,
+        references:vec![KnowledgeReferenceV1 {
+            title:"D1 pricing".to_owned(),
+            url:"https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+            source:"official Cloudflare docs".to_owned(),
+        }],
+    };
+    capability.entitlement.available = Some(true);
+    capability.verification.required = false;
+    "not_applicable".clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.selectors = vec![
+        SelectorV1 {
+            name:"account_id".to_owned(), location:"path".to_owned(), required:true,
+            value_type:"string".to_owned(),
+            description:Some("Pinned MLNavigator Cloudflare account; intended identity, not live ownership proof.".to_owned()),
+            contract:Some(SelectorContractV1 {
+                schema:serde_json::json!({"type":"string","enum":["ca30e922fda7f5578e49873542e4aaca"]}),
+                query:None,
+            }),
+        },
+        SelectorV1 {
+            name:"database_id".to_owned(), location:"path".to_owned(), required:true,
+            value_type:"string".to_owned(),
+            description:Some("Pinned MLNavigator Founder D1 database.".to_owned()),
+            contract:Some(SelectorContractV1 {
+                schema:serde_json::json!({"type":"string","enum":["7c282983-2e48-4ea4-9f0d-09b0d718fe65"]}),
+                query:None,
+            }),
+        },
+    ];
+    let hash = serde_json::json!({
+        "type":"string","pattern":"^sha256:[0-9a-f]{64}$","minLength":71,"maxLength":71
+    });
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object","additionalProperties":false,"x-cfctl-body-required":true,
+        "oneOf":[
+            {
+                "type":"object","additionalProperties":false,
+                "required":["migration_id","phase"],
+                "properties":{
+                    "migration_id":{"type":"string","enum":["0143"]},
+                    "phase":{"type":"string","enum":["pre_import"]}
+                }
+            },
+            {
+                "type":"object","additionalProperties":false,
+                "required":["migration_id","phase","pre_import_evidence_hash"],
+                "properties":{
+                    "migration_id":{"type":"string","enum":["0143"]},
+                    "phase":{"type":"string","enum":["post_import"]},
+                    "pre_import_evidence_hash":hash
+                }
+            },
+            {
+                "type":"object","additionalProperties":false,
+                "required":["migration_id","phase","pre_import_evidence_hash","post_import_evidence_hash"],
+                "properties":{
+                    "migration_id":{"type":"string","enum":["0143"]},
+                    "phase":{"type":"string","enum":["post_restore"]},
+                    "pre_import_evidence_hash":hash,
+                    "post_import_evidence_hash":hash
+                }
+            }
+        ]
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.mln_0143_data_invariants = Some(Mln0143DataInvariantsContractV1 {
+        account_id: "ca30e922fda7f5578e49873542e4aaca".to_owned(),
+        database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
+        migration_sha256: "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
+            .to_owned(),
+        trigger_definition_hashes: vec![
+            "sha256:d858df9c22c19df241e5045eca9635c4fb786000428707a821090daeacc69072".to_owned(),
+            "sha256:e9205a4863c717c901ec3ac87089555a9af7eac14d5f38fbf40bff775ad8497c".to_owned(),
+            "sha256:3ca04f9fc717104d2ee0da719e2c473a756d3345f4e222d52c4d0f76237a184b".to_owned(),
+        ],
+        capability_version: 1,
+        max_evidence_rows: 256,
+        probe_rows: 257,
+        max_bytes: 1024 * 1024,
+        max_timeout_seconds: 30,
+    });
+    capability
 }
 
 #[expect(

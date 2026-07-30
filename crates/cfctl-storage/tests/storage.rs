@@ -210,6 +210,23 @@ fn evidence_is_redacted_content_addressed_and_deduplicated() {
 }
 
 #[test]
+fn evidence_reload_revalidates_the_content_hash() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let value = json!({"capability_id":"mln-0143-data-invariants","complete":true});
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &value)
+        .expect("evidence writes");
+    assert_eq!(
+        store
+            .read_evidence_value(&evidence.content_hash)
+            .expect("verified evidence reload"),
+        value
+    );
+    assert!(store.read_evidence_value("sha256:not-a-digest").is_err());
+}
+
+#[test]
 fn operational_proof_index_is_append_only_scoped_and_live_read_only() {
     let root = tempfile::tempdir().expect("temporary storage root");
     let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");

@@ -295,6 +295,37 @@ impl StateStore {
         ))
     }
 
+    /// Loads one immutable evidence body by its content hash and revalidates
+    /// that the stored bytes still match the requested identity.
+    pub fn read_evidence_value(&self, content_hash: &str) -> Result<Value> {
+        let digest = content_hash.strip_prefix("sha256:").filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+        let digest = digest.ok_or_else(|| StorageError::UnsafeManagedDocument {
+            path: "evidence".to_owned(),
+            reason: "evidence hash must be canonical lowercase sha256".to_owned(),
+        })?;
+        let path = self
+            .paths
+            .data_dir
+            .join("evidence")
+            .join(format!("{digest}.json"));
+        let bytes = std::fs::read(&path).map_err(|source| StorageError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if hex::encode(Sha256::digest(&bytes)) != digest {
+            return Err(StorageError::UnsafeManagedDocument {
+                path: path.display().to_string(),
+                reason: "evidence bytes do not match the requested content hash".to_owned(),
+            });
+        }
+        serde_json::from_slice(&bytes).map_err(StorageError::Json)
+    }
+
     /// Indexes a live-read receipt by public contract and account scope. The
     /// evidence body remains immutable and content-addressed; this side index
     /// is a redacted, append-only lookup surface for coverage and workflows.

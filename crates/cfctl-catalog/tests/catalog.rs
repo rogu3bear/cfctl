@@ -10843,6 +10843,60 @@ fn native_control_overlay_adds_only_closed_bounded_d1_schema_assertions() {
 }
 
 #[test]
+fn native_control_overlay_adds_closed_pinned_mln_0143_invariant_read() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .get("mln-0143-data-invariants")
+        .expect("MLN invariant capability");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Read);
+    assert_eq!(capability.effect, EffectClass::ReadOnly);
+    assert!(!capability.mutating);
+    assert_eq!(capability.permissions, ["D1 Read"]);
+    assert_eq!(
+        capability.selectors[0]
+            .contract
+            .as_ref()
+            .expect("account pin")
+            .schema,
+        json!({"type":"string","enum":["ca30e922fda7f5578e49873542e4aaca"]})
+    );
+    assert_eq!(
+        capability.selectors[1]
+            .contract
+            .as_ref()
+            .expect("database pin")
+            .schema,
+        json!({"type":"string","enum":["7c282983-2e48-4ea4-9f0d-09b0d718fe65"]})
+    );
+    let schema = capability.request_schema.as_ref().expect("closed schema");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["oneOf"].as_array().expect("phase variants").len(), 3);
+    let encoded = serde_json::to_string(schema).expect("schema JSON");
+    for forbidden in ["\"sql\"", "\"table\"", "\"query\"", "\"output\""] {
+        assert!(!encoded.contains(forbidden), "{forbidden}");
+    }
+    let contract = capability
+        .mln_0143_data_invariants
+        .as_ref()
+        .expect("typed invariant contract");
+    assert_eq!(contract.max_evidence_rows, 256);
+    assert_eq!(contract.probe_rows, 257);
+    assert_eq!(
+        contract.migration_sha256,
+        "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
+    );
+}
+
+#[test]
 fn native_control_overlay_adds_governed_full_d1_export_without_sql_or_restore() {
     let mut snapshot = CatalogSnapshot {
         schema_version: 1,

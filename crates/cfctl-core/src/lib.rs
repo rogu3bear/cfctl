@@ -929,6 +929,22 @@ pub struct D1SchemaIntrospectionContractV1 {
     pub max_timeout_seconds: u64,
 }
 
+/// A closed, product-specific D1 read that proves the data and schema
+/// invariants surrounding `MLNavigator` migration 0143. The executor owns all
+/// SQL and replaces volatile row material with a digest-only manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mln0143DataInvariantsContractV1 {
+    pub account_id: String,
+    pub database_id: String,
+    pub migration_sha256: String,
+    pub trigger_definition_hashes: Vec<String>,
+    pub capability_version: u8,
+    pub max_evidence_rows: u64,
+    pub probe_rows: u64,
+    pub max_bytes: u64,
+    pub max_timeout_seconds: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct D1FullExportContractV1 {
     pub max_bytes: u64,
@@ -1513,6 +1529,8 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_schema_introspection: Option<D1SchemaIntrospectionContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mln_0143_data_invariants: Option<Mln0143DataInvariantsContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_full_export: Option<D1FullExportContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_restore_exact_bookmark: Option<D1RestoreExactBookmarkContractV1>,
@@ -1618,6 +1636,7 @@ impl CapabilityV1 {
             response_contract: None,
             analytics_query: None,
             d1_schema_introspection: None,
+            mln_0143_data_invariants: None,
             d1_full_export: None,
             d1_restore_exact_bookmark: None,
             r2_log_retrieval: None,

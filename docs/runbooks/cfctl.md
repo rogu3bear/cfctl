@@ -307,6 +307,28 @@ printf '%s' \
     --body-stdin --json
 ```
 
+MLNavigator migration 0143 has a narrower product-bound proof capability:
+`mln-0143-data-invariants`. It is pinned to the reviewed MLNavigator account
+and Founder database and accepts only migration `0143` plus one phase:
+`pre_import`, `post_import`, or `post_restore`. Post-import requires the
+content hash of a successful pre-import receipt. Post-restore requires both
+that pre-import hash and a post-import receipt that names the same baseline.
+
+The capability owns its SQL, probes with `COUNT(*) OVER()` and `LIMIT 257`,
+and accepts at most 256 complete evidence rows. It hashes the exact
+ten-column ordered projection in volatile memory, then discards raw rows,
+MLNavigator identifiers, and document hashes before stdout, errors, logs, or
+durable evidence. A saturated or ambiguous result fails with
+`invariant_not_feasible_under_safe_bounds`; generic D1 SQL remains blocked.
+
+```sh
+printf '%s' '{"migration_id":"0143","phase":"pre_import"}' |
+  cfctl call mln-0143-data-invariants \
+    --selector account_id=ca30e922fda7f5578e49873542e4aaca \
+    --selector database_id=7c282983-2e48-4ea4-9f0d-09b0d718fe65 \
+    --body-stdin --json
+```
+
 The allowed assertions are `table_exists`, `column_exists`, `index_exists`,
 `trigger_exists`, `schema_contains`, and `foreign_key_check_empty`. Caller SQL,
 parameters, arbitrary PRAGMAs, multiple statements, and database retargeting
