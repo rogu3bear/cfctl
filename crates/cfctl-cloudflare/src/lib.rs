@@ -391,8 +391,13 @@ fn d1_schema_introspection_receipt(capability: &CapabilityV1, input: &CallInput)
         "byte_limit": contract.max_bytes,
         "timeout_seconds": contract.max_timeout_seconds,
         "read_only": true,
-        "caller_sql": false,
+        "caller_sql": d1_schema_introspection_caller_sql(body),
     }))
+}
+
+fn d1_schema_introspection_caller_sql(body: &Value) -> bool {
+    body.as_object()
+        .is_some_and(|body| body.contains_key("sql"))
 }
 
 fn r2_log_retrieval_receipt(capability: &CapabilityV1, input: &CallInput) -> Option<Value> {
@@ -501,6 +506,27 @@ fn render_d1_schema_introspection_body(body: &Value) -> Result<Value> {
         .ok_or_else(|| {
             CloudflareError::InvalidAnalyticsQuery("D1 schema assertion kind is missing".to_owned())
         })?;
+    let allowed_fields: &[&str] = match assertion {
+        "table_exists" => &["assertion", "table"],
+        "column_exists" => &["assertion", "table", "column"],
+        "index_exists" => &["assertion", "index"],
+        "trigger_exists" => &["assertion", "trigger"],
+        "schema_contains" => &["assertion", "object_type", "name", "fragment"],
+        "foreign_key_check_empty" => &["assertion"],
+        _ => {
+            return Err(CloudflareError::InvalidAnalyticsQuery(format!(
+                "unsupported D1 schema assertion `{assertion}`"
+            )));
+        }
+    };
+    if let Some(field) = body
+        .keys()
+        .find(|field| !allowed_fields.contains(&field.as_str()))
+    {
+        return Err(CloudflareError::InvalidAnalyticsQuery(format!(
+            "D1 schema assertion `{assertion}` does not accept field `{field}`"
+        )));
+    }
     let bounded = |field: &str, maximum: usize| -> Result<String> {
         body.get(field)
             .and_then(Value::as_str)
@@ -558,13 +584,55 @@ fn render_d1_schema_introspection_body(body: &Value) -> Result<Value> {
             "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check LIMIT 1) AS present",
             Vec::new(),
         ),
-        _ => {
-            return Err(CloudflareError::InvalidAnalyticsQuery(format!(
-                "unsupported D1 schema assertion `{assertion}`"
-            )));
-        }
+        _ => unreachable!("assertion variants were closed above"),
     };
     Ok(serde_json::json!({"sql":sql,"params":params}))
+}
+
+fn d1_schema_introspection_request_schema() -> Value {
+    let name = serde_json::json!({"type":"string","minLength":1,"maxLength":255});
+    serde_json::json!({
+        "type":"object",
+        "x-cfctl-body-required":true,
+        "oneOf":[
+            {"type":"object","additionalProperties":false,"required":["assertion","table"],"properties":{"assertion":{"type":"string","enum":["table_exists"]},"table":name}},
+            {"type":"object","additionalProperties":false,"required":["assertion","table","column"],"properties":{"assertion":{"type":"string","enum":["column_exists"]},"table":name,"column":name}},
+            {"type":"object","additionalProperties":false,"required":["assertion","index"],"properties":{"assertion":{"type":"string","enum":["index_exists"]},"index":name}},
+            {"type":"object","additionalProperties":false,"required":["assertion","trigger"],"properties":{"assertion":{"type":"string","enum":["trigger_exists"]},"trigger":name}},
+            {"type":"object","additionalProperties":false,"required":["assertion","object_type","name","fragment"],"properties":{"assertion":{"type":"string","enum":["schema_contains"]},"object_type":{"type":"string","enum":["table","index","trigger"]},"name":name,"fragment":{"type":"string","minLength":1,"maxLength":512}}},
+            {"type":"object","additionalProperties":false,"required":["assertion"],"properties":{"assertion":{"type":"string","enum":["foreign_key_check_empty"]}}}
+        ]
+    })
+}
+
+#[cfg(test)]
+mod d1_schema_introspection_tests {
+    use super::{d1_schema_introspection_caller_sql, render_d1_schema_introspection_body};
+    use serde_json::json;
+
+    #[test]
+    fn renderer_rejects_unknown_fields_for_every_assertion_without_schema_help() {
+        for body in [
+            json!({"assertion":"table_exists","table":"users","sql":"SELECT 1"}),
+            json!({"assertion":"column_exists","table":"users","column":"id","params":[]}),
+            json!({"assertion":"index_exists","index":"idx_users","unexpected":true}),
+            json!({"assertion":"trigger_exists","trigger":"users_guard","unexpected":true}),
+            json!({"assertion":"schema_contains","object_type":"table","name":"users","fragment":"id","unexpected":true}),
+            json!({"assertion":"foreign_key_check_empty","unexpected":true}),
+        ] {
+            assert!(render_d1_schema_introspection_body(&body).is_err());
+        }
+    }
+
+    #[test]
+    fn caller_sql_receipt_fact_reflects_actual_body_field_presence() {
+        assert!(!d1_schema_introspection_caller_sql(
+            &json!({"assertion":"foreign_key_check_empty"})
+        ));
+        assert!(d1_schema_introspection_caller_sql(
+            &json!({"assertion":"foreign_key_check_empty","sql":"SELECT 1"})
+        ));
+    }
 }
 
 fn parse_output_format(value: &str) -> Result<OutputFormatV1> {
@@ -6250,6 +6318,10 @@ fn validate_d1_schema_introspection_contract(
         && capability.analytics_query.is_none()
         && capability.graphql.is_none()
         && capability.r2_log_retrieval.is_none()
+        && capability
+            .request_schema
+            .as_ref()
+            .is_some_and(|schema| schema == &d1_schema_introspection_request_schema())
         && capability.selectors.len() == 2
         && ["account_id", "database_id"].iter().all(|name| {
             capability.selectors.iter().any(|selector| {

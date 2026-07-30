@@ -7859,6 +7859,31 @@ fn d1_schema_introspection_rejects_raw_sql_and_contract_drift() {
     ));
 }
 
+#[test]
+fn d1_schema_introspection_rejects_missing_or_permissive_request_schema_drift() {
+    let input = d1_schema_input(json!({"assertion":"foreign_key_check_empty"}));
+
+    let mut missing = d1_schema_introspection_capability();
+    missing.request_schema = None;
+    assert!(matches!(
+        validate_request_contract(&missing, &input),
+        Err(CloudflareError::InvalidAnalyticsQuery(_))
+    ));
+
+    let mut permissive = d1_schema_introspection_capability();
+    permissive
+        .request_schema
+        .as_mut()
+        .and_then(|schema| schema.pointer_mut("/oneOf/0"))
+        .and_then(Value::as_object_mut)
+        .expect("first assertion schema")
+        .remove("additionalProperties");
+    assert!(matches!(
+        validate_request_contract(&permissive, &input),
+        Err(CloudflareError::InvalidAnalyticsQuery(_))
+    ));
+}
+
 #[tokio::test]
 async fn d1_schema_introspection_executes_as_one_bounded_read_only_post() {
     let capability = d1_schema_introspection_capability();
