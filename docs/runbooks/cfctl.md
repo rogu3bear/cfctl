@@ -313,6 +313,9 @@ and Founder database and accepts only migration `0143` plus one phase:
 `pre_import`, `post_import`, or `post_restore`. Post-import requires the
 content hash of a successful pre-import receipt. Post-restore requires both
 that pre-import hash and a post-import receipt that names the same baseline.
+Version 2 receipts also carry a validator-contract hash and the fixed-query
+hash; parent lookup rejects older or synthetic receipts that omit the current
+schema, packet, assertion, bounds, or validator identities.
 
 The capability owns its SQL, probes with `COUNT(*) OVER()` and `LIMIT 257`,
 and accepts at most 256 complete evidence rows. It hashes the exact
@@ -320,6 +323,10 @@ ten-column ordered projection in volatile memory, then discards raw rows,
 MLNavigator identifiers, and document hashes before stdout, errors, logs, or
 durable evidence. A saturated or ambiguous result fails with
 `invariant_not_feasible_under_safe_bounds`; generic D1 SQL remains blocked.
+The same read projects the complete ordered packet-kind table with a 513-row
+probe and accepts at most 512 rows. Evidence retains only full and non-target
+packet digests/counts: post-import permits exactly the reviewed advisor delta,
+and post-restore must reproduce the pre-import full-table digest and count.
 
 ```sh
 printf '%s' '{"migration_id":"0143","phase":"pre_import"}' |

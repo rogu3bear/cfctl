@@ -1875,7 +1875,7 @@ fn mln_0143_data_invariants_capability() -> CapabilityV1 {
         success_media_types: vec!["application/json".to_owned()],
         body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
     });
-    capability.mln_0143_data_invariants = Some(Mln0143DataInvariantsContractV1 {
+    let contract = Mln0143DataInvariantsContractV1 {
         account_id: "ca30e922fda7f5578e49873542e4aaca".to_owned(),
         database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
         migration_sha256: "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
@@ -1885,12 +1885,21 @@ fn mln_0143_data_invariants_capability() -> CapabilityV1 {
             "sha256:e9205a4863c717c901ec3ac87089555a9af7eac14d5f38fbf40bff775ad8497c".to_owned(),
             "sha256:3ca04f9fc717104d2ee0da719e2c473a756d3345f4e222d52c4d0f76237a184b".to_owned(),
         ],
-        capability_version: 1,
+        fixed_query_sha256:
+            "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d".to_owned(),
+        pre_table_definition_hash:
+            "sha256:8aa5012ace3d946354e0baba7e645646ac97373b42e7c3d61e79b67a5f689fea".to_owned(),
+        post_table_definition_hash:
+            "sha256:2fbdacd011abca8024507b99d179071b8b920271576e4cb3a2f06c4f3ffd2d7f".to_owned(),
+        validator_contract_hash:
+            "sha256:481f9ca0fd6defbc3e6c20e81d6391d5b26ae74174389935690b86dbc30c00e3".to_owned(),
+        capability_version: 2,
         max_evidence_rows: 256,
         probe_rows: 257,
         max_bytes: 1024 * 1024,
         max_timeout_seconds: 30,
-    });
+    };
+    capability.mln_0143_data_invariants = Some(contract);
     capability
 }
 

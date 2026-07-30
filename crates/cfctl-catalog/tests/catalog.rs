@@ -10890,6 +10890,17 @@ fn native_control_overlay_adds_closed_pinned_mln_0143_invariant_read() {
         .expect("typed invariant contract");
     assert_eq!(contract.max_evidence_rows, 256);
     assert_eq!(contract.probe_rows, 257);
+    assert_eq!(contract.capability_version, 2);
+    assert_eq!(
+        contract
+            .expected_validator_contract_hash()
+            .expect("validator hash"),
+        contract.validator_contract_hash
+    );
+    assert_eq!(
+        contract.fixed_query_sha256,
+        "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d"
+    );
     assert_eq!(
         contract.migration_sha256,
         "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"

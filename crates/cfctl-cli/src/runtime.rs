@@ -3890,6 +3890,10 @@ struct ExecutedRead {
     credential_generation_id: Option<String>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the versioned parent evidence contract stays explicit and auditable as one fail-closed gate"
+)]
 fn mln_0143_parent_manifests(
     store: &StateStore,
     capability: &CapabilityV1,
@@ -3898,6 +3902,15 @@ fn mln_0143_parent_manifests(
     let Some(contract) = capability.mln_0143_data_invariants.as_ref() else {
         return Ok(Vec::new());
     };
+    if contract.capability_version != 2
+        || !contract
+            .expected_validator_contract_hash()
+            .is_ok_and(|hash| hash == contract.validator_contract_hash)
+    {
+        return Err(CliError::Input(
+            "MLN 0143 validator contract is stale or internally inconsistent".to_owned(),
+        ));
+    }
     let body = input
         .body
         .as_ref()
@@ -3932,6 +3945,29 @@ fn mln_0143_parent_manifests(
             })?;
             let stored = store.read_evidence_value(evidence_hash)?;
             let manifest = stored.get("result").unwrap_or(&stored);
+            let expected_table_hash = if *expected_phase == "post_import" {
+                contract.post_table_definition_hash.as_str()
+            } else {
+                contract.pre_table_definition_hash.as_str()
+            };
+            let assertions = manifest.get("assertions").and_then(Value::as_object);
+            let exact_assertions = [
+                "old_table_absent",
+                "unique_hash_index_present",
+                "event_index_exact_non_unique_shape",
+                "document_index_exact_non_unique_shape",
+                "foreign_key_check_empty",
+                "duplicate_hash_groups_zero",
+                "invalid_evidence_kinds_zero",
+                "invalid_advanced_events_zero",
+            ];
+            let expected_trigger_hashes = if *expected_phase == "pre_import" {
+                json!([])
+            } else {
+                json!(contract.trigger_definition_hashes)
+            };
+            let projection = manifest.get("projection").and_then(Value::as_object);
+            let query = manifest.get("query").and_then(Value::as_object);
             let valid = manifest.get("capability_id").and_then(Value::as_str)
                 == Some("mln-0143-data-invariants")
                 && manifest.get("capability_version").and_then(Value::as_u64)
@@ -3939,10 +3975,64 @@ fn mln_0143_parent_manifests(
                 && manifest.get("migration_id").and_then(Value::as_str) == Some("0143")
                 && manifest.get("migration_sha256").and_then(Value::as_str)
                     == Some(contract.migration_sha256.as_str())
+                && manifest
+                    .get("validator_contract_hash")
+                    .and_then(Value::as_str)
+                    == Some(contract.validator_contract_hash.as_str())
                 && manifest.get("target_scope_hash").and_then(Value::as_str)
                     == Some(target_scope_hash.as_str())
                 && manifest.get("phase").and_then(Value::as_str) == Some(*expected_phase)
                 && manifest.get("complete").and_then(Value::as_bool) == Some(true)
+                && manifest.get("semantic_schema_hash").and_then(Value::as_str)
+                    == Some(expected_table_hash)
+                && manifest.get("packet_hash").and_then(Value::as_str).is_some()
+                && manifest.get("packet_count").and_then(Value::as_u64).is_some()
+                && manifest
+                    .get("packet_non_target_hash")
+                    .and_then(Value::as_str)
+                    .is_some()
+                && manifest
+                    .get("packet_non_target_count")
+                    .and_then(Value::as_u64)
+                    .is_some()
+                && assertions.is_some_and(|assertions| {
+                    assertions.len() == exact_assertions.len()
+                        && exact_assertions.iter().all(|field| {
+                            assertions.get(*field).and_then(Value::as_bool) == Some(true)
+                        })
+                })
+                && projection.is_some_and(|projection| {
+                    projection.len() == 3
+                        && projection.get("digest").and_then(Value::as_str).is_some()
+                        && projection.get("count").and_then(Value::as_u64).is_some()
+                        && projection
+                            .get("counts_by_kind")
+                            .is_some_and(Value::is_array)
+                })
+                && manifest.get("trigger_definition_hashes") == Some(&expected_trigger_hashes)
+                && query.is_some_and(|query| {
+                    query.len() == 9
+                        && query.get("sha256").and_then(Value::as_str)
+                            == Some(contract.fixed_query_sha256.as_str())
+                        && [
+                            "row_limit",
+                            "probe_rows",
+                            "byte_limit",
+                            "timeout_seconds",
+                            "received_rows",
+                            "provider_rows_read",
+                        ]
+                        .iter()
+                        .all(|field| query.get(*field).and_then(Value::as_u64).is_some())
+                        && query
+                            .get("provider_duration")
+                            .and_then(Value::as_f64)
+                            .is_some()
+                        && query.get("bounds_saturated").and_then(Value::as_bool)
+                            == Some(false)
+                })
+                && manifest.pointer("/query/sha256").and_then(Value::as_str)
+                    == Some(contract.fixed_query_sha256.as_str())
                 && manifest.pointer("/query/bounds_saturated").and_then(Value::as_bool)
                     == Some(false);
             if !valid {
@@ -3986,7 +4076,23 @@ fn validate_mln_0143_lineage_result(
             ));
         }
     }
+    if phase == "post_import"
+        && (current.get("packet_non_target_hash") != pre.get("packet_non_target_hash")
+            || current.get("packet_non_target_count") != pre.get("packet_non_target_count"))
+    {
+        return Err(CliError::Input(
+            "MLN 0143 packet configuration drifted outside the authorized advisor delta".to_owned(),
+        ));
+    }
     if phase == "post_restore" {
+        if current.get("packet_hash") != pre.get("packet_hash")
+            || current.get("packet_count") != pre.get("packet_count")
+        {
+            return Err(CliError::Input(
+                "MLN 0143 restored packet configuration differs from the pre-import baseline"
+                    .to_owned(),
+            ));
+        }
         let (post_hash, post) = parents.get(1).ok_or_else(|| {
             CliError::Input("MLN 0143 post-restore omitted its post-import parent".to_owned())
         })?;
@@ -17472,6 +17578,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one lineage fixture proves all stale-parent and full-packet phase transitions"
+    )]
     fn mln_0143_lineage_binds_post_restore_to_the_same_pre_baseline() {
         let root = tempfile::tempdir().expect("runtime root");
         let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
@@ -17500,22 +17610,105 @@ mod tests {
             json!({
                 "schema_version":1,
                 "capability_id":"mln-0143-data-invariants",
-                "capability_version":1,
+                "capability_version":contract.capability_version,
+                "validator_contract_hash":contract.validator_contract_hash,
                 "migration_id":"0143",
                 "migration_sha256":contract.migration_sha256,
                 "phase":phase,
                 "target_scope_hash":scope,
                 "complete":true,
                 "projection":{"digest":format!("sha256:{}", "a".repeat(64)),"count":2,"counts_by_kind":[]},
-                "semantic_schema_hash":format!("sha256:{}", "b".repeat(64)),
+                "semantic_schema_hash":if phase == "post_import" {
+                    contract.post_table_definition_hash.clone()
+                } else {
+                    contract.pre_table_definition_hash.clone()
+                },
                 "packet_hash":format!("sha256:{}", "c".repeat(64)),
-                "query":{"bounds_saturated":false},
+                "packet_count":3,
+                "packet_non_target_hash":format!("sha256:{}", "e".repeat(64)),
+                "packet_non_target_count":2,
+                "trigger_definition_hashes":if phase == "pre_import" {
+                    json!([])
+                } else {
+                    json!(contract.trigger_definition_hashes)
+                },
+                "assertions":{
+                    "old_table_absent":true,
+                    "unique_hash_index_present":true,
+                    "event_index_exact_non_unique_shape":true,
+                    "document_index_exact_non_unique_shape":true,
+                    "foreign_key_check_empty":true,
+                    "duplicate_hash_groups_zero":true,
+                    "invalid_evidence_kinds_zero":true,
+                    "invalid_advanced_events_zero":true
+                },
+                "query":{
+                    "sha256":contract.fixed_query_sha256,
+                    "row_limit":256,
+                    "probe_rows":257,
+                    "byte_limit":1024 * 1024,
+                    "timeout_seconds":30,
+                    "received_rows":2,
+                    "provider_rows_read":20,
+                    "provider_duration":0.1,
+                    "bounds_saturated":false
+                },
                 "lineage":{}
             })
         };
         let pre = store
             .write_evidence(EvidenceClass::LiveRead, &base("pre_import"))
             .expect("pre evidence");
+        for (label, mut stale) in [
+            ("v1", base("pre_import")),
+            ("missing query hash", base("pre_import")),
+            ("wrong validator hash", base("pre_import")),
+            ("missing authority identities", base("pre_import")),
+        ] {
+            match label {
+                "v1" => stale["capability_version"] = json!(1),
+                "missing query hash" => {
+                    stale["query"]
+                        .as_object_mut()
+                        .expect("query")
+                        .remove("sha256");
+                }
+                "wrong validator hash" => {
+                    stale["validator_contract_hash"] =
+                        Value::String(format!("sha256:{}", "f".repeat(64)));
+                }
+                "missing authority identities" => {
+                    stale
+                        .as_object_mut()
+                        .expect("manifest")
+                        .remove("assertions");
+                    stale
+                        .as_object_mut()
+                        .expect("manifest")
+                        .remove("semantic_schema_hash");
+                    stale
+                        .as_object_mut()
+                        .expect("manifest")
+                        .remove("packet_hash");
+                }
+                _ => unreachable!(),
+            }
+            let evidence = store
+                .write_evidence(EvidenceClass::LiveRead, &stale)
+                .expect("stale evidence");
+            let stale_input = CallInput {
+                body: Some(json!({
+                    "migration_id":"0143",
+                    "phase":"post_import",
+                    "pre_import_evidence_hash":evidence.content_hash
+                })),
+                ..CallInput::default()
+            };
+            assert!(
+                mln_0143_parent_manifests(&store, capability, &stale_input).is_err(),
+                "{label}"
+            );
+        }
         let mut post_manifest = base("post_import");
         post_manifest["lineage"]["pre_import_evidence_hash"] =
             Value::String(pre.content_hash.clone());
@@ -17539,6 +17732,26 @@ mod tests {
         let mut drifted = base("post_restore");
         drifted["packet_hash"] = Value::String(format!("sha256:{}", "d".repeat(64)));
         assert!(validate_mln_0143_lineage_result(&input, &drifted, &parents).is_err());
+
+        let mut non_target_post_drift = base("post_import");
+        non_target_post_drift["packet_non_target_hash"] =
+            Value::String(format!("sha256:{}", "9".repeat(64)));
+        assert!(
+            validate_mln_0143_lineage_result(
+                &CallInput {
+                    body: Some(json!({"phase":"post_import"})),
+                    ..CallInput::default()
+                },
+                &non_target_post_drift,
+                &[(pre.content_hash.clone(), base("pre_import"))],
+            )
+            .is_err()
+        );
+        let mut non_target_restore_drift = base("post_restore");
+        non_target_restore_drift["packet_count"] = json!(2);
+        assert!(
+            validate_mln_0143_lineage_result(&input, &non_target_restore_drift, &parents).is_err()
+        );
     }
 
     #[test]

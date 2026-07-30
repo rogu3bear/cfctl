@@ -512,9 +512,21 @@ const MLN_0143_QUERY: &str = r"WITH evidence_projection AS (
    'required',required,'created_by',created_by,'created_at',created_at)), '[]') AS evidence_rows,
    COUNT(*) AS evidence_received, COALESCE(MAX(projection_total),0) AS evidence_window_total
  FROM evidence_projection
+), packet_projection AS (
+ SELECT profile,evidence_kind,signature_required,sort_order,
+        COUNT(*) OVER() AS projection_total
+ FROM issuance_profile_packet_kinds ORDER BY profile,evidence_kind LIMIT 513
+), packet_payload AS (
+ SELECT COALESCE(json_group_array(json_object(
+   'profile',profile,'evidence_kind',evidence_kind,
+   'signature_required',signature_required,'sort_order',sort_order)),'[]') AS packet_rows,
+   COUNT(*) AS packet_received, COALESCE(MAX(projection_total),0) AS packet_window_total
+ FROM packet_projection
 )
 SELECT evidence_rows,evidence_received,evidence_window_total,
+ packet_rows,packet_received,packet_window_total,
  (SELECT COUNT(*) FROM equity_issuance_evidence_links) AS evidence_total,
+ (SELECT COUNT(*) FROM issuance_profile_packet_kinds) AS packet_total,
  (SELECT COALESCE(json_group_array(json_object('evidence_kind',evidence_kind,'count',kind_count)),'[]')
   FROM (SELECT evidence_kind,COUNT(*) AS kind_count FROM equity_issuance_evidence_links GROUP BY evidence_kind ORDER BY evidence_kind)) AS evidence_kind_counts,
  (SELECT sql FROM sqlite_schema WHERE type='table' AND name='equity_issuance_evidence_links') AS table_sql,
@@ -534,8 +546,6 @@ SELECT evidence_rows,evidence_received,evidence_window_total,
  (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_equity_instrument_evidence_contract') AS trigger_contract_sql,
  (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_equity_instrument_evidence_immutable') AS trigger_immutable_sql,
  (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_grant_final_instrument_required') AS trigger_final_required_sql,
- (SELECT COALESCE(json_group_array(json_object('evidence_kind',evidence_kind,'signature_required',signature_required,'sort_order',sort_order)),'[]')
-  FROM (SELECT evidence_kind,signature_required,sort_order FROM issuance_profile_packet_kinds WHERE profile='advisor_grant' ORDER BY evidence_kind)) AS advisor_packet_rows,
  (SELECT COUNT(*) FROM pragma_foreign_key_check) AS foreign_key_violations,
  (SELECT COUNT(*) FROM (SELECT 1 FROM equity_issuance_evidence_links WHERE document_hash IS NOT NULL GROUP BY org_id,issuance_event_id,evidence_kind,document_hash HAVING COUNT(*)>1)) AS duplicate_hash_groups,
  (SELECT COUNT(*) FROM equity_issuance_evidence_links WHERE evidence_kind NOT IN (
@@ -548,7 +558,7 @@ SELECT evidence_rows,evidence_received,evidence_window_total,
   AND NOT EXISTS (SELECT 1 FROM equity_issuance_evidence_links evidence WHERE evidence.org_id=event.org_id
     AND evidence.issuance_event_id=event.id AND evidence.evidence_kind='advisor_equity_instrument'
     AND evidence.required=1 AND evidence.document_id IS NOT NULL AND COALESCE(trim(evidence.document_hash),'')<>'')) AS invalid_advanced_events
-FROM evidence_payload";
+ FROM evidence_payload,packet_payload";
 
 fn render_mln_0143_data_invariants_body(body: &Value) -> Result<Value> {
     let object = body.as_object().ok_or_else(|| {
@@ -862,6 +872,28 @@ mod mln_0143_invariant_tests {
     use serde_json::{Value, json};
 
     fn prepared(phase: &str) -> PreparedRequest {
+        let mut contract = Mln0143DataInvariantsContractV1 {
+            account_id: "ca30e922fda7f5578e49873542e4aaca".to_owned(),
+            database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
+            migration_sha256: "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
+                .to_owned(),
+            trigger_definition_hashes: Vec::new(),
+            fixed_query_sha256:
+                "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d".to_owned(),
+            pre_table_definition_hash:
+                "sha256:8aa5012ace3d946354e0baba7e645646ac97373b42e7c3d61e79b67a5f689fea".to_owned(),
+            post_table_definition_hash:
+                "sha256:2fbdacd011abca8024507b99d179071b8b920271576e4cb3a2f06c4f3ffd2d7f".to_owned(),
+            validator_contract_hash: String::new(),
+            capability_version: 2,
+            max_evidence_rows: 256,
+            probe_rows: 257,
+            max_bytes: 1024 * 1024,
+            max_timeout_seconds: 30,
+        };
+        contract.validator_contract_hash = contract
+            .expected_validator_contract_hash()
+            .expect("validator contract");
         PreparedRequest {
             method: "POST".to_owned(),
             url: Url::parse("https://example.invalid/query").expect("URL"),
@@ -871,18 +903,7 @@ mod mln_0143_invariant_tests {
             response_contract: None,
             analytics_query: None,
             d1_schema_introspection: None,
-            mln_0143_data_invariants: Some(Mln0143DataInvariantsContractV1 {
-                account_id: "ca30e922fda7f5578e49873542e4aaca".to_owned(),
-                database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
-                migration_sha256:
-                    "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d".to_owned(),
-                trigger_definition_hashes: Vec::new(),
-                capability_version: 1,
-                max_evidence_rows: 256,
-                probe_rows: 257,
-                max_bytes: 1024 * 1024,
-                max_timeout_seconds: 30,
-            }),
+            mln_0143_data_invariants: Some(contract),
             d1_full_export: None,
             d1_restore_exact_bookmark: None,
             r2_log_retrieval: None,
@@ -927,6 +948,10 @@ mod mln_0143_invariant_tests {
                     "evidence_received":count,
                     "evidence_window_total":count,
                     "evidence_total":count,
+                    "packet_rows":"[{\"profile\":\"advisor_grant\",\"evidence_kind\":\"advisor_agreement\",\"signature_required\":1,\"sort_order\":1},{\"profile\":\"advisor_grant\",\"evidence_kind\":\"board_consent\",\"signature_required\":1,\"sort_order\":0},{\"profile\":\"advisor_grant\",\"evidence_kind\":\"election_83b\",\"signature_required\":0,\"sort_order\":2}]",
+                    "packet_received":3,
+                    "packet_window_total":3,
+                    "packet_total":3,
                     "evidence_kind_counts":"[{\"evidence_kind\":\"board_consent\",\"count\":1}]",
                     "table_sql":MLN_0143_PRE_TABLE_SQL,
                     "column_names":"[\"id\",\"org_id\",\"issuance_event_id\",\"evidence_kind\",\"document_id\",\"company_event_id\",\"document_hash\",\"required\",\"created_by\",\"created_at\"]",
@@ -945,7 +970,6 @@ mod mln_0143_invariant_tests {
                     "trigger_contract_sql":null,
                     "trigger_immutable_sql":null,
                     "trigger_final_required_sql":null,
-                    "advisor_packet_rows":"[{\"evidence_kind\":\"advisor_agreement\",\"signature_required\":1,\"sort_order\":1},{\"evidence_kind\":\"board_consent\",\"signature_required\":1,\"sort_order\":0},{\"evidence_kind\":\"election_83b\",\"signature_required\":0,\"sort_order\":2}]",
                     "foreign_key_violations":0,
                     "duplicate_hash_groups":0,
                     "invalid_evidence_kinds":0,
@@ -991,6 +1015,20 @@ mod mln_0143_invariant_tests {
                 .to_string()
                 .contains("invariant_not_feasible_under_safe_bounds")
         );
+    }
+
+    #[test]
+    fn packet_projection_requires_complete_unsaturated_full_table() {
+        let request = prepared("pre_import");
+        let mut response = pre_response(0);
+        response.result[0]["results"][0]["packet_total"] = json!(513);
+        response.result[0]["results"][0]["packet_window_total"] = json!(513);
+        response.result[0]["results"][0]["packet_received"] = json!(513);
+        assert!(sanitize_mln_0143_data_invariants_response(&mut response, &request).is_err());
+
+        let mut incomplete = pre_response(0);
+        incomplete.result[0]["results"][0]["packet_total"] = json!(4);
+        assert!(sanitize_mln_0143_data_invariants_response(&mut incomplete, &request).is_err());
     }
 
     #[test]
@@ -1181,8 +1219,8 @@ mod mln_0143_invariant_tests {
             Value::String(MLN_0143_POST_TABLE_SQL.to_owned()),
         );
         row.insert(
-            "advisor_packet_rows".to_owned(),
-            Value::String("[{\"evidence_kind\":\"advisor_agreement\",\"signature_required\":1,\"sort_order\":1},{\"evidence_kind\":\"advisor_equity_instrument\",\"signature_required\":1,\"sort_order\":2},{\"evidence_kind\":\"board_consent\",\"signature_required\":1,\"sort_order\":0}]".to_owned()),
+            "packet_rows".to_owned(),
+            Value::String("[{\"profile\":\"advisor_grant\",\"evidence_kind\":\"advisor_agreement\",\"signature_required\":1,\"sort_order\":1},{\"profile\":\"advisor_grant\",\"evidence_kind\":\"advisor_equity_instrument\",\"signature_required\":1,\"sort_order\":2},{\"profile\":\"advisor_grant\",\"evidence_kind\":\"board_consent\",\"signature_required\":1,\"sort_order\":0}]".to_owned()),
         );
         for (field, sql) in [
             ("trigger_contract_sql", trigger_sql[0]),
@@ -4851,7 +4889,14 @@ fn sanitize_mln_0143_data_invariants_response(
     } else {
         MLN_0143_POST_TABLE_SQL
     };
-    if reviewed_table_sql_hash(table_sql) != reviewed_table_sql_hash(expected_table_sql) {
+    let expected_table_hash = if pre {
+        &contract.pre_table_definition_hash
+    } else {
+        &contract.post_table_definition_hash
+    };
+    if reviewed_table_sql_hash(table_sql).as_ref() != Some(expected_table_hash)
+        || reviewed_table_sql_hash(expected_table_sql).as_ref() != Some(expected_table_hash)
+    {
         return Err(invariant_response_error(response.status));
     }
     let columns: Value = serde_json::from_str(text("column_names")?)
@@ -4933,24 +4978,66 @@ fn sanitize_mln_0143_data_invariants_response(
     {
         return Err(invariant_response_error(response.status));
     }
-    let packet_rows: Value = serde_json::from_str(text("advisor_packet_rows")?)
+    let packet_rows: Value = serde_json::from_str(text("packet_rows")?)
         .map_err(|_| invariant_response_error(response.status))?;
+    let packet_rows = packet_rows
+        .as_array()
+        .ok_or_else(|| invariant_response_error(response.status))?;
+    let packet_total = number("packet_total")?;
+    let packet_window_total = number("packet_window_total")?;
+    let packet_received = number("packet_received")?;
+    if packet_total > 512
+        || packet_window_total != packet_total
+        || packet_received != packet_total
+        || packet_received != packet_rows.len() as u64
+        || packet_received >= 513
+        || packet_rows.iter().any(|row| {
+            row.as_object().is_none_or(|row| {
+                row.len() != 4
+                    || ![
+                        "profile",
+                        "evidence_kind",
+                        "signature_required",
+                        "sort_order",
+                    ]
+                    .iter()
+                    .all(|field| row.contains_key(*field))
+            })
+        })
+    {
+        return Err(invariant_response_error(response.status));
+    }
+    let advisor_rows = packet_rows
+        .iter()
+        .filter(|row| row.get("profile").and_then(Value::as_str) == Some("advisor_grant"))
+        .cloned()
+        .collect::<Vec<_>>();
     let expected_packet = if pre {
         serde_json::json!([
-            {"evidence_kind":"advisor_agreement","signature_required":1,"sort_order":1},
-            {"evidence_kind":"board_consent","signature_required":1,"sort_order":0},
-            {"evidence_kind":"election_83b","signature_required":0,"sort_order":2}
+            {"profile":"advisor_grant","evidence_kind":"advisor_agreement","signature_required":1,"sort_order":1},
+            {"profile":"advisor_grant","evidence_kind":"board_consent","signature_required":1,"sort_order":0},
+            {"profile":"advisor_grant","evidence_kind":"election_83b","signature_required":0,"sort_order":2}
         ])
     } else {
         serde_json::json!([
-            {"evidence_kind":"advisor_agreement","signature_required":1,"sort_order":1},
-            {"evidence_kind":"advisor_equity_instrument","signature_required":1,"sort_order":2},
-            {"evidence_kind":"board_consent","signature_required":1,"sort_order":0}
+            {"profile":"advisor_grant","evidence_kind":"advisor_agreement","signature_required":1,"sort_order":1},
+            {"profile":"advisor_grant","evidence_kind":"advisor_equity_instrument","signature_required":1,"sort_order":2},
+            {"profile":"advisor_grant","evidence_kind":"board_consent","signature_required":1,"sort_order":0}
         ])
     };
-    if packet_rows != expected_packet {
+    if Value::Array(advisor_rows) != expected_packet {
         return Err(invariant_response_error(response.status));
     }
+    let non_target_packet_rows = packet_rows
+        .iter()
+        .filter(|row| {
+            let profile = row.get("profile").and_then(Value::as_str);
+            let kind = row.get("evidence_kind").and_then(Value::as_str);
+            profile != Some("advisor_grant")
+                || !matches!(kind, Some("election_83b" | "advisor_equity_instrument"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let trigger_fields = [
         "trigger_contract_sql",
         "trigger_immutable_sql",
@@ -4983,6 +5070,7 @@ fn sanitize_mln_0143_data_invariants_response(
         "schema_version":1,
         "capability_id":"mln-0143-data-invariants",
         "capability_version":contract.capability_version,
+        "validator_contract_hash":contract.validator_contract_hash,
         "migration_id":"0143",
         "migration_sha256":contract.migration_sha256,
         "phase":phase,
@@ -4997,7 +5085,10 @@ fn sanitize_mln_0143_data_invariants_response(
             "counts_by_kind":kind_counts,
         },
         "semantic_schema_hash":reviewed_table_sql_hash(table_sql).ok_or_else(|| invariant_response_error(response.status))?,
-        "packet_hash":hash_value(&packet_rows)?,
+        "packet_hash":hash_value(&Value::Array(packet_rows.clone()))?,
+        "packet_count":packet_total,
+        "packet_non_target_hash":hash_value(&Value::Array(non_target_packet_rows.clone()))?,
+        "packet_non_target_count":non_target_packet_rows.len(),
         "trigger_definition_hashes":trigger_hashes,
         "assertions":{
             "old_table_absent":true,
@@ -5010,7 +5101,7 @@ fn sanitize_mln_0143_data_invariants_response(
             "invalid_advanced_events_zero":true,
         },
         "query":{
-            "sha256":hash_value(&Value::String(MLN_0143_QUERY.to_owned()))?,
+            "sha256":contract.fixed_query_sha256,
             "row_limit":contract.max_evidence_rows,
             "probe_rows":contract.probe_rows,
             "byte_limit":contract.max_bytes,
@@ -7849,7 +7940,18 @@ fn validate_mln_0143_data_invariants_contract(
                 "sha256:e9205a4863c717c901ec3ac87089555a9af7eac14d5f38fbf40bff775ad8497c",
                 "sha256:3ca04f9fc717104d2ee0da719e2c473a756d3345f4e222d52c4d0f76237a184b",
             ]
-        && contract.capability_version == 1
+        && contract.fixed_query_sha256
+            == "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d"
+        && hash_value(&Value::String(MLN_0143_QUERY.to_owned()))
+            .is_ok_and(|hash| hash == contract.fixed_query_sha256)
+        && contract.pre_table_definition_hash
+            == "sha256:8aa5012ace3d946354e0baba7e645646ac97373b42e7c3d61e79b67a5f689fea"
+        && contract.post_table_definition_hash
+            == "sha256:2fbdacd011abca8024507b99d179071b8b920271576e4cb3a2f06c4f3ffd2d7f"
+        && contract
+            .expected_validator_contract_hash()
+            .is_ok_and(|hash| hash == contract.validator_contract_hash)
+        && contract.capability_version == 2
         && contract.max_evidence_rows == 256
         && contract.probe_rows == 257
         && (1..=1024 * 1024).contains(&contract.max_bytes)

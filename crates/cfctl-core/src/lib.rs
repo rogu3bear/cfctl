@@ -938,11 +938,57 @@ pub struct Mln0143DataInvariantsContractV1 {
     pub database_id: String,
     pub migration_sha256: String,
     pub trigger_definition_hashes: Vec<String>,
+    pub fixed_query_sha256: String,
+    pub pre_table_definition_hash: String,
+    pub post_table_definition_hash: String,
+    pub validator_contract_hash: String,
     pub capability_version: u8,
     pub max_evidence_rows: u64,
     pub probe_rows: u64,
     pub max_bytes: u64,
     pub max_timeout_seconds: u64,
+}
+
+impl Mln0143DataInvariantsContractV1 {
+    pub fn expected_validator_contract_hash(&self) -> Result<String> {
+        hash_value(&serde_json::json!({
+            "capability_id":"mln-0143-data-invariants",
+            "capability_version":self.capability_version,
+            "migration_sha256":self.migration_sha256,
+            "target_scope":{"account_id":self.account_id,"database_id":self.database_id},
+            "fixed_query_sha256":self.fixed_query_sha256,
+            "phase_table_definition_hashes":{
+                "pre_import":self.pre_table_definition_hash,
+                "post_import":self.post_table_definition_hash,
+                "post_restore":self.pre_table_definition_hash,
+            },
+            "packet_authority":{
+                "scope":"full issuance_profile_packet_kinds table",
+                "ordered_columns":["profile","evidence_kind","signature_required","sort_order"],
+                "authorized_delta":{
+                    "remove":["advisor_grant","election_83b"],
+                    "insert":["advisor_grant","advisor_equity_instrument",1,2],
+                },
+            },
+            "index_assertions":[
+                ["idx_equity_issuance_evidence_event",false,["org_id","issuance_event_id","evidence_kind"]],
+                ["idx_equity_issuance_evidence_document",false,["org_id","document_id"]],
+                ["idx_equity_issuance_evidence_unique_hash",true,["org_id","issuance_event_id","evidence_kind","document_hash"],"document_hash IS NOT NULL"],
+            ],
+            "trigger_definition_hashes":self.trigger_definition_hashes,
+            "bounds":{
+                "max_evidence_rows":self.max_evidence_rows,
+                "probe_rows":self.probe_rows,
+                "max_bytes":self.max_bytes,
+                "max_timeout_seconds":self.max_timeout_seconds,
+            },
+            "manifest_contract":{
+                "required":["schema_version","capability_id","capability_version","validator_contract_hash","migration_id","migration_sha256","phase","target_scope_hash","complete","projection","semantic_schema_hash","packet_hash","packet_count","packet_non_target_hash","packet_non_target_count","trigger_definition_hashes","assertions","query","lineage"],
+                "assertions":["old_table_absent","unique_hash_index_present","event_index_exact_non_unique_shape","document_index_exact_non_unique_shape","foreign_key_check_empty","duplicate_hash_groups_zero","invalid_evidence_kinds_zero","invalid_advanced_events_zero"],
+                "query":["sha256","row_limit","probe_rows","byte_limit","timeout_seconds","received_rows","provider_rows_read","provider_duration","bounds_saturated"],
+            },
+        }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
