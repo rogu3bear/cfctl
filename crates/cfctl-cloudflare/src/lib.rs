@@ -950,6 +950,39 @@ mod mln_0143_invariant_tests {
     }
 
     #[test]
+    fn top_level_provider_failures_are_sunk_before_result_processing() {
+        let request = prepared("pre_import");
+        let private_id = "mln-private-id-sentinel";
+        let private_hash = "sha256:mln-private-document-hash-sentinel";
+        let mut provider_error = pre_response(0);
+        provider_error.errors.push(super::CloudflareApiErrorV1 {
+            code: Some(10_001),
+            message: format!("{private_id} {private_hash}"),
+        });
+        let error = sanitize_mln_0143_data_invariants_response(&mut provider_error, &request)
+            .expect_err("top-level provider error must fail closed");
+        let observable = format!(
+            "{error} {}",
+            serde_json::to_string(&provider_error).expect("scrubbed response JSON")
+        );
+        assert!(!observable.contains(private_id));
+        assert!(!observable.contains(private_hash));
+        assert!(provider_error.errors.is_empty());
+        assert!(provider_error.result.is_null());
+
+        let mut unsuccessful = pre_response(0);
+        unsuccessful.success = false;
+        let error = sanitize_mln_0143_data_invariants_response(&mut unsuccessful, &request)
+            .expect_err("success=false must fail closed");
+        assert!(matches!(
+            error,
+            super::CloudflareError::InvalidResponseEnvelope { status: 200 }
+        ));
+        assert!(unsuccessful.errors.is_empty());
+        assert!(unsuccessful.result.is_null());
+    }
+
+    #[test]
     fn both_non_unique_indexes_fail_closed_on_absence_order_or_uniqueness_drift() {
         let request = prepared("pre_import");
         for (sql_field, unique_field, columns_field, wrong_columns) in [
@@ -4512,6 +4545,12 @@ fn sanitize_mln_0143_data_invariants_response(
     response: &mut CloudflareResponseV1,
     request: &PreparedRequest,
 ) -> Result<()> {
+    if !response.success || !response.errors.is_empty() {
+        response.result = Value::Null;
+        response.errors.clear();
+        response.result_info = None;
+        return Err(invariant_response_error(response.status));
+    }
     let contract = request
         .mln_0143_data_invariants
         .as_ref()
@@ -4807,6 +4846,7 @@ fn sanitize_mln_0143_data_invariants_response(
         "privacy":"raw rows, row fingerprints, MLN identifiers, and document hashes were discarded before evidence persistence",
     });
     response.result = manifest;
+    response.errors.clear();
     Ok(())
 }
 
