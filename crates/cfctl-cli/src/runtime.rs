@@ -13588,6 +13588,47 @@ fn approved_mln_import_execution_error_envelope(
     envelope
 }
 
+fn persist_d1_import_checkpoint(
+    store: &StateStore,
+    operation_id: &str,
+    checkpoint: &D1ImportCheckpointV1,
+) -> std::result::Result<(), String> {
+    let value = serde_json::to_value(checkpoint).map_err(|error| error.to_string())?;
+    let checkpoint_hash = store
+        .record_d1_import_checkpoint(operation_id, &value)
+        .map_err(|error| error.to_string())?;
+    let terminal_provider_failure = (checkpoint.step == "init_response"
+        || checkpoint.step == "ingest_response"
+        || checkpoint.step.starts_with("poll_response_"))
+        && checkpoint
+            .receipt
+            .pointer("/result/status")
+            .and_then(Value::as_str)
+            == Some("error")
+        && checkpoint
+            .receipt
+            .pointer("/result/success")
+            .and_then(Value::as_bool)
+            == Some(false);
+    let durable_apply = checkpoint.step == "provider_complete"
+        || terminal_provider_failure
+        || checkpoint.receipt.get("effect").and_then(Value::as_str)
+            == Some("d1_import_ingest_accepted")
+        || checkpoint.receipt.get("effect").and_then(Value::as_str)
+            == Some("d1_import_transport_uncertain");
+    if durable_apply {
+        let evidence = store
+            .write_evidence(EvidenceClass::Apply, &value)
+            .map_err(|error| error.to_string())?;
+        if evidence.content_hash != checkpoint_hash {
+            return Err(
+                "D1 import checkpoint and immutable apply evidence hashes diverged".to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "special import execution durably binds checkpoints evidence and pending verification"
@@ -13620,60 +13661,7 @@ async fn execute_approved_mln_import_plan(
             credential,
             &stage_path,
             |checkpoint: &D1ImportCheckpointV1| {
-                let value = serde_json::to_value(checkpoint).map_err(|error| error.to_string())?;
-                let checkpoint_hash = store
-                    .record_d1_import_checkpoint(&checkpoint_operation_id, &value)
-                    .map_err(|error| error.to_string())?;
-                if checkpoint.step == "provider_complete" {
-                    let evidence = store
-                        .write_evidence(EvidenceClass::Apply, &value)
-                        .map_err(|error| error.to_string())?;
-                    if evidence.content_hash != checkpoint_hash {
-                        return Err(
-                            "provider_complete checkpoint and apply evidence hashes diverged"
-                                .to_owned(),
-                        );
-                    }
-                }
-                if (checkpoint.step == "init_response"
-                    || checkpoint.step == "ingest_response"
-                    || checkpoint.step.starts_with("poll_response_"))
-                    && checkpoint
-                        .receipt
-                        .pointer("/result/status")
-                        .and_then(Value::as_str)
-                        == Some("error")
-                    && checkpoint
-                        .receipt
-                        .pointer("/result/success")
-                        .and_then(Value::as_bool)
-                        == Some(false)
-                {
-                    let evidence = store
-                        .write_evidence(EvidenceClass::Apply, &value)
-                        .map_err(|error| error.to_string())?;
-                    if evidence.content_hash != checkpoint_hash {
-                        return Err(
-                            "provider-failure checkpoint and apply evidence hashes diverged"
-                                .to_owned(),
-                        );
-                    }
-                }
-                if checkpoint.step == "ingest_response"
-                    && checkpoint.receipt.get("effect").and_then(Value::as_str)
-                        == Some("d1_import_ingest_accepted")
-                {
-                    let evidence = store
-                        .write_evidence(EvidenceClass::Apply, &value)
-                        .map_err(|error| error.to_string())?;
-                    if evidence.content_hash != checkpoint_hash {
-                        return Err(
-                            "accepted-ingest checkpoint and apply evidence hashes diverged"
-                                .to_owned(),
-                        );
-                    }
-                }
-                Ok(())
+                persist_d1_import_checkpoint(store, &checkpoint_operation_id, checkpoint)
             },
         )
         .await
@@ -19581,7 +19569,7 @@ mod tests {
         mln_0143_pre_import_matches, mln_0143_restore_anchor_matches,
         non_readback_verification_basis, normalize_reviewed_mln_repository_id,
         operational_proof_coverage, permission_inventory_call, permission_inventory_envelope,
-        persist_prepared_plan, persist_secret_lifecycle,
+        persist_d1_import_checkpoint, persist_prepared_plan, persist_secret_lifecycle,
         persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
         preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
@@ -19625,7 +19613,8 @@ mod tests {
     use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::{CatalogSnapshot, ingest_native_control_capabilities};
     use cfctl_cloudflare::{
-        CloudflareApiErrorV1, CloudflareError, CloudflareResponseV1, OperationVerificationV1,
+        CloudflareApiErrorV1, CloudflareError, CloudflareResponseV1, D1ImportCheckpointV1,
+        OperationVerificationV1,
     };
     use cfctl_core::{
         AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
@@ -21326,6 +21315,52 @@ mod tests {
                 }
             })
         };
+
+        let uncertainty_root = tempfile::tempdir().expect("uncertainty root");
+        let uncertainty_store = StateStore::open(RuntimePaths::from_root(uncertainty_root.path()))
+            .expect("uncertainty store");
+        let uncertainty_plan = build_plan();
+        let uncertainty = D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: uncertainty_plan.operation_id.clone(),
+            step: "upload_send_uncertain".to_owned(),
+            performed: true,
+            rectification_required: true,
+            receipt: json!({
+                "provider":"cloudflare",
+                "effect":"d1_import_transport_uncertain",
+                "transport_stage":"upload",
+                "migration_id":"0143",
+                "target":{
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                },
+                "plan_input_hash":hash_value(&uncertainty_plan.input).expect("input hash"),
+                "outcome":"unknown",
+                "receipt_available":false,
+                "no_replay":true,
+            }),
+        };
+        persist_d1_import_checkpoint(
+            &uncertainty_store,
+            &uncertainty_plan.operation_id,
+            &uncertainty,
+        )
+        .expect("durable uncertainty checkpoint");
+        let uncertainty_value = serde_json::to_value(&uncertainty).expect("uncertainty value");
+        let uncertainty_hash = uncertainty_store
+            .read_d1_import_checkpoints(&uncertainty_plan.operation_id)
+            .expect("uncertainty checkpoints")
+            .into_iter()
+            .find(|(_, checkpoint)| checkpoint == &uncertainty_value)
+            .map(|(hash, _)| hash)
+            .expect("uncertainty checkpoint hash");
+        assert_eq!(
+            uncertainty_store
+                .read_evidence_value(&uncertainty_hash)
+                .expect("durable uncertainty evidence"),
+            uncertainty_value
+        );
 
         let root = tempfile::tempdir().expect("known failure root");
         let store =

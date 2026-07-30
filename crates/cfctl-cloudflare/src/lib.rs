@@ -27,7 +27,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -2481,9 +2481,10 @@ impl Executor {
                 ..CallInput::default()
             };
             async move {
-                let request = self
+                let mut request = self
                     .builder
                     .build_unchecked(&provider_capability, &request_input)?;
+                request.timeout_seconds = contract.max_timeout_seconds;
                 self.clone()
                     .with_max_retries(0)
                     .send(&request, credential)
@@ -2498,8 +2499,8 @@ impl Executor {
         {
             Ok(response) => response,
             Err(error) => {
-                persist_import_uncertainty(&mut persist, plan, "init_send_uncertain")?;
                 plan.status = PlanStatus::RectificationRequired;
+                persist_import_uncertainty(&mut persist, plan, "init_send_uncertain")?;
                 return Err(error);
             }
         };
@@ -2545,24 +2546,25 @@ impl Executor {
                 return Err(error);
             }
         };
-        let Ok(upload) = self
-            .upload_client
-            .put(upload_url)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(staged)
-            .send()
-            .await
+        let Ok((upload_status, upload_headers)) = bounded_d1_import_upload(
+            &self.upload_client,
+            upload_url,
+            staged,
+            contract.max_timeout_seconds,
+            contract.max_response_bytes,
+        )
+        .await
         else {
-            persist_import_uncertainty(&mut persist, plan, "upload_send_uncertain")?;
             plan.status = PlanStatus::RectificationRequired;
+            persist_import_uncertainty(&mut persist, plan, "upload_send_uncertain")?;
             return Err(CloudflareError::InvalidRequestBody(
                 "D1 import upload transport failed; presigned URL redacted; do not replay"
                     .to_owned(),
             ));
         };
-        let upload_status = upload.status().as_u16();
-        let upload_etag = if upload.status().is_success() {
-            match validated_d1_import_upload_etag(upload.headers(), &migration.md5) {
+        let upload_status = upload_status.as_u16();
+        let upload_etag = if (200..300).contains(&upload_status) {
+            match validated_d1_import_upload_etag(&upload_headers, &migration.md5) {
                 Ok(etag) => Some(etag),
                 Err(error) => {
                     let receipt = D1ImportCheckpointV1 {
@@ -2574,7 +2576,7 @@ impl Executor {
                         receipt: serde_json::json!({
                             "http_status":upload_status,
                             "success":true,
-                            "etag_present":upload.headers().contains_key(reqwest::header::ETAG),
+                            "etag_present":upload_headers.contains_key(reqwest::header::ETAG),
                             "etag_matches":false,
                             "no_replay":true,
                         }),
@@ -2592,17 +2594,17 @@ impl Executor {
             operation_id: plan.operation_id.clone(),
             step: "upload_response".to_owned(),
             performed: true,
-            rectification_required: !upload.status().is_success(),
+            rectification_required: !(200..300).contains(&upload_status),
             receipt: serde_json::json!({
                 "http_status":upload_status,
-                "success":upload.status().is_success(),
+                "success":(200..300).contains(&upload_status),
                 "etag_present":upload_etag.is_some(),
                 "etag_matches":upload_etag.is_some(),
                 "etag_sha256":upload_etag.as_ref().map(|etag| format!("sha256:{}",hex::encode(Sha256::digest(etag.as_bytes())))),
             }),
         };
         persist(&upload_receipt).map_err(CloudflareError::InvalidRequestBody)?;
-        if !upload.status().is_success() {
+        if !(200..300).contains(&upload_status) {
             plan.status = PlanStatus::RectificationRequired;
             return Err(CloudflareError::InvalidRequestBody(format!(
                 "D1 import upload returned HTTP {upload_status}; do not replay"
@@ -2617,8 +2619,8 @@ impl Executor {
         {
             Ok(response) => response,
             Err(error) => {
-                persist_import_uncertainty(&mut persist, plan, "ingest_send_uncertain")?;
                 plan.status = PlanStatus::RectificationRequired;
+                persist_import_uncertainty(&mut persist, plan, "ingest_send_uncertain")?;
                 return Err(error);
             }
         };
@@ -2644,12 +2646,12 @@ impl Executor {
             {
                 Ok(response) => response,
                 Err(error) => {
+                    plan.status = PlanStatus::RectificationRequired;
                     persist_import_uncertainty(
                         &mut persist,
                         plan,
                         &format!("poll_send_uncertain_{attempt}"),
                     )?;
-                    plan.status = PlanStatus::RectificationRequired;
                     return Err(error);
                 }
             };
@@ -2720,8 +2722,8 @@ impl Executor {
                 ),
             }
         }
-        persist_import_uncertainty(&mut persist, plan, "poll_exhausted")?;
         plan.status = PlanStatus::RectificationRequired;
+        persist_import_uncertainty(&mut persist, plan, "poll_exhausted")?;
         Err(CloudflareError::InvalidRequestBody(
             "D1 import poll bound exhausted; resume only the existing bookmark poll".to_owned(),
         ))
@@ -8814,6 +8816,50 @@ fn validated_d1_import_upload_etag(
     Ok(normalized.to_ascii_lowercase())
 }
 
+async fn bounded_d1_import_upload(
+    client: &reqwest::Client,
+    upload_url: Url,
+    staged: Vec<u8>,
+    timeout_seconds: u64,
+    max_response_bytes: u64,
+) -> Result<(reqwest::StatusCode, HeaderMap)> {
+    timeout(Duration::from_secs(timeout_seconds), async {
+        let response = client
+            .put(upload_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .timeout(Duration::from_secs(timeout_seconds))
+            .body(staged)
+            .send()
+            .await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut response_bytes = 0_u64;
+        let mut body = response.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            response_bytes = response_bytes
+                .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+                .ok_or_else(|| {
+                    CloudflareError::InvalidRequestBody(
+                        "D1 import upload response exceeded its bounded receipt".to_owned(),
+                    )
+                })?;
+            if response_bytes > max_response_bytes {
+                return Err(CloudflareError::InvalidRequestBody(
+                    "D1 import upload response exceeded its bounded receipt".to_owned(),
+                ));
+            }
+        }
+        Ok((status, headers))
+    })
+    .await
+    .map_err(|_| {
+        CloudflareError::InvalidRequestBody(
+            "D1 import upload exceeded its approved timeout; do not replay".to_owned(),
+        )
+    })?
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum D1ImportPollOutcome<'a> {
     InProgress,
@@ -9034,6 +9080,24 @@ fn persist_import_uncertainty<F>(persist: &mut F, plan: &PlanV1, step: &str) -> 
 where
     F: FnMut(&D1ImportCheckpointV1) -> std::result::Result<(), String>,
 {
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| {
+            CloudflareError::InvalidRequestBody(
+                "approved MLN import contract is missing".to_owned(),
+            )
+        })?;
+    let migration_id = plan
+        .input
+        .pointer("/body/migration_id")
+        .and_then(Value::as_str);
+    let transport_stage = if step.starts_with("poll_send_uncertain_") || step == "poll_exhausted" {
+        "poll"
+    } else {
+        step.strip_suffix("_send_uncertain").unwrap_or(step)
+    };
     persist(&D1ImportCheckpointV1 {
         schema_version: 1,
         operation_id: plan.operation_id.clone(),
@@ -9041,6 +9105,15 @@ where
         performed: true,
         rectification_required: true,
         receipt: serde_json::json!({
+            "provider":"cloudflare",
+            "effect":"d1_import_transport_uncertain",
+            "transport_stage":transport_stage,
+            "migration_id":migration_id,
+            "target":{
+                "account_id":contract.account_id,
+                "database_id":contract.database_id,
+            },
+            "plan_input_hash":hash_value(&plan.input)?,
             "outcome":"unknown",
             "receipt_available":false,
             "no_replay":true,
@@ -9054,13 +9127,17 @@ where
 mod approved_mln_import_tests {
     use super::{
         CloudflareError, D1ImportPollOutcome, accepted_d1_import_ingest_response,
-        accepted_d1_import_init_response, accepted_d1_import_poll_outcome, parse_response,
+        accepted_d1_import_init_response, accepted_d1_import_poll_outcome,
+        bounded_d1_import_upload, parse_response, persist_import_uncertainty,
         validate_d1_import_poll_response, validate_d1_import_upload_url,
         validated_d1_import_upload_etag,
     };
-    use cfctl_core::D1ApprovedMlnImportContractV1;
+    use cfctl_core::{CapabilityV1, D1ApprovedMlnImportContractV1, PlanV1};
     use reqwest::header::{ETAG, HeaderMap, HeaderValue};
     use serde_json::json;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn contract() -> D1ApprovedMlnImportContractV1 {
         D1ApprovedMlnImportContractV1 {
@@ -9270,6 +9347,128 @@ mod approved_mln_import_tests {
             })))
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one transport-boundary regression joins stalled and successful upload receipts"
+    )]
+    async fn approved_import_upload_body_stall_is_bounded_and_durably_no_replay() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stall listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept upload");
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read upload");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nETag: bd50b7e05cc13c20f17eb8748472eb4b\r\n\r\n",
+                )
+                .await
+                .expect("write stalled response headers");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let started = Instant::now();
+        let ingest_attempts = 0_u8;
+        let error = bounded_d1_import_upload(
+            &reqwest::Client::new(),
+            format!("http://{address}/presigned?X-Amz-Signature=secret")
+                .parse()
+                .expect("local upload URL"),
+            b"reviewed migration".to_vec(),
+            1,
+            1024,
+        )
+        .await
+        .expect_err("stalled response body must time out");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(ingest_attempts, 0);
+        assert!(!error.to_string().contains("X-Amz-Signature"));
+        server.abort();
+
+        let success_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("success listener");
+        let success_address = success_listener.local_addr().expect("success address");
+        let success_server = tokio::spawn(async move {
+            let (mut socket, _) = success_listener.accept().await.expect("accept upload");
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read upload");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: bd50b7e05cc13c20f17eb8748472eb4b\r\n\r\n",
+                )
+                .await
+                .expect("write successful response");
+        });
+        let (status, headers) = bounded_d1_import_upload(
+            &reqwest::Client::new(),
+            format!("http://{success_address}/upload")
+                .parse()
+                .expect("success upload URL"),
+            b"reviewed migration".to_vec(),
+            1,
+            1024,
+        )
+        .await
+        .expect("bounded successful upload");
+        assert!(status.is_success());
+        assert_eq!(
+            validated_d1_import_upload_etag(&headers, "bd50b7e05cc13c20f17eb8748472eb4b")
+                .expect("exact successful ETag"),
+            "bd50b7e05cc13c20f17eb8748472eb4b"
+        );
+        success_server.await.expect("success server");
+
+        let mut capability = CapabilityV1::new(
+            "d1-import-approved-mln-migration",
+            "Approved import",
+            "POST",
+            "/accounts/{account_id}/d1/database/{database_id}/import",
+        );
+        capability.d1_approved_mln_import = Some(contract());
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:catalog",
+            capability,
+            json!({}),
+        )
+        .expect("import plan");
+        plan.input = json!({
+            "selectors":{
+                "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "database_id":"11111111-1111-4111-8111-111111111111",
+            },
+            "body":{"migration_id":"0143"},
+        });
+        let mut checkpoints = Vec::new();
+        persist_import_uncertainty(
+            &mut |checkpoint| {
+                checkpoints.push(serde_json::to_value(checkpoint).expect("checkpoint value"));
+                Ok(())
+            },
+            &plan,
+            "upload_send_uncertain",
+        )
+        .expect("persist uncertainty");
+        assert_eq!(checkpoints.len(), 1);
+        let checkpoint = &checkpoints[0];
+        assert_eq!(checkpoint["performed"], true);
+        assert_eq!(checkpoint["rectification_required"], true);
+        assert_eq!(
+            checkpoint["receipt"]["effect"],
+            "d1_import_transport_uncertain"
+        );
+        assert_eq!(checkpoint["receipt"]["transport_stage"], "upload");
+        assert_eq!(checkpoint["receipt"]["no_replay"], true);
+        assert_eq!(checkpoint["receipt"]["receipt_available"], false);
+        let redacted = checkpoint.to_string();
+        assert!(!redacted.contains("X-Amz-"));
+        assert!(!redacted.contains("presigned"));
     }
 
     #[test]
