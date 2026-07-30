@@ -19978,7 +19978,7 @@ async fn key_renew_analytics_profile(
         if let Some(slot_id) = retired_slot.as_deref() {
             secrets.delete_api_token_slot(slot_id)?;
         } else {
-            secrets.delete_profile(&arguments.profile)?;
+            secrets.delete_api_token(&arguments.profile)?;
         }
         old_profile = reconciled_profile;
     }
@@ -20010,7 +20010,7 @@ async fn key_renew_analytics_profile(
             let secrets = platform_secrets(store);
             let retired_legacy_credential =
                 if secrets.locate_api_token(&arguments.profile)?.is_some() {
-                    secrets.delete_profile(&arguments.profile)?;
+                    secrets.delete_api_token(&arguments.profile)?;
                     true
                 } else {
                     false
@@ -20419,7 +20419,7 @@ async fn key_renew_analytics_profile(
     if let Some(old_slot_id) = old_profile.api_token_slot_id.as_deref() {
         secrets.delete_api_token_slot(old_slot_id)?;
     } else {
-        secrets.delete_profile(&arguments.profile)?;
+        secrets.delete_api_token(&arguments.profile)?;
     }
     let mut envelope = ResultEnvelopeV2::success(
         "keys renew-analytics-profile",

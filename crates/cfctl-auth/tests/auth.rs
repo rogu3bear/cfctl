@@ -100,7 +100,7 @@ fn immutable_api_token_slots_switch_profiles_without_overwriting_the_old_generat
         Some("fresh-token")
     );
     store
-        .delete_profile("publisher")
+        .delete_api_token("publisher")
         .expect("retire legacy profile-keyed credential");
     assert_eq!(
         store

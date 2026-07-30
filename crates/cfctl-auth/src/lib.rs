@@ -386,6 +386,10 @@ pub trait SecretStore: Send + Sync {
         self.put(&api_token_key(profile_id), token)
     }
 
+    fn delete_api_token(&self, profile_id: &str) -> Result<()> {
+        self.delete(&api_token_key(profile_id))
+    }
+
     fn store_api_token_slot(&self, slot_id: &str, token: &str) -> Result<()> {
         self.put(&api_token_slot_key(slot_id)?, token)
     }
