@@ -2,8 +2,8 @@
 
 use cfctl_catalog::{
     CatalogChangeKind, CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1,
-    attach_official_product_knowledge, ingest_cli_help, ingest_telemetry_capabilities,
-    markdown_link, markdown_links, normalize_openapi,
+    attach_official_product_knowledge, ingest_cli_help, ingest_native_control_capabilities,
+    ingest_telemetry_capabilities, markdown_link, markdown_links, normalize_openapi,
 };
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryKindV1, BillingModelV1, CapabilityV1, CostExposureV1,
@@ -11973,4 +11973,442 @@ fn telemetry_overlay_closes_only_the_exact_bounded_r2_log_retrieval() {
             .is_some_and(|reason| reason.starts_with("schema drift:"))
     );
     assert!(drifted.r2_log_retrieval.is_none());
+}
+
+#[test]
+fn native_control_overlay_adds_only_closed_bounded_d1_schema_assertions() {
+    let blocked = ["d1-query-database", "d1-raw-database-query", "wrangler.d1"].map(|id| {
+        let mut capability = CapabilityV1::new(id, id, "POST", id);
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some("generic D1 execution remains blocked".to_owned());
+        (id.to_owned(), capability)
+    });
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: blocked.into_iter().collect(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+
+    let capability = snapshot
+        .get("d1-schema-introspection")
+        .expect("D1 schema capability");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.method, "POST");
+    assert!(!capability.mutating);
+    assert_eq!(capability.risk, RiskClass::Read);
+    assert_eq!(capability.effect, EffectClass::ReadOnly);
+    assert_eq!(capability.permissions, ["D1 Read"]);
+    assert_eq!(
+        capability.path,
+        "/accounts/{account_id}/d1/database/{database_id}/query"
+    );
+    assert_eq!(
+        capability
+            .selectors
+            .iter()
+            .map(|selector| selector.name.as_str())
+            .collect::<Vec<_>>(),
+        ["account_id", "database_id"]
+    );
+    let schema = capability
+        .request_schema
+        .as_ref()
+        .expect("closed assertion schema");
+    let variants = schema["oneOf"].as_array().expect("assertion variants");
+    assert_eq!(variants.len(), 6);
+    assert!(
+        variants
+            .iter()
+            .all(|variant| variant["additionalProperties"] == false)
+    );
+    let encoded = serde_json::to_string(schema).expect("schema JSON");
+    assert!(!encoded.contains("\"sql\""));
+    assert!(!encoded.contains("\"params\""));
+    let contract = capability
+        .d1_schema_introspection
+        .as_ref()
+        .expect("typed runtime contract");
+    assert_eq!(contract.max_rows, 1);
+    assert_eq!(contract.max_bytes, 64 * 1024);
+    assert_eq!(contract.max_timeout_seconds, 10);
+    assert!(capability.analytics_query.is_none());
+    for id in ["d1-query-database", "d1-raw-database-query", "wrangler.d1"] {
+        let generic = snapshot.get(id).expect("generic capability remains");
+        assert_eq!(generic.adapter_status, AdapterStatus::Blocked);
+        assert_eq!(
+            generic.blocked_reason.as_deref(),
+            Some("generic D1 execution remains blocked")
+        );
+    }
+}
+
+#[test]
+fn native_control_overlay_adds_closed_pinned_mln_0143_invariant_read() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .get("mln-0143-data-invariants")
+        .expect("MLN invariant capability");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Read);
+    assert_eq!(capability.effect, EffectClass::ReadOnly);
+    assert!(!capability.mutating);
+    assert_eq!(capability.permissions, ["D1 Read"]);
+    assert_eq!(
+        capability.selectors[0]
+            .contract
+            .as_ref()
+            .expect("account pin")
+            .schema,
+        json!({"type":"string","enum":["ca30e922fda7f5578e49873542e4aaca"]})
+    );
+    assert_eq!(
+        capability.selectors[1]
+            .contract
+            .as_ref()
+            .expect("database pin")
+            .schema,
+        json!({"type":"string","enum":["7c282983-2e48-4ea4-9f0d-09b0d718fe65"]})
+    );
+    let schema = capability.request_schema.as_ref().expect("closed schema");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["oneOf"].as_array().expect("phase variants").len(), 3);
+    let encoded = serde_json::to_string(schema).expect("schema JSON");
+    for forbidden in ["\"sql\"", "\"table\"", "\"query\"", "\"output\""] {
+        assert!(!encoded.contains(forbidden), "{forbidden}");
+    }
+    let contract = capability
+        .mln_0143_data_invariants
+        .as_ref()
+        .expect("typed invariant contract");
+    assert_eq!(contract.max_evidence_rows, 256);
+    assert_eq!(contract.probe_rows, 257);
+    assert_eq!(contract.capability_version, 5);
+    assert_eq!(
+        contract.prior_0142_trigger_definition_hash,
+        "sha256:7e68876f488b0117133c09de1cb0bbbd7a5a73ee705dd2888f480a2bdd1531e1"
+    );
+    assert_eq!(
+        contract.validator_contract_hash,
+        "sha256:e2c3ef831cbd18c58823a9577148dfd01c25df99f951d3f822cb99cf7561f992"
+    );
+    assert_eq!(
+        contract
+            .expected_validator_contract_hash()
+            .expect("validator hash"),
+        contract.validator_contract_hash
+    );
+    assert_eq!(
+        contract.fixed_query_sha256,
+        "sha256:5437f47c76377bf228f4b0113784294c880e42a9ef59b5f24a94cb7147e5383c"
+    );
+    assert_eq!(
+        contract.migration_sha256,
+        "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
+    );
+}
+
+#[test]
+fn native_control_overlay_adds_governed_full_d1_export_without_sql_or_restore() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot.get("d1-full-export").expect("D1 export");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Read);
+    assert_eq!(capability.effect, EffectClass::ReadOnly);
+    assert!(!capability.mutating);
+    assert_eq!(capability.permissions, ["D1 Read"]);
+    assert_eq!(
+        capability.path,
+        "/accounts/{account_id}/d1/database/{database_id}/export"
+    );
+    assert_eq!(
+        capability
+            .selectors
+            .iter()
+            .map(|selector| selector.name.as_str())
+            .collect::<Vec<_>>(),
+        ["account_id", "database_id"]
+    );
+    assert!(capability.request_schema.is_none());
+    let encoded = serde_json::to_string(capability).expect("capability JSON");
+    assert!(!encoded.contains("\"sql\""));
+    assert!(!encoded.contains("\"tables\""));
+    assert!(!encoded.contains("\"restore\""));
+    let contract = capability.d1_full_export.as_ref().expect("export contract");
+    assert!(contract.requires_new_mode_0600_file);
+    assert_eq!(contract.max_poll_attempts, 120);
+    assert_eq!(
+        capability.rollback.warning.as_deref(),
+        Some(
+            "The file is a pre-migration snapshot only; applying or restoring it is outside this capability."
+        )
+    );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the closed import catalog test keeps repository, invariant authority, target, and both migrations explicit"
+)]
+fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .get("d1-import-approved-mln-migration")
+        .expect("approved MLN import");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Irreversible);
+    assert_eq!(capability.effect, EffectClass::DataWrite);
+    assert!(capability.mutating);
+    assert_eq!(capability.permissions, ["D1 Write"]);
+    let contract = capability
+        .d1_approved_mln_import
+        .as_ref()
+        .expect("typed import contract");
+    assert_eq!(contract.account_id, "ca30e922fda7f5578e49873542e4aaca");
+    assert_eq!(contract.database_id, "7c282983-2e48-4ea4-9f0d-09b0d718fe65");
+    assert_eq!(contract.repository_id, "github.com/rogu3bear/mln-web");
+    assert_eq!(
+        contract.repository_head,
+        "7cb0327c084ce956d728aa7d9df467cea8ed44fb"
+    );
+    assert_eq!(contract.pre_import_capability_version, 5);
+    assert_eq!(
+        contract.pre_import_validator_contract_hash,
+        "sha256:e2c3ef831cbd18c58823a9577148dfd01c25df99f951d3f822cb99cf7561f992"
+    );
+    assert_eq!(
+        contract.pre_import_fixed_query_sha256,
+        "sha256:5437f47c76377bf228f4b0113784294c880e42a9ef59b5f24a94cb7147e5383c"
+    );
+    assert_eq!(contract.migrations.len(), 2);
+    assert_eq!(
+        contract
+            .migrations
+            .iter()
+            .map(|migration| (
+                migration.migration_id.as_str(),
+                migration.bytes,
+                migration.sha256.as_str(),
+                migration.md5.as_str(),
+                migration.repository_relative_path.as_str(),
+                migration.git_blob_oid.as_str(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "0142",
+                1_031,
+                "07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0",
+                "5dc9f871404bc6aede1dbf8becf881e5",
+                "crates/founder/migrations/d1/0142_document_render_claim_generation.sql",
+                "408607c6fed6a5d9c10e80d6bacb2ee355817953",
+            ),
+            (
+                "0143",
+                9_736,
+                "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d",
+                "bd50b7e05cc13c20f17eb8748472eb4b",
+                "crates/founder/migrations/d1/0143_advisor_final_equity_instrument.sql",
+                "4538523205bc1a3a2e68029aa040a06cd17946a8",
+            ),
+        ]
+    );
+    assert!(capability.rollback.supported);
+    assert_eq!(
+        capability.rollback.strategy.as_deref(),
+        Some("no_automatic_rollback_use_separately_approved_bookmark_restore")
+    );
+    let encoded = serde_json::to_string(capability).expect("capability JSON");
+    assert!(!encoded.contains("\"sql\""));
+    assert!(!encoded.contains("\"protocol\""));
+    for removed in [
+        "pre_snapshot_operation_id",
+        "pre_snapshot_evidence_hash",
+        "pre_export_operation_id",
+        "pre_export_evidence_hash",
+        "pre_bookmark_operation_id",
+        "pre_bookmark_evidence_hash",
+    ] {
+        assert!(
+            !encoded.contains(removed),
+            "forgeable prerequisite `{removed}` must not remain in the closed contract"
+        );
+    }
+    for required in [
+        "pre_recovery_anchor_operation_id",
+        "pre_recovery_anchor_evidence_hash",
+        "pre_recovery_anchor_output_sha256",
+        "pre_recovery_anchor_bookmark_hash",
+    ] {
+        assert!(encoded.contains(required), "missing governed `{required}`");
+    }
+    assert!(
+        capability
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.pointer("/properties/post_0142_anchor_bookmark_hash"))
+            .is_some(),
+        "0143 must name the exact bookmark captured by its governed post-0142 export"
+    );
+}
+
+#[test]
+fn native_control_overlay_adds_closed_poll_only_mln_import_continuation() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .get("d1-resume-approved-mln-import-poll")
+        .expect("poll-only continuation");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Irreversible);
+    assert_eq!(capability.effect, EffectClass::DataWrite);
+    assert!(capability.mutating);
+    assert_eq!(capability.permissions, ["D1 Write"]);
+    let contract = capability
+        .d1_approved_mln_import_poll_resume
+        .as_ref()
+        .expect("typed poll continuation");
+    assert_eq!(
+        contract.root_capability_id,
+        "d1-import-approved-mln-migration"
+    );
+    assert_eq!(contract.max_poll_attempts, 120);
+    assert_eq!(contract.max_timeout_seconds, 30);
+    assert_eq!(
+        capability.request_schema.as_ref().expect("closed request")["required"],
+        json!([
+            "parent_operation_id",
+            "parent_plan_hash",
+            "exhaustion_evidence_hash",
+            "accepted_ingest_evidence_hash",
+            "accepted_bookmark_hash"
+        ])
+    );
+    let encoded = serde_json::to_string(capability).expect("capability JSON");
+    for forbidden in [
+        "\"action\"",
+        "\"current_bookmark\"",
+        "\"source_file\"",
+        "\"sql\"",
+        "\"etag\"",
+        "\"filename\"",
+        "\"upload_url\"",
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "caller/provider control leaked into closed continuation: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn native_control_overlay_adds_exact_mln_0142_terminal_schema_proof() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .get("mln-0142-post-import-schema")
+        .expect("MLN 0142 schema proof");
+    assert_eq!(capability.risk, RiskClass::Read);
+    assert_eq!(capability.effect, EffectClass::ReadOnly);
+    let contract = capability
+        .mln_0142_post_import_schema
+        .as_ref()
+        .expect("typed contract");
+    assert_eq!(
+        contract.migration_sha256,
+        "sha256:07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0"
+    );
+    assert_eq!(
+        contract.trigger_definition_sha256,
+        "sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b"
+    );
+    assert_eq!(contract.trigger_definition.len(), 437);
+    let encoded = serde_json::to_string(capability.request_schema.as_ref().expect("closed schema"))
+        .expect("schema JSON");
+    assert!(!encoded.contains("\"sql\""));
+    assert!(!encoded.contains("prior_0142"));
+}
+
+#[test]
+fn native_control_overlay_adds_exact_bookmark_restore_as_approval_required_recovery() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .get("d1-restore-exact-bookmark")
+        .expect("D1 restore");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Recovery);
+    assert_eq!(capability.effect, EffectClass::DataWrite);
+    assert!(capability.mutating);
+    assert_eq!(capability.permissions, ["D1 Write"]);
+    assert_eq!(
+        capability.path,
+        "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore"
+    );
+    assert_eq!(
+        capability.request_schema.as_ref().expect("closed body")["required"],
+        json!([
+            "target_bookmark",
+            "expected_current_bookmark",
+            "source_operation_id",
+            "source_evidence_hash"
+        ])
+    );
+    assert_eq!(
+        capability.request_schema.as_ref().expect("closed body")["additionalProperties"],
+        false
+    );
+    let encoded = serde_json::to_string(capability.request_schema.as_ref().expect("closed body"))
+        .expect("request schema JSON");
+    assert!(!encoded.contains("\"timestamp\""));
+    assert!(!encoded.contains("\"url\""));
+    assert!(capability.rollback.supported);
 }

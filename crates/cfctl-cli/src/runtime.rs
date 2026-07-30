@@ -7,9 +7,10 @@ use std::{
     env,
     ffi::OsString,
     fs,
+    fs::OpenOptions,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Command as StdCommand, Stdio},
     time::Duration,
 };
 
@@ -25,11 +26,12 @@ use cfctl_auth::{
 use cfctl_catalog::{
     CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1, attach_official_product_knowledge,
     fetch_official, fetch_official_text_feeds, ingest_cli_help, ingest_governed_ui_capabilities,
-    ingest_telemetry_capabilities, refresh_dynamic_mutation_contract,
+    ingest_native_control_capabilities, ingest_telemetry_capabilities,
+    refresh_dynamic_mutation_contract,
 };
 use cfctl_cloudflare::{
-    CallInput, CloudflareError, CloudflareResponseV1, Executor, OperationVerificationV1,
-    R2LogRetrievalCredentials, validate_request_contract,
+    CallInput, CloudflareError, CloudflareResponseV1, D1ImportCheckpointV1, Executor,
+    OperationVerificationV1, R2LogRetrievalCredentials, validate_request_contract,
 };
 use cfctl_core::{
     AdapterStatus, AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1,
@@ -45,13 +47,18 @@ use cfctl_planner::{ImpactContext, PolicyEngine};
 use cfctl_registry::{InventoryProviderV1, OperationIndexRecordV1, Registry};
 use cfctl_storage::{RuntimePaths, StateStore, StoredPlanRecord};
 use cfctl_workspace::{RegisteredRoot, WorkspaceGraph};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{StreamExt, stream};
+use md5::Md5;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::process::Command as ProcessCommand;
 use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub(crate) use crate::telemetry_product::{
     OPERATIONAL_PROOF_PROJECTION_LIMIT, execute_native_workflow, operational_proof_coverage,
@@ -1047,6 +1054,7 @@ async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2> {
     let (mut catalog, feeds) =
         tokio::try_join!(fetch_official(&client), fetch_official_text_feeds(&client))?;
     ingest_telemetry_capabilities(&mut catalog)?;
+    ingest_native_control_capabilities(&mut catalog)?;
     attach_official_product_knowledge(&mut catalog, &feeds)?;
     for (program, version_argument) in [("wrangler", "--version"), ("cloudflared", "version")] {
         if which::which(program).is_ok() {
@@ -1175,6 +1183,22 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         ));
     }
     let is_r2_log_retrieval = capability.r2_log_retrieval.is_some();
+    let is_d1_full_export = capability.d1_full_export.is_some();
+    let is_d1_approved_mln_import = capability.d1_approved_mln_import.is_some();
+    let is_d1_approved_mln_import_poll_resume =
+        capability.d1_approved_mln_import_poll_resume.is_some();
+    if is_d1_approved_mln_import != arguments.source_file.is_some() {
+        return Err(CliError::Input(
+            "the approved MLNavigator D1 import requires exactly one plan-creation-only `--source-file`; no other capability accepts it"
+                .to_owned(),
+        ));
+    }
+    if is_d1_approved_mln_import_poll_resume && arguments.source_file.is_some() {
+        return Err(CliError::Input(
+            "approved MLNavigator import poll continuation derives source authority from its parent and never accepts `--source-file`"
+                .to_owned(),
+        ));
+    }
     if arguments.credential_in.is_some() && !is_r2_log_retrieval {
         return Err(CliError::Input(
             "`--credential-in` is accepted only by the governed R2 log retrieval capability"
@@ -1199,9 +1223,27 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
                 .to_owned(),
         ));
     }
-    if arguments.out.is_some() && capability.analytics_query.is_none() && !is_r2_log_retrieval {
+    if is_d1_full_export && arguments.out.is_none() {
         return Err(CliError::Input(
-            "`--out` is restricted to bounded analytics and governed R2 log retrieval capabilities"
+            "D1 full export requires `--out <new-path>`; the SQL dump is never written to stdout or evidence"
+                .to_owned(),
+        ));
+    }
+    if is_d1_full_export
+        && (arguments.body_json.is_some() || arguments.body_stdin || !arguments.query.is_empty())
+    {
+        return Err(CliError::Input(
+            "D1 full export accepts only account_id and database_id selectors plus `--out`; caller SQL and export filters are not supported"
+                .to_owned(),
+        ));
+    }
+    if arguments.out.is_some()
+        && capability.analytics_query.is_none()
+        && !is_r2_log_retrieval
+        && !is_d1_full_export
+    {
+        return Err(CliError::Input(
+            "`--out` is restricted to bounded analytics, governed R2 log retrieval, and D1 full export"
                 .to_owned(),
         ));
     }
@@ -1212,6 +1254,46 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         ));
     }
     let mut prepared = call_input(&capability, &arguments)?;
+    if is_d1_approved_mln_import {
+        let profiles = ProfilesConfig::load(store)?;
+        let profile = profiles.selected(arguments.profile.as_deref())?;
+        validate_approved_mln_import_prerequisites(
+            store,
+            &capability,
+            &prepared.input,
+            ImportPrerequisiteContext {
+                profile_id: &profile.id,
+                credential_generation_id: profile.credential_generation_id.as_deref(),
+                catalog_hash: &catalog.schema_hash,
+                import_operation_id: None,
+                before: Utc::now(),
+            },
+        )?;
+    }
+    if capability.mln_0142_post_import_schema.is_some() {
+        validate_mln_0142_post_import_schema_input(store, &capability, &prepared.input)?;
+    }
+    let import_stage = arguments
+        .source_file
+        .as_deref()
+        .map(|source| stage_approved_mln_migration(store, &capability, &prepared.input, source))
+        .transpose()?;
+    let resume_poll_authority = if is_d1_approved_mln_import_poll_resume {
+        let profiles = ProfilesConfig::load(store)?;
+        let profile = profiles.selected(arguments.profile.as_deref())?;
+        Some(validate_and_derive_resume_poll_authority(
+            store,
+            &capability,
+            &prepared.input,
+            &profile.id,
+            profile.credential_generation_id.as_deref(),
+            &catalog.schema_hash,
+            Utc::now(),
+            None,
+        )?)
+    } else {
+        None
+    };
     prepare_r2_temporary_credentials_input(&capability, &mut prepared.input)?;
     let security_action = prepare_security_action_input(&capability, &mut prepared.input)?;
     if is_access_application_login_methods_mutation(&capability) {
@@ -1279,7 +1361,13 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
             Value::String(value_out.display().to_string()),
         );
     }
-    let result = create_plan(
+    if let Some(import_stage) = import_stage {
+        adapter_targets.insert("approved_mln_import".to_owned(), import_stage);
+    }
+    if let Some(authority) = resume_poll_authority {
+        adapter_targets.insert("approved_mln_import_poll_resume".to_owned(), authority);
+    }
+    let result = Box::pin(create_plan(
         store,
         &catalog,
         capability,
@@ -1287,7 +1375,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         arguments.profile.as_deref(),
         arguments.account.as_deref(),
         Value::Object(adapter_targets),
-    )
+    ))
     .await;
     if result.is_err()
         && let Some(reference) = secret_ref
@@ -1295,6 +1383,851 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         secrets.delete(&reference)?;
     }
     result
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "source identity and managed staging are one fail-closed boundary"
+)]
+fn stage_approved_mln_migration(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    source: &Path,
+) -> Result<Value> {
+    let contract = capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    if !source.is_absolute()
+        || source.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(CliError::Input(
+            "approved migration source must be an absolute normalized path".to_owned(),
+        ));
+    }
+    let migration_id = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("approved migration_id is missing".to_owned()))?;
+    let approved = contract
+        .migrations
+        .iter()
+        .find(|migration| migration.migration_id == migration_id)
+        .ok_or_else(|| CliError::Input("migration_id is not in the closed catalogue".to_owned()))?;
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| CliError::Input("approved migration source has no parent".to_owned()))?;
+    let discovered_root = PathBuf::from(git_authority_output(
+        source_parent,
+        &["rev-parse", "--show-toplevel"],
+    )?);
+    let canonical_root = fs::canonicalize(&discovered_root).map_err(|source| CliError::Io {
+        path: discovered_root.display().to_string(),
+        source,
+    })?;
+    let expected_source = canonical_root.join(&approved.repository_relative_path);
+    if source != expected_source {
+        return Err(CliError::Input(format!(
+            "migration {migration_id} source must be the exact reviewed repository path `{}`",
+            expected_source.display()
+        )));
+    }
+    let git_common_dir =
+        validate_approved_mln_repository_authority(contract, approved, &canonical_root, None)?;
+    let mut cursor = PathBuf::new();
+    for component in source.components() {
+        cursor.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&cursor).map_err(|source| CliError::Io {
+            path: cursor.display().to_string(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(CliError::Input(format!(
+                "approved migration source has symlink component `{}`",
+                cursor.display()
+            )));
+        }
+    }
+    let mut source_options = OpenOptions::new();
+    source_options.read(true);
+    #[cfg(unix)]
+    source_options.custom_flags(libc::O_NOFOLLOW);
+    let mut source_file = source_options
+        .open(source)
+        .map_err(|source_error| CliError::Io {
+            path: source.display().to_string(),
+            source: source_error,
+        })?;
+    let metadata = source_file
+        .metadata()
+        .map_err(|source_error| CliError::Io {
+            path: source.display().to_string(),
+            source: source_error,
+        })?;
+    if !metadata.is_file() || metadata.len() != approved.bytes {
+        return Err(CliError::Input(format!(
+            "migration {migration_id} source is not a regular {}-byte file",
+            approved.bytes
+        )));
+    }
+    let capacity = usize::try_from(approved.bytes)
+        .map_err(|_| CliError::Input("approved migration size exceeds this host".to_owned()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    source_file
+        .read_to_end(&mut bytes)
+        .map_err(|source_error| CliError::Io {
+            path: source.display().to_string(),
+            source: source_error,
+        })?;
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let md5 = hex::encode(Md5::digest(&bytes));
+    if sha256 != approved.sha256 || md5 != approved.md5 || bytes.len() as u64 != approved.bytes {
+        return Err(CliError::Input(format!(
+            "migration {migration_id} source bytes do not match the approved SHA-256/MD5/size catalogue"
+        )));
+    }
+    let stage_dir = store
+        .paths()
+        .data_dir
+        .join("import-stages")
+        .join(Uuid::new_v4().to_string());
+    fs::create_dir_all(&stage_dir).map_err(|source| CliError::Io {
+        path: stage_dir.display().to_string(),
+        source,
+    })?;
+    #[cfg(unix)]
+    fs::set_permissions(&stage_dir, fs::Permissions::from_mode(0o700)).map_err(|source| {
+        CliError::Io {
+            path: stage_dir.display().to_string(),
+            source,
+        }
+    })?;
+    let stage_path = stage_dir.join(&approved.basename);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let mut stage = options.open(&stage_path).map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    stage.write_all(&bytes).map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    stage.sync_all().map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    drop(stage);
+    let mut staged_options = OpenOptions::new();
+    staged_options.read(true);
+    #[cfg(unix)]
+    staged_options.custom_flags(libc::O_NOFOLLOW);
+    let mut staged_file = staged_options
+        .open(&stage_path)
+        .map_err(|source| CliError::Io {
+            path: stage_path.display().to_string(),
+            source,
+        })?;
+    let staged_metadata = staged_file.metadata().map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    if !staged_metadata.is_file() || staged_metadata.len() != approved.bytes {
+        return Err(CliError::Input(
+            "managed import stage is no longer the reviewed regular file".to_owned(),
+        ));
+    }
+    let mut staged = Vec::with_capacity(capacity);
+    staged_file
+        .read_to_end(&mut staged)
+        .map_err(|source| CliError::Io {
+            path: stage_path.display().to_string(),
+            source,
+        })?;
+    let staged_sha256 = hex::encode(Sha256::digest(&staged));
+    let staged_md5 = hex::encode(Md5::digest(&staged));
+    if staged.len() as u64 != approved.bytes
+        || staged_sha256 != approved.sha256
+        || staged_md5 != approved.md5
+    {
+        return Err(CliError::Input(
+            "managed import stage did not reopen with the reviewed identity; preserve it for inspection and do not plan"
+                .to_owned(),
+        ));
+    }
+    let revalidated_common = validate_approved_mln_repository_authority(
+        contract,
+        approved,
+        &canonical_root,
+        Some(&bytes),
+    )?;
+    if revalidated_common != git_common_dir {
+        return Err(CliError::Input(
+            "reviewed MLN Git common directory changed while staging".to_owned(),
+        ));
+    }
+    let source_authority = json!({
+        "schema_version":1,
+        "repository_id":contract.repository_id,
+        "observed_worktree_root":canonical_root,
+        "observed_git_common_dir":git_common_dir,
+        "head":contract.repository_head,
+        "repository_relative_path":approved.repository_relative_path,
+        "git_blob_oid":approved.git_blob_oid,
+    });
+    Ok(json!({
+        "schema_version":1,
+        "migration_id":migration_id,
+        "catalog_basename":approved.basename,
+        "source_authority":source_authority,
+        "source_authority_hash":hash_value(&source_authority)?,
+        "bytes":approved.bytes,
+        "sha256":format!("sha256:{}", approved.sha256),
+        "md5":approved.md5,
+        "stage_path":stage_path,
+        "stage_lifecycle":"preserve_until_verified_or_explicitly_retired",
+        "target":{
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        },
+        "prerequisites":input.body,
+    }))
+}
+
+fn git_authority_output(repository_root: &Path, arguments: &[&str]) -> Result<String> {
+    let mut command = StdCommand::new("git");
+    command.arg("-C").arg(repository_root).args(arguments);
+    clear_git_authority_environment(&mut command);
+    let output = command.output().map_err(|source| CliError::Io {
+        path: repository_root.display().to_string(),
+        source,
+    })?;
+    if !output.status.success() {
+        return Err(CliError::Input(format!(
+            "reviewed MLN repository authority command `git {}` failed closed",
+            arguments.join(" ")
+        )));
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| CliError::Input("Git authority output was not UTF-8".to_owned()))
+}
+
+fn git_authority_bytes(repository_root: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
+    let mut command = StdCommand::new("git");
+    command.arg("-C").arg(repository_root).args(arguments);
+    clear_git_authority_environment(&mut command);
+    let output = command.output().map_err(|source| CliError::Io {
+        path: repository_root.display().to_string(),
+        source,
+    })?;
+    if !output.status.success() {
+        return Err(CliError::Input(format!(
+            "reviewed MLN repository authority command `git {}` failed closed",
+            arguments.join(" ")
+        )));
+    }
+    Ok(output.stdout)
+}
+
+fn clear_git_authority_environment(command: &mut StdCommand) {
+    for (name, _) in env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn validate_approved_mln_repository_authority(
+    contract: &cfctl_core::D1ApprovedMlnImportContractV1,
+    migration: &cfctl_core::D1ApprovedMlnMigrationV1,
+    root: &Path,
+    expected_bytes: Option<&[u8]>,
+) -> Result<PathBuf> {
+    let canonical_root = fs::canonicalize(root).map_err(|source| CliError::Io {
+        path: root.display().to_string(),
+        source,
+    })?;
+    if canonical_root != root {
+        return Err(CliError::Input(
+            "reviewed MLN repository root is missing, substituted, or non-canonical".to_owned(),
+        ));
+    }
+    let top = git_authority_output(root, &["rev-parse", "--show-toplevel"])?;
+    let head = git_authority_output(root, &["rev-parse", "HEAD"])?;
+    let remote = git_authority_output(root, &["remote", "get-url", "origin"])?;
+    let common = git_authority_output(root, &["rev-parse", "--git-common-dir"])?;
+    let common_path = if Path::new(&common).is_absolute() {
+        PathBuf::from(common)
+    } else {
+        root.join(common)
+    };
+    let canonical_common = fs::canonicalize(&common_path).map_err(|source| CliError::Io {
+        path: common_path.display().to_string(),
+        source,
+    })?;
+    if top != canonical_root.to_string_lossy()
+        || head != contract.repository_head
+        || normalize_reviewed_mln_repository_id(&remote).as_deref()
+            != Some(contract.repository_id.as_str())
+    {
+        return Err(CliError::Input(
+            "reviewed MLN repository identity, canonical worktree root, or HEAD drifted".to_owned(),
+        ));
+    }
+    let relative = migration.repository_relative_path.as_str();
+    let tracked = git_authority_output(root, &["ls-files", "--error-unmatch", "--", relative])?;
+    let blob_spec = format!("{}:{relative}", contract.repository_head);
+    let blob = git_authority_output(root, &["rev-parse", &blob_spec])?;
+    let status =
+        git_authority_output(root, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+    let blob_bytes = git_authority_bytes(root, &["cat-file", "blob", &migration.git_blob_oid])?;
+    if tracked != relative || blob != migration.git_blob_oid || !status.is_empty() {
+        return Err(CliError::Input(
+            "reviewed MLN migration is untracked, dirty, or does not match the pinned HEAD blob"
+                .to_owned(),
+        ));
+    }
+    if expected_bytes.is_some_and(|bytes| bytes != blob_bytes) {
+        return Err(CliError::Input(
+            "reviewed MLN source bytes differ from the exact pinned Git blob".to_owned(),
+        ));
+    }
+    Ok(canonical_common)
+}
+
+fn normalize_reviewed_mln_repository_id(remote: &str) -> Option<String> {
+    match remote {
+        "https://github.com/rogu3bear/mln-web.git"
+        | "https://github.com/rogu3bear/mln-web"
+        | "git@github.com:rogu3bear/mln-web.git"
+        | "git@github.com:rogu3bear/mln-web" => Some("github.com/rogu3bear/mln-web".to_owned()),
+        _ => None,
+    }
+}
+
+fn required_body_string<'a>(body: &'a Map<String, Value>, field: &str) -> Result<&'a str> {
+    body.get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input(format!("approved MLN import requires {field}")))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the closed 0142 then 0143 prerequisite graph is validated as one contract"
+)]
+fn validate_approved_mln_import_prerequisites(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    context: ImportPrerequisiteContext<'_>,
+) -> Result<()> {
+    let contract = capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("approved MLN import body is missing".to_owned()))?;
+    let migration_id = body
+        .get("migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("migration_id is missing".to_owned()))?;
+    let pre_operation = body
+        .get("pre_recovery_anchor_operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .ok_or_else(|| {
+            CliError::Input(
+                "pre_recovery_anchor_operation_id must be a canonical operation id".to_owned(),
+            )
+        })?;
+    let pre_evidence_hash = required_body_string(body, "pre_recovery_anchor_evidence_hash")?;
+    let pre_output_sha256 = required_body_string(body, "pre_recovery_anchor_output_sha256")?;
+    let pre_bookmark_hash = required_body_string(body, "pre_recovery_anchor_bookmark_hash")?;
+    store.read_evidence_value(pre_evidence_hash)?;
+    let expected_target_hash = hash_value(&json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    }))?;
+    let expected_export_request_hash = hash_value(&serde_json::to_value(CallInput {
+        selectors: input.selectors.clone(),
+        query: json!({}),
+        ..CallInput::default()
+    })?)?;
+    let pre_expectation = |before| D1RecoveryAnchorExpectation {
+        operation_id: pre_operation,
+        evidence_hash: pre_evidence_hash,
+        output_sha256: Some(pre_output_sha256),
+        bookmark_hash: pre_bookmark_hash,
+        catalog_hash: context.catalog_hash,
+        request_hash: &expected_export_request_hash,
+        target_scope_hash: &expected_target_hash,
+        account_id: &contract.account_id,
+        profile_id: context.profile_id,
+        credential_generation_id: context.credential_generation_id,
+        after: None,
+        before,
+    };
+    if migration_id == "0142" {
+        validate_exact_d1_recovery_anchor(store, &pre_expectation(context.before))?;
+        if context.import_operation_id == Some(pre_operation) {
+            return Err(CliError::Input(
+                "pre-0142 recovery anchor must be distinct from the import operation".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let prior_operation = body
+        .get("prior_0142_operation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("0143 requires prior_0142_operation_id".to_owned()))?;
+    let prior_hash = body
+        .get("prior_0142_boundary_evidence_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("0143 requires prior_0142_boundary_evidence_hash".to_owned())
+        })?;
+    let prior_proof_operation = body
+        .get("prior_0142_schema_proof_operation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("0143 requires prior_0142_schema_proof_operation_id".to_owned())
+        })?;
+    let prior_verification_hash = body
+        .get("prior_0142_verification_evidence_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("0143 requires prior_0142_verification_evidence_hash".to_owned())
+        })?;
+    let prior_plan = store.load_plan(prior_operation)?;
+    let prior_input: CallInput = serde_json::from_value(prior_plan.input.clone())?;
+    let prior_exact = prior_plan.capability.id == capability.id
+        && mln_0142_terminal_import_state(&prior_plan)
+        && prior_plan.account_id == contract.account_id
+        && prior_input.selectors == input.selectors
+        && prior_input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("migration_id"))
+            .and_then(Value::as_str)
+            == Some("0142");
+    let verification_artifact_matches = prior_plan
+        .transaction_artifact(TransactionStageV1::VerificationResponsePersisted)
+        .and_then(|artifact| artifact.get("evidence_hash"))
+        .and_then(Value::as_str)
+        == Some(prior_verification_hash);
+    let verification_evidence = store.read_evidence_value(prior_verification_hash)?;
+    let verification_receipt_matches = verification_evidence.get("state").and_then(Value::as_str)
+        == Some("verified")
+        && verification_evidence
+            .get("operation_id")
+            .and_then(Value::as_str)
+            == Some(prior_operation)
+        && verification_evidence
+            .get("provider_complete_evidence_hash")
+            .and_then(Value::as_str)
+            == Some(prior_hash)
+        && verification_evidence
+            .get("post_import_operation_id")
+            .and_then(Value::as_str)
+            == Some(prior_proof_operation);
+    let prior_boundary = exact_durable_provider_complete_boundary(store, prior_operation)?;
+    let boundary_matches = prior_boundary.evidence_hash == prior_hash;
+    let expected_final_bookmark_hash = prior_boundary
+        .checkpoint
+        .pointer("/receipt/final_bookmark")
+        .and_then(Value::as_str)
+        .and_then(|bookmark| hash_value(&Value::String(bookmark.to_owned())).ok());
+    let schema_proofs = store
+        .list_operational_proofs()?
+        .into_iter()
+        .filter(|proof| {
+            proof.mln_0142_governed_execution().is_some_and(|binding| {
+                proof.capability_id == "mln-0142-post-import-schema"
+                    && binding.operation_id == prior_proof_operation
+                    && binding.import_operation_id == prior_operation
+                    && binding.import_boundary_evidence_hash == prior_hash
+                    && binding.import_plan_hash == prior_plan.content_hash
+                    && binding.import_source_sha256
+                        == "sha256:07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0"
+                    && binding.target_scope_hash == expected_target_hash
+                    && Some(binding.final_bookmark_hash.as_str())
+                        == expected_final_bookmark_hash.as_deref()
+                    && binding.completion_status == "completed"
+            })
+        })
+        .collect::<Vec<_>>();
+    if !prior_exact
+        || !verification_artifact_matches
+        || !verification_receipt_matches
+        || schema_proofs.len() != 1
+        || !boundary_matches
+    {
+        return Err(CliError::Input(
+            "0143 requires one terminal verified 0142 import joined to its exact schema proof, verification evidence, and provider boundary"
+                .to_owned(),
+        ));
+    }
+    validate_exact_d1_recovery_anchor(store, &pre_expectation(prior_plan.created_at))?;
+    if pre_operation == prior_operation || context.import_operation_id == Some(pre_operation) {
+        return Err(CliError::Input(
+            "pre-0142 recovery anchor must be distinct from both import operations".to_owned(),
+        ));
+    }
+    let anchor_operation = body
+        .get("post_0142_anchor_operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .ok_or_else(|| {
+            CliError::Input("0143 requires a distinct post-0142 recovery anchor".to_owned())
+        })?;
+    if anchor_operation == pre_operation
+        || anchor_operation == prior_operation
+        || context.import_operation_id == Some(anchor_operation)
+    {
+        return Err(CliError::Input(
+            "0143 post-0142 recovery anchor must be distinct from both imports and the pre-0142 anchor"
+                .to_owned(),
+        ));
+    }
+    let anchor_evidence_hash = body
+        .get("post_0142_anchor_evidence_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("0143 requires post_0142_anchor_evidence_hash".to_owned())
+        })?;
+    let anchor_bookmark_hash = body
+        .get("post_0142_anchor_bookmark_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("0143 requires post_0142_anchor_bookmark_hash".to_owned())
+        })?;
+    store.read_evidence_value(anchor_evidence_hash)?;
+    let closed_at = prior_plan
+        .transaction_journal
+        .iter()
+        .find(|checkpoint| checkpoint.stage == TransactionStageV1::Closed)
+        .map(|checkpoint| checkpoint.recorded_at)
+        .ok_or_else(|| {
+            CliError::Input("verified 0142 omitted its terminal checkpoint".to_owned())
+        })?;
+    let cutoff = context.before;
+    let expected_profile = context.profile_id;
+    let current_generation = context.credential_generation_id;
+    let prior_generation = schema_proofs[0]
+        .mln_0142_governed_execution()
+        .map(|binding| binding.credential_generation_id.as_str())
+        .ok_or_else(|| CliError::Input("verified 0142 schema proof lost its binding".to_owned()))?;
+    if current_generation != Some(prior_generation) {
+        return Err(CliError::Input(
+            "0143 selected credential generation drifted from verified 0142".to_owned(),
+        ));
+    }
+    let anchor_expectation = D1RecoveryAnchorExpectation {
+        operation_id: anchor_operation,
+        evidence_hash: anchor_evidence_hash,
+        output_sha256: None,
+        bookmark_hash: anchor_bookmark_hash,
+        catalog_hash: context.catalog_hash,
+        request_hash: &expected_export_request_hash,
+        target_scope_hash: &expected_target_hash,
+        account_id: &contract.account_id,
+        profile_id: expected_profile,
+        credential_generation_id: current_generation,
+        after: Some(closed_at),
+        before: cutoff,
+    };
+    let anchor_completed_at = validate_exact_d1_recovery_anchor(store, &anchor_expectation)?;
+    let invariant_operation = body
+        .get("pre_import_invariant_operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .ok_or_else(|| {
+            CliError::Input(
+                "0143 requires a canonical pre_import_invariant_operation_id".to_owned(),
+            )
+        })?;
+    let invariant_evidence_hash = required_body_string(body, "pre_import_invariant_evidence_hash")?;
+    store
+        .read_evidence_value(invariant_evidence_hash)
+        .map_err(|error| {
+            CliError::Input(format!(
+                "pre_import_invariant_evidence_hash does not resolve to immutable evidence: {error}"
+            ))
+        })?;
+    let invariant_request_hash = hash_value(&serde_json::to_value(CallInput {
+        selectors: input.selectors.clone(),
+        query: json!({}),
+        body: Some(json!({"migration_id":"0143","phase":"pre_import"})),
+        ..CallInput::default()
+    })?)?;
+    validate_exact_mln_0143_pre_import(
+        store,
+        &Mln0143PreImportExpectation {
+            operation_id: invariant_operation,
+            evidence_hash: invariant_evidence_hash,
+            catalog_hash: context.catalog_hash,
+            request_hash: &invariant_request_hash,
+            target_scope_hash: &expected_target_hash,
+            account_id: &contract.account_id,
+            profile_id: context.profile_id,
+            credential_generation_id: context.credential_generation_id,
+            capability_version: contract.pre_import_capability_version,
+            validator_contract_hash: &contract.pre_import_validator_contract_hash,
+            fixed_query_sha256: &contract.pre_import_fixed_query_sha256,
+            after: anchor_completed_at,
+            before: context.before,
+        },
+    )?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ImportPrerequisiteContext<'a> {
+    profile_id: &'a str,
+    credential_generation_id: Option<&'a str>,
+    catalog_hash: &'a str,
+    import_operation_id: Option<&'a str>,
+    before: chrono::DateTime<Utc>,
+}
+
+#[derive(Clone, Copy)]
+struct D1RecoveryAnchorExpectation<'a> {
+    operation_id: &'a str,
+    evidence_hash: &'a str,
+    output_sha256: Option<&'a str>,
+    bookmark_hash: &'a str,
+    catalog_hash: &'a str,
+    request_hash: &'a str,
+    target_scope_hash: &'a str,
+    account_id: &'a str,
+    profile_id: &'a str,
+    credential_generation_id: Option<&'a str>,
+    after: Option<chrono::DateTime<Utc>>,
+    before: chrono::DateTime<Utc>,
+}
+
+#[derive(Clone, Copy)]
+struct Mln0143PreImportExpectation<'a> {
+    operation_id: &'a str,
+    evidence_hash: &'a str,
+    catalog_hash: &'a str,
+    request_hash: &'a str,
+    target_scope_hash: &'a str,
+    account_id: &'a str,
+    profile_id: &'a str,
+    credential_generation_id: Option<&'a str>,
+    capability_version: u8,
+    validator_contract_hash: &'a str,
+    fixed_query_sha256: &'a str,
+    after: chrono::DateTime<Utc>,
+    before: chrono::DateTime<Utc>,
+}
+
+fn d1_recovery_anchor_matches(
+    proof: &OperationalProofV1,
+    expected: &D1RecoveryAnchorExpectation<'_>,
+) -> bool {
+    proof
+        .d1_full_export_governed_execution()
+        .is_some_and(|binding| {
+            binding.operation_id == expected.operation_id
+                && proof.capability_id == "d1-full-export"
+                && proof.evidence.content_hash == expected.evidence_hash
+                && binding.manifest_evidence_hash == expected.evidence_hash
+                && expected
+                    .output_sha256
+                    .is_none_or(|value| binding.output_file_sha256 == value)
+                && binding.at_bookmark_hash == expected.bookmark_hash
+                && proof.catalog_hash == expected.catalog_hash
+                && binding.catalog_hash == expected.catalog_hash
+                && proof.input_hash == expected.request_hash
+                && binding.request_hash == expected.request_hash
+                && binding.target_scope_hash == expected.target_scope_hash
+                && proof.account_id.as_deref() == Some(expected.account_id)
+                && proof.profile_id.as_deref() == Some(expected.profile_id)
+                && binding.profile_id == expected.profile_id
+                && Some(binding.credential_generation_id.as_str())
+                    == expected.credential_generation_id
+                && binding.completion_status == "completed"
+                && expected
+                    .after
+                    .is_none_or(|after| binding.completed_at > after)
+                && binding.completed_at < expected.before
+        })
+}
+
+fn validate_exact_d1_recovery_anchor(
+    store: &StateStore,
+    expected: &D1RecoveryAnchorExpectation<'_>,
+) -> Result<chrono::DateTime<Utc>> {
+    let matches = store
+        .list_operational_proofs()?
+        .into_iter()
+        .filter(|proof| d1_recovery_anchor_matches(proof, expected))
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(CliError::Input(
+            "approved MLN import requires exactly one completed governed D1 full-export anchor bound to the exact operation, evidence, output, bookmark, catalog, input, target, profile, credential generation, and chronology"
+                .to_owned(),
+        ));
+    }
+    matches[0]
+        .d1_full_export_governed_execution()
+        .map(|binding| binding.completed_at)
+        .ok_or_else(|| CliError::Input("governed D1 export lost its execution binding".to_owned()))
+}
+
+fn mln_0143_pre_import_authority_matches(
+    proof: &OperationalProofV1,
+    expected: &Mln0143PreImportExpectation<'_>,
+) -> bool {
+    proof.mln_0143_governed_execution().is_some_and(|binding| {
+        let expected_profile_identity = hash_value(&json!({
+            "profile_id":expected.profile_id,
+            "credential_generation_id":expected.credential_generation_id,
+        }))
+        .ok();
+        proof.capability_id == "mln-0143-data-invariants"
+            && proof.outcome == OperationalProofOutcomeV1::Succeeded
+            && proof.evidence.class == EvidenceClass::LiveRead
+            && proof.catalog_hash == expected.catalog_hash
+            && binding.catalog_hash == expected.catalog_hash
+            && proof.input_hash == expected.request_hash
+            && binding.request_hash == expected.request_hash
+            && proof.account_id.as_deref() == Some(expected.account_id)
+            && proof.profile_id.as_deref() == Some(expected.profile_id)
+            && proof.credential_generation_id.as_deref() == expected.credential_generation_id
+            && Some(binding.credential_generation_id.as_str()) == expected.credential_generation_id
+            && Some(binding.profile_identity_hash.as_str()) == expected_profile_identity.as_deref()
+            && binding.capability_id == "mln-0143-data-invariants"
+            && binding.capability_version == expected.capability_version
+            && binding.validator_contract_hash == expected.validator_contract_hash
+            && binding.fixed_query_sha256 == expected.fixed_query_sha256
+            && binding.target_scope_hash == expected.target_scope_hash
+            && binding.phase == "pre_import"
+            && binding.completion_status == "completed"
+            && binding.cross_operation_lineage_hash.is_none()
+            && binding.completed_at == proof.observed_at
+            && binding.completed_at > expected.after
+            && binding.completed_at < expected.before
+    })
+}
+
+fn mln_0143_pre_import_matches(
+    proof: &OperationalProofV1,
+    expected: &Mln0143PreImportExpectation<'_>,
+) -> bool {
+    mln_0143_pre_import_authority_matches(proof, expected)
+        && proof.evidence.content_hash == expected.evidence_hash
+        && proof.mln_0143_governed_execution().is_some_and(|binding| {
+            binding.operation_id == expected.operation_id
+                && binding.manifest_evidence_hash == expected.evidence_hash
+        })
+}
+
+fn validate_exact_mln_0143_pre_import(
+    store: &StateStore,
+    expected: &Mln0143PreImportExpectation<'_>,
+) -> Result<()> {
+    let proofs = store.list_operational_proofs()?;
+    let current_authority = proofs
+        .iter()
+        .filter(|proof| mln_0143_pre_import_authority_matches(proof, expected))
+        .count();
+    let selected = proofs
+        .iter()
+        .filter(|proof| mln_0143_pre_import_matches(proof, expected))
+        .count();
+    if current_authority != 1 || selected != 1 {
+        return Err(CliError::Input(
+            "0143 requires exactly one selected completed pre_import proof bound to the current catalog, closed request, target, profile, credential generation, validator/query authority, and post-export-to-plan chronology; this ordered evidence does not prove absence of out-of-band provider writes"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn mln_0142_terminal_import_state(plan: &PlanV1) -> bool {
+    plan.status == PlanStatus::Verified && plan.transaction_stage == TransactionStageV1::Closed
+}
+
+fn validate_mln_0142_post_import_schema_input(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let contract = capability
+        .mln_0142_post_import_schema
+        .as_ref()
+        .ok_or_else(|| CliError::Input("MLN 0142 schema contract is missing".to_owned()))?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("MLN 0142 schema proof body is missing".to_owned()))?;
+    let field = |name: &str| {
+        body.get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::Input(format!("MLN 0142 schema proof requires `{name}`")))
+    };
+    let operation_id = field("import_operation_id")?;
+    let boundary_hash = field("import_boundary_evidence_hash")?;
+    let source_sha256 = field("import_source_sha256")?;
+    let plan_hash = field("import_plan_hash")?;
+    let final_bookmark_hash = field("final_bookmark_hash")?;
+    let import_plan = store.load_plan(operation_id)?;
+    let import_input: CallInput = serde_json::from_value(import_plan.input.clone())?;
+    let exact_plan = import_plan.capability.id == "d1-import-approved-mln-migration"
+        && import_plan.status == PlanStatus::Running
+        && import_plan.transaction_stage == TransactionStageV1::SecretSinkPersisted
+        && import_plan.content_hash == plan_hash
+        && import_plan.account_id == contract.account_id
+        && import_input.selectors == input.selectors
+        && import_input
+            .body
+            .as_ref()
+            .and_then(|value| value.get("migration_id"))
+            .and_then(Value::as_str)
+            == Some("0142");
+    let boundary = exact_durable_provider_complete_boundary(store, operation_id)?;
+    let boundary_matches = boundary.evidence_hash == boundary_hash
+        && boundary
+            .checkpoint
+            .pointer("/receipt/source_sha256")
+            .and_then(Value::as_str)
+            == Some(source_sha256)
+        && boundary
+            .checkpoint
+            .pointer("/receipt/final_bookmark")
+            .and_then(Value::as_str)
+            .and_then(|bookmark| hash_value(&Value::String(bookmark.to_owned())).ok())
+            .as_deref()
+            == Some(final_bookmark_hash);
+    if !exact_plan
+        || !boundary_matches
+        || source_sha256 != contract.migration_sha256
+        || field("trigger_definition_sha256")? != contract.trigger_definition_sha256
+    {
+        return Err(CliError::Input(
+            "MLN 0142 schema proof must bind the exact running import plan, provider boundary, source, target, final bookmark, and trigger definition"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 const SECURITY_IP_RULE_CREATE_ID: &str = "security-response-create-expiring-ip-access-rule";
@@ -3876,6 +4809,519 @@ struct ExecutedRead {
     credential_generation_id: Option<String>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the versioned parent evidence contract stays explicit and auditable as one fail-closed gate"
+)]
+fn mln_0143_parent_manifests(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<Vec<(String, Value)>> {
+    let Some(contract) = capability.mln_0143_data_invariants.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if contract.capability_version != 5
+        || !contract
+            .expected_validator_contract_hash()
+            .is_ok_and(|hash| hash == contract.validator_contract_hash)
+    {
+        return Err(CliError::Input(
+            "MLN 0143 validator contract is stale or internally inconsistent".to_owned(),
+        ));
+    }
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("MLN 0143 invariant input must be an object".to_owned()))?;
+    let phase = body
+        .get("phase")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("MLN 0143 invariant phase is missing".to_owned()))?;
+    validate_mln_cross_operation_lineage(store, contract, input, phase)?;
+    let required: &[(&str, &str)] = match phase {
+        "pre_import" => &[],
+        "post_import" => &[("pre_import_evidence_hash", "pre_import")],
+        "post_restore" => &[
+            ("pre_import_evidence_hash", "pre_import"),
+            ("post_import_evidence_hash", "post_import"),
+        ],
+        _ => {
+            return Err(CliError::Input(
+                "MLN 0143 invariant phase is unsupported".to_owned(),
+            ));
+        }
+    };
+    let target_scope_hash = hash_value(&json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    }))?;
+    required
+        .iter()
+        .map(|(field, expected_phase)| {
+            let evidence_hash = body.get(*field).and_then(Value::as_str).ok_or_else(|| {
+                CliError::Input(format!("MLN 0143 `{phase}` requires `{field}`"))
+            })?;
+            let matching_proofs = store
+                .list_operational_proofs()?
+                .into_iter()
+                .filter(|proof| {
+                    proof.evidence.content_hash == evidence_hash
+                        && proof.mln_0143_governed_execution().is_some_and(|binding| {
+                            binding.capability_id == capability.id
+                                && binding.capability_version == contract.capability_version
+                                && binding.validator_contract_hash
+                                    == contract.validator_contract_hash
+                                && binding.fixed_query_sha256 == contract.fixed_query_sha256
+                                && binding.catalog_hash == catalog.schema_hash
+                                && binding.target_scope_hash == target_scope_hash
+                                && binding.phase == *expected_phase
+                                && binding.manifest_evidence_hash == evidence_hash
+                                && binding.completion_status == "completed"
+                        })
+                })
+                .collect::<Vec<_>>();
+            if matching_proofs.len() != 1 {
+                return Err(CliError::Input(format!(
+                    "MLN 0143 parent evidence `{field}` requires exactly one matching completed governed execution proof"
+                )));
+            }
+            let stored = store.read_evidence_value(evidence_hash)?;
+            let manifest = stored.get("result").unwrap_or(&stored);
+            let expected_table_hash = if *expected_phase == "post_import" {
+                contract.post_table_definition_hash.as_str()
+            } else {
+                contract.pre_table_definition_hash.as_str()
+            };
+            let assertions = manifest.get("assertions").and_then(Value::as_object);
+            let exact_assertions = [
+                "old_table_absent",
+                "unique_hash_index_present",
+                "event_index_exact_non_unique_shape",
+                "document_index_exact_non_unique_shape",
+                "foreign_key_check_empty",
+                "duplicate_hash_groups_zero",
+                "invalid_evidence_kinds_zero",
+                "invalid_advanced_events_zero",
+                "prior_0142_terminal_trigger_present",
+            ];
+            let expected_trigger_hashes = if *expected_phase == "pre_import" {
+                json!([])
+            } else {
+                json!(contract.trigger_definition_hashes)
+            };
+            let projection = manifest.get("projection").and_then(Value::as_object);
+            let query = manifest.get("query").and_then(Value::as_object);
+            let valid = manifest.get("capability_id").and_then(Value::as_str)
+                == Some("mln-0143-data-invariants")
+                && manifest.get("capability_version").and_then(Value::as_u64)
+                    == Some(u64::from(contract.capability_version))
+                && manifest.get("migration_id").and_then(Value::as_str) == Some("0143")
+                && manifest.get("migration_sha256").and_then(Value::as_str)
+                    == Some(contract.migration_sha256.as_str())
+                && manifest
+                    .get("validator_contract_hash")
+                    .and_then(Value::as_str)
+                    == Some(contract.validator_contract_hash.as_str())
+                && manifest.get("target_scope_hash").and_then(Value::as_str)
+                    == Some(target_scope_hash.as_str())
+                && manifest.get("phase").and_then(Value::as_str) == Some(*expected_phase)
+                && manifest.get("complete").and_then(Value::as_bool) == Some(true)
+                && manifest.get("semantic_schema_hash").and_then(Value::as_str)
+                    == Some(expected_table_hash)
+                && manifest.get("packet_hash").and_then(Value::as_str).is_some()
+                && manifest.get("packet_count").and_then(Value::as_u64).is_some()
+                && manifest
+                    .get("packet_non_target_hash")
+                    .and_then(Value::as_str)
+                    .is_some()
+                && manifest
+                    .get("packet_non_target_count")
+                    .and_then(Value::as_u64)
+                    .is_some()
+                && manifest
+                    .get("prior_0142_trigger_definition_hash")
+                    .and_then(Value::as_str)
+                    == Some(contract.prior_0142_trigger_definition_hash.as_str())
+                && assertions.is_some_and(|assertions| {
+                    assertions.len() == exact_assertions.len()
+                        && exact_assertions.iter().all(|field| {
+                            assertions.get(*field).and_then(Value::as_bool) == Some(true)
+                        })
+                })
+                && projection.is_some_and(|projection| {
+                    projection.len() == 3
+                        && projection.get("digest").and_then(Value::as_str).is_some()
+                        && projection.get("count").and_then(Value::as_u64).is_some()
+                        && projection
+                            .get("counts_by_kind")
+                            .is_some_and(Value::is_array)
+                })
+                && manifest.get("trigger_definition_hashes") == Some(&expected_trigger_hashes)
+                && query.is_some_and(|query| {
+                    query.len() == 9
+                        && query.get("sha256").and_then(Value::as_str)
+                            == Some(contract.fixed_query_sha256.as_str())
+                        && [
+                            "row_limit",
+                            "probe_rows",
+                            "byte_limit",
+                            "timeout_seconds",
+                            "received_rows",
+                            "provider_rows_read",
+                        ]
+                        .iter()
+                        .all(|field| query.get(*field).and_then(Value::as_u64).is_some())
+                        && query
+                            .get("provider_duration")
+                            .and_then(Value::as_f64)
+                            .is_some()
+                        && query.get("bounds_saturated").and_then(Value::as_bool)
+                            == Some(false)
+                })
+                && manifest.pointer("/query/sha256").and_then(Value::as_str)
+                    == Some(contract.fixed_query_sha256.as_str())
+                && manifest.pointer("/query/bounds_saturated").and_then(Value::as_bool)
+                    == Some(false);
+            if !valid {
+                return Err(CliError::Input(format!(
+                    "MLN 0143 parent evidence `{field}` does not match the required capability, migration, target, completeness, or phase"
+                )));
+            }
+            Ok((evidence_hash.to_owned(), manifest.clone()))
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Mln0143RestoreAnchorJoin {
+    input_source_operation_id: String,
+    receipt_source_operation_id: String,
+    input_source_evidence_hash: String,
+    receipt_source_evidence_hash: String,
+    input_target_bookmark_hash: String,
+    requested_bookmark_hash: String,
+    observed_bookmark_hash: String,
+    account_id: String,
+    profile_id: String,
+    catalog_hash: String,
+    credential_generation_id: String,
+    anchor_completed_at: chrono::DateTime<Utc>,
+    restore_created_at: chrono::DateTime<Utc>,
+}
+
+fn mln_0143_restore_anchor_matches(
+    observed: &Mln0143RestoreAnchorJoin,
+    expected: &Mln0143RestoreAnchorJoin,
+) -> bool {
+    observed == expected && observed.anchor_completed_at < observed.restore_created_at
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "cross-operation import and restore joins are one fail-closed lineage gate"
+)]
+fn validate_mln_cross_operation_lineage(
+    store: &StateStore,
+    contract: &cfctl_core::Mln0143DataInvariantsContractV1,
+    input: &CallInput,
+    phase: &str,
+) -> Result<()> {
+    if phase == "pre_import" {
+        return Ok(());
+    }
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("MLN lineage body is missing".to_owned()))?;
+    let field = |name: &str| {
+        body.get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| CliError::Input(format!("MLN lineage requires `{name}`")))
+    };
+    let import_operation_id = field("import_operation_id")?;
+    let boundary_hash = field("import_boundary_evidence_hash")?;
+    let import_source_sha256 = field("import_source_sha256")?;
+    let import_plan_hash = field("import_plan_hash")?;
+    let import_plan = store.load_plan(import_operation_id)?;
+    let import_input: CallInput = serde_json::from_value(import_plan.input.clone())?;
+    let StoredPlanRecord::Current(import_plan_v2) =
+        store.load_stored_plan_record(import_operation_id)?
+    else {
+        return Err(CliError::Input(
+            "MLN lineage import operation is not a current immutable PlanV2".to_owned(),
+        ));
+    };
+    let exact_plan = import_plan.capability.id == "d1-import-approved-mln-migration"
+        && import_plan.status == PlanStatus::Verified
+        && import_plan.transaction_stage == TransactionStageV1::Closed
+        && import_plan.account_id == contract.account_id
+        && import_plan.content_hash == import_plan_hash
+        && import_plan_v2.plan.content_hash == import_plan.content_hash
+        && import_input.selectors == input.selectors
+        && import_input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("migration_id"))
+            .and_then(Value::as_str)
+            == Some("0143");
+    let boundary = exact_durable_provider_complete_boundary(store, import_operation_id)?;
+    let boundary_matches = boundary.evidence_hash == boundary_hash
+        && boundary
+            .checkpoint
+            .pointer("/receipt/source_sha256")
+            .and_then(Value::as_str)
+            == Some(import_source_sha256);
+    if !exact_plan
+        || import_source_sha256
+            != "sha256:9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
+        || !boundary_matches
+    {
+        return Err(CliError::Input(
+            "post-import lineage does not resolve to exactly one same-target approved 0143 provider-complete boundary"
+                .to_owned(),
+        ));
+    }
+    if phase != "post_restore" {
+        return Ok(());
+    }
+    let restore_operation_id = field("restore_operation_id")?;
+    let restore_evidence_hash = field("restore_evidence_hash")?;
+    let restore_plan = store.load_plan(restore_operation_id)?;
+    let StoredPlanRecord::Current(restore_plan_v2) =
+        store.load_stored_plan_record(restore_operation_id)?
+    else {
+        return Err(CliError::Input(
+            "post_restore operation is not a current immutable PlanV2".to_owned(),
+        ));
+    };
+    let restore_input: CallInput = serde_json::from_value(restore_plan.input.clone())?;
+    let import_body = import_input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input("0143 import lost its closed prerequisite body".to_owned())
+        })?;
+    let import_field = |name: &str| {
+        import_body
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| CliError::Input(format!("0143 import omitted `{name}`")))
+    };
+    let anchor_operation_id = import_field("post_0142_anchor_operation_id")?;
+    let anchor_evidence_hash = import_field("post_0142_anchor_evidence_hash")?;
+    let anchor_bookmark_hash = import_field("post_0142_anchor_bookmark_hash")?;
+    let prior_0142_operation_id = import_field("prior_0142_operation_id")?;
+    let prior_0142_plan = store.load_plan(prior_0142_operation_id)?;
+    let prior_0142_closed_at = prior_0142_plan
+        .transaction_journal
+        .iter()
+        .find(|checkpoint| checkpoint.stage == TransactionStageV1::Closed)
+        .map(|checkpoint| checkpoint.recorded_at)
+        .ok_or_else(|| CliError::Input("0142 import lost its Closed checkpoint".to_owned()))?;
+    let target_scope_hash = hash_value(&json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    }))?;
+    let anchor_request_hash = hash_value(&serde_json::to_value(CallInput {
+        selectors: input.selectors.clone(),
+        query: json!({}),
+        ..CallInput::default()
+    })?)?;
+    let anchor_completed_at = validate_exact_d1_recovery_anchor(
+        store,
+        &D1RecoveryAnchorExpectation {
+            operation_id: anchor_operation_id,
+            evidence_hash: anchor_evidence_hash,
+            output_sha256: None,
+            bookmark_hash: anchor_bookmark_hash,
+            catalog_hash: &import_plan.catalog_hash,
+            request_hash: &anchor_request_hash,
+            target_scope_hash: &target_scope_hash,
+            account_id: &contract.account_id,
+            profile_id: &import_plan.profile_id,
+            credential_generation_id: Some(import_plan_v2.pins.credential_generation_id.as_str()),
+            after: Some(prior_0142_closed_at),
+            before: import_plan.created_at,
+        },
+    )?;
+    let restore_evidence = store.read_evidence_value(restore_evidence_hash)?;
+    let receipt = restore_evidence
+        .pointer("/result/_cfctl")
+        .or_else(|| restore_evidence.pointer("/result/result/_cfctl"))
+        .ok_or_else(|| {
+            CliError::Input("restore evidence omitted the exact bookmark receipt".to_owned())
+        })?;
+    let hash_bookmark = |value: Option<&str>| {
+        value
+            .map(|value| hash_value(&Value::String(value.to_owned())))
+            .transpose()
+    };
+    let previous_hash = hash_bookmark(receipt.get("previous_bookmark").and_then(Value::as_str))?
+        .ok_or_else(|| CliError::Input("restore previous bookmark is missing".to_owned()))?;
+    let requested_hash = hash_bookmark(receipt.get("target_bookmark").and_then(Value::as_str))?
+        .ok_or_else(|| CliError::Input("restore requested bookmark is missing".to_owned()))?;
+    let observed_hash = hash_bookmark(receipt.get("returned_bookmark").and_then(Value::as_str))?
+        .ok_or_else(|| CliError::Input("restore observed bookmark is missing".to_owned()))?;
+    let receipt_source_operation_id = receipt.get("source_operation_id").and_then(Value::as_str);
+    let receipt_source_evidence_hash = receipt.get("source_evidence_hash").and_then(Value::as_str);
+    let restore_body = restore_input.body.as_ref();
+    let observed_anchor_join = Mln0143RestoreAnchorJoin {
+        input_source_operation_id: restore_body
+            .and_then(|body| body.get("source_operation_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        receipt_source_operation_id: receipt_source_operation_id.unwrap_or_default().to_owned(),
+        input_source_evidence_hash: restore_body
+            .and_then(|body| body.get("source_evidence_hash"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        receipt_source_evidence_hash: receipt_source_evidence_hash.unwrap_or_default().to_owned(),
+        input_target_bookmark_hash: restore_body
+            .and_then(|body| body.get("target_bookmark"))
+            .and_then(Value::as_str)
+            .and_then(|bookmark| hash_value(&Value::String(bookmark.to_owned())).ok())
+            .unwrap_or_default(),
+        requested_bookmark_hash: requested_hash.clone(),
+        observed_bookmark_hash: observed_hash.clone(),
+        account_id: restore_plan.account_id.clone(),
+        profile_id: restore_plan.profile_id.clone(),
+        catalog_hash: restore_plan.catalog_hash.clone(),
+        credential_generation_id: restore_plan_v2.pins.credential_generation_id.clone(),
+        anchor_completed_at,
+        restore_created_at: restore_plan.created_at,
+    };
+    let expected_anchor_join = Mln0143RestoreAnchorJoin {
+        input_source_operation_id: anchor_operation_id.to_owned(),
+        receipt_source_operation_id: anchor_operation_id.to_owned(),
+        input_source_evidence_hash: anchor_evidence_hash.to_owned(),
+        receipt_source_evidence_hash: anchor_evidence_hash.to_owned(),
+        input_target_bookmark_hash: anchor_bookmark_hash.to_owned(),
+        requested_bookmark_hash: anchor_bookmark_hash.to_owned(),
+        observed_bookmark_hash: anchor_bookmark_hash.to_owned(),
+        account_id: import_plan.account_id.clone(),
+        profile_id: import_plan.profile_id.clone(),
+        catalog_hash: import_plan.catalog_hash.clone(),
+        credential_generation_id: import_plan_v2.pins.credential_generation_id.clone(),
+        anchor_completed_at,
+        restore_created_at: restore_plan.created_at,
+    };
+    let boundary_evidence_matches = restore_plan
+        .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+        .and_then(|artifact| artifact.get("apply_evidence_hash"))
+        .and_then(Value::as_str)
+        == Some(restore_evidence_hash);
+    let exact_restore = restore_plan.capability.id == "d1-restore-exact-bookmark"
+        && restore_plan.status == PlanStatus::Verified
+        && restore_plan.transaction_stage == TransactionStageV1::Closed
+        && restore_plan.account_id == contract.account_id
+        && restore_plan.profile_id == import_plan.profile_id
+        && restore_plan.catalog_hash == import_plan.catalog_hash
+        && restore_plan_v2.plan.content_hash == restore_plan.content_hash
+        && restore_plan_v2.pins.catalog_hash == import_plan_v2.pins.catalog_hash
+        && mln_0143_restore_anchor_matches(&observed_anchor_join, &expected_anchor_join)
+        && restore_input.selectors == input.selectors
+        && boundary_evidence_matches
+        && previous_hash == field("restore_previous_bookmark_hash")?
+        && requested_hash == field("restore_requested_bookmark_hash")?
+        && observed_hash == field("restore_observed_bookmark_hash")?;
+    if !exact_restore {
+        return Err(CliError::Input(
+            "post_restore lineage does not resolve to the exact approved verified bookmark restore and import boundary"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mln_0143_lineage_result(
+    input: &CallInput,
+    current: &Value,
+    parents: &[(String, Value)],
+) -> Result<()> {
+    let Some(phase) = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("phase"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    if phase == "pre_import" {
+        return Ok(());
+    }
+    let (_, pre) = parents.first().ok_or_else(|| {
+        CliError::Input("MLN 0143 post phase omitted its pre-import parent".to_owned())
+    })?;
+    for pointer in [
+        "/projection/digest",
+        "/projection/count",
+        "/projection/counts_by_kind",
+    ] {
+        if current.pointer(pointer) != pre.pointer(pointer) {
+            return Err(CliError::Input(
+                "MLN 0143 evidence projection drifted from the bound pre-import baseline"
+                    .to_owned(),
+            ));
+        }
+    }
+    if phase == "post_import"
+        && (current.get("packet_non_target_hash") != pre.get("packet_non_target_hash")
+            || current.get("packet_non_target_count") != pre.get("packet_non_target_count"))
+    {
+        return Err(CliError::Input(
+            "MLN 0143 packet configuration drifted outside the authorized advisor delta".to_owned(),
+        ));
+    }
+    if phase == "post_restore" {
+        if current.get("packet_hash") != pre.get("packet_hash")
+            || current.get("packet_count") != pre.get("packet_count")
+        {
+            return Err(CliError::Input(
+                "MLN 0143 restored packet configuration differs from the pre-import baseline"
+                    .to_owned(),
+            ));
+        }
+        let (post_hash, post) = parents.get(1).ok_or_else(|| {
+            CliError::Input("MLN 0143 post-restore omitted its post-import parent".to_owned())
+        })?;
+        let pre_hash = &parents[0].0;
+        if post
+            .pointer("/lineage/pre_import_evidence_hash")
+            .and_then(Value::as_str)
+            != Some(pre_hash)
+            || input
+                .body
+                .as_ref()
+                .and_then(|body| body.get("post_import_evidence_hash"))
+                .and_then(Value::as_str)
+                != Some(post_hash)
+        {
+            return Err(CliError::Input(
+                "MLN 0143 post-import evidence does not name the same pre-import baseline"
+                    .to_owned(),
+            ));
+        }
+        for pointer in ["/semantic_schema_hash", "/packet_hash"] {
+            if current.pointer(pointer) != pre.pointer(pointer) {
+                return Err(CliError::Input(
+                    "MLN 0143 restored schema or packet digest differs from the pre-import baseline"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ExecutedRead {
     fn without_credential(envelope: ResultEnvelopeV2) -> Self {
         Self {
@@ -3941,6 +5387,7 @@ async fn execute_read(
         }
         AdapterStatus::Native | AdapterStatus::DynamicApi => {}
     }
+    let mln_0143_parents = mln_0143_parent_manifests(store, catalog, capability, input)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
     let credential_generation_id = credential_generation_for_read(profile)?;
@@ -3968,6 +5415,9 @@ async fn execute_read(
             .execute_read(capability, input, &credential)
             .await?
     };
+    if capability.mln_0143_data_invariants.is_some() {
+        validate_mln_0143_lineage_result(input, &response.result, &mln_0143_parents)?;
+    }
     let mut sanitized =
         redact_response_for_capability(capability, &serde_json::to_value(&response)?);
     if let Some(object) = sanitized.as_object_mut() {
@@ -3983,11 +5433,45 @@ async fn execute_read(
     envelope.account_id = account_id;
     envelope.ok = response.success;
     envelope.performed = true;
-    envelope.verification.state = VerificationState::NotApplicable;
-    envelope.verification.basis = Some(format!(
-        "live Cloudflare read pinned to catalog {}",
-        catalog.schema_hash
-    ));
+    if capability.mln_0143_data_invariants.is_some() {
+        let verified = response.result.get("complete").and_then(Value::as_bool) == Some(true)
+            && response
+                .result
+                .pointer("/query/bounds_saturated")
+                .and_then(Value::as_bool)
+                == Some(false);
+        envelope.verification.state = if verified {
+            VerificationState::Passed
+        } else {
+            VerificationState::Failed
+        };
+        envelope.verification.basis =
+            Some("closed MLN 0143 phase assertions and bounded completeness manifest".to_owned());
+    } else if capability.d1_full_export.is_some() {
+        let verified = response
+            .result
+            .pointer("/output_file/hash_matches")
+            .and_then(Value::as_bool)
+            == Some(true)
+            && response
+                .result
+                .pointer("/output_file/exists")
+                .and_then(Value::as_bool)
+                == Some(true);
+        envelope.verification.state = if verified {
+            VerificationState::Passed
+        } else {
+            VerificationState::Failed
+        };
+        envelope.verification.basis =
+            Some("same output file exists and its SHA-256 matches the streamed receipt".to_owned());
+    } else {
+        envelope.verification.state = VerificationState::NotApplicable;
+        envelope.verification.basis = Some(format!(
+            "live Cloudflare read pinned to catalog {}",
+            catalog.schema_hash
+        ));
+    }
     // A non-2xx Cloudflare response is `Ok` at the transport layer but a failure
     // to the agent. Without an ErrorV1 it would surface as `ok:false` with no
     // guidance; attach a status-specific next step so the agent knows the move.
@@ -10491,6 +11975,10 @@ fn cancel_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnve
     Ok(envelope)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "execution revalidates capability-specific immutable authority before dispatch"
+)]
 async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
     let _lock = store.lock_plan(&selector.operation_id)?;
     let catalog = ensure_catalog(store).await?;
@@ -10520,6 +12008,44 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     preflight_secret_sink(&plan)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(Some(&plan.profile_id))?;
+    if plan.capability.d1_approved_mln_import.is_some() {
+        let execution_input: CallInput = serde_json::from_value(plan.input.clone())?;
+        validate_approved_mln_import_prerequisites(
+            store,
+            &plan.capability,
+            &execution_input,
+            ImportPrerequisiteContext {
+                profile_id: &plan.profile_id,
+                credential_generation_id: profile.credential_generation_id.as_deref(),
+                catalog_hash: &plan.catalog_hash,
+                import_operation_id: Some(&plan.operation_id),
+                before: plan.created_at,
+            },
+        )?;
+    }
+    if plan.capability.d1_approved_mln_import_poll_resume.is_some() {
+        let execution_input: CallInput = serde_json::from_value(plan.input.clone())?;
+        let derived = validate_and_derive_resume_poll_authority(
+            store,
+            &plan.capability,
+            &execution_input,
+            &plan.profile_id,
+            profile.credential_generation_id.as_deref(),
+            &plan.catalog_hash,
+            plan.created_at,
+            Some(&plan.operation_id),
+        )?;
+        if plan
+            .targets
+            .pointer("/adapter/approved_mln_import_poll_resume")
+            != Some(&derived)
+        {
+            return Err(CliError::Input(
+                "poll continuation authority drifted after planning; do not cross the provider boundary"
+                    .to_owned(),
+            ));
+        }
+    }
     validate_plan_v2_runtime_pins(store, &plan, profile)?;
     if is_r2_temporary_credentials_operation_identity(&plan.capability)
         && profile.kind != ProfileKind::ApiToken
@@ -10555,7 +12081,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         &mut plan,
         TransactionStageV1::BoundaryAttemptPersisted,
     )?;
-    execute_consumed_plan(
+    Box::pin(execute_consumed_plan(
         store,
         &catalog,
         &mut plan,
@@ -10563,7 +12089,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         &credential,
         &secrets,
         live_precondition_evidence,
-    )
+    ))
     .await
 }
 
@@ -10635,7 +12161,7 @@ async fn run_plan_under_standing_authority(
     let standing_evidence =
         admit_standing_plan(store, &mut plan, &authority_snapshot, &execution_input)?;
     let admitted_authority_id = authority_snapshot.authority_id.clone();
-    let mut envelope = execute_consumed_plan(
+    let mut envelope = Box::pin(execute_consumed_plan(
         store,
         &catalog,
         &mut plan,
@@ -10643,7 +12169,7 @@ async fn run_plan_under_standing_authority(
         &credential,
         &secrets,
         live_precondition_evidence,
-    )
+    ))
     .await?;
     envelope.evidence.push(standing_evidence);
     if let Some(result) = envelope.result.as_object_mut() {
@@ -11124,14 +12650,14 @@ async fn execute_consumed_plan(
         }
         return result;
     }
-    let mut envelope = execute_api_plan(
+    let mut envelope = Box::pin(execute_api_plan(
         store,
         &catalog.schema_hash,
         plan,
         execution_input,
         credential,
         secrets,
-    )
+    ))
     .await?;
     prepend_live_precondition_evidence(&mut envelope, evidence);
     Ok(envelope)
@@ -12946,6 +14472,28 @@ async fn execute_api_plan(
     secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    if plan.capability.d1_approved_mln_import_poll_resume.is_some() {
+        return execute_approved_mln_import_poll_resume_plan(
+            store,
+            &executor,
+            plan,
+            execution_input,
+            credential,
+            secrets,
+        )
+        .await;
+    }
+    if plan.capability.d1_approved_mln_import.is_some() {
+        return execute_approved_mln_import_plan(
+            store,
+            &executor,
+            plan,
+            execution_input,
+            credential,
+            secrets,
+        )
+        .await;
+    }
     let response_result = executor
         .execute_consumed_plan_with_input(plan, catalog_hash, credential, execution_input)
         .await;
@@ -13005,6 +14553,3104 @@ async fn execute_api_plan(
         performed,
         finalization_error.as_ref(),
     ))
+}
+
+async fn execute_approved_mln_import_poll_resume_plan(
+    store: &StateStore,
+    executor: &Executor,
+    plan: &mut PlanV1,
+    execution_input: &CallInput,
+    credential: &AuthCredential,
+    secrets: &dyn SecretStore,
+) -> Result<ResultEnvelopeV2> {
+    let bookmark = plan
+        .targets
+        .pointer("/adapter/approved_mln_import_poll_resume/accepted_bookmark")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Input("poll continuation bookmark is missing".to_owned()))?
+        .to_owned();
+    let checkpoint_operation_id = plan.operation_id.clone();
+    let response = match executor
+        .execute_d1_approved_mln_import_poll_resume(
+            plan,
+            execution_input,
+            credential,
+            &bookmark,
+            |checkpoint| persist_d1_import_checkpoint(store, &checkpoint_operation_id, checkpoint),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(approved_mln_import_execution_error_envelope(
+                store, plan, error, secrets,
+            ));
+        }
+    };
+    let (response_value, apply_evidence, lineage_evidence) =
+        match process_api_boundary_response(store, plan, &response, secrets)? {
+            ApiBoundaryResponseOutcome::Ready {
+                response_value,
+                apply_evidence,
+                lineage_evidence,
+            } => (response_value, apply_evidence, lineage_evidence),
+            ApiBoundaryResponseOutcome::Recovery(envelope) => return Ok(envelope),
+        };
+    if !response.success {
+        return Ok(post_boundary_failure_envelope(
+            plan,
+            response_value,
+            Some(apply_evidence),
+            lineage_evidence,
+            &CliError::Input(
+                "Cloudflare did not complete the approved poll continuation".to_owned(),
+            ),
+            true,
+            "the poll-only boundary was crossed but provider completion was not proven",
+        ));
+    }
+    if let Err(error) = exact_durable_resume_provider_complete_boundary(store, plan) {
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+        return Ok(post_boundary_failure_envelope(
+            plan,
+            response_value,
+            Some(apply_evidence),
+            lineage_evidence,
+            &error,
+            true,
+            "the poll-only boundary was crossed but exact durable provider completion was not proven",
+        ));
+    }
+    plan.status = PlanStatus::Running;
+    store.save_plan(plan)?;
+    let mut envelope =
+        ResultEnvelopeV2::success("plans run", response_value).with_evidence(apply_evidence);
+    envelope.ok = false;
+    envelope.performed = true;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.policy_decision = Some(plan.policy.clone());
+    envelope.verification.state = VerificationState::Pending;
+    envelope.verification.basis = Some(
+        "poll-child provider_complete is durable and joined to the root import; governed post-import proof remains required"
+            .to_owned(),
+    );
+    envelope.error = Some(ErrorV1 {
+        code: "CFCTL_D1_IMPORT_POST_IMPORT_PROOF_REQUIRED".to_owned(),
+        message: "D1 import completed through a poll child but is not publication proof".to_owned(),
+        next_step: plan
+            .targets
+            .pointer("/adapter/approved_mln_import_poll_resume/root_operation_id")
+            .and_then(Value::as_str)
+            .map(|root| {
+                format!(
+                    "Run the governed migration-specific post_import read bound to root operation {root}, then run `cfctl plans rectify {root}`."
+                )
+            }),
+    });
+    if let Some(evidence) = lineage_evidence {
+        envelope.evidence.push(evidence);
+    }
+    Ok(envelope)
+}
+
+#[derive(Debug, Clone)]
+struct DurableProviderCompleteBoundary {
+    evidence_hash: String,
+    checkpoint: Value,
+}
+
+fn trusted_native_capability(capability_id: &str) -> Result<CapabilityV1> {
+    let mut trusted_catalog = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "native://control".to_owned(),
+        source_hash: "sha256:native-control".to_owned(),
+        schema_hash: String::new(),
+        capabilities: BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut trusted_catalog)?;
+    trusted_catalog
+        .capabilities
+        .remove(capability_id)
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "trusted native capability declaration `{capability_id}` is missing"
+            ))
+        })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "trusted root admission joins native request, governed prerequisites, source, and stage"
+)]
+fn validate_trusted_root_import_plan(store: &StateStore, plan_v2: &PlanV2) -> Result<()> {
+    plan_v2.validate()?;
+    let plan = &plan_v2.plan;
+    let trusted = trusted_native_capability("d1-import-approved-mln-migration")?;
+    if plan.capability != trusted
+        || plan_v2.pins.catalog_hash != plan.catalog_hash
+        || plan.precondition_hashes.get("catalog") != Some(&plan.catalog_hash)
+    {
+        return Err(CliError::Input(
+            "approved MLN import does not match the trusted native catalog declaration".to_owned(),
+        ));
+    }
+    let contract = trusted
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("trusted import contract is missing".to_owned()))?;
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let migration_id = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("trusted import migration id is missing".to_owned()))?;
+    let migration = contract
+        .migrations
+        .iter()
+        .find(|migration| migration.migration_id == migration_id)
+        .ok_or_else(|| CliError::Input("trusted import migration is not catalogued".to_owned()))?;
+    if input.selectors
+        != json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        })
+        || input.query != json!({})
+        || input.if_match.is_some()
+        || input.if_none_match.is_some()
+    {
+        return Err(CliError::Input(
+            "approved MLN import input is not the exact trusted migration request".to_owned(),
+        ));
+    }
+    preflight_call_input(&trusted, &input, None)?;
+    validate_approved_mln_import_prerequisites(
+        store,
+        &trusted,
+        &input,
+        ImportPrerequisiteContext {
+            profile_id: &plan.profile_id,
+            credential_generation_id: Some(&plan_v2.pins.credential_generation_id),
+            catalog_hash: &plan.catalog_hash,
+            import_operation_id: Some(&plan.operation_id),
+            before: plan.created_at,
+        },
+    )?;
+    let stage = plan
+        .targets
+        .pointer("/adapter/approved_mln_import")
+        .ok_or_else(|| CliError::Input("trusted import managed stage is missing".to_owned()))?;
+    let source = stage
+        .get("source_authority")
+        .ok_or_else(|| CliError::Input("trusted import source authority is missing".to_owned()))?;
+    let target = json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    });
+    let source_hash = hash_value(source)?;
+    if plan.account_id != contract.account_id
+        || source.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || source
+            .get("observed_worktree_root")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || source
+            .get("observed_git_common_dir")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || stage.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || stage.get("migration_id").and_then(Value::as_str) != Some(migration_id)
+        || stage.get("catalog_basename").and_then(Value::as_str)
+            != Some(migration.basename.as_str())
+        || stage.get("bytes").and_then(Value::as_u64) != Some(migration.bytes)
+        || stage.get("sha256").and_then(Value::as_str)
+            != Some(format!("sha256:{}", migration.sha256).as_str())
+        || stage.get("md5").and_then(Value::as_str) != Some(migration.md5.as_str())
+        || stage.get("target") != Some(&target)
+        || stage.get("source_authority_hash").and_then(Value::as_str) != Some(source_hash.as_str())
+        || stage
+            .get("stage_path")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || stage.get("stage_lifecycle").and_then(Value::as_str)
+            != Some("preserve_until_verified_or_explicitly_retired")
+        || stage.get("prerequisites") != input.body.as_ref()
+        || source.get("repository_id").and_then(Value::as_str)
+            != Some(contract.repository_id.as_str())
+        || source.get("head").and_then(Value::as_str) != Some(contract.repository_head.as_str())
+        || source
+            .get("repository_relative_path")
+            .and_then(Value::as_str)
+            != Some(migration.repository_relative_path.as_str())
+        || source.get("git_blob_oid").and_then(Value::as_str)
+            != Some(migration.git_blob_oid.as_str())
+    {
+        return Err(CliError::Input(
+            "approved MLN import source authority or managed stage drifted from the trusted migration"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "canonical child admission joins journal, response, evidence, and terminal outcome"
+)]
+fn validate_canonical_poll_child_lifecycle(
+    store: &StateStore,
+    current: &PlanV2,
+) -> Result<Option<DurableProviderCompleteBoundary>> {
+    let plan = &current.plan;
+    plan.validate_transaction_journal()?;
+    let terminal_status = match plan.status {
+        PlanStatus::Running => PlanStatus::Running,
+        PlanStatus::RectificationRequired => PlanStatus::RectificationRequired,
+        _ => {
+            return Err(CliError::Input(
+                "poll child has no authentic terminal provider outcome".to_owned(),
+            ));
+        }
+    };
+    let expected = [
+        (TransactionStageV1::ApprovalPersisted, PlanStatus::Approved),
+        (
+            TransactionStageV1::ConsumptionPersisted,
+            PlanStatus::Consumed,
+        ),
+        (
+            TransactionStageV1::BoundaryAttemptPersisted,
+            PlanStatus::Consumed,
+        ),
+        (
+            TransactionStageV1::BoundaryResponsePersisted,
+            terminal_status,
+        ),
+        (TransactionStageV1::SecretSinkPersisted, terminal_status),
+    ];
+    if plan.transaction_stage != TransactionStageV1::SecretSinkPersisted
+        || expected.into_iter().any(|(stage, status)| {
+            plan.transaction_journal
+                .iter()
+                .filter(|checkpoint| checkpoint.stage == stage && checkpoint.plan_status == status)
+                .count()
+                != 1
+        })
+    {
+        return Err(CliError::Input(
+            "poll child journal does not match the exact production boundary lifecycle".to_owned(),
+        ));
+    }
+    let response_artifact = plan
+        .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+        .ok_or_else(|| {
+            CliError::Input("poll child boundary response artifact is missing".to_owned())
+        })?;
+    let secret_artifact = plan
+        .transaction_artifact(TransactionStageV1::SecretSinkPersisted)
+        .ok_or_else(|| {
+            CliError::Input("poll child secret lifecycle artifact is missing".to_owned())
+        })?;
+    if secret_artifact
+        != &json!({
+            "completed":true,
+            "failure":Value::Null,
+            "input_cleanup":{"required":false,"completed":true},
+            "output_sink":{"required":false,"completed":true,"create_new":false,
+                "format":Value::Null,"unix_mode":if cfg!(unix) { Value::String("0600".to_owned()) } else { Value::Null }},
+            "path":Value::Null,
+        })
+    {
+        return Err(CliError::Input(
+            "poll child secret lifecycle artifact drifted".to_owned(),
+        ));
+    }
+    if terminal_status == PlanStatus::Running {
+        let boundary = exact_durable_resume_provider_complete_boundary(store, plan)?;
+        let apply_hash = response_artifact
+            .get("apply_evidence_hash")
+            .and_then(Value::as_str)
+            .filter(|hash| !hash.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "completed poll child response artifact lacks apply evidence".to_owned(),
+                )
+            })?;
+        let apply_response = store.read_evidence_value(apply_hash)?;
+        let receipt = boundary
+            .checkpoint
+            .get("receipt")
+            .ok_or_else(|| CliError::Input("provider completion receipt is missing".to_owned()))?;
+        let exact_response = response_artifact.get("success").and_then(Value::as_bool)
+            == Some(true)
+            && response_artifact.get("http_status").and_then(Value::as_u64) == Some(200)
+            && apply_response.get("status").and_then(Value::as_u64) == Some(200)
+            && apply_response.get("success").and_then(Value::as_bool) == Some(true)
+            && apply_response
+                .get("errors")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            && apply_response.pointer("/result/_cfctl") == Some(receipt)
+            && apply_response
+                .pointer("/result/type")
+                .and_then(Value::as_str)
+                == Some("import")
+            && apply_response
+                .pointer("/result/status")
+                .and_then(Value::as_str)
+                == Some("complete")
+            && apply_response
+                .pointer("/result/success")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && apply_response
+                .pointer("/result/at_bookmark")
+                .and_then(Value::as_str)
+                == receipt.get("at_bookmark").and_then(Value::as_str)
+            && apply_response
+                .pointer("/result/result/final_bookmark")
+                .and_then(Value::as_str)
+                == receipt.get("final_bookmark").and_then(Value::as_str);
+        if !exact_response {
+            return Err(CliError::Input(
+                "completed poll child apply evidence does not match provider completion".to_owned(),
+            ));
+        }
+        Ok(Some(boundary))
+    } else {
+        let exhaustion = exact_resume_poll_exhaustion(store, plan)?;
+        if response_artifact
+            != &json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":"poll_in_progress_exhausted",
+                "receipt_available":true,
+                "poll_exhaustion_evidence_hash":exhaustion.exhaustion_evidence.content_hash,
+                "accepted_ingest_evidence_hash":exhaustion.accepted_ingest_evidence.content_hash,
+            })
+        {
+            return Err(CliError::Input(
+                "exhausted poll child lacks its exact exhaustion response artifact".to_owned(),
+            ));
+        }
+        Ok(None)
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fail-closed join authenticates every stored-plan, stage, ingest, and terminal receipt field"
+)]
+fn exact_durable_provider_complete_boundary(
+    store: &StateStore,
+    operation_id: &str,
+) -> Result<DurableProviderCompleteBoundary> {
+    let StoredPlanRecord::Current(plan_v2) = store.load_stored_plan_record(operation_id)? else {
+        return Err(CliError::Input(
+            "durable provider completion requires the exact immutable PlanV2".to_owned(),
+        ));
+    };
+    let plan = &plan_v2.plan;
+    validate_trusted_root_import_plan(store, &plan_v2)?;
+    if plan.operation_id != operation_id
+        || plan.profile_id.is_empty()
+        || plan.catalog_hash.is_empty()
+        || plan_v2.pins.catalog_hash != plan.catalog_hash
+        || plan_v2.pins.credential_generation_id.is_empty()
+        || plan.precondition_hashes.get("catalog") != Some(&plan.catalog_hash)
+    {
+        return Err(CliError::Input(
+            "durable provider completion lost its plan, catalog, profile, or credential binding"
+                .to_owned(),
+        ));
+    }
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let migration_id = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("import migration identity is missing".to_owned()))?;
+    let migration = contract
+        .migrations
+        .iter()
+        .find(|migration| migration.migration_id == migration_id)
+        .ok_or_else(|| CliError::Input("managed import migration is not catalogued".to_owned()))?;
+    let staged = plan
+        .targets
+        .pointer("/adapter/approved_mln_import")
+        .ok_or_else(|| CliError::Input("managed import stage binding is missing".to_owned()))?;
+    let source_authority = staged
+        .get("source_authority")
+        .ok_or_else(|| CliError::Input("managed source authority is missing".to_owned()))?;
+    let expected_source_authority_hash = hash_value(source_authority)?;
+    let expected_stage_identity_hash = hash_value(staged)?;
+    if source_authority
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        != Some(1)
+        || source_authority
+            .get("repository_id")
+            .and_then(Value::as_str)
+            != Some(contract.repository_id.as_str())
+        || source_authority.get("head").and_then(Value::as_str)
+            != Some(contract.repository_head.as_str())
+        || source_authority
+            .get("repository_relative_path")
+            .and_then(Value::as_str)
+            != Some(migration.repository_relative_path.as_str())
+        || source_authority.get("git_blob_oid").and_then(Value::as_str)
+            != Some(migration.git_blob_oid.as_str())
+        || source_authority
+            .get("observed_worktree_root")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || source_authority
+            .get("observed_git_common_dir")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || staged.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || staged.get("source_authority_hash").and_then(Value::as_str)
+            != Some(expected_source_authority_hash.as_str())
+        || staged.get("migration_id").and_then(Value::as_str) != Some(migration_id)
+        || staged.get("catalog_basename").and_then(Value::as_str)
+            != Some(migration.basename.as_str())
+        || staged.pointer("/target/account_id").and_then(Value::as_str)
+            != Some(contract.account_id.as_str())
+        || staged
+            .pointer("/target/database_id")
+            .and_then(Value::as_str)
+            != Some(contract.database_id.as_str())
+        || staged.get("sha256").and_then(Value::as_str)
+            != Some(format!("sha256:{}", migration.sha256).as_str())
+        || staged.get("md5").and_then(Value::as_str) != Some(migration.md5.as_str())
+        || staged.get("bytes").and_then(Value::as_u64) != Some(migration.bytes)
+        || staged
+            .get("stage_path")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || staged.get("stage_lifecycle").and_then(Value::as_str)
+            != Some("preserve_until_verified_or_explicitly_retired")
+        || staged.get("prerequisites") != input.body.as_ref()
+    {
+        return Err(CliError::Input(
+            "durable provider completion lost its exact managed source or stage identity"
+                .to_owned(),
+        ));
+    }
+    let target = json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    });
+    let input_hash = hash_value(&plan.input)?;
+    let checkpoints = store.read_d1_import_checkpoints(operation_id)?;
+    let provider_complete = checkpoints
+        .iter()
+        .filter(|(_, checkpoint)| {
+            checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+        })
+        .collect::<Vec<_>>();
+    if provider_complete.is_empty() {
+        return exact_linear_poll_child_provider_complete(store, plan);
+    }
+    if provider_complete.len() != 1 {
+        return Err(CliError::Input(
+            "approved MLN import requires exactly one total provider_complete checkpoint"
+                .to_owned(),
+        ));
+    }
+    let accepted_ingest_bookmarks =
+        exact_accepted_ingest_bookmarks(store, plan, &checkpoints, &target, &input_hash);
+    if accepted_ingest_bookmarks.len() != 1 {
+        return Err(CliError::Input(
+            "provider completion requires exactly one immutable accepted-ingest authority"
+                .to_owned(),
+        ));
+    }
+    let (hash, checkpoint) = provider_complete[0];
+    let final_bookmark = checkpoint
+        .pointer("/receipt/final_bookmark")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let accepted_bookmark = accepted_ingest_bookmarks.first().map(String::as_str);
+    let exact = checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && checkpoint.get("operation_id").and_then(Value::as_str) == Some(operation_id)
+        && checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+        && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+        && checkpoint
+            .get("rectification_required")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && checkpoint
+            .pointer("/receipt/provider")
+            .and_then(Value::as_str)
+            == Some("cloudflare")
+        && checkpoint
+            .pointer("/receipt/effect")
+            .and_then(Value::as_str)
+            == Some("d1_import_provider_complete")
+        && checkpoint
+            .pointer("/receipt/response_action")
+            .and_then(Value::as_str)
+            == Some("poll")
+        && checkpoint
+            .pointer("/receipt/no_replay")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && checkpoint.pointer("/receipt/state").and_then(Value::as_str)
+            == Some("provider_complete")
+        && checkpoint
+            .pointer("/receipt/provider_status")
+            .and_then(Value::as_str)
+            == Some("complete")
+        && checkpoint
+            .pointer("/receipt/provider_success")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && checkpoint
+            .pointer("/receipt/migration_id")
+            .and_then(Value::as_str)
+            == Some(migration_id)
+        && checkpoint.pointer("/receipt/target") == Some(&target)
+        && checkpoint
+            .pointer("/receipt/plan_input_hash")
+            .and_then(Value::as_str)
+            == Some(input_hash.as_str())
+        && checkpoint
+            .pointer("/receipt/source_sha256")
+            .and_then(Value::as_str)
+            == Some(format!("sha256:{}", migration.sha256).as_str())
+        && checkpoint
+            .pointer("/receipt/source_md5")
+            .and_then(Value::as_str)
+            == Some(migration.md5.as_str())
+        && checkpoint
+            .pointer("/receipt/source_bytes")
+            .and_then(Value::as_u64)
+            == Some(migration.bytes)
+        && checkpoint
+            .pointer("/receipt/source_authority_hash")
+            .and_then(Value::as_str)
+            == Some(expected_source_authority_hash.as_str())
+        && checkpoint
+            .pointer("/receipt/stage_identity_hash")
+            .and_then(Value::as_str)
+            == Some(expected_stage_identity_hash.as_str())
+        && checkpoint.pointer("/receipt/prerequisites") == input.body.as_ref()
+        && checkpoint
+            .pointer("/receipt/at_bookmark")
+            .and_then(Value::as_str)
+            == accepted_bookmark
+        && final_bookmark.is_some();
+    if !exact {
+        return Err(CliError::Input(
+            "approved MLN import lacks exact durable provider completion".to_owned(),
+        ));
+    }
+    if store.read_evidence_value(hash)? != *checkpoint {
+        return Err(CliError::Input(
+            "provider_complete evidence does not match its immutable checkpoint".to_owned(),
+        ));
+    }
+    Ok(DurableProviderCompleteBoundary {
+        evidence_hash: hash.clone(),
+        checkpoint: checkpoint.clone(),
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear child completion joins every immutable root and parent authority pin"
+)]
+fn exact_linear_poll_child_provider_complete(
+    store: &StateStore,
+    root: &PlanV1,
+) -> Result<DurableProviderCompleteBoundary> {
+    let canonical_capability = trusted_native_capability("d1-resume-approved-mln-import-poll")?;
+    let canonical_contract_hash = hash_value(&serde_json::to_value(&canonical_capability)?)?;
+    let root_v2 = store.load_plan_v2(&root.operation_id)?;
+    validate_trusted_root_import_plan(store, &root_v2)?;
+    if root_v2.plan != *root {
+        return Err(CliError::Input(
+            "root import projection does not match its canonical PlanV2".to_owned(),
+        ));
+    }
+    let root_contract = root
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("root approved import contract is missing".to_owned()))?;
+    let canonical_contract = canonical_capability
+        .d1_approved_mln_import_poll_resume
+        .as_ref()
+        .ok_or_else(|| {
+            CliError::Input("trusted poll continuation contract is missing".to_owned())
+        })?;
+    let root_target = json!({
+        "account_id":root_contract.account_id,
+        "database_id":root_contract.database_id,
+    });
+    if root.account_id != root_contract.account_id
+        || canonical_contract.account_id != root_contract.account_id
+        || canonical_contract.database_id != root_contract.database_id
+        || root.targets.pointer("/adapter/approved_mln_import/target") != Some(&root_target)
+    {
+        return Err(CliError::Input(
+            "root, managed stage, and trusted poll continuation target drifted".to_owned(),
+        ));
+    }
+    let discovered = store
+        .list_plans()?
+        .into_iter()
+        .filter(|candidate| {
+            candidate.capability.id == "d1-resume-approved-mln-import-poll"
+                && candidate
+                    .targets
+                    .pointer("/adapter/approved_mln_import_poll_resume/root_operation_id")
+                    .and_then(Value::as_str)
+                    == Some(root.operation_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let children = discovered
+        .into_iter()
+        .map(|projection| {
+            let StoredPlanRecord::Current(current) =
+                store.load_stored_plan_record(&projection.operation_id)?
+            else {
+                return Err(CliError::Input(
+                    "every root-claiming poll child must have an authentic PlanV2 sidecar"
+                        .to_owned(),
+                ));
+            };
+            if serde_json::to_value(&projection)? != serde_json::to_value(&current.plan)?
+                || current.pins.catalog_hash != current.plan.catalog_hash
+                || current.pins.catalog_hash != root_v2.pins.catalog_hash
+                || current.pins.credential_generation_id
+                    != root_v2.pins.credential_generation_id
+                || current.plan.capability.id != "d1-resume-approved-mln-import-poll"
+                || current.plan.capability != canonical_capability
+                || current.plan.approval.is_none()
+            {
+                return Err(CliError::Input(
+                    "poll child PlanV2 projection, pins, approval, consumption, or boundary lifecycle is invalid"
+                        .to_owned(),
+                ));
+            }
+            let authority = current
+                .plan
+                .targets
+                .pointer("/adapter/approved_mln_import_poll_resume")
+                .ok_or_else(|| CliError::Input("poll child authority is missing".to_owned()))?;
+            let contract_hash = hash_value(&serde_json::to_value(&current.plan.capability)?)?;
+            let contract = current
+                .plan
+                .capability
+                .d1_approved_mln_import_poll_resume
+                .as_ref()
+                .ok_or_else(|| CliError::Input("poll child contract is missing".to_owned()))?;
+            let target = json!({
+                "account_id":contract.account_id,
+                "database_id":contract.database_id,
+            });
+            let input: CallInput = serde_json::from_value(current.plan.input.clone())?;
+            let body = input
+                .body
+                .as_ref()
+                .and_then(Value::as_object)
+                .ok_or_else(|| CliError::Input("poll child input body is missing".to_owned()))?;
+            let exact_input_fields = [
+                "parent_operation_id",
+                "parent_plan_hash",
+                "exhaustion_evidence_hash",
+                "accepted_ingest_evidence_hash",
+                "accepted_bookmark_hash",
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+            if authority.get("profile_id").and_then(Value::as_str)
+                != Some(root.profile_id.as_str())
+                || current.plan.profile_id != root.profile_id
+                || current.plan.account_id != root.account_id
+                || authority
+                    .get("credential_generation_id")
+                    .and_then(Value::as_str)
+                    != Some(root_v2.pins.credential_generation_id.as_str())
+                || authority.get("catalog_hash").and_then(Value::as_str)
+                    != Some(root.catalog_hash.as_str())
+                || authority
+                    .get("capability_contract_hash")
+                    .and_then(Value::as_str)
+                    != Some(canonical_contract_hash.as_str())
+                || contract_hash != canonical_contract_hash
+                || authority.get("root_operation_id").and_then(Value::as_str)
+                    != Some(root.operation_id.as_str())
+                || authority.get("root_plan_hash").and_then(Value::as_str)
+                    != Some(root.content_hash.as_str())
+                || authority.get("root_input") != Some(&root.input)
+                || authority.get("root_stage")
+                    != root.targets.pointer("/adapter/approved_mln_import")
+                || authority.get("target") != Some(&target)
+                || input.selectors != target
+                || !input
+                    .query
+                    .as_object()
+                    .is_none_or(serde_json::Map::is_empty)
+                || input.if_match.is_some()
+                || input.if_none_match.is_some()
+                || body.keys().map(String::as_str).collect::<BTreeSet<_>>()
+                    != exact_input_fields
+                || body.get("parent_operation_id") != authority.get("parent_operation_id")
+                || body.get("parent_plan_hash") != authority.get("parent_plan_hash")
+                || body.get("exhaustion_evidence_hash")
+                    != authority.get("parent_exhaustion_evidence_hash")
+                || body.get("accepted_ingest_evidence_hash")
+                    != authority.get("accepted_ingest_evidence_hash")
+                || body.get("accepted_bookmark_hash")
+                    != authority.get("accepted_bookmark_hash")
+            {
+                return Err(CliError::Input(
+                    "poll child profile, credential, catalog, contract, input, or root authority drifted"
+                        .to_owned(),
+                ));
+            }
+            validate_canonical_poll_child_lifecycle(store, &current)?;
+            Ok(current)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let completed = children
+        .iter()
+        .filter_map(|child| {
+            validate_canonical_poll_child_lifecycle(store, child)
+                .ok()
+                .flatten()
+                .map(|boundary| (child, boundary))
+        })
+        .collect::<Vec<_>>();
+    if completed.len() != 1 {
+        return Err(CliError::Input(
+            "root import requires exactly one authentic linear poll-child provider completion"
+                .to_owned(),
+        ));
+    }
+    let (terminal, boundary) = &completed[0];
+    let mut current = terminal.as_ref();
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(current.plan.operation_id.clone()) {
+            return Err(CliError::Input(
+                "poll continuation lineage contains a cycle".to_owned(),
+            ));
+        }
+        let authority = current
+            .plan
+            .targets
+            .pointer("/adapter/approved_mln_import_poll_resume")
+            .ok_or_else(|| CliError::Input("poll child authority is missing".to_owned()))?;
+        if authority.get("root_plan_hash").and_then(Value::as_str)
+            != Some(root.content_hash.as_str())
+            || current.plan.profile_id != root.profile_id
+            || current.plan.catalog_hash != root.catalog_hash
+            || current.plan.account_id != root.account_id
+        {
+            return Err(CliError::Input(
+                "poll child drifted from root plan, profile, account, or catalog".to_owned(),
+            ));
+        }
+        let parent_id = authority
+            .get("parent_operation_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::Input("poll child parent is missing".to_owned()))?;
+        let StoredPlanRecord::Current(parent_v2) = store.load_stored_plan_record(parent_id)? else {
+            return Err(CliError::Input(
+                "poll child parent is not an immutable PlanV2".to_owned(),
+            ));
+        };
+        let parent = &parent_v2.plan;
+        if authority.get("parent_plan_hash").and_then(Value::as_str)
+            != Some(parent.content_hash.as_str())
+            || parent.created_at >= current.plan.created_at
+            || parent_v2.pins.credential_generation_id
+                != store
+                    .load_plan_v2(&root.operation_id)?
+                    .pins
+                    .credential_generation_id
+        {
+            return Err(CliError::Input(
+                "poll child parent PlanV2, credential, or chronology drifted".to_owned(),
+            ));
+        }
+        let parent_target = if parent.operation_id == root.operation_id {
+            root_target.clone()
+        } else {
+            parent
+                .targets
+                .pointer("/adapter/approved_mln_import_poll_resume/target")
+                .cloned()
+                .ok_or_else(|| CliError::Input("poll child parent target is missing".to_owned()))?
+        };
+        if authority.get("target") != Some(&parent_target) {
+            return Err(CliError::Input(
+                "poll child target does not match its exact parent target".to_owned(),
+            ));
+        }
+        let (exhaustion_hash, accepted_hash, bookmark) = if parent.operation_id == root.operation_id
+        {
+            let (exhaustion, checkpoint, accepted) = exact_durable_poll_exhaustion(store, parent)?;
+            (
+                exhaustion.content_hash,
+                accepted.content_hash,
+                checkpoint
+                    .pointer("/receipt/at_bookmark")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        CliError::Input("root exhaustion bookmark is missing".to_owned())
+                    })?,
+            )
+        } else {
+            let exhaustion = exact_resume_poll_exhaustion(store, parent)?;
+            (
+                exhaustion.exhaustion_evidence.content_hash,
+                exhaustion.accepted_ingest_evidence.content_hash,
+                exhaustion.accepted_bookmark,
+            )
+        };
+        if authority
+            .get("parent_exhaustion_evidence_hash")
+            .and_then(Value::as_str)
+            != Some(exhaustion_hash.as_str())
+            || authority
+                .get("accepted_ingest_evidence_hash")
+                .and_then(Value::as_str)
+                != Some(accepted_hash.as_str())
+            || authority.get("accepted_bookmark").and_then(Value::as_str) != Some(bookmark.as_str())
+            || authority
+                .get("accepted_bookmark_hash")
+                .and_then(Value::as_str)
+                != hash_value(&Value::String(bookmark)).ok().as_deref()
+        {
+            return Err(CliError::Input(
+                "poll child does not join its exact parent exhaustion and accepted bookmark"
+                    .to_owned(),
+            ));
+        }
+        if parent.operation_id == root.operation_id {
+            break;
+        }
+        current = children
+            .iter()
+            .find(|candidate| candidate.plan.operation_id == parent.operation_id)
+            .map(Box::as_ref)
+            .ok_or_else(|| {
+                CliError::Input("poll child chain escaped its exact root lineage".to_owned())
+            })?;
+    }
+    Ok(boundary.clone())
+}
+
+fn exact_accepted_ingest_bookmarks(
+    store: &StateStore,
+    plan: &PlanV1,
+    checkpoints: &[(String, Value)],
+    target: &Value,
+    input_hash: &str,
+) -> Vec<String> {
+    let migration_id = plan
+        .input
+        .pointer("/body/migration_id")
+        .and_then(Value::as_str);
+    checkpoints
+        .iter()
+        .filter_map(|(hash, checkpoint)| {
+            let exact = checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+                && checkpoint.get("operation_id").and_then(Value::as_str)
+                    == Some(plan.operation_id.as_str())
+                && checkpoint.get("step").and_then(Value::as_str) == Some("ingest_response")
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && checkpoint
+                    .pointer("/receipt/success")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/response_action")
+                    .and_then(Value::as_str)
+                    == Some("ingest")
+                && checkpoint
+                    .pointer("/receipt/provider")
+                    .and_then(Value::as_str)
+                    == Some("cloudflare")
+                && checkpoint
+                    .pointer("/receipt/effect")
+                    .and_then(Value::as_str)
+                    == Some("d1_import_ingest_accepted")
+                && checkpoint
+                    .pointer("/receipt/migration_id")
+                    .and_then(Value::as_str)
+                    == migration_id
+                && checkpoint.pointer("/receipt/target") == Some(target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash)
+                && checkpoint
+                    .pointer("/receipt/no_replay")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && checkpoint
+                    .pointer("/receipt/result/type")
+                    .and_then(Value::as_str)
+                    == Some("import")
+                && matches!(
+                    checkpoint
+                        .pointer("/receipt/result/status")
+                        .and_then(Value::as_str),
+                    Some("active" | "pending")
+                )
+                && checkpoint
+                    .pointer("/receipt/result/success")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/result/provider_error_present")
+                    .and_then(Value::as_bool)
+                    .is_none_or(|present| !present)
+                && checkpoint.pointer("/receipt/result/error").is_none()
+                && store
+                    .read_evidence_value(hash)
+                    .is_ok_and(|evidence| evidence == *checkpoint);
+            exact.then(|| {
+                checkpoint
+                    .pointer("/receipt/result/at_bookmark")
+                    .and_then(Value::as_str)
+                    .filter(|bookmark| !bookmark.is_empty())
+                    .map(str::to_owned)
+            })?
+        })
+        .collect()
+}
+
+fn import_plan_runtime_lineage(plan: &PlanV1) -> Result<(Value, String, Option<String>)> {
+    if let Some(contract) = plan.capability.d1_approved_mln_import.as_ref() {
+        let migration_id = plan
+            .input
+            .pointer("/body/migration_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("approved MLN import migration id is missing".to_owned())
+            })?;
+        return Ok((
+            json!({"account_id":contract.account_id,"database_id":contract.database_id}),
+            migration_id.to_owned(),
+            None,
+        ));
+    }
+    let contract = plan
+        .capability
+        .d1_approved_mln_import_poll_resume
+        .as_ref()
+        .ok_or_else(|| {
+            CliError::Input("approved MLN import poll contract is missing".to_owned())
+        })?;
+    let migration_id = plan
+        .targets
+        .pointer("/adapter/approved_mln_import_poll_resume/root_input/body/migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("poll continuation migration id is missing".to_owned()))?;
+    let bookmark = plan
+        .targets
+        .pointer("/adapter/approved_mln_import_poll_resume/accepted_bookmark")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("poll continuation bookmark is missing".to_owned()))?;
+    Ok((
+        json!({"account_id":contract.account_id,"database_id":contract.database_id}),
+        migration_id.to_owned(),
+        Some(bookmark.to_owned()),
+    ))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "stage-specific init, ingest, and poll receipt authority is one fail-closed join"
+)]
+fn exact_durable_provider_failure_boundary(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<(EvidenceV1, Value)> {
+    let (target, _migration_id, inherited_bookmark) = import_plan_runtime_lineage(plan)?;
+    let input_hash = hash_value(&plan.input)?;
+    let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
+    let accepted_ingest_bookmarks = inherited_bookmark.map_or_else(
+        || exact_accepted_ingest_bookmarks(store, plan, &checkpoints, &target, &input_hash),
+        |bookmark| vec![bookmark],
+    );
+    let failures = checkpoints
+        .into_iter()
+        .filter(|(_, checkpoint)| {
+            let Some(step) = checkpoint.get("step").and_then(Value::as_str) else {
+                return false;
+            };
+            let action = if step == "init_response" {
+                "init"
+            } else if step == "ingest_response" {
+                "ingest"
+            } else if step.starts_with("poll_response_") {
+                "poll"
+            } else {
+                return false;
+            };
+            let bookmark = checkpoint
+                .pointer("/receipt/result/at_bookmark")
+                .and_then(Value::as_str);
+            let bookmark_matches_stage = match action {
+                "init" => bookmark.is_none(),
+                "ingest" => bookmark.is_none_or(|value| !value.is_empty()),
+                "poll" => {
+                    accepted_ingest_bookmarks.len() == 1
+                        && bookmark == accepted_ingest_bookmarks.first().map(String::as_str)
+                }
+                _ => false,
+            };
+            checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+                && checkpoint.get("operation_id").and_then(Value::as_str)
+                    == Some(plan.operation_id.as_str())
+                && checkpoint
+                    .pointer("/receipt/response_action")
+                    .and_then(Value::as_str)
+                    == Some(action)
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash.as_str())
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/success")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/result/type")
+                    .and_then(Value::as_str)
+                    == Some("import")
+                && checkpoint
+                    .pointer("/receipt/result/status")
+                    .and_then(Value::as_str)
+                    == Some("error")
+                && checkpoint
+                    .pointer("/receipt/result/success")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && checkpoint
+                    .pointer("/receipt/no_replay")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && bookmark_matches_stage
+                && checkpoint
+                    .pointer("/receipt/result/provider_error_present")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint.pointer("/receipt/result/error").is_none()
+                && checkpoint
+                    .pointer("/receipt/errors")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+        })
+        .collect::<Vec<_>>();
+    if failures.len() != 1 {
+        return Err(CliError::Input(
+            "known import provider failure requires exactly one stage-correct durable redacted checkpoint"
+                .to_owned(),
+        ));
+    }
+    let (hash, checkpoint) = &failures[0];
+    if store.read_evidence_value(hash)? != *checkpoint {
+        return Err(CliError::Input(
+            "known import provider-failure evidence does not match its immutable checkpoint"
+                .to_owned(),
+        ));
+    }
+    Ok((
+        EvidenceV1::new(
+            EvidenceClass::Apply,
+            hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!("{}.json", hash.trim_start_matches("sha256:")))
+                .display()
+                .to_string(),
+        ),
+        checkpoint.clone(),
+    ))
+}
+
+fn known_import_provider_failure_envelope(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    secrets: &dyn SecretStore,
+) -> ResultEnvelopeV2 {
+    plan.status = PlanStatus::RectificationRequired;
+    match exact_durable_provider_failure_boundary(store, plan) {
+        Ok((evidence, _checkpoint)) => {
+            let artifact = json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":"provider_rejected",
+                "receipt_available":true,
+                "provider_failure_evidence_hash":evidence.content_hash,
+            });
+            let mut local_failures = Vec::new();
+            if let Err(error) = persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                artifact,
+            ) {
+                local_failures.push(format!("provider-failure receipt binding failed: {error}"));
+            }
+            if let Err(error) = persist_secret_lifecycle(store, plan, false, None, secrets) {
+                local_failures.push(format!(
+                    "provider-failure secret lifecycle persistence failed: {error}"
+                ));
+            }
+            let detail = if local_failures.is_empty() {
+                "Cloudflare reported a terminal D1 import failure".to_owned()
+            } else {
+                format!(
+                    "Cloudflare reported a terminal D1 import failure; {}",
+                    local_failures.join("; ")
+                )
+            };
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":"provider_rejected",
+                    "receipt_available":true,
+                    "provider_status":"error",
+                }),
+                Some(evidence),
+                None,
+                &CliError::Input(detail),
+                true,
+                "the exact redacted Cloudflare provider-failure response is durable; the import did not complete and must not be replayed",
+            )
+        }
+        Err(error) => {
+            let _ = store.save_plan(plan);
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":"provider_rejected_receipt_invalid",
+                    "receipt_available":false,
+                }),
+                None,
+                None,
+                &error,
+                true,
+                "Cloudflare reported a terminal provider failure, but its exact durable redacted checkpoint could not be uniquely resolved; do not replay",
+            )
+        }
+    }
+}
+
+fn exact_durable_upload_response_failure(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<(EvidenceV1, Value)> {
+    let (target, migration_id, _) = import_plan_runtime_lineage(plan)?;
+    let input_hash = hash_value(&plan.input)?;
+    let failures = store
+        .read_d1_import_checkpoints(&plan.operation_id)?
+        .into_iter()
+        .filter(|(_, checkpoint)| {
+            let status = checkpoint
+                .pointer("/receipt/http_status")
+                .and_then(Value::as_u64);
+            let success = checkpoint
+                .pointer("/receipt/success")
+                .and_then(Value::as_bool);
+            let etag_present = checkpoint
+                .pointer("/receipt/etag_present")
+                .and_then(Value::as_bool);
+            let etag_matches = checkpoint
+                .pointer("/receipt/etag_matches")
+                .and_then(Value::as_bool);
+            let rejected = status.is_some_and(|value| !(200..300).contains(&value))
+                && success == Some(false)
+                && etag_present == Some(false)
+                && etag_matches == Some(false);
+            let integrity_rejected = status.is_some_and(|value| (200..300).contains(&value))
+                && success == Some(true)
+                && etag_present.is_some()
+                && etag_matches == Some(false);
+            checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+                && checkpoint.get("operation_id").and_then(Value::as_str)
+                    == Some(plan.operation_id.as_str())
+                && checkpoint.get("step").and_then(Value::as_str) == Some("upload_response")
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/provider")
+                    .and_then(Value::as_str)
+                    == Some("cloudflare")
+                && checkpoint
+                    .pointer("/receipt/effect")
+                    .and_then(Value::as_str)
+                    == Some("d1_import_upload_response")
+                && checkpoint
+                    .pointer("/receipt/migration_id")
+                    .and_then(Value::as_str)
+                    == Some(migration_id.as_str())
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash.as_str())
+                && checkpoint
+                    .pointer("/receipt/no_replay")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint.pointer("/receipt/etag").is_none()
+                && (rejected || integrity_rejected)
+        })
+        .collect::<Vec<_>>();
+    if failures.len() != 1 {
+        return Err(CliError::Input(
+            "known upload response requires exactly one operation-bound durable redacted checkpoint"
+                .to_owned(),
+        ));
+    }
+    let (hash, checkpoint) = &failures[0];
+    if store.read_evidence_value(hash)? != *checkpoint {
+        return Err(CliError::Input(
+            "known upload-response evidence does not match its immutable checkpoint".to_owned(),
+        ));
+    }
+    Ok((
+        EvidenceV1::new(
+            EvidenceClass::Apply,
+            hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!("{}.json", hash.trim_start_matches("sha256:")))
+                .display()
+                .to_string(),
+        ),
+        checkpoint.clone(),
+    ))
+}
+
+fn known_import_upload_response_failure_envelope(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    secrets: &dyn SecretStore,
+) -> ResultEnvelopeV2 {
+    plan.status = PlanStatus::RectificationRequired;
+    match exact_durable_upload_response_failure(store, plan) {
+        Ok((evidence, checkpoint)) => {
+            let integrity_rejected = checkpoint
+                .pointer("/receipt/success")
+                .and_then(Value::as_bool)
+                == Some(true);
+            let outcome = if integrity_rejected {
+                "upload_integrity_rejected"
+            } else {
+                "upload_rejected"
+            };
+            let artifact = json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":outcome,
+                "receipt_available":true,
+                "upload_response_evidence_hash":evidence.content_hash,
+            });
+            let mut local_failures = Vec::new();
+            if let Err(error) = persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                artifact,
+            ) {
+                local_failures.push(format!("upload-response receipt binding failed: {error}"));
+            }
+            if let Err(error) = persist_secret_lifecycle(store, plan, false, None, secrets) {
+                local_failures.push(format!(
+                    "upload-response secret lifecycle persistence failed: {error}"
+                ));
+            }
+            let detail = if local_failures.is_empty() {
+                "Cloudflare returned a known D1 import upload rejection".to_owned()
+            } else {
+                format!(
+                    "Cloudflare returned a known D1 import upload rejection; {}",
+                    local_failures.join("; ")
+                )
+            };
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":outcome,
+                    "receipt_available":true,
+                    "http_status":checkpoint.pointer("/receipt/http_status"),
+                    "etag_present":checkpoint.pointer("/receipt/etag_present"),
+                    "etag_matches":checkpoint.pointer("/receipt/etag_matches"),
+                }),
+                Some(evidence),
+                None,
+                &CliError::Input(detail),
+                true,
+                "the exact redacted Cloudflare upload response is durable; ingest was not attempted and the import must not be replayed",
+            )
+        }
+        Err(error) => {
+            let _ = store.save_plan(plan);
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":"upload_rejected_receipt_invalid",
+                    "receipt_available":false,
+                }),
+                None,
+                None,
+                &error,
+                true,
+                "Cloudflare returned an upload response, but its exact durable redacted checkpoint could not be uniquely resolved; do not replay",
+            )
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exact init authority join intentionally validates every projected field"
+)]
+fn exact_durable_init_response_failure(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<(EvidenceV1, Value)> {
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    let migration_id = plan
+        .input
+        .pointer("/body/migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("approved MLN import migration id is missing".to_owned()))?;
+    let target = json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    });
+    let input_hash = hash_value(&plan.input)?;
+    let failures = store
+        .read_d1_import_checkpoints(&plan.operation_id)?
+        .into_iter()
+        .filter(|(_, checkpoint)| {
+            let Some(result) = checkpoint
+                .pointer("/receipt/result")
+                .and_then(Value::as_object)
+            else {
+                return false;
+            };
+            let exact_result_fields = [
+                "type",
+                "status",
+                "success",
+                "at_bookmark",
+                "upload_url_present",
+                "upload_url_sha256",
+                "filename_present",
+                "filename_sha256",
+                "provider_error_present",
+            ];
+            let exact_result = result.len() == exact_result_fields.len()
+                && exact_result_fields
+                    .iter()
+                    .all(|field| result.contains_key(*field));
+            let hashes_are_redacted =
+                ["upload_url_sha256", "filename_sha256"]
+                    .iter()
+                    .all(|field| {
+                        result.get(*field).is_some_and(|value| {
+                            value.is_null()
+                                || value
+                                    .as_str()
+                                    .is_some_and(|hash| hash.starts_with("sha256:"))
+                        })
+                    });
+            checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+                && checkpoint.get("operation_id").and_then(Value::as_str)
+                    == Some(plan.operation_id.as_str())
+                && checkpoint.get("step").and_then(Value::as_str) == Some("init_response")
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/response_action")
+                    .and_then(Value::as_str)
+                    == Some("init")
+                && checkpoint
+                    .pointer("/receipt/provider")
+                    .and_then(Value::as_str)
+                    == Some("cloudflare")
+                && checkpoint
+                    .pointer("/receipt/effect")
+                    .and_then(Value::as_str)
+                    == Some("d1_import_response")
+                && checkpoint
+                    .pointer("/receipt/migration_id")
+                    .and_then(Value::as_str)
+                    == Some(migration_id)
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash.as_str())
+                && checkpoint
+                    .pointer("/receipt/no_replay")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint.pointer("/receipt/etag").is_none()
+                && exact_result
+                && hashes_are_redacted
+        })
+        .collect::<Vec<_>>();
+    if failures.len() != 1 {
+        return Err(CliError::Input(
+            "known init response requires exactly one operation-bound durable redacted checkpoint"
+                .to_owned(),
+        ));
+    }
+    let (hash, checkpoint) = &failures[0];
+    if store.read_evidence_value(hash)? != *checkpoint {
+        return Err(CliError::Input(
+            "known init-response evidence does not match its immutable checkpoint".to_owned(),
+        ));
+    }
+    Ok((
+        EvidenceV1::new(
+            EvidenceClass::Apply,
+            hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!("{}.json", hash.trim_start_matches("sha256:")))
+                .display()
+                .to_string(),
+        ),
+        checkpoint.clone(),
+    ))
+}
+
+fn known_import_init_response_failure_envelope(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    secrets: &dyn SecretStore,
+) -> ResultEnvelopeV2 {
+    plan.status = PlanStatus::RectificationRequired;
+    match exact_durable_init_response_failure(store, plan) {
+        Ok((evidence, checkpoint)) => {
+            let provider_rejected = checkpoint
+                .pointer("/receipt/success")
+                .and_then(Value::as_bool)
+                == Some(false)
+                || checkpoint
+                    .pointer("/receipt/result/status")
+                    .and_then(Value::as_str)
+                    == Some("error");
+            let outcome = if provider_rejected {
+                "provider_rejected"
+            } else {
+                "invalid_provider_response"
+            };
+            let artifact = json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":outcome,
+                "receipt_available":true,
+                "init_response_evidence_hash":evidence.content_hash,
+            });
+            let _ = persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                artifact,
+            );
+            let _ = persist_secret_lifecycle(store, plan, false, None, secrets);
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":outcome,
+                    "receipt_available":true,
+                }),
+                Some(evidence),
+                None,
+                &CliError::Input(
+                    "Cloudflare returned a known rejected or invalid D1 import init response"
+                        .to_owned(),
+                ),
+                true,
+                "the exact action-projected Cloudflare init response is durable; no upload occurred and the import must not be replayed",
+            )
+        }
+        Err(error) => {
+            let _ = store.save_plan(plan);
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":"init_response_receipt_invalid",
+                    "receipt_available":false,
+                }),
+                None,
+                None,
+                &error,
+                true,
+                "Cloudflare returned an init response, but its exact durable redacted checkpoint could not be uniquely resolved; do not replay",
+            )
+        }
+    }
+}
+
+fn exact_durable_action_response_failure(
+    store: &StateStore,
+    plan: &PlanV1,
+    action: &str,
+) -> Result<(EvidenceV1, Value)> {
+    let (target, migration_id, _) = import_plan_runtime_lineage(plan)?;
+    let input_hash = hash_value(&plan.input)?;
+    let failures = store
+        .read_d1_import_checkpoints(&plan.operation_id)?
+        .into_iter()
+        .filter(|(_, checkpoint)| {
+            let Some(step) = checkpoint.get("step").and_then(Value::as_str) else {
+                return false;
+            };
+            let step_matches = match action {
+                "ingest" => step == "ingest_response",
+                "poll" => step.starts_with("poll_response_"),
+                _ => false,
+            };
+            let Some(result) = checkpoint
+                .pointer("/receipt/result")
+                .and_then(Value::as_object)
+            else {
+                return false;
+            };
+            let allowed = [
+                "type",
+                "status",
+                "success",
+                "at_bookmark",
+                "result",
+                "provider_error_present",
+            ];
+            let projected = result.keys().all(|key| allowed.contains(&key.as_str()))
+                && result.get("result").is_none_or(|nested| {
+                    nested.as_object().is_some_and(|object| {
+                        object.len() == 1 && object.contains_key("final_bookmark")
+                    })
+                });
+            step_matches
+                && checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+                && checkpoint.get("operation_id").and_then(Value::as_str)
+                    == Some(plan.operation_id.as_str())
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/response_action")
+                    .and_then(Value::as_str)
+                    == Some(action)
+                && checkpoint
+                    .pointer("/receipt/provider")
+                    .and_then(Value::as_str)
+                    == Some("cloudflare")
+                && checkpoint
+                    .pointer("/receipt/effect")
+                    .and_then(Value::as_str)
+                    == Some("d1_import_response")
+                && checkpoint
+                    .pointer("/receipt/migration_id")
+                    .and_then(Value::as_str)
+                    == Some(migration_id.as_str())
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash.as_str())
+                && checkpoint
+                    .pointer("/receipt/no_replay")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint.pointer("/receipt/etag").is_none()
+                && projected
+        })
+        .collect::<Vec<_>>();
+    if failures.len() != 1 {
+        return Err(CliError::Input(format!(
+            "known {action} response requires exactly one operation-bound durable redacted checkpoint"
+        )));
+    }
+    let (hash, checkpoint) = &failures[0];
+    if store.read_evidence_value(hash)? != *checkpoint {
+        return Err(CliError::Input(format!(
+            "known {action}-response evidence does not match its immutable checkpoint"
+        )));
+    }
+    Ok((
+        EvidenceV1::new(
+            EvidenceClass::Apply,
+            hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!("{}.json", hash.trim_start_matches("sha256:")))
+                .display()
+                .to_string(),
+        ),
+        checkpoint.clone(),
+    ))
+}
+
+fn known_import_action_response_failure_envelope(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    error: CloudflareError,
+    secrets: &dyn SecretStore,
+) -> ResultEnvelopeV2 {
+    plan.status = PlanStatus::RectificationRequired;
+    let action = if matches!(error, CloudflareError::D1ImportIngestResponseFailure) {
+        "ingest"
+    } else {
+        "poll"
+    };
+    match exact_durable_action_response_failure(store, plan, action) {
+        Ok((evidence, checkpoint)) => {
+            let provider_rejected = checkpoint
+                .pointer("/receipt/success")
+                .and_then(Value::as_bool)
+                == Some(false)
+                || checkpoint
+                    .pointer("/receipt/result/status")
+                    .and_then(Value::as_str)
+                    == Some("error");
+            let outcome = if provider_rejected {
+                "provider_rejected"
+            } else {
+                "invalid_provider_response"
+            };
+            let artifact = json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":outcome,
+                "receipt_available":true,
+                "response_action":action,
+                "response_evidence_hash":evidence.content_hash,
+            });
+            let _ = persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                artifact,
+            );
+            let _ = persist_secret_lifecycle(store, plan, false, None, secrets);
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":outcome,
+                    "receipt_available":true,
+                    "response_action":action,
+                }),
+                Some(evidence),
+                None,
+                &CliError::Input(format!(
+                    "Cloudflare returned a known rejected or invalid D1 import {action} response"
+                )),
+                true,
+                &format!(
+                    "the exact action-projected Cloudflare {action} response is durable; no later import action occurred and the import must not be replayed"
+                ),
+            )
+        }
+        Err(error) => {
+            let _ = store.save_plan(plan);
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":"provider_response_receipt_invalid",
+                    "receipt_available":false,
+                    "response_action":action,
+                }),
+                None,
+                None,
+                &error,
+                true,
+                &format!(
+                    "Cloudflare returned an {action} response, but its exact durable redacted checkpoint could not be uniquely resolved; do not replay"
+                ),
+            )
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "canonical poll authority binds every immutable lineage dimension explicitly"
+)]
+fn exact_in_progress_poll_receipt(
+    store: &StateStore,
+    plan: &PlanV1,
+    hash: &str,
+    checkpoint: &Value,
+    expected_attempt: u64,
+    target: &Value,
+    input_hash: &str,
+    migration_id: &str,
+    bookmark: &str,
+) -> bool {
+    let expected_step = format!("poll_response_{expected_attempt}");
+    let Some(receipt) = checkpoint.get("receipt").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(result) = receipt.get("result").and_then(Value::as_object) else {
+        return false;
+    };
+    let receipt_fields = [
+        "http_status",
+        "success",
+        "response_action",
+        "provider",
+        "effect",
+        "migration_id",
+        "target",
+        "plan_input_hash",
+        "result",
+        "errors",
+        "provider_errors_present",
+        "no_replay",
+        "etag_present",
+        "etag_sha256",
+        "cf_ray",
+    ];
+    let result_fields = [
+        "type",
+        "status",
+        "success",
+        "at_bookmark",
+        "result",
+        "provider_error_present",
+    ];
+    let nested_result = result.get("result").and_then(Value::as_object);
+    let etag_present = receipt.get("etag_present").and_then(Value::as_bool);
+    let etag_hash = receipt.get("etag_sha256");
+    let etag_exact = match (etag_present, etag_hash) {
+        (Some(false), Some(value)) => value.is_null(),
+        (Some(true), Some(value)) => value
+            .as_str()
+            .and_then(|hash| hash.strip_prefix("sha256:"))
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
+        _ => false,
+    };
+    let cf_ray_exact = receipt.get("cf_ray").is_some_and(|value| {
+        value.is_null()
+            || value.as_str().is_some_and(|ray| {
+                !ray.is_empty()
+                    && ray.len() <= 128
+                    && ray
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+    });
+    checkpoint
+        .as_object()
+        .is_some_and(|object| object.len() == 6)
+        && checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && checkpoint.get("operation_id").and_then(Value::as_str)
+            == Some(plan.operation_id.as_str())
+        && checkpoint.get("step").and_then(Value::as_str) == Some(expected_step.as_str())
+        && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+        && checkpoint
+            .get("rectification_required")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && receipt.len() == receipt_fields.len()
+        && receipt_fields
+            .iter()
+            .all(|field| receipt.contains_key(*field))
+        && receipt.get("http_status").and_then(Value::as_u64) == Some(200)
+        && receipt.get("success").and_then(Value::as_bool) == Some(true)
+        && receipt.get("response_action").and_then(Value::as_str) == Some("poll")
+        && receipt.get("provider").and_then(Value::as_str) == Some("cloudflare")
+        && receipt.get("effect").and_then(Value::as_str) == Some("d1_import_response")
+        && receipt.get("migration_id").and_then(Value::as_str) == Some(migration_id)
+        && receipt.get("target") == Some(target)
+        && receipt.get("plan_input_hash").and_then(Value::as_str) == Some(input_hash)
+        && result.len() == result_fields.len()
+        && result_fields
+            .iter()
+            .all(|field| result.contains_key(*field))
+        && result.get("type").and_then(Value::as_str) == Some("import")
+        && matches!(
+            result.get("status").and_then(Value::as_str),
+            Some("active" | "pending")
+        )
+        && result.get("success").and_then(Value::as_bool) == Some(true)
+        && result.get("at_bookmark").and_then(Value::as_str) == Some(bookmark)
+        && result
+            .get("provider_error_present")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && nested_result.is_some_and(|nested| {
+            nested.len() == 1
+                && nested.contains_key("final_bookmark")
+                && nested.get("final_bookmark").is_some_and(Value::is_null)
+        })
+        && receipt
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        && receipt
+            .get("provider_errors_present")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && receipt.get("no_replay").and_then(Value::as_bool) == Some(false)
+        && etag_exact
+        && cf_ray_exact
+        && checkpoint.get("error").is_none()
+        && store
+            .read_evidence_value(hash)
+            .is_ok_and(|evidence| evidence == *checkpoint)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "poll exhaustion authority joins ingest lineage every bounded poll and terminal receipt"
+)]
+fn exact_durable_poll_exhaustion(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<(EvidenceV1, Value, EvidenceV1)> {
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    let target = json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    });
+    let input_hash = hash_value(&plan.input)?;
+    let migration_id = plan
+        .input
+        .pointer("/body/migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("approved MLN import migration id is missing".to_owned()))?;
+    let source_sha256 = plan
+        .targets
+        .pointer("/adapter/approved_mln_import/sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("approved MLN import source identity is missing".to_owned())
+        })?;
+    let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
+    let accepted = exact_accepted_ingest_bookmarks(store, plan, &checkpoints, &target, &input_hash);
+    if accepted.len() != 1 {
+        return Err(CliError::Input(
+            "poll exhaustion requires exactly one durable accepted-ingest bookmark".to_owned(),
+        ));
+    }
+    let bookmark = &accepted[0];
+    let accepted_entries = checkpoints
+        .iter()
+        .enumerate()
+        .filter(|(_, (hash, checkpoint))| {
+            checkpoint.get("step").and_then(Value::as_str) == Some("ingest_response")
+                && checkpoint
+                    .pointer("/receipt/effect")
+                    .and_then(Value::as_str)
+                    == Some("d1_import_ingest_accepted")
+                && checkpoint
+                    .pointer("/receipt/result/at_bookmark")
+                    .and_then(Value::as_str)
+                    == Some(bookmark.as_str())
+                && store
+                    .read_evidence_value(hash)
+                    .is_ok_and(|evidence| evidence == *checkpoint)
+        })
+        .collect::<Vec<_>>();
+    if accepted_entries.len() != 1 {
+        return Err(CliError::Input(
+            "poll exhaustion requires exactly one accepted-ingest checkpoint and evidence"
+                .to_owned(),
+        ));
+    }
+    let (accepted_index, (accepted_hash, _)) = accepted_entries[0];
+    let mut attempts = checkpoints
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (hash, checkpoint))| {
+            let step = checkpoint.get("step").and_then(Value::as_str)?;
+            let attempt = step.strip_prefix("poll_response_")?.parse::<u64>().ok()?;
+            let exact = exact_in_progress_poll_receipt(
+                store,
+                plan,
+                hash,
+                checkpoint,
+                attempt,
+                &target,
+                &input_hash,
+                migration_id,
+                bookmark,
+            );
+            exact.then_some((index, attempt))
+        })
+        .collect::<Vec<_>>();
+    attempts.sort_unstable_by_key(|(_, attempt)| *attempt);
+    let expected_attempts = (1..=contract.max_poll_attempts)
+        .enumerate()
+        .map(|(offset, attempt)| (accepted_index + offset + 1, attempt))
+        .collect::<Vec<_>>();
+    if attempts != expected_attempts {
+        return Err(CliError::Input(
+            "poll exhaustion requires one chronological durable in-progress receipt per approved attempt"
+                .to_owned(),
+        ));
+    }
+    if checkpoints.iter().any(|(_, checkpoint)| {
+        checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+    }) {
+        return Err(CliError::Input(
+            "poll exhaustion conflicts with a provider_complete checkpoint".to_owned(),
+        ));
+    }
+    let exhausted = checkpoints
+        .iter()
+        .enumerate()
+        .filter(|(index, (_, checkpoint))| {
+            let exact_receipt_shape = checkpoint
+                .get("receipt")
+                .and_then(Value::as_object)
+                .is_some_and(|receipt| receipt.len() == 12);
+            *index
+                == accepted_index
+                    + usize::try_from(contract.max_poll_attempts).unwrap_or(usize::MAX)
+                    + 1
+                && *index + 1 == checkpoints.len()
+                && checkpoint.get("step").and_then(Value::as_str)
+                    == Some("poll_in_progress_exhausted")
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/provider")
+                    .and_then(Value::as_str)
+                    == Some("cloudflare")
+                && checkpoint
+                    .pointer("/receipt/effect")
+                    .and_then(Value::as_str)
+                    == Some("d1_import_poll_in_progress_exhausted")
+                && checkpoint
+                    .pointer("/receipt/migration_id")
+                    .and_then(Value::as_str)
+                    == Some(migration_id)
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash.as_str())
+                && checkpoint
+                    .pointer("/receipt/source_sha256")
+                    .and_then(Value::as_str)
+                    == Some(source_sha256)
+                && checkpoint
+                    .pointer("/receipt/at_bookmark")
+                    .and_then(Value::as_str)
+                    == Some(bookmark.as_str())
+                && checkpoint
+                    .pointer("/receipt/attempt_count")
+                    .and_then(Value::as_u64)
+                    == Some(contract.max_poll_attempts)
+                && checkpoint
+                    .pointer("/receipt/attempt_bound")
+                    .and_then(Value::as_u64)
+                    == Some(contract.max_poll_attempts)
+                && checkpoint
+                    .pointer("/receipt/outcome")
+                    .and_then(Value::as_str)
+                    == Some("poll_in_progress_exhausted")
+                && checkpoint
+                    .pointer("/receipt/receipt_available")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/no_replay")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && exact_receipt_shape
+        })
+        .collect::<Vec<_>>();
+    if exhausted.len() != 1 {
+        return Err(CliError::Input(
+            "poll exhaustion requires exactly one lineage-bound durable receipt".to_owned(),
+        ));
+    }
+    let (_, (hash, checkpoint)) = exhausted[0];
+    if store.read_evidence_value(hash)? != *checkpoint {
+        return Err(CliError::Input(
+            "poll exhaustion evidence does not match its immutable checkpoint".to_owned(),
+        ));
+    }
+    Ok((
+        EvidenceV1::new(
+            EvidenceClass::Apply,
+            hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!("{}.json", hash.trim_start_matches("sha256:")))
+                .display()
+                .to_string(),
+        ),
+        checkpoint.clone(),
+        EvidenceV1::new(
+            EvidenceClass::Apply,
+            accepted_hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!(
+                    "{}.json",
+                    accepted_hash.trim_start_matches("sha256:")
+                ))
+                .display()
+                .to_string(),
+        ),
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct ResumePollExhaustionAuthority {
+    exhaustion_evidence: EvidenceV1,
+    exhaustion_checkpoint: Value,
+    accepted_ingest_evidence: EvidenceV1,
+    accepted_bookmark: String,
+    root_operation_id: String,
+    root_plan_hash: String,
+    root_input: Value,
+    root_stage: Value,
+}
+
+fn boundary_artifact_hash(plan: &PlanV1, stage: TransactionStageV1) -> Option<&str> {
+    plan.transaction_journal
+        .iter()
+        .find(|checkpoint| checkpoint.stage == stage)
+        .and_then(|checkpoint| checkpoint.artifact_hash.as_deref())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "continuation exhaustion validates every receipt and inherited authority field"
+)]
+fn exact_resume_poll_exhaustion(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<ResumePollExhaustionAuthority> {
+    let authority = plan
+        .targets
+        .pointer("/adapter/approved_mln_import_poll_resume")
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("poll continuation authority is missing".to_owned()))?;
+    let root_operation_id = authority
+        .get("root_operation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("poll continuation root operation is missing".to_owned()))?;
+    let root_plan_hash = authority
+        .get("root_plan_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("poll continuation root plan hash is missing".to_owned()))?;
+    let root_input = authority
+        .get("root_input")
+        .cloned()
+        .ok_or_else(|| CliError::Input("poll continuation root input is missing".to_owned()))?;
+    let root_stage = authority
+        .get("root_stage")
+        .cloned()
+        .ok_or_else(|| CliError::Input("poll continuation root stage is missing".to_owned()))?;
+    let accepted_hash = authority
+        .get("accepted_ingest_evidence_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("accepted-ingest evidence identity is missing".to_owned())
+        })?;
+    let accepted_bookmark = authority
+        .get("accepted_bookmark")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Input("accepted-ingest bookmark is missing".to_owned()))?;
+    let contract = plan
+        .capability
+        .d1_approved_mln_import_poll_resume
+        .as_ref()
+        .ok_or_else(|| CliError::Input("poll continuation contract is missing".to_owned()))?;
+    let target = json!({"account_id":contract.account_id,"database_id":contract.database_id});
+    let input_hash = hash_value(&plan.input)?;
+    let migration_id = root_input
+        .pointer("/body/migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("root migration identity is missing".to_owned()))?;
+    let source_sha256 = root_stage
+        .get("sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("root source identity is missing".to_owned()))?;
+    let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
+    let attempts = checkpoints
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (hash, checkpoint))| {
+            let attempt = checkpoint
+                .get("step")
+                .and_then(Value::as_str)?
+                .strip_prefix("poll_response_")?
+                .parse::<u64>()
+                .ok()?;
+            exact_in_progress_poll_receipt(
+                store,
+                plan,
+                hash,
+                checkpoint,
+                attempt,
+                &target,
+                &input_hash,
+                migration_id,
+                accepted_bookmark,
+            )
+            .then_some((index, attempt))
+        })
+        .collect::<Vec<_>>();
+    let expected = (1..=contract.max_poll_attempts)
+        .enumerate()
+        .collect::<Vec<_>>();
+    if attempts != expected {
+        return Err(CliError::Input(
+            "poll continuation exhaustion requires every bounded chronological in-progress receipt"
+                .to_owned(),
+        ));
+    }
+    let exhausted = checkpoints
+        .iter()
+        .enumerate()
+        .filter(|(index, (_, checkpoint))| {
+            *index == usize::try_from(contract.max_poll_attempts).unwrap_or(usize::MAX)
+                && *index + 1 == checkpoints.len()
+                && checkpoint.get("step").and_then(Value::as_str)
+                    == Some("poll_in_progress_exhausted")
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/provider")
+                    .and_then(Value::as_str)
+                    == Some("cloudflare")
+                && checkpoint
+                    .pointer("/receipt/effect")
+                    .and_then(Value::as_str)
+                    == Some("d1_import_poll_in_progress_exhausted")
+                && checkpoint
+                    .pointer("/receipt/migration_id")
+                    .and_then(Value::as_str)
+                    == Some(migration_id)
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash.as_str())
+                && checkpoint
+                    .pointer("/receipt/source_sha256")
+                    .and_then(Value::as_str)
+                    == Some(source_sha256)
+                && checkpoint
+                    .pointer("/receipt/at_bookmark")
+                    .and_then(Value::as_str)
+                    == Some(accepted_bookmark)
+                && checkpoint
+                    .pointer("/receipt/attempt_count")
+                    .and_then(Value::as_u64)
+                    == Some(contract.max_poll_attempts)
+                && checkpoint
+                    .pointer("/receipt/attempt_bound")
+                    .and_then(Value::as_u64)
+                    == Some(contract.max_poll_attempts)
+                && checkpoint
+                    .pointer("/receipt/no_replay")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/outcome")
+                    .and_then(Value::as_str)
+                    == Some("poll_in_progress_exhausted")
+                && checkpoint
+                    .pointer("/receipt/receipt_available")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+        .collect::<Vec<_>>();
+    if exhausted.len() != 1 {
+        return Err(CliError::Input(
+            "poll continuation requires exactly one terminal exhaustion receipt".to_owned(),
+        ));
+    }
+    let (_, (hash, checkpoint)) = exhausted[0];
+    let accepted = store.read_evidence_value(accepted_hash)?;
+    let root_input_hash = hash_value(&root_input)?;
+    let accepted_exact = accepted.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && accepted.get("operation_id").and_then(Value::as_str) == Some(root_operation_id)
+        && accepted.get("step").and_then(Value::as_str) == Some("ingest_response")
+        && accepted.get("performed").and_then(Value::as_bool) == Some(true)
+        && accepted
+            .get("rectification_required")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && accepted
+            .pointer("/receipt/http_status")
+            .and_then(Value::as_u64)
+            == Some(200)
+        && accepted
+            .pointer("/receipt/success")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && accepted
+            .pointer("/receipt/response_action")
+            .and_then(Value::as_str)
+            == Some("ingest")
+        && accepted
+            .pointer("/receipt/provider")
+            .and_then(Value::as_str)
+            == Some("cloudflare")
+        && accepted.pointer("/receipt/effect").and_then(Value::as_str)
+            == Some("d1_import_ingest_accepted")
+        && accepted
+            .pointer("/receipt/migration_id")
+            .and_then(Value::as_str)
+            == Some(migration_id)
+        && accepted.pointer("/receipt/target") == Some(&target)
+        && accepted
+            .pointer("/receipt/plan_input_hash")
+            .and_then(Value::as_str)
+            == Some(root_input_hash.as_str())
+        && accepted
+            .pointer("/receipt/no_replay")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && accepted
+            .pointer("/receipt/result/type")
+            .and_then(Value::as_str)
+            == Some("import")
+        && matches!(
+            accepted
+                .pointer("/receipt/result/status")
+                .and_then(Value::as_str),
+            Some("active" | "pending")
+        )
+        && accepted
+            .pointer("/receipt/result/success")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && accepted
+            .pointer("/receipt/result/at_bookmark")
+            .and_then(Value::as_str)
+            == Some(accepted_bookmark)
+        && accepted
+            .pointer("/receipt/errors")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+    if store.read_evidence_value(hash)? != *checkpoint || !accepted_exact {
+        return Err(CliError::Input(
+            "poll continuation exhaustion or accepted-ingest evidence drifted".to_owned(),
+        ));
+    }
+    Ok(ResumePollExhaustionAuthority {
+        exhaustion_evidence: EvidenceV1::new(
+            EvidenceClass::Apply,
+            hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!("{}.json", hash.trim_start_matches("sha256:")))
+                .display()
+                .to_string(),
+        ),
+        exhaustion_checkpoint: checkpoint.clone(),
+        accepted_ingest_evidence: EvidenceV1::new(
+            EvidenceClass::Apply,
+            accepted_hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!(
+                    "{}.json",
+                    accepted_hash.trim_start_matches("sha256:")
+                ))
+                .display()
+                .to_string(),
+        ),
+        accepted_bookmark: accepted_bookmark.to_owned(),
+        root_operation_id: root_operation_id.to_owned(),
+        root_plan_hash: root_plan_hash.to_owned(),
+        root_input,
+        root_stage,
+    })
+}
+
+fn exact_durable_resume_provider_complete_boundary(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<DurableProviderCompleteBoundary> {
+    let authority = plan
+        .targets
+        .pointer("/adapter/approved_mln_import_poll_resume")
+        .ok_or_else(|| CliError::Input("poll continuation authority is missing".to_owned()))?;
+    let contract = plan
+        .capability
+        .d1_approved_mln_import_poll_resume
+        .as_ref()
+        .ok_or_else(|| CliError::Input("poll continuation contract is missing".to_owned()))?;
+    let root_input = authority
+        .get("root_input")
+        .ok_or_else(|| CliError::Input("root input is missing".to_owned()))?;
+    let root_stage = authority
+        .get("root_stage")
+        .ok_or_else(|| CliError::Input("root stage is missing".to_owned()))?;
+    let migration_id = root_input
+        .pointer("/body/migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("root migration identity is missing".to_owned()))?;
+    let accepted_bookmark = authority
+        .get("accepted_bookmark")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("accepted bookmark is missing".to_owned()))?;
+    let target = json!({"account_id":contract.account_id,"database_id":contract.database_id});
+    let input_hash = hash_value(&plan.input)?;
+    let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
+    let completed = checkpoints
+        .iter()
+        .filter(|(_, checkpoint)| {
+            checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+        })
+        .collect::<Vec<_>>();
+    if completed.len() != 1 {
+        return Err(CliError::Input(
+            "poll continuation requires exactly one provider completion".to_owned(),
+        ));
+    }
+    let (hash, checkpoint) = completed[0];
+    let exact = checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && checkpoint.get("operation_id").and_then(Value::as_str)
+            == Some(plan.operation_id.as_str())
+        && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+        && checkpoint
+            .get("rectification_required")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && checkpoint
+            .pointer("/receipt/provider")
+            .and_then(Value::as_str)
+            == Some("cloudflare")
+        && checkpoint
+            .pointer("/receipt/effect")
+            .and_then(Value::as_str)
+            == Some("d1_import_provider_complete")
+        && checkpoint
+            .pointer("/receipt/response_action")
+            .and_then(Value::as_str)
+            == Some("poll")
+        && checkpoint
+            .pointer("/receipt/migration_id")
+            .and_then(Value::as_str)
+            == Some(migration_id)
+        && checkpoint.pointer("/receipt/target") == Some(&target)
+        && checkpoint
+            .pointer("/receipt/plan_input_hash")
+            .and_then(Value::as_str)
+            == Some(input_hash.as_str())
+        && checkpoint.pointer("/receipt/source_sha256") == root_stage.get("sha256")
+        && checkpoint.pointer("/receipt/source_md5") == root_stage.get("md5")
+        && checkpoint.pointer("/receipt/source_bytes") == root_stage.get("bytes")
+        && checkpoint.pointer("/receipt/source_authority_hash")
+            == root_stage.get("source_authority_hash")
+        && checkpoint
+            .pointer("/receipt/stage_identity_hash")
+            .and_then(Value::as_str)
+            == hash_value(root_stage).ok().as_deref()
+        && checkpoint
+            .pointer("/receipt/at_bookmark")
+            .and_then(Value::as_str)
+            == Some(accepted_bookmark)
+        && checkpoint
+            .pointer("/receipt/final_bookmark")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && checkpoint.pointer("/receipt/root_operation_id") == authority.get("root_operation_id")
+        && checkpoint.pointer("/receipt/root_plan_hash") == authority.get("root_plan_hash")
+        && checkpoint.pointer("/receipt/parent_operation_id")
+            == authority.get("parent_operation_id")
+        && checkpoint.pointer("/receipt/parent_exhaustion_evidence_hash")
+            == authority.get("parent_exhaustion_evidence_hash");
+    if !exact || store.read_evidence_value(hash)? != *checkpoint {
+        return Err(CliError::Input(
+            "poll continuation provider completion is not exact and durable".to_owned(),
+        ));
+    }
+    Ok(DurableProviderCompleteBoundary {
+        evidence_hash: hash.clone(),
+        checkpoint: checkpoint.clone(),
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the child-plan admission joins immutable parent, root, evidence, and sibling authority"
+)]
+fn validate_and_derive_resume_poll_authority(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    profile_id: &str,
+    credential_generation_id: Option<&str>,
+    catalog_hash: &str,
+    before: DateTime<Utc>,
+    child_operation_id: Option<&str>,
+) -> Result<Value> {
+    let contract = capability
+        .d1_approved_mln_import_poll_resume
+        .as_ref()
+        .ok_or_else(|| CliError::Input("poll continuation contract is missing".to_owned()))?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("poll continuation body is missing".to_owned()))?;
+    let expected = [
+        "parent_operation_id",
+        "parent_plan_hash",
+        "exhaustion_evidence_hash",
+        "accepted_ingest_evidence_hash",
+        "accepted_bookmark_hash",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if body.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+        return Err(CliError::Input(
+            "poll continuation accepts only the five immutable parent receipt identities"
+                .to_owned(),
+        ));
+    }
+    let field = |name| required_body_string(body, name);
+    let parent_operation_id = field("parent_operation_id")?;
+    Uuid::parse_str(parent_operation_id).map_err(|_| {
+        CliError::Input("parent_operation_id must be one canonical UUID".to_owned())
+    })?;
+    let StoredPlanRecord::Current(parent_v2) =
+        store.load_stored_plan_record(parent_operation_id)?
+    else {
+        return Err(CliError::Input(
+            "poll continuation parent must be an immutable PlanV2".to_owned(),
+        ));
+    };
+    let parent = &parent_v2.plan;
+    if parent.content_hash != field("parent_plan_hash")?
+        || parent_v2.pins.catalog_hash != parent.catalog_hash
+        || parent_v2.pins.credential_generation_id.is_empty()
+        || parent.created_at >= before
+        || parent.profile_id != profile_id
+        || parent.catalog_hash != catalog_hash
+        || parent_v2.pins.credential_generation_id != credential_generation_id.unwrap_or_default()
+        || parent.account_id != contract.account_id
+    {
+        return Err(CliError::Input(
+            "poll continuation parent PlanV2, chronology, profile, credential, account, or catalog drifted"
+                .to_owned(),
+        ));
+    }
+    let exhaustion = if parent.capability.id == contract.root_capability_id {
+        validate_trusted_root_import_plan(store, &parent_v2)?;
+        let (exhaustion_evidence, exhaustion_checkpoint, accepted_ingest_evidence) =
+            exact_durable_poll_exhaustion(store, parent)?;
+        let accepted_bookmark = exhaustion_checkpoint
+            .pointer("/receipt/at_bookmark")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::Input("root exhaustion bookmark is missing".to_owned()))?
+            .to_owned();
+        ResumePollExhaustionAuthority {
+            exhaustion_evidence,
+            exhaustion_checkpoint,
+            accepted_ingest_evidence,
+            accepted_bookmark,
+            root_operation_id: parent.operation_id.clone(),
+            root_plan_hash: parent.content_hash.clone(),
+            root_input: parent.input.clone(),
+            root_stage: parent
+                .targets
+                .pointer("/adapter/approved_mln_import")
+                .cloned()
+                .ok_or_else(|| CliError::Input("root managed stage is missing".to_owned()))?,
+        }
+    } else if parent.capability.id == capability.id {
+        exact_resume_poll_exhaustion(store, parent)?
+    } else {
+        return Err(CliError::Input(
+            "poll continuation parent is neither the root import nor a poll child".to_owned(),
+        ));
+    };
+    let accepted_bookmark_hash = hash_value(&Value::String(exhaustion.accepted_bookmark.clone()))?;
+    if exhaustion.exhaustion_evidence.content_hash != field("exhaustion_evidence_hash")?
+        || exhaustion.accepted_ingest_evidence.content_hash
+            != field("accepted_ingest_evidence_hash")?
+        || accepted_bookmark_hash != field("accepted_bookmark_hash")?
+    {
+        return Err(CliError::Input(
+            "poll continuation caller receipt identities do not match canonical parent authority"
+                .to_owned(),
+        ));
+    }
+    let boundary = parent
+        .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+        .ok_or_else(|| {
+            CliError::Input("parent exhaustion boundary artifact is missing".to_owned())
+        })?;
+    if boundary.get("outcome").and_then(Value::as_str) != Some("poll_in_progress_exhausted")
+        || boundary
+            .get("poll_exhaustion_evidence_hash")
+            .and_then(Value::as_str)
+            != Some(exhaustion.exhaustion_evidence.content_hash.as_str())
+        || boundary
+            .get("accepted_ingest_evidence_hash")
+            .and_then(Value::as_str)
+            != Some(exhaustion.accepted_ingest_evidence.content_hash.as_str())
+        || boundary_artifact_hash(parent, TransactionStageV1::BoundaryResponsePersisted)
+            != hash_value(boundary).ok().as_deref()
+    {
+        return Err(CliError::Input(
+            "parent BoundaryResponse artifact does not authenticate its exhaustion".to_owned(),
+        ));
+    }
+    for sibling in store.list_plans()? {
+        if child_operation_id == Some(sibling.operation_id.as_str()) {
+            continue;
+        }
+        let sibling_authority = sibling
+            .targets
+            .pointer("/adapter/approved_mln_import_poll_resume");
+        let same_exhaustion = sibling_authority
+            .and_then(|value| value.get("parent_operation_id"))
+            .and_then(Value::as_str)
+            == Some(parent_operation_id)
+            && sibling_authority
+                .and_then(|value| value.get("parent_exhaustion_evidence_hash"))
+                .and_then(Value::as_str)
+                == Some(exhaustion.exhaustion_evidence.content_hash.as_str());
+        if same_exhaustion {
+            let crossed_consumption = sibling.transaction_journal.iter().any(|checkpoint| {
+                matches!(
+                    checkpoint.stage,
+                    TransactionStageV1::ConsumptionPersisted
+                        | TransactionStageV1::BoundaryAttemptPersisted
+                        | TransactionStageV1::BoundaryResponsePersisted
+                        | TransactionStageV1::VerificationAttemptPersisted
+                        | TransactionStageV1::VerificationResponsePersisted
+                        | TransactionStageV1::CompensationAttemptPersisted
+                        | TransactionStageV1::CompensationResponsePersisted
+                        | TransactionStageV1::Closed
+                )
+            });
+            let provider_checkpoint_exists = !store
+                .read_d1_import_checkpoints(&sibling.operation_id)?
+                .is_empty();
+            let replaceable = sibling.status == PlanStatus::Cancelled
+                && !crossed_consumption
+                && !provider_checkpoint_exists;
+            if !replaceable {
+                return Err(CliError::Input(
+                    "this exact exhaustion already has a poll child or crossed child boundary"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    let capability_contract_hash = hash_value(&serde_json::to_value(capability)?)?;
+    Ok(json!({
+        "schema_version":1,
+        "parent_operation_id":parent.operation_id,
+        "parent_plan_hash":parent.content_hash,
+        "parent_boundary_artifact_hash":boundary_artifact_hash(parent,TransactionStageV1::BoundaryResponsePersisted),
+        "parent_exhaustion_evidence_hash":exhaustion.exhaustion_evidence.content_hash,
+        "accepted_ingest_evidence_hash":exhaustion.accepted_ingest_evidence.content_hash,
+        "accepted_bookmark":exhaustion.accepted_bookmark,
+        "accepted_bookmark_hash":accepted_bookmark_hash,
+        "root_operation_id":exhaustion.root_operation_id,
+        "root_plan_hash":exhaustion.root_plan_hash,
+        "root_input":exhaustion.root_input,
+        "root_stage":exhaustion.root_stage,
+        "target":{"account_id":contract.account_id,"database_id":contract.database_id},
+        "profile_id":profile_id,
+        "credential_generation_id":credential_generation_id,
+        "catalog_hash":catalog_hash,
+        "capability_contract_hash":capability_contract_hash,
+    }))
+}
+
+fn known_import_poll_exhausted_envelope(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    secrets: &dyn SecretStore,
+) -> ResultEnvelopeV2 {
+    plan.status = PlanStatus::RectificationRequired;
+    let authority = if plan.capability.d1_approved_mln_import.is_some() {
+        exact_durable_poll_exhaustion(store, plan)
+    } else {
+        exact_resume_poll_exhaustion(store, plan).map(|authority| {
+            (
+                authority.exhaustion_evidence,
+                authority.exhaustion_checkpoint,
+                authority.accepted_ingest_evidence,
+            )
+        })
+    };
+    match authority {
+        Ok((evidence, checkpoint, accepted_ingest_evidence)) => {
+            let artifact = json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":"poll_in_progress_exhausted",
+                "receipt_available":true,
+                "poll_exhaustion_evidence_hash":evidence.content_hash,
+                "accepted_ingest_evidence_hash":accepted_ingest_evidence.content_hash,
+            });
+            let mut local_failures = Vec::new();
+            if let Err(error) = persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                artifact,
+            ) {
+                local_failures.push(format!("poll-exhaustion receipt binding failed: {error}"));
+            }
+            if let Err(error) = persist_secret_lifecycle(store, plan, false, None, secrets) {
+                local_failures.push(format!(
+                    "poll-exhaustion secret lifecycle persistence failed: {error}"
+                ));
+            }
+            let detail = if local_failures.is_empty() {
+                "Cloudflare D1 import remains in progress after the approved poll bound".to_owned()
+            } else {
+                format!(
+                    "Cloudflare D1 import remains in progress after the approved poll bound; {}",
+                    local_failures.join("; ")
+                )
+            };
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":"poll_in_progress_exhausted",
+                    "receipt_available":true,
+                    "at_bookmark_hash":checkpoint.pointer("/receipt/at_bookmark").and_then(Value::as_str).and_then(|value| hash_value(&Value::String(value.to_owned())).ok()),
+                    "attempt_count":checkpoint.pointer("/receipt/attempt_count"),
+                    "attempt_bound":checkpoint.pointer("/receipt/attempt_bound"),
+                    "accepted_ingest_evidence_hash":accepted_ingest_evidence.content_hash,
+                }),
+                Some(evidence),
+                None,
+                &CliError::Input(detail),
+                true,
+                "the exact accepted-ingest bookmark and every bounded in-progress poll receipt are durable; do not replay init/upload/ingest",
+            )
+        }
+        Err(error) => post_boundary_failure_envelope(
+            plan,
+            json!({
+                "success":false,
+                "outcome":"poll_exhaustion_receipt_invalid",
+                "receipt_available":false,
+            }),
+            None,
+            None,
+            &error,
+            true,
+            "poll exhaustion lineage could not be resolved exactly; do not replay any import stage",
+        ),
+    }
+}
+
+fn approved_mln_import_execution_error_envelope(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    error: CloudflareError,
+    secrets: &dyn SecretStore,
+) -> ResultEnvelopeV2 {
+    if matches!(error, CloudflareError::D1ImportProviderFailure) {
+        return known_import_provider_failure_envelope(store, plan, secrets);
+    }
+    if matches!(
+        error,
+        CloudflareError::D1ImportUploadResponseIntegrityFailure
+    ) {
+        return known_import_upload_response_failure_envelope(store, plan, secrets);
+    }
+    if matches!(error, CloudflareError::D1ImportInitResponseFailure) {
+        return known_import_init_response_failure_envelope(store, plan, secrets);
+    }
+    if matches!(
+        error,
+        CloudflareError::D1ImportIngestResponseFailure
+            | CloudflareError::D1ImportPollResponseFailure
+    ) {
+        return known_import_action_response_failure_envelope(store, plan, error, secrets);
+    }
+    if matches!(error, CloudflareError::D1ImportPollInProgressExhausted) {
+        return known_import_poll_exhausted_envelope(store, plan, secrets);
+    }
+    if !matches!(
+        plan.status,
+        PlanStatus::RectificationRequired | PlanStatus::Failed
+    ) {
+        plan.status = PlanStatus::RectificationRequired;
+    }
+    let _ = store.save_plan(plan);
+    let mut envelope = process_api_transport_failure(store, plan, &CliError::from(error), secrets);
+    envelope.performed = true;
+    envelope
+}
+
+fn persist_d1_import_checkpoint(
+    store: &StateStore,
+    operation_id: &str,
+    checkpoint: &D1ImportCheckpointV1,
+) -> std::result::Result<(), String> {
+    let value = serde_json::to_value(checkpoint).map_err(|error| error.to_string())?;
+    let checkpoint_hash = store
+        .record_d1_import_checkpoint(operation_id, &value)
+        .map_err(|error| error.to_string())?;
+    let terminal_provider_failure = (checkpoint.step == "init_response"
+        || checkpoint.step == "ingest_response"
+        || checkpoint.step.starts_with("poll_response_"))
+        && checkpoint
+            .receipt
+            .pointer("/result/status")
+            .and_then(Value::as_str)
+            == Some("error")
+        && checkpoint
+            .receipt
+            .pointer("/result/success")
+            .and_then(Value::as_bool)
+            == Some(false);
+    let durable_apply = checkpoint.step == "provider_complete"
+        || checkpoint.step.starts_with("poll_response_")
+        || terminal_provider_failure
+        || (checkpoint.receipt.get("effect").and_then(Value::as_str) == Some("d1_import_response")
+            && checkpoint.rectification_required)
+        || checkpoint.receipt.get("effect").and_then(Value::as_str)
+            == Some("d1_import_ingest_accepted")
+        || checkpoint.receipt.get("effect").and_then(Value::as_str)
+            == Some("d1_import_transport_uncertain")
+        || checkpoint.receipt.get("effect").and_then(Value::as_str)
+            == Some("d1_import_upload_response")
+        || checkpoint.receipt.get("effect").and_then(Value::as_str)
+            == Some("d1_import_poll_in_progress_exhausted");
+    if durable_apply {
+        let evidence = store
+            .write_evidence(EvidenceClass::Apply, &value)
+            .map_err(|error| error.to_string())?;
+        if evidence.content_hash != checkpoint_hash {
+            return Err(
+                "D1 import checkpoint and immutable apply evidence hashes diverged".to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "special import execution durably binds checkpoints evidence and pending verification"
+)]
+async fn execute_approved_mln_import_plan(
+    store: &StateStore,
+    executor: &Executor,
+    plan: &mut PlanV1,
+    execution_input: &CallInput,
+    credential: &AuthCredential,
+    secrets: &dyn SecretStore,
+) -> Result<ResultEnvelopeV2> {
+    let stage_path = plan
+        .targets
+        .pointer("/adapter/approved_mln_import/stage_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            CliError::Input(
+                "approved MLN import plan omitted its managed stage identity; do not run"
+                    .to_owned(),
+            )
+        })?;
+    validate_managed_mln_stage_authority(plan)?;
+    let checkpoint_operation_id = plan.operation_id.clone();
+    let response = match executor
+        .execute_d1_approved_mln_import(
+            plan,
+            execution_input,
+            credential,
+            &stage_path,
+            |checkpoint: &D1ImportCheckpointV1| {
+                persist_d1_import_checkpoint(store, &checkpoint_operation_id, checkpoint)
+            },
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(approved_mln_import_execution_error_envelope(
+                store, plan, error, secrets,
+            ));
+        }
+    };
+    let (response_value, apply_evidence, lineage_evidence) =
+        match process_api_boundary_response(store, plan, &response, secrets)? {
+            ApiBoundaryResponseOutcome::Ready {
+                response_value,
+                apply_evidence,
+                lineage_evidence,
+            } => (response_value, apply_evidence, lineage_evidence),
+            ApiBoundaryResponseOutcome::Recovery(envelope) => return Ok(envelope),
+        };
+    if !response.success {
+        if !matches!(
+            plan.status,
+            PlanStatus::RectificationRequired | PlanStatus::Failed
+        ) {
+            plan.status = PlanStatus::RectificationRequired;
+        }
+        store.save_plan(plan)?;
+        return Ok(post_boundary_failure_envelope(
+            plan,
+            response_value,
+            Some(apply_evidence),
+            lineage_evidence,
+            &CliError::Input(
+                "Cloudflare did not complete the approved import; preserve all checkpoints and do not replay"
+                    .to_owned(),
+            ),
+            true,
+            "the import boundary was crossed but provider completion was not proven",
+        ));
+    }
+    if let Err(error) = exact_durable_provider_complete_boundary(store, plan.operation_id.as_str())
+    {
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+        return Ok(post_boundary_failure_envelope(
+            plan,
+            response_value,
+            Some(apply_evidence),
+            lineage_evidence,
+            &error,
+            true,
+            "the import boundary was crossed but exact durable provider completion was not proven",
+        ));
+    }
+    if matches!(
+        plan.status,
+        PlanStatus::RectificationRequired | PlanStatus::Failed
+    ) {
+        store.save_plan(plan)?;
+        return Ok(post_boundary_failure_envelope(
+            plan,
+            response_value,
+            Some(apply_evidence),
+            lineage_evidence,
+            &CliError::Input(
+                "approved MLN import ended in a terminal failure state; do not replay".to_owned(),
+            ),
+            true,
+            "terminal import evidence cannot be overwritten by a pending-proof state",
+        ));
+    }
+    plan.status = PlanStatus::Running;
+    store.save_plan(plan)?;
+    let mut envelope =
+        ResultEnvelopeV2::success("plans run", response_value).with_evidence(apply_evidence);
+    envelope.ok = false;
+    envelope.performed = true;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.policy_decision = Some(plan.policy.clone());
+    envelope.verification.state = VerificationState::Pending;
+    envelope.verification.basis = Some(
+        "provider_complete is durable; the operation remains unverified until the exact governed post_import MLN invariant proof is attached"
+            .to_owned(),
+    );
+    envelope.error = Some(ErrorV1 {
+        code: "CFCTL_D1_IMPORT_POST_IMPORT_PROOF_REQUIRED".to_owned(),
+        message: "D1 import crossed the provider boundary but is not publication proof".to_owned(),
+        next_step: Some(format!(
+            "Run the exact mln-0143-data-invariants post_import read bound to operation {}, then run `cfctl plans rectify {}`.",
+            plan.operation_id, plan.operation_id
+        )),
+    });
+    if let Some(evidence) = lineage_evidence {
+        envelope.evidence.push(evidence);
+    }
+    Ok(envelope)
+}
+
+fn validate_managed_mln_stage_authority(plan: &PlanV1) -> Result<()> {
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    let migration_id = plan
+        .input
+        .get("body")
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("managed import migration identity is missing".to_owned())
+        })?;
+    let migration = contract
+        .migrations
+        .iter()
+        .find(|migration| migration.migration_id == migration_id)
+        .ok_or_else(|| CliError::Input("managed import migration is not catalogued".to_owned()))?;
+    let staged = plan
+        .targets
+        .pointer("/adapter/approved_mln_import")
+        .ok_or_else(|| CliError::Input("managed import stage binding is missing".to_owned()))?;
+    let authority = staged
+        .get("source_authority")
+        .ok_or_else(|| CliError::Input("managed source authority is missing".to_owned()))?;
+    let authority_hash = hash_value(authority)?;
+    let expected_sha256 = format!("sha256:{}", migration.sha256);
+    if authority.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || authority.get("repository_id").and_then(Value::as_str)
+            != Some(contract.repository_id.as_str())
+        || authority.get("head").and_then(Value::as_str) != Some(contract.repository_head.as_str())
+        || authority
+            .get("repository_relative_path")
+            .and_then(Value::as_str)
+            != Some(migration.repository_relative_path.as_str())
+        || authority.get("git_blob_oid").and_then(Value::as_str)
+            != Some(migration.git_blob_oid.as_str())
+        || authority
+            .get("observed_worktree_root")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || authority
+            .get("observed_git_common_dir")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || staged.get("source_authority_hash").and_then(Value::as_str)
+            != Some(authority_hash.as_str())
+        || staged.get("sha256").and_then(Value::as_str) != Some(expected_sha256.as_str())
+        || staged.get("md5").and_then(Value::as_str) != Some(migration.md5.as_str())
+        || staged.get("bytes").and_then(Value::as_u64) != Some(migration.bytes)
+    {
+        return Err(CliError::Input(
+            "managed import stage lost its exact source-authority or byte identity".to_owned(),
+        ));
+    }
+    let stage_path = staged
+        .get("stage_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::Input("managed import stage path is missing".to_owned()))?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(&stage_path).map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| CliError::Io {
+            path: stage_path.display().to_string(),
+            source,
+        })?;
+    if !metadata.is_file()
+        || metadata.len() != migration.bytes
+        || bytes.len() as u64 != migration.bytes
+        || hex::encode(Sha256::digest(&bytes)) != migration.sha256
+        || hex::encode(Md5::digest(&bytes)) != migration.md5
+    {
+        return Err(CliError::Input(
+            "managed import stage no longer matches the consumed reviewed source".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 enum ApiBoundaryResponseOutcome {
@@ -14216,7 +18862,10 @@ fn bind_required_empty_compensation_body(
 )]
 async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
     let _plan_lock = store.lock_plan(&selector.operation_id)?;
-    let plan = load_validated_plan(store, &selector.operation_id)?;
+    let mut plan = load_validated_plan(store, &selector.operation_id)?;
+    if plan.capability.d1_approved_mln_import.is_some() {
+        return rectify_approved_mln_import(store, &mut plan);
+    }
     let lineage_evidence = reconcile_standing_lineage_from_plan(store, &plan)?;
     if let Some(mut request) = compensation_request(&plan)? {
         let catalog = ensure_catalog(store).await?;
@@ -14274,7 +18923,7 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
                     }),
             )?,
         );
-        let mut envelope = create_plan(
+        let mut envelope = Box::pin(create_plan(
             store,
             &catalog,
             capability,
@@ -14282,7 +18931,7 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
             Some(&plan.profile_id),
             request.requested_account.as_deref(),
             Value::Object(compensation_targets),
-        )
+        ))
         .await?;
         "plans rectify".clone_into(&mut envelope.command);
         if let Some(result) = envelope.result.as_object_mut() {
@@ -14320,6 +18969,139 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
     Ok(envelope)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "rectification is one no-replay verified-state transition"
+)]
+fn rectify_approved_mln_import(store: &StateStore, plan: &mut PlanV1) -> Result<ResultEnvelopeV2> {
+    if plan.status != PlanStatus::Running
+        || plan.transaction_stage != TransactionStageV1::SecretSinkPersisted
+    {
+        return Err(CliError::Input(
+            "approved MLN import is not at the durable provider_complete boundary".to_owned(),
+        ));
+    }
+    let staged = plan
+        .targets
+        .pointer("/adapter/approved_mln_import")
+        .cloned()
+        .ok_or_else(|| CliError::Input("import stage binding is missing".to_owned()))?;
+    let source_sha256 = staged
+        .get("sha256")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| CliError::Input("import source SHA-256 is missing".to_owned()))?;
+    let provider_boundary =
+        exact_durable_provider_complete_boundary(store, plan.operation_id.as_str())?;
+    let provider_complete_hash = &provider_boundary.evidence_hash;
+    let import_input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let migration_id = import_input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("import migration identity is missing".to_owned()))?;
+    let matching = store
+        .list_operational_proofs()?
+        .into_iter()
+        .filter_map(|proof| {
+            if migration_id == "0142" {
+                let binding = proof.mln_0142_governed_execution()?;
+                let final_bookmark_hash = provider_boundary
+                    .checkpoint
+                    .pointer("/receipt/final_bookmark")
+                    .and_then(Value::as_str)
+                    .and_then(|bookmark| hash_value(&Value::String(bookmark.to_owned())).ok())?;
+                let exact = proof.capability_id == "mln-0142-post-import-schema"
+                    && binding.completion_status == "completed"
+                    && binding.import_operation_id == plan.operation_id
+                    && binding.import_boundary_evidence_hash == *provider_complete_hash
+                    && binding.import_source_sha256 == source_sha256
+                    && binding.import_plan_hash == plan.content_hash
+                    && binding.final_bookmark_hash == final_bookmark_hash
+                    && binding.target_scope_hash == hash_value(staged.get("target")?).ok()?;
+                return exact.then_some(proof);
+            }
+            let binding = proof.mln_0143_governed_execution()?;
+            if proof.capability_id != "mln-0143-data-invariants"
+                || binding.phase != "post_import"
+                || binding.completion_status != "completed"
+                || binding.cross_operation_lineage_hash.is_none()
+            {
+                return None;
+            }
+            let evidence = store
+                .read_evidence_value(&proof.evidence.content_hash)
+                .ok()?;
+            let manifest = evidence.get("result").unwrap_or(&evidence);
+            let lineage = manifest.get("lineage")?;
+            let exact = lineage.get("import_operation_id").and_then(Value::as_str)
+                == Some(plan.operation_id.as_str())
+                && lineage
+                    .get("import_boundary_evidence_hash")
+                    .and_then(Value::as_str)
+                    == Some(provider_complete_hash.as_str())
+                && lineage.get("import_source_sha256").and_then(Value::as_str)
+                    == Some(source_sha256.as_str())
+                && lineage.get("import_plan_hash").and_then(Value::as_str)
+                    == Some(plan.content_hash.as_str())
+                && binding.cross_operation_lineage_hash.as_deref()
+                    == hash_value(lineage).ok().as_deref();
+            exact.then_some(proof)
+        })
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(CliError::Input(
+            "import verification requires exactly one governed post_import proof bound to this plan, source, target, and provider boundary"
+                .to_owned(),
+        ));
+    }
+    let proof = &matching[0];
+    persist_transaction_stage(
+        store,
+        plan,
+        TransactionStageV1::VerificationAttemptPersisted,
+    )?;
+    plan.status = PlanStatus::Verified;
+    let completion = json!({
+        "schema_version":1,
+        "state":"verified",
+        "operation_id":plan.operation_id,
+        "provider_complete_evidence_hash":provider_complete_hash,
+        "post_import_operation_id":proof.mln_0143_governed_execution().map(|binding| binding.operation_id.as_str()).or_else(|| proof.mln_0142_governed_execution().map(|binding| binding.operation_id.as_str())),
+        "post_import_evidence_hash":proof.evidence.content_hash,
+        "source_sha256":source_sha256,
+        "target":staged.get("target"),
+    });
+    let verification_evidence =
+        store.write_evidence(EvidenceClass::PostChangeVerification, &completion)?;
+    persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::VerificationResponsePersisted,
+        json!({
+            "state":"passed",
+            "evidence_hash":verification_evidence.content_hash,
+            "provider_complete_evidence_hash":provider_complete_hash,
+        }),
+    )?;
+    persist_transaction_stage(store, plan, TransactionStageV1::Closed)?;
+    let mut envelope =
+        ResultEnvelopeV2::success("plans rectify", completion).with_evidence(verification_evidence);
+    envelope.performed = false;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.policy_decision = Some(plan.policy.clone());
+    envelope.verification.state = VerificationState::Passed;
+    envelope.verification.basis = Some(
+        "the exact provider_complete import boundary is joined to one governed migration-specific post-import proof; this local transition performed no additional provider mutation"
+            .to_owned(),
+    );
+    Ok(envelope)
+}
+
 async fn keys_command(store: &StateStore, command: KeysCommand) -> Result<ResultEnvelopeV2> {
     match command {
         KeysCommand::Permissions(arguments) => Box::pin(key_permissions(store, &arguments)).await,
@@ -14333,10 +19115,10 @@ async fn keys_command(store: &StateStore, command: KeysCommand) -> Result<Result
             ))
             .await
         }
-        KeysCommand::Rotate(arguments) => key_rotate(store, &arguments).await,
+        KeysCommand::Rotate(arguments) => Box::pin(key_rotate(store, &arguments)).await,
         KeysCommand::Revoke(arguments) => {
             preflight_standing_authority(store, arguments.under_policy.as_deref())?;
-            let plan = key_revoke(store, &arguments).await?;
+            let plan = Box::pin(key_revoke(store, &arguments)).await?;
             Box::pin(finish_standing_run(
                 store,
                 plan,
@@ -14619,6 +19401,7 @@ fn permission_inventory_call(arguments: &KeyPermissionArgs) -> CallArgs {
         value_out: None,
         credential_in: None,
         out: None,
+        source_file: None,
     }
 }
 
@@ -14707,7 +19490,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
         .get(capability_id)
         .cloned()
         .ok_or_else(|| capability_missing(capability_id))?;
-    let mut plan = create_plan(
+    let mut plan = Box::pin(create_plan(
         store,
         &catalog,
         capability,
@@ -14733,7 +19516,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
                 "evidence_hashes": inventory_evidence_hashes,
             }
         }),
-    )
+    ))
     .await?;
     plan.evidence.splice(0..0, inventory.evidence);
     Ok(plan)
@@ -14849,7 +19632,7 @@ async fn key_rotate(store: &StateStore, arguments: &KeyRotateArgs) -> Result<Res
         .get(capability_id)
         .cloned()
         .ok_or_else(|| capability_missing(capability_id))?;
-    create_plan(
+    Box::pin(create_plan(
         store,
         &catalog,
         capability,
@@ -14866,7 +19649,7 @@ async fn key_rotate(store: &StateStore, arguments: &KeyRotateArgs) -> Result<Res
         None,
         Some(&arguments.account),
         json!({"value_out": arguments.value_out}),
-    )
+    ))
     .await
 }
 
@@ -14884,7 +19667,7 @@ async fn key_revoke(store: &StateStore, arguments: &KeyRevokeArgs) -> Result<Res
         .get(capability_id)
         .cloned()
         .ok_or_else(|| capability_missing(capability_id))?;
-    create_plan(
+    Box::pin(create_plan(
         store,
         &catalog,
         capability,
@@ -14901,7 +19684,7 @@ async fn key_revoke(store: &StateStore, arguments: &KeyRevokeArgs) -> Result<Res
         None,
         Some(account),
         Value::Null,
-    )
+    ))
     .await
 }
 
@@ -17239,6 +22022,9 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
         };
         argv.extend(["--value-out".to_owned(), sink.to_owned()]);
     }
+    if capability.d1_full_export.is_some() {
+        argv.extend(["--out".to_owned(), "<new-mode-0600-sql-path>".to_owned()]);
+    }
     argv.push("--json".to_owned());
     argv
 }
@@ -18549,8 +23335,9 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        CallInput, CliError, DNS_RECORD_DETAIL_PATH, DNS_RECORD_DETAIL_READ_CAPABILITY_ID,
-        DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
+        CallInput, CliError, D1RecoveryAnchorExpectation, DNS_RECORD_DETAIL_PATH,
+        DNS_RECORD_DETAIL_READ_CAPABILITY_ID, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
+        Mln0143PreImportExpectation, Mln0143RestoreAnchorJoin,
         OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, SECURITY_IP_RULE_COLLECTION_PATH,
         SECURITY_IP_RULE_CREATE_ID, SECURITY_IP_RULE_STATE_CAPABILITY_ID,
         SECURITY_LIST_MEMBER_COLLECTION_PATH, SECURITY_LIST_MEMBER_CREATE_ID,
@@ -18563,17 +23350,24 @@ mod tests {
         apply_oauth_client_secret_state_response, apply_operational_proof_index_result,
         apply_r2_parent_token_response, apply_warp_connector_configuration_state_response,
         apply_web_analytics_rum_state_response, apply_zone_account_response,
-        apply_zone_entitlement_response, approve_plan, bind_required_empty_compensation_body,
+        apply_zone_entitlement_response, approve_plan,
+        approved_mln_import_execution_error_envelope, bind_required_empty_compensation_body,
         blocked_capability_envelope, boundary_response_artifact, build_mint_policy_body,
         call_command, cancel_plan, capability_call_argv, compensation_request,
-        credential_generation_for_read, delegated_read_envelope, entitlement_probe_selectors,
+        credential_generation_for_read, d1_recovery_anchor_matches, delegated_read_envelope,
+        entitlement_probe_selectors, exact_accepted_ingest_bookmarks,
+        exact_durable_poll_exhaustion, exact_durable_provider_complete_boundary,
+        exact_durable_provider_failure_boundary, exact_in_progress_poll_receipt,
         execute_native_workflow, execute_read, find_secret_value, force_ipv4_from,
         governed_cli_environment_contract, governed_cli_workspace_env, guide_document,
         guide_stage_commands, http_client, is_live_plan_precondition_hash,
         is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
-        list_security_action_state_receipt, non_readback_verification_basis,
+        list_security_action_state_receipt, mln_0142_terminal_import_state,
+        mln_0143_parent_manifests, mln_0143_pre_import_authority_matches,
+        mln_0143_pre_import_matches, mln_0143_restore_anchor_matches,
+        non_readback_verification_basis, normalize_reviewed_mln_repository_id,
         operational_proof_coverage, permission_inventory_call, permission_inventory_envelope,
-        persist_prepared_plan, persist_secret_lifecycle,
+        persist_d1_import_checkpoint, persist_prepared_plan, persist_secret_lifecycle,
         persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
         preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
@@ -18594,10 +23388,12 @@ mod tests {
         should_bind_kv_empty_namespace_state, should_bind_oauth_client_secret_state,
         should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
         should_bind_zone_account, should_redact_secret_response, should_resolve_entitlement_probe,
-        should_resolve_zone_entitlement, sink_secret_result, store_imported_api_token,
-        validate_api_token_creation_contract, validate_current_permission_groups,
+        should_resolve_zone_entitlement, sink_secret_result, stage_approved_mln_migration,
+        store_imported_api_token, validate_api_token_creation_contract,
+        validate_approved_mln_repository_authority, validate_current_permission_groups,
         validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
+        validate_managed_mln_stage_authority, validate_mln_0143_lineage_result,
         validate_permission_group_resource_scope, validate_request_contract,
         validate_selected_permission_groups, validate_standing_authority_group_scopes,
         validate_standing_authority_permission_inventory, validate_token_policy_body,
@@ -18607,28 +23403,36 @@ mod tests {
         wrangler_deploy_version_id, wrangler_status_has_promoted_version, zone_target,
     };
     use crate::profiles::ProfilesConfig;
+    use crate::telemetry_product::record_operational_proof;
     use crate::{
         CallArgs, CapabilitySelector, CatalogCommand, KeyMutationArgs, KeyPermissionArgs,
         KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs, PlanSelector, SearchArgs,
     };
     use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
-    use cfctl_catalog::CatalogSnapshot;
-    use cfctl_cloudflare::{CloudflareApiErrorV1, CloudflareResponseV1, OperationVerificationV1};
+    use cfctl_catalog::{CatalogSnapshot, ingest_native_control_capabilities};
+    use cfctl_cloudflare::{
+        CloudflareApiErrorV1, CloudflareError, CloudflareResponseV1, D1ImportCheckpointV1,
+        OperationVerificationV1,
+    };
     use cfctl_core::{
         AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
         AsyncCollectionMutationContractV1, CapabilityV1, CostV1,
         CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
-        CreatedResourceContractV1, EffectClass, EntitlementProbeV1, EvidenceClass, EvidenceV1,
-        OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, OutputFormatV1,
-        PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1, PlanV2, QuerySerializationV1,
-        ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1,
-        SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
-        SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
-        TransactionStageV1, VerificationState, WorkflowContractV1, WorkflowStepV1, hash_value,
+        CreatedResourceContractV1, D1FullExportGovernedExecutionBindingV1, EffectClass,
+        EntitlementProbeV1, EvidenceClass, EvidenceV1, Mln0142GovernedExecutionBindingV1,
+        Mln0143GovernedExecutionBindingV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
+        OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1,
+        PlanV2, QuerySerializationV1, ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES,
+        SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+        SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
+        StandingAuthorityV1, TransactionStageV1, VerificationState, WorkflowContractV1,
+        WorkflowStepV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
+    use md5::Md5;
     use serde_json::{Value, json};
+    use sha2::{Digest as _, Sha256};
     use std::path::PathBuf;
     use std::{
         collections::BTreeMap,
@@ -18636,9 +23440,1837 @@ mod tests {
         sync::{Arc, Barrier},
         thread,
     };
+    use uuid::Uuid;
 
     fn guide_json(capability: &CapabilityV1) -> Value {
         serde_json::to_value(guide_document(capability)).expect("typed capability guide JSON")
+    }
+
+    #[test]
+    fn d1_schema_introspection_guide_emits_only_closed_body_and_exact_selectors() {
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let capability = catalog
+            .get("d1-schema-introspection")
+            .expect("D1 introspection");
+        let guide = guide_json(capability);
+
+        assert_eq!(guide["contract_state"], "available");
+        assert_eq!(
+            guide["call_argv"],
+            json!([
+                "cfctl",
+                "call",
+                "d1-schema-introspection",
+                "--selector",
+                "account_id=<account_id>",
+                "--selector",
+                "database_id=<database_id>",
+                "--body-stdin",
+                "--json"
+            ])
+        );
+        let schema = &guide["capability"]["request_schema"];
+        let encoded = serde_json::to_string(schema).expect("guide schema");
+        assert!(!encoded.contains("\"sql\""));
+        assert!(!encoded.contains("\"params\""));
+    }
+
+    #[test]
+    fn mln_0143_invariant_guide_exposes_only_pinned_phase_lineage_input() {
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let capability = catalog
+            .get("mln-0143-data-invariants")
+            .expect("MLN invariant capability");
+        let guide = guide_json(capability);
+        assert_eq!(guide["contract_state"], "available");
+        assert_eq!(
+            guide["call_argv"],
+            json!([
+                "cfctl",
+                "call",
+                "mln-0143-data-invariants",
+                "--selector",
+                "account_id=<account_id>",
+                "--selector",
+                "database_id=<database_id>",
+                "--body-stdin",
+                "--json"
+            ])
+        );
+        let encoded = serde_json::to_string(&guide).expect("guide JSON");
+        for forbidden in ["\"sql\"", "\"table\"", "\"document_hash\"", "\"output\""] {
+            assert!(!encoded.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn mln_0143_admission_requires_0142_verified_and_terminal_not_provider_complete_running() {
+        let capability = CapabilityV1::new(
+            "d1-import-approved-mln-migration",
+            "fixture",
+            "POST",
+            "/accounts/{account_id}/d1/database/{database_id}/import",
+        );
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "ca30e922fda7f5578e49873542e4aaca",
+            "catalog-a",
+            capability,
+            json!({}),
+        )
+        .expect("draft plan");
+        plan.status = PlanStatus::Running;
+        plan.transaction_stage = TransactionStageV1::SecretSinkPersisted;
+        assert!(
+            !mln_0142_terminal_import_state(&plan),
+            "provider_complete Running cannot authorize 0143"
+        );
+        plan.status = PlanStatus::Verified;
+        assert!(
+            !mln_0142_terminal_import_state(&plan),
+            "Verified without terminal journal closure cannot authorize 0143"
+        );
+        plan.transaction_stage = TransactionStageV1::Closed;
+        assert!(
+            mln_0142_terminal_import_state(&plan),
+            "only Verified plus Closed is admissible"
+        );
+    }
+
+    #[test]
+    fn mln_0143_restore_anchor_join_rejects_every_authority_substitution() {
+        let anchor_completed_at = Utc::now() - chrono::Duration::minutes(2);
+        let restore_created_at = Utc::now() - chrono::Duration::minutes(1);
+        let exact = Mln0143RestoreAnchorJoin {
+            input_source_operation_id: "post-0142-anchor".to_owned(),
+            receipt_source_operation_id: "post-0142-anchor".to_owned(),
+            input_source_evidence_hash: "sha256:anchor-evidence".to_owned(),
+            receipt_source_evidence_hash: "sha256:anchor-evidence".to_owned(),
+            input_target_bookmark_hash: "sha256:post-0142-bookmark".to_owned(),
+            requested_bookmark_hash: "sha256:post-0142-bookmark".to_owned(),
+            observed_bookmark_hash: "sha256:post-0142-bookmark".to_owned(),
+            account_id: "account".to_owned(),
+            profile_id: "profile".to_owned(),
+            catalog_hash: "sha256:catalog".to_owned(),
+            credential_generation_id: "credential-generation".to_owned(),
+            anchor_completed_at,
+            restore_created_at,
+        };
+        assert!(mln_0143_restore_anchor_matches(&exact, &exact));
+        for (label, drifted) in [
+            ("input operation", {
+                let mut value = exact.clone();
+                value.input_source_operation_id = "pre-0142-anchor".to_owned();
+                value
+            }),
+            ("receipt operation", {
+                let mut value = exact.clone();
+                value.receipt_source_operation_id = "grafted-operation".to_owned();
+                value
+            }),
+            ("input evidence", {
+                let mut value = exact.clone();
+                value.input_source_evidence_hash = "sha256:substitute".to_owned();
+                value
+            }),
+            ("receipt evidence", {
+                let mut value = exact.clone();
+                value.receipt_source_evidence_hash = "sha256:substitute".to_owned();
+                value
+            }),
+            ("target bookmark", {
+                let mut value = exact.clone();
+                value.input_target_bookmark_hash = "sha256:pre-0142".to_owned();
+                value
+            }),
+            ("requested bookmark", {
+                let mut value = exact.clone();
+                value.requested_bookmark_hash = "sha256:pre-0142".to_owned();
+                value
+            }),
+            ("observed bookmark", {
+                let mut value = exact.clone();
+                value.observed_bookmark_hash = "sha256:pre-0142".to_owned();
+                value
+            }),
+            ("account", {
+                let mut value = exact.clone();
+                value.account_id = "other-account".to_owned();
+                value
+            }),
+            ("profile", {
+                let mut value = exact.clone();
+                value.profile_id = "other-profile".to_owned();
+                value
+            }),
+            ("catalog", {
+                let mut value = exact.clone();
+                value.catalog_hash = "sha256:other-catalog".to_owned();
+                value
+            }),
+            ("credential", {
+                let mut value = exact.clone();
+                value.credential_generation_id = "other-generation".to_owned();
+                value
+            }),
+            ("chronology", {
+                let mut value = exact.clone();
+                value.anchor_completed_at = restore_created_at;
+                value
+            }),
+        ] {
+            assert!(
+                !mln_0143_restore_anchor_matches(&drifted, &exact),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_conditionals_canonical_hash_and_parent_target_grafts() {
+        for generations in [1, 2] {
+            for conditional in ["if_match", "if_none_match"] {
+                let fixture = build_poll_child_lineage(generations);
+                let index = generations - 1;
+                let mut child = fixture.children[index].clone();
+                let response_artifact = child
+                    .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                    .expect("terminal response artifact")
+                    .clone();
+                let mut input: CallInput =
+                    serde_json::from_value(child.input.clone()).expect("child input");
+                if conditional == "if_match" {
+                    input.if_match = Some("grafted-etag".to_owned());
+                } else {
+                    input.if_none_match = Some("grafted-etag".to_owned());
+                }
+                child.input = serde_json::to_value(input).expect("conditional child input");
+                let terminal_status = child.status;
+                rebuild_poll_child_terminal_lifecycle(
+                    &mut child,
+                    terminal_status,
+                    response_artifact,
+                );
+                let pins = fixture
+                    .store
+                    .load_plan_v2(&child.operation_id)
+                    .expect("canonical child")
+                    .pins;
+                persist_poll_test_plan_v2(&fixture.store, &child, pins);
+                assert!(
+                    super::exact_linear_poll_child_provider_complete(
+                        &fixture.store,
+                        &fixture.root_plan
+                    )
+                    .is_err(),
+                    "{conditional} must fail closed for generation {generations}"
+                );
+            }
+        }
+
+        for intermediate in [false, true] {
+            let fixture = build_poll_child_lineage(if intermediate { 2 } else { 1 });
+            let index = 0;
+            let mut child = fixture.children[index].clone();
+            let response_artifact = child
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .expect("response artifact")
+                .clone();
+            let substituted_hash =
+                hash_value(&serde_json::to_value(&fixture.root_plan.capability).expect("root cap"))
+                    .expect("substituted canonical hash");
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["capability_contract_hash"] =
+                json!(substituted_hash);
+            let status = child.status;
+            rebuild_poll_child_terminal_lifecycle(&mut child, status, response_artifact);
+            let pins = fixture
+                .store
+                .load_plan_v2(&child.operation_id)
+                .expect("canonical child")
+                .pins;
+            persist_poll_test_plan_v2(&fixture.store, &child, pins);
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err(),
+                "another canonical capability hash must not substitute"
+            );
+        }
+
+        let fixture = build_poll_child_lineage(2);
+        let mut terminal = fixture.children[1].clone();
+        let response_artifact = terminal
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .expect("terminal response artifact")
+            .clone();
+        terminal.targets["adapter"]["approved_mln_import_poll_resume"]["target"] = json!({
+            "account_id":"target-b",
+            "database_id":"22222222-2222-4222-8222-222222222222",
+        });
+        let mut input: CallInput =
+            serde_json::from_value(terminal.input.clone()).expect("terminal input");
+        input.selectors =
+            terminal.targets["adapter"]["approved_mln_import_poll_resume"]["target"].clone();
+        terminal.input = serde_json::to_value(input).expect("target-grafted input");
+        rebuild_poll_child_terminal_lifecycle(
+            &mut terminal,
+            PlanStatus::Running,
+            response_artifact,
+        );
+        let pins = fixture
+            .store
+            .load_plan_v2(&terminal.operation_id)
+            .expect("canonical terminal")
+            .pins;
+        persist_poll_test_plan_v2(&fixture.store, &terminal, pins);
+        assert!(
+            super::exact_linear_poll_child_provider_complete(&fixture.store, &fixture.root_plan)
+                .is_err(),
+            "terminal target must match its exact intermediate parent"
+        );
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_fully_coordinated_target_b_substitution() {
+        for intermediate in [false, true] {
+            let fixture = build_poll_child_lineage(if intermediate { 2 } else { 1 });
+            let mut child = fixture.children[0].clone();
+            let original_apply =
+                (!intermediate).then(|| completed_poll_child_apply_response(&fixture));
+            let target_b = json!({
+                "account_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "database_id":"22222222-2222-4222-8222-222222222222",
+            });
+            let contract = child
+                .capability
+                .d1_approved_mln_import_poll_resume
+                .as_mut()
+                .expect("poll child contract");
+            contract.account_id = target_b["account_id"]
+                .as_str()
+                .expect("target B account")
+                .to_owned();
+            contract.database_id = target_b["database_id"]
+                .as_str()
+                .expect("target B database")
+                .to_owned();
+            child.account_id = contract.account_id.clone();
+            let mut input: CallInput =
+                serde_json::from_value(child.input.clone()).expect("child input");
+            input.selectors = target_b.clone();
+            child.input = serde_json::to_value(input).expect("target B input");
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["target"] =
+                target_b.clone();
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["root_stage"]["target"] =
+                target_b.clone();
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["root_input"]["selectors"] =
+                target_b.clone();
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["capability_contract_hash"] = json!(
+                hash_value(&serde_json::to_value(&child.capability).expect("target B capability"))
+                    .expect("target B capability hash")
+            );
+            let rewritten =
+                rewrite_poll_test_checkpoints_for_target(&fixture.store, &child, &target_b);
+            let response_artifact = if intermediate {
+                let (exhaustion_hash, _) = rewritten
+                    .get("poll_in_progress_exhausted")
+                    .expect("rewritten exhaustion");
+                let accepted_hash = child
+                    .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                    .and_then(|artifact| artifact.get("accepted_ingest_evidence_hash"))
+                    .and_then(Value::as_str)
+                    .expect("accepted evidence hash");
+                json!({
+                    "adapter":"dynamic_api",
+                    "performed":true,
+                    "success":false,
+                    "outcome":"poll_in_progress_exhausted",
+                    "receipt_available":true,
+                    "poll_exhaustion_evidence_hash":exhaustion_hash,
+                    "accepted_ingest_evidence_hash":accepted_hash,
+                })
+            } else {
+                let (_, completion) = rewritten
+                    .get("provider_complete")
+                    .expect("rewritten completion");
+                let mut response = original_apply.expect("original apply response");
+                response["result"]["_cfctl"] = completion["receipt"].clone();
+                response["result"]["at_bookmark"] = completion["receipt"]["at_bookmark"].clone();
+                response["result"]["result"]["final_bookmark"] =
+                    completion["receipt"]["final_bookmark"].clone();
+                let apply = fixture
+                    .store
+                    .write_evidence(EvidenceClass::Apply, &response)
+                    .expect("target B apply evidence");
+                let mut artifact = child
+                    .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                    .expect("completion response artifact")
+                    .clone();
+                artifact["apply_evidence_hash"] = json!(apply.content_hash);
+                artifact
+            };
+            let status = child.status;
+            rebuild_poll_child_terminal_lifecycle(&mut child, status, response_artifact);
+            let pins = fixture
+                .store
+                .load_plan_v2(&child.operation_id)
+                .expect("canonical child")
+                .pins;
+            persist_poll_test_plan_v2(&fixture.store, &child, pins);
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err(),
+                "fully coordinated target B substitution must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the matrix coordinates root source authority, stage, checkpoints, child lineage, and evidence"
+    )]
+    fn poll_child_resolver_rejects_recomputed_valid_root_source_authority_grafts() {
+        let positive = build_poll_child_lineage(1);
+        let positive_root = positive
+            .store
+            .load_plan_v2(&positive.root_plan.operation_id)
+            .expect("canonical positive root");
+        super::validate_trusted_root_import_plan(&positive.store, &positive_root)
+            .expect("trusted positive root");
+        super::exact_linear_poll_child_provider_complete(&positive.store, &positive.root_plan)
+            .expect("positive root-to-child completion");
+
+        for graft in [
+            "repository_head",
+            "repository_id",
+            "migration_path_blob",
+            "migration_digest",
+            "migration_bytes",
+        ] {
+            let fixture = build_poll_child_lineage(1);
+            let mut root = fixture.root_plan.clone();
+            let contract = root
+                .capability
+                .d1_approved_mln_import
+                .as_mut()
+                .expect("root import contract");
+            let migration = contract
+                .migrations
+                .iter_mut()
+                .find(|migration| migration.migration_id == "0143")
+                .expect("0143 migration");
+            let stage = root
+                .targets
+                .pointer_mut("/adapter/approved_mln_import")
+                .expect("root stage");
+            match graft {
+                "repository_head" => {
+                    contract.repository_head =
+                        "1111111111111111111111111111111111111111".to_owned();
+                    stage["source_authority"]["head"] = json!(contract.repository_head);
+                }
+                "repository_id" => {
+                    contract.repository_id = "grafted/mln-web".to_owned();
+                    stage["source_authority"]["repository_id"] = json!(contract.repository_id);
+                }
+                "migration_path_blob" => {
+                    migration.repository_relative_path =
+                        "grafted/0143_advisor_final_equity_instrument.sql".to_owned();
+                    migration.git_blob_oid = "2222222222222222222222222222222222222222".to_owned();
+                    stage["source_authority"]["repository_relative_path"] =
+                        json!(migration.repository_relative_path);
+                    stage["source_authority"]["git_blob_oid"] = json!(migration.git_blob_oid);
+                }
+                "migration_digest" => {
+                    migration.sha256 = "33".repeat(32);
+                    migration.md5 = "44".repeat(16);
+                    stage["sha256"] = json!(format!("sha256:{}", migration.sha256));
+                    stage["md5"] = json!(migration.md5);
+                }
+                "migration_bytes" => {
+                    migration.bytes = migration.bytes.saturating_add(1);
+                    stage["bytes"] = json!(migration.bytes);
+                }
+                _ => unreachable!("closed root graft matrix"),
+            }
+            stage["source_authority_hash"] =
+                json!(hash_value(&stage["source_authority"]).expect("grafted authority hash"));
+            let stage = stage.clone();
+            root.refresh_hash().expect("grafted root hash");
+            let root_pins = fixture
+                .store
+                .load_plan_v2(&root.operation_id)
+                .expect("canonical root")
+                .pins;
+            persist_poll_test_plan_v2(&fixture.store, &root, root_pins);
+
+            let root_checkpoint_dir = fixture
+                .store
+                .paths()
+                .data_dir
+                .join("d1-import-checkpoints")
+                .join(&root.operation_id);
+            let root_checkpoints = fixture
+                .store
+                .read_d1_import_checkpoints(&root.operation_id)
+                .expect("root checkpoints");
+            for entry in fs::read_dir(&root_checkpoint_dir).expect("root checkpoint directory") {
+                fs::remove_file(entry.expect("root checkpoint entry").path())
+                    .expect("remove root checkpoint");
+            }
+            let mut accepted_hash = None;
+            let mut exhaustion_hash = None;
+            for (_, mut checkpoint) in root_checkpoints {
+                if checkpoint.get("step").and_then(Value::as_str)
+                    == Some("poll_in_progress_exhausted")
+                {
+                    checkpoint["receipt"]["source_sha256"] = stage["sha256"].clone();
+                }
+                let step = checkpoint
+                    .get("step")
+                    .and_then(Value::as_str)
+                    .expect("root checkpoint step")
+                    .to_owned();
+                let hash = persist_poll_lineage_checkpoint(
+                    &fixture.store,
+                    &root.operation_id,
+                    &checkpoint,
+                );
+                if step == "ingest_response" {
+                    accepted_hash = Some(hash.clone());
+                }
+                if step == "poll_in_progress_exhausted" {
+                    exhaustion_hash = Some(hash);
+                }
+            }
+            let accepted_hash = accepted_hash.expect("accepted evidence hash");
+            let exhaustion_hash = exhaustion_hash.expect("exhaustion evidence hash");
+
+            let mut child = fixture.children[0].clone();
+            let authority = child
+                .targets
+                .pointer_mut("/adapter/approved_mln_import_poll_resume")
+                .expect("child authority");
+            authority["root_plan_hash"] = json!(root.content_hash);
+            authority["parent_plan_hash"] = json!(root.content_hash);
+            authority["parent_exhaustion_evidence_hash"] = json!(exhaustion_hash);
+            authority["accepted_ingest_evidence_hash"] = json!(accepted_hash);
+            authority["root_input"] = root.input.clone();
+            authority["root_stage"] = stage.clone();
+            let mut input: CallInput =
+                serde_json::from_value(child.input.clone()).expect("child input");
+            let body = input
+                .body
+                .as_mut()
+                .and_then(Value::as_object_mut)
+                .expect("child input body");
+            body.insert("parent_plan_hash".to_owned(), json!(root.content_hash));
+            body.insert(
+                "exhaustion_evidence_hash".to_owned(),
+                json!(exhaustion_hash),
+            );
+            body.insert(
+                "accepted_ingest_evidence_hash".to_owned(),
+                json!(accepted_hash),
+            );
+            child.input = serde_json::to_value(input).expect("rebound child input");
+
+            let checkpoint_dir = fixture
+                .store
+                .paths()
+                .data_dir
+                .join("d1-import-checkpoints")
+                .join(&child.operation_id);
+            let child_checkpoints = fixture
+                .store
+                .read_d1_import_checkpoints(&child.operation_id)
+                .expect("child checkpoints");
+            for entry in fs::read_dir(&checkpoint_dir).expect("child checkpoint directory") {
+                fs::remove_file(entry.expect("child checkpoint entry").path())
+                    .expect("remove child checkpoint");
+            }
+            let child_input_hash = hash_value(&child.input).expect("child input hash");
+            let mut completion = None;
+            for (_, mut checkpoint) in child_checkpoints {
+                checkpoint["receipt"]["plan_input_hash"] = json!(child_input_hash);
+                if checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete") {
+                    checkpoint["receipt"]["source_sha256"] = stage["sha256"].clone();
+                    checkpoint["receipt"]["source_md5"] = stage["md5"].clone();
+                    checkpoint["receipt"]["source_bytes"] = stage["bytes"].clone();
+                    checkpoint["receipt"]["source_authority_hash"] =
+                        stage["source_authority_hash"].clone();
+                    checkpoint["receipt"]["stage_identity_hash"] =
+                        json!(hash_value(&stage).expect("grafted stage hash"));
+                    checkpoint["receipt"]["root_plan_hash"] = json!(root.content_hash);
+                    checkpoint["receipt"]["parent_exhaustion_evidence_hash"] =
+                        json!(exhaustion_hash);
+                    completion = Some(checkpoint.clone());
+                }
+                persist_poll_lineage_checkpoint(&fixture.store, &child.operation_id, &checkpoint);
+            }
+            let completion = completion.expect("rebound completion");
+            let mut apply_response = completed_poll_child_apply_response(&fixture);
+            apply_response["result"]["_cfctl"] = completion["receipt"].clone();
+            apply_response["result"]["at_bookmark"] = completion["receipt"]["at_bookmark"].clone();
+            apply_response["result"]["result"]["final_bookmark"] =
+                completion["receipt"]["final_bookmark"].clone();
+            let apply = fixture
+                .store
+                .write_evidence(EvidenceClass::Apply, &apply_response)
+                .expect("rebound completion evidence");
+            let mut response_artifact = child
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .expect("child response artifact")
+                .clone();
+            response_artifact["apply_evidence_hash"] = json!(apply.content_hash);
+            rebuild_poll_child_terminal_lifecycle(
+                &mut child,
+                PlanStatus::Running,
+                response_artifact,
+            );
+            let child_pins = fixture
+                .store
+                .load_plan_v2(&child.operation_id)
+                .expect("canonical child")
+                .pins;
+            persist_poll_test_plan_v2(&fixture.store, &child, child_pins);
+
+            let grafted_root = fixture
+                .store
+                .load_plan_v2(&root.operation_id)
+                .expect("grafted root PlanV2");
+            assert!(
+                super::validate_trusted_root_import_plan(&fixture.store, &grafted_root).is_err(),
+                "{graft} must fail direct trusted-root admission"
+            );
+            assert!(
+                super::exact_durable_provider_complete_boundary(&fixture.store, &root.operation_id)
+                    .is_err(),
+                "{graft} must fail direct completion resolution"
+            );
+            assert!(
+                super::exact_linear_poll_child_provider_complete(&fixture.store, &root).is_err(),
+                "{graft} must fail root-to-child completion resolution"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the matrix rebinds every root-input dependent child receipt and PlanV2 lifecycle"
+    )]
+    fn poll_child_resolver_rejects_recomputed_valid_root_input_grafts() {
+        for graft in [
+            "if_match",
+            "if_none_match",
+            "missing_selector",
+            "extra_selector",
+            "wrong_selector",
+            "nonempty_query",
+            "extra_body_key",
+            "unknown_migration",
+            "missing_pre_anchor_field",
+            "wrong_type_pre_anchor_field",
+            "missing_0143_prior_field",
+            "wrong_type_0143_prior_field",
+            "missing_0143_invariant_field",
+            "wrong_type_0143_invariant_field",
+            "drifted_prior_boundary",
+            "drifted_post_anchor",
+        ] {
+            let fixture = build_poll_child_lineage(1);
+            let mut root = fixture.root_plan.clone();
+            let mut input: CallInput =
+                serde_json::from_value(root.input.clone()).expect("root input");
+            match graft {
+                "if_match" => input.if_match = Some("grafted-etag".to_owned()),
+                "if_none_match" => input.if_none_match = Some("grafted-etag".to_owned()),
+                "missing_selector" => {
+                    input
+                        .selectors
+                        .as_object_mut()
+                        .expect("root selectors")
+                        .remove("database_id");
+                }
+                "extra_selector" => {
+                    input
+                        .selectors
+                        .as_object_mut()
+                        .expect("root selectors")
+                        .insert("extra".to_owned(), json!("grafted"));
+                }
+                "wrong_selector" => {
+                    input.selectors["database_id"] = json!("22222222-2222-4222-8222-222222222222");
+                }
+                "nonempty_query" => input.query = json!({"extra":"grafted"}),
+                "extra_body_key" => {
+                    input
+                        .body
+                        .as_mut()
+                        .and_then(Value::as_object_mut)
+                        .expect("root body")
+                        .insert("extra".to_owned(), json!("grafted"));
+                }
+                "unknown_migration" => {
+                    input
+                        .body
+                        .as_mut()
+                        .and_then(Value::as_object_mut)
+                        .expect("root body")
+                        .insert("migration_id".to_owned(), json!("9999"));
+                }
+                "missing_pre_anchor_field" => {
+                    input
+                        .body
+                        .as_mut()
+                        .and_then(Value::as_object_mut)
+                        .expect("root body")
+                        .remove("pre_recovery_anchor_evidence_hash");
+                }
+                "wrong_type_pre_anchor_field" => {
+                    input.body.as_mut().expect("root body")["pre_recovery_anchor_operation_id"] =
+                        json!(42);
+                }
+                "missing_0143_prior_field" => {
+                    input
+                        .body
+                        .as_mut()
+                        .and_then(Value::as_object_mut)
+                        .expect("root body")
+                        .remove("prior_0142_schema_proof_operation_id");
+                }
+                "wrong_type_0143_prior_field" => {
+                    input.body.as_mut().expect("root body")["prior_0142_operation_id"] =
+                        json!(false);
+                }
+                "missing_0143_invariant_field" => {
+                    input
+                        .body
+                        .as_mut()
+                        .and_then(Value::as_object_mut)
+                        .expect("root body")
+                        .remove("pre_import_invariant_evidence_hash");
+                }
+                "wrong_type_0143_invariant_field" => {
+                    input.body.as_mut().expect("root body")["pre_import_invariant_operation_id"] =
+                        json!([]);
+                }
+                "drifted_prior_boundary" => {
+                    input.body.as_mut().expect("root body")["prior_0142_boundary_evidence_hash"] =
+                        json!(format!("sha256:{}", "9".repeat(64)));
+                }
+                "drifted_post_anchor" => {
+                    input.body.as_mut().expect("root body")["post_0142_anchor_operation_id"] =
+                        json!(Uuid::new_v4());
+                }
+                _ => unreachable!("closed root input graft matrix"),
+            }
+            root.input = serde_json::to_value(input).expect("grafted root input");
+            if graft == "unknown_migration" {
+                root.targets["adapter"]["approved_mln_import"]["migration_id"] = json!("9999");
+            }
+            root.targets["adapter"]["approved_mln_import"]["prerequisites"] =
+                root.input.get("body").cloned().unwrap_or(Value::Null);
+            root.refresh_hash().expect("grafted root hash");
+            let root_pins = fixture
+                .store
+                .load_plan_v2(&root.operation_id)
+                .expect("canonical root")
+                .pins;
+            persist_poll_test_plan_v2(&fixture.store, &root, root_pins);
+
+            let mut child = fixture.children[0].clone();
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["root_plan_hash"] =
+                json!(root.content_hash);
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["parent_plan_hash"] =
+                json!(root.content_hash);
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["root_input"] =
+                root.input.clone();
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["root_stage"] =
+                root.targets["adapter"]["approved_mln_import"].clone();
+            let mut child_input: CallInput =
+                serde_json::from_value(child.input.clone()).expect("child input");
+            child_input
+                .body
+                .as_mut()
+                .and_then(Value::as_object_mut)
+                .expect("child body")
+                .insert("parent_plan_hash".to_owned(), json!(root.content_hash));
+            child.input = serde_json::to_value(child_input).expect("rebound child input");
+
+            let checkpoint_dir = fixture
+                .store
+                .paths()
+                .data_dir
+                .join("d1-import-checkpoints")
+                .join(&child.operation_id);
+            let checkpoints = fixture
+                .store
+                .read_d1_import_checkpoints(&child.operation_id)
+                .expect("child checkpoints");
+            for entry in fs::read_dir(&checkpoint_dir).expect("child checkpoint directory") {
+                fs::remove_file(entry.expect("child checkpoint entry").path())
+                    .expect("remove child checkpoint");
+            }
+            let child_input_hash = hash_value(&child.input).expect("child input hash");
+            let mut completion = None;
+            for (_, mut checkpoint) in checkpoints {
+                checkpoint["receipt"]["plan_input_hash"] = json!(child_input_hash);
+                if checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete") {
+                    checkpoint["receipt"]["root_plan_hash"] = json!(root.content_hash);
+                    completion = Some(checkpoint.clone());
+                }
+                persist_poll_lineage_checkpoint(&fixture.store, &child.operation_id, &checkpoint);
+            }
+            let completion = completion.expect("rebound completion");
+            let mut apply_response = completed_poll_child_apply_response(&fixture);
+            apply_response["result"]["_cfctl"] = completion["receipt"].clone();
+            let apply = fixture
+                .store
+                .write_evidence(EvidenceClass::Apply, &apply_response)
+                .expect("rebound apply evidence");
+            let mut response_artifact = child
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .expect("child response artifact")
+                .clone();
+            response_artifact["apply_evidence_hash"] = json!(apply.content_hash);
+            rebuild_poll_child_terminal_lifecycle(
+                &mut child,
+                PlanStatus::Running,
+                response_artifact,
+            );
+            let child_pins = fixture
+                .store
+                .load_plan_v2(&child.operation_id)
+                .expect("canonical child")
+                .pins;
+            persist_poll_test_plan_v2(&fixture.store, &child, child_pins);
+
+            let root_v2 = fixture
+                .store
+                .load_plan_v2(&root.operation_id)
+                .expect("grafted root PlanV2");
+            assert!(
+                super::validate_trusted_root_import_plan(&fixture.store, &root_v2).is_err(),
+                "{graft} must fail trusted-root input admission"
+            );
+            assert!(
+                super::exact_durable_provider_complete_boundary(&fixture.store, &root.operation_id)
+                    .is_err(),
+                "{graft} must fail direct completion resolution"
+            );
+            assert!(
+                super::exact_linear_poll_child_provider_complete(&fixture.store, &root).is_err(),
+                "{graft} must fail root-to-child completion resolution"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the adversarial anchor fixture keeps every joined authority dimension visible"
+    )]
+    fn mln_import_anchor_requires_the_exact_governed_export_join() {
+        let after = Utc::now();
+        let completed_at = after + ChronoDuration::seconds(10);
+        let before = completed_at + ChronoDuration::seconds(10);
+        let evidence = EvidenceV1::new(
+            EvidenceClass::LiveRead,
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "/tmp/export-evidence.json",
+        );
+        let binding = D1FullExportGovernedExecutionBindingV1 {
+            schema_version: 1,
+            operation_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            capability_id: "d1-full-export".to_owned(),
+            catalog_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            target_scope_hash:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            output_file_sha256:
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+            at_bookmark_hash:
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            manifest_evidence_hash: evidence.content_hash.clone(),
+            request_hash: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                .to_owned(),
+            profile_id: "profile-a".to_owned(),
+            credential_generation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            completion_status: "completed".to_owned(),
+            completed_at,
+        };
+        let build = |binding: D1FullExportGovernedExecutionBindingV1| {
+            let mut proof = OperationalProofV1::new(
+                binding.completed_at,
+                "d1-full-export",
+                &binding.catalog_hash,
+                &binding.request_hash,
+                OperationalProofScopeV1::new(
+                    Some("profile-a"),
+                    Some("account-a"),
+                    Some("22222222-2222-4222-8222-222222222222"),
+                ),
+                OperationalProofOutcomeV1::Succeeded,
+                evidence.clone(),
+            );
+            proof
+                .bind_d1_full_export_governed_execution(binding)
+                .expect("valid export binding");
+            proof
+        };
+        let proof = build(binding.clone());
+        let exact = D1RecoveryAnchorExpectation {
+            operation_id: &binding.operation_id,
+            evidence_hash: &binding.manifest_evidence_hash,
+            output_sha256: Some(&binding.output_file_sha256),
+            bookmark_hash: &binding.at_bookmark_hash,
+            catalog_hash: &binding.catalog_hash,
+            request_hash: &binding.request_hash,
+            target_scope_hash: &binding.target_scope_hash,
+            account_id: "account-a",
+            profile_id: "profile-a",
+            credential_generation_id: Some(&binding.credential_generation_id),
+            after: Some(after),
+            before,
+        };
+        assert!(d1_recovery_anchor_matches(&proof, &exact));
+        assert!(
+            d1_recovery_anchor_matches(
+                &proof,
+                &D1RecoveryAnchorExpectation {
+                    after: None,
+                    ..exact
+                }
+            ),
+            "the same typed export is a valid pre-migration anchor when it predates the plan"
+        );
+        assert_eq!(
+            [proof.clone(), proof.clone()]
+                .iter()
+                .filter(|candidate| d1_recovery_anchor_matches(candidate, &exact))
+                .count(),
+            2,
+            "the admission cardinality gate must reject duplicate matching proof rows"
+        );
+        for drifted in [
+            D1RecoveryAnchorExpectation {
+                operation_id: "33333333-3333-4333-8333-333333333333",
+                ..exact
+            },
+            D1RecoveryAnchorExpectation {
+                evidence_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            D1RecoveryAnchorExpectation {
+                output_sha256: Some(
+                    "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ),
+                ..exact
+            },
+            D1RecoveryAnchorExpectation {
+                bookmark_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            D1RecoveryAnchorExpectation {
+                catalog_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            D1RecoveryAnchorExpectation {
+                request_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            D1RecoveryAnchorExpectation {
+                target_scope_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            D1RecoveryAnchorExpectation {
+                profile_id: "other-profile",
+                ..exact
+            },
+            D1RecoveryAnchorExpectation {
+                credential_generation_id: Some("33333333-3333-4333-8333-333333333333"),
+                ..exact
+            },
+            D1RecoveryAnchorExpectation {
+                after: Some(completed_at),
+                ..exact
+            },
+            D1RecoveryAnchorExpectation {
+                before: completed_at,
+                ..exact
+            },
+        ] {
+            assert!(!d1_recovery_anchor_matches(&proof, &drifted));
+        }
+        let mut stale = binding.clone();
+        stale.completed_at = after - ChronoDuration::seconds(1);
+        assert!(
+            !d1_recovery_anchor_matches(&build(stale), &exact),
+            "a pre-0142 export cannot serve as the post-0142 anchor"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the adversarial fixture keeps every pre-import authority and chronology dimension visible"
+    )]
+    fn mln_0143_pre_import_requires_one_current_authority_proof_after_recovery_anchor() {
+        let after = Utc::now();
+        let completed_at = after + ChronoDuration::seconds(10);
+        let before = completed_at + ChronoDuration::seconds(10);
+        let evidence = EvidenceV1::new(
+            EvidenceClass::LiveRead,
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "/tmp/pre-import-evidence.json",
+        );
+        let binding = Mln0143GovernedExecutionBindingV1 {
+            schema_version: 1,
+            operation_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            capability_id: "mln-0143-data-invariants".to_owned(),
+            capability_version: 5,
+            validator_contract_hash:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            fixed_query_sha256:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            catalog_hash: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .to_owned(),
+            target_scope_hash:
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            phase: "pre_import".to_owned(),
+            manifest_evidence_hash: evidence.content_hash.clone(),
+            request_hash: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                .to_owned(),
+            profile_identity_hash: hash_value(&json!({
+                "profile_id":"profile-a",
+                "credential_generation_id":"22222222-2222-4222-8222-222222222222",
+            }))
+            .expect("profile identity"),
+            credential_generation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            completion_status: "completed".to_owned(),
+            completed_at,
+            cross_operation_lineage_hash: None,
+        };
+        let build = |binding: Mln0143GovernedExecutionBindingV1| {
+            let mut proof = OperationalProofV1::new(
+                binding.completed_at,
+                "mln-0143-data-invariants",
+                &binding.catalog_hash,
+                &binding.request_hash,
+                OperationalProofScopeV1::new(
+                    Some("profile-a"),
+                    Some("account-a"),
+                    Some("22222222-2222-4222-8222-222222222222"),
+                ),
+                OperationalProofOutcomeV1::Succeeded,
+                evidence.clone(),
+            );
+            proof
+                .bind_mln_0143_governed_execution(binding)
+                .expect("valid pre-import binding");
+            proof
+        };
+        let proof = build(binding.clone());
+        let exact = Mln0143PreImportExpectation {
+            operation_id: &binding.operation_id,
+            evidence_hash: &binding.manifest_evidence_hash,
+            catalog_hash: &binding.catalog_hash,
+            request_hash: &binding.request_hash,
+            target_scope_hash: &binding.target_scope_hash,
+            account_id: "account-a",
+            profile_id: "profile-a",
+            credential_generation_id: Some(&binding.credential_generation_id),
+            capability_version: binding.capability_version,
+            validator_contract_hash: &binding.validator_contract_hash,
+            fixed_query_sha256: &binding.fixed_query_sha256,
+            after,
+            before,
+        };
+        assert!(mln_0143_pre_import_matches(&proof, &exact));
+        assert_eq!(
+            [proof.clone(), proof.clone()]
+                .iter()
+                .filter(|candidate| mln_0143_pre_import_authority_matches(candidate, &exact))
+                .count(),
+            2,
+            "duplicate or intervening current-authority proofs must invalidate admission"
+        );
+        for drifted in [
+            Mln0143PreImportExpectation {
+                operation_id: "33333333-3333-4333-8333-333333333333",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                evidence_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                catalog_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                request_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                target_scope_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                profile_id: "other-profile",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                credential_generation_id: Some("33333333-3333-4333-8333-333333333333"),
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                capability_version: 3,
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                validator_contract_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                fixed_query_sha256: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                after: completed_at,
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                before: completed_at,
+                ..exact
+            },
+        ] {
+            assert!(!mln_0143_pre_import_matches(&proof, &drifted));
+        }
+        let mut stale = binding.clone();
+        stale.completed_at = after - ChronoDuration::seconds(1);
+        assert!(
+            !mln_0143_pre_import_matches(&build(stale), &exact),
+            "a proof before 0142 closure or the recovery anchor must fail"
+        );
+        let mut after_plan = binding.clone();
+        after_plan.completed_at = before + ChronoDuration::seconds(1);
+        assert!(
+            !mln_0143_pre_import_matches(&build(after_plan), &exact),
+            "a proof after the immutable plan cutoff must fail"
+        );
+    }
+
+    #[test]
+    fn d1_full_export_runtime_records_the_exact_bookmark_anchor_receipt() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let capability = catalog.get("d1-full-export").expect("D1 export");
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"ca30e922fda7f5578e49873542e4aaca",
+                "database_id":"15dc8c91-cba5-4ba8-9e5b-a06cf7e6bf15",
+            }),
+            query: json!({}),
+            ..CallInput::default()
+        };
+        let result = json!({
+            "output_file":{
+                "sha256":format!("sha256:{}", "a".repeat(64)),
+                "complete":true,
+                "hash_matches":true,
+            },
+            "provider":{"at_bookmark":"bookmark-after-0142"},
+        });
+        let evidence = store
+            .write_evidence(EvidenceClass::LiveRead, &result)
+            .expect("evidence");
+        let mut envelope =
+            ResultEnvelopeV2::success("call", result).with_evidence(evidence.clone());
+        envelope.performed = true;
+        envelope.profile_id = Some("profile-a".to_owned());
+        envelope.account_id = Some("ca30e922fda7f5578e49873542e4aaca".to_owned());
+        record_operational_proof(
+            &store,
+            &catalog,
+            capability,
+            &input,
+            Some("22222222-2222-4222-8222-222222222222"),
+            &envelope,
+        )
+        .expect("governed export proof");
+        let proofs = store.list_operational_proofs().expect("proofs");
+        assert_eq!(proofs.len(), 1);
+        let binding = proofs[0]
+            .d1_full_export_governed_execution()
+            .expect("bound export");
+        assert_eq!(binding.manifest_evidence_hash, evidence.content_hash);
+        assert_eq!(
+            binding.at_bookmark_hash,
+            hash_value(&json!("bookmark-after-0142")).expect("bookmark hash")
+        );
+        assert_eq!(binding.completion_status, "completed");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one portable Git fixture proves the complete reviewed-source authority boundary"
+    )]
+    fn approved_mln_source_rejects_suffix_grafts_and_git_authority_drift() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let repository = root.path().join("mln-web");
+        fs::create_dir_all(&repository).expect("repo directory");
+        let repository = fs::canonicalize(repository).expect("canonical repo directory");
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(arguments)
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {}: {}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .expect("git output")
+                .trim()
+                .to_owned()
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/rogu3bear/mln-web.git",
+        ]);
+        let relative = "crates/founder/migrations/d1/0142_document_render_claim_generation.sql";
+        let source = repository.join(relative);
+        fs::create_dir_all(source.parent().expect("source parent")).expect("migration directory");
+        let bytes = b"approved migration\n";
+        fs::write(&source, bytes).expect("migration source");
+        git(&["add", relative]);
+        git(&["commit", "-m", "fixture"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        let blob_spec = format!("HEAD:{relative}");
+        let blob = git(&["rev-parse", &blob_spec]);
+
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let mut capability = catalog
+            .get("d1-import-approved-mln-migration")
+            .expect("import")
+            .clone();
+        let contract = capability
+            .d1_approved_mln_import
+            .as_mut()
+            .expect("contract");
+        contract.repository_head = head.clone();
+        let migration = &mut contract.migrations[0];
+        migration.bytes = bytes.len() as u64;
+        migration.sha256 = hex::encode(Sha256::digest(bytes));
+        migration.md5 = hex::encode(Md5::digest(bytes));
+        migration.git_blob_oid = blob.clone();
+        let contract = capability
+            .d1_approved_mln_import
+            .as_ref()
+            .expect("contract")
+            .clone();
+        validate_approved_mln_repository_authority(
+            &contract,
+            &contract.migrations[0],
+            &repository,
+            Some(bytes),
+        )
+        .expect("exact portable repository authority");
+
+        for remote in [
+            "https://github.com/rogu3bear/mln-web.git",
+            "https://github.com/rogu3bear/mln-web",
+            "git@github.com:rogu3bear/mln-web.git",
+            "git@github.com:rogu3bear/mln-web",
+        ] {
+            assert_eq!(
+                normalize_reviewed_mln_repository_id(remote).as_deref(),
+                Some("github.com/rogu3bear/mln-web")
+            );
+        }
+        for remote in [
+            "https://user@github.com/rogu3bear/mln-web.git",
+            "https://github.com:443/rogu3bear/mln-web.git",
+            "https://github.com/rogu3bear/mln-web.git?x=1",
+            "https://example.com/rogu3bear/mln-web.git",
+        ] {
+            assert!(normalize_reviewed_mln_repository_id(remote).is_none());
+        }
+
+        let state = tempfile::tempdir().expect("state root");
+        let store =
+            StateStore::open(RuntimePaths::from_root(state.path())).expect("state store opens");
+        let input = CallInput {
+            body: Some(json!({"migration_id":"0142"})),
+            ..CallInput::default()
+        };
+        let staged = stage_approved_mln_migration(&store, &capability, &input, &source)
+            .expect("exact reviewed source stages");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            contract.account_id.as_str(),
+            "catalog-sha",
+            capability.clone(),
+            json!({"adapter":{"approved_mln_import":staged}}),
+        )
+        .expect("managed import plan");
+        plan.input = serde_json::to_value(&input).expect("plan input");
+        plan.refresh_hash().expect("refresh staged plan");
+        validate_managed_mln_stage_authority(&plan).expect("managed stage authority");
+        let graft = root.path().join("graft").join(relative);
+        fs::create_dir_all(graft.parent().expect("graft parent")).expect("graft directory");
+        fs::write(&graft, bytes).expect("graft bytes");
+        assert!(
+            stage_approved_mln_migration(&store, &capability, &input, &graft).is_err(),
+            "an exact-byte suffix graft outside the reviewed Git authority must fail"
+        );
+
+        let mut wrong = contract.clone();
+        wrong.repository_head = "1111111111111111111111111111111111111111".to_owned();
+        assert!(
+            validate_approved_mln_repository_authority(
+                &wrong,
+                &wrong.migrations[0],
+                &repository,
+                Some(bytes)
+            )
+            .is_err()
+        );
+        let mut wrong = contract.clone();
+        wrong.repository_id = "github.com/attacker/mln-web".to_owned();
+        assert!(
+            validate_approved_mln_repository_authority(
+                &wrong,
+                &wrong.migrations[0],
+                &repository,
+                Some(bytes)
+            )
+            .is_err()
+        );
+        let mut wrong_migration = contract.migrations[0].clone();
+        wrong_migration.git_blob_oid = "1111111111111111111111111111111111111111".to_owned();
+        assert!(
+            validate_approved_mln_repository_authority(
+                &contract,
+                &wrong_migration,
+                &repository,
+                Some(bytes)
+            )
+            .is_err()
+        );
+        fs::write(&source, b"dirty source\n").expect("dirty source");
+        assert!(
+            validate_approved_mln_repository_authority(
+                &contract,
+                &contract.migrations[0],
+                &repository,
+                Some(bytes)
+            )
+            .is_err(),
+            "dirty worktree source must fail"
+        );
+        validate_managed_mln_stage_authority(&plan)
+            .expect("execution consumes the immutable managed stage, not the changed checkout");
+        git(&["checkout", "--", relative]);
+        let symlink_root = root.path().join("mln-link");
+        std::os::unix::fs::symlink(&repository, &symlink_root).expect("root symlink");
+        assert!(
+            validate_approved_mln_repository_authority(
+                &contract,
+                &contract.migrations[0],
+                &symlink_root,
+                Some(bytes)
+            )
+            .is_err(),
+            "symlink root substitution must fail"
+        );
+        let stage_path = plan
+            .targets
+            .pointer("/adapter/approved_mln_import/stage_path")
+            .and_then(Value::as_str)
+            .expect("managed stage path");
+        fs::write(stage_path, b"tampered stage\n").expect("tamper managed stage");
+        assert!(
+            validate_managed_mln_stage_authority(&plan).is_err(),
+            "execution must reject a managed stage that drifted after planning"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one lineage fixture proves all stale-parent and full-packet phase transitions"
+    )]
+    fn mln_0143_lineage_binds_post_restore_to_the_same_pre_baseline() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let capability = catalog
+            .get("mln-0143-data-invariants")
+            .expect("MLN invariant");
+        let contract = capability
+            .mln_0143_data_invariants
+            .as_ref()
+            .expect("typed contract");
+        let scope = hash_value(&json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        }))
+        .expect("scope hash");
+        let base = |phase: &str| {
+            json!({
+                "schema_version":1,
+                "capability_id":"mln-0143-data-invariants",
+                "capability_version":contract.capability_version,
+                "validator_contract_hash":contract.validator_contract_hash,
+                "migration_id":"0143",
+                "migration_sha256":contract.migration_sha256,
+                "phase":phase,
+                "target_scope_hash":scope,
+                "complete":true,
+                "projection":{"digest":format!("sha256:{}", "a".repeat(64)),"count":2,"counts_by_kind":[]},
+                "semantic_schema_hash":if phase == "post_import" {
+                    contract.post_table_definition_hash.clone()
+                } else {
+                    contract.pre_table_definition_hash.clone()
+                },
+                "packet_hash":format!("sha256:{}", "c".repeat(64)),
+                "packet_count":3,
+                "packet_non_target_hash":format!("sha256:{}", "e".repeat(64)),
+                "packet_non_target_count":2,
+                "prior_0142_trigger_definition_hash":contract.prior_0142_trigger_definition_hash,
+                "trigger_definition_hashes":if phase == "pre_import" {
+                    json!([])
+                } else {
+                    json!(contract.trigger_definition_hashes)
+                },
+                "assertions":{
+                    "old_table_absent":true,
+                    "unique_hash_index_present":true,
+                    "event_index_exact_non_unique_shape":true,
+                    "document_index_exact_non_unique_shape":true,
+                    "foreign_key_check_empty":true,
+                    "duplicate_hash_groups_zero":true,
+                    "invalid_evidence_kinds_zero":true,
+                    "invalid_advanced_events_zero":true,
+                    "prior_0142_terminal_trigger_present":true
+                },
+                "query":{
+                    "sha256":contract.fixed_query_sha256,
+                    "row_limit":256,
+                    "probe_rows":257,
+                    "byte_limit":1024 * 1024,
+                    "timeout_seconds":30,
+                    "received_rows":2,
+                    "provider_rows_read":20,
+                    "provider_duration":0.1,
+                    "bounds_saturated":false
+                },
+                "lineage":{}
+            })
+        };
+        let synthetic_pre = store
+            .write_evidence(EvidenceClass::LiveRead, &base("pre_import"))
+            .expect("synthetic pre evidence");
+        let synthetic_input = CallInput {
+            body: Some(json!({
+                "migration_id":"0143",
+                "phase":"post_import",
+                "pre_import_evidence_hash":synthetic_pre.content_hash
+            })),
+            ..CallInput::default()
+        };
+        assert!(
+            mln_0143_parent_manifests(&store, &catalog, capability, &synthetic_input).is_err(),
+            "direct evidence persistence must not mint governed-execution provenance"
+        );
+        let credential_generation_id = "11111111-1111-4111-8111-111111111111";
+        let register = |manifest: Value, phase: &str| {
+            let response = json!({"result": manifest});
+            let evidence = store
+                .write_evidence(EvidenceClass::LiveRead, &response)
+                .expect("runtime evidence");
+            let mut envelope = cfctl_core::ResultEnvelopeV2::success("call", response)
+                .with_evidence(evidence.clone());
+            envelope.performed = true;
+            envelope.capability_id = Some(capability.id.clone());
+            envelope.profile_id = Some("default".to_owned());
+            envelope.account_id = Some(contract.account_id.clone());
+            let proof_input = CallInput {
+                body: Some(json!({"migration_id":"0143","phase":phase})),
+                ..CallInput::default()
+            };
+            record_operational_proof(
+                &store,
+                &catalog,
+                capability,
+                &proof_input,
+                Some(credential_generation_id),
+                &envelope,
+            )
+            .expect("governed runtime proof");
+            evidence
+        };
+        let pre = register(base("pre_import"), "pre_import");
+        for (label, mut stale) in [
+            ("v1", base("pre_import")),
+            ("missing query hash", base("pre_import")),
+            ("wrong validator hash", base("pre_import")),
+            ("missing authority identities", base("pre_import")),
+        ] {
+            match label {
+                "v1" => stale["capability_version"] = json!(1),
+                "missing query hash" => {
+                    stale["query"]
+                        .as_object_mut()
+                        .expect("query")
+                        .remove("sha256");
+                }
+                "wrong validator hash" => {
+                    stale["validator_contract_hash"] =
+                        Value::String(format!("sha256:{}", "f".repeat(64)));
+                }
+                "missing authority identities" => {
+                    stale
+                        .as_object_mut()
+                        .expect("manifest")
+                        .remove("assertions");
+                    stale
+                        .as_object_mut()
+                        .expect("manifest")
+                        .remove("semantic_schema_hash");
+                    stale
+                        .as_object_mut()
+                        .expect("manifest")
+                        .remove("packet_hash");
+                }
+                _ => unreachable!(),
+            }
+            let evidence = store
+                .write_evidence(EvidenceClass::LiveRead, &stale)
+                .expect("stale evidence");
+            let stale_input = CallInput {
+                body: Some(json!({
+                    "migration_id":"0143",
+                    "phase":"post_import",
+                    "pre_import_evidence_hash":evidence.content_hash
+                })),
+                ..CallInput::default()
+            };
+            assert!(
+                mln_0143_parent_manifests(&store, &catalog, capability, &stale_input).is_err(),
+                "{label}"
+            );
+        }
+        let mut post_manifest = base("post_import");
+        post_manifest["lineage"]["pre_import_evidence_hash"] =
+            Value::String(pre.content_hash.clone());
+        let post = register(post_manifest, "post_import");
+        let input = CallInput {
+            body: Some(json!({
+                "migration_id":"0143",
+                "phase":"post_restore",
+                "pre_import_evidence_hash":pre.content_hash,
+                "post_import_evidence_hash":post.content_hash
+            })),
+            ..CallInput::default()
+        };
+        assert!(
+            mln_0143_parent_manifests(&store, &catalog, capability, &input).is_err(),
+            "post-restore evidence without the exact import and restore operation joins fails closed"
+        );
+        let parents = vec![
+            (pre.content_hash.clone(), base("pre_import")),
+            (post.content_hash.clone(), {
+                let mut manifest = base("post_import");
+                manifest["lineage"]["pre_import_evidence_hash"] =
+                    Value::String(pre.content_hash.clone());
+                manifest
+            }),
+        ];
+        validate_mln_0143_lineage_result(&input, &base("post_restore"), &parents)
+            .expect("restored result equals pre baseline");
+
+        let mut drifted = base("post_restore");
+        drifted["packet_hash"] = Value::String(format!("sha256:{}", "d".repeat(64)));
+        assert!(validate_mln_0143_lineage_result(&input, &drifted, &parents).is_err());
+
+        let mut non_target_post_drift = base("post_import");
+        non_target_post_drift["packet_non_target_hash"] =
+            Value::String(format!("sha256:{}", "9".repeat(64)));
+        assert!(
+            validate_mln_0143_lineage_result(
+                &CallInput {
+                    body: Some(json!({"phase":"post_import"})),
+                    ..CallInput::default()
+                },
+                &non_target_post_drift,
+                &[(pre.content_hash.clone(), base("pre_import"))],
+            )
+            .is_err()
+        );
+        let mut non_target_restore_drift = base("post_restore");
+        non_target_restore_drift["packet_count"] = json!(2);
+        assert!(
+            validate_mln_0143_lineage_result(&input, &non_target_restore_drift, &parents).is_err()
+        );
+        let duplicate_pre = register(base("pre_import"), "pre_import");
+        assert_eq!(duplicate_pre.content_hash, pre.content_hash);
+        assert!(
+            mln_0143_parent_manifests(&store, &catalog, capability, &input).is_err(),
+            "duplicate governed executions for one parent manifest fail closed"
+        );
+    }
+
+    #[test]
+    fn d1_full_export_guide_binds_exact_selectors_and_file_output() {
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let guide = guide_json(catalog.get("d1-full-export").expect("D1 export"));
+        assert_eq!(guide["contract_state"], "available");
+        assert_eq!(
+            guide["call_argv"],
+            json!([
+                "cfctl",
+                "call",
+                "d1-full-export",
+                "--selector",
+                "account_id=<account_id>",
+                "--selector",
+                "database_id=<database_id>",
+                "--out",
+                "<new-mode-0600-sql-path>",
+                "--json"
+            ])
+        );
+        let encoded = serde_json::to_string(&guide).expect("guide JSON");
+        assert!(!encoded.contains("\"sql\""));
+        assert!(!encoded.contains("\"restore\""));
+    }
+
+    #[test]
+    fn d1_restore_exact_bookmark_guide_is_closed_and_approval_bound() {
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let capability = catalog
+            .get("d1-restore-exact-bookmark")
+            .expect("D1 restore");
+        let guide = guide_json(capability);
+        assert_eq!(guide["contract_state"], "available");
+        assert_eq!(
+            guide["call_argv"],
+            json!([
+                "cfctl",
+                "call",
+                "d1-restore-exact-bookmark",
+                "--selector",
+                "account_id=<account_id>",
+                "--selector",
+                "database_id=<database_id>",
+                "--body-stdin",
+                "--json"
+            ])
+        );
+        let schema = &guide["capability"]["request_schema"];
+        assert_eq!(schema["additionalProperties"], false);
+        let encoded = serde_json::to_string(schema).expect("schema JSON");
+        assert!(!encoded.contains("\"timestamp\""));
+        assert!(!encoded.contains("\"url\""));
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one CLI boundary regression covers the exact export allowlist and ordinary mutation denial"
+    )]
+    async fn d1_full_export_requires_out_and_rejects_caller_body_before_credentials() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        store
+            .write_json(&store.paths().catalog_file(), &catalog)
+            .expect("seed catalog");
+        let arguments = CallArgs {
+            capability_id: "d1-full-export".to_owned(),
+            selectors: vec![
+                ("account_id".to_owned(), "a".repeat(32)),
+                (
+                    "database_id".to_owned(),
+                    "11111111-2222-3333-4444-555555555555".to_owned(),
+                ),
+            ],
+            query: Vec::new(),
+            body_json: None,
+            body_stdin: false,
+            profile: None,
+            account: None,
+            if_match: None,
+            if_none_match: None,
+            value_out: None,
+            credential_in: None,
+            out: None,
+            source_file: None,
+        };
+        let error = Box::pin(call_command(&store, arguments))
+            .await
+            .expect_err("missing --out");
+        assert!(error.to_string().contains("requires `--out"));
+
+        let error = Box::pin(call_command(
+            &store,
+            CallArgs {
+                capability_id: "d1-full-export".to_owned(),
+                selectors: vec![
+                    ("account_id".to_owned(), "a".repeat(32)),
+                    (
+                        "database_id".to_owned(),
+                        "11111111-2222-3333-4444-555555555555".to_owned(),
+                    ),
+                ],
+                query: Vec::new(),
+                body_json: Some(r#"{"sql":"SELECT 1"}"#.to_owned()),
+                body_stdin: false,
+                profile: None,
+                account: None,
+                if_match: None,
+                if_none_match: None,
+                value_out: None,
+                credential_in: None,
+                out: Some(root.path().join("snapshot.sql")),
+                source_file: None,
+            },
+        ))
+        .await
+        .expect_err("caller SQL must be rejected");
+        assert!(error.to_string().contains("caller SQL"));
+
+        let mut mutation = CapabilityV1::new(
+            "fixture-mutation",
+            "Fixture mutation",
+            "POST",
+            "/accounts/{account_id}/fixture",
+        );
+        mutation.mutating = true;
+        mutation.selectors = vec![SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        }];
+        catalog.capabilities.insert(mutation.id.clone(), mutation);
+        catalog.refresh_hash().expect("refresh catalog");
+        store
+            .write_json(&store.paths().catalog_file(), &catalog)
+            .expect("replace catalog");
+        let error = Box::pin(call_command(
+            &store,
+            CallArgs {
+                capability_id: "fixture-mutation".to_owned(),
+                selectors: vec![("account_id".to_owned(), "a".repeat(32))],
+                query: Vec::new(),
+                body_json: None,
+                body_stdin: false,
+                profile: None,
+                account: None,
+                if_match: None,
+                if_none_match: None,
+                value_out: None,
+                credential_in: None,
+                out: Some(root.path().join("mutation.out")),
+                source_file: None,
+            },
+        ))
+        .await
+        .expect_err("ordinary mutation must reject --out");
+        assert!(
+            error
+                .to_string()
+                .contains("restricted to bounded analytics")
+        );
     }
 
     fn save_current_test_plan(store: &StateStore, plan: &PlanV1) {
@@ -18647,7 +25279,7 @@ mod tests {
             PlanPinsV2 {
                 build_identity_hash: "sha256:test-build".to_owned(),
                 catalog_hash: plan.catalog_hash.clone(),
-                credential_generation_id: "test-credential-generation".to_owned(),
+                credential_generation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
                 admission_policy_hash: "compiled:test-policy".to_owned(),
                 authority_hash: None,
                 workspace_graph_hash: "sha256:test-workspace".to_owned(),
@@ -18659,6 +25291,2961 @@ mod tests {
         store
             .save_plan_v2(&document)
             .expect("persist current PlanV2 fixture");
+    }
+
+    struct PollChildLineageFixture {
+        _root: tempfile::TempDir,
+        store: StateStore,
+        root_plan: PlanV1,
+        children: Vec<PlanV1>,
+    }
+
+    const POLL_FIXTURE_CATALOG_HASH: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const POLL_FIXTURE_CREDENTIAL_GENERATION: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn persist_poll_lineage_checkpoint(
+        store: &StateStore,
+        operation_id: &str,
+        checkpoint: &Value,
+    ) -> String {
+        let hash = store
+            .record_d1_import_checkpoint(operation_id, checkpoint)
+            .expect("persist lineage checkpoint");
+        assert_eq!(
+            store
+                .write_evidence(EvidenceClass::Apply, checkpoint)
+                .expect("persist lineage evidence")
+                .content_hash,
+            hash
+        );
+        hash
+    }
+
+    fn record_test_export_anchor(
+        store: &StateStore,
+        contract: &cfctl_core::D1ApprovedMlnImportContractV1,
+        catalog_hash: &str,
+        completed_at: chrono::DateTime<Utc>,
+        bookmark: &str,
+    ) -> (String, String, String, String) {
+        let operation_id = Uuid::new_v4().to_string();
+        let output_sha256 = format!("sha256:{}", "a".repeat(64));
+        let bookmark_hash = hash_value(&json!(bookmark)).expect("bookmark hash");
+        let target_scope_hash = hash_value(&json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        }))
+        .expect("target hash");
+        let request_hash = hash_value(
+            &serde_json::to_value(CallInput {
+                selectors: json!({
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                }),
+                query: json!({}),
+                ..CallInput::default()
+            })
+            .expect("export input"),
+        )
+        .expect("export request hash");
+        let evidence = store
+            .write_evidence(
+                EvidenceClass::LiveRead,
+                &json!({"operation_id":operation_id,"bookmark":bookmark}),
+            )
+            .expect("anchor evidence");
+        let binding = D1FullExportGovernedExecutionBindingV1 {
+            schema_version: 1,
+            operation_id: operation_id.clone(),
+            capability_id: "d1-full-export".to_owned(),
+            catalog_hash: catalog_hash.to_owned(),
+            target_scope_hash,
+            output_file_sha256: output_sha256.clone(),
+            at_bookmark_hash: bookmark_hash.clone(),
+            manifest_evidence_hash: evidence.content_hash.clone(),
+            request_hash: request_hash.clone(),
+            profile_id: "profile-a".to_owned(),
+            credential_generation_id: POLL_FIXTURE_CREDENTIAL_GENERATION.to_owned(),
+            completion_status: "completed".to_owned(),
+            completed_at,
+        };
+        let mut proof = OperationalProofV1::new(
+            completed_at,
+            "d1-full-export",
+            catalog_hash,
+            &request_hash,
+            OperationalProofScopeV1::new(
+                Some("profile-a"),
+                Some(&contract.account_id),
+                Some(POLL_FIXTURE_CREDENTIAL_GENERATION),
+            ),
+            OperationalProofOutcomeV1::Succeeded,
+            evidence.clone(),
+        );
+        proof
+            .bind_d1_full_export_governed_execution(binding)
+            .expect("bind export anchor");
+        store
+            .record_operational_proof(&proof)
+            .expect("record export anchor");
+        (
+            operation_id,
+            evidence.content_hash,
+            output_sha256,
+            bookmark_hash,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the production-shaped fixture materializes the entire governed 0142 to 0143 authority chain"
+    )]
+    fn authentic_0143_prerequisites(
+        store: &StateStore,
+        root_capability: &CapabilityV1,
+        root_created_at: chrono::DateTime<Utc>,
+    ) -> Value {
+        let contract = root_capability
+            .d1_approved_mln_import
+            .as_ref()
+            .expect("root import contract");
+        let selectors = json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        });
+        let (pre_operation, pre_evidence, pre_output, pre_bookmark) = record_test_export_anchor(
+            store,
+            contract,
+            POLL_FIXTURE_CATALOG_HASH,
+            root_created_at - ChronoDuration::minutes(50),
+            "pre-0142",
+        );
+        let body_0142 = json!({
+            "migration_id":"0142",
+            "pre_recovery_anchor_operation_id":pre_operation,
+            "pre_recovery_anchor_evidence_hash":pre_evidence,
+            "pre_recovery_anchor_output_sha256":pre_output,
+            "pre_recovery_anchor_bookmark_hash":pre_bookmark,
+        });
+        let migration = contract
+            .migrations
+            .iter()
+            .find(|migration| migration.migration_id == "0142")
+            .expect("0142 migration");
+        let mut prior = PlanV1::draft(
+            "profile-a",
+            &contract.account_id,
+            POLL_FIXTURE_CATALOG_HASH,
+            root_capability.clone(),
+            json!({}),
+        )
+        .expect("0142 plan");
+        prior.created_at = root_created_at - ChronoDuration::minutes(40);
+        prior.expires_at = root_created_at + ChronoDuration::minutes(20);
+        prior.input = serde_json::to_value(CallInput {
+            selectors: selectors.clone(),
+            query: json!({}),
+            body: Some(body_0142.clone()),
+            ..CallInput::default()
+        })
+        .expect("0142 input");
+        prior
+            .precondition_hashes
+            .insert("catalog".to_owned(), prior.catalog_hash.clone());
+        let authority = json!({
+            "schema_version":1,
+            "repository_id":contract.repository_id,
+            "observed_worktree_root":"/reviewed/mln-web",
+            "observed_git_common_dir":"/reviewed/mln-web/.git",
+            "head":contract.repository_head,
+            "repository_relative_path":migration.repository_relative_path,
+            "git_blob_oid":migration.git_blob_oid,
+        });
+        let stage = json!({
+            "schema_version":1,
+            "migration_id":"0142",
+            "catalog_basename":migration.basename,
+            "source_authority":authority,
+            "source_authority_hash":hash_value(&authority).expect("0142 authority hash"),
+            "bytes":migration.bytes,
+            "sha256":format!("sha256:{}",migration.sha256),
+            "md5":migration.md5,
+            "stage_path":"/managed/0142.sql",
+            "stage_lifecycle":"preserve_until_verified_or_explicitly_retired",
+            "target":selectors,
+            "prerequisites":body_0142,
+        });
+        prior.targets = json!({"adapter":{"approved_mln_import":stage}});
+        prior.refresh_hash().expect("0142 plan hash");
+        prior.approve(true, None).expect("approve 0142");
+        prior.mark_consumed().expect("consume 0142");
+        prior
+            .record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("0142 boundary attempt");
+        let input_hash = hash_value(&prior.input).expect("0142 input hash");
+        let accepted = json!({
+            "schema_version":1,"operation_id":prior.operation_id,"step":"ingest_response",
+            "performed":true,"rectification_required":false,
+            "receipt":{"http_status":200,"success":true,"response_action":"ingest",
+                "provider":"cloudflare","effect":"d1_import_ingest_accepted",
+                "migration_id":"0142","target":selectors,"plan_input_hash":input_hash,
+                "no_replay":false,"result":{"type":"import","status":"active","success":true,
+                    "at_bookmark":"accepted-0142"},"errors":[]}
+        });
+        persist_poll_lineage_checkpoint(store, &prior.operation_id, &accepted);
+        let completion = json!({
+            "schema_version":1,"operation_id":prior.operation_id,"step":"provider_complete",
+            "performed":true,"rectification_required":false,
+            "receipt":{"provider":"cloudflare","effect":"d1_import_provider_complete",
+                "response_action":"poll","no_replay":true,"state":"provider_complete",
+                "provider_status":"complete","provider_success":true,"migration_id":"0142",
+                "target":selectors,"plan_input_hash":input_hash,
+                "source_sha256":stage["sha256"],"source_md5":stage["md5"],
+                "source_bytes":stage["bytes"],"source_authority_hash":stage["source_authority_hash"],
+                "stage_identity_hash":hash_value(&stage).expect("0142 stage hash"),
+                "prerequisites":body_0142,"at_bookmark":"accepted-0142",
+                "final_bookmark":"completed-0142"}
+        });
+        let boundary_hash =
+            persist_poll_lineage_checkpoint(store, &prior.operation_id, &completion);
+        prior.status = PlanStatus::Running;
+        prior
+            .record_transaction_stage(TransactionStageV1::BoundaryResponsePersisted)
+            .expect("0142 boundary response");
+        prior
+            .record_transaction_stage(TransactionStageV1::SecretSinkPersisted)
+            .expect("0142 secret sink");
+        let proof_operation = Uuid::new_v4().to_string();
+        let verification = store
+            .write_evidence(
+                EvidenceClass::Apply,
+                &json!({"state":"verified","operation_id":prior.operation_id,
+                    "provider_complete_evidence_hash":boundary_hash,
+                    "post_import_operation_id":proof_operation}),
+            )
+            .expect("0142 verification evidence");
+        prior.status = PlanStatus::Verified;
+        prior
+            .record_transaction_stage(TransactionStageV1::VerificationAttemptPersisted)
+            .expect("0142 verification attempt");
+        prior
+            .record_transaction_stage_with_artifact(
+                TransactionStageV1::VerificationResponsePersisted,
+                json!({"evidence_hash":verification.content_hash}),
+            )
+            .expect("0142 verification response");
+        prior
+            .record_transaction_stage(TransactionStageV1::Closed)
+            .expect("close 0142");
+        prior.refresh_hash().expect("terminal 0142 hash");
+        save_current_test_plan(store, &prior);
+        let schema_evidence = store
+            .write_evidence(
+                EvidenceClass::LiveRead,
+                &json!({"operation_id":proof_operation,"migration_id":"0142"}),
+            )
+            .expect("0142 schema evidence");
+        let schema_capability = super::trusted_native_capability("mln-0142-post-import-schema")
+            .expect("0142 schema capability");
+        let schema_contract = schema_capability
+            .mln_0142_post_import_schema
+            .expect("0142 schema contract");
+        let schema_request_hash =
+            hash_value(&json!({"fixture":"0142-schema"})).expect("0142 schema request hash");
+        let mut schema_proof = OperationalProofV1::new(
+            root_created_at - ChronoDuration::minutes(20),
+            "mln-0142-post-import-schema",
+            POLL_FIXTURE_CATALOG_HASH,
+            &schema_request_hash,
+            OperationalProofScopeV1::new(
+                Some("profile-a"),
+                Some(&contract.account_id),
+                Some(POLL_FIXTURE_CREDENTIAL_GENERATION),
+            ),
+            OperationalProofOutcomeV1::Succeeded,
+            schema_evidence.clone(),
+        );
+        schema_proof
+            .bind_mln_0142_governed_execution(Mln0142GovernedExecutionBindingV1 {
+                schema_version: 1,
+                operation_id: proof_operation.clone(),
+                capability_id: "mln-0142-post-import-schema".to_owned(),
+                capability_version: 1,
+                catalog_hash: POLL_FIXTURE_CATALOG_HASH.to_owned(),
+                target_scope_hash: hash_value(&selectors).expect("target hash"),
+                import_operation_id: prior.operation_id.clone(),
+                import_boundary_evidence_hash: boundary_hash.clone(),
+                import_source_sha256:
+                    "sha256:07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0"
+                        .to_owned(),
+                import_plan_hash: prior.content_hash.clone(),
+                final_bookmark_hash: hash_value(&json!("completed-0142"))
+                    .expect("final bookmark hash"),
+                trigger_name: schema_contract.trigger_name,
+                trigger_definition_sha256: schema_contract.trigger_definition_sha256,
+                manifest_evidence_hash: schema_evidence.content_hash.clone(),
+                request_hash: schema_request_hash,
+                credential_generation_id: POLL_FIXTURE_CREDENTIAL_GENERATION.to_owned(),
+                completion_status: "completed".to_owned(),
+                completed_at: root_created_at - ChronoDuration::minutes(20),
+            })
+            .expect("bind 0142 schema proof");
+        store
+            .record_operational_proof(&schema_proof)
+            .expect("record 0142 schema proof");
+        let (post_operation, post_evidence, _, post_bookmark) = record_test_export_anchor(
+            store,
+            contract,
+            POLL_FIXTURE_CATALOG_HASH,
+            root_created_at - ChronoDuration::minutes(10),
+            "post-0142",
+        );
+        let invariant_operation = Uuid::new_v4().to_string();
+        let invariant_evidence = store
+            .write_evidence(
+                EvidenceClass::LiveRead,
+                &json!({"operation_id":invariant_operation,"migration_id":"0143","phase":"pre_import"}),
+            )
+            .expect("0143 invariant evidence");
+        let invariant_request_hash = hash_value(
+            &serde_json::to_value(CallInput {
+                selectors: selectors.clone(),
+                query: json!({}),
+                body: Some(json!({"migration_id":"0143","phase":"pre_import"})),
+                ..CallInput::default()
+            })
+            .expect("0143 invariant input"),
+        )
+        .expect("0143 invariant request hash");
+        let completed_at = root_created_at - ChronoDuration::minutes(5);
+        let mut invariant_proof = OperationalProofV1::new(
+            completed_at,
+            "mln-0143-data-invariants",
+            POLL_FIXTURE_CATALOG_HASH,
+            &invariant_request_hash,
+            OperationalProofScopeV1::new(
+                Some("profile-a"),
+                Some(&contract.account_id),
+                Some(POLL_FIXTURE_CREDENTIAL_GENERATION),
+            ),
+            OperationalProofOutcomeV1::Succeeded,
+            invariant_evidence.clone(),
+        );
+        invariant_proof
+            .bind_mln_0143_governed_execution(Mln0143GovernedExecutionBindingV1 {
+                schema_version: 1,
+                operation_id: invariant_operation.clone(),
+                capability_id: "mln-0143-data-invariants".to_owned(),
+                capability_version: contract.pre_import_capability_version,
+                validator_contract_hash: contract.pre_import_validator_contract_hash.clone(),
+                fixed_query_sha256: contract.pre_import_fixed_query_sha256.clone(),
+                catalog_hash: POLL_FIXTURE_CATALOG_HASH.to_owned(),
+                target_scope_hash: hash_value(&selectors).expect("target hash"),
+                phase: "pre_import".to_owned(),
+                manifest_evidence_hash: invariant_evidence.content_hash.clone(),
+                request_hash: invariant_request_hash,
+                profile_identity_hash: hash_value(&json!({
+                    "profile_id":"profile-a",
+                    "credential_generation_id":POLL_FIXTURE_CREDENTIAL_GENERATION,
+                }))
+                .expect("profile identity hash"),
+                credential_generation_id: POLL_FIXTURE_CREDENTIAL_GENERATION.to_owned(),
+                completion_status: "completed".to_owned(),
+                completed_at,
+                cross_operation_lineage_hash: None,
+            })
+            .expect("bind 0143 invariant");
+        store
+            .record_operational_proof(&invariant_proof)
+            .expect("record 0143 invariant");
+        json!({
+            "migration_id":"0143",
+            "pre_recovery_anchor_operation_id":pre_operation,
+            "pre_recovery_anchor_evidence_hash":pre_evidence,
+            "pre_recovery_anchor_output_sha256":pre_output,
+            "pre_recovery_anchor_bookmark_hash":pre_bookmark,
+            "prior_0142_operation_id":prior.operation_id,
+            "prior_0142_boundary_evidence_hash":boundary_hash,
+            "prior_0142_schema_proof_operation_id":proof_operation,
+            "prior_0142_verification_evidence_hash":verification.content_hash,
+            "post_0142_anchor_operation_id":post_operation,
+            "post_0142_anchor_evidence_hash":post_evidence,
+            "post_0142_anchor_bookmark_hash":post_bookmark,
+            "pre_import_invariant_operation_id":invariant_operation,
+            "pre_import_invariant_evidence_hash":invariant_evidence.content_hash,
+        })
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fixture builds the exact root exhaustion and immutable child lifecycle"
+    )]
+    fn build_poll_child_lineage(generations: usize) -> PollChildLineageFixture {
+        assert!((1..=2).contains(&generations));
+        let root = tempfile::tempdir().expect("poll lineage root");
+        let store =
+            StateStore::open(RuntimePaths::from_root(root.path())).expect("poll lineage store");
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://native".to_owned(),
+            source_hash: "sha256:test".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native overlay");
+        let root_capability = catalog
+            .capabilities
+            .remove("d1-import-approved-mln-migration")
+            .expect("root import capability");
+        let root_poll_bound = root_capability
+            .d1_approved_mln_import
+            .as_ref()
+            .expect("root contract")
+            .max_poll_attempts;
+        let child_capability = catalog
+            .capabilities
+            .remove("d1-resume-approved-mln-import-poll")
+            .expect("child poll capability");
+        let child_poll_bound = child_capability
+            .d1_approved_mln_import_poll_resume
+            .as_ref()
+            .expect("child contract")
+            .max_poll_attempts;
+        let root_contract = root_capability
+            .d1_approved_mln_import
+            .clone()
+            .expect("root contract");
+        let migration = root_contract
+            .migrations
+            .iter()
+            .find(|migration| migration.migration_id == "0143")
+            .expect("0143 migration");
+        let mut root_plan = PlanV1::draft(
+            "profile-a",
+            &root_contract.account_id,
+            POLL_FIXTURE_CATALOG_HASH,
+            root_capability.clone(),
+            json!({}),
+        )
+        .expect("root plan");
+        root_plan.created_at = Utc::now() + ChronoDuration::hours(1);
+        root_plan.expires_at = root_plan.created_at + ChronoDuration::hours(1);
+        let prerequisites =
+            authentic_0143_prerequisites(&store, &root_capability, root_plan.created_at);
+        root_plan.input = serde_json::to_value(CallInput {
+            selectors: json!({
+                "account_id":root_contract.account_id,
+                "database_id":root_contract.database_id,
+            }),
+            query: json!({}),
+            body: Some(prerequisites),
+            ..CallInput::default()
+        })
+        .expect("root input");
+        root_plan
+            .precondition_hashes
+            .insert("catalog".to_owned(), root_plan.catalog_hash.clone());
+        let source_authority = json!({
+            "schema_version":1,
+            "repository_id":root_contract.repository_id,
+            "observed_worktree_root":"/reviewed/mln-web",
+            "observed_git_common_dir":"/reviewed/mln-web/.git",
+            "head":root_contract.repository_head,
+            "repository_relative_path":migration.repository_relative_path,
+            "git_blob_oid":migration.git_blob_oid,
+        });
+        let root_stage = json!({
+            "schema_version":1,
+            "migration_id":"0143",
+            "catalog_basename":migration.basename,
+            "source_authority":source_authority,
+            "source_authority_hash":hash_value(&source_authority).expect("authority hash"),
+            "bytes":migration.bytes,
+            "sha256":format!("sha256:{}",migration.sha256),
+            "md5":migration.md5,
+            "stage_path":"/managed/0143.sql",
+            "stage_lifecycle":"preserve_until_verified_or_explicitly_retired",
+            "target":{
+                "account_id":root_contract.account_id,
+                "database_id":root_contract.database_id,
+            },
+            "prerequisites":root_plan.input.get("body"),
+        });
+        root_plan.targets = json!({"adapter":{"approved_mln_import":root_stage}});
+        root_plan.refresh_hash().expect("root plan hash");
+        save_current_test_plan(&store, &root_plan);
+
+        let target = json!({
+            "account_id":root_contract.account_id,
+            "database_id":root_contract.database_id,
+        });
+        let root_input_hash = hash_value(&root_plan.input).expect("root input hash");
+        let accepted = json!({
+            "schema_version":1,
+            "operation_id":root_plan.operation_id,
+            "step":"ingest_response",
+            "performed":true,
+            "rectification_required":false,
+            "receipt":{
+                "http_status":200,
+                "success":true,
+                "response_action":"ingest",
+                "provider":"cloudflare",
+                "effect":"d1_import_ingest_accepted",
+                "migration_id":"0143",
+                "target":target,
+                "plan_input_hash":root_input_hash,
+                "no_replay":false,
+                "result":{
+                    "type":"import",
+                    "status":"active",
+                    "success":true,
+                    "at_bookmark":"accepted",
+                },
+                "errors":[],
+            }
+        });
+        let accepted_hash =
+            persist_poll_lineage_checkpoint(&store, &root_plan.operation_id, &accepted);
+        for attempt in 1..=root_poll_bound {
+            let root_poll = json!({
+                "schema_version":1,
+                "operation_id":root_plan.operation_id,
+                "step":format!("poll_response_{attempt}"),
+                "performed":true,
+                "rectification_required":false,
+                "receipt":{
+                    "http_status":200,"success":true,"response_action":"poll",
+                    "provider":"cloudflare","effect":"d1_import_response",
+                    "migration_id":"0143","target":target,"plan_input_hash":root_input_hash,
+                    "result":{"type":"import","status":"active","success":true,
+                        "at_bookmark":"accepted","result":{"final_bookmark":null},
+                        "provider_error_present":false},
+                    "errors":[],"provider_errors_present":false,"no_replay":false,
+                    "etag_present":false,"etag_sha256":null,"cf_ray":null
+                }
+            });
+            persist_poll_lineage_checkpoint(&store, &root_plan.operation_id, &root_poll);
+        }
+        let root_exhaustion = json!({
+            "schema_version":1,
+            "operation_id":root_plan.operation_id,
+            "step":"poll_in_progress_exhausted",
+            "performed":true,
+            "rectification_required":true,
+            "receipt":{
+                "provider":"cloudflare","effect":"d1_import_poll_in_progress_exhausted",
+                "migration_id":"0143","target":target,"plan_input_hash":root_input_hash,
+                "source_sha256":root_stage["sha256"],"at_bookmark":"accepted",
+                "attempt_count":root_poll_bound,"attempt_bound":root_poll_bound,
+                "outcome":"poll_in_progress_exhausted","receipt_available":true,"no_replay":true
+            }
+        });
+        let mut parent_exhaustion_hash =
+            persist_poll_lineage_checkpoint(&store, &root_plan.operation_id, &root_exhaustion);
+        let mut parent = root_plan.clone();
+        let mut children = Vec::new();
+        for generation in 1..=generations {
+            let mut child = PlanV1::draft(
+                "profile-a",
+                &root_contract.account_id,
+                POLL_FIXTURE_CATALOG_HASH,
+                child_capability.clone(),
+                json!({}),
+            )
+            .expect("child plan");
+            child.created_at = parent.created_at + ChronoDuration::seconds(1);
+            child.expires_at = child.created_at + ChronoDuration::hours(1);
+            child.input = serde_json::to_value(CallInput {
+                selectors: json!({
+                    "account_id":root_contract.account_id,
+                    "database_id":root_contract.database_id,
+                }),
+                body: Some(json!({
+                    "parent_operation_id":parent.operation_id,
+                    "parent_plan_hash":parent.content_hash,
+                    "exhaustion_evidence_hash":parent_exhaustion_hash,
+                    "accepted_ingest_evidence_hash":accepted_hash,
+                    "accepted_bookmark_hash":hash_value(&json!("accepted"))
+                        .expect("bookmark hash"),
+                })),
+                ..CallInput::default()
+            })
+            .expect("child input");
+            child.targets = json!({"adapter":{"approved_mln_import_poll_resume":{
+                "root_operation_id":root_plan.operation_id,
+                "root_plan_hash":root_plan.content_hash,
+                "parent_operation_id":parent.operation_id,
+                "parent_plan_hash":parent.content_hash,
+                "parent_exhaustion_evidence_hash":parent_exhaustion_hash,
+                "accepted_ingest_evidence_hash":accepted_hash,
+                "accepted_bookmark":"accepted",
+                "accepted_bookmark_hash":hash_value(&json!("accepted")).expect("bookmark hash"),
+                "root_input":root_plan.input,
+                "root_stage":root_stage,
+                "profile_id":"profile-a",
+                "credential_generation_id":POLL_FIXTURE_CREDENTIAL_GENERATION,
+                "catalog_hash":POLL_FIXTURE_CATALOG_HASH,
+                "capability_contract_hash":hash_value(
+                    &serde_json::to_value(&child_capability).expect("child capability value")
+                ).expect("child capability hash"),
+                "target":target,
+            }}});
+            child.refresh_hash().expect("child hash");
+            child.approve(true, None).expect("approve child");
+            child.mark_consumed().expect("consume child");
+            child
+                .record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+                .expect("child boundary attempt");
+            let child_input_hash = hash_value(&child.input).expect("child input hash");
+            if generation == generations {
+                let completion = json!({
+                    "schema_version":1,
+                    "operation_id":child.operation_id,
+                    "step":"provider_complete",
+                    "performed":true,
+                    "rectification_required":false,
+                    "receipt":{
+                        "provider":"cloudflare","effect":"d1_import_provider_complete",
+                        "response_action":"poll","migration_id":"0143","target":target,
+                        "plan_input_hash":child_input_hash,
+                        "source_sha256":root_stage["sha256"],
+                        "source_md5":root_stage["md5"],
+                        "source_bytes":root_stage["bytes"],
+                        "source_authority_hash":root_stage["source_authority_hash"],
+                        "stage_identity_hash":hash_value(&root_stage).expect("stage hash"),
+                        "at_bookmark":"accepted","final_bookmark":"completed",
+                        "root_operation_id":root_plan.operation_id,
+                        "root_plan_hash":root_plan.content_hash,
+                        "parent_operation_id":parent.operation_id,
+                        "parent_exhaustion_evidence_hash":parent_exhaustion_hash,
+                    }
+                });
+                persist_poll_lineage_checkpoint(&store, &child.operation_id, &completion);
+                child.status = PlanStatus::Running;
+                let response = CloudflareResponseV1 {
+                    status: 200,
+                    success: true,
+                    result: json!({
+                        "type":"import",
+                        "status":"complete",
+                        "success":true,
+                        "at_bookmark":"accepted",
+                        "result":{"final_bookmark":"completed"},
+                        "_cfctl":completion["receipt"],
+                    }),
+                    errors: Vec::new(),
+                    result_info: None,
+                    etag: None,
+                    cf_ray: None,
+                };
+                assert!(matches!(
+                    super::process_api_boundary_response(
+                        &store,
+                        &mut child,
+                        &response,
+                        &MemorySecretStore::default(),
+                    )
+                    .expect("production completion lifecycle"),
+                    super::ApiBoundaryResponseOutcome::Ready { .. }
+                ));
+            } else {
+                for attempt in 1..=child_poll_bound {
+                    let child_poll = json!({
+                        "schema_version":1,
+                        "operation_id":child.operation_id,
+                        "step":format!("poll_response_{attempt}"),
+                        "performed":true,
+                        "rectification_required":false,
+                        "receipt":{
+                            "http_status":200,"success":true,"response_action":"poll",
+                            "provider":"cloudflare","effect":"d1_import_response",
+                            "migration_id":"0143","target":target,"plan_input_hash":child_input_hash,
+                            "result":{"type":"import","status":"active","success":true,
+                                "at_bookmark":"accepted","result":{"final_bookmark":null},
+                                "provider_error_present":false},
+                            "errors":[],"provider_errors_present":false,"no_replay":false,
+                            "etag_present":false,"etag_sha256":null,"cf_ray":null
+                        }
+                    });
+                    persist_poll_lineage_checkpoint(&store, &child.operation_id, &child_poll);
+                }
+                let exhaustion = json!({
+                    "schema_version":1,
+                    "operation_id":child.operation_id,
+                    "step":"poll_in_progress_exhausted",
+                    "performed":true,
+                    "rectification_required":true,
+                    "receipt":{
+                        "provider":"cloudflare","effect":"d1_import_poll_in_progress_exhausted",
+                        "migration_id":"0143","target":target,"plan_input_hash":child_input_hash,
+                        "source_sha256":root_stage["sha256"],"at_bookmark":"accepted",
+                        "attempt_count":child_poll_bound,"attempt_bound":child_poll_bound,
+                        "outcome":"poll_in_progress_exhausted","receipt_available":true,
+                        "no_replay":true
+                    }
+                });
+                parent_exhaustion_hash =
+                    persist_poll_lineage_checkpoint(&store, &child.operation_id, &exhaustion);
+                let envelope = super::known_import_poll_exhausted_envelope(
+                    &store,
+                    &mut child,
+                    &MemorySecretStore::default(),
+                );
+                assert!(!envelope.ok);
+                assert_eq!(child.status, PlanStatus::RectificationRequired);
+            }
+            save_current_test_plan(&store, &child);
+            parent = child.clone();
+            children.push(child);
+        }
+        PollChildLineageFixture {
+            _root: root,
+            store,
+            root_plan,
+            children,
+        }
+    }
+
+    #[test]
+    fn poll_child_resolver_accepts_exact_one_and_two_generation_plan_v2_lineages() {
+        for generations in [1, 2] {
+            let fixture = build_poll_child_lineage(generations);
+            let boundary = super::exact_linear_poll_child_provider_complete(
+                &fixture.store,
+                &fixture.root_plan,
+            )
+            .expect("exact child lineage");
+            assert_eq!(
+                boundary
+                    .checkpoint
+                    .pointer("/receipt/final_bookmark")
+                    .and_then(Value::as_str),
+                Some("completed")
+            );
+            assert_eq!(fixture.children.len(), generations);
+        }
+    }
+
+    #[test]
+    fn trusted_root_validator_accepts_direct_0142_and_0143_completion_authorities() {
+        let fixture = build_poll_child_lineage(1);
+        let root_v2 = fixture
+            .store
+            .load_plan_v2(&fixture.root_plan.operation_id)
+            .expect("canonical 0143 root");
+        super::validate_trusted_root_import_plan(&fixture.store, &root_v2)
+            .expect("authentic 0143 root");
+        let root_input: CallInput =
+            serde_json::from_value(fixture.root_plan.input.clone()).expect("0143 input");
+        let prior_0142 = root_input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("prior_0142_operation_id"))
+            .and_then(Value::as_str)
+            .expect("prior 0142 operation");
+        let prior_v2 = fixture
+            .store
+            .load_plan_v2(prior_0142)
+            .expect("canonical 0142 root");
+        super::validate_trusted_root_import_plan(&fixture.store, &prior_v2)
+            .expect("authentic 0142 root");
+        super::exact_durable_provider_complete_boundary(&fixture.store, prior_0142)
+            .expect("direct exact 0142 completion");
+
+        let stage = &fixture.root_plan.targets["adapter"]["approved_mln_import"];
+        let target = stage["target"].clone();
+        let completion = json!({
+            "schema_version":1,"operation_id":fixture.root_plan.operation_id,
+            "step":"provider_complete","performed":true,"rectification_required":false,
+            "receipt":{"provider":"cloudflare","effect":"d1_import_provider_complete",
+                "response_action":"poll","no_replay":true,"state":"provider_complete",
+                "provider_status":"complete","provider_success":true,"migration_id":"0143",
+                "target":target,"plan_input_hash":hash_value(&fixture.root_plan.input)
+                    .expect("0143 input hash"),
+                "source_sha256":stage["sha256"],"source_md5":stage["md5"],
+                "source_bytes":stage["bytes"],"source_authority_hash":stage["source_authority_hash"],
+                "stage_identity_hash":hash_value(stage).expect("0143 stage hash"),
+                "prerequisites":root_input.body,"at_bookmark":"accepted",
+                "final_bookmark":"completed-direct-0143"}
+        });
+        persist_poll_lineage_checkpoint(
+            &fixture.store,
+            &fixture.root_plan.operation_id,
+            &completion,
+        );
+        super::exact_durable_provider_complete_boundary(
+            &fixture.store,
+            &fixture.root_plan.operation_id,
+        )
+        .expect("direct exact 0143 completion");
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_required_plan_v2_sidecar_missing() {
+        let fixture = build_poll_child_lineage(1);
+        let child = fixture.children.first().expect("poll child");
+        fs::remove_file(
+            fixture
+                .store
+                .paths()
+                .data_dir
+                .join("plans-v2")
+                .join(format!("{}.json", child.operation_id)),
+        )
+        .expect("remove required PlanV2 sidecar");
+        let error =
+            super::exact_linear_poll_child_provider_complete(&fixture.store, &fixture.root_plan)
+                .expect_err("missing PlanV2 sidecar must fail closed");
+        assert!(
+            error.to_string().contains("authentic PlanV2 sidecar"),
+            "{error}"
+        );
+    }
+
+    fn reset_poll_child_to_draft(child: &mut PlanV1) {
+        child.status = PlanStatus::Draft;
+        child.approval = None;
+        child.transaction_stage = TransactionStageV1::PlanPrepared;
+        child.transaction_journal.clear();
+        child.transaction_artifacts.clear();
+        child
+            .record_transaction_stage(TransactionStageV1::PlanPrepared)
+            .expect("restore prepared draft lifecycle");
+    }
+
+    fn persist_rebound_poll_child(store: &StateStore, child: &PlanV1) {
+        store
+            .save_plan(child)
+            .expect("persist rebound canonical child and projection");
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_projection_drift() {
+        let fixture = build_poll_child_lineage(1);
+        let mut projection = fixture.children[0].clone();
+        projection
+            .verification_steps
+            .push("projection drift".to_owned());
+        projection
+            .refresh_hash()
+            .expect("refresh drifted projection");
+        let path = fixture
+            .store
+            .paths()
+            .data_dir
+            .join("plans")
+            .join(format!("{}.json", projection.operation_id));
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&projection).expect("encode drifted projection"),
+        )
+        .expect("write drifted compatibility projection");
+        assert!(
+            super::exact_linear_poll_child_provider_complete(&fixture.store, &fixture.root_plan)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_unapproved_unconsumed_and_missing_attempt_lifecycles() {
+        let unapproved = build_poll_child_lineage(1);
+        let mut unapproved_child = unapproved.children[0].clone();
+        reset_poll_child_to_draft(&mut unapproved_child);
+        persist_rebound_poll_child(&unapproved.store, &unapproved_child);
+        assert!(
+            super::exact_linear_poll_child_provider_complete(
+                &unapproved.store,
+                &unapproved.root_plan
+            )
+            .is_err()
+        );
+
+        let unconsumed = build_poll_child_lineage(1);
+        let mut unconsumed_child = unconsumed.children[0].clone();
+        reset_poll_child_to_draft(&mut unconsumed_child);
+        unconsumed_child
+            .approve(true, None)
+            .expect("approve unconsumed child");
+        persist_rebound_poll_child(&unconsumed.store, &unconsumed_child);
+        assert!(
+            super::exact_linear_poll_child_provider_complete(
+                &unconsumed.store,
+                &unconsumed.root_plan
+            )
+            .is_err()
+        );
+
+        let missing_attempt = build_poll_child_lineage(1);
+        let mut missing_attempt_child = missing_attempt.children[0].clone();
+        reset_poll_child_to_draft(&mut missing_attempt_child);
+        missing_attempt_child
+            .approve(true, None)
+            .expect("approve missing-attempt child");
+        missing_attempt_child
+            .mark_consumed()
+            .expect("consume missing-attempt child");
+        persist_rebound_poll_child(&missing_attempt.store, &missing_attempt_child);
+        assert!(
+            super::exact_linear_poll_child_provider_complete(
+                &missing_attempt.store,
+                &missing_attempt.root_plan
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_missing_or_mismatched_boundary_response_artifacts() {
+        for replacement in [None, Some(json!({"outcome":"grafted"}))] {
+            let fixture = build_poll_child_lineage(1);
+            let child = fixture.children.first().expect("poll child");
+            let v2_path = fixture
+                .store
+                .paths()
+                .data_dir
+                .join("plans-v2")
+                .join(format!("{}.json", child.operation_id));
+            let projection_path = fixture
+                .store
+                .paths()
+                .data_dir
+                .join("plans")
+                .join(format!("{}.json", child.operation_id));
+            let mut current = fixture
+                .store
+                .load_plan_v2(&child.operation_id)
+                .expect("canonical child");
+            match replacement.clone() {
+                Some(value) => {
+                    current.plan.transaction_artifacts.insert(
+                        TransactionStageV1::BoundaryResponsePersisted
+                            .as_str()
+                            .to_owned(),
+                        value,
+                    );
+                }
+                None => {
+                    current
+                        .plan
+                        .transaction_artifacts
+                        .remove(TransactionStageV1::BoundaryResponsePersisted.as_str());
+                }
+            }
+            fs::write(
+                &v2_path,
+                serde_json::to_vec_pretty(&current).expect("encode corrupt canonical child"),
+            )
+            .expect("write corrupt canonical child");
+            fs::write(
+                &projection_path,
+                serde_json::to_vec_pretty(&current.plan).expect("encode corrupt child projection"),
+            )
+            .expect("write corrupt child projection");
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_duplicate_completion_and_lineage_grafts() {
+        let duplicate = build_poll_child_lineage(1);
+        let child = duplicate.children.first().expect("poll child");
+        let (_, completion) = duplicate
+            .store
+            .read_d1_import_checkpoints(&child.operation_id)
+            .expect("child checkpoints")
+            .into_iter()
+            .find(|(_, checkpoint)| {
+                checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+            })
+            .expect("provider completion");
+        persist_poll_lineage_checkpoint(&duplicate.store, &child.operation_id, &completion);
+        assert!(
+            super::exact_linear_poll_child_provider_complete(
+                &duplicate.store,
+                &duplicate.root_plan
+            )
+            .is_err()
+        );
+
+        for pointer in [
+            "/adapter/approved_mln_import_poll_resume/parent_operation_id",
+            "/adapter/approved_mln_import_poll_resume/root_operation_id",
+        ] {
+            let fixture = build_poll_child_lineage(1);
+            let mut grafted = fixture.children[0].clone();
+            reset_poll_child_to_draft(&mut grafted);
+            *grafted
+                .targets
+                .pointer_mut(pointer)
+                .expect("lineage graft pointer") = json!(grafted.operation_id);
+            grafted.refresh_hash().expect("refresh grafted child");
+            grafted.approve(true, None).expect("approve grafted child");
+            grafted.mark_consumed().expect("consume grafted child");
+            grafted
+                .record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+                .expect("grafted child attempt");
+            grafted
+                .record_transaction_stage_with_artifact(
+                    TransactionStageV1::BoundaryResponsePersisted,
+                    json!({"outcome":"grafted"}),
+                )
+                .expect("grafted child response");
+            persist_rebound_poll_child(&fixture.store, &grafted);
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err()
+            );
+        }
+    }
+
+    fn poll_test_evidence_path(store: &StateStore, hash: &str) -> PathBuf {
+        store
+            .paths()
+            .data_dir
+            .join("evidence")
+            .join(format!("{}.json", hash.trim_start_matches("sha256:")))
+    }
+
+    fn exact_poll_test_secret_artifact() -> Value {
+        json!({
+            "completed":true,
+            "failure":Value::Null,
+            "input_cleanup":{"required":false,"completed":true},
+            "output_sink":{"required":false,"completed":true,"create_new":false,
+                "format":Value::Null,
+                "unix_mode":if cfg!(unix) {
+                    Value::String("0600".to_owned())
+                } else {
+                    Value::Null
+                }},
+            "path":Value::Null,
+        })
+    }
+
+    fn rebuild_poll_child_terminal_lifecycle(
+        child: &mut PlanV1,
+        terminal_status: PlanStatus,
+        response_artifact: Value,
+    ) {
+        reset_poll_child_to_draft(child);
+        child.refresh_hash().expect("refresh rebound child");
+        child.approve(true, None).expect("approve rebound child");
+        child.mark_consumed().expect("consume rebound child");
+        child
+            .record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("rebound boundary attempt");
+        child.status = terminal_status;
+        child
+            .record_transaction_stage_with_artifact(
+                TransactionStageV1::BoundaryResponsePersisted,
+                response_artifact,
+            )
+            .expect("rebound boundary response");
+        child
+            .record_transaction_stage_with_artifact(
+                TransactionStageV1::SecretSinkPersisted,
+                exact_poll_test_secret_artifact(),
+            )
+            .expect("rebound secret lifecycle");
+    }
+
+    fn rebind_poll_child_terminal_lifecycle(
+        store: &StateStore,
+        child: &mut PlanV1,
+        terminal_status: PlanStatus,
+        response_artifact: Value,
+    ) {
+        rebuild_poll_child_terminal_lifecycle(child, terminal_status, response_artifact);
+        persist_rebound_poll_child(store, child);
+    }
+
+    fn persist_poll_test_plan_v2(store: &StateStore, plan: &PlanV1, pins: PlanPinsV2) {
+        let document = PlanV2::new(plan.clone(), pins).expect("valid drifted PlanV2");
+        let projection_path = store
+            .paths()
+            .data_dir
+            .join("plans")
+            .join(format!("{}.json", plan.operation_id));
+        let current_path = store
+            .paths()
+            .data_dir
+            .join("plans-v2")
+            .join(format!("{}.json", plan.operation_id));
+        fs::write(
+            projection_path,
+            serde_json::to_vec_pretty(plan).expect("encode drifted projection"),
+        )
+        .expect("persist drifted projection");
+        fs::write(
+            current_path,
+            serde_json::to_vec_pretty(&document).expect("encode drifted PlanV2"),
+        )
+        .expect("persist drifted PlanV2");
+    }
+
+    fn rewrite_poll_test_checkpoints_for_target(
+        store: &StateStore,
+        plan: &PlanV1,
+        target: &Value,
+    ) -> BTreeMap<String, (String, Value)> {
+        let checkpoints = store
+            .read_d1_import_checkpoints(&plan.operation_id)
+            .expect("read target-drift checkpoints");
+        let directory = store
+            .paths()
+            .data_dir
+            .join("d1-import-checkpoints")
+            .join(&plan.operation_id);
+        for entry in fs::read_dir(&directory).expect("checkpoint directory") {
+            fs::remove_file(entry.expect("checkpoint entry").path())
+                .expect("remove old checkpoint");
+        }
+        let input_hash = hash_value(&plan.input).expect("target-drift input hash");
+        checkpoints
+            .into_iter()
+            .map(|(_, mut checkpoint)| {
+                checkpoint["receipt"]["target"] = target.clone();
+                checkpoint["receipt"]["plan_input_hash"] = json!(input_hash);
+                let step = checkpoint
+                    .get("step")
+                    .and_then(Value::as_str)
+                    .expect("checkpoint step")
+                    .to_owned();
+                let hash = persist_poll_lineage_checkpoint(store, &plan.operation_id, &checkpoint);
+                (step, (hash, checkpoint))
+            })
+            .collect()
+    }
+
+    fn rebind_completed_poll_child_apply_evidence(
+        fixture: &PollChildLineageFixture,
+        apply_response: &Value,
+    ) {
+        let mut child = fixture.children[0].clone();
+        let evidence = fixture
+            .store
+            .write_evidence(EvidenceClass::Apply, apply_response)
+            .expect("replacement apply evidence");
+        let mut response_artifact = child
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .expect("completion response artifact")
+            .clone();
+        response_artifact["apply_evidence_hash"] = json!(evidence.content_hash);
+        rebind_poll_child_terminal_lifecycle(
+            &fixture.store,
+            &mut child,
+            PlanStatus::Running,
+            response_artifact,
+        );
+    }
+
+    fn completed_poll_child_apply_response(fixture: &PollChildLineageFixture) -> Value {
+        let child = &fixture.children[0];
+        let hash = child
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .and_then(|artifact| artifact.get("apply_evidence_hash"))
+            .and_then(Value::as_str)
+            .expect("completion apply evidence hash");
+        fixture
+            .store
+            .read_evidence_value(hash)
+            .expect("completion apply evidence")
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_missing_or_corrupt_completion_apply_evidence() {
+        for corrupt in [false, true] {
+            let fixture = build_poll_child_lineage(1);
+            let child = &fixture.children[0];
+            let hash = child
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .and_then(|artifact| artifact.get("apply_evidence_hash"))
+                .and_then(Value::as_str)
+                .expect("completion apply evidence hash");
+            let path = poll_test_evidence_path(&fixture.store, hash);
+            if corrupt {
+                fs::write(path, b"{\"corrupt\":true}").expect("corrupt completion evidence");
+            } else {
+                fs::remove_file(path).expect("remove completion evidence");
+            }
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_grafted_or_semantically_drifted_completion_evidence() {
+        let mutations = [
+            ("/status", json!(202)),
+            ("/success", json!(false)),
+            ("/result/type", json!("export")),
+            ("/result/status", json!("active")),
+            ("/result/success", json!(false)),
+            ("/result/at_bookmark", json!("other")),
+            ("/result/result/final_bookmark", json!("other")),
+            ("/result/_cfctl/response_action", json!("init")),
+            ("/result/_cfctl/root_operation_id", json!(Uuid::new_v4())),
+            ("/result/_cfctl/final_bookmark", json!("other")),
+        ];
+        for (pointer, replacement) in mutations {
+            let fixture = build_poll_child_lineage(1);
+            let mut apply_response = completed_poll_child_apply_response(&fixture);
+            *apply_response
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing completion semantic pointer {pointer}")) =
+                replacement;
+            rebind_completed_poll_child_apply_evidence(&fixture, &apply_response);
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err(),
+                "completion evidence drift at {pointer} must fail closed"
+            );
+        }
+
+        let fixture = build_poll_child_lineage(1);
+        let mut valid_other = completed_poll_child_apply_response(&fixture);
+        valid_other["result"]["_cfctl"]["root_operation_id"] = json!(Uuid::new_v4());
+        valid_other["result"]["_cfctl"]["parent_operation_id"] = json!(Uuid::new_v4());
+        rebind_completed_poll_child_apply_evidence(&fixture, &valid_other);
+        assert!(
+            super::exact_linear_poll_child_provider_complete(&fixture.store, &fixture.root_plan)
+                .is_err(),
+            "an otherwise valid response from another operation must not graft"
+        );
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_missing_or_corrupt_exhaustion_lineage_evidence() {
+        for evidence_kind in ["exhaustion", "accepted"] {
+            for corrupt in [false, true] {
+                let fixture = build_poll_child_lineage(2);
+                let exhausted = &fixture.children[0];
+                let artifact = exhausted
+                    .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                    .expect("exhaustion response artifact");
+                let hash = artifact
+                    .get(match evidence_kind {
+                        "exhaustion" => "poll_exhaustion_evidence_hash",
+                        _ => "accepted_ingest_evidence_hash",
+                    })
+                    .and_then(Value::as_str)
+                    .expect("lineage evidence hash");
+                let path = poll_test_evidence_path(&fixture.store, hash);
+                if corrupt {
+                    fs::write(path, b"{\"corrupt\":true}")
+                        .expect("corrupt exhaustion lineage evidence");
+                } else {
+                    fs::remove_file(path).expect("remove exhaustion lineage evidence");
+                }
+                assert!(
+                    super::exact_linear_poll_child_provider_complete(
+                        &fixture.store,
+                        &fixture.root_plan
+                    )
+                    .is_err(),
+                    "{evidence_kind} evidence must be authentic"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the matrix grafts every exhaustion and accepted-ingest semantic dimension"
+    )]
+    fn poll_child_resolver_rejects_grafted_or_semantically_drifted_exhaustion_evidence() {
+        let fixture = build_poll_child_lineage(2);
+        let mut exhausted = fixture.children[0].clone();
+        let unrelated = fixture
+            .store
+            .write_evidence(
+                EvidenceClass::Apply,
+                &json!({
+                    "schema_version":1,
+                    "operation_id":Uuid::new_v4(),
+                    "step":"ingest_response",
+                    "performed":true,
+                    "rectification_required":false,
+                    "receipt":{"result":{"at_bookmark":"accepted"}}
+                }),
+            )
+            .expect("grafted accepted evidence");
+        exhausted.targets["adapter"]["approved_mln_import_poll_resume"]["accepted_ingest_evidence_hash"] =
+            json!(unrelated.content_hash);
+        let exhaustion_hash = exhausted
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .and_then(|artifact| artifact.get("poll_exhaustion_evidence_hash"))
+            .and_then(Value::as_str)
+            .expect("exhaustion evidence hash")
+            .to_owned();
+        rebind_poll_child_terminal_lifecycle(
+            &fixture.store,
+            &mut exhausted,
+            PlanStatus::RectificationRequired,
+            json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":"poll_in_progress_exhausted",
+                "receipt_available":true,
+                "poll_exhaustion_evidence_hash":exhaustion_hash,
+                "accepted_ingest_evidence_hash":unrelated.content_hash,
+            }),
+        );
+        let current = fixture
+            .store
+            .load_plan_v2(&exhausted.operation_id)
+            .expect("rebound exhausted child");
+        assert!(
+            super::validate_canonical_poll_child_lifecycle(&fixture.store, &current).is_err(),
+            "semantically unrelated accepted evidence must not graft"
+        );
+
+        let fixture = build_poll_child_lineage(2);
+        let mut exhausted = fixture.children[0].clone();
+        let graft = fixture
+            .store
+            .write_evidence(EvidenceClass::Apply, &json!({"other":"exhaustion"}))
+            .expect("grafted exhaustion evidence");
+        let accepted_hash = exhausted
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .and_then(|artifact| artifact.get("accepted_ingest_evidence_hash"))
+            .and_then(Value::as_str)
+            .expect("accepted evidence hash")
+            .to_owned();
+        rebind_poll_child_terminal_lifecycle(
+            &fixture.store,
+            &mut exhausted,
+            PlanStatus::RectificationRequired,
+            json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":"poll_in_progress_exhausted",
+                "receipt_available":true,
+                "poll_exhaustion_evidence_hash":graft.content_hash,
+                "accepted_ingest_evidence_hash":accepted_hash,
+            }),
+        );
+        let current = fixture
+            .store
+            .load_plan_v2(&exhausted.operation_id)
+            .expect("rebound exhausted child");
+        assert!(
+            super::validate_canonical_poll_child_lifecycle(&fixture.store, &current).is_err(),
+            "a valid but unrelated exhaustion evidence object must not graft"
+        );
+
+        let fixture = build_poll_child_lineage(2);
+        let mut exhausted = fixture.children[0].clone();
+        let checkpoint_dir = fixture
+            .store
+            .paths()
+            .data_dir
+            .join("d1-import-checkpoints")
+            .join(&exhausted.operation_id);
+        let exhaustion_path = fs::read_dir(&checkpoint_dir)
+            .expect("exhaustion checkpoint directory")
+            .map(|entry| entry.expect("checkpoint entry").path())
+            .find(|path| {
+                fs::read(path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .and_then(|checkpoint| {
+                        checkpoint
+                            .get("step")
+                            .and_then(Value::as_str)
+                            .map(|step| step == "poll_in_progress_exhausted")
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("exhaustion checkpoint path");
+        let mut semantic_mismatch: Value = serde_json::from_slice(
+            &fs::read(&exhaustion_path).expect("read exhaustion checkpoint"),
+        )
+        .expect("decode exhaustion checkpoint");
+        fs::remove_file(exhaustion_path).expect("remove original exhaustion checkpoint");
+        semantic_mismatch["receipt"]["outcome"] = json!("different");
+        let exhaustion_hash = persist_poll_lineage_checkpoint(
+            &fixture.store,
+            &exhausted.operation_id,
+            &semantic_mismatch,
+        );
+        let accepted_hash = exhausted
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .and_then(|artifact| artifact.get("accepted_ingest_evidence_hash"))
+            .and_then(Value::as_str)
+            .expect("accepted evidence hash")
+            .to_owned();
+        rebind_poll_child_terminal_lifecycle(
+            &fixture.store,
+            &mut exhausted,
+            PlanStatus::RectificationRequired,
+            json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":"poll_in_progress_exhausted",
+                "receipt_available":true,
+                "poll_exhaustion_evidence_hash":exhaustion_hash,
+                "accepted_ingest_evidence_hash":accepted_hash,
+            }),
+        );
+        let current = fixture
+            .store
+            .load_plan_v2(&exhausted.operation_id)
+            .expect("semantically drifted exhausted child");
+        assert!(
+            super::validate_canonical_poll_child_lifecycle(&fixture.store, &current).is_err(),
+            "semantically mismatched exhaustion evidence must fail closed"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the matrix rebuilds valid PlanV2 children across every pinned authority drift"
+    )]
+    fn poll_child_resolver_rejects_canonical_terminal_and_intermediate_authority_drift() {
+        let drift_cases = [
+            "credential_pin",
+            "profile",
+            "catalog",
+            "capability_contract_hash",
+            "capability",
+            "root_input",
+            "root_stage",
+            "target_account",
+        ];
+        for generations in [1, 2] {
+            for drift_case in drift_cases {
+                let fixture = build_poll_child_lineage(generations);
+                let child_index = generations - 1;
+                let mut child = fixture.children[child_index].clone();
+                let response_artifact = child
+                    .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                    .expect("terminal response artifact")
+                    .clone();
+                let terminal_status = child.status;
+                let mut pins = fixture
+                    .store
+                    .load_plan_v2(&child.operation_id)
+                    .expect("canonical child")
+                    .pins;
+                match drift_case {
+                    "credential_pin" => {
+                        pins.credential_generation_id = "drifted-credential".to_owned();
+                    }
+                    "profile" => {
+                        child.profile_id = "profile-b".to_owned();
+                    }
+                    "catalog" => {
+                        child.catalog_hash = "drifted-catalog".to_owned();
+                        pins.catalog_hash = child.catalog_hash.clone();
+                    }
+                    "capability_contract_hash" => {
+                        child.targets["adapter"]["approved_mln_import_poll_resume"]["capability_contract_hash"] = json!(
+                            hash_value(&json!({
+                                "different":"capability"
+                            }))
+                            .expect("drifted contract hash")
+                        );
+                    }
+                    "capability" => {
+                        child.capability.title.push_str(" drifted");
+                    }
+                    "root_input" => {
+                        child.targets["adapter"]["approved_mln_import_poll_resume"]["root_input"]
+                            ["body"]["migration_id"] = json!("0142");
+                    }
+                    "root_stage" => {
+                        child.targets["adapter"]["approved_mln_import_poll_resume"]["root_stage"]
+                            ["sha256"] = json!("sha256:drifted");
+                    }
+                    "target_account" => {
+                        child.account_id = "drifted-account".to_owned();
+                    }
+                    _ => unreachable!("closed drift matrix"),
+                }
+                rebuild_poll_child_terminal_lifecycle(
+                    &mut child,
+                    terminal_status,
+                    response_artifact,
+                );
+                persist_poll_test_plan_v2(&fixture.store, &child, pins);
+                assert!(
+                    super::exact_linear_poll_child_provider_complete(
+                        &fixture.store,
+                        &fixture.root_plan
+                    )
+                    .is_err(),
+                    "{drift_case} must be rejected for a {generations}-generation terminal child"
+                );
+            }
+        }
+
+        for drift_case in drift_cases {
+            let fixture = build_poll_child_lineage(2);
+            let mut child = fixture.children[0].clone();
+            let response_artifact = child
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .expect("intermediate exhaustion response artifact")
+                .clone();
+            let mut pins = fixture
+                .store
+                .load_plan_v2(&child.operation_id)
+                .expect("canonical intermediate child")
+                .pins;
+            match drift_case {
+                "credential_pin" => {
+                    pins.credential_generation_id = "drifted-credential".to_owned();
+                }
+                "profile" => {
+                    child.profile_id = "profile-b".to_owned();
+                }
+                "catalog" => {
+                    child.catalog_hash = "drifted-catalog".to_owned();
+                    pins.catalog_hash = child.catalog_hash.clone();
+                }
+                "capability_contract_hash" => {
+                    child.targets["adapter"]["approved_mln_import_poll_resume"]["capability_contract_hash"] = json!(
+                        hash_value(&json!({
+                            "different":"capability"
+                        }))
+                        .expect("drifted contract hash")
+                    );
+                }
+                "capability" => {
+                    child.capability.title.push_str(" drifted");
+                }
+                "root_input" => {
+                    child.targets["adapter"]["approved_mln_import_poll_resume"]["root_input"]["body"]
+                        ["migration_id"] = json!("0142");
+                }
+                "root_stage" => {
+                    child.targets["adapter"]["approved_mln_import_poll_resume"]["root_stage"]["sha256"] =
+                        json!("sha256:drifted");
+                }
+                "target_account" => {
+                    child.account_id = "drifted-account".to_owned();
+                }
+                _ => unreachable!("closed drift matrix"),
+            }
+            rebuild_poll_child_terminal_lifecycle(
+                &mut child,
+                PlanStatus::RectificationRequired,
+                response_artifact,
+            );
+            persist_poll_test_plan_v2(&fixture.store, &child, pins);
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err(),
+                "{drift_case} must be rejected for an intermediate exhausted child"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one matrix proves missing, undurable, exact, duplicate, and mismatched completion"
+    )]
+    fn approved_mln_completion_requires_one_exact_durable_provider_boundary() {
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://native".to_owned(),
+            source_hash: "sha256:test".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native overlay");
+        let capability = catalog
+            .capabilities
+            .remove("d1-import-approved-mln-migration")
+            .expect("native import capability");
+        let contract = capability
+            .d1_approved_mln_import
+            .as_ref()
+            .expect("import contract");
+        let migration = contract
+            .migrations
+            .iter()
+            .find(|migration| migration.migration_id == "0143")
+            .expect("0143 migration");
+        let build = |root: &std::path::Path| {
+            let store =
+                StateStore::open(RuntimePaths::from_root(root)).expect("runtime state store");
+            let mut plan = PlanV1::draft(
+                "profile-a",
+                &contract.account_id,
+                POLL_FIXTURE_CATALOG_HASH,
+                capability.clone(),
+                json!({}),
+            )
+            .expect("import plan");
+            plan.created_at = Utc::now() + ChronoDuration::hours(1);
+            plan.expires_at = plan.created_at + ChronoDuration::hours(1);
+            let prerequisites = authentic_0143_prerequisites(&store, &capability, plan.created_at);
+            plan.input = serde_json::to_value(CallInput {
+                selectors: json!({
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                }),
+                query: json!({}),
+                body: Some(prerequisites),
+                ..CallInput::default()
+            })
+            .expect("input");
+            plan.precondition_hashes
+                .insert("catalog".to_owned(), plan.catalog_hash.clone());
+            let source_authority = json!({
+                "schema_version":1,
+                "repository_id":contract.repository_id,
+                "observed_worktree_root":"/reviewed/mln-web",
+                "observed_git_common_dir":"/reviewed/mln-web/.git",
+                "head":contract.repository_head,
+                "repository_relative_path":migration.repository_relative_path,
+                "git_blob_oid":migration.git_blob_oid,
+            });
+            let staged = json!({
+                "schema_version":1,
+                "migration_id":"0143",
+                "catalog_basename":migration.basename,
+                "source_authority":source_authority,
+                "source_authority_hash":hash_value(&source_authority).expect("authority hash"),
+                "bytes":migration.bytes,
+                "sha256":format!("sha256:{}",migration.sha256),
+                "md5":migration.md5,
+                "stage_path":"/managed/0143.sql",
+                "stage_lifecycle":"preserve_until_verified_or_explicitly_retired",
+                "target":{
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                },
+                "prerequisites":plan.input.get("body"),
+            });
+            plan.targets = json!({"adapter":{"approved_mln_import":staged}});
+            plan.refresh_hash().expect("refresh import plan");
+            save_current_test_plan(&store, &plan);
+            (store, plan)
+        };
+        let accepted_ingest = |plan: &PlanV1, target: Value| {
+            json!({
+                "schema_version":1,
+                "operation_id":plan.operation_id,
+                "step":"ingest_response",
+                "performed":true,
+                "rectification_required":false,
+                "receipt":{
+                    "http_status":200,
+                    "success":true,
+                    "response_action":"ingest",
+                    "provider":"cloudflare",
+                    "effect":"d1_import_ingest_accepted",
+                    "migration_id":"0143",
+                    "target":target,
+                    "plan_input_hash":hash_value(&plan.input).expect("input hash"),
+                    "no_replay":false,
+                    "result":{
+                        "type":"import",
+                        "status":"active",
+                        "success":true,
+                        "at_bookmark":"before",
+                    },
+                    "errors":[],
+                }
+            })
+        };
+        let checkpoint = |plan: &PlanV1, target: Value| {
+            let staged = plan
+                .targets
+                .pointer("/adapter/approved_mln_import")
+                .expect("stage");
+            json!({
+                "schema_version":1,
+                "operation_id":plan.operation_id,
+                "step":"provider_complete",
+                "performed":true,
+                "rectification_required":false,
+                "receipt":{
+                    "provider":"cloudflare",
+                    "effect":"d1_import_provider_complete",
+                    "response_action":"poll",
+                    "no_replay":true,
+                    "migration_id":"0143",
+                    "source_sha256":staged.get("sha256"),
+                    "source_md5":staged.get("md5"),
+                    "source_bytes":staged.get("bytes"),
+                    "source_authority_hash":staged.get("source_authority_hash"),
+                    "stage_identity_hash":hash_value(staged).expect("stage hash"),
+                    "target":target,
+                    "plan_input_hash":hash_value(&plan.input).expect("input hash"),
+                    "prerequisites":plan.input.get("body"),
+                    "at_bookmark":"before",
+                    "final_bookmark":"after",
+                    "provider_status":"complete",
+                    "provider_success":true,
+                    "state":"provider_complete",
+                }
+            })
+        };
+        let persist = |store: &StateStore, plan: &PlanV1, value: &Value| {
+            let hash = store
+                .record_d1_import_checkpoint(&plan.operation_id, value)
+                .expect("checkpoint");
+            assert_eq!(
+                store
+                    .write_evidence(EvidenceClass::Apply, value)
+                    .expect("checkpoint evidence")
+                    .content_hash,
+                hash
+            );
+            hash
+        };
+        let target = || {
+            json!({
+                "account_id":contract.account_id,
+                "database_id":contract.database_id,
+            })
+        };
+
+        let missing_root = tempfile::tempdir().expect("missing root");
+        let (missing_store, missing_plan) = build(missing_root.path());
+        assert!(
+            exact_durable_provider_complete_boundary(
+                &missing_store,
+                missing_plan.operation_id.as_str()
+            )
+            .is_err()
+        );
+
+        let evidence_failure_root = tempfile::tempdir().expect("evidence failure root");
+        let (evidence_failure_store, evidence_failure_plan) = build(evidence_failure_root.path());
+        persist(
+            &evidence_failure_store,
+            &evidence_failure_plan,
+            &accepted_ingest(&evidence_failure_plan, target()),
+        );
+        let evidence_failure = checkpoint(&evidence_failure_plan, target());
+        evidence_failure_store
+            .record_d1_import_checkpoint(&evidence_failure_plan.operation_id, &evidence_failure)
+            .expect("checkpoint without evidence");
+        assert!(
+            exact_durable_provider_complete_boundary(
+                &evidence_failure_store,
+                evidence_failure_plan.operation_id.as_str()
+            )
+            .is_err(),
+            "a checkpoint whose matching apply evidence did not persist cannot authorize Running"
+        );
+
+        let exact_root = tempfile::tempdir().expect("exact root");
+        let (exact_store, exact_plan) = build(exact_root.path());
+        persist(
+            &exact_store,
+            &exact_plan,
+            &accepted_ingest(&exact_plan, target()),
+        );
+        let exact = checkpoint(&exact_plan, target());
+        let hash = persist(&exact_store, &exact_plan, &exact);
+        assert_eq!(
+            exact_durable_provider_complete_boundary(&exact_store, &exact_plan.operation_id)
+                .expect("exact durable completion")
+                .evidence_hash,
+            hash
+        );
+        exact_store
+            .record_d1_import_checkpoint(&exact_plan.operation_id, &exact)
+            .expect("duplicate checkpoint");
+        assert!(
+            exact_durable_provider_complete_boundary(&exact_store, &exact_plan.operation_id)
+                .is_err()
+        );
+
+        let mismatch_root = tempfile::tempdir().expect("mismatch root");
+        let (mismatch_store, mismatch_plan) = build(mismatch_root.path());
+        persist(
+            &mismatch_store,
+            &mismatch_plan,
+            &accepted_ingest(&mismatch_plan, target()),
+        );
+        let mismatch = checkpoint(
+            &mismatch_plan,
+            json!({
+                "account_id":contract.account_id,
+                "database_id":"different-database",
+            }),
+        );
+        persist(&mismatch_store, &mismatch_plan, &mismatch);
+        assert!(
+            exact_durable_provider_complete_boundary(&mismatch_store, &mismatch_plan.operation_id)
+                .is_err()
+        );
+
+        for (pointer, replacement) in [
+            ("/performed", json!(false)),
+            ("/rectification_required", json!(true)),
+            ("/receipt/provider", json!("different-provider")),
+            ("/receipt/effect", json!("different-effect")),
+            ("/receipt/response_action", json!("ingest")),
+            ("/receipt/no_replay", json!(false)),
+            ("/receipt/migration_id", json!("0142")),
+            ("/receipt/source_sha256", json!("sha256:different")),
+            ("/receipt/source_md5", json!("different")),
+            ("/receipt/source_bytes", json!(1)),
+            ("/receipt/source_authority_hash", json!("sha256:different")),
+            ("/receipt/stage_identity_hash", json!("sha256:different")),
+            ("/receipt/plan_input_hash", json!("sha256:different")),
+            ("/receipt/prerequisites/migration_id", json!("0142")),
+            ("/receipt/at_bookmark", json!("different")),
+            ("/receipt/final_bookmark", json!("")),
+            ("/receipt/provider_status", json!("active")),
+            ("/receipt/provider_success", json!(false)),
+            ("/receipt/state", json!("different")),
+        ] {
+            let mutation_root = tempfile::tempdir().expect("mutation root");
+            let (mutation_store, mutation_plan) = build(mutation_root.path());
+            persist(
+                &mutation_store,
+                &mutation_plan,
+                &accepted_ingest(&mutation_plan, target()),
+            );
+            let mut mutation = checkpoint(&mutation_plan, target());
+            *mutation
+                .pointer_mut(pointer)
+                .expect("completion mutation pointer") = replacement;
+            persist(&mutation_store, &mutation_plan, &mutation);
+            assert!(
+                exact_durable_provider_complete_boundary(
+                    &mutation_store,
+                    &mutation_plan.operation_id
+                )
+                .is_err(),
+                "every durable-completion consumer must reject drift at {pointer}"
+            );
+        }
+
+        let deleted_root = tempfile::tempdir().expect("deleted evidence root");
+        let (deleted_store, deleted_plan) = build(deleted_root.path());
+        persist(
+            &deleted_store,
+            &deleted_plan,
+            &accepted_ingest(&deleted_plan, target()),
+        );
+        let deleted = checkpoint(&deleted_plan, target());
+        let deleted_hash = persist(&deleted_store, &deleted_plan, &deleted);
+        std::fs::remove_file(
+            deleted_store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!(
+                    "{}.json",
+                    deleted_hash.trim_start_matches("sha256:")
+                )),
+        )
+        .expect("delete provider-complete evidence");
+        assert!(
+            exact_durable_provider_complete_boundary(&deleted_store, &deleted_plan.operation_id)
+                .is_err()
+        );
+
+        let corrupt_root = tempfile::tempdir().expect("corrupt evidence root");
+        let (corrupt_store, corrupt_plan) = build(corrupt_root.path());
+        persist(
+            &corrupt_store,
+            &corrupt_plan,
+            &accepted_ingest(&corrupt_plan, target()),
+        );
+        let corrupt = checkpoint(&corrupt_plan, target());
+        let corrupt_hash = persist(&corrupt_store, &corrupt_plan, &corrupt);
+        std::fs::write(
+            corrupt_store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!(
+                    "{}.json",
+                    corrupt_hash.trim_start_matches("sha256:")
+                )),
+            b"{\"mismatched\":true}\n",
+        )
+        .expect("corrupt provider-complete evidence");
+        assert!(
+            exact_durable_provider_complete_boundary(&corrupt_store, &corrupt_plan.operation_id)
+                .is_err()
+        );
+
+        let duplicate_ingest_root = tempfile::tempdir().expect("duplicate ingest root");
+        let (duplicate_ingest_store, duplicate_ingest_plan) = build(duplicate_ingest_root.path());
+        let duplicate_ingest = accepted_ingest(&duplicate_ingest_plan, target());
+        persist(
+            &duplicate_ingest_store,
+            &duplicate_ingest_plan,
+            &duplicate_ingest,
+        );
+        duplicate_ingest_store
+            .record_d1_import_checkpoint(&duplicate_ingest_plan.operation_id, &duplicate_ingest)
+            .expect("duplicate accepted-ingest checkpoint");
+        let complete = checkpoint(&duplicate_ingest_plan, target());
+        persist(&duplicate_ingest_store, &duplicate_ingest_plan, &complete);
+        assert!(
+            exact_durable_provider_complete_boundary(
+                &duplicate_ingest_store,
+                &duplicate_ingest_plan.operation_id
+            )
+            .is_err()
+        );
+
+        for (pointer, replacement) in [
+            ("/plan/profile_id", json!("")),
+            ("/plan/catalog_hash", json!("sha256:different")),
+            ("/pins/catalog_hash", json!("sha256:different")),
+            ("/pins/credential_generation_id", json!("")),
+        ] {
+            let plan_drift_root = tempfile::tempdir().expect("PlanV2 drift root");
+            let (plan_drift_store, plan_drift) = build(plan_drift_root.path());
+            persist(
+                &plan_drift_store,
+                &plan_drift,
+                &accepted_ingest(&plan_drift, target()),
+            );
+            persist(
+                &plan_drift_store,
+                &plan_drift,
+                &checkpoint(&plan_drift, target()),
+            );
+            let path = plan_drift_store
+                .paths()
+                .data_dir
+                .join("plans-v2")
+                .join(format!("{}.json", plan_drift.operation_id));
+            let mut document: Value =
+                serde_json::from_slice(&std::fs::read(&path).expect("read PlanV2"))
+                    .expect("decode PlanV2");
+            *document
+                .pointer_mut(pointer)
+                .expect("PlanV2 mutation pointer") = replacement;
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&document).expect("encode drifted PlanV2"),
+            )
+            .expect("write drifted PlanV2");
+            assert!(
+                exact_durable_provider_complete_boundary(
+                    &plan_drift_store,
+                    &plan_drift.operation_id
+                )
+                .is_err(),
+                "every durable-completion consumer must reject PlanV2 drift at {pointer}"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one state-machine regression proves known provider failure versus transport ambiguity"
+    )]
+    fn approved_mln_provider_failure_uses_its_durable_receipt_not_transport_unknown() {
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://native".to_owned(),
+            source_hash: "sha256:test".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native overlay");
+        let capability = catalog
+            .capabilities
+            .remove("d1-import-approved-mln-migration")
+            .expect("native import capability");
+        let contract = capability
+            .d1_approved_mln_import
+            .as_ref()
+            .expect("import contract");
+        let build_plan = || {
+            let mut plan = PlanV1::draft(
+                "profile-a",
+                &contract.account_id,
+                "catalog-sha",
+                capability.clone(),
+                json!({}),
+            )
+            .expect("import plan");
+            plan.input = serde_json::to_value(CallInput {
+                selectors: json!({
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                }),
+                body: Some(json!({"migration_id":"0143"})),
+                ..CallInput::default()
+            })
+            .expect("input");
+            plan.refresh_hash().expect("refresh import plan");
+            plan.status = PlanStatus::RectificationRequired;
+            plan
+        };
+        let checkpoint = |plan: &PlanV1| {
+            json!({
+                "schema_version":1,
+                "operation_id":plan.operation_id,
+                "step":"ingest_response",
+                "performed":true,
+                "rectification_required":true,
+                "receipt":{
+                    "http_status":200,
+                    "success":true,
+                    "response_action":"ingest",
+                    "target":{
+                        "account_id":contract.account_id,
+                        "database_id":contract.database_id,
+                    },
+                    "plan_input_hash":hash_value(&plan.input).expect("input hash"),
+                    "no_replay":true,
+                    "result":{
+                        "type":"import",
+                        "status":"error",
+                        "success":false,
+                        "at_bookmark":null,
+                        "provider_error_present":true,
+                    },
+                    "errors":[],
+                    "etag":null,
+                    "cf_ray":null,
+                }
+            })
+        };
+
+        let uncertainty_root = tempfile::tempdir().expect("uncertainty root");
+        let uncertainty_store = StateStore::open(RuntimePaths::from_root(uncertainty_root.path()))
+            .expect("uncertainty store");
+        let uncertainty_plan = build_plan();
+        let uncertainty = D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: uncertainty_plan.operation_id.clone(),
+            step: "upload_send_uncertain".to_owned(),
+            performed: true,
+            rectification_required: true,
+            receipt: json!({
+                "provider":"cloudflare",
+                "effect":"d1_import_transport_uncertain",
+                "transport_stage":"upload",
+                "migration_id":"0143",
+                "target":{
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                },
+                "plan_input_hash":hash_value(&uncertainty_plan.input).expect("input hash"),
+                "outcome":"unknown",
+                "receipt_available":false,
+                "no_replay":true,
+            }),
+        };
+        persist_d1_import_checkpoint(
+            &uncertainty_store,
+            &uncertainty_plan.operation_id,
+            &uncertainty,
+        )
+        .expect("durable uncertainty checkpoint");
+        let uncertainty_value = serde_json::to_value(&uncertainty).expect("uncertainty value");
+        let uncertainty_hash = uncertainty_store
+            .read_d1_import_checkpoints(&uncertainty_plan.operation_id)
+            .expect("uncertainty checkpoints")
+            .into_iter()
+            .find(|(_, checkpoint)| checkpoint == &uncertainty_value)
+            .map(|(hash, _)| hash)
+            .expect("uncertainty checkpoint hash");
+        assert_eq!(
+            uncertainty_store
+                .read_evidence_value(&uncertainty_hash)
+                .expect("durable uncertainty evidence"),
+            uncertainty_value
+        );
+        let timeout_envelope = approved_mln_import_execution_error_envelope(
+            &uncertainty_store,
+            &mut uncertainty_plan.clone(),
+            CloudflareError::InvalidRequestBody(
+                "D1 import upload transport failed; presigned URL redacted; do not replay"
+                    .to_owned(),
+            ),
+            &MemorySecretStore::default(),
+        );
+        assert_eq!(timeout_envelope.result["receipt_available"], false);
+        assert!(
+            timeout_envelope
+                .verification
+                .basis
+                .as_deref()
+                .is_none_or(|basis| !basis.contains("upload response is durable"))
+        );
+
+        for (name, status, success, etag_present, expected_outcome) in [
+            (
+                "missing etag",
+                200,
+                true,
+                false,
+                "upload_integrity_rejected",
+            ),
+            (
+                "mismatched etag",
+                200,
+                true,
+                true,
+                "upload_integrity_rejected",
+            ),
+            ("provider rejection", 403, false, false, "upload_rejected"),
+        ] {
+            let upload_root = tempfile::tempdir().expect("upload response root");
+            let upload_store =
+                StateStore::open(RuntimePaths::from_root(upload_root.path())).expect(name);
+            let mut upload_plan = build_plan();
+            let upload_checkpoint = D1ImportCheckpointV1 {
+                schema_version: 1,
+                operation_id: upload_plan.operation_id.clone(),
+                step: "upload_response".to_owned(),
+                performed: true,
+                rectification_required: true,
+                receipt: json!({
+                    "provider":"cloudflare",
+                    "effect":"d1_import_upload_response",
+                    "migration_id":"0143",
+                    "target":{
+                        "account_id":contract.account_id,
+                        "database_id":contract.database_id,
+                    },
+                    "plan_input_hash":hash_value(&upload_plan.input).expect("input hash"),
+                    "http_status":status,
+                    "success":success,
+                    "etag_present":etag_present,
+                    "etag_matches":false,
+                    "no_replay":true,
+                }),
+            };
+            persist_d1_import_checkpoint(
+                &upload_store,
+                &upload_plan.operation_id,
+                &upload_checkpoint,
+            )
+            .expect("durable upload response");
+            let envelope = approved_mln_import_execution_error_envelope(
+                &upload_store,
+                &mut upload_plan,
+                CloudflareError::D1ImportUploadResponseIntegrityFailure,
+                &MemorySecretStore::default(),
+            );
+            assert!(envelope.performed, "{name}");
+            assert_eq!(envelope.result["outcome"], expected_outcome, "{name}");
+            assert_eq!(envelope.result["receipt_available"], true, "{name}");
+            assert_eq!(envelope.result["http_status"], status, "{name}");
+            assert_eq!(envelope.result["etag_present"], etag_present, "{name}");
+            assert_eq!(envelope.result["etag_matches"], false, "{name}");
+            assert_ne!(upload_plan.status, PlanStatus::Running, "{name}");
+            assert!(
+                !envelope.result.to_string().contains("etag_sha256"),
+                "{name}"
+            );
+        }
+
+        let missing_evidence_root = tempfile::tempdir().expect("missing evidence root");
+        let missing_evidence_store =
+            StateStore::open(RuntimePaths::from_root(missing_evidence_root.path()))
+                .expect("missing evidence store");
+        let mut missing_evidence_plan = build_plan();
+        let missing_evidence_checkpoint = json!({
+            "schema_version":1,
+            "operation_id":missing_evidence_plan.operation_id,
+            "step":"upload_response",
+            "performed":true,
+            "rectification_required":true,
+            "receipt":{
+                "provider":"cloudflare",
+                "effect":"d1_import_upload_response",
+                "migration_id":"0143",
+                "target":{
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                },
+                "plan_input_hash":hash_value(&missing_evidence_plan.input).expect("input hash"),
+                "http_status":200,
+                "success":true,
+                "etag_present":false,
+                "etag_matches":false,
+                "no_replay":true,
+            }
+        });
+        missing_evidence_store
+            .record_d1_import_checkpoint(
+                &missing_evidence_plan.operation_id,
+                &missing_evidence_checkpoint,
+            )
+            .expect("checkpoint without evidence");
+        let invalid_receipt = approved_mln_import_execution_error_envelope(
+            &missing_evidence_store,
+            &mut missing_evidence_plan,
+            CloudflareError::D1ImportUploadResponseIntegrityFailure,
+            &MemorySecretStore::default(),
+        );
+        assert_eq!(
+            invalid_receipt.result["outcome"],
+            "upload_rejected_receipt_invalid"
+        );
+        assert_eq!(invalid_receipt.result["receipt_available"], false);
+
+        let duplicate_root = tempfile::tempdir().expect("duplicate response root");
+        let duplicate_store = StateStore::open(RuntimePaths::from_root(duplicate_root.path()))
+            .expect("duplicate response store");
+        let mut duplicate_plan = build_plan();
+        let duplicate_checkpoint = |status: u16, success: bool| D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: duplicate_plan.operation_id.clone(),
+            step: "upload_response".to_owned(),
+            performed: true,
+            rectification_required: true,
+            receipt: json!({
+                "provider":"cloudflare",
+                "effect":"d1_import_upload_response",
+                "migration_id":"0143",
+                "target":{
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                },
+                "plan_input_hash":hash_value(&duplicate_plan.input).expect("input hash"),
+                "http_status":status,
+                "success":success,
+                "etag_present":false,
+                "etag_matches":false,
+                "no_replay":true,
+            }),
+        };
+        for checkpoint in [
+            duplicate_checkpoint(200, true),
+            duplicate_checkpoint(403, false),
+        ] {
+            persist_d1_import_checkpoint(
+                &duplicate_store,
+                &duplicate_plan.operation_id,
+                &checkpoint,
+            )
+            .expect("duplicate durable response");
+        }
+        let duplicate_receipt = approved_mln_import_execution_error_envelope(
+            &duplicate_store,
+            &mut duplicate_plan,
+            CloudflareError::D1ImportUploadResponseIntegrityFailure,
+            &MemorySecretStore::default(),
+        );
+        assert_eq!(
+            duplicate_receipt.result["outcome"],
+            "upload_rejected_receipt_invalid"
+        );
+        assert_eq!(duplicate_receipt.result["receipt_available"], false);
+
+        let init_root = tempfile::tempdir().expect("known init response root");
+        let init_store =
+            StateStore::open(RuntimePaths::from_root(init_root.path())).expect("init store");
+        let mut init_plan = build_plan();
+        let init_checkpoint = D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: init_plan.operation_id.clone(),
+            step: "init_response".to_owned(),
+            performed: true,
+            rectification_required: true,
+            receipt: json!({
+                "http_status":200,
+                "success":true,
+                "response_action":"init",
+                "provider":"cloudflare",
+                "effect":"d1_import_response",
+                "migration_id":"0143",
+                "target":{
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                },
+                "plan_input_hash":hash_value(&init_plan.input).expect("input hash"),
+                "result":{
+                    "type":"import",
+                    "status":"unsupported",
+                    "success":true,
+                    "at_bookmark":null,
+                    "upload_url_present":true,
+                    "upload_url_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "filename_present":true,
+                    "filename_sha256":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "provider_error_present":true,
+                },
+                "errors":[],
+                "provider_errors_present":true,
+                "no_replay":true,
+                "etag_present":true,
+                "etag_sha256":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "cf_ray":"safe-ray",
+            }),
+        };
+        persist_d1_import_checkpoint(&init_store, &init_plan.operation_id, &init_checkpoint)
+            .expect("durable init response");
+        let init_envelope = approved_mln_import_execution_error_envelope(
+            &init_store,
+            &mut init_plan,
+            CloudflareError::D1ImportInitResponseFailure,
+            &MemorySecretStore::default(),
+        );
+        assert!(init_envelope.performed);
+        assert_eq!(init_envelope.result["outcome"], "invalid_provider_response");
+        assert_eq!(init_envelope.result["receipt_available"], true);
+        assert_ne!(init_plan.status, PlanStatus::Running);
+        for forbidden in ["X-Amz-Signature", "SECRET", "upload_url\":"] {
+            assert!(!init_envelope.result.to_string().contains(forbidden));
+            assert!(
+                !init_envelope
+                    .verification
+                    .basis
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(forbidden)
+            );
+        }
+
+        for (action, step, error) in [
+            (
+                "ingest",
+                "ingest_response",
+                CloudflareError::D1ImportIngestResponseFailure,
+            ),
+            (
+                "poll",
+                "poll_response_1",
+                CloudflareError::D1ImportPollResponseFailure,
+            ),
+        ] {
+            let action_root = tempfile::tempdir().expect("known action response root");
+            let action_store = StateStore::open(RuntimePaths::from_root(action_root.path()))
+                .expect("action response store");
+            let mut action_plan = build_plan();
+            let action_checkpoint = D1ImportCheckpointV1 {
+                schema_version: 1,
+                operation_id: action_plan.operation_id.clone(),
+                step: step.to_owned(),
+                performed: true,
+                rectification_required: true,
+                receipt: json!({
+                    "http_status":200,
+                    "success":true,
+                    "response_action":action,
+                    "provider":"cloudflare",
+                    "effect":"d1_import_response",
+                    "migration_id":"0143",
+                    "target":{
+                        "account_id":contract.account_id,
+                        "database_id":contract.database_id,
+                    },
+                    "plan_input_hash":hash_value(&action_plan.input).expect("input hash"),
+                    "result":{
+                        "type":"import",
+                        "status":"unsupported",
+                        "success":true,
+                        "at_bookmark":"owned",
+                        "result":{"final_bookmark":null},
+                        "provider_error_present":false,
+                    },
+                    "errors":[],
+                    "provider_errors_present":false,
+                    "no_replay":true,
+                    "etag_present":false,
+                    "etag_sha256":null,
+                    "cf_ray":null,
+                }),
+            };
+            persist_d1_import_checkpoint(
+                &action_store,
+                &action_plan.operation_id,
+                &action_checkpoint,
+            )
+            .expect("durable action response");
+            let action_envelope = approved_mln_import_execution_error_envelope(
+                &action_store,
+                &mut action_plan,
+                error,
+                &MemorySecretStore::default(),
+            );
+            assert!(action_envelope.performed, "{action}");
+            assert_eq!(
+                action_envelope.result["outcome"], "invalid_provider_response",
+                "{action}"
+            );
+            assert_eq!(
+                action_envelope.result["receipt_available"], true,
+                "{action}"
+            );
+            assert_eq!(action_envelope.result["response_action"], action);
+            assert_ne!(action_plan.status, PlanStatus::Running);
+            assert!(!action_envelope.result.to_string().contains("SECRET"));
+        }
+
+        let exhaustion_root = tempfile::tempdir().expect("poll exhaustion root");
+        let exhaustion_store = StateStore::open(RuntimePaths::from_root(exhaustion_root.path()))
+            .expect("poll exhaustion store");
+        let mut exhaustion_plan = build_plan();
+        exhaustion_plan
+            .capability
+            .d1_approved_mln_import
+            .as_mut()
+            .expect("import contract")
+            .max_poll_attempts = 2;
+        exhaustion_plan.targets = json!({
+            "adapter":{
+                "approved_mln_import":{
+                    "sha256":"sha256:source",
+                }
+            }
+        });
+        exhaustion_plan
+            .refresh_hash()
+            .expect("exhaustion plan hash");
+        let target = json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        });
+        let input_hash = hash_value(&exhaustion_plan.input).expect("input hash");
+        let accepted = D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: exhaustion_plan.operation_id.clone(),
+            step: "ingest_response".to_owned(),
+            performed: true,
+            rectification_required: false,
+            receipt: json!({
+                "http_status":200,
+                "success":true,
+                "response_action":"ingest",
+                "provider":"cloudflare",
+                "effect":"d1_import_ingest_accepted",
+                "migration_id":"0143",
+                "target":target,
+                "plan_input_hash":input_hash,
+                "result":{
+                    "type":"import",
+                    "status":"active",
+                    "success":true,
+                    "at_bookmark":"owned",
+                    "result":{"final_bookmark":null},
+                    "provider_error_present":false,
+                },
+                "errors":[],
+                "provider_errors_present":false,
+                "no_replay":false,
+                "etag_present":false,
+                "etag_sha256":null,
+                "cf_ray":null,
+            }),
+        };
+        persist_d1_import_checkpoint(&exhaustion_store, &exhaustion_plan.operation_id, &accepted)
+            .expect("accepted ingest authority");
+        let exhaustion_operation_id = exhaustion_plan.operation_id.clone();
+        let poll_checkpoint = |attempt| D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: exhaustion_operation_id.clone(),
+            step: format!("poll_response_{attempt}"),
+            performed: true,
+            rectification_required: false,
+            receipt: json!({
+                "http_status":200,
+                "success":true,
+                "response_action":"poll",
+                "provider":"cloudflare",
+                "effect":"d1_import_response",
+                "migration_id":"0143",
+                "target":target,
+                "plan_input_hash":input_hash,
+                "result":{
+                    "type":"import",
+                    "status":"active",
+                    "success":true,
+                    "at_bookmark":"owned",
+                    "result":{"final_bookmark":null},
+                    "provider_error_present":false,
+                },
+                "errors":[],
+                "provider_errors_present":false,
+                "no_replay":false,
+                "etag_present":false,
+                "etag_sha256":null,
+                "cf_ray":null,
+            }),
+        };
+        for attempt in 1..=2 {
+            let poll = poll_checkpoint(attempt);
+            persist_d1_import_checkpoint(&exhaustion_store, &exhaustion_plan.operation_id, &poll)
+                .expect("durable in-progress poll");
+        }
+        let exact_poll = serde_json::to_value(poll_checkpoint(1)).expect("exact poll");
+        let exact_poll_hash = exhaustion_store
+            .read_d1_import_checkpoints(&exhaustion_plan.operation_id)
+            .expect("poll checkpoints")
+            .into_iter()
+            .find(|(_, checkpoint)| checkpoint == &exact_poll)
+            .map(|(hash, _)| hash)
+            .expect("exact poll hash");
+        assert!(exact_in_progress_poll_receipt(
+            &exhaustion_store,
+            &exhaustion_plan,
+            &exact_poll_hash,
+            &exact_poll,
+            1,
+            &target,
+            &input_hash,
+            "0143",
+            "owned",
+        ));
+        for (pointer, replacement) in [
+            ("/schema_version", json!(2)),
+            ("/operation_id", json!("different")),
+            ("/step", json!("poll_response_2")),
+            ("/performed", json!(false)),
+            ("/rectification_required", json!(true)),
+            ("/receipt/http_status", json!(201)),
+            ("/receipt/success", json!(false)),
+            ("/receipt/response_action", json!("ingest")),
+            ("/receipt/provider", json!("different")),
+            ("/receipt/effect", json!("different")),
+            ("/receipt/migration_id", json!("0142")),
+            ("/receipt/target/database_id", json!("different")),
+            ("/receipt/plan_input_hash", json!("sha256:different")),
+            ("/receipt/result/type", json!("export")),
+            ("/receipt/result/status", json!("complete")),
+            ("/receipt/result/success", json!(false)),
+            ("/receipt/result/at_bookmark", json!("grafted")),
+            ("/receipt/result/provider_error_present", json!(true)),
+            ("/receipt/result/result/final_bookmark", json!("unexpected")),
+            ("/receipt/errors", json!(["SECRET"])),
+            ("/receipt/provider_errors_present", json!(true)),
+            ("/receipt/no_replay", json!(true)),
+            ("/receipt/etag_present", json!(true)),
+            ("/receipt/etag_sha256", json!("raw-etag")),
+            ("/receipt/unknown", json!("SECRET")),
+        ] {
+            let mut drifted = exact_poll.clone();
+            if pointer == "/receipt/unknown" {
+                drifted["receipt"]["unknown"] = replacement;
+            } else {
+                *drifted.pointer_mut(pointer).expect("mutation pointer") = replacement;
+            }
+            assert!(
+                !exact_in_progress_poll_receipt(
+                    &exhaustion_store,
+                    &exhaustion_plan,
+                    &exact_poll_hash,
+                    &drifted,
+                    1,
+                    &target,
+                    &input_hash,
+                    "0143",
+                    "owned",
+                ),
+                "{pointer}"
+            );
+        }
+        assert!(
+            !exact_in_progress_poll_receipt(
+                &exhaustion_store,
+                &exhaustion_plan,
+                "sha256:missing",
+                &exact_poll,
+                1,
+                &target,
+                &input_hash,
+                "0143",
+                "owned",
+            ),
+            "missing or mismatched evidence must fail"
+        );
+        let exhausted = D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: exhaustion_plan.operation_id.clone(),
+            step: "poll_in_progress_exhausted".to_owned(),
+            performed: true,
+            rectification_required: true,
+            receipt: json!({
+                "provider":"cloudflare",
+                "effect":"d1_import_poll_in_progress_exhausted",
+                "migration_id":"0143",
+                "target":target,
+                "plan_input_hash":input_hash,
+                "source_sha256":"sha256:source",
+                "at_bookmark":"owned",
+                "attempt_count":2,
+                "attempt_bound":2,
+                "outcome":"poll_in_progress_exhausted",
+                "receipt_available":true,
+                "no_replay":true,
+            }),
+        };
+        persist_d1_import_checkpoint(&exhaustion_store, &exhaustion_plan.operation_id, &exhausted)
+            .expect("durable exhaustion");
+        let exhaustion_envelope = approved_mln_import_execution_error_envelope(
+            &exhaustion_store,
+            &mut exhaustion_plan,
+            CloudflareError::D1ImportPollInProgressExhausted,
+            &MemorySecretStore::default(),
+        );
+        assert!(exhaustion_envelope.performed);
+        assert_eq!(
+            exhaustion_envelope.result["outcome"],
+            "poll_in_progress_exhausted"
+        );
+        assert_eq!(exhaustion_envelope.result["receipt_available"], true);
+        assert_eq!(exhaustion_envelope.result["attempt_count"], 2);
+        assert_eq!(exhaustion_envelope.result["attempt_bound"], 2);
+        assert!(
+            exhaustion_envelope.result["accepted_ingest_evidence_hash"]
+                .as_str()
+                .is_some_and(|hash| hash.starts_with("sha256:"))
+        );
+        assert_ne!(exhaustion_plan.status, PlanStatus::Running);
+        persist_d1_import_checkpoint(
+            &exhaustion_store,
+            &exhaustion_plan.operation_id,
+            &poll_checkpoint(2),
+        )
+        .expect("later duplicate poll");
+        assert!(
+            exact_durable_poll_exhaustion(&exhaustion_store, &exhaustion_plan).is_err(),
+            "a duplicate poll after exhaustion must invalidate chronology and tail authority"
+        );
+
+        let root = tempfile::tempdir().expect("known failure root");
+        let store =
+            StateStore::open(RuntimePaths::from_root(root.path())).expect("known failure store");
+        let mut plan = build_plan();
+        let receipt = checkpoint(&plan);
+        let hash = store
+            .record_d1_import_checkpoint(&plan.operation_id, &receipt)
+            .expect("provider-failure checkpoint");
+        assert_eq!(
+            store
+                .write_evidence(EvidenceClass::Apply, &receipt)
+                .expect("provider-failure evidence")
+                .content_hash,
+            hash
+        );
+        let envelope = approved_mln_import_execution_error_envelope(
+            &store,
+            &mut plan,
+            CloudflareError::D1ImportProviderFailure,
+            &MemorySecretStore::default(),
+        );
+        assert!(!envelope.ok);
+        assert!(envelope.performed);
+        assert_eq!(envelope.result["outcome"], "provider_rejected");
+        assert_eq!(envelope.result["receipt_available"], true);
+        assert!(
+            envelope
+                .verification
+                .basis
+                .as_deref()
+                .is_some_and(|basis| basis.contains("provider-failure response is durable"))
+        );
+        assert!(
+            !envelope
+                .result
+                .to_string()
+                .contains("provider rejected import")
+        );
+        assert_eq!(plan.status, PlanStatus::RectificationRequired);
+        assert_ne!(plan.status, PlanStatus::Running);
+
+        let init_root = tempfile::tempdir().expect("init failure root");
+        let init_store =
+            StateStore::open(RuntimePaths::from_root(init_root.path())).expect("init store");
+        let mut init_plan = build_plan();
+        let mut init_receipt = checkpoint(&init_plan);
+        init_receipt["step"] = json!("init_response");
+        init_receipt["receipt"]["response_action"] = json!("init");
+        let init_hash = init_store
+            .record_d1_import_checkpoint(&init_plan.operation_id, &init_receipt)
+            .expect("init failure checkpoint");
+        assert_eq!(
+            init_store
+                .write_evidence(EvidenceClass::Apply, &init_receipt)
+                .expect("init failure evidence")
+                .content_hash,
+            init_hash
+        );
+        let init_envelope = approved_mln_import_execution_error_envelope(
+            &init_store,
+            &mut init_plan,
+            CloudflareError::D1ImportProviderFailure,
+            &MemorySecretStore::default(),
+        );
+        assert_eq!(init_envelope.result["outcome"], "provider_rejected");
+        assert_eq!(init_envelope.result["receipt_available"], true);
+        assert_ne!(init_plan.status, PlanStatus::Running);
+
+        let poll_root = tempfile::tempdir().expect("poll failure root");
+        let poll_store =
+            StateStore::open(RuntimePaths::from_root(poll_root.path())).expect("poll store");
+        let poll_plan = build_plan();
+        let mut accepted_ingest = checkpoint(&poll_plan);
+        accepted_ingest["rectification_required"] = json!(false);
+        accepted_ingest["receipt"]["provider"] = json!("cloudflare");
+        accepted_ingest["receipt"]["effect"] = json!("d1_import_ingest_accepted");
+        accepted_ingest["receipt"]["migration_id"] = json!("0143");
+        accepted_ingest["receipt"]["no_replay"] = json!(false);
+        accepted_ingest["receipt"]["result"] = json!({
+            "type":"import",
+            "status":"active",
+            "success":true,
+            "at_bookmark":"before",
+        });
+        let accepted_hash = poll_store
+            .record_d1_import_checkpoint(&poll_plan.operation_id, &accepted_ingest)
+            .expect("accepted ingest checkpoint");
+        assert_eq!(
+            poll_store
+                .write_evidence(EvidenceClass::Apply, &accepted_ingest)
+                .expect("accepted ingest evidence")
+                .content_hash,
+            accepted_hash
+        );
+        let target = json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        });
+        let input_hash = hash_value(&poll_plan.input).expect("poll plan input hash");
+        assert_eq!(
+            exact_accepted_ingest_bookmarks(
+                &poll_store,
+                &poll_plan,
+                &[(accepted_hash.clone(), accepted_ingest.clone())],
+                &target,
+                &input_hash,
+            ),
+            vec!["before"]
+        );
+
+        for (pointer, replacement) in [
+            ("/schema_version", json!(2)),
+            ("/operation_id", json!("different-operation")),
+            ("/step", json!("poll_response_1")),
+            ("/performed", json!(false)),
+            ("/rectification_required", json!(true)),
+            ("/receipt/success", json!(false)),
+            ("/receipt/response_action", json!("poll")),
+            ("/receipt/provider", json!("different-provider")),
+            ("/receipt/effect", json!("d1_import_response")),
+            ("/receipt/migration_id", json!("0142")),
+            (
+                "/receipt/target",
+                json!({
+                    "account_id":contract.account_id,
+                    "database_id":"different-database",
+                }),
+            ),
+            ("/receipt/plan_input_hash", json!("sha256:different")),
+            ("/receipt/no_replay", json!(true)),
+            ("/receipt/result/type", json!("other")),
+            ("/receipt/result/status", json!("complete")),
+            ("/receipt/result/success", json!(false)),
+            ("/receipt/result/at_bookmark", json!("")),
+        ] {
+            let mut drifted = accepted_ingest.clone();
+            *drifted.pointer_mut(pointer).expect("mutation pointer") = replacement;
+            let drifted_hash = poll_store
+                .write_evidence(EvidenceClass::Apply, &drifted)
+                .expect("drifted accepted-ingest evidence")
+                .content_hash;
+            assert!(
+                exact_accepted_ingest_bookmarks(
+                    &poll_store,
+                    &poll_plan,
+                    &[(drifted_hash, drifted)],
+                    &target,
+                    &input_hash,
+                )
+                .is_empty(),
+                "accepted-ingest authority must reject drift at {pointer}"
+            );
+        }
+        for (pointer, replacement) in [
+            ("/receipt/result/provider_error_present", json!(true)),
+            ("/receipt/result/error", json!({"code":7500})),
+        ] {
+            let mut errored = accepted_ingest.clone();
+            errored
+                .pointer_mut("/receipt/result")
+                .and_then(Value::as_object_mut)
+                .expect("result object")
+                .insert(
+                    pointer.rsplit('/').next().expect("field").to_owned(),
+                    replacement,
+                );
+            let errored_hash = poll_store
+                .write_evidence(EvidenceClass::Apply, &errored)
+                .expect("errored accepted-ingest evidence")
+                .content_hash;
+            assert!(
+                exact_accepted_ingest_bookmarks(
+                    &poll_store,
+                    &poll_plan,
+                    &[(errored_hash, errored)],
+                    &target,
+                    &input_hash,
+                )
+                .is_empty(),
+                "accepted-ingest authority must reject {pointer}"
+            );
+        }
+        assert!(
+            exact_accepted_ingest_bookmarks(
+                &poll_store,
+                &poll_plan,
+                &[("sha256:missing".to_owned(), accepted_ingest.clone())],
+                &target,
+                &input_hash,
+            )
+            .is_empty(),
+            "accepted-ingest authority requires durable evidence"
+        );
+        let mismatched_hash = poll_store
+            .write_evidence(EvidenceClass::Apply, &json!({"different":"evidence"}))
+            .expect("mismatched evidence")
+            .content_hash;
+        assert!(
+            exact_accepted_ingest_bookmarks(
+                &poll_store,
+                &poll_plan,
+                &[(mismatched_hash, accepted_ingest.clone())],
+                &target,
+                &input_hash,
+            )
+            .is_empty(),
+            "accepted-ingest authority requires exact immutable evidence"
+        );
+        assert_eq!(
+            exact_accepted_ingest_bookmarks(
+                &poll_store,
+                &poll_plan,
+                &[
+                    (accepted_hash.clone(), accepted_ingest.clone()),
+                    (accepted_hash, accepted_ingest.clone()),
+                ],
+                &target,
+                &input_hash,
+            )
+            .len(),
+            2,
+            "duplicate accepted-ingest authorities remain visible to the exact-one gate"
+        );
+        let mut poll_receipt = checkpoint(&poll_plan);
+        poll_receipt["step"] = json!("poll_response_1");
+        poll_receipt["receipt"]["response_action"] = json!("poll");
+        poll_receipt["receipt"]["result"]["at_bookmark"] = json!("before");
+        let poll_hash = poll_store
+            .record_d1_import_checkpoint(&poll_plan.operation_id, &poll_receipt)
+            .expect("poll failure checkpoint");
+        assert_eq!(
+            poll_store
+                .write_evidence(EvidenceClass::Apply, &poll_receipt)
+                .expect("poll failure evidence")
+                .content_hash,
+            poll_hash
+        );
+        assert!(
+            exact_durable_provider_failure_boundary(&poll_store, &poll_plan).is_ok(),
+            "poll failure binds the exact accepted-ingest bookmark"
+        );
+
+        store
+            .record_d1_import_checkpoint(&plan.operation_id, &receipt)
+            .expect("duplicate known failure");
+        assert!(exact_durable_provider_failure_boundary(&store, &plan).is_err());
+
+        for receipt_fixture in [
+            None,
+            Some({
+                let mut mismatched = checkpoint(&build_plan());
+                mismatched["receipt"]["result"]["provider_error_present"] = json!(false);
+                mismatched
+            }),
+            Some({
+                let mut grafted = checkpoint(&build_plan());
+                grafted["receipt"]["response_action"] = json!("poll");
+                grafted
+            }),
+        ] {
+            let invalid_root = tempfile::tempdir().expect("invalid receipt root");
+            let invalid_store =
+                StateStore::open(RuntimePaths::from_root(invalid_root.path())).expect("store");
+            let mut invalid_plan = build_plan();
+            if let Some(mut invalid_receipt) = receipt_fixture {
+                invalid_receipt["operation_id"] = json!(invalid_plan.operation_id);
+                invalid_store
+                    .record_d1_import_checkpoint(&invalid_plan.operation_id, &invalid_receipt)
+                    .expect("invalid provider checkpoint");
+                invalid_store
+                    .write_evidence(EvidenceClass::Apply, &invalid_receipt)
+                    .expect("invalid provider evidence");
+            }
+            let invalid = approved_mln_import_execution_error_envelope(
+                &invalid_store,
+                &mut invalid_plan,
+                CloudflareError::D1ImportProviderFailure,
+                &MemorySecretStore::default(),
+            );
+            assert_eq!(
+                invalid.result["outcome"],
+                "provider_rejected_receipt_invalid"
+            );
+            assert_eq!(invalid.result["receipt_available"], false);
+            assert_ne!(invalid_plan.status, PlanStatus::Running);
+        }
+
+        let transport_root = tempfile::tempdir().expect("transport root");
+        let transport_store =
+            StateStore::open(RuntimePaths::from_root(transport_root.path())).expect("store");
+        let mut transport_plan = build_plan();
+        let transport = approved_mln_import_execution_error_envelope(
+            &transport_store,
+            &mut transport_plan,
+            CloudflareError::InvalidRequestBody("injected transport timeout".to_owned()),
+            &MemorySecretStore::default(),
+        );
+        assert_eq!(transport.result["outcome"], "unknown");
+        assert_eq!(transport.result["receipt_available"], false);
+        assert!(
+            transport
+                .verification
+                .basis
+                .as_deref()
+                .is_some_and(|basis| basis.contains("no Cloudflare response was received"))
+        );
+        assert_eq!(transport_plan.status, PlanStatus::RectificationRequired);
     }
 
     fn security_action_create_capability() -> CapabilityV1 {
@@ -24529,6 +34116,7 @@ mod tests {
                 value_out: None,
                 credential_in: None,
                 out: None,
+                source_file: None,
             },
         ))
         .await
@@ -30072,5 +39660,144 @@ mod tests {
             Some("example.com")
         );
         assert_eq!(super::extract_domain("enable email routing"), None);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fixture proves every bounded child receipt and inherited authority pin"
+    )]
+    fn poll_child_exhaustion_is_exact_bounded_and_carries_root_ingest_authority() {
+        let root = tempfile::tempdir().expect("poll child root");
+        let store =
+            StateStore::open(RuntimePaths::from_root(root.path())).expect("poll child store");
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://native".to_owned(),
+            source_hash: "sha256:test".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native overlay");
+        let mut capability = catalog
+            .capabilities
+            .remove("d1-resume-approved-mln-import-poll")
+            .expect("poll child capability");
+        capability
+            .d1_approved_mln_import_poll_resume
+            .as_mut()
+            .expect("poll child contract")
+            .max_poll_attempts = 2;
+        let contract = capability
+            .d1_approved_mln_import_poll_resume
+            .clone()
+            .expect("poll child contract");
+        let target = json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        });
+        let root_input = json!({"body":{"migration_id":"0143"}});
+        let accepted = json!({
+            "schema_version":1,
+            "operation_id":"00000000-0000-4000-8000-000000000001",
+            "step":"ingest_response",
+            "performed":true,
+            "rectification_required":false,
+            "receipt":{
+                "http_status":200,"success":true,"response_action":"ingest",
+                "provider":"cloudflare","effect":"d1_import_ingest_accepted",
+                "migration_id":"0143","target":target,
+                "plan_input_hash":hash_value(&root_input).expect("root input hash"),
+                "no_replay":false,
+                "result":{"type":"import","status":"active","success":true,
+                    "at_bookmark":"accepted"},
+                "errors":[]
+            }
+        });
+        let accepted_evidence = store
+            .write_evidence(EvidenceClass::Apply, &accepted)
+            .expect("accepted evidence");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            &contract.account_id,
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("poll child plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors: json!({
+                "account_id":contract.account_id,
+                "database_id":contract.database_id,
+            }),
+            body: Some(json!({
+                "parent_operation_id":"00000000-0000-4000-8000-000000000001",
+                "parent_plan_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "exhaustion_evidence_hash":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "accepted_ingest_evidence_hash":accepted_evidence.content_hash,
+                "accepted_bookmark_hash":hash_value(&json!("accepted")).expect("bookmark hash"),
+            })),
+            ..CallInput::default()
+        })
+        .expect("poll child input");
+        plan.targets = json!({"adapter":{"approved_mln_import_poll_resume":{
+            "root_operation_id":"00000000-0000-4000-8000-000000000001",
+            "root_plan_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "root_input":root_input,
+            "root_stage":{"sha256":"sha256:source"},
+            "accepted_ingest_evidence_hash":accepted_evidence.content_hash,
+            "accepted_bookmark":"accepted"
+        }}});
+        plan.refresh_hash().expect("poll child hash");
+        let input_hash = hash_value(&plan.input).expect("input hash");
+        for attempt in 1..=2 {
+            let checkpoint = D1ImportCheckpointV1 {
+                schema_version: 1,
+                operation_id: plan.operation_id.clone(),
+                step: format!("poll_response_{attempt}"),
+                performed: true,
+                rectification_required: false,
+                receipt: json!({
+                    "http_status":200,"success":true,"response_action":"poll",
+                    "provider":"cloudflare","effect":"d1_import_response",
+                    "migration_id":"0143","target":target,"plan_input_hash":input_hash,
+                    "result":{"type":"import","status":"active","success":true,
+                        "at_bookmark":"accepted","result":{"final_bookmark":null},
+                        "provider_error_present":false},
+                    "errors":[],"provider_errors_present":false,"no_replay":false,
+                    "etag_present":false,"etag_sha256":null,"cf_ray":null
+                }),
+            };
+            persist_d1_import_checkpoint(&store, &plan.operation_id, &checkpoint)
+                .expect("poll checkpoint");
+        }
+        let exhausted = D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: plan.operation_id.clone(),
+            step: "poll_in_progress_exhausted".to_owned(),
+            performed: true,
+            rectification_required: true,
+            receipt: json!({
+                "provider":"cloudflare","effect":"d1_import_poll_in_progress_exhausted",
+                "migration_id":"0143","target":target,"plan_input_hash":input_hash,
+                "source_sha256":"sha256:source","at_bookmark":"accepted",
+                "attempt_count":2,"attempt_bound":2,
+                "outcome":"poll_in_progress_exhausted","receipt_available":true,"no_replay":true
+            }),
+        };
+        persist_d1_import_checkpoint(&store, &plan.operation_id, &exhausted)
+            .expect("exhaustion checkpoint");
+        let exact =
+            super::exact_resume_poll_exhaustion(&store, &plan).expect("exact child exhaustion");
+        assert_eq!(exact.accepted_bookmark, "accepted");
+        assert_eq!(
+            exact.accepted_ingest_evidence.content_hash,
+            accepted_evidence.content_hash
+        );
+        let mut grafted = plan.clone();
+        grafted.targets["adapter"]["approved_mln_import_poll_resume"]["accepted_bookmark"] =
+            json!("grafted");
+        assert!(super::exact_resume_poll_exhaustion(&store, &grafted).is_err());
     }
 }

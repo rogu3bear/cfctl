@@ -10,14 +10,15 @@ use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
     AsyncCollectionMutationContractV1, BillingModelV1, CapabilityV1, CostExposureV1, CostV1,
     CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
-    CreatedResourceContractV1, DeletedNestedResourceContractV1, DeletedResourceContractV1,
-    EffectClass, EntitlementProbeV1, EntitlementV1, EventBatchContractV1,
-    GraphqlAnalyticsContractV1, KnowledgeReferenceV1, Maturity, OutputFormatV1, PaginationModeV1,
-    QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
-    RiskClass, SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
-    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
-    TimestampFormatV1, UpdatedResourceContractV1, WorkflowContractV1, WorkflowStepV1, hash_value,
-    request_header_is_reserved,
+    CreatedResourceContractV1, D1FullExportContractV1, D1SchemaIntrospectionContractV1,
+    DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass, EntitlementProbeV1,
+    EntitlementV1, EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1,
+    Maturity, Mln0142PostImportSchemaContractV1, Mln0143DataInvariantsContractV1, OutputFormatV1,
+    PaginationModeV1, QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1,
+    ResponseContractV1, RiskClass, SamePathReadContractV1, SecurityActionContractV1,
+    SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1,
+    TimeRangeContractV1, TimestampFormatV1, UpdatedResourceContractV1, WorkflowContractV1,
+    WorkflowStepV1, hash_value, request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -1748,6 +1749,887 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
             .insert(capability.id.clone(), capability);
     }
     snapshot.refresh_hash()
+}
+
+/// Adds operation-specific native control-plane capabilities whose wire
+/// contracts cannot be represented safely by Cloudflare's raw `OpenAPI`
+/// operation. These capabilities compile closed inputs into fixed requests;
+/// they never expose the underlying generic provider operation.
+pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
+    for capability in vec![
+        mln_0143_data_invariants_capability(),
+        mln_0142_post_import_schema_capability(),
+        d1_schema_introspection_capability(),
+        d1_full_export_capability(),
+        d1_restore_exact_bookmark_capability(),
+        d1_import_approved_mln_migration_capability(),
+        d1_resume_approved_mln_import_poll_capability(),
+    ]
+    .into_boxed_slice()
+    {
+        snapshot
+            .capabilities
+            .insert(capability.id.clone(), capability);
+    }
+    snapshot.refresh_hash()
+}
+
+const MLN_0142_TRIGGER_DEFINITION: &str = r"CREATE TRIGGER document_render_jobs_terminal_generation_guard
+BEFORE UPDATE OF state ON document_render_jobs
+FOR EACH ROW
+WHEN NEW.state IN ('ready', 'failed')
+ AND (
+   OLD.state <> 'rendering'
+   OR OLD.attempts < 1
+   OR OLD.claimed_by IS NULL
+   OR trim(OLD.claimed_by) = ''
+   OR NEW.attempts <> OLD.attempts
+   OR NEW.claimed_by IS NOT OLD.claimed_by
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'document_render_terminal_generation_stale');
+END";
+
+fn mln_0142_post_import_schema_capability() -> CapabilityV1 {
+    const ACCOUNT: &str = "ca30e922fda7f5578e49873542e4aaca";
+    const DATABASE: &str = "7c282983-2e48-4ea4-9f0d-09b0d718fe65";
+    const SOURCE: &str = "sha256:07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0";
+    const DEFINITION: &str =
+        "sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b";
+    let mut capability = d1_schema_introspection_capability();
+    "mln-0142-post-import-schema".clone_into(&mut capability.id);
+    "Prove MLN 0142 post-import trigger authority".clone_into(&mut capability.title);
+    capability.description = Some(
+        "Run one exact compiler-owned equality assertion for the reviewed MLNavigator 0142 trigger and bind the result to its durable import boundary."
+            .to_owned(),
+    );
+    capability.aliases = vec!["verify MLN 0142 migration".to_owned()];
+    capability.selectors[0].contract = Some(SelectorContractV1 {
+        schema: serde_json::json!({"type":"string","enum":[ACCOUNT]}),
+        query: None,
+    });
+    capability.selectors[1].contract = Some(SelectorContractV1 {
+        schema: serde_json::json!({"type":"string","enum":[DATABASE]}),
+        query: None,
+    });
+    let hash = serde_json::json!({"type":"string","pattern":"^sha256:[0-9a-f]{64}$"});
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "x-cfctl-body-required":true,
+        "required":[
+            "assertion","import_operation_id","import_boundary_evidence_hash",
+            "import_source_sha256","import_plan_hash","final_bookmark_hash",
+            "trigger_definition_sha256"
+        ],
+        "properties":{
+            "assertion":{"type":"string","enum":["mln_0142_trigger_definition"]},
+            "import_operation_id":{"type":"string","format":"uuid"},
+            "import_boundary_evidence_hash":hash,
+            "import_source_sha256":{"type":"string","enum":[SOURCE]},
+            "import_plan_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+            "final_bookmark_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+            "trigger_definition_sha256":{"type":"string","enum":[DEFINITION]}
+        }
+    }));
+    capability.mln_0142_post_import_schema = Some(Mln0142PostImportSchemaContractV1 {
+        account_id: ACCOUNT.to_owned(),
+        database_id: DATABASE.to_owned(),
+        migration_sha256: SOURCE.to_owned(),
+        trigger_name: "document_render_jobs_terminal_generation_guard".to_owned(),
+        trigger_definition: MLN_0142_TRIGGER_DEFINITION.to_owned(),
+        trigger_definition_sha256: DEFINITION.to_owned(),
+        capability_version: 1,
+    });
+    capability
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the two-entry migration catalogue and immutable receipt prerequisites remain visible in one declaration"
+)]
+fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
+    let account_id = "ca30e922fda7f5578e49873542e4aaca";
+    let database_id = "7c282983-2e48-4ea4-9f0d-09b0d718fe65";
+    let hash = serde_json::json!({
+        "type":"string","pattern":"^sha256:[0-9a-f]{64}$","minLength":71,"maxLength":71
+    });
+    let operation = serde_json::json!({
+        "type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f-]{27,72}$","minLength":36,"maxLength":80
+    });
+    let mut capability = CapabilityV1::new(
+        "d1-import-approved-mln-migration",
+        "Import one approved MLNavigator migration",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/import",
+    );
+    capability.description = Some(
+        "Stage and import exactly MLNavigator migration 0142 or 0143. The reviewed source is one exact clean Git repository revision, relative path, and blob; local origin configuration establishes snapshot identity, not hosted ownership. For 0143, the shared admission and consumption gate requires verified 0142 closure, then the governed recovery export, then exactly one current-authority pre_import proof, all before the immutable plan cutoff. This is evidence chronology, not a claim that out-of-band provider writes were absent. A 0143 post-restore proof must restore the exact post-0142 recovery anchor and re-prove the exact 0142 terminal-generation trigger. A 0142 rollback is a different boundary: it must target the pre-0142 anchor and separately prove that the 0142 trigger is absent; it cannot use the 0143 post-restore contract. The plan binds reviewed source bytes, the phase-specific recovery anchor with its provider bookmark, and proof authority; provider completion remains unverified until the governed post-import proof is attached."
+            .to_owned(),
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native closed MLNavigator migration import adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![
+        "apply MLN migration 0142".to_owned(),
+        "apply MLN migration 0143".to_owned(),
+    ];
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.mutating = true;
+    capability.risk = RiskClass::Irreversible;
+    capability.effect = cfctl_core::EffectClass::DataWrite;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: Some(0.0),
+        basis: Some("D1 import has no incremental operation charge; ordinary D1 storage and rows-written accounting remains".to_owned()),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![KnowledgeReferenceV1 {
+            title: "D1 pricing".to_owned(),
+            url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        }],
+    };
+    capability.entitlement.available = Some(true);
+    capability.verification.required = true;
+    "mln_import_requires_governed_post_import_proof"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("no_automatic_rollback_use_separately_approved_bookmark_restore".to_owned());
+    capability.rollback.warning = Some(
+        "There is no automatic rollback. Recovery requires a new explicitly approved exact-bookmark restore after quiescence and impact review. Restore 0143 only to its post-0142 anchor and prove the 0142 terminal trigger remains exact; restore 0142 only to its pre-0142 anchor and prove that trigger is absent."
+            .to_owned(),
+    );
+    capability.selectors = [("account_id", account_id), ("database_id", database_id)]
+        .map(|(name, value)| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some(format!("Pinned MLNavigator {name}.")),
+            contract: Some(SelectorContractV1 {
+                schema: serde_json::json!({"type":"string","enum":[value]}),
+                query: None,
+            }),
+        })
+        .to_vec();
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object","additionalProperties":false,"x-cfctl-body-required":true,
+        "required":[
+            "migration_id","pre_recovery_anchor_operation_id",
+            "pre_recovery_anchor_evidence_hash","pre_recovery_anchor_output_sha256",
+            "pre_recovery_anchor_bookmark_hash"
+        ],
+        "properties":{
+            "migration_id":{"type":"string","enum":["0142","0143"]},
+            "pre_recovery_anchor_operation_id":operation,
+            "pre_recovery_anchor_evidence_hash":hash,
+            "pre_recovery_anchor_output_sha256":hash,
+            "pre_recovery_anchor_bookmark_hash":hash,
+            "prior_0142_operation_id":operation,
+            "prior_0142_boundary_evidence_hash":hash,
+            "prior_0142_schema_proof_operation_id":operation,
+            "prior_0142_verification_evidence_hash":hash,
+            "post_0142_anchor_operation_id":operation,
+            "post_0142_anchor_evidence_hash":hash,
+            "post_0142_anchor_bookmark_hash":hash,
+            "pre_import_invariant_operation_id":operation,
+            "pre_import_invariant_evidence_hash":hash
+        },
+        "allOf":[
+            {"if":{"properties":{"migration_id":{"const":"0142"}}},
+             "then":{"not":{"anyOf":[
+                 {"required":["prior_0142_operation_id"]},{"required":["prior_0142_boundary_evidence_hash"]},
+                 {"required":["prior_0142_schema_proof_operation_id"]},{"required":["prior_0142_verification_evidence_hash"]},
+                 {"required":["post_0142_anchor_operation_id"]},{"required":["post_0142_anchor_evidence_hash"]},
+                 {"required":["post_0142_anchor_bookmark_hash"]},
+                 {"required":["pre_import_invariant_operation_id"]},{"required":["pre_import_invariant_evidence_hash"]}
+             ]}}},
+            {"if":{"properties":{"migration_id":{"const":"0143"}}},
+             "then":{"required":[
+                 "prior_0142_operation_id","prior_0142_boundary_evidence_hash",
+                 "prior_0142_schema_proof_operation_id","prior_0142_verification_evidence_hash",
+                 "post_0142_anchor_operation_id","post_0142_anchor_evidence_hash",
+                 "post_0142_anchor_bookmark_hash",
+                 "pre_import_invariant_operation_id","pre_import_invariant_evidence_hash"
+             ]}}
+        ]
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    let invariant_contract = mln_0143_data_invariants_capability()
+        .mln_0143_data_invariants
+        .unwrap_or_else(|| unreachable!("native MLN invariant contract"));
+    capability.d1_approved_mln_import = Some(cfctl_core::D1ApprovedMlnImportContractV1 {
+        repository_id: "github.com/rogu3bear/mln-web".to_owned(),
+        repository_head: "7cb0327c084ce956d728aa7d9df467cea8ed44fb".to_owned(),
+        pre_import_capability_version: invariant_contract.capability_version,
+        pre_import_validator_contract_hash: invariant_contract.validator_contract_hash,
+        pre_import_fixed_query_sha256: invariant_contract.fixed_query_sha256,
+        account_id: account_id.to_owned(),
+        database_id: database_id.to_owned(),
+        import_path: capability.path.clone(),
+        migrations: vec![
+            cfctl_core::D1ApprovedMlnMigrationV1 {
+                migration_id: "0142".to_owned(),
+                basename: "0142_document_render_claim_generation.sql".to_owned(),
+                repository_relative_path:
+                    "crates/founder/migrations/d1/0142_document_render_claim_generation.sql"
+                        .to_owned(),
+                git_blob_oid: "408607c6fed6a5d9c10e80d6bacb2ee355817953".to_owned(),
+                bytes: 1031,
+                sha256: "07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0"
+                    .to_owned(),
+                md5: "5dc9f871404bc6aede1dbf8becf881e5".to_owned(),
+            },
+            cfctl_core::D1ApprovedMlnMigrationV1 {
+                migration_id: "0143".to_owned(),
+                basename: "0143_advisor_final_equity_instrument.sql".to_owned(),
+                repository_relative_path:
+                    "crates/founder/migrations/d1/0143_advisor_final_equity_instrument.sql"
+                        .to_owned(),
+                git_blob_oid: "4538523205bc1a3a2e68029aa040a06cd17946a8".to_owned(),
+                bytes: 9736,
+                sha256: "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
+                    .to_owned(),
+                md5: "bd50b7e05cc13c20f17eb8748472eb4b".to_owned(),
+            },
+        ],
+        max_response_bytes: 1024 * 1024,
+        max_poll_attempts: 120,
+        max_timeout_seconds: 30,
+        upload_url_suffix: ".r2.cloudflarestorage.com".to_owned(),
+        requires_create_new_mode_0600_stage: true,
+    });
+    capability
+}
+
+fn d1_resume_approved_mln_import_poll_capability() -> CapabilityV1 {
+    let account_id = "ca30e922fda7f5578e49873542e4aaca";
+    let database_id = "7c282983-2e48-4ea4-9f0d-09b0d718fe65";
+    let hash = serde_json::json!({
+        "type":"string","pattern":"^sha256:[0-9a-f]{64}$","minLength":71,"maxLength":71
+    });
+    let operation = serde_json::json!({
+        "type":"string","format":"uuid","minLength":36,"maxLength":36
+    });
+    let mut capability = CapabilityV1::new(
+        "d1-resume-approved-mln-import-poll",
+        "Resume polling one approved MLNavigator import",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/import",
+    );
+    capability.description = Some(
+        "Create a separately approved poll-only child of one exact durable MLNavigator import exhaustion. The runtime derives the root migration, source, target, credential, catalog, accepted bookmark, and provider request from immutable parent authority. It never replays init, upload, or ingest; each exhaustion admits at most one non-cancelled child."
+            .to_owned(),
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native closed MLNavigator import poll continuation".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec!["continue approved MLN import polling".to_owned()];
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.mutating = true;
+    capability.risk = RiskClass::Irreversible;
+    capability.effect = EffectClass::DataWrite;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: Some(0.0),
+        basis: Some("Bounded D1 import polling has no incremental operation charge.".to_owned()),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![KnowledgeReferenceV1 {
+            title: "D1 pricing".to_owned(),
+            url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        }],
+    };
+    capability.entitlement.available = Some(true);
+    capability.verification.required = true;
+    "mln_import_requires_governed_post_import_proof"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("no_automatic_rollback_use_separately_approved_bookmark_restore".to_owned());
+    capability.rollback.warning = Some(
+        "Polling may observe provider completion. Recovery remains a separately approved exact-bookmark restore."
+            .to_owned(),
+    );
+    capability.selectors = [("account_id", account_id), ("database_id", database_id)]
+        .map(|(name, value)| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some(format!("Pinned MLNavigator {name}.")),
+            contract: Some(SelectorContractV1 {
+                schema: serde_json::json!({"type":"string","enum":[value]}),
+                query: None,
+            }),
+        })
+        .to_vec();
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object","additionalProperties":false,"x-cfctl-body-required":true,
+        "required":[
+            "parent_operation_id","parent_plan_hash","exhaustion_evidence_hash",
+            "accepted_ingest_evidence_hash","accepted_bookmark_hash"
+        ],
+        "properties":{
+            "parent_operation_id":operation,
+            "parent_plan_hash":hash,
+            "exhaustion_evidence_hash":hash,
+            "accepted_ingest_evidence_hash":hash,
+            "accepted_bookmark_hash":hash
+        }
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_approved_mln_import_poll_resume =
+        Some(cfctl_core::D1ApprovedMlnImportPollResumeContractV1 {
+            root_capability_id: "d1-import-approved-mln-migration".to_owned(),
+            account_id: account_id.to_owned(),
+            database_id: database_id.to_owned(),
+            import_path: capability.path.clone(),
+            max_response_bytes: 1024 * 1024,
+            max_poll_attempts: 120,
+            max_timeout_seconds: 30,
+        });
+    capability
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the closed MLN phase and lineage schema stays visible beside its pinned target contract"
+)]
+fn mln_0143_data_invariants_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "mln-0143-data-invariants",
+        "Prove MLNavigator migration 0143 data invariants",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/query",
+    );
+    capability.description = Some(
+        "Run fixed compiler-owned reads for the bounded pre-import, post-import, or post-restore MLNavigator 0143 boundary. Raw evidence rows and identifiers are digested in volatile memory and never persisted."
+            .to_owned(),
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native closed MLN 0143 invariant adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![
+        "verify MLN advisor instrument migration data".to_owned(),
+        "prove MLN 0143 restore boundary".to_owned(),
+    ];
+    capability.permissions = vec!["D1 Read".to_owned()];
+    capability.mutating = false;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.cost = CostV1 {
+        incremental:false,
+        currency:None,
+        maximum:None,
+        basis:Some("one bounded fixed D1 read has no separate operation charge; ordinary rows-read accounting may apply".to_owned()),
+        known:true,
+        billing_model:BillingModelV1::UsageBased,
+        exposure:CostExposureV1::DownstreamUsage,
+        references:vec![KnowledgeReferenceV1 {
+            title:"D1 pricing".to_owned(),
+            url:"https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+            source:"official Cloudflare docs".to_owned(),
+        }],
+    };
+    capability.entitlement.available = Some(true);
+    capability.verification.required = false;
+    "not_applicable".clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.selectors = vec![
+        SelectorV1 {
+            name:"account_id".to_owned(), location:"path".to_owned(), required:true,
+            value_type:"string".to_owned(),
+            description:Some("Pinned MLNavigator Cloudflare account; intended identity, not live ownership proof.".to_owned()),
+            contract:Some(SelectorContractV1 {
+                schema:serde_json::json!({"type":"string","enum":["ca30e922fda7f5578e49873542e4aaca"]}),
+                query:None,
+            }),
+        },
+        SelectorV1 {
+            name:"database_id".to_owned(), location:"path".to_owned(), required:true,
+            value_type:"string".to_owned(),
+            description:Some("Pinned MLNavigator Founder D1 database.".to_owned()),
+            contract:Some(SelectorContractV1 {
+                schema:serde_json::json!({"type":"string","enum":["7c282983-2e48-4ea4-9f0d-09b0d718fe65"]}),
+                query:None,
+            }),
+        },
+    ];
+    let hash = serde_json::json!({
+        "type":"string","pattern":"^sha256:[0-9a-f]{64}$","minLength":71,"maxLength":71
+    });
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object","additionalProperties":false,"x-cfctl-body-required":true,
+        "oneOf":[
+            {
+                "type":"object","additionalProperties":false,
+                "required":["migration_id","phase"],
+                "properties":{
+                    "migration_id":{"type":"string","enum":["0143"]},
+                    "phase":{"type":"string","enum":["pre_import"]}
+                }
+            },
+            {
+                "type":"object","additionalProperties":false,
+                "required":[
+                    "migration_id","phase","pre_import_evidence_hash",
+                    "import_operation_id","import_boundary_evidence_hash",
+                    "import_source_sha256","import_plan_hash"
+                ],
+                "properties":{
+                    "migration_id":{"type":"string","enum":["0143"]},
+                    "phase":{"type":"string","enum":["post_import"]},
+                    "pre_import_evidence_hash":hash,
+                    "import_operation_id":{"type":"string","minLength":36,"maxLength":80},
+                    "import_boundary_evidence_hash":hash,
+                    "import_source_sha256":hash,
+                    "import_plan_hash":hash
+                }
+            },
+            {
+                "type":"object","additionalProperties":false,
+                "required":[
+                    "migration_id","phase","pre_import_evidence_hash","post_import_evidence_hash",
+                    "import_operation_id","import_boundary_evidence_hash",
+                    "import_source_sha256","import_plan_hash",
+                    "restore_operation_id","restore_evidence_hash",
+                    "restore_previous_bookmark_hash","restore_requested_bookmark_hash",
+                    "restore_observed_bookmark_hash"
+                ],
+                "properties":{
+                    "migration_id":{"type":"string","enum":["0143"]},
+                    "phase":{"type":"string","enum":["post_restore"]},
+                    "pre_import_evidence_hash":hash,
+                    "post_import_evidence_hash":hash,
+                    "import_operation_id":{"type":"string","minLength":36,"maxLength":80},
+                    "import_boundary_evidence_hash":hash,
+                    "import_source_sha256":hash,
+                    "import_plan_hash":hash,
+                    "restore_operation_id":{"type":"string","minLength":36,"maxLength":80},
+                    "restore_evidence_hash":hash,
+                    "restore_previous_bookmark_hash":hash,
+                    "restore_requested_bookmark_hash":hash,
+                    "restore_observed_bookmark_hash":hash
+                }
+            }
+        ]
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    let mut contract = Mln0143DataInvariantsContractV1 {
+        account_id: "ca30e922fda7f5578e49873542e4aaca".to_owned(),
+        database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
+        migration_sha256: "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
+            .to_owned(),
+        prior_0142_trigger_definition_hash:
+            "sha256:7e68876f488b0117133c09de1cb0bbbd7a5a73ee705dd2888f480a2bdd1531e1".to_owned(),
+        trigger_definition_hashes: vec![
+            "sha256:d858df9c22c19df241e5045eca9635c4fb786000428707a821090daeacc69072".to_owned(),
+            "sha256:e9205a4863c717c901ec3ac87089555a9af7eac14d5f38fbf40bff775ad8497c".to_owned(),
+            "sha256:3ca04f9fc717104d2ee0da719e2c473a756d3345f4e222d52c4d0f76237a184b".to_owned(),
+        ],
+        fixed_query_sha256:
+            "sha256:5437f47c76377bf228f4b0113784294c880e42a9ef59b5f24a94cb7147e5383c".to_owned(),
+        pre_table_definition_hash:
+            "sha256:8aa5012ace3d946354e0baba7e645646ac97373b42e7c3d61e79b67a5f689fea".to_owned(),
+        post_table_definition_hash:
+            "sha256:2fbdacd011abca8024507b99d179071b8b920271576e4cb3a2f06c4f3ffd2d7f".to_owned(),
+        validator_contract_hash: String::new(),
+        capability_version: 5,
+        max_evidence_rows: 256,
+        probe_rows: 257,
+        max_bytes: 1024 * 1024,
+        max_timeout_seconds: 30,
+    };
+    contract.validator_contract_hash = contract
+        .expected_validator_contract_hash()
+        .unwrap_or_default();
+    capability.mln_0143_data_invariants = Some(contract);
+    capability
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exact destructive restore contract stays visible as one auditable catalog declaration"
+)]
+fn d1_restore_exact_bookmark_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "d1-restore-exact-bookmark",
+        "Restore D1 database to exact bookmark",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore",
+    );
+    capability.description = Some(
+        "Destructively overwrite one exact D1 database from an exact time-travel bookmark after verifying its expected current bookmark. In-flight queries are cancelled. Recovery is a separately approved new restore plan using the returned previous_bookmark; it is never automatic."
+            .to_owned(),
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native governed D1 exact-bookmark recovery adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![
+        "restore D1 exact bookmark".to_owned(),
+        "recover D1 database from bookmark".to_owned(),
+    ];
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.mutating = true;
+    capability.risk = RiskClass::Recovery;
+    capability.effect = EffectClass::DataWrite;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: Some(0.0),
+        basis: Some(
+            "D1 Time Travel restore has no incremental provider operation charge; ordinary D1 storage and usage pricing remains unchanged"
+                .to_owned(),
+        ),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![
+            KnowledgeReferenceV1 {
+                title: "D1 Time Travel".to_owned(),
+                url: "https://developers.cloudflare.com/d1/reference/time-travel/".to_owned(),
+                source: "official Cloudflare docs".to_owned(),
+            },
+            KnowledgeReferenceV1 {
+                title: "D1 pricing".to_owned(),
+                url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+                source: "official Cloudflare docs".to_owned(),
+            },
+        ],
+    };
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans =
+        BTreeMap::from([("free".to_owned(), true), ("paid".to_owned(), true)]);
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/d1/reference/time-travel/".to_owned());
+    capability.verification.required = true;
+    "d1_current_bookmark_equals_restore_result_bookmark"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("new_approved_exact_bookmark_restore_from_previous_bookmark".to_owned());
+    capability.rollback.warning = Some(
+        "Undo is never automatic: create and explicitly approve a new d1-restore-exact-bookmark plan whose target_bookmark is this operation's returned previous_bookmark, after a fresh expected-current-bookmark read."
+            .to_owned(),
+    );
+    capability.selectors = ["account_id", "database_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some(format!("Exact Cloudflare {name}.")),
+            contract: Some(SelectorContractV1 {
+                schema: if name == "account_id" {
+                    serde_json::json!({"type":"string","minLength":32,"maxLength":32})
+                } else {
+                    serde_json::json!({"type":"string","minLength":36,"maxLength":36})
+                },
+                query: None,
+            }),
+        })
+        .to_vec();
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":[
+            "target_bookmark",
+            "expected_current_bookmark",
+            "source_operation_id",
+            "source_evidence_hash"
+        ],
+        "properties":{
+            "target_bookmark":{"type":"string","minLength":1,"maxLength":512},
+            "expected_current_bookmark":{"type":"string","minLength":1,"maxLength":512},
+            "source_operation_id":{"type":"string","minLength":1,"maxLength":80},
+            "source_evidence_hash":{
+                "type":"string",
+                "pattern":"^sha256:[0-9a-f]{64}$",
+                "minLength":71,
+                "maxLength":71
+            }
+        },
+        "x-cfctl-body-required":true
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_restore_exact_bookmark = Some(cfctl_core::D1RestoreExactBookmarkContractV1 {
+        bookmark_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/bookmark"
+            .to_owned(),
+        restore_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore"
+            .to_owned(),
+        max_response_bytes: 64 * 1024,
+        max_timeout_seconds: 30,
+        post_retry_count: 0,
+    });
+    capability
+}
+
+fn d1_full_export_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "d1-full-export",
+        "Export full D1 database to SQL",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/export",
+    );
+    capability.description = Some("Create a provider-consistent full schema-and-data SQL export at one caller-specified new local file. Caller SQL, table filters, apply, and restore are excluded.".to_owned());
+    "D1".clone_into(&mut capability.product);
+    "cfctl native governed D1 full-export adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![
+        "snapshot D1 before migration".to_owned(),
+        "export complete D1 database".to_owned(),
+    ];
+    capability.permissions = vec!["D1 Read".to_owned()];
+    capability.mutating = false;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.cost = CostV1 {
+        incremental: false, currency: None, maximum: None,
+        basis: Some("provider export and download have no declared direct operation charge".to_owned()),
+        known: true, billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![KnowledgeReferenceV1 {
+            title: "Export D1 Database as SQL".to_owned(),
+            url: "https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/export/".to_owned(),
+            source: "official Cloudflare API docs".to_owned(),
+        }],
+    };
+    capability.entitlement.available = Some(true);
+    capability.verification.required = true;
+    "same_output_file_exists_and_sha256_matches".clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.warning = Some("The file is a pre-migration snapshot only; applying or restoring it is outside this capability.".to_owned());
+    capability.selectors = ["account_id", "database_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: if name == "account_id" {
+                    serde_json::json!({"type":"string","minLength":32,"maxLength":32})
+                } else {
+                    serde_json::json!({"type":"string","minLength":36,"maxLength":36})
+                },
+                query: None,
+            }),
+        })
+        .to_vec();
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_full_export = Some(D1FullExportContractV1 {
+        max_bytes: 10 * 1024 * 1024 * 1024,
+        max_poll_response_bytes: 1024 * 1024,
+        max_poll_attempts: 120,
+        max_timeout_seconds: 30,
+        max_download_seconds: 3600,
+        requires_new_mode_0600_file: true,
+    });
+    capability
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the closed D1 assertion variants remain visible beside their exact native contract"
+)]
+fn d1_schema_introspection_capability() -> CapabilityV1 {
+    const ID: &str = "d1-schema-introspection";
+    let mut capability = CapabilityV1::new(
+        ID,
+        "Assert bounded D1 schema state",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/query",
+    );
+    capability.description = Some(
+        "Run one closed, compiler-owned sqlite_schema or table-valued PRAGMA assertion without accepting caller SQL."
+            .to_owned(),
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native D1 schema assertion adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![
+        "check D1 migration schema".to_owned(),
+        "inspect D1 table column index trigger check constraint".to_owned(),
+        "verify D1 foreign keys".to_owned(),
+    ];
+    capability.permissions = vec!["D1 Read".to_owned()];
+    capability.mutating = false;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.blocked_reason = None;
+    capability.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: None,
+        basis: Some(
+            "one bounded metadata assertion has no separate operation charge; ordinary D1 rows-read accounting may apply"
+                .to_owned(),
+        ),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![KnowledgeReferenceV1 {
+            title: "D1 pricing".to_owned(),
+            url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        }],
+    };
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans =
+        BTreeMap::from([("free".to_owned(), true), ("paid".to_owned(), true)]);
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/d1/platform/pricing/".to_owned());
+    capability.verification.required = false;
+    "not_applicable".clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = None;
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some("Exact Cloudflare account identifier.".to_owned()),
+            contract: Some(SelectorContractV1 {
+                schema: serde_json::json!({
+                    "type":"string",
+                    "minLength":32,
+                    "maxLength":32
+                }),
+                query: None,
+            }),
+        },
+        SelectorV1 {
+            name: "database_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some("Exact D1 database UUID.".to_owned()),
+            contract: Some(SelectorContractV1 {
+                schema: serde_json::json!({
+                    "type":"string",
+                    "minLength":36,
+                    "maxLength":36
+                }),
+                query: None,
+            }),
+        },
+    ];
+    let name = serde_json::json!({"type":"string","minLength":1,"maxLength":255});
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object",
+        "x-cfctl-body-required":true,
+        "oneOf":[
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["assertion","table"],
+                "properties":{
+                    "assertion":{"type":"string","enum":["table_exists"]},
+                    "table":name
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["assertion","table","column"],
+                "properties":{
+                    "assertion":{"type":"string","enum":["column_exists"]},
+                    "table":name,
+                    "column":name
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["assertion","index"],
+                "properties":{
+                    "assertion":{"type":"string","enum":["index_exists"]},
+                    "index":name
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["assertion","trigger"],
+                "properties":{
+                    "assertion":{"type":"string","enum":["trigger_exists"]},
+                    "trigger":name
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["assertion","object_type","name","fragment"],
+                "properties":{
+                    "assertion":{"type":"string","enum":["schema_contains"]},
+                    "object_type":{"type":"string","enum":["table","index","trigger"]},
+                    "name":name,
+                    "fragment":{"type":"string","minLength":1,"maxLength":512}
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["assertion"],
+                "properties":{
+                    "assertion":{"type":"string","enum":["foreign_key_check_empty"]}
+                }
+            }
+        ]
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_schema_introspection = Some(D1SchemaIntrospectionContractV1 {
+        max_rows: 1,
+        max_bytes: 64 * 1024,
+        max_timeout_seconds: 10,
+    });
+    capability
 }
 
 fn reserve_queue_message_operations_for_event_consumer(snapshot: &mut CatalogSnapshot) {

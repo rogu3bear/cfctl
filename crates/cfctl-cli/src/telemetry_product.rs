@@ -10,13 +10,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use cfctl_catalog::CatalogSnapshot;
 use cfctl_cloudflare::CallInput;
 use cfctl_core::{
-    AdapterStatus, CapabilityV1, EvidenceClass, OperationalProofFreshnessV1,
-    OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, PlanStatus, PlanV1,
-    ResultEnvelopeV2, TransactionStageV1, VerificationState, hash_value,
+    AdapterStatus, CapabilityV1, D1FullExportGovernedExecutionBindingV1, EvidenceClass,
+    Mln0142GovernedExecutionBindingV1, Mln0143GovernedExecutionBindingV1,
+    OperationalProofFreshnessV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
+    OperationalProofV1, PlanStatus, PlanV1, ResultEnvelopeV2, TransactionStageV1,
+    VerificationState, hash_value,
 };
 use cfctl_storage::{OperationalProofPageV1, StateStore};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::profiles::ProfilesConfig;
 use crate::runtime::{
@@ -171,6 +174,10 @@ pub(crate) fn operational_proof_projection_json(page: &OperationalProofPageV1) -
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "proof recording validates and binds one complete governed execution"
+)]
 pub(crate) fn record_operational_proof(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -194,7 +201,7 @@ pub(crate) fn record_operational_proof(
             ))
         })?;
     let input_hash = hash_value(&serde_json::to_value(input)?)?;
-    let proof = OperationalProofV1::new(
+    let mut proof = OperationalProofV1::new(
         envelope.generated_at,
         &capability.id,
         &catalog.schema_hash,
@@ -211,6 +218,218 @@ pub(crate) fn record_operational_proof(
         },
         evidence,
     );
+    if capability.d1_full_export.is_some() {
+        let account_id = input
+            .selectors
+            .get("account_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("D1 full export omitted its account selector".to_owned())
+            })?;
+        let database_id = input
+            .selectors
+            .get("database_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("D1 full export omitted its database selector".to_owned())
+            })?;
+        let output_sha256 = envelope
+            .result
+            .pointer("/output_file/sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("D1 full export omitted the verified output hash".to_owned())
+            })?;
+        let at_bookmark = envelope
+            .result
+            .pointer("/provider/at_bookmark")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Input("D1 full export omitted its captured provider bookmark".to_owned())
+            })?;
+        if !envelope.ok
+            || envelope
+                .result
+                .pointer("/output_file/complete")
+                .and_then(Value::as_bool)
+                != Some(true)
+            || envelope
+                .result
+                .pointer("/output_file/hash_matches")
+                .and_then(Value::as_bool)
+                != Some(true)
+            || envelope.account_id.as_deref() != Some(account_id)
+        {
+            return Err(CliError::Input(
+                "D1 full export is not a completed same-file verified snapshot".to_owned(),
+            ));
+        }
+        let profile_id = envelope.profile_id.as_deref().ok_or_else(|| {
+            CliError::Input("D1 full export proof requires a profile identity".to_owned())
+        })?;
+        let credential_generation_id = credential_generation_id.ok_or_else(|| {
+            CliError::Input("D1 full export proof requires a credential generation".to_owned())
+        })?;
+        proof.bind_d1_full_export_governed_execution(D1FullExportGovernedExecutionBindingV1 {
+            schema_version: 1,
+            operation_id: Uuid::new_v4().to_string(),
+            capability_id: capability.id.clone(),
+            catalog_hash: catalog.schema_hash.clone(),
+            target_scope_hash: hash_value(&json!({
+                "account_id": account_id,
+                "database_id": database_id,
+            }))?,
+            output_file_sha256: output_sha256.to_owned(),
+            at_bookmark_hash: hash_value(&Value::String(at_bookmark.to_owned()))?,
+            manifest_evidence_hash: proof.evidence.content_hash.clone(),
+            request_hash: input_hash.clone(),
+            profile_id: profile_id.to_owned(),
+            credential_generation_id: credential_generation_id.to_owned(),
+            completion_status: "completed".to_owned(),
+            completed_at: envelope.generated_at,
+        })?;
+    }
+    if let Some(contract) = capability.mln_0143_data_invariants.as_ref() {
+        let manifest = envelope.result.get("result").unwrap_or(&envelope.result);
+        let phase = input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("phase"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::Input("MLN 0143 runtime phase is missing".to_owned()))?;
+        let target_scope_hash = hash_value(&json!({
+            "account_id": contract.account_id,
+            "database_id": contract.database_id,
+        }))?;
+        if !envelope.ok
+            || manifest.get("complete").and_then(Value::as_bool) != Some(true)
+            || manifest.get("capability_id").and_then(Value::as_str) != Some(capability.id.as_str())
+            || manifest.get("capability_version").and_then(Value::as_u64)
+                != Some(u64::from(contract.capability_version))
+            || manifest
+                .get("validator_contract_hash")
+                .and_then(Value::as_str)
+                != Some(contract.validator_contract_hash.as_str())
+            || manifest.get("phase").and_then(Value::as_str) != Some(phase)
+            || manifest.get("target_scope_hash").and_then(Value::as_str)
+                != Some(target_scope_hash.as_str())
+            || manifest.pointer("/query/sha256").and_then(Value::as_str)
+                != Some(contract.fixed_query_sha256.as_str())
+            || manifest
+                .pointer("/query/bounds_saturated")
+                .and_then(Value::as_bool)
+                != Some(false)
+        {
+            return Err(CliError::Input(
+                "MLN 0143 runtime result is not a completed validated manifest".to_owned(),
+            ));
+        }
+        let profile_id = envelope.profile_id.as_deref().ok_or_else(|| {
+            CliError::Input("MLN 0143 runtime proof requires a profile identity".to_owned())
+        })?;
+        let credential_generation_id = credential_generation_id.ok_or_else(|| {
+            CliError::Input("MLN 0143 runtime proof requires a credential generation".to_owned())
+        })?;
+        proof.bind_mln_0143_governed_execution(Mln0143GovernedExecutionBindingV1 {
+            schema_version: 1,
+            operation_id: Uuid::new_v4().to_string(),
+            capability_id: capability.id.clone(),
+            capability_version: contract.capability_version,
+            validator_contract_hash: contract.validator_contract_hash.clone(),
+            fixed_query_sha256: contract.fixed_query_sha256.clone(),
+            catalog_hash: catalog.schema_hash.clone(),
+            target_scope_hash,
+            phase: phase.to_owned(),
+            manifest_evidence_hash: proof.evidence.content_hash.clone(),
+            request_hash: input_hash.clone(),
+            profile_identity_hash: hash_value(&json!({
+                "profile_id": profile_id,
+                "credential_generation_id": credential_generation_id,
+            }))?,
+            credential_generation_id: credential_generation_id.to_owned(),
+            completion_status: "completed".to_owned(),
+            completed_at: envelope.generated_at,
+            cross_operation_lineage_hash: (phase != "pre_import")
+                .then(|| {
+                    manifest
+                        .get("lineage")
+                        .ok_or_else(|| {
+                            CliError::Input(
+                                "MLN post-phase manifest omitted cross-operation lineage"
+                                    .to_owned(),
+                            )
+                        })
+                        .and_then(|lineage| hash_value(lineage).map_err(CliError::from))
+                })
+                .transpose()?,
+        })?;
+    }
+    if let Some(contract) = capability.mln_0142_post_import_schema.as_ref() {
+        let body = input
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or_else(|| CliError::Input("MLN 0142 proof body is missing".to_owned()))?;
+        let field = |name: &str| {
+            body.get(name)
+                .and_then(Value::as_str)
+                .ok_or_else(|| CliError::Input(format!("MLN 0142 proof requires `{name}`")))
+        };
+        let present = envelope
+            .result
+            .pointer("/result/0/results/0/present")
+            .is_some_and(|value| value == &Value::Bool(true) || value.as_u64() == Some(1));
+        let receipt = envelope
+            .result
+            .pointer("/result_info/query/mln_0142")
+            .ok_or_else(|| CliError::Input("MLN 0142 runtime receipt is missing".to_owned()))?;
+        if !envelope.ok
+            || !present
+            || receipt.get("import_operation_id").and_then(Value::as_str)
+                != Some(field("import_operation_id")?)
+            || receipt
+                .get("import_boundary_evidence_hash")
+                .and_then(Value::as_str)
+                != Some(field("import_boundary_evidence_hash")?)
+            || receipt.get("trigger_name").and_then(Value::as_str)
+                != Some(contract.trigger_name.as_str())
+            || receipt
+                .get("trigger_definition_sha256")
+                .and_then(Value::as_str)
+                != Some(contract.trigger_definition_sha256.as_str())
+        {
+            return Err(CliError::Input(
+                "MLN 0142 runtime result is not the exact completed trigger proof".to_owned(),
+            ));
+        }
+        let credential_generation_id = credential_generation_id.ok_or_else(|| {
+            CliError::Input("MLN 0142 runtime proof requires a credential generation".to_owned())
+        })?;
+        proof.bind_mln_0142_governed_execution(Mln0142GovernedExecutionBindingV1 {
+            schema_version: 1,
+            operation_id: Uuid::new_v4().to_string(),
+            capability_id: capability.id.clone(),
+            capability_version: contract.capability_version,
+            catalog_hash: catalog.schema_hash.clone(),
+            target_scope_hash: hash_value(&json!({
+                "account_id":contract.account_id,
+                "database_id":contract.database_id,
+            }))?,
+            import_operation_id: field("import_operation_id")?.to_owned(),
+            import_boundary_evidence_hash: field("import_boundary_evidence_hash")?.to_owned(),
+            import_source_sha256: field("import_source_sha256")?.to_owned(),
+            import_plan_hash: field("import_plan_hash")?.to_owned(),
+            final_bookmark_hash: field("final_bookmark_hash")?.to_owned(),
+            trigger_name: contract.trigger_name.clone(),
+            trigger_definition_sha256: contract.trigger_definition_sha256.clone(),
+            manifest_evidence_hash: proof.evidence.content_hash.clone(),
+            request_hash: input_hash,
+            credential_generation_id: credential_generation_id.to_owned(),
+            completion_status: "completed".to_owned(),
+            completed_at: envelope.generated_at,
+        })?;
+    }
     store.record_operational_proof(&proof)?;
     Ok(())
 }

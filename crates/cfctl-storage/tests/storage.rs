@@ -2,9 +2,10 @@
 
 use cfctl_core::{
     AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1, CapabilityV1,
-    EvidenceClass, OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1,
-    PlanStatus, PlanV1, PolicyDisposition, StandingAuthorityStatus, StandingAuthorityV1,
-    TransactionStageV1,
+    D1FullExportGovernedExecutionBindingV1, EvidenceClass, Mln0142GovernedExecutionBindingV1,
+    Mln0143GovernedExecutionBindingV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
+    OperationalProofV1, PlanStatus, PlanV1, PolicyDisposition, StandingAuthorityStatus,
+    StandingAuthorityV1, TransactionStageV1, hash_value,
 };
 use cfctl_storage::{RuntimePaths, StateStore, StorageError, StoredPlanRecord};
 use chrono::{Duration, Utc};
@@ -228,6 +229,23 @@ fn evidence_is_redacted_content_addressed_and_deduplicated() {
 }
 
 #[test]
+fn evidence_reload_revalidates_the_content_hash() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let value = json!({"capability_id":"mln-0143-data-invariants","complete":true});
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &value)
+        .expect("evidence writes");
+    assert_eq!(
+        store
+            .read_evidence_value(&evidence.content_hash)
+            .expect("verified evidence reload"),
+        value
+    );
+    assert!(store.read_evidence_value("sha256:not-a-digest").is_err());
+}
+
+#[test]
 fn operational_proof_index_is_append_only_scoped_and_live_read_only() {
     let root = tempfile::tempdir().expect("temporary storage root");
     let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
@@ -370,6 +388,334 @@ fn operational_proof_requires_exact_hashes_and_nonempty_scope() {
         Err(StorageError::InvalidOperationalProof(message))
             if message.contains("credential-generation")
     ));
+}
+
+#[test]
+fn mln_0143_operational_proof_requires_exact_completed_runtime_binding() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let observed_at = Utc::now();
+    let evidence = store
+        .write_evidence(
+            EvidenceClass::LiveRead,
+            &json!({"result":{"complete":true}}),
+        )
+        .expect("evidence writes");
+    let valid_binding = Mln0143GovernedExecutionBindingV1 {
+        schema_version: 1,
+        operation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+        capability_id: "mln-0143-data-invariants".to_owned(),
+        capability_version: 5,
+        validator_contract_hash: sha256('c'),
+        fixed_query_sha256: sha256('d'),
+        catalog_hash: sha256('a'),
+        target_scope_hash: sha256('e'),
+        phase: "pre_import".to_owned(),
+        manifest_evidence_hash: evidence.content_hash.clone(),
+        request_hash: sha256('b'),
+        profile_identity_hash: hash_value(&json!({
+            "profile_id":"profile-a",
+            "credential_generation_id":GENERATION_A,
+        }))
+        .expect("profile identity hash"),
+        credential_generation_id: GENERATION_A.to_owned(),
+        completion_status: "completed".to_owned(),
+        completed_at: observed_at,
+        cross_operation_lineage_hash: None,
+    };
+    let build = |binding: Mln0143GovernedExecutionBindingV1| {
+        let mut proof = OperationalProofV1::new(
+            observed_at,
+            "mln-0143-data-invariants",
+            &sha256('a'),
+            &sha256('b'),
+            OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+            OperationalProofOutcomeV1::Succeeded,
+            evidence.clone(),
+        );
+        proof
+            .bind_mln_0143_governed_execution(binding)
+            .map(|()| proof)
+    };
+    store
+        .record_operational_proof(&build(valid_binding.clone()).expect("valid binding"))
+        .expect("valid governed proof indexes");
+
+    let mut invalid_bindings = Vec::new();
+    for mutate in [
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.operation_id = "not-an-operation".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.capability_id = "zones-list".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.request_hash = sha256('9');
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.credential_generation_id = "33333333-3333-4333-8333-333333333333".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.target_scope_hash = "not-a-hash".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.phase = "during_import".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.validator_contract_hash = "not-a-hash".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.fixed_query_sha256 = "not-a-hash".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.manifest_evidence_hash = sha256('8');
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.profile_identity_hash = sha256('7');
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.completion_status = "started".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.completed_at += Duration::seconds(1);
+        },
+    ] {
+        let mut binding = valid_binding.clone();
+        mutate(&mut binding);
+        invalid_bindings.push(binding);
+    }
+    for binding in invalid_bindings {
+        if let Ok(proof) = build(binding) {
+            assert!(matches!(
+                store.record_operational_proof(&proof),
+                Err(StorageError::InvalidOperationalProof(_))
+            ));
+        }
+    }
+}
+
+#[test]
+fn mln_0142_operational_proof_rejects_synthetic_or_drifted_authority() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let observed_at = Utc::now();
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &json!({"present":true}))
+        .expect("evidence writes");
+    let valid = Mln0142GovernedExecutionBindingV1 {
+        schema_version: 1,
+        operation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+        capability_id: "mln-0142-post-import-schema".to_owned(),
+        capability_version: 1,
+        catalog_hash: sha256('a'),
+        target_scope_hash: sha256('b'),
+        import_operation_id: "33333333-3333-4333-8333-333333333333".to_owned(),
+        import_boundary_evidence_hash: sha256('c'),
+        import_source_sha256: sha256('d'),
+        import_plan_hash: sha256('e'),
+        final_bookmark_hash: sha256('f'),
+        trigger_name: "document_render_jobs_terminal_generation_guard".to_owned(),
+        trigger_definition_sha256:
+            "sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b".to_owned(),
+        manifest_evidence_hash: evidence.content_hash.clone(),
+        request_hash: sha256('1'),
+        credential_generation_id: GENERATION_A.to_owned(),
+        completion_status: "completed".to_owned(),
+        completed_at: observed_at,
+    };
+    let build = |binding: Mln0142GovernedExecutionBindingV1| {
+        let mut proof = OperationalProofV1::new(
+            observed_at,
+            "mln-0142-post-import-schema",
+            &sha256('a'),
+            &sha256('1'),
+            OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+            OperationalProofOutcomeV1::Succeeded,
+            evidence.clone(),
+        );
+        proof
+            .bind_mln_0142_governed_execution(binding)
+            .map(|()| proof)
+    };
+    store
+        .record_operational_proof(&build(valid.clone()).expect("valid binding"))
+        .expect("valid proof indexes");
+    for mutate in [
+        |binding: &mut Mln0142GovernedExecutionBindingV1| {
+            binding.import_source_sha256 = "not-a-hash".to_owned();
+        },
+        |binding: &mut Mln0142GovernedExecutionBindingV1| {
+            binding.import_plan_hash = "not-a-hash".to_owned();
+        },
+        |binding: &mut Mln0142GovernedExecutionBindingV1| {
+            binding.target_scope_hash = "not-a-hash".to_owned();
+        },
+        |binding: &mut Mln0142GovernedExecutionBindingV1| {
+            binding.trigger_definition_sha256 = sha256('9');
+        },
+    ] {
+        let mut binding = valid.clone();
+        mutate(&mut binding);
+        if let Ok(proof) = build(binding) {
+            assert!(matches!(
+                store.record_operational_proof(&proof),
+                Err(StorageError::InvalidOperationalProof(_))
+            ));
+        }
+    }
+    let synthetic = OperationalProofV1::new(
+        observed_at,
+        "mln-0142-post-import-schema",
+        &sha256('a'),
+        &sha256('1'),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+    assert!(matches!(
+        store.record_operational_proof(&synthetic),
+        Err(StorageError::InvalidOperationalProof(_))
+    ));
+}
+
+#[test]
+fn d1_full_export_proof_requires_exact_completed_snapshot_binding() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let observed_at = Utc::now();
+    let evidence = store
+        .write_evidence(
+            EvidenceClass::LiveRead,
+            &json!({"provider":{"at_bookmark":"bookmark-42"}}),
+        )
+        .expect("evidence writes");
+    let valid = D1FullExportGovernedExecutionBindingV1 {
+        schema_version: 1,
+        operation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+        capability_id: "d1-full-export".to_owned(),
+        catalog_hash: sha256('a'),
+        target_scope_hash: sha256('b'),
+        output_file_sha256: sha256('c'),
+        at_bookmark_hash: sha256('d'),
+        manifest_evidence_hash: evidence.content_hash.clone(),
+        request_hash: sha256('e'),
+        profile_id: "profile-a".to_owned(),
+        credential_generation_id: GENERATION_A.to_owned(),
+        completion_status: "completed".to_owned(),
+        completed_at: observed_at,
+    };
+    let build = |binding: D1FullExportGovernedExecutionBindingV1| {
+        let mut proof = OperationalProofV1::new(
+            observed_at,
+            "d1-full-export",
+            &sha256('a'),
+            &sha256('e'),
+            OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+            OperationalProofOutcomeV1::Succeeded,
+            evidence.clone(),
+        );
+        proof
+            .bind_d1_full_export_governed_execution(binding)
+            .map(|()| proof)
+    };
+    store
+        .record_operational_proof(&build(valid.clone()).expect("valid binding"))
+        .expect("valid proof indexes");
+    for mutate in [
+        |binding: &mut D1FullExportGovernedExecutionBindingV1| {
+            binding.at_bookmark_hash = "not-a-hash".to_owned();
+        },
+        |binding: &mut D1FullExportGovernedExecutionBindingV1| {
+            binding.target_scope_hash = "not-a-hash".to_owned();
+        },
+        |binding: &mut D1FullExportGovernedExecutionBindingV1| {
+            binding.profile_id = "other".to_owned();
+        },
+        |binding: &mut D1FullExportGovernedExecutionBindingV1| {
+            binding.completion_status = "started".to_owned();
+        },
+    ] {
+        let mut binding = valid.clone();
+        mutate(&mut binding);
+        if let Ok(proof) = build(binding) {
+            assert!(matches!(
+                store.record_operational_proof(&proof),
+                Err(StorageError::InvalidOperationalProof(_))
+            ));
+        }
+    }
+    let synthetic = OperationalProofV1::new(
+        observed_at,
+        "d1-full-export",
+        &sha256('a'),
+        &sha256('e'),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+    assert!(matches!(
+        store.record_operational_proof(&synthetic),
+        Err(StorageError::InvalidOperationalProof(_))
+    ));
+}
+
+#[test]
+fn d1_import_checkpoints_are_append_only_hash_bound_and_operation_scoped() {
+    let root = tempfile::tempdir().expect("runtime root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("store");
+    let operation_id = "11111111-1111-4111-8111-111111111111";
+    let first = json!({
+        "schema_version":1,
+        "operation_id":operation_id,
+        "step":"init_response",
+        "performed":true,
+        "rectification_required":false,
+        "receipt":{"upload_url_sha256":format!("sha256:{}", "a".repeat(64))}
+    });
+    let second = json!({
+        "schema_version":1,
+        "operation_id":operation_id,
+        "step":"provider_complete",
+        "performed":true,
+        "rectification_required":false,
+        "receipt":{"state":"provider_complete"}
+    });
+    let first_hash = store
+        .record_d1_import_checkpoint(operation_id, &first)
+        .expect("first checkpoint");
+    let second_hash = store
+        .record_d1_import_checkpoint(operation_id, &second)
+        .expect("second checkpoint");
+    let checkpoints = store
+        .read_d1_import_checkpoints(operation_id)
+        .expect("checkpoint journal");
+    assert_eq!(checkpoints, [(first_hash, first), (second_hash, second)]);
+
+    let checkpoint_path = paths
+        .data_dir
+        .join("d1-import-checkpoints")
+        .join(operation_id)
+        .read_dir()
+        .expect("checkpoint directory")
+        .next()
+        .expect("checkpoint entry")
+        .expect("checkpoint path")
+        .path();
+    std::fs::write(&checkpoint_path, b"{}").expect("tamper checkpoint");
+    assert!(
+        store.read_d1_import_checkpoints(operation_id).is_err(),
+        "tampered checkpoint bytes fail closed"
+    );
+    assert!(
+        store
+            .record_d1_import_checkpoint(
+                operation_id,
+                &json!({"schema_version":1,"operation_id":"22222222-2222-4222-8222-222222222222","step":"poll"})
+            )
+            .is_err(),
+        "a checkpoint cannot be grafted across operations"
+    );
 }
 
 #[test]
