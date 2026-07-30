@@ -1176,6 +1176,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         ));
     }
     let is_r2_log_retrieval = capability.r2_log_retrieval.is_some();
+    let is_d1_full_export = capability.d1_full_export.is_some();
     if arguments.credential_in.is_some() && !is_r2_log_retrieval {
         return Err(CliError::Input(
             "`--credential-in` is accepted only by the governed R2 log retrieval capability"
@@ -1200,9 +1201,27 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
                 .to_owned(),
         ));
     }
-    if arguments.out.is_some() && capability.analytics_query.is_none() && !is_r2_log_retrieval {
+    if is_d1_full_export && arguments.out.is_none() {
         return Err(CliError::Input(
-            "`--out` is restricted to bounded analytics and governed R2 log retrieval capabilities"
+            "D1 full export requires `--out <new-path>`; the SQL dump is never written to stdout or evidence"
+                .to_owned(),
+        ));
+    }
+    if is_d1_full_export
+        && (arguments.body_json.is_some() || arguments.body_stdin || !arguments.query.is_empty())
+    {
+        return Err(CliError::Input(
+            "D1 full export accepts only account_id and database_id selectors plus `--out`; caller SQL and export filters are not supported"
+                .to_owned(),
+        ));
+    }
+    if arguments.out.is_some()
+        && capability.analytics_query.is_none()
+        && !is_r2_log_retrieval
+        && !is_d1_full_export
+    {
+        return Err(CliError::Input(
+            "`--out` is restricted to bounded analytics, governed R2 log retrieval, and D1 full export"
                 .to_owned(),
         ));
     }
@@ -3978,11 +3997,31 @@ async fn execute_read(
     envelope.account_id = account_id;
     envelope.ok = response.success;
     envelope.performed = true;
-    envelope.verification.state = VerificationState::NotApplicable;
-    envelope.verification.basis = Some(format!(
-        "live Cloudflare read pinned to catalog {}",
-        catalog.schema_hash
-    ));
+    if capability.d1_full_export.is_some() {
+        let verified = response
+            .result
+            .pointer("/output_file/hash_matches")
+            .and_then(Value::as_bool)
+            == Some(true)
+            && response
+                .result
+                .pointer("/output_file/exists")
+                .and_then(Value::as_bool)
+                == Some(true);
+        envelope.verification.state = if verified {
+            VerificationState::Passed
+        } else {
+            VerificationState::Failed
+        };
+        envelope.verification.basis =
+            Some("same output file exists and its SHA-256 matches the streamed receipt".to_owned());
+    } else {
+        envelope.verification.state = VerificationState::NotApplicable;
+        envelope.verification.basis = Some(format!(
+            "live Cloudflare read pinned to catalog {}",
+            catalog.schema_hash
+        ));
+    }
     // A non-2xx Cloudflare response is `Ok` at the transport layer but a failure
     // to the agent. Without an ErrorV1 it would surface as `ok:false` with no
     // guidance; attach a status-specific next step so the agent knows the move.
@@ -9191,7 +9230,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         &mut plan,
         TransactionStageV1::BoundaryAttemptPersisted,
     )?;
-    execute_consumed_plan(
+    Box::pin(execute_consumed_plan(
         store,
         &catalog,
         &mut plan,
@@ -9199,7 +9238,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         &credential,
         &secrets,
         live_precondition_evidence,
-    )
+    ))
     .await
 }
 
@@ -9271,7 +9310,7 @@ async fn run_plan_under_standing_authority(
     let standing_evidence =
         admit_standing_plan(store, &mut plan, &authority_snapshot, &execution_input)?;
     let admitted_authority_id = authority_snapshot.authority_id.clone();
-    let mut envelope = execute_consumed_plan(
+    let mut envelope = Box::pin(execute_consumed_plan(
         store,
         &catalog,
         &mut plan,
@@ -9279,7 +9318,7 @@ async fn run_plan_under_standing_authority(
         &credential,
         &secrets,
         live_precondition_evidence,
-    )
+    ))
     .await?;
     envelope.evidence.push(standing_evidence);
     if let Some(result) = envelope.result.as_object_mut() {
@@ -12901,10 +12940,10 @@ async fn keys_command(store: &StateStore, command: KeysCommand) -> Result<Result
             ))
             .await
         }
-        KeysCommand::Rotate(arguments) => key_rotate(store, &arguments).await,
+        KeysCommand::Rotate(arguments) => Box::pin(key_rotate(store, &arguments)).await,
         KeysCommand::Revoke(arguments) => {
             preflight_standing_authority(store, arguments.under_policy.as_deref())?;
-            let plan = key_revoke(store, &arguments).await?;
+            let plan = Box::pin(key_revoke(store, &arguments)).await?;
             Box::pin(finish_standing_run(
                 store,
                 plan,
@@ -15807,6 +15846,9 @@ pub(crate) fn capability_call_argv(capability: &CapabilityV1) -> Vec<String> {
         };
         argv.extend(["--value-out".to_owned(), sink.to_owned()]);
     }
+    if capability.d1_full_export.is_some() {
+        argv.extend(["--out".to_owned(), "<new-mode-0600-sql-path>".to_owned()]);
+    }
     argv.push("--json".to_owned());
     argv
 }
@@ -17244,6 +17286,157 @@ mod tests {
         let encoded = serde_json::to_string(schema).expect("guide schema");
         assert!(!encoded.contains("\"sql\""));
         assert!(!encoded.contains("\"params\""));
+    }
+
+    #[test]
+    fn d1_full_export_guide_binds_exact_selectors_and_file_output() {
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let guide = guide_json(catalog.get("d1-full-export").expect("D1 export"));
+        assert_eq!(guide["contract_state"], "available");
+        assert_eq!(
+            guide["call_argv"],
+            json!([
+                "cfctl",
+                "call",
+                "d1-full-export",
+                "--selector",
+                "account_id=<account_id>",
+                "--selector",
+                "database_id=<database_id>",
+                "--out",
+                "<new-mode-0600-sql-path>",
+                "--json"
+            ])
+        );
+        let encoded = serde_json::to_string(&guide).expect("guide JSON");
+        assert!(!encoded.contains("\"sql\""));
+        assert!(!encoded.contains("\"restore\""));
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one CLI boundary regression covers the exact export allowlist and ordinary mutation denial"
+    )]
+    async fn d1_full_export_requires_out_and_rejects_caller_body_before_credentials() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        store
+            .write_json(&store.paths().catalog_file(), &catalog)
+            .expect("seed catalog");
+        let arguments = CallArgs {
+            capability_id: "d1-full-export".to_owned(),
+            selectors: vec![
+                ("account_id".to_owned(), "a".repeat(32)),
+                (
+                    "database_id".to_owned(),
+                    "11111111-2222-3333-4444-555555555555".to_owned(),
+                ),
+            ],
+            query: Vec::new(),
+            body_json: None,
+            body_stdin: false,
+            profile: None,
+            account: None,
+            if_match: None,
+            if_none_match: None,
+            value_out: None,
+            credential_in: None,
+            out: None,
+        };
+        let error = Box::pin(call_command(&store, arguments))
+            .await
+            .expect_err("missing --out");
+        assert!(error.to_string().contains("requires `--out"));
+
+        let error = Box::pin(call_command(
+            &store,
+            CallArgs {
+                capability_id: "d1-full-export".to_owned(),
+                selectors: vec![
+                    ("account_id".to_owned(), "a".repeat(32)),
+                    (
+                        "database_id".to_owned(),
+                        "11111111-2222-3333-4444-555555555555".to_owned(),
+                    ),
+                ],
+                query: Vec::new(),
+                body_json: Some(r#"{"sql":"SELECT 1"}"#.to_owned()),
+                body_stdin: false,
+                profile: None,
+                account: None,
+                if_match: None,
+                if_none_match: None,
+                value_out: None,
+                credential_in: None,
+                out: Some(root.path().join("snapshot.sql")),
+            },
+        ))
+        .await
+        .expect_err("caller SQL must be rejected");
+        assert!(error.to_string().contains("caller SQL"));
+
+        let mut mutation = CapabilityV1::new(
+            "fixture-mutation",
+            "Fixture mutation",
+            "POST",
+            "/accounts/{account_id}/fixture",
+        );
+        mutation.mutating = true;
+        mutation.selectors = vec![SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        }];
+        catalog.capabilities.insert(mutation.id.clone(), mutation);
+        catalog.refresh_hash().expect("refresh catalog");
+        store
+            .write_json(&store.paths().catalog_file(), &catalog)
+            .expect("replace catalog");
+        let error = Box::pin(call_command(
+            &store,
+            CallArgs {
+                capability_id: "fixture-mutation".to_owned(),
+                selectors: vec![("account_id".to_owned(), "a".repeat(32))],
+                query: Vec::new(),
+                body_json: None,
+                body_stdin: false,
+                profile: None,
+                account: None,
+                if_match: None,
+                if_none_match: None,
+                value_out: None,
+                credential_in: None,
+                out: Some(root.path().join("mutation.out")),
+            },
+        ))
+        .await
+        .expect_err("ordinary mutation must reject --out");
+        assert!(
+            error
+                .to_string()
+                .contains("restricted to bounded analytics")
+        );
     }
 
     fn save_current_test_plan(store: &StateStore, plan: &PlanV1) {

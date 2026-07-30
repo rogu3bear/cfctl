@@ -10,10 +10,10 @@ use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
     AsyncCollectionMutationContractV1, BillingModelV1, CapabilityV1, CostExposureV1, CostV1,
     CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
-    CreatedResourceContractV1, D1SchemaIntrospectionContractV1, DeletedNestedResourceContractV1,
-    DeletedResourceContractV1, EffectClass, EntitlementProbeV1, EntitlementV1,
-    EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1, Maturity,
-    OutputFormatV1, PaginationModeV1, QuerySerializationV1, R2LogRetrievalContractV1,
+    CreatedResourceContractV1, D1FullExportContractV1, D1SchemaIntrospectionContractV1,
+    DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass, EntitlementProbeV1,
+    EntitlementV1, EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1,
+    Maturity, OutputFormatV1, PaginationModeV1, QuerySerializationV1, R2LogRetrievalContractV1,
     ResponseBodyModeV1, ResponseContractV1, RiskClass, SamePathReadContractV1,
     SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
     SelectorContractV1, SelectorV1, TimeRangeContractV1, TimestampFormatV1,
@@ -1752,17 +1752,95 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
 }
 
 /// Adds operation-specific native control-plane capabilities whose wire
-/// contracts cannot be represented safely by Cloudflare's raw OpenAPI
+/// contracts cannot be represented safely by Cloudflare's raw `OpenAPI`
 /// operation. These capabilities compile closed inputs into fixed requests;
 /// they never expose the underlying generic provider operation.
 pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
-    let capability = d1_schema_introspection_capability();
-    snapshot
-        .capabilities
-        .insert(capability.id.clone(), capability);
+    for capability in [
+        d1_schema_introspection_capability(),
+        d1_full_export_capability(),
+    ] {
+        snapshot
+            .capabilities
+            .insert(capability.id.clone(), capability);
+    }
     snapshot.refresh_hash()
 }
 
+fn d1_full_export_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "d1-full-export",
+        "Export full D1 database to SQL",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/export",
+    );
+    capability.description = Some("Create a provider-consistent full schema-and-data SQL export at one caller-specified new local file. Caller SQL, table filters, apply, and restore are excluded.".to_owned());
+    "D1".clone_into(&mut capability.product);
+    "cfctl native governed D1 full-export adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![
+        "snapshot D1 before migration".to_owned(),
+        "export complete D1 database".to_owned(),
+    ];
+    capability.permissions = vec!["D1 Read".to_owned()];
+    capability.mutating = false;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.cost = CostV1 {
+        incremental: false, currency: None, maximum: None,
+        basis: Some("provider export and download have no declared direct operation charge".to_owned()),
+        known: true, billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![KnowledgeReferenceV1 {
+            title: "Export D1 Database as SQL".to_owned(),
+            url: "https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/export/".to_owned(),
+            source: "official Cloudflare API docs".to_owned(),
+        }],
+    };
+    capability.entitlement.available = Some(true);
+    capability.verification.required = true;
+    "same_output_file_exists_and_sha256_matches".clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.warning = Some("The file is a pre-migration snapshot only; applying or restoring it is outside this capability.".to_owned());
+    capability.selectors = ["account_id", "database_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: if name == "account_id" {
+                    serde_json::json!({"type":"string","minLength":32,"maxLength":32})
+                } else {
+                    serde_json::json!({"type":"string","minLength":36,"maxLength":36})
+                },
+                query: None,
+            }),
+        })
+        .to_vec();
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_full_export = Some(D1FullExportContractV1 {
+        max_bytes: 10 * 1024 * 1024 * 1024,
+        max_poll_response_bytes: 1024 * 1024,
+        max_poll_attempts: 120,
+        max_timeout_seconds: 30,
+        max_download_seconds: 3600,
+        requires_new_mode_0600_file: true,
+    });
+    capability
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the closed D1 assertion variants remain visible beside their exact native contract"
+)]
 fn d1_schema_introspection_capability() -> CapabilityV1 {
     const ID: &str = "d1-schema-introspection";
     let mut capability = CapabilityV1::new(
@@ -1775,9 +1853,9 @@ fn d1_schema_introspection_capability() -> CapabilityV1 {
         "Run one closed, compiler-owned sqlite_schema or table-valued PRAGMA assertion without accepting caller SQL."
             .to_owned(),
     );
-    capability.product = "D1".to_owned();
-    capability.source = "cfctl native D1 schema assertion adapter".to_owned();
-    capability.account_scope = "account".to_owned();
+    "D1".clone_into(&mut capability.product);
+    "cfctl native D1 schema assertion adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
     capability.aliases = vec![
         "check D1 migration schema".to_owned(),
         "inspect D1 table column index trigger check constraint".to_owned(),
@@ -1813,7 +1891,7 @@ fn d1_schema_introspection_capability() -> CapabilityV1 {
     capability.entitlement.source =
         Some("https://developers.cloudflare.com/d1/platform/pricing/".to_owned());
     capability.verification.required = false;
-    capability.verification.strategy = "not_applicable".to_owned();
+    "not_applicable".clone_into(&mut capability.verification.strategy);
     capability.rollback.supported = false;
     capability.rollback.strategy = None;
     capability.rollback.warning = None;

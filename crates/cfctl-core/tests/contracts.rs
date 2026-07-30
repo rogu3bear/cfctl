@@ -4,12 +4,12 @@ use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
     AsyncCollectionMutationContractV1, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1,
     CostV1, CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
-    CreatedResourceContractV1, D1SchemaIntrospectionContractV1, DeletedNestedResourceContractV1,
-    EffectClass, EntitlementProbeV1, EvidenceClass, EvidenceV1, GraphqlAnalyticsContractV1,
-    GuideActionV1, GuideCloudflareEffectV1, GuideContractStateV1, GuideStage, GuideTopicV1,
-    OperationalProofFreshnessV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
-    OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1,
-    R2LogRetrievalContractV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1,
+    CreatedResourceContractV1, D1FullExportContractV1, D1SchemaIntrospectionContractV1,
+    DeletedNestedResourceContractV1, EffectClass, EntitlementProbeV1, EvidenceClass, EvidenceV1,
+    GraphqlAnalyticsContractV1, GuideActionV1, GuideCloudflareEffectV1, GuideContractStateV1,
+    GuideStage, GuideTopicV1, OperationalProofFreshnessV1, OperationalProofOutcomeV1,
+    OperationalProofScopeV1, OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanStatus,
+    PlanV1, R2LogRetrievalContractV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1,
     SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
     SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
     TimeRangeContractV1, TimestampFormatV1, TransactionStageV1, UpdatedResourceContractV1,
@@ -90,6 +90,36 @@ fn d1_schema_introspection_contract_is_hash_bound_and_serializable() {
     let after = hash_value(&serde_json::to_value(&capability).expect("serialize drifted"))
         .expect("hash drifted");
     assert_ne!(before, after);
+}
+
+#[test]
+fn d1_full_export_contract_is_hash_bound_and_serializable() {
+    let mut capability = CapabilityV1::new(
+        "d1-full-export",
+        "Export full D1 database to SQL",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/export",
+    );
+    capability.d1_full_export = Some(D1FullExportContractV1 {
+        max_bytes: 10 * 1024 * 1024 * 1024,
+        max_poll_response_bytes: 1024 * 1024,
+        max_poll_attempts: 120,
+        max_timeout_seconds: 30,
+        max_download_seconds: 3600,
+        requires_new_mode_0600_file: true,
+    });
+    let hash = hash_value(&serde_json::to_value(&capability).expect("serialize capability"))
+        .expect("hash export contract");
+    let encoded = serde_json::to_value(&capability).expect("serialize capability");
+    assert_eq!(encoded["d1_full_export"]["max_poll_attempts"], 120);
+    capability
+        .d1_full_export
+        .as_mut()
+        .expect("export contract")
+        .max_poll_attempts = 119;
+    let changed = hash_value(&serde_json::to_value(&capability).expect("serialize changed"))
+        .expect("hash changed contract");
+    assert_ne!(changed, hash);
 }
 
 #[test]

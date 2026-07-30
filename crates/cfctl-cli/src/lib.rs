@@ -407,7 +407,7 @@ pub struct CallArgs {
         long,
         value_name = "NEW_PATH",
         conflicts_with = "value_out",
-        help = "Stream a bounded analytics or governed log-retrieval result to a new mode-0600 file and return its hash receipt"
+        help = "Stream a bounded analytics, governed log-retrieval, or D1 full-export result to a new mode-0600 file and return its hash receipt"
     )]
     pub out: Option<PathBuf>,
 }

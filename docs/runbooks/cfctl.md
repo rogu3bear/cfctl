@@ -313,6 +313,28 @@ parameters, arbitrary PRAGMAs, multiple statements, and database retargeting
 are not inputs. The generic `d1-query-database`, `d1-raw-database-query`, and
 `wrangler.d1` capabilities remain blocked.
 
+Use `d1-full-export` to capture a full schema-and-data SQL snapshot immediately
+before a separately governed migration:
+
+```bash
+cfctl call d1-full-export \
+  --selector account_id=<account-id> \
+  --selector database_id=<database-id> \
+  --out <new-mode-0600-sql-path> --json
+```
+
+This is a read/export-only capability. It accepts no body, SQL, parameters,
+table filters, schema-only/data-only switches, apply input, or restore target.
+cfctl owns the provider polling body, bounds each polling response, and streams
+the completed signed download into a newly created mode-0600 file. The live-read
+evidence binds the account and database identity, exact output path, SHA-256,
+byte count, file-exists/hash-match verification, and the provider filename and
+time-travel bookmark when returned. Cloudflare may temporarily make the
+database unavailable while producing a large export, so capture the snapshot
+in the migration window. The receipt proves only the local pre-migration
+snapshot; importing, applying, or restoring it is a separate protected
+workflow and is not implemented here.
+
 Logs Engine retrieval is the one reserved-header exception and remains
 operation-specific. Supply a mode-0600 JSON bundle containing exactly
 `access_key_id` and `secret_access_key`, plus a new output path:

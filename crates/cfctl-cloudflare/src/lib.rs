@@ -11,10 +11,11 @@ use std::{
 
 use cfctl_auth::AuthCredential;
 use cfctl_core::{
-    AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1, D1SchemaIntrospectionContractV1,
-    GraphqlAnalyticsContractV1, OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1,
-    R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1, RiskClass, SelectorV1,
-    TimestampFormatV1, TransactionStageV1, hash_value, request_header_is_reserved,
+    AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1, D1FullExportContractV1,
+    D1SchemaIntrospectionContractV1, GraphqlAnalyticsContractV1, OutputFormatV1, PaginationModeV1,
+    PlanStatus, PlanV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
+    RiskClass, SelectorV1, TimestampFormatV1, TransactionStageV1, hash_value,
+    request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
@@ -196,6 +197,7 @@ pub struct PreparedRequest {
     pub response_contract: Option<ResponseContractV1>,
     pub analytics_query: Option<AnalyticsQueryContractV1>,
     pub d1_schema_introspection: Option<D1SchemaIntrospectionContractV1>,
+    pub d1_full_export: Option<D1FullExportContractV1>,
     pub r2_log_retrieval: Option<R2LogRetrievalContractV1>,
     pub graphql: Option<GraphqlAnalyticsContractV1>,
     pub output_format: OutputFormatV1,
@@ -305,7 +307,9 @@ impl RequestBuilder {
         )?;
         let (output_format, max_rows, max_bytes, timeout_seconds) =
             read_runtime_options(capability, input)?;
-        let (body, text_body) = if capability.d1_schema_introspection.is_some() {
+        let (body, text_body) = if capability.d1_full_export.is_some() {
+            (Some(serde_json::json!({"output_format":"polling"})), None)
+        } else if capability.d1_schema_introspection.is_some() {
             (
                 Some(render_d1_schema_introspection_body(
                     input.body.as_ref().ok_or_else(|| {
@@ -364,17 +368,33 @@ impl RequestBuilder {
             response_contract: capability.response_contract.clone(),
             analytics_query: capability.analytics_query.clone(),
             d1_schema_introspection: capability.d1_schema_introspection.clone(),
+            d1_full_export: capability.d1_full_export.clone(),
             r2_log_retrieval: capability.r2_log_retrieval.clone(),
             graphql: capability.graphql.clone(),
             output_format,
             max_rows,
             max_bytes,
             timeout_seconds,
-            query_receipt: d1_schema_introspection_receipt(capability, input)
+            query_receipt: d1_full_export_receipt(capability, input)
+                .or_else(|| d1_schema_introspection_receipt(capability, input))
                 .or_else(|| analytics_query_receipt(capability, input, output_format))
                 .or_else(|| r2_log_retrieval_receipt(capability, input)),
         })
     }
+}
+
+fn d1_full_export_receipt(capability: &CapabilityV1, input: &CallInput) -> Option<Value> {
+    let contract = capability.d1_full_export.as_ref()?;
+    Some(serde_json::json!({
+        "capability_id": capability.id,
+        "kind": "d1_full_export",
+        "account_id": input.selectors.get("account_id"),
+        "database_id": input.selectors.get("database_id"),
+        "caller_sql": false,
+        "scope": "full_schema_and_data",
+        "byte_limit": contract.max_bytes,
+        "requires_new_mode_0600_file": contract.requires_new_mode_0600_file,
+    }))
 }
 
 fn d1_schema_introspection_receipt(capability: &CapabilityV1, input: &CallInput) -> Option<Value> {
@@ -457,6 +477,14 @@ fn read_runtime_options(
         return Ok((
             OutputFormatV1::Json,
             contract.max_rows,
+            contract.max_bytes,
+            contract.max_timeout_seconds,
+        ));
+    }
+    if let Some(contract) = capability.d1_full_export.as_ref() {
+        return Ok((
+            OutputFormatV1::Json,
+            1,
             contract.max_bytes,
             contract.max_timeout_seconds,
         ));
@@ -1280,6 +1308,15 @@ impl Executor {
         if capability.r2_log_retrieval.is_some() {
             return Err(CloudflareError::R2LogCredentialsRequired);
         }
+        if capability.d1_full_export.is_some() {
+            let request = self.builder.build(capability, input)?;
+            return Box::pin(self.execute_d1_full_export_to_file(
+                &request,
+                credential,
+                output_path,
+            ))
+            .await;
+        }
         if capability.analytics_query.is_none() {
             return Err(CloudflareError::InvalidAnalyticsQuery(
                 "file output is restricted to bounded analytics capabilities".to_owned(),
@@ -1288,6 +1325,98 @@ impl Executor {
         let request = self.builder.build(capability, input)?;
         self.send_paginated_with_output(&request, credential, Some(output_path))
             .await
+    }
+
+    async fn execute_d1_full_export_to_file(
+        &self,
+        request: &PreparedRequest,
+        credential: &AuthCredential,
+        output_path: &Path,
+    ) -> Result<CloudflareResponseV1> {
+        let contract = request.d1_full_export.as_ref().ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery("D1 full-export contract is missing".to_owned())
+        })?;
+        let mut bookmark = None;
+        for _ in 0..contract.max_poll_attempts {
+            let mut poll = request.clone();
+            poll.max_bytes = contract.max_poll_response_bytes;
+            poll.body = Some(bookmark.as_deref().map_or_else(
+                || serde_json::json!({"output_format":"polling"}),
+                |bookmark| serde_json::json!({"output_format":"polling","current_bookmark":bookmark}),
+            ));
+            let response = self.send(&poll, credential).await?;
+            if !response.success {
+                return Ok(response);
+            }
+            bookmark = response
+                .result
+                .get("at_bookmark")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(bookmark);
+            match response.result.get("status").and_then(Value::as_str) {
+                Some("complete") => {
+                    let signed_url = response
+                        .result
+                        .pointer("/result/signed_url")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            CloudflareError::InvalidAnalyticsQuery(
+                                "completed D1 export omitted signed_url".to_owned(),
+                            )
+                        })?;
+                    let url = Url::parse(signed_url)?;
+                    if url.scheme() != request.url.scheme()
+                        || url.host_str().is_none()
+                        || !url.username().is_empty()
+                        || url.password().is_some()
+                    {
+                        return Err(CloudflareError::InvalidAnalyticsQuery(
+                            "D1 export returned an unsafe signed URL".to_owned(),
+                        ));
+                    }
+                    let filename = response
+                        .result
+                        .pointer("/result/filename")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let download = self
+                        .client
+                        .get(url)
+                        .timeout(Duration::from_secs(contract.max_download_seconds))
+                        .send()
+                        .await?;
+                    if !download.status().is_success() {
+                        return Err(CloudflareError::InvalidAnalyticsQuery(format!(
+                            "D1 export download failed with HTTP {}",
+                            download.status().as_u16()
+                        )));
+                    }
+                    return stream_d1_export_response(
+                        download,
+                        request,
+                        output_path,
+                        bookmark,
+                        filename,
+                    )
+                    .await;
+                }
+                Some("error") => {
+                    return Err(CloudflareError::InvalidAnalyticsQuery(
+                        response
+                            .result
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("provider D1 export failed")
+                            .to_owned(),
+                    ));
+                }
+                _ => sleep(Duration::from_millis(100)).await,
+            }
+        }
+        Err(CloudflareError::InvalidAnalyticsQuery(
+            "D1 full export did not complete within the governed polling bound".to_owned(),
+        ))
     }
 
     /// Executes the one pinned Logs Engine retrieval with its two ephemeral R2
@@ -4346,6 +4475,110 @@ async fn stream_r2_log_response(
     })
 }
 
+async fn stream_d1_export_response(
+    response: reqwest::Response,
+    request: &PreparedRequest,
+    output_path: &Path,
+    bookmark: Option<String>,
+    provider_filename: Option<String>,
+) -> Result<CloudflareResponseV1> {
+    let contract = request.d1_full_export.as_ref().ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery("D1 full-export contract is missing".to_owned())
+    })?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(output_path)
+        .map_err(|source| CloudflareError::OutputFile {
+            path: output_path.display().to_string(),
+            source,
+        })?;
+    let mut file = tokio::fs::File::from_std(file);
+    let mut stream = response.bytes_stream();
+    let mut hasher = Sha256::new();
+    let mut bytes_written = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = contract.max_bytes.saturating_sub(bytes_written);
+        if chunk.len() as u64 > remaining {
+            return Err(CloudflareError::InvalidAnalyticsQuery(
+                "D1 export exceeded its governed byte bound; partial file retained".to_owned(),
+            ));
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|source| CloudflareError::OutputFile {
+                path: output_path.display().to_string(),
+                source,
+            })?;
+        hasher.update(&chunk);
+        bytes_written += chunk.len() as u64;
+    }
+    file.flush()
+        .await
+        .map_err(|source| CloudflareError::OutputFile {
+            path: output_path.display().to_string(),
+            source,
+        })?;
+    let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+    let mut verification_file =
+        std::fs::File::open(output_path).map_err(|source| CloudflareError::OutputFile {
+            path: output_path.display().to_string(),
+            source,
+        })?;
+    let mut verification_hasher = Sha256::new();
+    let mut verification_bytes = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = std::io::Read::read(&mut verification_file, &mut buffer).map_err(|source| {
+            CloudflareError::OutputFile {
+                path: output_path.display().to_string(),
+                source,
+            }
+        })?;
+        if read == 0 {
+            break;
+        }
+        verification_hasher.update(&buffer[..read]);
+        verification_bytes += read as u64;
+    }
+    let verification_digest = format!("sha256:{}", hex::encode(verification_hasher.finalize()));
+    let verified = verification_bytes == bytes_written && verification_digest == digest;
+    Ok(CloudflareResponseV1 {
+        status: 200,
+        success: verified,
+        result: serde_json::json!({
+            "output_file": {
+                "path": output_path,
+                "sha256": digest,
+                "bytes": bytes_written,
+                "exists": true,
+                "hash_matches": verified,
+                "complete": true,
+            },
+            "database": {
+                "account_id": request.query_receipt.as_ref().and_then(|value| value.get("account_id")),
+                "database_id": request.query_receipt.as_ref().and_then(|value| value.get("database_id")),
+            },
+            "provider": {
+                "at_bookmark": bookmark,
+                "filename": provider_filename,
+                "exported_at": Utc::now(),
+            },
+        }),
+        errors: Vec::new(),
+        result_info: Some(serde_json::json!({
+            "query": request.query_receipt,
+            "output": {"bytes": bytes_written, "byte_limit": contract.max_bytes, "partial": false},
+            "verification": {"strategy":"same_output_file_exists_and_sha256_matches","passed":verified},
+        })),
+        etag: None,
+        cf_ray: None,
+    })
+}
+
 async fn file_receipt(path: &Path, bytes: &[u8], rows: u64, complete: bool) -> Result<Value> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -6280,9 +6513,46 @@ pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -
     validate_selector_contract(capability, &input.selectors)?;
     validate_query_contract(capability, &input.query)?;
     validate_request_body(capability, input.body.as_ref())?;
+    validate_d1_full_export_contract(capability, input)?;
     validate_d1_schema_introspection_contract(capability, input)?;
     validate_analytics_query_contract(capability, input)?;
     validate_r2_log_retrieval_contract(capability, input)
+}
+
+fn validate_d1_full_export_contract(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
+    let Some(contract) = capability.d1_full_export.as_ref() else {
+        return Ok(());
+    };
+    let supported = capability.id == "d1-full-export"
+        && capability.method == "POST"
+        && capability.path == "/accounts/{account_id}/d1/database/{database_id}/export"
+        && capability.product == "D1"
+        && !capability.mutating
+        && capability.risk == RiskClass::Read
+        && capability.effect == cfctl_core::EffectClass::ReadOnly
+        && capability.permissions == ["D1 Read"]
+        && capability.analytics_query.is_none()
+        && capability.d1_schema_introspection.is_none()
+        && capability.r2_log_retrieval.is_none()
+        && capability.request_schema.is_none()
+        && input.body.is_none()
+        && input
+            .query
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+        && contract.requires_new_mode_0600_file
+        && contract.max_bytes > 0
+        && (1..=1024 * 1024).contains(&contract.max_poll_response_bytes)
+        && (1..=120).contains(&contract.max_poll_attempts)
+        && (1..=30).contains(&contract.max_timeout_seconds)
+        && (1..=3600).contains(&contract.max_download_seconds);
+    if !supported {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "D1 full export identity, input closure, permission, or runtime bounds drifted"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_response_contract(capability: &CapabilityV1) -> Result<()> {

@@ -10841,3 +10841,48 @@ fn native_control_overlay_adds_only_closed_bounded_d1_schema_assertions() {
         );
     }
 }
+
+#[test]
+fn native_control_overlay_adds_governed_full_d1_export_without_sql_or_restore() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot.get("d1-full-export").expect("D1 export");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Read);
+    assert_eq!(capability.effect, EffectClass::ReadOnly);
+    assert!(!capability.mutating);
+    assert_eq!(capability.permissions, ["D1 Read"]);
+    assert_eq!(
+        capability.path,
+        "/accounts/{account_id}/d1/database/{database_id}/export"
+    );
+    assert_eq!(
+        capability
+            .selectors
+            .iter()
+            .map(|selector| selector.name.as_str())
+            .collect::<Vec<_>>(),
+        ["account_id", "database_id"]
+    );
+    assert!(capability.request_schema.is_none());
+    let encoded = serde_json::to_string(capability).expect("capability JSON");
+    assert!(!encoded.contains("\"sql\""));
+    assert!(!encoded.contains("\"tables\""));
+    assert!(!encoded.contains("\"restore\""));
+    let contract = capability.d1_full_export.as_ref().expect("export contract");
+    assert!(contract.requires_new_mode_0600_file);
+    assert_eq!(contract.max_poll_attempts, 120);
+    assert_eq!(
+        capability.rollback.warning.as_deref(),
+        Some(
+            "The file is a pre-migration snapshot only; applying or restoring it is outside this capability."
+        )
+    );
+}

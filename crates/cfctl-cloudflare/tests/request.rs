@@ -8,13 +8,14 @@ use cfctl_cloudflare::{
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
     AsyncCollectionMutationContractV1, CapabilityV1, CreatedCollectionResourceContractV1,
-    CreatedNestedResourceContractV1, CreatedResourceContractV1, D1SchemaIntrospectionContractV1,
-    DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass, EventBatchContractV1,
-    GraphqlAnalyticsContractV1, KnowledgeReferenceV1, OutputFormatV1, PaginationModeV1, PlanStatus,
-    PlanV1, QUEUE_ACK_CAPABILITY_ID, QUEUE_ACK_PATH, QUEUE_PULL_CAPABILITY_ID, QUEUE_PULL_PATH,
-    QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
-    RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
-    TimestampFormatV1, TransactionStageV1, UpdatedResourceContractV1,
+    CreatedNestedResourceContractV1, CreatedResourceContractV1, D1FullExportContractV1,
+    D1SchemaIntrospectionContractV1, DeletedNestedResourceContractV1, DeletedResourceContractV1,
+    EffectClass, EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1,
+    OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1, QUEUE_ACK_CAPABILITY_ID, QUEUE_ACK_PATH,
+    QUEUE_PULL_CAPABILITY_ID, QUEUE_PULL_PATH, QuerySerializationV1, R2LogRetrievalContractV1,
+    ResponseBodyModeV1, ResponseContractV1, RiskClass, SamePathReadContractV1, SelectorContractV1,
+    SelectorV1, TimeRangeContractV1, TimestampFormatV1, TransactionStageV1,
+    UpdatedResourceContractV1,
 };
 use chrono::{Duration, SecondsFormat, Utc};
 use serde_json::{Value, json};
@@ -7698,15 +7699,15 @@ fn d1_schema_introspection_capability() -> CapabilityV1 {
         "POST",
         "/accounts/{account_id}/d1/database/{database_id}/query",
     );
-    capability.product = "D1".to_owned();
-    capability.source = "cfctl native D1 schema assertion adapter".to_owned();
+    "D1".clone_into(&mut capability.product);
+    "cfctl native D1 schema assertion adapter".clone_into(&mut capability.source);
     capability.permissions = vec!["D1 Read".to_owned()];
     capability.mutating = false;
     capability.risk = RiskClass::Read;
     capability.effect = EffectClass::ReadOnly;
     capability.adapter_status = AdapterStatus::Native;
-    capability.verification.required = false;
-    capability.verification.strategy = "not_applicable".to_owned();
+    capability.verification.required = true;
+    "not_applicable".clone_into(&mut capability.verification.strategy);
     capability.rollback.warning = None;
     capability.selectors = ["account_id", "database_id"]
         .map(|name| SelectorV1 {
@@ -7749,6 +7750,175 @@ fn d1_schema_introspection_capability() -> CapabilityV1 {
         max_timeout_seconds: 10,
     });
     capability
+}
+
+fn d1_full_export_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "d1-full-export",
+        "Export full D1 database to SQL",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/export",
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native governed D1 full-export adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.permissions = vec!["D1 Read".to_owned()];
+    capability.mutating = false;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.verification.required = true;
+    "same_output_file_exists_and_sha256_matches".clone_into(&mut capability.verification.strategy);
+    capability.selectors = ["account_id", "database_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: if name == "account_id" {
+                    json!({"type":"string","minLength":32,"maxLength":32})
+                } else {
+                    json!({"type":"string","minLength":36,"maxLength":36})
+                },
+                query: None,
+            }),
+        })
+        .to_vec();
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_full_export = Some(D1FullExportContractV1 {
+        max_bytes: 1024 * 1024,
+        max_poll_response_bytes: 64 * 1024,
+        max_poll_attempts: 3,
+        max_timeout_seconds: 5,
+        max_download_seconds: 5,
+        requires_new_mode_0600_file: true,
+    });
+    capability
+}
+
+fn d1_full_export_input() -> CallInput {
+    CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        query: json!({}),
+        ..CallInput::default()
+    }
+}
+
+#[test]
+fn d1_full_export_builds_only_fixed_polling_body_and_rejects_caller_controls() {
+    let capability = d1_full_export_capability();
+    let prepared = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build(&capability, &d1_full_export_input())
+        .expect("closed export request");
+    assert_eq!(prepared.body, Some(json!({"output_format":"polling"})));
+    assert_eq!(
+        prepared
+            .query_receipt
+            .as_ref()
+            .and_then(|value| value.get("scope")),
+        Some(&json!("full_schema_and_data"))
+    );
+    for input in [
+        CallInput {
+            body: Some(json!({"sql":"SELECT 1"})),
+            ..d1_full_export_input()
+        },
+        CallInput {
+            body: Some(json!({"dump_options":{"tables":["users"]}})),
+            ..d1_full_export_input()
+        },
+        CallInput {
+            query: json!({"bookmark":"caller-controlled"}),
+            ..d1_full_export_input()
+        },
+    ] {
+        assert!(validate_request_contract(&capability, &input).is_err());
+    }
+}
+
+#[tokio::test]
+async fn d1_full_export_polls_streams_and_verifies_same_path_hash() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for response in [
+            r#"{"success":true,"result":{"type":"export","success":true,"at_bookmark":"bookmark-42"}}"#
+                .to_owned(),
+            format!(
+                r#"{{"success":true,"result":{{"type":"export","status":"complete","success":true,"at_bookmark":"bookmark-42","result":{{"filename":"snapshot.sql","signed_url":"http://{address}/download"}}}}}}"#
+            ),
+            "CREATE TABLE users(id INTEGER);\nINSERT INTO users VALUES (1);\n".to_owned(),
+        ] {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let read = socket.read(&mut buffer).await.expect("read");
+            request.extend_from_slice(&buffer[..read]);
+            requests.push(String::from_utf8_lossy(&request).into_owned());
+            let content_type = if response.starts_with('{') {
+                "application/json"
+            } else {
+                "application/sql"
+            };
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write");
+        }
+        requests
+    });
+    let output_root = tempfile::tempdir().expect("output root");
+    let output = output_root.path().join("snapshot.sql");
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read_to_file(
+        &d1_full_export_capability(),
+        &d1_full_export_input(),
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+        &output,
+    )
+    .await
+    .expect("full export");
+    assert!(response.success);
+    assert_eq!(
+        response.result["database"]["database_id"],
+        "11111111-2222-3333-4444-555555555555"
+    );
+    assert_eq!(response.result["provider"]["at_bookmark"], "bookmark-42");
+    assert_eq!(response.result["output_file"]["bytes"], 62);
+    assert_eq!(response.result["output_file"]["exists"], true);
+    assert_eq!(response.result["output_file"]["hash_matches"], true);
+    assert_eq!(
+        std::fs::read_to_string(&output).expect("export file"),
+        "CREATE TABLE users(id INTEGER);\nINSERT INTO users VALUES (1);\n"
+    );
+    let requests = server.await.expect("server");
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].contains("\"output_format\":\"polling\""));
+    assert!(!requests[0].contains("sql"));
+    assert!(requests[1].contains("\"current_bookmark\":\"bookmark-42\""));
 }
 
 fn d1_schema_input(body: Value) -> CallInput {

@@ -927,6 +927,16 @@ pub struct D1SchemaIntrospectionContractV1 {
     pub max_timeout_seconds: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1FullExportContractV1 {
+    pub max_bytes: u64,
+    pub max_poll_response_bytes: u64,
+    pub max_poll_attempts: u64,
+    pub max_timeout_seconds: u64,
+    pub max_download_seconds: u64,
+    pub requires_new_mode_0600_file: bool,
+}
+
 /// Timestamp wire representation at the pointers declared by a query contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1492,6 +1502,8 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_schema_introspection: Option<D1SchemaIntrospectionContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d1_full_export: Option<D1FullExportContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2_log_retrieval: Option<R2LogRetrievalContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphql: Option<GraphqlAnalyticsContractV1>,
@@ -1593,6 +1605,7 @@ impl CapabilityV1 {
             response_contract: None,
             analytics_query: None,
             d1_schema_introspection: None,
+            d1_full_export: None,
             r2_log_retrieval: None,
             graphql: None,
             workflow: None,
