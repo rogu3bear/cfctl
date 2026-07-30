@@ -1863,7 +1863,7 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
         "/accounts/{account_id}/d1/database/{database_id}/import",
     );
     capability.description = Some(
-        "Stage and import exactly MLNavigator migration 0142 or 0143. The plan binds reviewed source bytes, one governed full-export recovery anchor with its verified file and provider bookmark, and phase authority; provider completion remains unverified until the governed post-import proof is attached."
+        "Stage and import exactly MLNavigator migration 0142 or 0143. The reviewed source is one exact clean Git repository revision, relative path, and blob; local origin configuration establishes snapshot identity, not hosted ownership. The plan binds those reviewed source bytes, one governed full-export recovery anchor with its verified file and provider bookmark, and phase authority; provider completion remains unverified until the governed post-import proof is attached."
             .to_owned(),
     );
     "D1".clone_into(&mut capability.product);
@@ -1965,6 +1965,8 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
         body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
     });
     capability.d1_approved_mln_import = Some(cfctl_core::D1ApprovedMlnImportContractV1 {
+        repository_id: "github.com/rogu3bear/mln-web".to_owned(),
+        repository_head: "7cb0327c084ce956d728aa7d9df467cea8ed44fb".to_owned(),
         account_id: account_id.to_owned(),
         database_id: database_id.to_owned(),
         import_path: capability.path.clone(),
@@ -1972,9 +1974,10 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
             cfctl_core::D1ApprovedMlnMigrationV1 {
                 migration_id: "0142".to_owned(),
                 basename: "0142_document_render_claim_generation.sql".to_owned(),
-                source_suffix:
+                repository_relative_path:
                     "crates/founder/migrations/d1/0142_document_render_claim_generation.sql"
                         .to_owned(),
+                git_blob_oid: "408607c6fed6a5d9c10e80d6bacb2ee355817953".to_owned(),
                 bytes: 1031,
                 sha256: "07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0"
                     .to_owned(),
@@ -1983,9 +1986,10 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
             cfctl_core::D1ApprovedMlnMigrationV1 {
                 migration_id: "0143".to_owned(),
                 basename: "0143_advisor_final_equity_instrument.sql".to_owned(),
-                source_suffix:
+                repository_relative_path:
                     "crates/founder/migrations/d1/0143_advisor_final_equity_instrument.sql"
                         .to_owned(),
+                git_blob_oid: "4538523205bc1a3a2e68029aa040a06cd17946a8".to_owned(),
                 bytes: 9736,
                 sha256: "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
                     .to_owned(),

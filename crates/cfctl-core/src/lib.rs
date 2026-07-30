@@ -1049,7 +1049,8 @@ pub struct D1RestoreExactBookmarkContractV1 {
 pub struct D1ApprovedMlnMigrationV1 {
     pub migration_id: String,
     pub basename: String,
-    pub source_suffix: String,
+    pub repository_relative_path: String,
+    pub git_blob_oid: String,
     pub bytes: u64,
     pub sha256: String,
     pub md5: String,
@@ -1057,6 +1058,8 @@ pub struct D1ApprovedMlnMigrationV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct D1ApprovedMlnImportContractV1 {
+    pub repository_id: String,
+    pub repository_head: String,
     pub account_id: String,
     pub database_id: String,
     pub import_path: String,

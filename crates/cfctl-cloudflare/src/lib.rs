@@ -8552,15 +8552,23 @@ fn validate_d1_approved_mln_import_contract(
         && database == Some(contract.database_id.as_str())
         && migration_id.is_some_and(|id| matches!(id, "0142" | "0143"))
         && keys == expected
+        && contract.repository_id == "github.com/rogu3bear/mln-web"
+        && contract.repository_head == "7cb0327c084ce956d728aa7d9df467cea8ed44fb"
         && contract.migrations.len() == 2
         && contract.migrations[0].migration_id == "0142"
         && contract.migrations[0].basename == "0142_document_render_claim_generation.sql"
+        && contract.migrations[0].repository_relative_path
+            == "crates/founder/migrations/d1/0142_document_render_claim_generation.sql"
+        && contract.migrations[0].git_blob_oid == "408607c6fed6a5d9c10e80d6bacb2ee355817953"
         && contract.migrations[0].bytes == 1031
         && contract.migrations[0].sha256
             == "07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0"
         && contract.migrations[0].md5 == "5dc9f871404bc6aede1dbf8becf881e5"
         && contract.migrations[1].migration_id == "0143"
         && contract.migrations[1].basename == "0143_advisor_final_equity_instrument.sql"
+        && contract.migrations[1].repository_relative_path
+            == "crates/founder/migrations/d1/0143_advisor_final_equity_instrument.sql"
+        && contract.migrations[1].git_blob_oid == "4538523205bc1a3a2e68029aa040a06cd17946a8"
         && contract.migrations[1].bytes == 9736
         && contract.migrations[1].sha256
             == "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
@@ -8688,6 +8696,8 @@ mod approved_mln_import_tests {
 
     fn contract() -> D1ApprovedMlnImportContractV1 {
         D1ApprovedMlnImportContractV1 {
+            repository_id: "github.com/rogu3bear/mln-web".to_owned(),
+            repository_head: "7cb0327c084ce956d728aa7d9df467cea8ed44fb".to_owned(),
             account_id: "ca30e922fda7f5578e49873542e4aaca".to_owned(),
             database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
             import_path: "/accounts/{account_id}/d1/database/{database_id}/import".to_owned(),

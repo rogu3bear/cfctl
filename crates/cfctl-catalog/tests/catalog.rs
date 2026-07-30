@@ -10977,6 +10977,11 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
         .expect("typed import contract");
     assert_eq!(contract.account_id, "ca30e922fda7f5578e49873542e4aaca");
     assert_eq!(contract.database_id, "7c282983-2e48-4ea4-9f0d-09b0d718fe65");
+    assert_eq!(contract.repository_id, "github.com/rogu3bear/mln-web");
+    assert_eq!(
+        contract.repository_head,
+        "7cb0327c084ce956d728aa7d9df467cea8ed44fb"
+    );
     assert_eq!(contract.migrations.len(), 2);
     assert_eq!(
         contract
@@ -10987,6 +10992,8 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
                 migration.bytes,
                 migration.sha256.as_str(),
                 migration.md5.as_str(),
+                migration.repository_relative_path.as_str(),
+                migration.git_blob_oid.as_str(),
             ))
             .collect::<Vec<_>>(),
         [
@@ -10995,12 +11002,16 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
                 1_031,
                 "07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0",
                 "5dc9f871404bc6aede1dbf8becf881e5",
+                "crates/founder/migrations/d1/0142_document_render_claim_generation.sql",
+                "408607c6fed6a5d9c10e80d6bacb2ee355817953",
             ),
             (
                 "0143",
                 9_736,
                 "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d",
                 "bd50b7e05cc13c20f17eb8748472eb4b",
+                "crates/founder/migrations/d1/0143_advisor_final_equity_instrument.sql",
+                "4538523205bc1a3a2e68029aa040a06cd17946a8",
             ),
         ]
     );

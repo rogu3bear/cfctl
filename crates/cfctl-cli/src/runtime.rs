@@ -10,7 +10,7 @@ use std::{
     fs::OpenOptions,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Command as StdCommand, Stdio},
     time::Duration,
 };
 
@@ -1388,15 +1388,26 @@ fn stage_approved_mln_migration(
         .iter()
         .find(|migration| migration.migration_id == migration_id)
         .ok_or_else(|| CliError::Input("migration_id is not in the closed catalogue".to_owned()))?;
-    let suffix = Path::new(&approved.source_suffix);
-    if !source.ends_with(suffix)
-        || source.file_name().and_then(|name| name.to_str()) != Some(approved.basename.as_str())
-    {
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| CliError::Input("approved migration source has no parent".to_owned()))?;
+    let discovered_root = PathBuf::from(git_authority_output(
+        source_parent,
+        &["rev-parse", "--show-toplevel"],
+    )?);
+    let canonical_root = fs::canonicalize(&discovered_root).map_err(|source| CliError::Io {
+        path: discovered_root.display().to_string(),
+        source,
+    })?;
+    let expected_source = canonical_root.join(&approved.repository_relative_path);
+    if source != expected_source {
         return Err(CliError::Input(format!(
-            "migration {migration_id} source must end in the reviewed path `{}`",
-            approved.source_suffix
+            "migration {migration_id} source must be the exact reviewed repository path `{}`",
+            expected_source.display()
         )));
     }
+    let git_common_dir =
+        validate_approved_mln_repository_authority(contract, approved, &canonical_root, None)?;
     let mut cursor = PathBuf::new();
     for component in source.components() {
         cursor.push(component.as_os_str());
@@ -1520,11 +1531,32 @@ fn stage_approved_mln_migration(
                 .to_owned(),
         ));
     }
+    let revalidated_common = validate_approved_mln_repository_authority(
+        contract,
+        approved,
+        &canonical_root,
+        Some(&bytes),
+    )?;
+    if revalidated_common != git_common_dir {
+        return Err(CliError::Input(
+            "reviewed MLN Git common directory changed while staging".to_owned(),
+        ));
+    }
+    let source_authority = json!({
+        "schema_version":1,
+        "repository_id":contract.repository_id,
+        "observed_worktree_root":canonical_root,
+        "observed_git_common_dir":git_common_dir,
+        "head":contract.repository_head,
+        "repository_relative_path":approved.repository_relative_path,
+        "git_blob_oid":approved.git_blob_oid,
+    });
     Ok(json!({
         "schema_version":1,
         "migration_id":migration_id,
         "catalog_basename":approved.basename,
-        "catalog_source_suffix":approved.source_suffix,
+        "source_authority":source_authority,
+        "source_authority_hash":hash_value(&source_authority)?,
         "bytes":approved.bytes,
         "sha256":format!("sha256:{}", approved.sha256),
         "md5":approved.md5,
@@ -1536,6 +1568,118 @@ fn stage_approved_mln_migration(
         },
         "prerequisites":input.body,
     }))
+}
+
+fn git_authority_output(repository_root: &Path, arguments: &[&str]) -> Result<String> {
+    let mut command = StdCommand::new("git");
+    command.arg("-C").arg(repository_root).args(arguments);
+    clear_git_authority_environment(&mut command);
+    let output = command.output().map_err(|source| CliError::Io {
+        path: repository_root.display().to_string(),
+        source,
+    })?;
+    if !output.status.success() {
+        return Err(CliError::Input(format!(
+            "reviewed MLN repository authority command `git {}` failed closed",
+            arguments.join(" ")
+        )));
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| CliError::Input("Git authority output was not UTF-8".to_owned()))
+}
+
+fn git_authority_bytes(repository_root: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
+    let mut command = StdCommand::new("git");
+    command.arg("-C").arg(repository_root).args(arguments);
+    clear_git_authority_environment(&mut command);
+    let output = command.output().map_err(|source| CliError::Io {
+        path: repository_root.display().to_string(),
+        source,
+    })?;
+    if !output.status.success() {
+        return Err(CliError::Input(format!(
+            "reviewed MLN repository authority command `git {}` failed closed",
+            arguments.join(" ")
+        )));
+    }
+    Ok(output.stdout)
+}
+
+fn clear_git_authority_environment(command: &mut StdCommand) {
+    for (name, _) in env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn validate_approved_mln_repository_authority(
+    contract: &cfctl_core::D1ApprovedMlnImportContractV1,
+    migration: &cfctl_core::D1ApprovedMlnMigrationV1,
+    root: &Path,
+    expected_bytes: Option<&[u8]>,
+) -> Result<PathBuf> {
+    let canonical_root = fs::canonicalize(root).map_err(|source| CliError::Io {
+        path: root.display().to_string(),
+        source,
+    })?;
+    if canonical_root != root {
+        return Err(CliError::Input(
+            "reviewed MLN repository root is missing, substituted, or non-canonical".to_owned(),
+        ));
+    }
+    let top = git_authority_output(root, &["rev-parse", "--show-toplevel"])?;
+    let head = git_authority_output(root, &["rev-parse", "HEAD"])?;
+    let remote = git_authority_output(root, &["remote", "get-url", "origin"])?;
+    let common = git_authority_output(root, &["rev-parse", "--git-common-dir"])?;
+    let common_path = if Path::new(&common).is_absolute() {
+        PathBuf::from(common)
+    } else {
+        root.join(common)
+    };
+    let canonical_common = fs::canonicalize(&common_path).map_err(|source| CliError::Io {
+        path: common_path.display().to_string(),
+        source,
+    })?;
+    if top != canonical_root.to_string_lossy()
+        || head != contract.repository_head
+        || normalize_reviewed_mln_repository_id(&remote).as_deref()
+            != Some(contract.repository_id.as_str())
+    {
+        return Err(CliError::Input(
+            "reviewed MLN repository identity, canonical worktree root, or HEAD drifted".to_owned(),
+        ));
+    }
+    let relative = migration.repository_relative_path.as_str();
+    let tracked = git_authority_output(root, &["ls-files", "--error-unmatch", "--", relative])?;
+    let blob_spec = format!("{}:{relative}", contract.repository_head);
+    let blob = git_authority_output(root, &["rev-parse", &blob_spec])?;
+    let status =
+        git_authority_output(root, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+    let blob_bytes = git_authority_bytes(root, &["cat-file", "blob", &migration.git_blob_oid])?;
+    if tracked != relative || blob != migration.git_blob_oid || !status.is_empty() {
+        return Err(CliError::Input(
+            "reviewed MLN migration is untracked, dirty, or does not match the pinned HEAD blob"
+                .to_owned(),
+        ));
+    }
+    if expected_bytes.is_some_and(|bytes| bytes != blob_bytes) {
+        return Err(CliError::Input(
+            "reviewed MLN source bytes differ from the exact pinned Git blob".to_owned(),
+        ));
+    }
+    Ok(canonical_common)
+}
+
+fn normalize_reviewed_mln_repository_id(remote: &str) -> Option<String> {
+    match remote {
+        "https://github.com/rogu3bear/mln-web.git"
+        | "https://github.com/rogu3bear/mln-web"
+        | "git@github.com:rogu3bear/mln-web.git"
+        | "git@github.com:rogu3bear/mln-web" => Some("github.com/rogu3bear/mln-web".to_owned()),
+        _ => None,
+    }
 }
 
 fn required_body_string<'a>(body: &'a Map<String, Value>, field: &str) -> Result<&'a str> {
@@ -12760,6 +12904,7 @@ async fn execute_approved_mln_import_plan(
                     .to_owned(),
             )
         })?;
+    validate_managed_mln_stage_authority(plan)?;
     let checkpoint_operation_id = plan.operation_id.clone();
     let response = match executor
         .execute_d1_approved_mln_import(
@@ -12851,6 +12996,98 @@ async fn execute_approved_mln_import_plan(
         envelope.evidence.push(evidence);
     }
     Ok(envelope)
+}
+
+fn validate_managed_mln_stage_authority(plan: &PlanV1) -> Result<()> {
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    let migration_id = plan
+        .input
+        .get("body")
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("managed import migration identity is missing".to_owned())
+        })?;
+    let migration = contract
+        .migrations
+        .iter()
+        .find(|migration| migration.migration_id == migration_id)
+        .ok_or_else(|| CliError::Input("managed import migration is not catalogued".to_owned()))?;
+    let staged = plan
+        .targets
+        .pointer("/adapter/approved_mln_import")
+        .ok_or_else(|| CliError::Input("managed import stage binding is missing".to_owned()))?;
+    let authority = staged
+        .get("source_authority")
+        .ok_or_else(|| CliError::Input("managed source authority is missing".to_owned()))?;
+    let authority_hash = hash_value(authority)?;
+    let expected_sha256 = format!("sha256:{}", migration.sha256);
+    if authority.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || authority.get("repository_id").and_then(Value::as_str)
+            != Some(contract.repository_id.as_str())
+        || authority.get("head").and_then(Value::as_str) != Some(contract.repository_head.as_str())
+        || authority
+            .get("repository_relative_path")
+            .and_then(Value::as_str)
+            != Some(migration.repository_relative_path.as_str())
+        || authority.get("git_blob_oid").and_then(Value::as_str)
+            != Some(migration.git_blob_oid.as_str())
+        || authority
+            .get("observed_worktree_root")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || authority
+            .get("observed_git_common_dir")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || staged.get("source_authority_hash").and_then(Value::as_str)
+            != Some(authority_hash.as_str())
+        || staged.get("sha256").and_then(Value::as_str) != Some(expected_sha256.as_str())
+        || staged.get("md5").and_then(Value::as_str) != Some(migration.md5.as_str())
+        || staged.get("bytes").and_then(Value::as_u64) != Some(migration.bytes)
+    {
+        return Err(CliError::Input(
+            "managed import stage lost its exact source-authority or byte identity".to_owned(),
+        ));
+    }
+    let stage_path = staged
+        .get("stage_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::Input("managed import stage path is missing".to_owned()))?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(&stage_path).map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| CliError::Io {
+            path: stage_path.display().to_string(),
+            source,
+        })?;
+    if !metadata.is_file()
+        || metadata.len() != migration.bytes
+        || bytes.len() as u64 != migration.bytes
+        || hex::encode(Sha256::digest(&bytes)) != migration.sha256
+        || hex::encode(Md5::digest(&bytes)) != migration.md5
+    {
+        return Err(CliError::Input(
+            "managed import stage no longer matches the consumed reviewed source".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 enum ApiBoundaryResponseOutcome {
@@ -18571,7 +18808,8 @@ mod tests {
         guide_document, guide_stage_commands, http_client, is_live_plan_precondition_hash,
         is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
         list_security_action_state_receipt, mln_0142_terminal_import_state,
-        mln_0143_parent_manifests, non_readback_verification_basis, operational_proof_coverage,
+        mln_0143_parent_manifests, non_readback_verification_basis,
+        normalize_reviewed_mln_repository_id, operational_proof_coverage,
         permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
         persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
         plan_state_next_step, plan_status_label, preflight_call_input,
@@ -18594,10 +18832,12 @@ mod tests {
         should_bind_kv_empty_namespace_state, should_bind_oauth_client_secret_state,
         should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
         should_bind_zone_account, should_redact_secret_response, should_resolve_entitlement_probe,
-        should_resolve_zone_entitlement, sink_secret_result, store_imported_api_token,
-        validate_api_token_creation_contract, validate_current_permission_groups,
+        should_resolve_zone_entitlement, sink_secret_result, stage_approved_mln_migration,
+        store_imported_api_token, validate_api_token_creation_contract,
+        validate_approved_mln_repository_authority, validate_current_permission_groups,
         validate_entitlement_receipt_precondition,
-        validate_global_warp_override_state_receipt_precondition, validate_mln_0143_lineage_result,
+        validate_global_warp_override_state_receipt_precondition,
+        validate_managed_mln_stage_authority, validate_mln_0143_lineage_result,
         validate_permission_group_resource_scope, validate_request_contract,
         validate_selected_permission_groups, validate_standing_authority_group_scopes,
         validate_standing_authority_permission_inventory, validate_token_policy_body,
@@ -18630,7 +18870,9 @@ mod tests {
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
+    use md5::Md5;
     use serde_json::{Value, json};
+    use sha2::{Digest as _, Sha256};
     use std::path::PathBuf;
     use std::{
         collections::BTreeMap,
@@ -18953,6 +19195,209 @@ mod tests {
             hash_value(&json!("bookmark-after-0142")).expect("bookmark hash")
         );
         assert_eq!(binding.completion_status, "completed");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one portable Git fixture proves the complete reviewed-source authority boundary"
+    )]
+    fn approved_mln_source_rejects_suffix_grafts_and_git_authority_drift() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let repository = root.path().join("mln-web");
+        fs::create_dir_all(&repository).expect("repo directory");
+        let repository = fs::canonicalize(repository).expect("canonical repo directory");
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(arguments)
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {}: {}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .expect("git output")
+                .trim()
+                .to_owned()
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/rogu3bear/mln-web.git",
+        ]);
+        let relative = "crates/founder/migrations/d1/0142_document_render_claim_generation.sql";
+        let source = repository.join(relative);
+        fs::create_dir_all(source.parent().expect("source parent")).expect("migration directory");
+        let bytes = b"approved migration\n";
+        fs::write(&source, bytes).expect("migration source");
+        git(&["add", relative]);
+        git(&["commit", "-m", "fixture"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        let blob_spec = format!("HEAD:{relative}");
+        let blob = git(&["rev-parse", &blob_spec]);
+
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let mut capability = catalog
+            .get("d1-import-approved-mln-migration")
+            .expect("import")
+            .clone();
+        let contract = capability
+            .d1_approved_mln_import
+            .as_mut()
+            .expect("contract");
+        contract.repository_head = head.clone();
+        let migration = &mut contract.migrations[0];
+        migration.bytes = bytes.len() as u64;
+        migration.sha256 = hex::encode(Sha256::digest(bytes));
+        migration.md5 = hex::encode(Md5::digest(bytes));
+        migration.git_blob_oid = blob.clone();
+        let contract = capability
+            .d1_approved_mln_import
+            .as_ref()
+            .expect("contract")
+            .clone();
+        validate_approved_mln_repository_authority(
+            &contract,
+            &contract.migrations[0],
+            &repository,
+            Some(bytes),
+        )
+        .expect("exact portable repository authority");
+
+        for remote in [
+            "https://github.com/rogu3bear/mln-web.git",
+            "https://github.com/rogu3bear/mln-web",
+            "git@github.com:rogu3bear/mln-web.git",
+            "git@github.com:rogu3bear/mln-web",
+        ] {
+            assert_eq!(
+                normalize_reviewed_mln_repository_id(remote).as_deref(),
+                Some("github.com/rogu3bear/mln-web")
+            );
+        }
+        for remote in [
+            "https://user@github.com/rogu3bear/mln-web.git",
+            "https://github.com:443/rogu3bear/mln-web.git",
+            "https://github.com/rogu3bear/mln-web.git?x=1",
+            "https://example.com/rogu3bear/mln-web.git",
+        ] {
+            assert!(normalize_reviewed_mln_repository_id(remote).is_none());
+        }
+
+        let state = tempfile::tempdir().expect("state root");
+        let store =
+            StateStore::open(RuntimePaths::from_root(state.path())).expect("state store opens");
+        let input = CallInput {
+            body: Some(json!({"migration_id":"0142"})),
+            ..CallInput::default()
+        };
+        let staged = stage_approved_mln_migration(&store, &capability, &input, &source)
+            .expect("exact reviewed source stages");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            contract.account_id.as_str(),
+            "catalog-sha",
+            capability.clone(),
+            json!({"adapter":{"approved_mln_import":staged}}),
+        )
+        .expect("managed import plan");
+        plan.input = serde_json::to_value(&input).expect("plan input");
+        plan.refresh_hash().expect("refresh staged plan");
+        validate_managed_mln_stage_authority(&plan).expect("managed stage authority");
+        let graft = root.path().join("graft").join(relative);
+        fs::create_dir_all(graft.parent().expect("graft parent")).expect("graft directory");
+        fs::write(&graft, bytes).expect("graft bytes");
+        assert!(
+            stage_approved_mln_migration(&store, &capability, &input, &graft).is_err(),
+            "an exact-byte suffix graft outside the reviewed Git authority must fail"
+        );
+
+        let mut wrong = contract.clone();
+        wrong.repository_head = "1111111111111111111111111111111111111111".to_owned();
+        assert!(
+            validate_approved_mln_repository_authority(
+                &wrong,
+                &wrong.migrations[0],
+                &repository,
+                Some(bytes)
+            )
+            .is_err()
+        );
+        let mut wrong = contract.clone();
+        wrong.repository_id = "github.com/attacker/mln-web".to_owned();
+        assert!(
+            validate_approved_mln_repository_authority(
+                &wrong,
+                &wrong.migrations[0],
+                &repository,
+                Some(bytes)
+            )
+            .is_err()
+        );
+        let mut wrong_migration = contract.migrations[0].clone();
+        wrong_migration.git_blob_oid = "1111111111111111111111111111111111111111".to_owned();
+        assert!(
+            validate_approved_mln_repository_authority(
+                &contract,
+                &wrong_migration,
+                &repository,
+                Some(bytes)
+            )
+            .is_err()
+        );
+        fs::write(&source, b"dirty source\n").expect("dirty source");
+        assert!(
+            validate_approved_mln_repository_authority(
+                &contract,
+                &contract.migrations[0],
+                &repository,
+                Some(bytes)
+            )
+            .is_err(),
+            "dirty worktree source must fail"
+        );
+        validate_managed_mln_stage_authority(&plan)
+            .expect("execution consumes the immutable managed stage, not the changed checkout");
+        git(&["checkout", "--", relative]);
+        let symlink_root = root.path().join("mln-link");
+        std::os::unix::fs::symlink(&repository, &symlink_root).expect("root symlink");
+        assert!(
+            validate_approved_mln_repository_authority(
+                &contract,
+                &contract.migrations[0],
+                &symlink_root,
+                Some(bytes)
+            )
+            .is_err(),
+            "symlink root substitution must fail"
+        );
+        let stage_path = plan
+            .targets
+            .pointer("/adapter/approved_mln_import/stage_path")
+            .and_then(Value::as_str)
+            .expect("managed stage path");
+        fs::write(stage_path, b"tampered stage\n").expect("tamper managed stage");
+        assert!(
+            validate_managed_mln_stage_authority(&plan).is_err(),
+            "execution must reject a managed stage that drifted after planning"
+        );
     }
 
     #[test]
