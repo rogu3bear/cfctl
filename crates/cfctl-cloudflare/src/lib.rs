@@ -110,6 +110,10 @@ pub enum CloudflareError {
     D1ImportUploadResponseIntegrityFailure,
     #[error("D1 import init returned a known rejected or invalid provider response")]
     D1ImportInitResponseFailure,
+    #[error("D1 import ingest returned a known rejected or invalid provider response")]
+    D1ImportIngestResponseFailure,
+    #[error("D1 import poll returned a known rejected or invalid provider response")]
+    D1ImportPollResponseFailure,
     #[error("plan or capability `{capability_id}` is not an exact consumed event batch contract")]
     InvalidEventBatchPlan { capability_id: String },
     #[error("Cloudflare API base URL cannot accept path segments")]
@@ -2614,19 +2618,12 @@ impl Executor {
                 return Err(error);
             }
         };
-        persist_import_response(&mut persist, plan, "ingest_response", &ingest, None)?;
-        if !ingest.success {
+        let Ok(at_bookmark) = classify_d1_import_ingest_response(&ingest) else {
             plan.status = PlanStatus::RectificationRequired;
-            return Ok(ingest);
-        }
-        let at_bookmark = match accepted_d1_import_ingest_response(&ingest) {
-            Ok(bookmark) => bookmark,
-            Err(error) => {
-                plan.status = PlanStatus::RectificationRequired;
-                return Err(error);
-            }
+            persist_import_response(&mut persist, plan, "ingest_response", &ingest, None)?;
+            return Err(CloudflareError::D1ImportIngestResponseFailure);
         };
-        let at_bookmark = at_bookmark.to_owned();
+        persist_import_response(&mut persist, plan, "ingest_response", &ingest, None)?;
         for attempt in 1..=contract.max_poll_attempts {
             let poll = match send_provider(serde_json::json!({
                 "action":"poll",
@@ -2645,6 +2642,17 @@ impl Executor {
                     return Err(error);
                 }
             };
+            let Ok(poll_outcome) = classify_d1_import_poll_response(&poll, &at_bookmark) else {
+                plan.status = PlanStatus::RectificationRequired;
+                persist_import_response(
+                    &mut persist,
+                    plan,
+                    &format!("poll_response_{attempt}"),
+                    &poll,
+                    None,
+                )?;
+                return Err(CloudflareError::D1ImportPollResponseFailure);
+            };
             persist_import_response(
                 &mut persist,
                 plan,
@@ -2652,17 +2660,6 @@ impl Executor {
                 &poll,
                 None,
             )?;
-            if !poll.success {
-                plan.status = PlanStatus::RectificationRequired;
-                return Ok(poll);
-            }
-            let poll_outcome = match accepted_d1_import_poll_outcome(&poll, &at_bookmark) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    plan.status = PlanStatus::RectificationRequired;
-                    return Err(error);
-                }
-            };
             match poll_outcome {
                 D1ImportPollOutcome::Complete(final_bookmark) => {
                     let staged_identity = plan
@@ -8958,6 +8955,17 @@ fn accepted_d1_import_ingest_response(response: &CloudflareResponseV1) -> Result
         })
 }
 
+fn classify_d1_import_ingest_response(
+    response: &CloudflareResponseV1,
+) -> std::result::Result<String, ()> {
+    if !response.success {
+        return Err(());
+    }
+    accepted_d1_import_ingest_response(response)
+        .map(str::to_owned)
+        .map_err(|_| ())
+}
+
 fn validate_d1_import_poll_response<'a>(
     response: &'a CloudflareResponseV1,
     expected_at_bookmark: &str,
@@ -9012,6 +9020,16 @@ fn accepted_d1_import_poll_outcome<'a>(
         D1ImportPollOutcome::ProviderError => Err(CloudflareError::D1ImportProviderFailure),
         outcome => Ok(outcome),
     }
+}
+
+fn classify_d1_import_poll_response<'a>(
+    response: &'a CloudflareResponseV1,
+    expected_at_bookmark: &str,
+) -> std::result::Result<D1ImportPollOutcome<'a>, ()> {
+    if !response.success {
+        return Err(());
+    }
+    accepted_d1_import_poll_outcome(response, expected_at_bookmark).map_err(|_| ())
 }
 
 #[expect(
@@ -9190,7 +9208,8 @@ mod approved_mln_import_tests {
     use super::{
         CloudflareError, D1ImportPollOutcome, accepted_d1_import_ingest_response,
         accepted_d1_import_init_response, accepted_d1_import_poll_outcome,
-        bounded_d1_import_upload, classify_d1_import_init_response, parse_response,
+        bounded_d1_import_upload, classify_d1_import_ingest_response,
+        classify_d1_import_init_response, classify_d1_import_poll_response, parse_response,
         persist_import_response, persist_import_uncertainty, validate_d1_import_poll_response,
         validate_d1_import_upload_url, validated_d1_import_upload_etag,
     };
@@ -9469,6 +9488,70 @@ mod approved_mln_import_tests {
             .is_err()
         );
         assert_eq!(upload_attempts, 0);
+    }
+
+    #[test]
+    fn approved_import_classifies_ingest_and_poll_before_later_actions() {
+        let response = |success, result| {
+            parse_response(200, &json!({"success":success,"result":result}), None, None)
+        };
+        let valid_ingest = response(
+            true,
+            json!({"type":"import","status":"active","success":true,"at_bookmark":"owned"}),
+        );
+        assert_eq!(
+            classify_d1_import_ingest_response(&valid_ingest).expect("valid ingest"),
+            "owned"
+        );
+        let invalid_ingest = [
+            json!({"status":"active","success":true,"at_bookmark":"b"}),
+            json!({"type":"export","status":"active","success":true,"at_bookmark":"b"}),
+            json!({"type":"import","success":true,"at_bookmark":"b"}),
+            json!({"type":"import","status":"unknown","success":true,"at_bookmark":"b"}),
+            json!({"type":"import","status":"active","success":false,"at_bookmark":"b"}),
+            json!({"type":"import","status":"active","success":"yes","at_bookmark":"b"}),
+            json!({"type":"import","status":"active","success":true}),
+            json!({"type":"import","status":"active","success":true,"at_bookmark":""}),
+            json!({"type":"import","status":"error","success":false,"at_bookmark":"b","error":"SECRET"}),
+        ];
+        let poll_attempts = 0_u8;
+        for result in invalid_ingest {
+            assert!(classify_d1_import_ingest_response(&response(true, result)).is_err());
+        }
+        assert!(
+            classify_d1_import_ingest_response(&response(
+                false,
+                json!({"type":"import","status":"active","success":true,"at_bookmark":"b"})
+            ))
+            .is_err()
+        );
+        assert_eq!(poll_attempts, 0);
+
+        let valid_poll = response(
+            true,
+            json!({"type":"import","status":"pending","success":true,"at_bookmark":"owned"}),
+        );
+        assert_eq!(
+            classify_d1_import_poll_response(&valid_poll, "owned"),
+            Ok(D1ImportPollOutcome::InProgress)
+        );
+        for result in [
+            json!({"type":"import","status":"pending","success":true,"at_bookmark":"wrong"}),
+            json!({"type":"import","status":"complete","success":true,"at_bookmark":"owned"}),
+            json!({"type":"import","status":"error","success":false,"at_bookmark":"owned","error":"SECRET"}),
+        ] {
+            assert!(classify_d1_import_poll_response(&response(true, result), "owned").is_err());
+        }
+        assert!(
+            classify_d1_import_poll_response(
+                &response(
+                    false,
+                    json!({"type":"import","status":"pending","success":true,"at_bookmark":"owned"})
+                ),
+                "owned"
+            )
+            .is_err()
+        );
     }
 
     #[test]

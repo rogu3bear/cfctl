@@ -13953,6 +13953,211 @@ fn known_import_init_response_failure_envelope(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the ingest and poll receipt join validates every action and authority field"
+)]
+fn exact_durable_action_response_failure(
+    store: &StateStore,
+    plan: &PlanV1,
+    action: &str,
+) -> Result<(EvidenceV1, Value)> {
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    let migration_id = plan
+        .input
+        .pointer("/body/migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("approved MLN import migration id is missing".to_owned()))?;
+    let target = json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    });
+    let input_hash = hash_value(&plan.input)?;
+    let failures = store
+        .read_d1_import_checkpoints(&plan.operation_id)?
+        .into_iter()
+        .filter(|(_, checkpoint)| {
+            let Some(step) = checkpoint.get("step").and_then(Value::as_str) else {
+                return false;
+            };
+            let step_matches = match action {
+                "ingest" => step == "ingest_response",
+                "poll" => step.starts_with("poll_response_"),
+                _ => false,
+            };
+            let Some(result) = checkpoint
+                .pointer("/receipt/result")
+                .and_then(Value::as_object)
+            else {
+                return false;
+            };
+            let allowed = [
+                "type",
+                "status",
+                "success",
+                "at_bookmark",
+                "result",
+                "provider_error_present",
+            ];
+            let projected = result.keys().all(|key| allowed.contains(&key.as_str()))
+                && result.get("result").is_none_or(|nested| {
+                    nested.as_object().is_some_and(|object| {
+                        object.len() == 1 && object.contains_key("final_bookmark")
+                    })
+                });
+            step_matches
+                && checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+                && checkpoint.get("operation_id").and_then(Value::as_str)
+                    == Some(plan.operation_id.as_str())
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/response_action")
+                    .and_then(Value::as_str)
+                    == Some(action)
+                && checkpoint
+                    .pointer("/receipt/provider")
+                    .and_then(Value::as_str)
+                    == Some("cloudflare")
+                && checkpoint
+                    .pointer("/receipt/effect")
+                    .and_then(Value::as_str)
+                    == Some("d1_import_response")
+                && checkpoint
+                    .pointer("/receipt/migration_id")
+                    .and_then(Value::as_str)
+                    == Some(migration_id)
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash.as_str())
+                && checkpoint
+                    .pointer("/receipt/no_replay")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint.pointer("/receipt/etag").is_none()
+                && projected
+        })
+        .collect::<Vec<_>>();
+    if failures.len() != 1 {
+        return Err(CliError::Input(format!(
+            "known {action} response requires exactly one operation-bound durable redacted checkpoint"
+        )));
+    }
+    let (hash, checkpoint) = &failures[0];
+    if store.read_evidence_value(hash)? != *checkpoint {
+        return Err(CliError::Input(format!(
+            "known {action}-response evidence does not match its immutable checkpoint"
+        )));
+    }
+    Ok((
+        EvidenceV1::new(
+            EvidenceClass::Apply,
+            hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!("{}.json", hash.trim_start_matches("sha256:")))
+                .display()
+                .to_string(),
+        ),
+        checkpoint.clone(),
+    ))
+}
+
+fn known_import_action_response_failure_envelope(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    error: CloudflareError,
+    secrets: &dyn SecretStore,
+) -> ResultEnvelopeV2 {
+    plan.status = PlanStatus::RectificationRequired;
+    let action = if matches!(error, CloudflareError::D1ImportIngestResponseFailure) {
+        "ingest"
+    } else {
+        "poll"
+    };
+    match exact_durable_action_response_failure(store, plan, action) {
+        Ok((evidence, checkpoint)) => {
+            let provider_rejected = checkpoint
+                .pointer("/receipt/success")
+                .and_then(Value::as_bool)
+                == Some(false)
+                || checkpoint
+                    .pointer("/receipt/result/status")
+                    .and_then(Value::as_str)
+                    == Some("error");
+            let outcome = if provider_rejected {
+                "provider_rejected"
+            } else {
+                "invalid_provider_response"
+            };
+            let artifact = json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":outcome,
+                "receipt_available":true,
+                "response_action":action,
+                "response_evidence_hash":evidence.content_hash,
+            });
+            let _ = persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                artifact,
+            );
+            let _ = persist_secret_lifecycle(store, plan, false, None, secrets);
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":outcome,
+                    "receipt_available":true,
+                    "response_action":action,
+                }),
+                Some(evidence),
+                None,
+                &CliError::Input(format!(
+                    "Cloudflare returned a known rejected or invalid D1 import {action} response"
+                )),
+                true,
+                &format!(
+                    "the exact action-projected Cloudflare {action} response is durable; no later import action occurred and the import must not be replayed"
+                ),
+            )
+        }
+        Err(error) => {
+            let _ = store.save_plan(plan);
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":"provider_response_receipt_invalid",
+                    "receipt_available":false,
+                    "response_action":action,
+                }),
+                None,
+                None,
+                &error,
+                true,
+                &format!(
+                    "Cloudflare returned an {action} response, but its exact durable redacted checkpoint could not be uniquely resolved; do not replay"
+                ),
+            )
+        }
+    }
+}
+
 fn approved_mln_import_execution_error_envelope(
     store: &StateStore,
     plan: &mut PlanV1,
@@ -13970,6 +14175,13 @@ fn approved_mln_import_execution_error_envelope(
     }
     if matches!(error, CloudflareError::D1ImportInitResponseFailure) {
         return known_import_init_response_failure_envelope(store, plan, secrets);
+    }
+    if matches!(
+        error,
+        CloudflareError::D1ImportIngestResponseFailure
+            | CloudflareError::D1ImportPollResponseFailure
+    ) {
+        return known_import_action_response_failure_envelope(store, plan, error, secrets);
     }
     if !matches!(
         plan.status,
@@ -14007,7 +14219,8 @@ fn persist_d1_import_checkpoint(
             == Some(false);
     let durable_apply = checkpoint.step == "provider_complete"
         || terminal_provider_failure
-        || (checkpoint.step == "init_response" && checkpoint.rectification_required)
+        || (checkpoint.receipt.get("effect").and_then(Value::as_str) == Some("d1_import_response")
+            && checkpoint.rectification_required)
         || checkpoint.receipt.get("effect").and_then(Value::as_str)
             == Some("d1_import_ingest_accepted")
         || checkpoint.receipt.get("effect").and_then(Value::as_str)
@@ -22002,6 +22215,82 @@ mod tests {
                     .unwrap_or_default()
                     .contains(forbidden)
             );
+        }
+
+        for (action, step, error) in [
+            (
+                "ingest",
+                "ingest_response",
+                CloudflareError::D1ImportIngestResponseFailure,
+            ),
+            (
+                "poll",
+                "poll_response_1",
+                CloudflareError::D1ImportPollResponseFailure,
+            ),
+        ] {
+            let action_root = tempfile::tempdir().expect("known action response root");
+            let action_store = StateStore::open(RuntimePaths::from_root(action_root.path()))
+                .expect("action response store");
+            let mut action_plan = build_plan();
+            let action_checkpoint = D1ImportCheckpointV1 {
+                schema_version: 1,
+                operation_id: action_plan.operation_id.clone(),
+                step: step.to_owned(),
+                performed: true,
+                rectification_required: true,
+                receipt: json!({
+                    "http_status":200,
+                    "success":true,
+                    "response_action":action,
+                    "provider":"cloudflare",
+                    "effect":"d1_import_response",
+                    "migration_id":"0143",
+                    "target":{
+                        "account_id":contract.account_id,
+                        "database_id":contract.database_id,
+                    },
+                    "plan_input_hash":hash_value(&action_plan.input).expect("input hash"),
+                    "result":{
+                        "type":"import",
+                        "status":"unsupported",
+                        "success":true,
+                        "at_bookmark":"owned",
+                        "result":{"final_bookmark":null},
+                        "provider_error_present":false,
+                    },
+                    "errors":[],
+                    "provider_errors_present":false,
+                    "no_replay":true,
+                    "etag_present":false,
+                    "etag_sha256":null,
+                    "cf_ray":null,
+                }),
+            };
+            persist_d1_import_checkpoint(
+                &action_store,
+                &action_plan.operation_id,
+                &action_checkpoint,
+            )
+            .expect("durable action response");
+            let action_envelope = approved_mln_import_execution_error_envelope(
+                &action_store,
+                &mut action_plan,
+                error,
+                &MemorySecretStore::default(),
+            );
+            assert!(action_envelope.performed, "{action}");
+            assert_eq!(
+                action_envelope.result["outcome"], "invalid_provider_response",
+                "{action}"
+            );
+            assert_eq!(
+                action_envelope.result["receipt_available"], true,
+                "{action}"
+            );
+            assert_eq!(action_envelope.result["response_action"], action);
+            assert_ne!(action_plan.status, PlanStatus::Running);
+            assert!(!action_envelope.result.to_string().contains("SECRET"));
         }
 
         let root = tempfile::tempdir().expect("known failure root");
