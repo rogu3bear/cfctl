@@ -13608,10 +13608,50 @@ fn exact_linear_poll_child_provider_complete(
     store: &StateStore,
     root: &PlanV1,
 ) -> Result<DurableProviderCompleteBoundary> {
+    let mut trusted_catalog = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "native://control".to_owned(),
+        source_hash: "sha256:native-control".to_owned(),
+        schema_hash: String::new(),
+        capabilities: BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut trusted_catalog)?;
+    let canonical_capability = trusted_catalog
+        .capabilities
+        .remove("d1-resume-approved-mln-import-poll")
+        .ok_or_else(|| {
+            CliError::Input("trusted poll continuation declaration is missing".to_owned())
+        })?;
+    let canonical_contract_hash = hash_value(&serde_json::to_value(&canonical_capability)?)?;
     let root_v2 = store.load_plan_v2(&root.operation_id)?;
     if root_v2.plan != *root {
         return Err(CliError::Input(
             "root import projection does not match its canonical PlanV2".to_owned(),
+        ));
+    }
+    let root_contract = root
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("root approved import contract is missing".to_owned()))?;
+    let canonical_contract = canonical_capability
+        .d1_approved_mln_import_poll_resume
+        .as_ref()
+        .ok_or_else(|| {
+            CliError::Input("trusted poll continuation contract is missing".to_owned())
+        })?;
+    let root_target = json!({
+        "account_id":root_contract.account_id,
+        "database_id":root_contract.database_id,
+    });
+    if root.account_id != root_contract.account_id
+        || canonical_contract.account_id != root_contract.account_id
+        || canonical_contract.database_id != root_contract.database_id
+        || root.targets.pointer("/adapter/approved_mln_import/target") != Some(&root_target)
+    {
+        return Err(CliError::Input(
+            "root, managed stage, and trusted poll continuation target drifted".to_owned(),
         ));
     }
     let discovered = store
@@ -13643,6 +13683,7 @@ fn exact_linear_poll_child_provider_complete(
                 || current.pins.credential_generation_id
                     != root_v2.pins.credential_generation_id
                 || current.plan.capability.id != "d1-resume-approved-mln-import-poll"
+                || current.plan.capability != canonical_capability
                 || current.plan.approval.is_none()
             {
                 return Err(CliError::Input(
@@ -13694,7 +13735,8 @@ fn exact_linear_poll_child_provider_complete(
                 || authority
                     .get("capability_contract_hash")
                     .and_then(Value::as_str)
-                    != Some(contract_hash.as_str())
+                    != Some(canonical_contract_hash.as_str())
+                || contract_hash != canonical_contract_hash
                 || authority.get("root_operation_id").and_then(Value::as_str)
                     != Some(root.operation_id.as_str())
                 || authority.get("root_plan_hash").and_then(Value::as_str)
@@ -13708,6 +13750,8 @@ fn exact_linear_poll_child_provider_complete(
                     .query
                     .as_object()
                     .is_none_or(serde_json::Map::is_empty)
+                || input.if_match.is_some()
+                || input.if_none_match.is_some()
                 || body.keys().map(String::as_str).collect::<BTreeSet<_>>()
                     != exact_input_fields
                 || body.get("parent_operation_id") != authority.get("parent_operation_id")
@@ -13788,6 +13832,20 @@ fn exact_linear_poll_child_provider_complete(
         {
             return Err(CliError::Input(
                 "poll child parent PlanV2, credential, or chronology drifted".to_owned(),
+            ));
+        }
+        let parent_target = if parent.operation_id == root.operation_id {
+            root_target.clone()
+        } else {
+            parent
+                .targets
+                .pointer("/adapter/approved_mln_import_poll_resume/target")
+                .cloned()
+                .ok_or_else(|| CliError::Input("poll child parent target is missing".to_owned()))?
+        };
+        if authority.get("target") != Some(&parent_target) {
+            return Err(CliError::Input(
+                "poll child target does not match its exact parent target".to_owned(),
             ));
         }
         let (exhaustion_hash, accepted_hash, bookmark) = if parent.operation_id == root.operation_id
@@ -22026,6 +22084,210 @@ mod tests {
     }
 
     #[test]
+    fn poll_child_resolver_rejects_conditionals_canonical_hash_and_parent_target_grafts() {
+        for generations in [1, 2] {
+            for conditional in ["if_match", "if_none_match"] {
+                let fixture = build_poll_child_lineage(generations);
+                let index = generations - 1;
+                let mut child = fixture.children[index].clone();
+                let response_artifact = child
+                    .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                    .expect("terminal response artifact")
+                    .clone();
+                let mut input: CallInput =
+                    serde_json::from_value(child.input.clone()).expect("child input");
+                if conditional == "if_match" {
+                    input.if_match = Some("grafted-etag".to_owned());
+                } else {
+                    input.if_none_match = Some("grafted-etag".to_owned());
+                }
+                child.input = serde_json::to_value(input).expect("conditional child input");
+                let terminal_status = child.status;
+                rebuild_poll_child_terminal_lifecycle(
+                    &mut child,
+                    terminal_status,
+                    response_artifact,
+                );
+                let pins = fixture
+                    .store
+                    .load_plan_v2(&child.operation_id)
+                    .expect("canonical child")
+                    .pins;
+                persist_poll_test_plan_v2(&fixture.store, &child, pins);
+                assert!(
+                    super::exact_linear_poll_child_provider_complete(
+                        &fixture.store,
+                        &fixture.root_plan
+                    )
+                    .is_err(),
+                    "{conditional} must fail closed for generation {generations}"
+                );
+            }
+        }
+
+        for intermediate in [false, true] {
+            let fixture = build_poll_child_lineage(if intermediate { 2 } else { 1 });
+            let index = 0;
+            let mut child = fixture.children[index].clone();
+            let response_artifact = child
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .expect("response artifact")
+                .clone();
+            let substituted_hash =
+                hash_value(&serde_json::to_value(&fixture.root_plan.capability).expect("root cap"))
+                    .expect("substituted canonical hash");
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["capability_contract_hash"] =
+                json!(substituted_hash);
+            let status = child.status;
+            rebuild_poll_child_terminal_lifecycle(&mut child, status, response_artifact);
+            let pins = fixture
+                .store
+                .load_plan_v2(&child.operation_id)
+                .expect("canonical child")
+                .pins;
+            persist_poll_test_plan_v2(&fixture.store, &child, pins);
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err(),
+                "another canonical capability hash must not substitute"
+            );
+        }
+
+        let fixture = build_poll_child_lineage(2);
+        let mut terminal = fixture.children[1].clone();
+        let response_artifact = terminal
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .expect("terminal response artifact")
+            .clone();
+        terminal.targets["adapter"]["approved_mln_import_poll_resume"]["target"] = json!({
+            "account_id":"target-b",
+            "database_id":"22222222-2222-4222-8222-222222222222",
+        });
+        let mut input: CallInput =
+            serde_json::from_value(terminal.input.clone()).expect("terminal input");
+        input.selectors =
+            terminal.targets["adapter"]["approved_mln_import_poll_resume"]["target"].clone();
+        terminal.input = serde_json::to_value(input).expect("target-grafted input");
+        rebuild_poll_child_terminal_lifecycle(
+            &mut terminal,
+            PlanStatus::Running,
+            response_artifact,
+        );
+        let pins = fixture
+            .store
+            .load_plan_v2(&terminal.operation_id)
+            .expect("canonical terminal")
+            .pins;
+        persist_poll_test_plan_v2(&fixture.store, &terminal, pins);
+        assert!(
+            super::exact_linear_poll_child_provider_complete(&fixture.store, &fixture.root_plan)
+                .is_err(),
+            "terminal target must match its exact intermediate parent"
+        );
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_fully_coordinated_target_b_substitution() {
+        for intermediate in [false, true] {
+            let fixture = build_poll_child_lineage(if intermediate { 2 } else { 1 });
+            let mut child = fixture.children[0].clone();
+            let original_apply =
+                (!intermediate).then(|| completed_poll_child_apply_response(&fixture));
+            let target_b = json!({
+                "account_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "database_id":"22222222-2222-4222-8222-222222222222",
+            });
+            let contract = child
+                .capability
+                .d1_approved_mln_import_poll_resume
+                .as_mut()
+                .expect("poll child contract");
+            contract.account_id = target_b["account_id"]
+                .as_str()
+                .expect("target B account")
+                .to_owned();
+            contract.database_id = target_b["database_id"]
+                .as_str()
+                .expect("target B database")
+                .to_owned();
+            child.account_id = contract.account_id.clone();
+            let mut input: CallInput =
+                serde_json::from_value(child.input.clone()).expect("child input");
+            input.selectors = target_b.clone();
+            child.input = serde_json::to_value(input).expect("target B input");
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["target"] =
+                target_b.clone();
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["root_stage"]["target"] =
+                target_b.clone();
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["root_input"]["selectors"] =
+                target_b.clone();
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["capability_contract_hash"] = json!(
+                hash_value(&serde_json::to_value(&child.capability).expect("target B capability"))
+                    .expect("target B capability hash")
+            );
+            let rewritten =
+                rewrite_poll_test_checkpoints_for_target(&fixture.store, &child, &target_b);
+            let response_artifact = if intermediate {
+                let (exhaustion_hash, _) = rewritten
+                    .get("poll_in_progress_exhausted")
+                    .expect("rewritten exhaustion");
+                let accepted_hash = child
+                    .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                    .and_then(|artifact| artifact.get("accepted_ingest_evidence_hash"))
+                    .and_then(Value::as_str)
+                    .expect("accepted evidence hash");
+                json!({
+                    "adapter":"dynamic_api",
+                    "performed":true,
+                    "success":false,
+                    "outcome":"poll_in_progress_exhausted",
+                    "receipt_available":true,
+                    "poll_exhaustion_evidence_hash":exhaustion_hash,
+                    "accepted_ingest_evidence_hash":accepted_hash,
+                })
+            } else {
+                let (_, completion) = rewritten
+                    .get("provider_complete")
+                    .expect("rewritten completion");
+                let mut response = original_apply.expect("original apply response");
+                response["result"]["_cfctl"] = completion["receipt"].clone();
+                response["result"]["at_bookmark"] = completion["receipt"]["at_bookmark"].clone();
+                response["result"]["result"]["final_bookmark"] =
+                    completion["receipt"]["final_bookmark"].clone();
+                let apply = fixture
+                    .store
+                    .write_evidence(EvidenceClass::Apply, &response)
+                    .expect("target B apply evidence");
+                let mut artifact = child
+                    .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                    .expect("completion response artifact")
+                    .clone();
+                artifact["apply_evidence_hash"] = json!(apply.content_hash);
+                artifact
+            };
+            let status = child.status;
+            rebuild_poll_child_terminal_lifecycle(&mut child, status, response_artifact);
+            let pins = fixture
+                .store
+                .load_plan_v2(&child.operation_id)
+                .expect("canonical child")
+                .pins;
+            persist_poll_test_plan_v2(&fixture.store, &child, pins);
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err(),
+                "fully coordinated target B substitution must fail closed"
+            );
+        }
+    }
+
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "the adversarial anchor fixture keeps every joined authority dimension visible"
@@ -23081,15 +23343,15 @@ mod tests {
             .as_mut()
             .expect("root contract")
             .max_poll_attempts = 1;
-        let mut child_capability = catalog
+        let child_capability = catalog
             .capabilities
             .remove("d1-resume-approved-mln-import-poll")
             .expect("child poll capability");
-        child_capability
+        let child_poll_bound = child_capability
             .d1_approved_mln_import_poll_resume
-            .as_mut()
+            .as_ref()
             .expect("child contract")
-            .max_poll_attempts = 1;
+            .max_poll_attempts;
         let root_contract = root_capability
             .d1_approved_mln_import
             .clone()
@@ -23319,24 +23581,26 @@ mod tests {
                     super::ApiBoundaryResponseOutcome::Ready { .. }
                 ));
             } else {
-                let child_poll = json!({
-                    "schema_version":1,
-                    "operation_id":child.operation_id,
-                    "step":"poll_response_1",
-                    "performed":true,
-                    "rectification_required":false,
-                    "receipt":{
-                        "http_status":200,"success":true,"response_action":"poll",
-                        "provider":"cloudflare","effect":"d1_import_response",
-                        "migration_id":"0143","target":target,"plan_input_hash":child_input_hash,
-                        "result":{"type":"import","status":"active","success":true,
-                            "at_bookmark":"accepted","result":{"final_bookmark":null},
-                            "provider_error_present":false},
-                        "errors":[],"provider_errors_present":false,"no_replay":false,
-                        "etag_present":false,"etag_sha256":null,"cf_ray":null
-                    }
-                });
-                persist_poll_lineage_checkpoint(&store, &child.operation_id, &child_poll);
+                for attempt in 1..=child_poll_bound {
+                    let child_poll = json!({
+                        "schema_version":1,
+                        "operation_id":child.operation_id,
+                        "step":format!("poll_response_{attempt}"),
+                        "performed":true,
+                        "rectification_required":false,
+                        "receipt":{
+                            "http_status":200,"success":true,"response_action":"poll",
+                            "provider":"cloudflare","effect":"d1_import_response",
+                            "migration_id":"0143","target":target,"plan_input_hash":child_input_hash,
+                            "result":{"type":"import","status":"active","success":true,
+                                "at_bookmark":"accepted","result":{"final_bookmark":null},
+                                "provider_error_present":false},
+                            "errors":[],"provider_errors_present":false,"no_replay":false,
+                            "etag_present":false,"etag_sha256":null,"cf_ray":null
+                        }
+                    });
+                    persist_poll_lineage_checkpoint(&store, &child.operation_id, &child_poll);
+                }
                 let exhaustion = json!({
                     "schema_version":1,
                     "operation_id":child.operation_id,
@@ -23347,7 +23611,7 @@ mod tests {
                         "provider":"cloudflare","effect":"d1_import_poll_in_progress_exhausted",
                         "migration_id":"0143","target":target,"plan_input_hash":child_input_hash,
                         "source_sha256":root_stage["sha256"],"at_bookmark":"accepted",
-                        "attempt_count":1,"attempt_bound":1,
+                        "attempt_count":child_poll_bound,"attempt_bound":child_poll_bound,
                         "outcome":"poll_in_progress_exhausted","receipt_available":true,
                         "no_replay":true
                     }
@@ -23704,6 +23968,40 @@ mod tests {
             serde_json::to_vec_pretty(&document).expect("encode drifted PlanV2"),
         )
         .expect("persist drifted PlanV2");
+    }
+
+    fn rewrite_poll_test_checkpoints_for_target(
+        store: &StateStore,
+        plan: &PlanV1,
+        target: &Value,
+    ) -> BTreeMap<String, (String, Value)> {
+        let checkpoints = store
+            .read_d1_import_checkpoints(&plan.operation_id)
+            .expect("read target-drift checkpoints");
+        let directory = store
+            .paths()
+            .data_dir
+            .join("d1-import-checkpoints")
+            .join(&plan.operation_id);
+        for entry in fs::read_dir(&directory).expect("checkpoint directory") {
+            fs::remove_file(entry.expect("checkpoint entry").path())
+                .expect("remove old checkpoint");
+        }
+        let input_hash = hash_value(&plan.input).expect("target-drift input hash");
+        checkpoints
+            .into_iter()
+            .map(|(_, mut checkpoint)| {
+                checkpoint["receipt"]["target"] = target.clone();
+                checkpoint["receipt"]["plan_input_hash"] = json!(input_hash);
+                let step = checkpoint
+                    .get("step")
+                    .and_then(Value::as_str)
+                    .expect("checkpoint step")
+                    .to_owned();
+                let hash = persist_poll_lineage_checkpoint(store, &plan.operation_id, &checkpoint);
+                (step, (hash, checkpoint))
+            })
+            .collect()
     }
 
     fn rebind_completed_poll_child_apply_evidence(
