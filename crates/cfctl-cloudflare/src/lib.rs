@@ -2508,48 +2508,14 @@ impl Executor {
                 return Err(error);
             }
         };
-        if !init.success {
+        let Ok(init_fields) = classify_d1_import_init_response(&init, contract) else {
             plan.status = PlanStatus::RectificationRequired;
             persist_import_response(&mut persist, plan, "init_response", &init, None)?;
             return Err(CloudflareError::D1ImportInitResponseFailure);
-        }
-        if accepted_d1_import_init_response(&init).is_err() {
-            plan.status = PlanStatus::RectificationRequired;
-            persist_import_response(&mut persist, plan, "init_response", &init, None)?;
-            return Err(CloudflareError::D1ImportInitResponseFailure);
-        }
-        let upload_url_raw = init.result.get("upload_url").and_then(Value::as_str);
-        let filename_raw = init.result.get("filename").and_then(Value::as_str);
-        persist_import_response(
-            &mut persist,
-            plan,
-            "init_response",
-            &init,
-            Some(serde_json::json!({
-                "filename":filename_raw,
-                "upload_url_sha256":upload_url_raw.map(|value| format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))),
-            })),
-        )?;
-        let Some(upload_url_raw) = upload_url_raw else {
-            plan.status = PlanStatus::RectificationRequired;
-            return Err(CloudflareError::InvalidRequestBody(
-                "D1 import init omitted upload_url; do not replay".to_owned(),
-            ));
         };
-        let Some(filename) = filename_raw.filter(|value| !value.is_empty() && value.len() <= 512)
-        else {
-            plan.status = PlanStatus::RectificationRequired;
-            return Err(CloudflareError::InvalidRequestBody(
-                "D1 import init omitted filename; do not replay".to_owned(),
-            ));
-        };
-        let upload_url = match validate_d1_import_upload_url(upload_url_raw, contract) {
-            Ok(url) => url,
-            Err(error) => {
-                plan.status = PlanStatus::RectificationRequired;
-                return Err(error);
-            }
-        };
+        persist_import_response(&mut persist, plan, "init_response", &init, None)?;
+        let upload_url = init_fields.upload_url;
+        let filename = init_fields.filename;
         let Ok((upload_status, upload_headers)) = bounded_d1_import_upload(
             &self.upload_client,
             upload_url,
@@ -8925,6 +8891,45 @@ fn accepted_d1_import_init_response(response: &CloudflareResponseV1) -> Result<(
     }
 }
 
+struct AcceptedD1ImportInit {
+    filename: String,
+    upload_url: Url,
+}
+
+fn classify_d1_import_init_response(
+    response: &CloudflareResponseV1,
+    contract: &D1ApprovedMlnImportContractV1,
+) -> std::result::Result<AcceptedD1ImportInit, ()> {
+    if !response.success || accepted_d1_import_init_response(response).is_err() {
+        return Err(());
+    }
+    let filename = response
+        .result
+        .get("filename")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 512
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+                && !value.starts_with('.')
+                && !value.ends_with('.')
+        })
+        .ok_or(())?
+        .to_owned();
+    let upload_url_raw = response
+        .result
+        .get("upload_url")
+        .and_then(Value::as_str)
+        .ok_or(())?;
+    let upload_url = validate_d1_import_upload_url(upload_url_raw, contract).map_err(|_| ())?;
+    Ok(AcceptedD1ImportInit {
+        filename,
+        upload_url,
+    })
+}
+
 fn accepted_d1_import_ingest_response(response: &CloudflareResponseV1) -> Result<&str> {
     if d1_import_action_provider_error(response) {
         return Err(CloudflareError::D1ImportProviderFailure);
@@ -9185,8 +9190,8 @@ mod approved_mln_import_tests {
     use super::{
         CloudflareError, D1ImportPollOutcome, accepted_d1_import_ingest_response,
         accepted_d1_import_init_response, accepted_d1_import_poll_outcome,
-        bounded_d1_import_upload, parse_response, persist_import_response,
-        persist_import_uncertainty, validate_d1_import_poll_response,
+        bounded_d1_import_upload, classify_d1_import_init_response, parse_response,
+        persist_import_response, persist_import_uncertainty, validate_d1_import_poll_response,
         validate_d1_import_upload_url, validated_d1_import_upload_etag,
     };
     use cfctl_core::{CapabilityV1, D1ApprovedMlnImportContractV1, PlanStatus, PlanV1};
@@ -9404,6 +9409,66 @@ mod approved_mln_import_tests {
             })))
             .is_err()
         );
+    }
+
+    #[test]
+    fn approved_import_classifies_every_init_field_before_persistence_or_upload() {
+        let contract = contract();
+        let signed_query = concat!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256",
+            "&X-Amz-Credential=credential",
+            "&X-Amz-Date=20260730T000000Z",
+            "&X-Amz-Expires=3600",
+            "&X-Amz-SignedHeaders=host",
+            "&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let valid_url = format!(
+            "https://ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object?{signed_query}"
+        );
+        let response = |success, result| {
+            parse_response(200, &json!({"success":success,"result":result}), None, None)
+        };
+        let valid = response(
+            true,
+            json!({
+                "type":"import",
+                "status":"active",
+                "success":true,
+                "filename":"upload.sql",
+                "upload_url":valid_url,
+            }),
+        );
+        let accepted =
+            classify_d1_import_init_response(&valid, &contract).expect("official init response");
+        assert_eq!(accepted.filename, "upload.sql");
+        assert_eq!(accepted.upload_url.scheme(), "https");
+
+        let invalid_results = [
+            json!({"filename":"upload.sql"}),
+            json!({"filename":"upload.sql","upload_url":7}),
+            json!({"filename":"upload.sql","upload_url":"https://example.com/object"}),
+            json!({"upload_url":valid_url}),
+            json!({"filename":"","upload_url":valid_url}),
+            json!({"filename":7,"upload_url":valid_url}),
+            json!({"filename":"../secret.sql","upload_url":valid_url}),
+            json!({"type":"import","status":"unsupported","success":true,"filename":"upload.sql","upload_url":valid_url}),
+            json!({"type":"import","status":"error","success":false,"filename":"upload.sql","upload_url":valid_url}),
+        ];
+        let upload_attempts = 0_u8;
+        for result in invalid_results {
+            assert!(classify_d1_import_init_response(&response(true, result), &contract).is_err());
+        }
+        assert!(
+            classify_d1_import_init_response(
+                &response(
+                    false,
+                    json!({"filename":"upload.sql","upload_url":valid_url})
+                ),
+                &contract
+            )
+            .is_err()
+        );
+        assert_eq!(upload_attempts, 0);
     }
 
     #[test]
