@@ -8935,6 +8935,25 @@ fn persist_import_response<F>(
 where
     F: FnMut(&D1ImportCheckpointV1) -> std::result::Result<(), String>,
 {
+    let response_action = if step == "init_response" {
+        "init"
+    } else if step == "ingest_response" {
+        "ingest"
+    } else if step.starts_with("poll_response_") {
+        "poll"
+    } else {
+        "unknown"
+    };
+    let target = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .map(|contract| {
+            serde_json::json!({
+                "account_id":contract.account_id,
+                "database_id":contract.database_id,
+            })
+        });
     let mut result = replacement_result.unwrap_or_else(|| response.result.clone());
     let terminal_provider_failure = result.get("status").and_then(Value::as_str) == Some("error")
         && result.get("success").and_then(Value::as_bool) == Some(false);
@@ -8967,9 +8986,13 @@ where
         receipt: serde_json::json!({
             "http_status":response.status,
             "success":response.success,
+            "response_action":response_action,
+            "target":target,
+            "plan_input_hash":hash_value(&plan.input)?,
             "result":result,
             "errors":[],
             "provider_errors_present":!response.errors.is_empty(),
+            "no_replay":terminal_provider_failure,
             "etag":response.etag,
             "cf_ray":response.cf_ray,
         }),

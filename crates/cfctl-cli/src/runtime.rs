@@ -13194,25 +13194,100 @@ fn exact_durable_provider_complete_boundary(
     Ok((hash.clone(), checkpoint.clone()))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "stage-specific init, ingest, and poll receipt authority is one fail-closed join"
+)]
 fn exact_durable_provider_failure_boundary(
     store: &StateStore,
     plan: &PlanV1,
 ) -> Result<(EvidenceV1, Value)> {
-    let failures = store
-        .read_d1_import_checkpoints(&plan.operation_id)?
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    let target = json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    });
+    let input_hash = hash_value(&plan.input)?;
+    let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
+    let accepted_ingest_bookmarks = checkpoints
+        .iter()
+        .filter_map(|(_, checkpoint)| {
+            let exact = checkpoint.get("step").and_then(Value::as_str) == Some("ingest_response")
+                && checkpoint
+                    .pointer("/receipt/response_action")
+                    .and_then(Value::as_str)
+                    == Some("ingest")
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash.as_str())
+                && checkpoint
+                    .pointer("/receipt/result/type")
+                    .and_then(Value::as_str)
+                    == Some("import")
+                && matches!(
+                    checkpoint
+                        .pointer("/receipt/result/status")
+                        .and_then(Value::as_str),
+                    Some("active" | "pending")
+                )
+                && checkpoint
+                    .pointer("/receipt/result/success")
+                    .and_then(Value::as_bool)
+                    == Some(true);
+            exact.then(|| {
+                checkpoint
+                    .pointer("/receipt/result/at_bookmark")
+                    .and_then(Value::as_str)
+                    .filter(|bookmark| !bookmark.is_empty())
+                    .map(str::to_owned)
+            })?
+        })
+        .collect::<Vec<_>>();
+    let failures = checkpoints
         .into_iter()
         .filter(|(_, checkpoint)| {
+            let Some(step) = checkpoint.get("step").and_then(Value::as_str) else {
+                return false;
+            };
+            let action = if step == "init_response" {
+                "init"
+            } else if step == "ingest_response" {
+                "ingest"
+            } else if step.starts_with("poll_response_") {
+                "poll"
+            } else {
+                return false;
+            };
+            let bookmark = checkpoint
+                .pointer("/receipt/result/at_bookmark")
+                .and_then(Value::as_str);
+            let bookmark_matches_stage = match action {
+                "init" => bookmark.is_none(),
+                "ingest" => bookmark.is_none_or(|value| !value.is_empty()),
+                "poll" => {
+                    accepted_ingest_bookmarks.len() == 1
+                        && bookmark == accepted_ingest_bookmarks.first().map(String::as_str)
+                }
+                _ => false,
+            };
             checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
                 && checkpoint.get("operation_id").and_then(Value::as_str)
                     == Some(plan.operation_id.as_str())
                 && checkpoint
-                    .get("step")
+                    .pointer("/receipt/response_action")
                     .and_then(Value::as_str)
-                    .is_some_and(|step| {
-                        step == "init_response"
-                            || step == "ingest_response"
-                            || step.starts_with("poll_response_")
-                    })
+                    == Some(action)
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash.as_str())
                 && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
                 && checkpoint
                     .get("rectification_required")
@@ -13235,9 +13310,10 @@ fn exact_durable_provider_failure_boundary(
                     .and_then(Value::as_bool)
                     == Some(false)
                 && checkpoint
-                    .pointer("/receipt/result/at_bookmark")
-                    .and_then(Value::as_str)
-                    .is_some_and(|bookmark| !bookmark.is_empty())
+                    .pointer("/receipt/no_replay")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && bookmark_matches_stage
                 && checkpoint
                     .pointer("/receipt/result/provider_error_present")
                     .and_then(Value::as_bool)
@@ -13251,7 +13327,7 @@ fn exact_durable_provider_failure_boundary(
         .collect::<Vec<_>>();
     if failures.len() != 1 {
         return Err(CliError::Input(
-            "known import provider failure requires exactly one durable redacted poll checkpoint"
+            "known import provider failure requires exactly one stage-correct durable redacted checkpoint"
                 .to_owned(),
         ));
     }
@@ -20880,11 +20956,18 @@ mod tests {
                 "receipt":{
                     "http_status":200,
                     "success":true,
+                    "response_action":"ingest",
+                    "target":{
+                        "account_id":contract.account_id,
+                        "database_id":contract.database_id,
+                    },
+                    "plan_input_hash":hash_value(&plan.input).expect("input hash"),
+                    "no_replay":true,
                     "result":{
                         "type":"import",
                         "status":"error",
                         "success":false,
-                        "at_bookmark":"before",
+                        "at_bookmark":null,
                         "provider_error_present":true,
                     },
                     "errors":[],
@@ -20935,6 +21018,68 @@ mod tests {
         assert_eq!(plan.status, PlanStatus::RectificationRequired);
         assert_ne!(plan.status, PlanStatus::Running);
 
+        let init_root = tempfile::tempdir().expect("init failure root");
+        let init_store =
+            StateStore::open(RuntimePaths::from_root(init_root.path())).expect("init store");
+        let mut init_plan = build_plan();
+        let mut init_receipt = checkpoint(&init_plan);
+        init_receipt["step"] = json!("init_response");
+        init_receipt["receipt"]["response_action"] = json!("init");
+        let init_hash = init_store
+            .record_d1_import_checkpoint(&init_plan.operation_id, &init_receipt)
+            .expect("init failure checkpoint");
+        assert_eq!(
+            init_store
+                .write_evidence(EvidenceClass::Apply, &init_receipt)
+                .expect("init failure evidence")
+                .content_hash,
+            init_hash
+        );
+        let init_envelope = approved_mln_import_execution_error_envelope(
+            &init_store,
+            &mut init_plan,
+            CloudflareError::D1ImportProviderFailure,
+            &MemorySecretStore::default(),
+        );
+        assert_eq!(init_envelope.result["outcome"], "provider_rejected");
+        assert_eq!(init_envelope.result["receipt_available"], true);
+        assert_ne!(init_plan.status, PlanStatus::Running);
+
+        let poll_root = tempfile::tempdir().expect("poll failure root");
+        let poll_store =
+            StateStore::open(RuntimePaths::from_root(poll_root.path())).expect("poll store");
+        let poll_plan = build_plan();
+        let mut accepted_ingest = checkpoint(&poll_plan);
+        accepted_ingest["rectification_required"] = json!(false);
+        accepted_ingest["receipt"]["no_replay"] = json!(false);
+        accepted_ingest["receipt"]["result"] = json!({
+            "type":"import",
+            "status":"active",
+            "success":true,
+            "at_bookmark":"before",
+        });
+        poll_store
+            .record_d1_import_checkpoint(&poll_plan.operation_id, &accepted_ingest)
+            .expect("accepted ingest checkpoint");
+        let mut poll_receipt = checkpoint(&poll_plan);
+        poll_receipt["step"] = json!("poll_response_1");
+        poll_receipt["receipt"]["response_action"] = json!("poll");
+        poll_receipt["receipt"]["result"]["at_bookmark"] = json!("before");
+        let poll_hash = poll_store
+            .record_d1_import_checkpoint(&poll_plan.operation_id, &poll_receipt)
+            .expect("poll failure checkpoint");
+        assert_eq!(
+            poll_store
+                .write_evidence(EvidenceClass::Apply, &poll_receipt)
+                .expect("poll failure evidence")
+                .content_hash,
+            poll_hash
+        );
+        assert!(
+            exact_durable_provider_failure_boundary(&poll_store, &poll_plan).is_ok(),
+            "poll failure binds the exact accepted-ingest bookmark"
+        );
+
         store
             .record_d1_import_checkpoint(&plan.operation_id, &receipt)
             .expect("duplicate known failure");
@@ -20946,6 +21091,11 @@ mod tests {
                 let mut mismatched = checkpoint(&build_plan());
                 mismatched["receipt"]["result"]["provider_error_present"] = json!(false);
                 mismatched
+            }),
+            Some({
+                let mut grafted = checkpoint(&build_plan());
+                grafted["receipt"]["response_action"] = json!("poll");
+                grafted
             }),
         ] {
             let invalid_root = tempfile::tempdir().expect("invalid receipt root");
