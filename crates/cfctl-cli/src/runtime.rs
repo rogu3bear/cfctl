@@ -14158,6 +14158,313 @@ fn known_import_action_response_failure_envelope(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "poll exhaustion authority joins ingest lineage every bounded poll and terminal receipt"
+)]
+fn exact_durable_poll_exhaustion(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<(EvidenceV1, Value, EvidenceV1)> {
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    let target = json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    });
+    let input_hash = hash_value(&plan.input)?;
+    let migration_id = plan
+        .input
+        .pointer("/body/migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("approved MLN import migration id is missing".to_owned()))?;
+    let source_sha256 = plan
+        .targets
+        .pointer("/adapter/approved_mln_import/sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("approved MLN import source identity is missing".to_owned())
+        })?;
+    let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
+    let accepted = exact_accepted_ingest_bookmarks(store, plan, &checkpoints, &target, &input_hash);
+    if accepted.len() != 1 {
+        return Err(CliError::Input(
+            "poll exhaustion requires exactly one durable accepted-ingest bookmark".to_owned(),
+        ));
+    }
+    let bookmark = &accepted[0];
+    let accepted_entries = checkpoints
+        .iter()
+        .enumerate()
+        .filter(|(_, (hash, checkpoint))| {
+            checkpoint.get("step").and_then(Value::as_str) == Some("ingest_response")
+                && checkpoint
+                    .pointer("/receipt/effect")
+                    .and_then(Value::as_str)
+                    == Some("d1_import_ingest_accepted")
+                && checkpoint
+                    .pointer("/receipt/result/at_bookmark")
+                    .and_then(Value::as_str)
+                    == Some(bookmark.as_str())
+                && store
+                    .read_evidence_value(hash)
+                    .is_ok_and(|evidence| evidence == *checkpoint)
+        })
+        .collect::<Vec<_>>();
+    if accepted_entries.len() != 1 {
+        return Err(CliError::Input(
+            "poll exhaustion requires exactly one accepted-ingest checkpoint and evidence"
+                .to_owned(),
+        ));
+    }
+    let (accepted_index, (accepted_hash, _)) = accepted_entries[0];
+    let mut attempts = checkpoints
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (hash, checkpoint))| {
+            let step = checkpoint.get("step").and_then(Value::as_str)?;
+            let attempt = step.strip_prefix("poll_response_")?.parse::<u64>().ok()?;
+            let exact = checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && checkpoint
+                    .pointer("/receipt/response_action")
+                    .and_then(Value::as_str)
+                    == Some("poll")
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash.as_str())
+                && checkpoint
+                    .pointer("/receipt/result/type")
+                    .and_then(Value::as_str)
+                    == Some("import")
+                && matches!(
+                    checkpoint
+                        .pointer("/receipt/result/status")
+                        .and_then(Value::as_str),
+                    Some("active" | "pending")
+                )
+                && checkpoint
+                    .pointer("/receipt/result/success")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/result/at_bookmark")
+                    .and_then(Value::as_str)
+                    == Some(bookmark.as_str())
+                && store
+                    .read_evidence_value(hash)
+                    .is_ok_and(|evidence| evidence == *checkpoint);
+            exact.then_some((index, attempt))
+        })
+        .collect::<Vec<_>>();
+    attempts.sort_unstable_by_key(|(_, attempt)| *attempt);
+    let expected_attempts = (1..=contract.max_poll_attempts)
+        .enumerate()
+        .map(|(offset, attempt)| (accepted_index + offset + 1, attempt))
+        .collect::<Vec<_>>();
+    if attempts != expected_attempts {
+        return Err(CliError::Input(
+            "poll exhaustion requires one chronological durable in-progress receipt per approved attempt"
+                .to_owned(),
+        ));
+    }
+    if checkpoints.iter().any(|(_, checkpoint)| {
+        checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+    }) {
+        return Err(CliError::Input(
+            "poll exhaustion conflicts with a provider_complete checkpoint".to_owned(),
+        ));
+    }
+    let exhausted = checkpoints
+        .iter()
+        .enumerate()
+        .filter(|(index, (_, checkpoint))| {
+            let exact_receipt_shape = checkpoint
+                .get("receipt")
+                .and_then(Value::as_object)
+                .is_some_and(|receipt| receipt.len() == 12);
+            *index
+                == accepted_index
+                    + usize::try_from(contract.max_poll_attempts).unwrap_or(usize::MAX)
+                    + 1
+                && *index + 1 == checkpoints.len()
+                && checkpoint.get("step").and_then(Value::as_str)
+                    == Some("poll_in_progress_exhausted")
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/provider")
+                    .and_then(Value::as_str)
+                    == Some("cloudflare")
+                && checkpoint
+                    .pointer("/receipt/effect")
+                    .and_then(Value::as_str)
+                    == Some("d1_import_poll_in_progress_exhausted")
+                && checkpoint
+                    .pointer("/receipt/migration_id")
+                    .and_then(Value::as_str)
+                    == Some(migration_id)
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash.as_str())
+                && checkpoint
+                    .pointer("/receipt/source_sha256")
+                    .and_then(Value::as_str)
+                    == Some(source_sha256)
+                && checkpoint
+                    .pointer("/receipt/at_bookmark")
+                    .and_then(Value::as_str)
+                    == Some(bookmark.as_str())
+                && checkpoint
+                    .pointer("/receipt/attempt_count")
+                    .and_then(Value::as_u64)
+                    == Some(contract.max_poll_attempts)
+                && checkpoint
+                    .pointer("/receipt/attempt_bound")
+                    .and_then(Value::as_u64)
+                    == Some(contract.max_poll_attempts)
+                && checkpoint
+                    .pointer("/receipt/outcome")
+                    .and_then(Value::as_str)
+                    == Some("poll_in_progress_exhausted")
+                && checkpoint
+                    .pointer("/receipt/receipt_available")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/no_replay")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && exact_receipt_shape
+        })
+        .collect::<Vec<_>>();
+    if exhausted.len() != 1 {
+        return Err(CliError::Input(
+            "poll exhaustion requires exactly one lineage-bound durable receipt".to_owned(),
+        ));
+    }
+    let (_, (hash, checkpoint)) = exhausted[0];
+    if store.read_evidence_value(hash)? != *checkpoint {
+        return Err(CliError::Input(
+            "poll exhaustion evidence does not match its immutable checkpoint".to_owned(),
+        ));
+    }
+    Ok((
+        EvidenceV1::new(
+            EvidenceClass::Apply,
+            hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!("{}.json", hash.trim_start_matches("sha256:")))
+                .display()
+                .to_string(),
+        ),
+        checkpoint.clone(),
+        EvidenceV1::new(
+            EvidenceClass::Apply,
+            accepted_hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!(
+                    "{}.json",
+                    accepted_hash.trim_start_matches("sha256:")
+                ))
+                .display()
+                .to_string(),
+        ),
+    ))
+}
+
+fn known_import_poll_exhausted_envelope(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    secrets: &dyn SecretStore,
+) -> ResultEnvelopeV2 {
+    plan.status = PlanStatus::RectificationRequired;
+    match exact_durable_poll_exhaustion(store, plan) {
+        Ok((evidence, checkpoint, accepted_ingest_evidence)) => {
+            let artifact = json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":"poll_in_progress_exhausted",
+                "receipt_available":true,
+                "poll_exhaustion_evidence_hash":evidence.content_hash,
+                "accepted_ingest_evidence_hash":accepted_ingest_evidence.content_hash,
+            });
+            let mut local_failures = Vec::new();
+            if let Err(error) = persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                artifact,
+            ) {
+                local_failures.push(format!("poll-exhaustion receipt binding failed: {error}"));
+            }
+            if let Err(error) = persist_secret_lifecycle(store, plan, false, None, secrets) {
+                local_failures.push(format!(
+                    "poll-exhaustion secret lifecycle persistence failed: {error}"
+                ));
+            }
+            let detail = if local_failures.is_empty() {
+                "Cloudflare D1 import remains in progress after the approved poll bound".to_owned()
+            } else {
+                format!(
+                    "Cloudflare D1 import remains in progress after the approved poll bound; {}",
+                    local_failures.join("; ")
+                )
+            };
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":"poll_in_progress_exhausted",
+                    "receipt_available":true,
+                    "at_bookmark_hash":checkpoint.pointer("/receipt/at_bookmark").and_then(Value::as_str).and_then(|value| hash_value(&Value::String(value.to_owned())).ok()),
+                    "attempt_count":checkpoint.pointer("/receipt/attempt_count"),
+                    "attempt_bound":checkpoint.pointer("/receipt/attempt_bound"),
+                    "accepted_ingest_evidence_hash":accepted_ingest_evidence.content_hash,
+                }),
+                Some(evidence),
+                None,
+                &CliError::Input(detail),
+                true,
+                "the exact accepted-ingest bookmark and every bounded in-progress poll receipt are durable; do not replay init/upload/ingest",
+            )
+        }
+        Err(error) => post_boundary_failure_envelope(
+            plan,
+            json!({
+                "success":false,
+                "outcome":"poll_exhaustion_receipt_invalid",
+                "receipt_available":false,
+            }),
+            None,
+            None,
+            &error,
+            true,
+            "poll exhaustion lineage could not be resolved exactly; do not replay any import stage",
+        ),
+    }
+}
+
 fn approved_mln_import_execution_error_envelope(
     store: &StateStore,
     plan: &mut PlanV1,
@@ -14182,6 +14489,9 @@ fn approved_mln_import_execution_error_envelope(
             | CloudflareError::D1ImportPollResponseFailure
     ) {
         return known_import_action_response_failure_envelope(store, plan, error, secrets);
+    }
+    if matches!(error, CloudflareError::D1ImportPollInProgressExhausted) {
+        return known_import_poll_exhausted_envelope(store, plan, secrets);
     }
     if !matches!(
         plan.status,
@@ -14218,6 +14528,7 @@ fn persist_d1_import_checkpoint(
             .and_then(Value::as_bool)
             == Some(false);
     let durable_apply = checkpoint.step == "provider_complete"
+        || checkpoint.step.starts_with("poll_response_")
         || terminal_provider_failure
         || (checkpoint.receipt.get("effect").and_then(Value::as_str) == Some("d1_import_response")
             && checkpoint.rectification_required)
@@ -14226,7 +14537,9 @@ fn persist_d1_import_checkpoint(
         || checkpoint.receipt.get("effect").and_then(Value::as_str)
             == Some("d1_import_transport_uncertain")
         || checkpoint.receipt.get("effect").and_then(Value::as_str)
-            == Some("d1_import_upload_response");
+            == Some("d1_import_upload_response")
+        || checkpoint.receipt.get("effect").and_then(Value::as_str)
+            == Some("d1_import_poll_in_progress_exhausted");
     if durable_apply {
         let evidence = store
             .write_evidence(EvidenceClass::Apply, &value)
@@ -20170,17 +20483,18 @@ mod tests {
         call_command, cancel_plan, capability_call_argv, compensation_request,
         credential_generation_for_read, d1_recovery_anchor_matches, delegated_read_envelope,
         entitlement_probe_selectors, exact_accepted_ingest_bookmarks,
-        exact_durable_provider_complete_boundary, exact_durable_provider_failure_boundary,
-        execute_native_workflow, execute_read, find_secret_value, force_ipv4_from,
-        governed_cli_environment_contract, governed_cli_workspace_env, guide_document,
-        guide_stage_commands, http_client, is_live_plan_precondition_hash,
-        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
-        list_security_action_state_receipt, mln_0142_terminal_import_state,
-        mln_0143_parent_manifests, mln_0143_pre_import_authority_matches,
-        mln_0143_pre_import_matches, mln_0143_restore_anchor_matches,
-        non_readback_verification_basis, normalize_reviewed_mln_repository_id,
-        operational_proof_coverage, permission_inventory_call, permission_inventory_envelope,
-        persist_d1_import_checkpoint, persist_prepared_plan, persist_secret_lifecycle,
+        exact_durable_poll_exhaustion, exact_durable_provider_complete_boundary,
+        exact_durable_provider_failure_boundary, execute_native_workflow, execute_read,
+        find_secret_value, force_ipv4_from, governed_cli_environment_contract,
+        governed_cli_workspace_env, guide_document, guide_stage_commands, http_client,
+        is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
+        key_policy_list, key_policy_revoke, list_security_action_state_receipt,
+        mln_0142_terminal_import_state, mln_0143_parent_manifests,
+        mln_0143_pre_import_authority_matches, mln_0143_pre_import_matches,
+        mln_0143_restore_anchor_matches, non_readback_verification_basis,
+        normalize_reviewed_mln_repository_id, operational_proof_coverage,
+        permission_inventory_call, permission_inventory_envelope, persist_d1_import_checkpoint,
+        persist_prepared_plan, persist_secret_lifecycle,
         persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
         preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
@@ -22292,6 +22606,149 @@ mod tests {
             assert_ne!(action_plan.status, PlanStatus::Running);
             assert!(!action_envelope.result.to_string().contains("SECRET"));
         }
+
+        let exhaustion_root = tempfile::tempdir().expect("poll exhaustion root");
+        let exhaustion_store = StateStore::open(RuntimePaths::from_root(exhaustion_root.path()))
+            .expect("poll exhaustion store");
+        let mut exhaustion_plan = build_plan();
+        exhaustion_plan
+            .capability
+            .d1_approved_mln_import
+            .as_mut()
+            .expect("import contract")
+            .max_poll_attempts = 2;
+        exhaustion_plan.targets = json!({
+            "adapter":{
+                "approved_mln_import":{
+                    "sha256":"sha256:source",
+                }
+            }
+        });
+        exhaustion_plan
+            .refresh_hash()
+            .expect("exhaustion plan hash");
+        let target = json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        });
+        let input_hash = hash_value(&exhaustion_plan.input).expect("input hash");
+        let accepted = D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: exhaustion_plan.operation_id.clone(),
+            step: "ingest_response".to_owned(),
+            performed: true,
+            rectification_required: false,
+            receipt: json!({
+                "http_status":200,
+                "success":true,
+                "response_action":"ingest",
+                "provider":"cloudflare",
+                "effect":"d1_import_ingest_accepted",
+                "migration_id":"0143",
+                "target":target,
+                "plan_input_hash":input_hash,
+                "result":{
+                    "type":"import",
+                    "status":"active",
+                    "success":true,
+                    "at_bookmark":"owned",
+                    "result":{"final_bookmark":null},
+                    "provider_error_present":false,
+                },
+                "errors":[],
+                "provider_errors_present":false,
+                "no_replay":false,
+                "etag_present":false,
+                "etag_sha256":null,
+                "cf_ray":null,
+            }),
+        };
+        persist_d1_import_checkpoint(&exhaustion_store, &exhaustion_plan.operation_id, &accepted)
+            .expect("accepted ingest authority");
+        for attempt in 1..=2 {
+            let poll = D1ImportCheckpointV1 {
+                schema_version: 1,
+                operation_id: exhaustion_plan.operation_id.clone(),
+                step: format!("poll_response_{attempt}"),
+                performed: true,
+                rectification_required: false,
+                receipt: json!({
+                    "http_status":200,
+                    "success":true,
+                    "response_action":"poll",
+                    "provider":"cloudflare",
+                    "effect":"d1_import_response",
+                    "migration_id":"0143",
+                    "target":target,
+                    "plan_input_hash":input_hash,
+                    "result":{
+                        "type":"import",
+                        "status":"active",
+                        "success":true,
+                        "at_bookmark":"owned",
+                        "result":{"final_bookmark":null},
+                        "provider_error_present":false,
+                    },
+                    "errors":[],
+                    "provider_errors_present":false,
+                    "no_replay":false,
+                    "etag_present":false,
+                    "etag_sha256":null,
+                    "cf_ray":null,
+                }),
+            };
+            persist_d1_import_checkpoint(&exhaustion_store, &exhaustion_plan.operation_id, &poll)
+                .expect("durable in-progress poll");
+        }
+        let exhausted = D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: exhaustion_plan.operation_id.clone(),
+            step: "poll_in_progress_exhausted".to_owned(),
+            performed: true,
+            rectification_required: true,
+            receipt: json!({
+                "provider":"cloudflare",
+                "effect":"d1_import_poll_in_progress_exhausted",
+                "migration_id":"0143",
+                "target":target,
+                "plan_input_hash":input_hash,
+                "source_sha256":"sha256:source",
+                "at_bookmark":"owned",
+                "attempt_count":2,
+                "attempt_bound":2,
+                "outcome":"poll_in_progress_exhausted",
+                "receipt_available":true,
+                "no_replay":true,
+            }),
+        };
+        persist_d1_import_checkpoint(&exhaustion_store, &exhaustion_plan.operation_id, &exhausted)
+            .expect("durable exhaustion");
+        let exhaustion_envelope = approved_mln_import_execution_error_envelope(
+            &exhaustion_store,
+            &mut exhaustion_plan,
+            CloudflareError::D1ImportPollInProgressExhausted,
+            &MemorySecretStore::default(),
+        );
+        assert!(exhaustion_envelope.performed);
+        assert_eq!(
+            exhaustion_envelope.result["outcome"],
+            "poll_in_progress_exhausted"
+        );
+        assert_eq!(exhaustion_envelope.result["receipt_available"], true);
+        assert_eq!(exhaustion_envelope.result["attempt_count"], 2);
+        assert_eq!(exhaustion_envelope.result["attempt_bound"], 2);
+        assert!(
+            exhaustion_envelope.result["accepted_ingest_evidence_hash"]
+                .as_str()
+                .is_some_and(|hash| hash.starts_with("sha256:"))
+        );
+        assert_ne!(exhaustion_plan.status, PlanStatus::Running);
+        persist_d1_import_checkpoint(&exhaustion_store, &exhaustion_plan.operation_id, &exhausted)
+            .expect("later grafted exhaustion");
+        assert!(
+            exact_durable_poll_exhaustion(&exhaustion_store, &exhaustion_plan).is_err(),
+            "the exhaustion authority must be unique and the journal tail"
+        );
 
         let root = tempfile::tempdir().expect("known failure root");
         let store =

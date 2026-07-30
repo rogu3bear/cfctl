@@ -114,6 +114,8 @@ pub enum CloudflareError {
     D1ImportIngestResponseFailure,
     #[error("D1 import poll returned a known rejected or invalid provider response")]
     D1ImportPollResponseFailure,
+    #[error("D1 import remained active after the approved poll bound")]
+    D1ImportPollInProgressExhausted,
     #[error("plan or capability `{capability_id}` is not an exact consumed event batch contract")]
     InvalidEventBatchPlan { capability_id: String },
     #[error("Cloudflare API base URL cannot accept path segments")]
@@ -930,6 +932,46 @@ fn mln_0142_post_import_schema_request_schema() -> Value {
             "trigger_definition_sha256":{"type":"string","enum":["sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b"]}
         }
     })
+}
+
+fn persist_import_poll_exhausted<F>(persist: &mut F, plan: &PlanV1, at_bookmark: &str) -> Result<()>
+where
+    F: FnMut(&D1ImportCheckpointV1) -> std::result::Result<(), String>,
+{
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| {
+            CloudflareError::InvalidRequestBody(
+                "approved MLN import contract is missing".to_owned(),
+            )
+        })?;
+    persist(&D1ImportCheckpointV1 {
+        schema_version: 1,
+        operation_id: plan.operation_id.clone(),
+        step: "poll_in_progress_exhausted".to_owned(),
+        performed: true,
+        rectification_required: true,
+        receipt: serde_json::json!({
+            "provider":"cloudflare",
+            "effect":"d1_import_poll_in_progress_exhausted",
+            "migration_id":plan.input.pointer("/body/migration_id").and_then(Value::as_str),
+            "target":{
+                "account_id":contract.account_id,
+                "database_id":contract.database_id,
+            },
+            "plan_input_hash":hash_value(&plan.input)?,
+            "source_sha256":plan.targets.pointer("/adapter/approved_mln_import/sha256").and_then(Value::as_str),
+            "at_bookmark":at_bookmark,
+            "attempt_count":contract.max_poll_attempts,
+            "attempt_bound":contract.max_poll_attempts,
+            "outcome":"poll_in_progress_exhausted",
+            "receipt_available":true,
+            "no_replay":true,
+        }),
+    })
+    .map_err(CloudflareError::InvalidRequestBody)
 }
 
 #[cfg(test)]
@@ -2710,10 +2752,8 @@ impl Executor {
             }
         }
         plan.status = PlanStatus::RectificationRequired;
-        persist_import_uncertainty(&mut persist, plan, "poll_exhausted")?;
-        Err(CloudflareError::InvalidRequestBody(
-            "D1 import poll bound exhausted; resume only the existing bookmark poll".to_owned(),
-        ))
+        persist_import_poll_exhausted(&mut persist, plan, &at_bookmark)?;
+        Err(CloudflareError::D1ImportPollInProgressExhausted)
     }
 
     /// Runs the operation-specific live readback declared by a plan. Unknown
