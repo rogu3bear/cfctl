@@ -2208,7 +2208,7 @@ fn mln_0143_data_invariants_capability() -> CapabilityV1 {
         "type":"string","pattern":"^sha256:[0-9a-f]{64}$","minLength":71,"maxLength":71
     });
     capability.request_schema = Some(serde_json::json!({
-        "type":"object","additionalProperties":false,"x-cfctl-body-required":true,
+        "type":"object","x-cfctl-body-required":true,
         "oneOf":[
             {
                 "type":"object","additionalProperties":false,

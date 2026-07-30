@@ -1093,11 +1093,22 @@ mod mln_0143_invariant_tests {
     use super::{
         CloudflareResponseV1, MLN_0142_TERMINAL_TRIGGER_SQL, MLN_0143_POST_TABLE_SQL,
         MLN_0143_PRE_TABLE_SQL, Mln0143DataInvariantsContractV1, OutputFormatV1, PreparedRequest,
-        Url, normalized_sql_hash, reviewed_table_sql_hash,
+        Url, mln_0143_request_schema, normalized_sql_hash, reviewed_table_sql_hash,
         sanitize_mln_0143_data_invariants_response,
     };
     use reqwest::header::HeaderMap;
     use serde_json::{Value, json};
+
+    #[test]
+    fn request_schema_closes_each_phase_without_rejecting_phase_fields_at_root() {
+        let schema = mln_0143_request_schema();
+        assert!(schema.get("additionalProperties").is_none());
+        assert_eq!(schema["oneOf"][0]["additionalProperties"], false);
+        assert_eq!(
+            schema["oneOf"][0]["required"],
+            json!(["migration_id", "phase"])
+        );
+    }
 
     fn prepared(phase: &str) -> PreparedRequest {
         let mut contract = Mln0143DataInvariantsContractV1 {
@@ -9754,7 +9765,6 @@ fn mln_0143_request_schema() -> Value {
     });
     serde_json::json!({
         "type":"object",
-        "additionalProperties":false,
         "x-cfctl-body-required":true,
         "oneOf":[
             {
