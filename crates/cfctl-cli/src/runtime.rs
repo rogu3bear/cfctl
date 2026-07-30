@@ -13250,7 +13250,11 @@ fn trusted_native_capability(capability_id: &str) -> Result<CapabilityV1> {
         })
 }
 
-fn validate_trusted_root_import_plan(plan_v2: &PlanV2) -> Result<()> {
+#[expect(
+    clippy::too_many_lines,
+    reason = "trusted root admission joins native request, governed prerequisites, source, and stage"
+)]
+fn validate_trusted_root_import_plan(store: &StateStore, plan_v2: &PlanV2) -> Result<()> {
     plan_v2.validate()?;
     let plan = &plan_v2.plan;
     let trusted = trusted_native_capability("d1-import-approved-mln-migration")?;
@@ -13278,21 +13282,32 @@ fn validate_trusted_root_import_plan(plan_v2: &PlanV2) -> Result<()> {
         .iter()
         .find(|migration| migration.migration_id == migration_id)
         .ok_or_else(|| CliError::Input("trusted import migration is not catalogued".to_owned()))?;
-    let expected_input = CallInput {
-        selectors: json!({
+    if input.selectors
+        != json!({
             "account_id":contract.account_id,
             "database_id":contract.database_id,
-        }),
-        query: json!({}),
-        body: Some(json!({"migration_id":migration.migration_id})),
-        if_match: None,
-        if_none_match: None,
-    };
-    if input != expected_input {
+        })
+        || input.query != json!({})
+        || input.if_match.is_some()
+        || input.if_none_match.is_some()
+    {
         return Err(CliError::Input(
             "approved MLN import input is not the exact trusted migration request".to_owned(),
         ));
     }
+    preflight_call_input(&trusted, &input, None)?;
+    validate_approved_mln_import_prerequisites(
+        store,
+        &trusted,
+        &input,
+        ImportPrerequisiteContext {
+            profile_id: &plan.profile_id,
+            credential_generation_id: Some(&plan_v2.pins.credential_generation_id),
+            catalog_hash: &plan.catalog_hash,
+            import_operation_id: Some(&plan.operation_id),
+            before: plan.created_at,
+        },
+    )?;
     let stage = plan
         .targets
         .pointer("/adapter/approved_mln_import")
@@ -13509,7 +13524,7 @@ fn exact_durable_provider_complete_boundary(
         ));
     };
     let plan = &plan_v2.plan;
-    validate_trusted_root_import_plan(&plan_v2)?;
+    validate_trusted_root_import_plan(store, &plan_v2)?;
     if plan.operation_id != operation_id
         || plan.profile_id.is_empty()
         || plan.catalog_hash.is_empty()
@@ -13732,7 +13747,7 @@ fn exact_linear_poll_child_provider_complete(
     let canonical_capability = trusted_native_capability("d1-resume-approved-mln-import-poll")?;
     let canonical_contract_hash = hash_value(&serde_json::to_value(&canonical_capability)?)?;
     let root_v2 = store.load_plan_v2(&root.operation_id)?;
-    validate_trusted_root_import_plan(&root_v2)?;
+    validate_trusted_root_import_plan(store, &root_v2)?;
     if root_v2.plan != *root {
         return Err(CliError::Input(
             "root import projection does not match its canonical PlanV2".to_owned(),
@@ -15679,7 +15694,7 @@ fn validate_and_derive_resume_poll_authority(
         ));
     }
     let exhaustion = if parent.capability.id == contract.root_capability_id {
-        validate_trusted_root_import_plan(&parent_v2)?;
+        validate_trusted_root_import_plan(store, &parent_v2)?;
         let (exhaustion_evidence, exhaustion_checkpoint, accepted_ingest_evidence) =
             exact_durable_poll_exhaustion(store, parent)?;
         let accepted_bookmark = exhaustion_checkpoint
@@ -21970,13 +21985,14 @@ mod tests {
         AsyncCollectionMutationContractV1, CapabilityV1, CostV1,
         CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
         CreatedResourceContractV1, D1FullExportGovernedExecutionBindingV1, EffectClass,
-        EntitlementProbeV1, EvidenceClass, EvidenceV1, Mln0143GovernedExecutionBindingV1,
-        OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, OutputFormatV1,
-        PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1, PlanV2, QuerySerializationV1,
-        ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1,
-        SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
-        SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
-        TransactionStageV1, VerificationState, WorkflowContractV1, WorkflowStepV1, hash_value,
+        EntitlementProbeV1, EvidenceClass, EvidenceV1, Mln0142GovernedExecutionBindingV1,
+        Mln0143GovernedExecutionBindingV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
+        OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1,
+        PlanV2, QuerySerializationV1, ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES,
+        SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+        SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
+        StandingAuthorityV1, TransactionStageV1, VerificationState, WorkflowContractV1,
+        WorkflowStepV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -22407,7 +22423,8 @@ mod tests {
             .store
             .load_plan_v2(&positive.root_plan.operation_id)
             .expect("canonical positive root");
-        super::validate_trusted_root_import_plan(&positive_root).expect("trusted positive root");
+        super::validate_trusted_root_import_plan(&positive.store, &positive_root)
+            .expect("trusted positive root");
         super::exact_linear_poll_child_provider_complete(&positive.store, &positive.root_plan)
             .expect("positive root-to-child completion");
 
@@ -22611,7 +22628,7 @@ mod tests {
                 .load_plan_v2(&root.operation_id)
                 .expect("grafted root PlanV2");
             assert!(
-                super::validate_trusted_root_import_plan(&grafted_root).is_err(),
+                super::validate_trusted_root_import_plan(&fixture.store, &grafted_root).is_err(),
                 "{graft} must fail direct trusted-root admission"
             );
             assert!(
@@ -22641,6 +22658,14 @@ mod tests {
             "nonempty_query",
             "extra_body_key",
             "unknown_migration",
+            "missing_pre_anchor_field",
+            "wrong_type_pre_anchor_field",
+            "missing_0143_prior_field",
+            "wrong_type_0143_prior_field",
+            "missing_0143_invariant_field",
+            "wrong_type_0143_invariant_field",
+            "drifted_prior_boundary",
+            "drifted_post_anchor",
         ] {
             let fixture = build_poll_child_lineage(1);
             let mut root = fixture.root_plan.clone();
@@ -22682,6 +22707,50 @@ mod tests {
                         .and_then(Value::as_object_mut)
                         .expect("root body")
                         .insert("migration_id".to_owned(), json!("9999"));
+                }
+                "missing_pre_anchor_field" => {
+                    input
+                        .body
+                        .as_mut()
+                        .and_then(Value::as_object_mut)
+                        .expect("root body")
+                        .remove("pre_recovery_anchor_evidence_hash");
+                }
+                "wrong_type_pre_anchor_field" => {
+                    input.body.as_mut().expect("root body")["pre_recovery_anchor_operation_id"] =
+                        json!(42);
+                }
+                "missing_0143_prior_field" => {
+                    input
+                        .body
+                        .as_mut()
+                        .and_then(Value::as_object_mut)
+                        .expect("root body")
+                        .remove("prior_0142_schema_proof_operation_id");
+                }
+                "wrong_type_0143_prior_field" => {
+                    input.body.as_mut().expect("root body")["prior_0142_operation_id"] =
+                        json!(false);
+                }
+                "missing_0143_invariant_field" => {
+                    input
+                        .body
+                        .as_mut()
+                        .and_then(Value::as_object_mut)
+                        .expect("root body")
+                        .remove("pre_import_invariant_evidence_hash");
+                }
+                "wrong_type_0143_invariant_field" => {
+                    input.body.as_mut().expect("root body")["pre_import_invariant_operation_id"] =
+                        json!([]);
+                }
+                "drifted_prior_boundary" => {
+                    input.body.as_mut().expect("root body")["prior_0142_boundary_evidence_hash"] =
+                        json!(format!("sha256:{}", "9".repeat(64)));
+                }
+                "drifted_post_anchor" => {
+                    input.body.as_mut().expect("root body")["post_0142_anchor_operation_id"] =
+                        json!(Uuid::new_v4());
                 }
                 _ => unreachable!("closed root input graft matrix"),
             }
@@ -22771,7 +22840,7 @@ mod tests {
                 .load_plan_v2(&root.operation_id)
                 .expect("grafted root PlanV2");
             assert!(
-                super::validate_trusted_root_import_plan(&root_v2).is_err(),
+                super::validate_trusted_root_import_plan(&fixture.store, &root_v2).is_err(),
                 "{graft} must fail trusted-root input admission"
             );
             assert!(
@@ -23776,7 +23845,7 @@ mod tests {
             PlanPinsV2 {
                 build_identity_hash: "sha256:test-build".to_owned(),
                 catalog_hash: plan.catalog_hash.clone(),
-                credential_generation_id: "test-credential-generation".to_owned(),
+                credential_generation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
                 admission_policy_hash: "compiled:test-policy".to_owned(),
                 authority_hash: None,
                 workspace_graph_hash: "sha256:test-workspace".to_owned(),
@@ -23797,6 +23866,10 @@ mod tests {
         children: Vec<PlanV1>,
     }
 
+    const POLL_FIXTURE_CATALOG_HASH: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const POLL_FIXTURE_CREDENTIAL_GENERATION: &str = "22222222-2222-4222-8222-222222222222";
+
     fn persist_poll_lineage_checkpoint(
         store: &StateStore,
         operation_id: &str,
@@ -23813,6 +23886,361 @@ mod tests {
             hash
         );
         hash
+    }
+
+    fn record_test_export_anchor(
+        store: &StateStore,
+        contract: &cfctl_core::D1ApprovedMlnImportContractV1,
+        catalog_hash: &str,
+        completed_at: chrono::DateTime<Utc>,
+        bookmark: &str,
+    ) -> (String, String, String, String) {
+        let operation_id = Uuid::new_v4().to_string();
+        let output_sha256 = format!("sha256:{}", "a".repeat(64));
+        let bookmark_hash = hash_value(&json!(bookmark)).expect("bookmark hash");
+        let target_scope_hash = hash_value(&json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        }))
+        .expect("target hash");
+        let request_hash = hash_value(
+            &serde_json::to_value(CallInput {
+                selectors: json!({
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                }),
+                query: json!({}),
+                ..CallInput::default()
+            })
+            .expect("export input"),
+        )
+        .expect("export request hash");
+        let evidence = store
+            .write_evidence(
+                EvidenceClass::LiveRead,
+                &json!({"operation_id":operation_id,"bookmark":bookmark}),
+            )
+            .expect("anchor evidence");
+        let binding = D1FullExportGovernedExecutionBindingV1 {
+            schema_version: 1,
+            operation_id: operation_id.clone(),
+            capability_id: "d1-full-export".to_owned(),
+            catalog_hash: catalog_hash.to_owned(),
+            target_scope_hash,
+            output_file_sha256: output_sha256.clone(),
+            at_bookmark_hash: bookmark_hash.clone(),
+            manifest_evidence_hash: evidence.content_hash.clone(),
+            request_hash: request_hash.clone(),
+            profile_id: "profile-a".to_owned(),
+            credential_generation_id: POLL_FIXTURE_CREDENTIAL_GENERATION.to_owned(),
+            completion_status: "completed".to_owned(),
+            completed_at,
+        };
+        let mut proof = OperationalProofV1::new(
+            completed_at,
+            "d1-full-export",
+            catalog_hash,
+            &request_hash,
+            OperationalProofScopeV1::new(
+                Some("profile-a"),
+                Some(&contract.account_id),
+                Some(POLL_FIXTURE_CREDENTIAL_GENERATION),
+            ),
+            OperationalProofOutcomeV1::Succeeded,
+            evidence.clone(),
+        );
+        proof
+            .bind_d1_full_export_governed_execution(binding)
+            .expect("bind export anchor");
+        store
+            .record_operational_proof(&proof)
+            .expect("record export anchor");
+        (
+            operation_id,
+            evidence.content_hash,
+            output_sha256,
+            bookmark_hash,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the production-shaped fixture materializes the entire governed 0142 to 0143 authority chain"
+    )]
+    fn authentic_0143_prerequisites(
+        store: &StateStore,
+        root_capability: &CapabilityV1,
+        root_created_at: chrono::DateTime<Utc>,
+    ) -> Value {
+        let contract = root_capability
+            .d1_approved_mln_import
+            .as_ref()
+            .expect("root import contract");
+        let selectors = json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        });
+        let (pre_operation, pre_evidence, pre_output, pre_bookmark) = record_test_export_anchor(
+            store,
+            contract,
+            POLL_FIXTURE_CATALOG_HASH,
+            root_created_at - ChronoDuration::minutes(50),
+            "pre-0142",
+        );
+        let body_0142 = json!({
+            "migration_id":"0142",
+            "pre_recovery_anchor_operation_id":pre_operation,
+            "pre_recovery_anchor_evidence_hash":pre_evidence,
+            "pre_recovery_anchor_output_sha256":pre_output,
+            "pre_recovery_anchor_bookmark_hash":pre_bookmark,
+        });
+        let migration = contract
+            .migrations
+            .iter()
+            .find(|migration| migration.migration_id == "0142")
+            .expect("0142 migration");
+        let mut prior = PlanV1::draft(
+            "profile-a",
+            &contract.account_id,
+            POLL_FIXTURE_CATALOG_HASH,
+            root_capability.clone(),
+            json!({}),
+        )
+        .expect("0142 plan");
+        prior.created_at = root_created_at - ChronoDuration::minutes(40);
+        prior.expires_at = root_created_at + ChronoDuration::minutes(20);
+        prior.input = serde_json::to_value(CallInput {
+            selectors: selectors.clone(),
+            query: json!({}),
+            body: Some(body_0142.clone()),
+            ..CallInput::default()
+        })
+        .expect("0142 input");
+        prior
+            .precondition_hashes
+            .insert("catalog".to_owned(), prior.catalog_hash.clone());
+        let authority = json!({
+            "schema_version":1,
+            "repository_id":contract.repository_id,
+            "observed_worktree_root":"/reviewed/mln-web",
+            "observed_git_common_dir":"/reviewed/mln-web/.git",
+            "head":contract.repository_head,
+            "repository_relative_path":migration.repository_relative_path,
+            "git_blob_oid":migration.git_blob_oid,
+        });
+        let stage = json!({
+            "schema_version":1,
+            "migration_id":"0142",
+            "catalog_basename":migration.basename,
+            "source_authority":authority,
+            "source_authority_hash":hash_value(&authority).expect("0142 authority hash"),
+            "bytes":migration.bytes,
+            "sha256":format!("sha256:{}",migration.sha256),
+            "md5":migration.md5,
+            "stage_path":"/managed/0142.sql",
+            "stage_lifecycle":"preserve_until_verified_or_explicitly_retired",
+            "target":selectors,
+            "prerequisites":body_0142,
+        });
+        prior.targets = json!({"adapter":{"approved_mln_import":stage}});
+        prior.refresh_hash().expect("0142 plan hash");
+        prior.approve(true, None).expect("approve 0142");
+        prior.mark_consumed().expect("consume 0142");
+        prior
+            .record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("0142 boundary attempt");
+        let input_hash = hash_value(&prior.input).expect("0142 input hash");
+        let accepted = json!({
+            "schema_version":1,"operation_id":prior.operation_id,"step":"ingest_response",
+            "performed":true,"rectification_required":false,
+            "receipt":{"http_status":200,"success":true,"response_action":"ingest",
+                "provider":"cloudflare","effect":"d1_import_ingest_accepted",
+                "migration_id":"0142","target":selectors,"plan_input_hash":input_hash,
+                "no_replay":false,"result":{"type":"import","status":"active","success":true,
+                    "at_bookmark":"accepted-0142"},"errors":[]}
+        });
+        persist_poll_lineage_checkpoint(store, &prior.operation_id, &accepted);
+        let completion = json!({
+            "schema_version":1,"operation_id":prior.operation_id,"step":"provider_complete",
+            "performed":true,"rectification_required":false,
+            "receipt":{"provider":"cloudflare","effect":"d1_import_provider_complete",
+                "response_action":"poll","no_replay":true,"state":"provider_complete",
+                "provider_status":"complete","provider_success":true,"migration_id":"0142",
+                "target":selectors,"plan_input_hash":input_hash,
+                "source_sha256":stage["sha256"],"source_md5":stage["md5"],
+                "source_bytes":stage["bytes"],"source_authority_hash":stage["source_authority_hash"],
+                "stage_identity_hash":hash_value(&stage).expect("0142 stage hash"),
+                "prerequisites":body_0142,"at_bookmark":"accepted-0142",
+                "final_bookmark":"completed-0142"}
+        });
+        let boundary_hash =
+            persist_poll_lineage_checkpoint(store, &prior.operation_id, &completion);
+        prior.status = PlanStatus::Running;
+        prior
+            .record_transaction_stage(TransactionStageV1::BoundaryResponsePersisted)
+            .expect("0142 boundary response");
+        prior
+            .record_transaction_stage(TransactionStageV1::SecretSinkPersisted)
+            .expect("0142 secret sink");
+        let proof_operation = Uuid::new_v4().to_string();
+        let verification = store
+            .write_evidence(
+                EvidenceClass::Apply,
+                &json!({"state":"verified","operation_id":prior.operation_id,
+                    "provider_complete_evidence_hash":boundary_hash,
+                    "post_import_operation_id":proof_operation}),
+            )
+            .expect("0142 verification evidence");
+        prior.status = PlanStatus::Verified;
+        prior
+            .record_transaction_stage(TransactionStageV1::VerificationAttemptPersisted)
+            .expect("0142 verification attempt");
+        prior
+            .record_transaction_stage_with_artifact(
+                TransactionStageV1::VerificationResponsePersisted,
+                json!({"evidence_hash":verification.content_hash}),
+            )
+            .expect("0142 verification response");
+        prior
+            .record_transaction_stage(TransactionStageV1::Closed)
+            .expect("close 0142");
+        prior.refresh_hash().expect("terminal 0142 hash");
+        save_current_test_plan(store, &prior);
+        let schema_evidence = store
+            .write_evidence(
+                EvidenceClass::LiveRead,
+                &json!({"operation_id":proof_operation,"migration_id":"0142"}),
+            )
+            .expect("0142 schema evidence");
+        let schema_capability = super::trusted_native_capability("mln-0142-post-import-schema")
+            .expect("0142 schema capability");
+        let schema_contract = schema_capability
+            .mln_0142_post_import_schema
+            .expect("0142 schema contract");
+        let schema_request_hash =
+            hash_value(&json!({"fixture":"0142-schema"})).expect("0142 schema request hash");
+        let mut schema_proof = OperationalProofV1::new(
+            root_created_at - ChronoDuration::minutes(20),
+            "mln-0142-post-import-schema",
+            POLL_FIXTURE_CATALOG_HASH,
+            &schema_request_hash,
+            OperationalProofScopeV1::new(
+                Some("profile-a"),
+                Some(&contract.account_id),
+                Some(POLL_FIXTURE_CREDENTIAL_GENERATION),
+            ),
+            OperationalProofOutcomeV1::Succeeded,
+            schema_evidence.clone(),
+        );
+        schema_proof
+            .bind_mln_0142_governed_execution(Mln0142GovernedExecutionBindingV1 {
+                schema_version: 1,
+                operation_id: proof_operation.clone(),
+                capability_id: "mln-0142-post-import-schema".to_owned(),
+                capability_version: 1,
+                catalog_hash: POLL_FIXTURE_CATALOG_HASH.to_owned(),
+                target_scope_hash: hash_value(&selectors).expect("target hash"),
+                import_operation_id: prior.operation_id.clone(),
+                import_boundary_evidence_hash: boundary_hash.clone(),
+                import_source_sha256:
+                    "sha256:07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0"
+                        .to_owned(),
+                import_plan_hash: prior.content_hash.clone(),
+                final_bookmark_hash: hash_value(&json!("completed-0142"))
+                    .expect("final bookmark hash"),
+                trigger_name: schema_contract.trigger_name,
+                trigger_definition_sha256: schema_contract.trigger_definition_sha256,
+                manifest_evidence_hash: schema_evidence.content_hash.clone(),
+                request_hash: schema_request_hash,
+                credential_generation_id: POLL_FIXTURE_CREDENTIAL_GENERATION.to_owned(),
+                completion_status: "completed".to_owned(),
+                completed_at: root_created_at - ChronoDuration::minutes(20),
+            })
+            .expect("bind 0142 schema proof");
+        store
+            .record_operational_proof(&schema_proof)
+            .expect("record 0142 schema proof");
+        let (post_operation, post_evidence, _, post_bookmark) = record_test_export_anchor(
+            store,
+            contract,
+            POLL_FIXTURE_CATALOG_HASH,
+            root_created_at - ChronoDuration::minutes(10),
+            "post-0142",
+        );
+        let invariant_operation = Uuid::new_v4().to_string();
+        let invariant_evidence = store
+            .write_evidence(
+                EvidenceClass::LiveRead,
+                &json!({"operation_id":invariant_operation,"migration_id":"0143","phase":"pre_import"}),
+            )
+            .expect("0143 invariant evidence");
+        let invariant_request_hash = hash_value(
+            &serde_json::to_value(CallInput {
+                selectors: selectors.clone(),
+                query: json!({}),
+                body: Some(json!({"migration_id":"0143","phase":"pre_import"})),
+                ..CallInput::default()
+            })
+            .expect("0143 invariant input"),
+        )
+        .expect("0143 invariant request hash");
+        let completed_at = root_created_at - ChronoDuration::minutes(5);
+        let mut invariant_proof = OperationalProofV1::new(
+            completed_at,
+            "mln-0143-data-invariants",
+            POLL_FIXTURE_CATALOG_HASH,
+            &invariant_request_hash,
+            OperationalProofScopeV1::new(
+                Some("profile-a"),
+                Some(&contract.account_id),
+                Some(POLL_FIXTURE_CREDENTIAL_GENERATION),
+            ),
+            OperationalProofOutcomeV1::Succeeded,
+            invariant_evidence.clone(),
+        );
+        invariant_proof
+            .bind_mln_0143_governed_execution(Mln0143GovernedExecutionBindingV1 {
+                schema_version: 1,
+                operation_id: invariant_operation.clone(),
+                capability_id: "mln-0143-data-invariants".to_owned(),
+                capability_version: contract.pre_import_capability_version,
+                validator_contract_hash: contract.pre_import_validator_contract_hash.clone(),
+                fixed_query_sha256: contract.pre_import_fixed_query_sha256.clone(),
+                catalog_hash: POLL_FIXTURE_CATALOG_HASH.to_owned(),
+                target_scope_hash: hash_value(&selectors).expect("target hash"),
+                phase: "pre_import".to_owned(),
+                manifest_evidence_hash: invariant_evidence.content_hash.clone(),
+                request_hash: invariant_request_hash,
+                profile_identity_hash: hash_value(&json!({
+                    "profile_id":"profile-a",
+                    "credential_generation_id":POLL_FIXTURE_CREDENTIAL_GENERATION,
+                }))
+                .expect("profile identity hash"),
+                credential_generation_id: POLL_FIXTURE_CREDENTIAL_GENERATION.to_owned(),
+                completion_status: "completed".to_owned(),
+                completed_at,
+                cross_operation_lineage_hash: None,
+            })
+            .expect("bind 0143 invariant");
+        store
+            .record_operational_proof(&invariant_proof)
+            .expect("record 0143 invariant");
+        json!({
+            "migration_id":"0143",
+            "pre_recovery_anchor_operation_id":pre_operation,
+            "pre_recovery_anchor_evidence_hash":pre_evidence,
+            "pre_recovery_anchor_output_sha256":pre_output,
+            "pre_recovery_anchor_bookmark_hash":pre_bookmark,
+            "prior_0142_operation_id":prior.operation_id,
+            "prior_0142_boundary_evidence_hash":boundary_hash,
+            "prior_0142_schema_proof_operation_id":proof_operation,
+            "prior_0142_verification_evidence_hash":verification.content_hash,
+            "post_0142_anchor_operation_id":post_operation,
+            "post_0142_anchor_evidence_hash":post_evidence,
+            "post_0142_anchor_bookmark_hash":post_bookmark,
+            "pre_import_invariant_operation_id":invariant_operation,
+            "pre_import_invariant_evidence_hash":invariant_evidence.content_hash,
+        })
     }
 
     #[expect(
@@ -23863,18 +24291,22 @@ mod tests {
         let mut root_plan = PlanV1::draft(
             "profile-a",
             &root_contract.account_id,
-            "catalog-sha",
-            root_capability,
+            POLL_FIXTURE_CATALOG_HASH,
+            root_capability.clone(),
             json!({}),
         )
         .expect("root plan");
+        root_plan.created_at = Utc::now() + ChronoDuration::hours(1);
+        root_plan.expires_at = root_plan.created_at + ChronoDuration::hours(1);
+        let prerequisites =
+            authentic_0143_prerequisites(&store, &root_capability, root_plan.created_at);
         root_plan.input = serde_json::to_value(CallInput {
             selectors: json!({
                 "account_id":root_contract.account_id,
                 "database_id":root_contract.database_id,
             }),
             query: json!({}),
-            body: Some(json!({"migration_id":"0143"})),
+            body: Some(prerequisites),
             ..CallInput::default()
         })
         .expect("root input");
@@ -23985,7 +24417,7 @@ mod tests {
             let mut child = PlanV1::draft(
                 "profile-a",
                 &root_contract.account_id,
-                "catalog-sha",
+                POLL_FIXTURE_CATALOG_HASH,
                 child_capability.clone(),
                 json!({}),
             )
@@ -24020,8 +24452,8 @@ mod tests {
                 "root_input":root_plan.input,
                 "root_stage":root_stage,
                 "profile_id":"profile-a",
-                "credential_generation_id":"test-credential-generation",
-                "catalog_hash":"catalog-sha",
+                "credential_generation_id":POLL_FIXTURE_CREDENTIAL_GENERATION,
+                "catalog_hash":POLL_FIXTURE_CATALOG_HASH,
                 "capability_contract_hash":hash_value(
                     &serde_json::to_value(&child_capability).expect("child capability value")
                 ).expect("child capability hash"),
@@ -24161,6 +24593,60 @@ mod tests {
             );
             assert_eq!(fixture.children.len(), generations);
         }
+    }
+
+    #[test]
+    fn trusted_root_validator_accepts_direct_0142_and_0143_completion_authorities() {
+        let fixture = build_poll_child_lineage(1);
+        let root_v2 = fixture
+            .store
+            .load_plan_v2(&fixture.root_plan.operation_id)
+            .expect("canonical 0143 root");
+        super::validate_trusted_root_import_plan(&fixture.store, &root_v2)
+            .expect("authentic 0143 root");
+        let root_input: CallInput =
+            serde_json::from_value(fixture.root_plan.input.clone()).expect("0143 input");
+        let prior_0142 = root_input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("prior_0142_operation_id"))
+            .and_then(Value::as_str)
+            .expect("prior 0142 operation");
+        let prior_v2 = fixture
+            .store
+            .load_plan_v2(prior_0142)
+            .expect("canonical 0142 root");
+        super::validate_trusted_root_import_plan(&fixture.store, &prior_v2)
+            .expect("authentic 0142 root");
+        super::exact_durable_provider_complete_boundary(&fixture.store, prior_0142)
+            .expect("direct exact 0142 completion");
+
+        let stage = &fixture.root_plan.targets["adapter"]["approved_mln_import"];
+        let target = stage["target"].clone();
+        let completion = json!({
+            "schema_version":1,"operation_id":fixture.root_plan.operation_id,
+            "step":"provider_complete","performed":true,"rectification_required":false,
+            "receipt":{"provider":"cloudflare","effect":"d1_import_provider_complete",
+                "response_action":"poll","no_replay":true,"state":"provider_complete",
+                "provider_status":"complete","provider_success":true,"migration_id":"0143",
+                "target":target,"plan_input_hash":hash_value(&fixture.root_plan.input)
+                    .expect("0143 input hash"),
+                "source_sha256":stage["sha256"],"source_md5":stage["md5"],
+                "source_bytes":stage["bytes"],"source_authority_hash":stage["source_authority_hash"],
+                "stage_identity_hash":hash_value(stage).expect("0143 stage hash"),
+                "prerequisites":root_input.body,"at_bookmark":"accepted",
+                "final_bookmark":"completed-direct-0143"}
+        });
+        persist_poll_lineage_checkpoint(
+            &fixture.store,
+            &fixture.root_plan.operation_id,
+            &completion,
+        );
+        super::exact_durable_provider_complete_boundary(
+            &fixture.store,
+            &fixture.root_plan.operation_id,
+        )
+        .expect("direct exact 0143 completion");
     }
 
     #[test]
@@ -24983,18 +25469,21 @@ mod tests {
             let mut plan = PlanV1::draft(
                 "profile-a",
                 &contract.account_id,
-                "catalog-sha",
+                POLL_FIXTURE_CATALOG_HASH,
                 capability.clone(),
                 json!({}),
             )
             .expect("import plan");
+            plan.created_at = Utc::now() + ChronoDuration::hours(1);
+            plan.expires_at = plan.created_at + ChronoDuration::hours(1);
+            let prerequisites = authentic_0143_prerequisites(&store, &capability, plan.created_at);
             plan.input = serde_json::to_value(CallInput {
                 selectors: json!({
                     "account_id":contract.account_id,
                     "database_id":contract.database_id,
                 }),
                 query: json!({}),
-                body: Some(json!({"migration_id":"0143"})),
+                body: Some(prerequisites),
                 ..CallInput::default()
             })
             .expect("input");
