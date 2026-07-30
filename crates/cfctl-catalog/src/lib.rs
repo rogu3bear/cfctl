@@ -1863,7 +1863,7 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
         "/accounts/{account_id}/d1/database/{database_id}/import",
     );
     capability.description = Some(
-        "Stage and import exactly MLNavigator migration 0142 or 0143. The plan binds reviewed source bytes, snapshot/export/bookmark receipts, and phase authority; provider completion remains unverified until the governed post-import proof is attached."
+        "Stage and import exactly MLNavigator migration 0142 or 0143. The plan binds reviewed source bytes, one governed full-export recovery anchor with its verified file and provider bookmark, and phase authority; provider completion remains unverified until the governed post-import proof is attached."
             .to_owned(),
     );
     "D1".clone_into(&mut capability.product);
@@ -1920,18 +1920,16 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
     capability.request_schema = Some(serde_json::json!({
         "type":"object","additionalProperties":false,"x-cfctl-body-required":true,
         "required":[
-            "migration_id","pre_snapshot_operation_id","pre_snapshot_evidence_hash",
-            "pre_export_operation_id","pre_export_evidence_hash",
-            "pre_bookmark_operation_id","pre_bookmark_evidence_hash"
+            "migration_id","pre_recovery_anchor_operation_id",
+            "pre_recovery_anchor_evidence_hash","pre_recovery_anchor_output_sha256",
+            "pre_recovery_anchor_bookmark_hash"
         ],
         "properties":{
             "migration_id":{"type":"string","enum":["0142","0143"]},
-            "pre_snapshot_operation_id":operation,
-            "pre_snapshot_evidence_hash":hash,
-            "pre_export_operation_id":operation,
-            "pre_export_evidence_hash":hash,
-            "pre_bookmark_operation_id":operation,
-            "pre_bookmark_evidence_hash":hash,
+            "pre_recovery_anchor_operation_id":operation,
+            "pre_recovery_anchor_evidence_hash":hash,
+            "pre_recovery_anchor_output_sha256":hash,
+            "pre_recovery_anchor_bookmark_hash":hash,
             "prior_0142_operation_id":operation,
             "prior_0142_boundary_evidence_hash":hash,
             "prior_0142_schema_proof_operation_id":operation,

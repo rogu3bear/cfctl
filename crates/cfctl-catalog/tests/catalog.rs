@@ -11012,6 +11012,27 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
     let encoded = serde_json::to_string(capability).expect("capability JSON");
     assert!(!encoded.contains("\"sql\""));
     assert!(!encoded.contains("\"protocol\""));
+    for removed in [
+        "pre_snapshot_operation_id",
+        "pre_snapshot_evidence_hash",
+        "pre_export_operation_id",
+        "pre_export_evidence_hash",
+        "pre_bookmark_operation_id",
+        "pre_bookmark_evidence_hash",
+    ] {
+        assert!(
+            !encoded.contains(removed),
+            "forgeable prerequisite `{removed}` must not remain in the closed contract"
+        );
+    }
+    for required in [
+        "pre_recovery_anchor_operation_id",
+        "pre_recovery_anchor_evidence_hash",
+        "pre_recovery_anchor_output_sha256",
+        "pre_recovery_anchor_bookmark_hash",
+    ] {
+        assert!(encoded.contains(required), "missing governed `{required}`");
+    }
     assert!(
         capability
             .request_schema
