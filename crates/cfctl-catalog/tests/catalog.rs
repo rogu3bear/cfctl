@@ -10886,3 +10886,46 @@ fn native_control_overlay_adds_governed_full_d1_export_without_sql_or_restore() 
         )
     );
 }
+
+#[test]
+fn native_control_overlay_adds_exact_bookmark_restore_as_approval_required_recovery() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .get("d1-restore-exact-bookmark")
+        .expect("D1 restore");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Recovery);
+    assert_eq!(capability.effect, EffectClass::DataWrite);
+    assert!(capability.mutating);
+    assert_eq!(capability.permissions, ["D1 Write"]);
+    assert_eq!(
+        capability.path,
+        "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore"
+    );
+    assert_eq!(
+        capability.request_schema.as_ref().expect("closed body")["required"],
+        json!([
+            "target_bookmark",
+            "expected_current_bookmark",
+            "source_operation_id",
+            "source_evidence_hash"
+        ])
+    );
+    assert_eq!(
+        capability.request_schema.as_ref().expect("closed body")["additionalProperties"],
+        false
+    );
+    let encoded = serde_json::to_string(capability.request_schema.as_ref().expect("closed body"))
+        .expect("request schema JSON");
+    assert!(!encoded.contains("\"timestamp\""));
+    assert!(!encoded.contains("\"url\""));
+    assert!(capability.rollback.supported);
+}

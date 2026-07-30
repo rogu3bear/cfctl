@@ -9,13 +9,13 @@ use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
     AsyncCollectionMutationContractV1, CapabilityV1, CreatedCollectionResourceContractV1,
     CreatedNestedResourceContractV1, CreatedResourceContractV1, D1FullExportContractV1,
-    D1SchemaIntrospectionContractV1, DeletedNestedResourceContractV1, DeletedResourceContractV1,
-    EffectClass, EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1,
-    OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1, QUEUE_ACK_CAPABILITY_ID, QUEUE_ACK_PATH,
-    QUEUE_PULL_CAPABILITY_ID, QUEUE_PULL_PATH, QuerySerializationV1, R2LogRetrievalContractV1,
-    ResponseBodyModeV1, ResponseContractV1, RiskClass, SamePathReadContractV1, SelectorContractV1,
-    SelectorV1, TimeRangeContractV1, TimestampFormatV1, TransactionStageV1,
-    UpdatedResourceContractV1,
+    D1RestoreExactBookmarkContractV1, D1SchemaIntrospectionContractV1,
+    DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass, EventBatchContractV1,
+    GraphqlAnalyticsContractV1, KnowledgeReferenceV1, OutputFormatV1, PaginationModeV1, PlanStatus,
+    PlanV1, QUEUE_ACK_CAPABILITY_ID, QUEUE_ACK_PATH, QUEUE_PULL_CAPABILITY_ID, QUEUE_PULL_PATH,
+    QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
+    RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
+    TimestampFormatV1, TransactionStageV1, UpdatedResourceContractV1,
 };
 use chrono::{Duration, SecondsFormat, Utc};
 use serde_json::{Value, json};
@@ -79,6 +79,270 @@ async fn single_raw_response_server(
             .expect("write response");
     });
     (address.to_string(), server)
+}
+
+fn d1_restore_exact_bookmark_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "d1-restore-exact-bookmark",
+        "Restore D1 database to exact bookmark",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore",
+    );
+    "D1".clone_into(&mut capability.product);
+    "account".clone_into(&mut capability.account_scope);
+    capability.adapter_status = AdapterStatus::Native;
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.risk = RiskClass::Recovery;
+    capability.effect = EffectClass::DataWrite;
+    "d1_current_bookmark_equals_restore_result_bookmark"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("new_approved_exact_bookmark_restore_from_previous_bookmark".to_owned());
+    capability.selectors = ["account_id", "database_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: if name == "account_id" {
+                    json!({"type":"string","minLength":32,"maxLength":32})
+                } else {
+                    json!({"type":"string","minLength":36,"maxLength":36})
+                },
+                query: None,
+            }),
+        })
+        .to_vec();
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["target_bookmark","expected_current_bookmark","source_operation_id","source_evidence_hash"],
+        "properties":{
+            "target_bookmark":{"type":"string","minLength":1},
+            "expected_current_bookmark":{"type":"string","minLength":1},
+            "source_operation_id":{"type":"string","minLength":1},
+            "source_evidence_hash":{"type":"string","minLength":1}
+        }
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_restore_exact_bookmark = Some(D1RestoreExactBookmarkContractV1 {
+        bookmark_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/bookmark"
+            .to_owned(),
+        restore_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore"
+            .to_owned(),
+        max_response_bytes: 64 * 1024,
+        max_timeout_seconds: 30,
+        post_retry_count: 0,
+    });
+    capability
+}
+
+#[tokio::test]
+async fn d1_restore_prechecks_posts_once_and_postchecks_exact_returned_bookmark() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"bookmark":"current-7"},"errors":[]}"#,
+        r#"{"success":true,"result":{"bookmark":"restored-8","message":"Database restored","previous_bookmark":"current-7"},"errors":[]}"#,
+        r#"{"success":true,"result":{"bookmark":"restored-8"},"errors":[]}"#,
+    ])
+    .await;
+    let capability = d1_restore_exact_bookmark_capability();
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        body: Some(json!({
+            "target_bookmark":"target-1",
+            "expected_current_bookmark":"current-7",
+            "source_operation_id":"source-op",
+            "source_evidence_hash":format!("sha256:{}", "a".repeat(64))
+        })),
+        ..CallInput::default()
+    };
+    let mut plan = PlanV1::draft(
+        "profile",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("draft plan");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    plan.refresh_hash().expect("refresh plan");
+    plan.approve(true, None).expect("approve plan");
+    plan.mark_consumed().expect("consume plan");
+    let response = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            "sha256:catalog",
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect("restore");
+    assert!(response.success);
+    assert_eq!(response.result["bookmark"], "restored-8");
+    assert_eq!(response.result["previous_bookmark"], "current-7");
+    assert_eq!(
+        response.result["_cfctl"]["pre_restore_bookmark"],
+        "current-7"
+    );
+    assert_eq!(
+        response.result["_cfctl"]["post_restore_bookmark"],
+        "restored-8"
+    );
+    assert_eq!(
+        response.result["_cfctl"]["source_operation_id"],
+        "source-op"
+    );
+    let requests = server.await.expect("server");
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with("GET "));
+    assert!(requests[1].starts_with("POST "));
+    assert!(requests[2].starts_with("GET "));
+    assert!(requests[1].contains(r#"{"bookmark":"target-1"}"#));
+    assert!(!requests[1].contains("source_operation_id"));
+    assert!(!requests[1].contains("expected_current_bookmark"));
+}
+
+#[tokio::test]
+async fn d1_restore_expected_bookmark_mismatch_fails_before_post() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"bookmark":"unexpected"},"errors":[]}"#,
+    ])
+    .await;
+    let capability = d1_restore_exact_bookmark_capability();
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        body: Some(json!({
+            "target_bookmark":"target-1",
+            "expected_current_bookmark":"expected",
+            "source_operation_id":"source-op",
+            "source_evidence_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        })),
+        ..CallInput::default()
+    };
+    let mut plan = PlanV1::draft(
+        "profile",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("draft plan");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    plan.refresh_hash().expect("refresh plan");
+    plan.approve(true, None).expect("approve plan");
+    plan.mark_consumed().expect("consume plan");
+    let error = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            "sha256:catalog",
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect_err("bookmark drift");
+    assert!(error.to_string().contains("expected current bookmark"));
+    assert_eq!(server.await.expect("server").len(), 1);
+}
+
+#[tokio::test]
+async fn d1_restore_does_not_retry_post_after_provider_500() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for (status, body) in [
+            (
+                "200 OK",
+                r#"{"success":true,"result":{"bookmark":"current-7"},"errors":[]}"#,
+            ),
+            (
+                "500 Internal Server Error",
+                r#"{"success":false,"result":{},"errors":[{"message":"uncertain"}]}"#,
+            ),
+        ] {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).await.expect("read");
+            requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write");
+        }
+        let retried =
+            tokio::time::timeout(std::time::Duration::from_millis(150), listener.accept())
+                .await
+                .is_ok();
+        (requests, retried)
+    });
+    let capability = d1_restore_exact_bookmark_capability();
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        body: Some(json!({
+            "target_bookmark":"target-1",
+            "expected_current_bookmark":"current-7",
+            "source_operation_id":"source-op",
+            "source_evidence_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        })),
+        ..CallInput::default()
+    };
+    let mut plan = PlanV1::draft(
+        "profile",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("draft plan");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    plan.refresh_hash().expect("refresh plan");
+    plan.approve(true, None).expect("approve plan");
+    plan.mark_consumed().expect("consume plan");
+    let response = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            "sha256:catalog",
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect("provider rejection is a response");
+    assert!(!response.success);
+    let (requests, retried) = server.await.expect("server");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].starts_with("POST "));
+    assert!(!retried, "destructive restore POST must never retry");
 }
 
 #[test]

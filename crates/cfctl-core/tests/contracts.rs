@@ -123,6 +123,40 @@ fn d1_full_export_contract_is_hash_bound_and_serializable() {
 }
 
 #[test]
+fn d1_restore_exact_bookmark_contract_is_hash_bound_and_serializable() {
+    let mut capability = CapabilityV1::new(
+        "d1-restore-exact-bookmark",
+        "Restore D1 database to exact bookmark",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore",
+    );
+    capability.risk = RiskClass::Recovery;
+    capability.effect = EffectClass::DataWrite;
+    capability.d1_restore_exact_bookmark = Some(cfctl_core::D1RestoreExactBookmarkContractV1 {
+        bookmark_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/bookmark"
+            .to_owned(),
+        restore_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore"
+            .to_owned(),
+        max_response_bytes: 64 * 1024,
+        max_timeout_seconds: 30,
+        post_retry_count: 0,
+    });
+    let before = hash_value(&serde_json::to_value(&capability).expect("serialize capability"))
+        .expect("hash capability");
+    let encoded = serde_json::to_vec(&capability).expect("encode capability");
+    let mut decoded: CapabilityV1 = serde_json::from_slice(&encoded).expect("decode capability");
+    assert_eq!(decoded, capability);
+    decoded
+        .d1_restore_exact_bookmark
+        .as_mut()
+        .expect("restore contract")
+        .post_retry_count = 1;
+    let after = hash_value(&serde_json::to_value(decoded).expect("serialize drifted"))
+        .expect("hash drifted");
+    assert_ne!(before, after);
+}
+
+#[test]
 fn event_envelopes_are_hash_bound_redacted_and_never_observations() {
     let account = cfctl_core::ScopeRefV1::new(cfctl_core::ScopeKindV1::Account, "account-a", None);
     let resource = cfctl_core::ResourceRefV1::new(account.clone(), "worker", "worker-a");

@@ -12,10 +12,11 @@ use std::{
 use cfctl_auth::AuthCredential;
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1,
-    D1FullExportContractV1, D1SchemaIntrospectionContractV1, GraphqlAnalyticsContractV1,
-    OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1, R2LogRetrievalContractV1,
-    ResponseBodyModeV1, ResponseContractV1, RiskClass, SelectorContractV1, SelectorV1,
-    TimestampFormatV1, TransactionStageV1, hash_value, request_header_is_reserved,
+    D1FullExportContractV1, D1RestoreExactBookmarkContractV1, D1SchemaIntrospectionContractV1,
+    GraphqlAnalyticsContractV1, OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1,
+    R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1, RiskClass,
+    SelectorContractV1, SelectorV1, TimestampFormatV1, TransactionStageV1, hash_value,
+    request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
@@ -201,6 +202,7 @@ pub struct PreparedRequest {
     pub analytics_query: Option<AnalyticsQueryContractV1>,
     pub d1_schema_introspection: Option<D1SchemaIntrospectionContractV1>,
     pub d1_full_export: Option<D1FullExportContractV1>,
+    pub d1_restore_exact_bookmark: Option<D1RestoreExactBookmarkContractV1>,
     pub r2_log_retrieval: Option<R2LogRetrievalContractV1>,
     pub graphql: Option<GraphqlAnalyticsContractV1>,
     pub output_format: OutputFormatV1,
@@ -312,6 +314,14 @@ impl RequestBuilder {
             read_runtime_options(capability, input)?;
         let (body, text_body) = if capability.d1_full_export.is_some() {
             (Some(serde_json::json!({"output_format":"polling"})), None)
+        } else if capability.d1_restore_exact_bookmark.is_some() {
+            let target = input
+                .body
+                .as_ref()
+                .and_then(|body| body.get("target_bookmark"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| CloudflareError::MissingRequestBody(capability.id.clone()))?;
+            (Some(serde_json::json!({"bookmark":target})), None)
         } else if capability.d1_schema_introspection.is_some() {
             (
                 Some(render_d1_schema_introspection_body(
@@ -372,6 +382,7 @@ impl RequestBuilder {
             analytics_query: capability.analytics_query.clone(),
             d1_schema_introspection: capability.d1_schema_introspection.clone(),
             d1_full_export: capability.d1_full_export.clone(),
+            d1_restore_exact_bookmark: capability.d1_restore_exact_bookmark.clone(),
             r2_log_retrieval: capability.r2_log_retrieval.clone(),
             graphql: capability.graphql.clone(),
             output_format,
@@ -489,6 +500,14 @@ fn read_runtime_options(
             OutputFormatV1::Json,
             1,
             contract.max_bytes,
+            contract.max_timeout_seconds,
+        ));
+    }
+    if let Some(contract) = capability.d1_restore_exact_bookmark.as_ref() {
+        return Ok((
+            OutputFormatV1::Json,
+            1,
+            contract.max_response_bytes,
             contract.max_timeout_seconds,
         ));
     }
@@ -1483,6 +1502,11 @@ impl Executor {
             ));
         }
         validate_verification_preconditions(&plan.capability, input)?;
+        if plan.capability.d1_restore_exact_bookmark.is_some() {
+            return self
+                .execute_d1_restore_exact_bookmark(plan, input, credential)
+                .await;
+        }
         let mut request = self.builder.build_unchecked(&plan.capability, input)?;
         request.headers.insert(
             HeaderName::from_static("idempotency-key"),
@@ -1503,6 +1527,138 @@ impl Executor {
                 Err(error)
             }
         }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the pre-read, single boundary attempt, response validation, and post-read remain one auditable recovery state machine"
+    )]
+    async fn execute_d1_restore_exact_bookmark(
+        &self,
+        plan: &mut PlanV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<CloudflareResponseV1> {
+        let contract = plan
+            .capability
+            .d1_restore_exact_bookmark
+            .as_ref()
+            .ok_or_else(|| {
+                CloudflareError::InvalidRequestBody(
+                    "D1 exact-bookmark restore contract is missing".to_owned(),
+                )
+            })?;
+        let caller_body = input
+            .body
+            .as_ref()
+            .ok_or_else(|| CloudflareError::MissingRequestBody(plan.capability.id.clone()))?;
+        let value = |name: &str| {
+            caller_body
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    CloudflareError::InvalidRequestBody(format!(
+                        "D1 exact-bookmark restore requires non-empty `{name}`"
+                    ))
+                })
+        };
+        let target_bookmark = value("target_bookmark")?;
+        let expected_current_bookmark = value("expected_current_bookmark")?;
+        let source_operation_id = value("source_operation_id")?;
+        let source_evidence_hash = value("source_evidence_hash")?;
+        let request_digest = hash_value(caller_body)?;
+        let mut bookmark_capability = CapabilityV1::new(
+            "d1-current-time-travel-bookmark",
+            "Read current D1 time-travel bookmark",
+            "GET",
+            &contract.bookmark_path,
+        );
+        "D1".clone_into(&mut bookmark_capability.product);
+        "account".clone_into(&mut bookmark_capability.account_scope);
+        bookmark_capability.permissions = vec!["D1 Read".to_owned()];
+        bookmark_capability.selectors = plan.capability.selectors.clone();
+        bookmark_capability.response_contract = plan.capability.response_contract.clone();
+        let bookmark_input = CallInput {
+            selectors: input.selectors.clone(),
+            query: serde_json::json!({}),
+            body: None,
+            ..CallInput::default()
+        };
+        let bookmark_request = self.builder.build(&bookmark_capability, &bookmark_input)?;
+        let pre = self.send(&bookmark_request, credential).await?;
+        let pre_bookmark = required_d1_bookmark(&pre, "pre-restore")?;
+        if pre_bookmark != expected_current_bookmark {
+            return Err(CloudflareError::InvalidRequestBody(format!(
+                "D1 expected current bookmark `{expected_current_bookmark}` did not match live bookmark `{pre_bookmark}`; restore POST was not attempted"
+            )));
+        }
+        let mut restore_request = self.builder.build_unchecked(&plan.capability, input)?;
+        restore_request.headers.insert(
+            HeaderName::from_static("idempotency-key"),
+            HeaderValue::from_str(&plan.operation_id)
+                .map_err(|_| CloudflareError::InvalidConditionalHeader)?,
+        );
+        // The destructive restore boundary is attempted exactly once. A 429,
+        // 5xx, timeout, or transport uncertainty is returned to the plan
+        // runtime for rectification and is never replayed here.
+        let restore = self
+            .clone()
+            .with_max_retries(0)
+            .send(&restore_request, credential)
+            .await?;
+        if !restore.success {
+            plan.status = PlanStatus::Failed;
+            return Ok(restore);
+        }
+        let returned_bookmark = required_d1_bookmark(&restore, "restore")?.to_owned();
+        let previous_bookmark = restore
+            .result
+            .get("previous_bookmark")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "D1 restore response omitted required previous_bookmark".to_owned(),
+                )
+            })?
+            .to_owned();
+        let message = restore
+            .result
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "D1 restore response omitted required message".to_owned(),
+                )
+            })?
+            .to_owned();
+        let post = self.send(&bookmark_request, credential).await?;
+        let post_bookmark = required_d1_bookmark(&post, "post-restore")?;
+        if post_bookmark != returned_bookmark {
+            return Err(CloudflareError::MissingVerificationTarget(format!(
+                "D1 post-restore bookmark `{post_bookmark}` did not equal returned restore bookmark `{returned_bookmark}`"
+            )));
+        }
+        let mut response = restore;
+        response.result["_cfctl"] = serde_json::json!({
+            "target_bookmark":target_bookmark,
+            "expected_current_bookmark":expected_current_bookmark,
+            "pre_restore_bookmark":pre_bookmark,
+            "returned_bookmark":returned_bookmark,
+            "previous_bookmark":previous_bookmark,
+            "post_restore_bookmark":post_bookmark,
+            "source_operation_id":source_operation_id,
+            "source_evidence_hash":source_evidence_hash,
+            "request_digest":request_digest,
+            "provider_message":message,
+            "post_retry_count":contract.post_retry_count,
+            "performed":true,
+            "verified":true,
+        });
+        plan.status = PlanStatus::Running;
+        Ok(response)
     }
 
     /// Runs the operation-specific live readback declared by a plan. Unknown
@@ -1532,6 +1688,37 @@ impl Executor {
     ) -> Result<OperationVerificationV1> {
         let strategy = plan.capability.verification.strategy.as_str();
         validate_verification_preconditions(&plan.capability, input)?;
+        if strategy == "d1_current_bookmark_equals_restore_result_bookmark" {
+            let returned = apply_response
+                .result
+                .get("bookmark")
+                .and_then(Value::as_str);
+            let post = apply_response
+                .result
+                .pointer("/_cfctl/post_restore_bookmark")
+                .and_then(Value::as_str);
+            let passed = apply_response.success
+                && returned.is_some()
+                && returned == post
+                && apply_response
+                    .result
+                    .get("previous_bookmark")
+                    .and_then(Value::as_str)
+                    .is_some_and(|bookmark| !bookmark.is_empty());
+            return Ok(OperationVerificationV1 {
+                strategy: strategy.to_owned(),
+                passed,
+                basis: if passed {
+                    "the exact post-restore current bookmark equals Cloudflare's returned restore bookmark"
+                        .to_owned()
+                } else {
+                    "the exact post-restore bookmark receipt did not match the returned restore bookmark"
+                        .to_owned()
+                },
+                readback: apply_response.clone(),
+                correlated_resource_id: None,
+            });
+        }
         if strategy.starts_with("api_token_details_") {
             return self
                 .verify_api_token(plan, apply_response, input, credential)
@@ -3654,6 +3841,24 @@ impl Executor {
         }
         Ok(combined)
     }
+}
+
+fn required_d1_bookmark<'a>(response: &'a CloudflareResponseV1, phase: &str) -> Result<&'a str> {
+    if !response.success {
+        return Err(CloudflareError::MissingVerificationTarget(format!(
+            "D1 {phase} bookmark read was unsuccessful"
+        )));
+    }
+    response
+        .result
+        .get("bookmark")
+        .and_then(Value::as_str)
+        .filter(|bookmark| !bookmark.is_empty())
+        .ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(format!(
+                "D1 {phase} response omitted required bookmark"
+            ))
+        })
 }
 
 #[expect(
@@ -6548,9 +6753,91 @@ pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -
     validate_query_contract(capability, &input.query)?;
     validate_request_body(capability, input.body.as_ref())?;
     validate_d1_full_export_contract(capability, input)?;
+    validate_d1_restore_exact_bookmark_contract(capability, input)?;
     validate_d1_schema_introspection_contract(capability, input)?;
     validate_analytics_query_contract(capability, input)?;
     validate_r2_log_retrieval_contract(capability, input)
+}
+
+fn validate_d1_restore_exact_bookmark_contract(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let Some(contract) = capability.d1_restore_exact_bookmark.as_ref() else {
+        return Ok(());
+    };
+    let body = input.body.as_ref().and_then(Value::as_object);
+    let keys = body
+        .map(|body| body.keys().map(String::as_str).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let expected = [
+        "expected_current_bookmark",
+        "source_evidence_hash",
+        "source_operation_id",
+        "target_bookmark",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let supported = capability.id == "d1-restore-exact-bookmark"
+        && capability.method == "POST"
+        && capability.path
+            == "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore"
+        && capability.product == "D1"
+        && capability.account_scope == "account"
+        && capability.adapter_status == AdapterStatus::Native
+        && d1_restore_selectors_are_pinned(&capability.selectors)
+        && capability.mutating
+        && capability.risk == RiskClass::Recovery
+        && capability.effect == cfctl_core::EffectClass::DataWrite
+        && capability.permissions == ["D1 Write"]
+        && capability.analytics_query.is_none()
+        && capability.d1_schema_introspection.is_none()
+        && capability.d1_full_export.is_none()
+        && capability.r2_log_retrieval.is_none()
+        && (input.query.is_null()
+            || input
+                .query
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty))
+        && keys == expected
+        && contract.bookmark_path
+            == "/accounts/{account_id}/d1/database/{database_id}/time_travel/bookmark"
+        && contract.restore_path == capability.path
+        && (1..=1024 * 1024).contains(&contract.max_response_bytes)
+        && (1..=30).contains(&contract.max_timeout_seconds)
+        && contract.post_retry_count == 0;
+    if !supported {
+        return Err(CloudflareError::InvalidRequestBody(
+            "D1 exact-bookmark restore identity, closed input, permission, or no-retry bounds drifted"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn d1_restore_selectors_are_pinned(selectors: &[SelectorV1]) -> bool {
+    selectors.len() == 2
+        && selectors
+            .iter()
+            .zip([
+                (
+                    "account_id",
+                    serde_json::json!({"type":"string","minLength":32,"maxLength":32}),
+                ),
+                (
+                    "database_id",
+                    serde_json::json!({"type":"string","minLength":36,"maxLength":36}),
+                ),
+            ])
+            .all(|(selector, (name, schema))| {
+                selector.name == name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+                    && selector.contract.as_ref().is_some_and(|contract| {
+                        contract.schema == schema && contract.query.is_none()
+                    })
+            })
 }
 
 fn validate_d1_full_export_contract(capability: &CapabilityV1, input: &CallInput) -> Result<()> {

@@ -818,6 +818,7 @@ pub enum AdapterStatus {
 #[serde(rename_all = "snake_case")]
 pub enum RiskClass {
     Read,
+    Recovery,
     ScopedWrite,
     CrossConfig,
     Destructive,
@@ -833,6 +834,7 @@ pub enum RiskClass {
 #[serde(rename_all = "snake_case")]
 pub enum EffectClass {
     ReadOnly,
+    DataWrite,
     ReversibleWrite,
     Destructive,
     ExternalCommunication,
@@ -935,6 +937,15 @@ pub struct D1FullExportContractV1 {
     pub max_timeout_seconds: u64,
     pub max_download_seconds: u64,
     pub requires_new_mode_0600_file: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1RestoreExactBookmarkContractV1 {
+    pub bookmark_path: String,
+    pub restore_path: String,
+    pub max_response_bytes: u64,
+    pub max_timeout_seconds: u64,
+    pub post_retry_count: u64,
 }
 
 /// Timestamp wire representation at the pointers declared by a query contract.
@@ -1504,6 +1515,8 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_full_export: Option<D1FullExportContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d1_restore_exact_bookmark: Option<D1RestoreExactBookmarkContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2_log_retrieval: Option<R2LogRetrievalContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphql: Option<GraphqlAnalyticsContractV1>,
@@ -1606,6 +1619,7 @@ impl CapabilityV1 {
             analytics_query: None,
             d1_schema_introspection: None,
             d1_full_export: None,
+            d1_restore_exact_bookmark: None,
             r2_log_retrieval: None,
             graphql: None,
             workflow: None,
@@ -1783,6 +1797,13 @@ impl CapabilityV1 {
         }
 
         match self.verification.strategy.as_str() {
+            "d1_current_bookmark_equals_restore_result_bookmark" => {
+                self.id == "d1-restore-exact-bookmark"
+                    && self.method == "POST"
+                    && self.risk == RiskClass::Recovery
+                    && self.effect == EffectClass::DataWrite
+                    && self.d1_restore_exact_bookmark.is_some()
+            }
             "event_batch_registry_commit_and_queue_acknowledgement_receipt" => {
                 self.event_batch_contract_supported()
             }
@@ -2137,6 +2158,13 @@ impl CapabilityV1 {
             }
             Some("restore_same_path_prior_snapshot") => {
                 self.same_path_prior_snapshot_rollback_supported()
+            }
+            Some("new_approved_exact_bookmark_restore_from_previous_bookmark") => {
+                self.id == "d1-restore-exact-bookmark"
+                    && self.method == "POST"
+                    && self.risk == RiskClass::Recovery
+                    && self.effect == EffectClass::DataWrite
+                    && self.d1_restore_exact_bookmark.is_some()
             }
             _ => false,
         }

@@ -339,8 +339,43 @@ byte count, file-exists/hash-match verification, and the provider filename and
 time-travel bookmark when returned. Cloudflare may temporarily make the
 database unavailable while producing a large export, so capture the snapshot
 in the migration window. The receipt proves only the local pre-migration
-snapshot; importing, applying, or restoring it is a separate protected
-workflow and is not implemented here.
+snapshot; importing or applying it is a separate protected workflow.
+
+Restore only through the native `d1-restore-exact-bookmark` recovery
+capability. Raw D1 query/restore operations and Wrangler remain blocked:
+
+```bash
+cfctl call d1-restore-exact-bookmark \
+  --selector account_id=<account-id> \
+  --selector database_id=<database-id> \
+  --body-stdin --json
+```
+
+The stdin body is a closed object with exactly `target_bookmark`,
+`expected_current_bookmark`, `source_operation_id`, and
+`source_evidence_hash`. It accepts no timestamp, SQL, import, or raw URL. The
+call creates a destructive Recovery/DataWrite plan and never restores during
+planning. Review and explicitly approve the exact operation ID before
+`plans run`.
+
+At execution, cfctl reads the database's current time-travel bookmark and
+fails before the mutation unless it exactly equals
+`expected_current_bookmark`. It then sends exactly one restore POST containing
+only `{"bookmark":"<target_bookmark>"}`. A rate limit, provider error,
+timeout, or uncertain transport outcome is not retried; inspect the original
+operation with `plans status`/`plans rectify`. A successful provider response
+must include non-empty `bookmark`, `message`, and `previous_bookmark`. cfctl
+then reads the current bookmark again and verifies that it equals the returned
+restore bookmark.
+
+The receipt binds target, expected, pre-restore, returned, previous, and
+post-restore bookmarks; source operation/evidence linkage; the closed request
+digest; provider response metadata; and performed/verified truth. Cloudflare
+documents no incremental restore operation charge, but restoring overwrites
+the database and cancels in-flight queries. Undo is never automatic: create a
+new `d1-restore-exact-bookmark` plan targeting the prior receipt's
+`previous_bookmark`, bind a fresh expected current bookmark, review it, and
+approve it separately.
 
 Logs Engine retrieval is the one reserved-header exception and remains
 operation-specific. Supply a mode-0600 JSON bundle containing exactly

@@ -1759,12 +1759,136 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
     for capability in [
         d1_schema_introspection_capability(),
         d1_full_export_capability(),
+        d1_restore_exact_bookmark_capability(),
     ] {
         snapshot
             .capabilities
             .insert(capability.id.clone(), capability);
     }
     snapshot.refresh_hash()
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exact destructive restore contract stays visible as one auditable catalog declaration"
+)]
+fn d1_restore_exact_bookmark_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "d1-restore-exact-bookmark",
+        "Restore D1 database to exact bookmark",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore",
+    );
+    capability.description = Some(
+        "Destructively overwrite one exact D1 database from an exact time-travel bookmark after verifying its expected current bookmark. In-flight queries are cancelled. Recovery is a separately approved new restore plan using the returned previous_bookmark; it is never automatic."
+            .to_owned(),
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native governed D1 exact-bookmark recovery adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![
+        "restore D1 exact bookmark".to_owned(),
+        "recover D1 database from bookmark".to_owned(),
+    ];
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.mutating = true;
+    capability.risk = RiskClass::Recovery;
+    capability.effect = EffectClass::DataWrite;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: Some(0.0),
+        basis: Some(
+            "D1 Time Travel restore has no incremental provider operation charge; ordinary D1 storage and usage pricing remains unchanged"
+                .to_owned(),
+        ),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![
+            KnowledgeReferenceV1 {
+                title: "D1 Time Travel".to_owned(),
+                url: "https://developers.cloudflare.com/d1/reference/time-travel/".to_owned(),
+                source: "official Cloudflare docs".to_owned(),
+            },
+            KnowledgeReferenceV1 {
+                title: "D1 pricing".to_owned(),
+                url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+                source: "official Cloudflare docs".to_owned(),
+            },
+        ],
+    };
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans =
+        BTreeMap::from([("free".to_owned(), true), ("paid".to_owned(), true)]);
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/d1/reference/time-travel/".to_owned());
+    capability.verification.required = true;
+    "d1_current_bookmark_equals_restore_result_bookmark"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("new_approved_exact_bookmark_restore_from_previous_bookmark".to_owned());
+    capability.rollback.warning = Some(
+        "Undo is never automatic: create and explicitly approve a new d1-restore-exact-bookmark plan whose target_bookmark is this operation's returned previous_bookmark, after a fresh expected-current-bookmark read."
+            .to_owned(),
+    );
+    capability.selectors = ["account_id", "database_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some(format!("Exact Cloudflare {name}.")),
+            contract: Some(SelectorContractV1 {
+                schema: if name == "account_id" {
+                    serde_json::json!({"type":"string","minLength":32,"maxLength":32})
+                } else {
+                    serde_json::json!({"type":"string","minLength":36,"maxLength":36})
+                },
+                query: None,
+            }),
+        })
+        .to_vec();
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":[
+            "target_bookmark",
+            "expected_current_bookmark",
+            "source_operation_id",
+            "source_evidence_hash"
+        ],
+        "properties":{
+            "target_bookmark":{"type":"string","minLength":1,"maxLength":512},
+            "expected_current_bookmark":{"type":"string","minLength":1,"maxLength":512},
+            "source_operation_id":{"type":"string","minLength":1,"maxLength":80},
+            "source_evidence_hash":{
+                "type":"string",
+                "pattern":"^sha256:[0-9a-f]{64}$",
+                "minLength":71,
+                "maxLength":71
+            }
+        },
+        "x-cfctl-body-required":true
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_restore_exact_bookmark = Some(cfctl_core::D1RestoreExactBookmarkContractV1 {
+        bookmark_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/bookmark"
+            .to_owned(),
+        restore_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore"
+            .to_owned(),
+        max_response_bytes: 64 * 1024,
+        max_timeout_seconds: 30,
+        post_retry_count: 0,
+    });
+    capability
 }
 
 fn d1_full_export_capability() -> CapabilityV1 {

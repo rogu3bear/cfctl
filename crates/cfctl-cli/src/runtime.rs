@@ -1293,7 +1293,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
             Value::String(value_out.display().to_string()),
         );
     }
-    let result = create_plan(
+    let result = Box::pin(create_plan(
         store,
         &catalog,
         capability,
@@ -1301,7 +1301,7 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         arguments.profile.as_deref(),
         arguments.account.as_deref(),
         Value::Object(adapter_targets),
-    )
+    ))
     .await;
     if result.is_err()
         && let Some(reference) = secret_ref
@@ -12881,7 +12881,7 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
                     }),
             )?,
         );
-        let mut envelope = create_plan(
+        let mut envelope = Box::pin(create_plan(
             store,
             &catalog,
             capability,
@@ -12889,7 +12889,7 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
             Some(&plan.profile_id),
             request.requested_account.as_deref(),
             Value::Object(compensation_targets),
-        )
+        ))
         .await?;
         "plans rectify".clone_into(&mut envelope.command);
         if let Some(result) = envelope.result.as_object_mut() {
@@ -13314,7 +13314,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
         .get(capability_id)
         .cloned()
         .ok_or_else(|| capability_missing(capability_id))?;
-    let mut plan = create_plan(
+    let mut plan = Box::pin(create_plan(
         store,
         &catalog,
         capability,
@@ -13340,7 +13340,7 @@ async fn key_mint(store: &StateStore, arguments: &KeyMutationArgs) -> Result<Res
                 "evidence_hashes": inventory_evidence_hashes,
             }
         }),
-    )
+    ))
     .await?;
     plan.evidence.splice(0..0, inventory.evidence);
     Ok(plan)
@@ -13456,7 +13456,7 @@ async fn key_rotate(store: &StateStore, arguments: &KeyRotateArgs) -> Result<Res
         .get(capability_id)
         .cloned()
         .ok_or_else(|| capability_missing(capability_id))?;
-    create_plan(
+    Box::pin(create_plan(
         store,
         &catalog,
         capability,
@@ -13473,7 +13473,7 @@ async fn key_rotate(store: &StateStore, arguments: &KeyRotateArgs) -> Result<Res
         None,
         Some(&arguments.account),
         json!({"value_out": arguments.value_out}),
-    )
+    ))
     .await
 }
 
@@ -13491,7 +13491,7 @@ async fn key_revoke(store: &StateStore, arguments: &KeyRevokeArgs) -> Result<Res
         .get(capability_id)
         .cloned()
         .ok_or_else(|| capability_missing(capability_id))?;
-    create_plan(
+    Box::pin(create_plan(
         store,
         &catalog,
         capability,
@@ -13508,7 +13508,7 @@ async fn key_revoke(store: &StateStore, arguments: &KeyRevokeArgs) -> Result<Res
         None,
         Some(account),
         Value::Null,
-    )
+    ))
     .await
 }
 
@@ -17282,7 +17282,7 @@ mod tests {
                 "--json"
             ])
         );
-        let schema = &guide["input_contract"]["request_schema"];
+        let schema = &guide["capability"]["request_schema"];
         let encoded = serde_json::to_string(schema).expect("guide schema");
         assert!(!encoded.contains("\"sql\""));
         assert!(!encoded.contains("\"params\""));
@@ -17319,6 +17319,43 @@ mod tests {
         let encoded = serde_json::to_string(&guide).expect("guide JSON");
         assert!(!encoded.contains("\"sql\""));
         assert!(!encoded.contains("\"restore\""));
+    }
+
+    #[test]
+    fn d1_restore_exact_bookmark_guide_is_closed_and_approval_bound() {
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let capability = catalog
+            .get("d1-restore-exact-bookmark")
+            .expect("D1 restore");
+        let guide = guide_json(capability);
+        assert_eq!(guide["contract_state"], "available");
+        assert_eq!(
+            guide["call_argv"],
+            json!([
+                "cfctl",
+                "call",
+                "d1-restore-exact-bookmark",
+                "--selector",
+                "account_id=<account_id>",
+                "--selector",
+                "database_id=<database_id>",
+                "--body-stdin",
+                "--json"
+            ])
+        );
+        let schema = &guide["capability"]["request_schema"];
+        assert_eq!(schema["additionalProperties"], false);
+        let encoded = serde_json::to_string(schema).expect("schema JSON");
+        assert!(!encoded.contains("\"timestamp\""));
+        assert!(!encoded.contains("\"url\""));
     }
 
     #[tokio::test]
