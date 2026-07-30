@@ -82,6 +82,7 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
             CommandNodeV1::leaf("login"),
             CommandNodeV1::leaf("logout"),
             CommandNodeV1::leaf("profiles"),
+            CommandNodeV1::leaf("repair-keychain-access"),
             CommandNodeV1::leaf("status"),
             CommandNodeV1::leaf("use"),
         ],

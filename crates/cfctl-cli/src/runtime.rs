@@ -679,6 +679,9 @@ async fn auth_command(store: &StateStore, command: AuthCommand) -> Result<Result
             json!({"current": profiles.current_profile, "profiles": profiles.profiles.values().collect::<Vec<_>>() }),
         )),
         AuthCommand::Use(selector) => use_profile(store, &mut profiles, &selector),
+        AuthCommand::RepairKeychainAccess(selector) => {
+            repair_keychain_access(&profiles, &secrets, &selector)
+        }
         AuthCommand::Logout(selector) => {
             logout_profile(store, &mut profiles, &secrets, &selector).await
         }
@@ -809,6 +812,29 @@ fn auth_status(
     Ok(ResultEnvelopeV2::success(
         "auth status",
         json!({"profile": profile, "credential_available": credential_available, "selected": profiles.current_profile.as_deref() == Some(&profile.id)}),
+    ))
+}
+
+fn repair_keychain_access(
+    profiles: &ProfilesConfig,
+    secrets: &dyn SecretStore,
+    selector: &ProfileSelector,
+) -> Result<ResultEnvelopeV2> {
+    let profile = profiles
+        .profiles
+        .get(&selector.profile)
+        .ok_or_else(|| CliError::Input(format!("profile `{}` does not exist", selector.profile)))?;
+    ensure_supported_profile(profile)?;
+    secrets.repair_profile_credential_access(profile)?;
+    let backend = secrets.locate_profile_credential(profile)?;
+    Ok(ResultEnvelopeV2::success(
+        "auth repair-keychain-access",
+        json!({
+            "profile": profile.id,
+            "credential_available": true,
+            "backend": backend,
+            "message": "The opaque credential was rewritten without disclosure using the unattended platform-reader access contract."
+        }),
     ))
 }
 

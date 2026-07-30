@@ -125,6 +125,35 @@ fn immutable_api_token_slots_switch_profiles_without_overwriting_the_old_generat
 }
 
 #[test]
+fn profile_access_repair_rewrites_the_exact_active_credential_without_disclosure() {
+    let store = MemorySecretStore::default();
+    let slot_id = "22222222-2222-4222-8222-222222222222";
+    store
+        .store_api_token_slot(slot_id, "opaque-token")
+        .expect("store active slot");
+    let mut profile = ProfileMetadata::new("publisher", ProfileKind::ApiToken, Some("account-a"));
+    profile.api_token_slot_id = Some(slot_id.to_owned());
+
+    store
+        .repair_profile_credential_access(&profile)
+        .expect("repair active credential access");
+
+    assert_eq!(
+        store
+            .load_profile_credential(&profile)
+            .expect("repaired credential remains readable")
+            .bearer_token(),
+        Some("opaque-token")
+    );
+    assert_eq!(
+        store
+            .locate_profile_credential(&profile)
+            .expect("active credential location"),
+        Some(cfctl_auth::SecretBackend::Memory)
+    );
+}
+
+#[test]
 fn global_key_profiles_require_an_email_and_are_explicitly_emergency_only() {
     let store = MemorySecretStore::default();
     store

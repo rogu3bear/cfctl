@@ -2,12 +2,14 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{RngExt as _, distr::Alphanumeric};
+#[cfg(target_os = "macos")]
+use std::io::Read as _;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::{
     collections::BTreeMap,
     fmt, fs,
-    io::{Read as _, Write as _},
+    io::Write as _,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -370,6 +372,25 @@ pub trait SecretStore: Send + Sync {
         self.locate(&global_key(profile_id))
     }
 
+    fn locate_profile_credential(
+        &self,
+        profile: &ProfileMetadata,
+    ) -> Result<Option<SecretBackend>> {
+        self.locate(&profile_credential_key(profile)?)
+    }
+
+    /// Rewrite one profile's opaque credential through the active secret
+    /// backend without exposing its value. On macOS this repairs legacy
+    /// Keychain items whose creator ACL does not trust the native reader used
+    /// by unattended cfctl processes.
+    fn repair_profile_credential_access(&self, profile: &ProfileMetadata) -> Result<()> {
+        let key = profile_credential_key(profile)?;
+        let value = self
+            .get(&key)?
+            .ok_or_else(|| AuthError::MissingCredential(profile.id.clone()))?;
+        self.put(&key, &value)
+    }
+
     fn store_oauth_tokens(&self, profile_id: &str, tokens: &OAuthTokenSet) -> Result<()> {
         let encoded = serde_json::to_string(tokens)?;
         self.put(&oauth_key(profile_id), &encoded)
@@ -500,11 +521,61 @@ pub struct KeyringSecretStore;
 
 impl SecretStore for KeyringSecretStore {
     fn put(&self, key: &str, value: &str) -> Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, key)
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-        entry
-            .set_password(value)
-            .map_err(|error| AuthError::SecretStore(error.to_string()))
+        #[cfg(target_os = "macos")]
+        {
+            if value.contains(['\n', '\r']) {
+                return Err(AuthError::SecretStore(
+                    "macOS Keychain credentials cannot contain line breaks".to_owned(),
+                ));
+            }
+            let mut child = std::process::Command::new("/usr/bin/security")
+                .args([
+                    "add-generic-password",
+                    "-U",
+                    "-a",
+                    key,
+                    "-s",
+                    KEYRING_SERVICE,
+                    "-T",
+                    "/usr/bin/security",
+                    "-w",
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+            {
+                let stdin = child.stdin.as_mut().ok_or_else(|| {
+                    AuthError::SecretStore(
+                        "platform keyring credential write produced no input sink".to_owned(),
+                    )
+                })?;
+                stdin
+                    .write_all(value.as_bytes())
+                    .and_then(|()| stdin.write_all(b"\n"))
+                    .and_then(|()| stdin.write_all(value.as_bytes()))
+                    .and_then(|()| stdin.write_all(b"\n"))
+                    .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+            }
+            drop(child.stdin.take());
+            let status = wait_for_macos_keychain_child(&mut child)?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(AuthError::SecretStore(format!(
+                    "platform keyring credential write failed with exit status {status}"
+                )))
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let entry = keyring::Entry::new(KEYRING_SERVICE, key)
+                .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+            entry
+                .set_password(value)
+                .map_err(|error| AuthError::SecretStore(error.to_string()))
+        }
     }
 
     fn get(&self, key: &str) -> Result<Option<String>> {
@@ -805,17 +876,26 @@ impl PlatformSecretStore {
     /// non-secret probe value. Returns the platform failure text when the
     /// keyring is unusable.
     pub fn keyring_probe(&self) -> std::result::Result<(), String> {
-        const PROBE_KEY: &str = "doctor/keyring-probe";
         const PROBE_VALUE: &str = "cfctl-keyring-probe";
-        let _ = self.keyring.delete(PROBE_KEY);
+        if self
+            .fallback_secret_count()
+            .map_err(|error| error.to_string())?
+            > 0
+        {
+            return Err(
+                "not probed while governed fallback credentials are active; this avoids interactive platform prompts"
+                    .to_owned(),
+            );
+        }
+        let probe_key = format!("doctor/keyring-probe/{}", Uuid::new_v4());
         self.keyring
-            .put(PROBE_KEY, PROBE_VALUE)
+            .put(&probe_key, PROBE_VALUE)
             .map_err(|error| error.to_string())?;
         let read = self
             .keyring
-            .get(PROBE_KEY)
+            .get(&probe_key)
             .map_err(|error| error.to_string());
-        let _ = self.keyring.delete(PROBE_KEY);
+        let _ = self.keyring.delete(&probe_key);
         match read? {
             Some(value) if value == PROBE_VALUE => Ok(()),
             _ => Err("keyring probe read back an unexpected value".to_owned()),
@@ -825,6 +905,9 @@ impl PlatformSecretStore {
 
 impl SecretStore for PlatformSecretStore {
     fn put(&self, key: &str, value: &str) -> Result<()> {
+        if self.fallback_secret_count()? > 0 {
+            return self.fallback.put(fallback_journal_key(key).as_str(), value);
+        }
         chained_put(&self.keyring, &self.fallback, key, value)
     }
 
@@ -1126,6 +1209,20 @@ fn api_token_slot_key(slot_id: &str) -> Result<String> {
 
 fn global_key(profile_id: &str) -> String {
     format!("profile/{profile_id}/global-key")
+}
+
+fn profile_credential_key(profile: &ProfileMetadata) -> Result<String> {
+    match profile.kind {
+        ProfileKind::OAuth => Ok(oauth_key(&profile.id)),
+        ProfileKind::ApiToken => profile
+            .api_token_slot_id
+            .as_deref()
+            .map_or_else(|| Ok(api_token_key(&profile.id)), api_token_slot_key),
+        ProfileKind::LegacyWranglerSession => Err(AuthError::UnsupportedLegacyWranglerSession(
+            profile.id.clone(),
+        )),
+        ProfileKind::GlobalKey => Ok(global_key(&profile.id)),
+    }
 }
 
 pub async fn exchange_authorization_code(
@@ -1489,6 +1586,32 @@ mod tests {
                 .expect("journal"),
             None
         );
+    }
+
+    #[test]
+    fn active_platform_fallback_stays_sticky_for_fresh_credentials_and_health_probes() {
+        let runtime = tempfile::tempdir().expect("fallback root");
+        let store = PlatformSecretStore::new(runtime.path().to_path_buf());
+        store
+            .fallback
+            .put("existing", "existing-value")
+            .expect("seed active fallback");
+
+        store
+            .put("fresh", "fresh-value")
+            .expect("fresh credential uses active fallback");
+
+        assert_eq!(
+            store
+                .fallback
+                .get(fallback_journal_key("fresh").as_str())
+                .expect("read fresh fallback journal"),
+            Some("fresh-value".to_owned())
+        );
+        let probe = store
+            .keyring_probe()
+            .expect_err("active fallback skips keyring");
+        assert!(probe.contains("avoids interactive platform prompts"));
     }
 
     #[test]

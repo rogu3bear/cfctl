@@ -176,10 +176,19 @@ credential store or its private mode-0600 fallback. Slot activation is
 old-or-new atomic. A healthy managed-profile check repeats all three live reads
 and retires any unreachable legacy profile-keyed credential left by the
 one-time migration without touching the active immutable slot. On macOS,
-Keychain reads and deletes use a bounded native subprocess so an interactive
-access prompt becomes a nonzero scheduler failure instead of an indefinite
-hang. No token value enters stdout, arguments, profiles, plans, evidence, or
-repository files.
+Keychain writes, reads, and deletes use a bounded native subprocess. Writes
+send the value only through stdin and trust only `/usr/bin/security`, the same
+reader used by unattended cfctl processes. `cfctl auth
+repair-keychain-access <profile>` performs a one-time opaque rewrite for items
+created before this contract. An interactive access prompt becomes a nonzero
+scheduler failure instead of an indefinite hang. No token value enters stdout,
+arguments, profiles, plans, evidence, or repository files.
+
+Once the governed fallback contains an active credential, it remains the
+selected write backend for fresh slots and Keychain health probes are skipped.
+This prevents unattended jobs from reopening an interactive password dialog.
+An explicit credential repair or re-import is required to migrate back to the
+platform keyring.
 
 ## Secrets
 

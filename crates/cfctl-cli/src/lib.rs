@@ -78,6 +78,8 @@ pub enum AuthCommand {
     Status(ProfileSelector),
     Profiles,
     Use(ProfileSelector),
+    /// Rewrite one opaque credential with the unattended platform-reader ACL.
+    RepairKeychainAccess(ProfileSelector),
     Logout(ProfileSelector),
     ImportApiToken(ImportApiTokenArgs),
     ImportGlobalKey(ImportGlobalKeyArgs),
