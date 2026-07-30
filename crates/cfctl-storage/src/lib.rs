@@ -12,6 +12,7 @@ use std::{
 use cfctl_core::{
     AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, EvidenceClass, EvidenceV1,
     OperationalProofV1, PlanV1, PlanV2, StandingAuthorityStatus, StandingAuthorityV1, redact_json,
+    redact_json_schema,
 };
 use cfctl_workspace::{
     WORKSPACE_MANIFEST_SCHEMA_VERSION, WorkspaceManifestV1, WorkspaceRegistrationV1,
@@ -402,7 +403,7 @@ impl StateStore {
         validate_plan_id(&plan.operation_id)?;
         plan.validate_transaction_journal()?;
         let value = serde_json::to_value(plan)?;
-        if redact_json(&value) != value {
+        if plan_document_contains_sensitive_data(value, "/capability/request_schema") {
             return Err(StorageError::SensitiveData);
         }
         let plan_v2_path = self.plan_v2_path(&plan.operation_id)?;
@@ -580,7 +581,7 @@ impl StateStore {
 
     fn write_current_plan(&self, plan: &PlanV2) -> Result<()> {
         let value = serde_json::to_value(plan)?;
-        if redact_json(&value) != value {
+        if plan_document_contains_sensitive_data(value, "/plan/capability/request_schema") {
             return Err(StorageError::SensitiveData);
         }
         self.write_json(&self.plan_v2_path(&plan.plan.operation_id)?, plan)?;
@@ -1128,6 +1129,16 @@ impl ManagedIdKind {
 
 fn validate_plan_id(operation_id: &str) -> Result<()> {
     validate_managed_id(operation_id, ManagedIdKind::Plan)
+}
+
+fn plan_document_contains_sensitive_data(mut value: Value, request_schema_pointer: &str) -> bool {
+    if let Some(request_schema) = value.pointer_mut(request_schema_pointer) {
+        if redact_json_schema(request_schema) != *request_schema {
+            return true;
+        }
+        *request_schema = Value::Null;
+    }
+    redact_json(&value) != value
 }
 
 fn plan_v2_is_required(plan: &PlanV1) -> bool {

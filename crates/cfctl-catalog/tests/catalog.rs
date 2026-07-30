@@ -1678,6 +1678,7 @@ fn install_request_contract_fixture(document: &mut Value) {
                 "minLength": 1,
                 "maxLength": 253,
                 "pattern": "^[^.]+$",
+                "const": "api",
                 "description": "record name"
             },
             "ttl": {
@@ -1737,6 +1738,7 @@ fn assert_request_schema_bounds(schema: &Value) {
     assert_eq!(schema["properties"]["name"]["minLength"], 1);
     assert_eq!(schema["properties"]["name"]["maxLength"], 253);
     assert!(schema["properties"]["name"].get("pattern").is_none());
+    assert!(schema["properties"]["name"].get("const").is_none());
     assert_eq!(schema["properties"]["tags"]["minItems"], 1);
     assert_eq!(schema["properties"]["tags"]["maxItems"], 3);
     assert_eq!(schema["properties"]["tags"]["uniqueItems"], true);
@@ -4980,6 +4982,275 @@ fn access_authorization_configuration_classifier_rejects_retargeting_and_permiss
     assert_eq!(drifted_create.adapter_status, AdapterStatus::Blocked);
 }
 
+fn access_human_policy_fixture() -> serde_json::Value {
+    let case = AccessConfigurationFixture {
+        collection_path: "/accounts/{account_id}/access/apps/{app_id}/policies",
+        detail_path: "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}",
+        create_id: "access-policies-create-an-access-policy",
+        update_id: "access-policies-update-an-access-policy",
+        read_id: "access-policies-get-an-access-policy",
+        delete_id: "access-policies-delete-an-access-policy",
+        product: "Access application-scoped policies",
+        permission: "Access: Apps and Policies Write",
+        expected_risk: RiskClass::CrossConfig,
+        expected_effect: EffectClass::ReversibleWrite,
+    };
+    let mut document = access_configuration_fixture(&case);
+    document["paths"][case.detail_path]["parameters"]
+        .as_array_mut()
+        .expect("detail parameters")
+        .insert(
+            1,
+            json!({
+                "in":"path",
+                "name":"app_id",
+                "required":true,
+                "schema":{"type":"string"}
+            }),
+        );
+    document["components"]["schemas"]["Widget"]["properties"] = json!({
+        "id":{"type":"string"},
+        "name":{"type":"string"},
+        "decision":{"type":"string"},
+        "include":{"type":"array","items":{"type":"object"}},
+        "exclude":{"type":"array","items":{"type":"object"}},
+        "require":{"type":"array","items":{"type":"object"}},
+        "precedence":{"type":"integer"},
+        "session_duration":{"type":"string"},
+        "mfa_config":{"type":"object"}
+    });
+    document["paths"][case.detail_path]["put"]["requestBody"]["content"]["application/json"]["schema"] =
+        compatible_access_human_policy_put_schema();
+    document
+}
+
+#[test]
+fn access_human_policy_update_is_closed_and_exact_resource_verified() {
+    let snapshot =
+        normalize_openapi(&access_human_policy_fixture()).expect("human Access policy catalog");
+    let capability = snapshot
+        .get("access-policies-update-human-access-controls")
+        .expect("derived human policy update");
+    assert_eq!(
+        capability.adapter_status,
+        AdapterStatus::DynamicApi,
+        "gaps: {:?} blocked: {:?}",
+        capability.mutation_contract_gaps(),
+        capability.blocked_reason
+    );
+    assert_eq!(capability.risk, RiskClass::IdentityOrOwnership);
+    assert_eq!(capability.effect, EffectClass::IdentityOrOwnership);
+    assert!(capability.cost.known);
+    assert_eq!(
+        capability.verification.strategy,
+        "same_path_result_contains_planned_fields_after_update"
+    );
+    assert!(capability.rollback.supported);
+    assert_eq!(
+        capability.rollback.strategy.as_deref(),
+        Some("restore_same_path_prior_snapshot")
+    );
+    assert_eq!(
+        capability
+            .same_path_read
+            .as_ref()
+            .expect("exact policy readback")
+            .verified_response_fields,
+        [
+            "decision",
+            "exclude",
+            "include",
+            "mfa_config",
+            "name",
+            "precedence",
+            "require",
+            "session_duration",
+        ]
+    );
+    let schema = capability
+        .request_schema
+        .as_ref()
+        .expect("closed human policy schema");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["properties"]["decision"]["enum"], json!(["allow"]));
+    assert_eq!(schema["properties"]["require"]["maxItems"], 0);
+    assert_eq!(
+        schema.pointer(
+            "/properties/include/items/oneOf/1/properties/email_domain/properties/domain/format"
+        ),
+        Some(&json!("hostname"))
+    );
+    assert_eq!(
+        schema["properties"]["mfa_config"]["properties"]["allowed_authenticators"]["items"]["enum"],
+        json!(["totp", "biometrics", "security_key"])
+    );
+    let rendered_schema = serde_json::to_string(schema).expect("serializable request schema");
+    assert!(!rendered_schema.contains("\"token\""));
+    assert!(!rendered_schema.contains("\"client_secret\""));
+    assert!(capability.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn access_human_policy_update_blocks_on_readback_schema_drift() {
+    let mut fixture = access_human_policy_fixture();
+    fixture["components"]["schemas"]["Widget"]["properties"]
+        .as_object_mut()
+        .expect("policy result properties")
+        .remove("mfa_config");
+    let snapshot = normalize_openapi(&fixture).expect("drifted human Access policy catalog");
+    let capability = snapshot
+        .get("access-policies-update-human-access-controls")
+        .expect("derived human policy update");
+    assert_eq!(capability.adapter_status, AdapterStatus::Blocked);
+    assert!(
+        capability
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("schema drift:"))
+    );
+}
+
+fn compatible_access_human_policy_put_schema() -> serde_json::Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["name","decision","include","exclude","require","precedence"],
+        "properties":{
+            "name":{"type":"string"},
+            "decision":{"type":"string"},
+            "include":{"type":"array","items":{"type":"object"}},
+            "exclude":{"type":"array","items":{"type":"object"}},
+            "require":{"type":"array","maxItems":0},
+            "precedence":{"type":"integer"},
+            "session_duration":{"type":"string"},
+            "mfa_config":{"type":"object"}
+        }
+    })
+}
+
+#[test]
+fn access_human_policy_fixed_empty_require_ignores_impossible_source_items() {
+    const DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
+    const CAPABILITY_ID: &str = "access-policies-update-human-access-controls";
+
+    let mut fixture = access_human_policy_fixture();
+    let baseline = normalize_openapi(&fixture).expect("compatible human Access policy catalog");
+    assert_eq!(
+        baseline
+            .get(CAPABILITY_ID)
+            .expect("baseline human policy capability")
+            .adapter_status,
+        AdapterStatus::DynamicApi,
+        "positive control must derive the human policy capability"
+    );
+
+    fixture["paths"][DETAIL_PATH]["put"]["requestBody"]["content"]["application/json"]["schema"]
+        ["properties"]["require"] = json!({
+        "type":"array",
+        "items":{
+            "type":"object",
+            "required":["service_token"],
+            "properties":{
+                "service_token":{
+                    "type":"object",
+                    "required":["token_id"],
+                    "properties":{"token_id":{"type":"string"}}
+                }
+            }
+        }
+    });
+    let snapshot =
+        normalize_openapi(&fixture).expect("official-shaped human Access policy catalog");
+    let capability = snapshot
+        .get(CAPABILITY_ID)
+        .expect("derived human policy capability");
+    assert_eq!(
+        capability.adapter_status,
+        AdapterStatus::DynamicApi,
+        "a source item schema cannot constrain curated `require: []`: {:?}",
+        capability.blocked_reason
+    );
+}
+
+#[test]
+fn access_human_policy_derivation_fails_closed_on_source_put_schema_drift() {
+    const DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
+    const CAPABILITY_ID: &str = "access-policies-update-human-access-controls";
+
+    let mut compatible = access_human_policy_fixture();
+    compatible["paths"][DETAIL_PATH]["put"]["requestBody"]["content"]["application/json"]["schema"] =
+        compatible_access_human_policy_put_schema();
+    let baseline = normalize_openapi(&compatible).expect("compatible human policy catalog");
+    let baseline_capability = baseline
+        .get(CAPABILITY_ID)
+        .expect("compatible derived human policy update");
+    assert_eq!(
+        baseline_capability.adapter_status,
+        AdapterStatus::DynamicApi,
+        "compatible raw PUT schema must preserve the curated capability: {:?}",
+        baseline_capability.blocked_reason
+    );
+
+    let mut missing_body = compatible.clone();
+    missing_body["paths"][DETAIL_PATH]["put"]
+        .as_object_mut()
+        .expect("PUT operation")
+        .remove("requestBody");
+
+    let mut split_variant = compatible.clone();
+    let mut without_mfa = compatible_access_human_policy_put_schema();
+    without_mfa["properties"]
+        .as_object_mut()
+        .expect("source properties")
+        .remove("mfa_config");
+    split_variant["paths"][DETAIL_PATH]["put"]["requestBody"]["content"]["application/json"]["schema"] = json!({
+        "oneOf":[
+            without_mfa,
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["mfa_config"],
+                "properties":{"mfa_config":{"type":"object"}}
+            }
+        ]
+    });
+
+    let mut missing_include = compatible.clone();
+    missing_include["paths"][DETAIL_PATH]["put"]["requestBody"]["content"]["application/json"]
+        ["schema"]["properties"]
+        .as_object_mut()
+        .expect("source properties")
+        .remove("include");
+
+    let mut retyped_mfa = compatible.clone();
+    retyped_mfa["paths"][DETAIL_PATH]["put"]["requestBody"]["content"]["application/json"]["schema"]
+        ["properties"]["mfa_config"] = json!({"type":"string"});
+
+    let mut unsafe_derivations = Vec::new();
+    for (case, fixture) in [
+        ("missing request body", missing_body),
+        ("split oneOf body", split_variant),
+        ("removed include", missing_include),
+        ("retyped mfa_config", retyped_mfa),
+    ] {
+        let snapshot = normalize_openapi(&fixture).expect("drifted human policy catalog");
+        let capability = snapshot
+            .get(CAPABILITY_ID)
+            .expect("derived human policy update");
+        if capability.adapter_status != AdapterStatus::Blocked {
+            unsafe_derivations.push(format!(
+                "{case}: status={:?}, reason={:?}",
+                capability.adapter_status, capability.blocked_reason
+            ));
+        }
+    }
+
+    assert!(
+        unsafe_derivations.is_empty(),
+        "human-policy derivation survived incompatible raw PUT schema forms: {unsafe_derivations:?}"
+    );
+}
+
 /// Access app bodies are a polymorphic `anyOf` over app types. This fixture
 /// reproduces the two properties that decide the design: `name` and `type`
 /// are present in every variant, but variant-specific fields (`domain`,
@@ -5080,6 +5351,78 @@ fn access_application_fixture() -> serde_json::Value {
     document
 }
 
+fn access_application_login_methods_fixture() -> serde_json::Value {
+    let mut document = access_application_fixture();
+    let request_schema = json!({
+        "type":"object",
+        "properties":{
+            "allowed_idps":{"type":"array","items":{"type":"string"}},
+            "app_launcher_logo_url":{"type":"string"},
+            "app_launcher_visible":{"type":"boolean"},
+            "auto_redirect_to_identity":{"type":"boolean"},
+            "bg_color":{"type":"string"},
+            "custom_deny_url":{"type":"string"},
+            "custom_non_identity_deny_url":{"type":"string"},
+            "custom_pages":{"type":"array","items":{"type":"string"}},
+            "destinations":{"type":"array","items":{"type":"object"}},
+            "domain":{"type":"string"},
+            "eager_redirect_cookie_setting":{"type":"boolean"},
+            "enable_binding_cookie":{"type":"boolean"},
+            "footer_links":{"type":"array","items":{"type":"object"}},
+            "header_bg_color":{"type":"string"},
+            "http_only_cookie_attribute":{"type":"boolean"},
+            "landing_page_design":{"type":"object"},
+            "name":{"type":"string"},
+            "options_preflight_bypass":{"type":"boolean"},
+            "path_cookie_attribute":{"type":"boolean"},
+            "policies":{"type":"array","items":{"type":"object"}},
+            "same_site_cookie_attribute":{"type":"string"},
+            "self_hosted_domains":{"type":"array","items":{"type":"string"}},
+            "session_duration":{"type":"string"},
+            "skip_app_launcher_login_page":{"type":"boolean"},
+            "tags":{"type":"array","items":{"type":"string"}},
+            "type":{"type":"string","enum":["self_hosted","app_launcher"]}
+        }
+    });
+    document["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
+        ["application/json"]["schema"] = request_schema;
+    let result_properties = json!({
+        "id":{"type":"string"},
+        "allowed_idps":{"type":"array","items":{"type":"string"}},
+        "app_launcher_logo_url":{"type":"string"},
+        "app_launcher_visible":{"type":"boolean"},
+        "auto_redirect_to_identity":{"type":"boolean"},
+        "bg_color":{"type":"string"},
+        "custom_deny_url":{"type":"string"},
+        "custom_non_identity_deny_url":{"type":"string"},
+        "custom_pages":{"type":"array","items":{"type":"string"}},
+        "destinations":{"type":"array","items":{"type":"object"}},
+        "domain":{"type":"string"},
+        "eager_redirect_cookie_setting":{"type":"boolean"},
+        "enable_binding_cookie":{"type":"boolean"},
+        "footer_links":{"type":"array","items":{"type":"object"}},
+        "header_bg_color":{"type":"string"},
+        "http_only_cookie_attribute":{"type":"boolean"},
+        "landing_page_design":{"type":"object"},
+        "name":{"type":"string"},
+        "options_preflight_bypass":{"type":"boolean"},
+        "path_cookie_attribute":{"type":"boolean"},
+        "policies":{"type":"array","items":{"type":"object"}},
+        "same_site_cookie_attribute":{"type":"string"},
+        "self_hosted_domains":{"type":"array","items":{"type":"string"}},
+        "session_duration":{"type":"string"},
+        "skip_app_launcher_login_page":{"type":"boolean"},
+        "tags":{"type":"array","items":{"type":"string"}},
+        "type":{"type":"string"}
+    });
+    for method in ["get", "put"] {
+        document["paths"]["/accounts/{account_id}/access/apps/{app_id}"][method]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["properties"]["result"]["properties"] =
+            result_properties.clone();
+    }
+    document
+}
+
 #[test]
 fn access_application_create_is_governed_with_a_curated_verified_field_set() {
     let snapshot = normalize_openapi(&access_application_fixture()).expect("access catalog");
@@ -5116,6 +5459,867 @@ fn access_application_create_is_governed_with_a_curated_verified_field_set() {
         .get("access-applications-update-an-access-application")
         .expect("access update");
     assert_eq!(update.adapter_status, AdapterStatus::Blocked);
+}
+
+#[test]
+fn access_application_login_methods_update_is_full_snapshot_governed() {
+    let snapshot = normalize_openapi(&access_application_login_methods_fixture())
+        .expect("Access login-method catalog");
+    let update = snapshot
+        .get("access-applications-update-self-hosted-login-methods")
+        .expect("derived login-method update");
+    assert_eq!(
+        update.adapter_status,
+        AdapterStatus::DynamicApi,
+        "gaps: {:?} blocked: {:?}",
+        update.mutation_contract_gaps(),
+        update.blocked_reason
+    );
+    assert_eq!(update.risk, RiskClass::IdentityOrOwnership);
+    assert_eq!(update.effect, EffectClass::IdentityOrOwnership);
+    assert!(update.cost.known);
+    assert_eq!(
+        update.verification.strategy,
+        "same_path_result_contains_planned_fields_after_update"
+    );
+    assert_eq!(
+        update.rollback.strategy.as_deref(),
+        Some("restore_same_path_prior_snapshot")
+    );
+    assert_eq!(
+        update
+            .same_path_read
+            .as_ref()
+            .expect("exact app readback")
+            .verified_response_fields,
+        [
+            "allowed_idps",
+            "app_launcher_visible",
+            "auto_redirect_to_identity",
+            "destinations",
+            "domain",
+            "eager_redirect_cookie_setting",
+            "enable_binding_cookie",
+            "http_only_cookie_attribute",
+            "name",
+            "options_preflight_bypass",
+            "path_cookie_attribute",
+            "policies",
+            "same_site_cookie_attribute",
+            "self_hosted_domains",
+            "session_duration",
+            "tags",
+            "type",
+        ]
+    );
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("additionalProperties"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    assert!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("required"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|required| {
+                required.iter().all(|field| {
+                    !matches!(
+                        field.as_str(),
+                        Some(
+                            "eager_redirect_cookie_setting"
+                                | "path_cookie_attribute"
+                                | "same_site_cookie_attribute"
+                                | "tags"
+                        )
+                    )
+                })
+            }),
+        "optional cookie and tag fields are writable and verifiable when present"
+    );
+    let allowed_idp_schema = update
+        .request_schema
+        .as_ref()
+        .and_then(|schema| schema.pointer("/properties/allowed_idps/items"))
+        .expect("allowed identity-provider item schema");
+    assert_eq!(
+        allowed_idp_schema,
+        &cfctl_catalog::access_identity_provider_id_schema()
+    );
+    assert!(update.mutation_contract_gaps().is_empty());
+
+    let generic = snapshot
+        .get("access-applications-update-an-access-application")
+        .expect("generic update");
+    assert_eq!(generic.adapter_status, AdapterStatus::Blocked);
+}
+
+#[test]
+fn access_app_launcher_login_methods_update_is_full_snapshot_governed() {
+    let snapshot = normalize_openapi(&access_application_login_methods_fixture())
+        .expect("Access login-method catalog");
+    let launcher = snapshot
+        .get("access-applications-update-app-launcher-login-methods")
+        .expect("derived App Launcher login-method update");
+    assert_eq!(
+        launcher.adapter_status,
+        AdapterStatus::DynamicApi,
+        "gaps: {:?} blocked: {:?}",
+        launcher.mutation_contract_gaps(),
+        launcher.blocked_reason
+    );
+    assert_eq!(launcher.risk, RiskClass::IdentityOrOwnership);
+    assert_eq!(launcher.effect, EffectClass::IdentityOrOwnership);
+    assert!(launcher.cost.known);
+    assert_eq!(
+        launcher.verification.strategy,
+        "same_path_result_contains_planned_fields_after_update"
+    );
+    assert_eq!(
+        launcher.rollback.strategy.as_deref(),
+        Some("restore_same_path_prior_snapshot")
+    );
+    assert_eq!(
+        launcher
+            .same_path_read
+            .as_ref()
+            .expect("exact App Launcher readback")
+            .verified_response_fields,
+        [
+            "allowed_idps",
+            "app_launcher_logo_url",
+            "auto_redirect_to_identity",
+            "bg_color",
+            "custom_deny_url",
+            "custom_non_identity_deny_url",
+            "custom_pages",
+            "footer_links",
+            "header_bg_color",
+            "landing_page_design",
+            "policies",
+            "session_duration",
+            "skip_app_launcher_login_page",
+            "type",
+        ]
+    );
+    let allowed_idp_schema = launcher
+        .request_schema
+        .as_ref()
+        .and_then(|schema| schema.pointer("/properties/allowed_idps/items"))
+        .expect("allowed identity-provider item schema");
+    assert_eq!(
+        allowed_idp_schema,
+        &cfctl_catalog::access_identity_provider_id_schema()
+    );
+    assert!(launcher.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn access_application_login_methods_update_blocks_on_readback_schema_drift() {
+    let mut fixture = access_application_login_methods_fixture();
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("result properties")
+        .remove("enable_binding_cookie");
+    let snapshot = normalize_openapi(&fixture).expect("drifted Access catalog");
+    let update = snapshot
+        .get("access-applications-update-self-hosted-login-methods")
+        .expect("derived login-method update");
+    assert_eq!(update.adapter_status, AdapterStatus::Blocked);
+    assert!(
+        update
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("schema drift:"))
+    );
+}
+
+#[test]
+fn access_application_login_methods_update_blocks_when_cookie_readback_disappears() {
+    let mut fixture = access_application_login_methods_fixture();
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("result properties")
+        .remove("same_site_cookie_attribute");
+    let snapshot = normalize_openapi(&fixture).expect("drifted Access catalog");
+    let update = snapshot
+        .get("access-applications-update-self-hosted-login-methods")
+        .expect("derived login-method update");
+    assert_eq!(update.adapter_status, AdapterStatus::Blocked);
+    assert!(
+        update
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("same_site_cookie_attribute"))
+    );
+}
+
+#[test]
+fn access_application_login_methods_update_blocks_when_tag_readback_disappears() {
+    let mut fixture = access_application_login_methods_fixture();
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("result properties")
+        .remove("tags");
+    let snapshot = normalize_openapi(&fixture).expect("drifted Access catalog");
+    let update = snapshot
+        .get("access-applications-update-self-hosted-login-methods")
+        .expect("derived login-method update");
+    assert_eq!(update.adapter_status, AdapterStatus::Blocked);
+    assert!(
+        update
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("tags"))
+    );
+}
+
+#[test]
+fn access_application_login_methods_update_checks_the_matching_readback_variant() {
+    let mut fixture = access_application_login_methods_fixture();
+    let result_schema =
+        fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["properties"]["result"]
+            .clone();
+    let mut self_hosted = result_schema.clone();
+    self_hosted["properties"]["type"] = json!({"type":"string","enum":["self_hosted"]});
+    self_hosted["properties"]
+        .as_object_mut()
+        .expect("self-hosted result properties")
+        .remove("tags");
+    let mut saas = result_schema;
+    saas["properties"]["type"] = json!({"type":"string","enum":["saas"]});
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["properties"]["result"] =
+        json!({"anyOf":[self_hosted,saas]});
+
+    let snapshot = normalize_openapi(&fixture).expect("variant-shaped Access catalog");
+    let update = snapshot
+        .get("access-applications-update-self-hosted-login-methods")
+        .expect("derived login-method update");
+    assert_eq!(
+        update.adapter_status,
+        AdapterStatus::Blocked,
+        "a field on another application variant must not certify the self-hosted readback"
+    );
+    assert!(
+        update
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("tags"))
+    );
+}
+
+#[test]
+fn access_application_readback_variant_ignores_shared_type_example() {
+    let mut fixture = access_application_login_methods_fixture();
+    fixture["components"]["schemas"]["shared_access_type"] =
+        json!({"type":"string","example":"self_hosted"});
+    let result_schema =
+        fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["properties"]["result"]
+            .clone();
+    let mut self_hosted = result_schema.clone();
+    self_hosted["properties"]["type"] = json!({
+        "allOf":[
+            {"$ref":"#/components/schemas/shared_access_type"},
+            {"example":"self_hosted"}
+        ]
+    });
+    fixture["components"]["schemas"]["self_hosted_variant_props"] = self_hosted;
+    fixture["components"]["schemas"]["ssh_variant_props"] = json!({
+        "allOf":[
+            {"$ref":"#/components/schemas/self_hosted_variant_props"},
+            {"properties":{"type":{"allOf":[
+                {"$ref":"#/components/schemas/shared_access_type"},
+                {"example":"ssh"}
+            ]}}}
+        ]
+    });
+    let mut app_launcher = result_schema;
+    app_launcher["properties"]["type"] = json!({
+        "allOf":[
+            {"$ref":"#/components/schemas/shared_access_type"},
+            {"example":"app_launcher"}
+        ]
+    });
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["properties"]["result"] = json!({
+        "anyOf":[
+            {"allOf":[{"$ref":"#/components/schemas/self_hosted_variant_props"}]},
+            {"allOf":[{"$ref":"#/components/schemas/ssh_variant_props"}]},
+            {"allOf":[app_launcher]}
+        ]
+    });
+
+    let snapshot = normalize_openapi(&fixture).expect("official-shaped Access catalog");
+    for capability_id in [
+        "access-applications-update-self-hosted-login-methods",
+        "access-applications-update-app-launcher-login-methods",
+    ] {
+        let capability = snapshot
+            .get(capability_id)
+            .expect("derived login-method capability");
+        assert_eq!(
+            capability.adapter_status,
+            AdapterStatus::DynamicApi,
+            "{capability_id} must use the branch-local type annotation instead of the shared example: {:?}",
+            capability.blocked_reason
+        );
+    }
+}
+
+#[test]
+fn access_app_launcher_login_methods_update_blocks_on_readback_schema_drift() {
+    let mut fixture = access_application_login_methods_fixture();
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("result properties")
+        .remove("skip_app_launcher_login_page");
+    let snapshot = normalize_openapi(&fixture).expect("drifted Access catalog");
+    let update = snapshot
+        .get("access-applications-update-app-launcher-login-methods")
+        .expect("derived App Launcher login-method update");
+    assert_eq!(update.adapter_status, AdapterStatus::Blocked);
+    assert!(
+        update
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("schema drift:"))
+    );
+}
+
+fn source_compatible_access_application_login_methods_fixture() -> Value {
+    let mut complete = access_application_login_methods_fixture();
+    let source_properties = complete["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]
+        ["requestBody"]["content"]["application/json"]["schema"]["properties"]
+        .as_object_mut()
+        .expect("source PUT properties");
+    source_properties.extend(
+        [
+            ("app_launcher_logo_url", json!({"type":"string"})),
+            ("bg_color", json!({"type":"string"})),
+            ("custom_deny_url", json!({"type":"string"})),
+            ("custom_non_identity_deny_url", json!({"type":"string"})),
+            (
+                "custom_pages",
+                json!({"type":"array","items":{"type":"string"}}),
+            ),
+            (
+                "footer_links",
+                json!({"type":"array","items":{"type":"object"}}),
+            ),
+            ("header_bg_color", json!({"type":"string"})),
+            ("landing_page_design", json!({"type":"object"})),
+            ("skip_app_launcher_login_page", json!({"type":"boolean"})),
+        ]
+        .into_iter()
+        .map(|(name, schema)| (name.to_owned(), schema)),
+    );
+    source_properties.insert(
+        "type".to_owned(),
+        json!({"type":"string","enum":["self_hosted","app_launcher"]}),
+    );
+    complete
+}
+
+#[test]
+fn access_application_login_methods_derivation_accepts_official_policy_id_bound() {
+    let mut fixture = source_compatible_access_application_login_methods_fixture();
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["policies"]["items"] = json!({
+        "oneOf":[{
+            "type":"object",
+            "additionalProperties":false,
+            "required":["id","precedence"],
+            "properties":{
+                "id":{"type":"string","minLength":1,"maxLength":36},
+                "precedence":{"type":"integer","minimum":1}
+            }
+        }]
+    });
+
+    let snapshot = normalize_openapi(&fixture).expect("official-shaped Access application catalog");
+    for capability_id in [
+        "access-applications-update-self-hosted-login-methods",
+        "access-applications-update-app-launcher-login-methods",
+    ] {
+        let capability = snapshot
+            .get(capability_id)
+            .expect("derived login-method capability");
+        assert_eq!(
+            capability.adapter_status,
+            AdapterStatus::DynamicApi,
+            "{capability_id} must retain the source-proven 36-character policy ID bound: {:?}",
+            capability.blocked_reason
+        );
+    }
+}
+
+#[test]
+fn access_application_login_methods_compatibility_ignores_unrelated_deep_policy_branch() {
+    let capability_ids = [
+        "access-applications-update-self-hosted-login-methods",
+        "access-applications-update-app-launcher-login-methods",
+    ];
+    let mut fixture = source_compatible_access_application_login_methods_fixture();
+    let baseline = normalize_openapi(&fixture).expect("compatible Access application catalog");
+    for capability_id in capability_ids {
+        assert_eq!(
+            baseline
+                .get(capability_id)
+                .expect("baseline login-method capability")
+                .adapter_status,
+            AdapterStatus::DynamicApi,
+            "{capability_id} positive control must be source-compatible"
+        );
+    }
+
+    let mut unrelated_policy_branch = json!({"type":"string"});
+    for _ in 0..20 {
+        unrelated_policy_branch = json!({
+            "type":"array",
+            "items":unrelated_policy_branch
+        });
+    }
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["unrelated_policy_branch"] =
+        unrelated_policy_branch;
+
+    let snapshot =
+        normalize_openapi(&fixture).expect("Access catalog with an unrelated deep policy branch");
+    for capability_id in capability_ids {
+        let capability = snapshot
+            .get(capability_id)
+            .expect("derived login-method capability");
+        assert_eq!(
+            capability.adapter_status,
+            AdapterStatus::DynamicApi,
+            "{capability_id} must ignore an unrelated deep policy branch while proving the curated body: {:?}",
+            capability.blocked_reason
+        );
+    }
+}
+
+fn access_application_fixture_with_source_required_policy_variants(mut fixture: Value) -> Value {
+    fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["policies"]["items"] = json!({
+        "oneOf":[
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["id","precedence"],
+                "properties":{
+                    "id":{"type":"string","minLength":1},
+                    "precedence":{"type":"integer","minimum":1}
+                }
+            },
+            {
+                "type":"object",
+                "required":["name"],
+                "properties":{"name":{"type":"string","minLength":1}}
+            }
+        ]
+    });
+    fixture
+}
+
+#[test]
+fn source_required_keys_disambiguate_access_one_of_variants() {
+    const HUMAN_POLICY_ID: &str = "access-policies-update-human-access-controls";
+    let application_ids = [
+        "access-applications-update-self-hosted-login-methods",
+        "access-applications-update-app-launcher-login-methods",
+    ];
+
+    let application_fixture = source_compatible_access_application_login_methods_fixture();
+    let application_baseline =
+        normalize_openapi(&application_fixture).expect("compatible Access application catalog");
+    for capability_id in application_ids {
+        assert_eq!(
+            application_baseline
+                .get(capability_id)
+                .expect("baseline application capability")
+                .adapter_status,
+            AdapterStatus::DynamicApi,
+            "{capability_id} positive control must be source-compatible"
+        );
+    }
+    let application_fixture =
+        access_application_fixture_with_source_required_policy_variants(application_fixture);
+
+    let mut human_fixture = access_human_policy_fixture();
+    let human_baseline =
+        normalize_openapi(&human_fixture).expect("compatible human Access policy catalog");
+    assert_eq!(
+        human_baseline
+            .get(HUMAN_POLICY_ID)
+            .expect("baseline human policy capability")
+            .adapter_status,
+        AdapterStatus::DynamicApi,
+        "human policy positive control must be source-compatible"
+    );
+    let identity_rule = json!({
+        "oneOf":[
+            {
+                "type":"object",
+                "required":["email"],
+                "properties":{
+                    "email":{
+                        "type":"object",
+                        "required":["email"],
+                        "properties":{"email":{"type":"string"}}
+                    }
+                }
+            },
+            {
+                "type":"object",
+                "required":["email_domain"],
+                "properties":{
+                    "email_domain":{
+                        "type":"object",
+                        "required":["domain"],
+                        "properties":{"domain":{"type":"string"}}
+                    }
+                }
+            }
+        ]
+    });
+    for field in ["include", "exclude"] {
+        human_fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}"]
+            ["put"]["requestBody"]["content"]["application/json"]["schema"]["properties"][field]
+            ["items"] = identity_rule.clone();
+    }
+
+    let mut blocked = Vec::new();
+    let application_snapshot =
+        normalize_openapi(&application_fixture).expect("official-shaped application catalog");
+    for capability_id in application_ids {
+        let capability = application_snapshot
+            .get(capability_id)
+            .expect("derived application capability");
+        if capability.adapter_status != AdapterStatus::DynamicApi {
+            blocked.push(format!(
+                "embedded policy shape: {capability_id}: {:?}",
+                capability.blocked_reason
+            ));
+        }
+    }
+    let human_snapshot =
+        normalize_openapi(&human_fixture).expect("official-shaped human policy catalog");
+    let human_capability = human_snapshot
+        .get(HUMAN_POLICY_ID)
+        .expect("derived human policy capability");
+    if human_capability.adapter_status != AdapterStatus::DynamicApi {
+        blocked.push(format!(
+            "email/email-domain shape: {HUMAN_POLICY_ID}: {:?}",
+            human_capability.blocked_reason
+        ));
+    }
+
+    assert!(
+        blocked.is_empty(),
+        "source-required keys must prove valid Access oneOf alternatives disjoint: {blocked:?}"
+    );
+}
+
+fn access_application_fixture_without_put_request_body(complete: &Value) -> Value {
+    let mut missing_body = complete.clone();
+    missing_body["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]
+        .as_object_mut()
+        .expect("source PUT")
+        .remove("requestBody");
+    missing_body
+}
+
+fn access_application_fixture_without_allowed_idps(complete: &Value) -> Value {
+    let mut missing_field = complete.clone();
+    missing_field["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]
+        ["content"]["application/json"]["schema"]["properties"]
+        .as_object_mut()
+        .expect("source PUT properties")
+        .remove("allowed_idps");
+    missing_field
+}
+
+fn access_application_fixture_with_retyped_allowed_idps(complete: &Value) -> Value {
+    let mut retyped_field = complete.clone();
+    retyped_field["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["allowed_idps"] = json!({"type":"string"});
+    retyped_field
+}
+
+fn access_application_fixture_with_split_put_variants(complete: &Value) -> Value {
+    let mut split_body_variants = complete.clone();
+    let split_schema = &mut split_body_variants["paths"]["/accounts/{account_id}/access/apps/{app_id}"]
+        ["put"]["requestBody"]["content"]["application/json"]["schema"];
+    let mut split_properties = split_schema["properties"]
+        .as_object()
+        .cloned()
+        .expect("source PUT properties");
+    let allowed_idps = split_properties
+        .remove("allowed_idps")
+        .expect("source PUT allowed_idps");
+    *split_schema = json!({
+        "oneOf":[
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "properties":split_properties
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "properties":{"allowed_idps":allowed_idps}
+            }
+        ]
+    });
+    split_body_variants
+}
+
+fn access_application_fixture_with_retyped_idp_items(complete: &Value) -> Value {
+    let mut retyped_idp_items = complete.clone();
+    retyped_idp_items["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]
+        ["content"]["application/json"]["schema"]["properties"]["allowed_idps"]["items"] =
+        json!({"type":"object"});
+    retyped_idp_items
+}
+
+fn access_application_fixture_with_overlapping_source_one_of(complete: &Value) -> Value {
+    let mut overlapping_source_one_of = complete.clone();
+    let overlapping_schema = &mut overlapping_source_one_of["paths"]["/accounts/{account_id}/access/apps/{app_id}"]
+        ["put"]["requestBody"]["content"]["application/json"]["schema"];
+    let compatible_member = overlapping_schema.clone();
+    *overlapping_schema = json!({
+        "oneOf":[
+            compatible_member,
+            {
+                "type":"object",
+                "required":["session_duration"],
+                "properties":{
+                    "session_duration":{"type":"string","enum":["24h"]}
+                }
+            }
+        ]
+    });
+    overlapping_source_one_of
+}
+
+fn access_application_fixture_with_conjunctive_policy_bounds(complete: &Value) -> Value {
+    let mut conjunctive_policy_bounds = complete.clone();
+    conjunctive_policy_bounds["openapi"] = json!("3.1.0");
+    conjunctive_policy_bounds["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]
+        ["content"]["application/json"]["schema"]["properties"]["policies"]["items"] = json!({
+        "type":"object",
+        "properties":{
+            "precedence":{
+                "type":"integer",
+                "minimum":10,
+                "exclusiveMinimum":0
+            }
+        }
+    });
+    conjunctive_policy_bounds
+}
+
+fn access_application_fixture_with_unsupported_root_not(complete: &Value) -> Value {
+    let mut unsupported_root_not = complete.clone();
+    unsupported_root_not["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]
+        ["content"]["application/json"]["schema"]["not"] = json!({"type":"object"});
+    unsupported_root_not
+}
+
+fn access_application_fixture_with_stricter_duration_pattern(complete: &Value) -> Value {
+    let mut stricter_session_duration_pattern = complete.clone();
+    stricter_session_duration_pattern["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]
+        ["requestBody"]["content"]["application/json"]["schema"]["properties"]["session_duration"]
+        ["pattern"] = json!("^24h$");
+    stricter_session_duration_pattern
+}
+
+fn access_application_fixture_with_stricter_duration_const(complete: &Value) -> Value {
+    let mut stricter_session_duration_const = complete.clone();
+    stricter_session_duration_const["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]
+        ["requestBody"]["content"]["application/json"]["schema"]["properties"]["session_duration"]
+        ["const"] = json!("24h");
+    stricter_session_duration_const
+}
+
+#[test]
+fn access_application_login_methods_derivation_fails_closed_on_source_put_schema_drift() {
+    let complete = source_compatible_access_application_login_methods_fixture();
+    let capability_ids = [
+        "access-applications-update-self-hosted-login-methods",
+        "access-applications-update-app-launcher-login-methods",
+    ];
+    let baseline = normalize_openapi(&complete).expect("complete Access application catalog");
+    for capability_id in capability_ids {
+        assert_eq!(
+            baseline
+                .get(capability_id)
+                .expect("derived capability")
+                .adapter_status,
+            AdapterStatus::DynamicApi,
+            "{capability_id} fixture must start source-compatible"
+        );
+    }
+
+    let mut unsafe_derivations = Vec::new();
+    for (drift, fixture) in [
+        (
+            "missing request body",
+            access_application_fixture_without_put_request_body(&complete),
+        ),
+        (
+            "removed curated field",
+            access_application_fixture_without_allowed_idps(&complete),
+        ),
+        (
+            "retyped curated field",
+            access_application_fixture_with_retyped_allowed_idps(&complete),
+        ),
+        (
+            "split incompatible body variants",
+            access_application_fixture_with_split_put_variants(&complete),
+        ),
+        (
+            "retyped allowed_idps items",
+            access_application_fixture_with_retyped_idp_items(&complete),
+        ),
+        (
+            "overlapping source oneOf",
+            access_application_fixture_with_overlapping_source_one_of(&complete),
+        ),
+        (
+            "conjunctive policy item bounds",
+            access_application_fixture_with_conjunctive_policy_bounds(&complete),
+        ),
+        (
+            "unsupported source root not",
+            access_application_fixture_with_unsupported_root_not(&complete),
+        ),
+        (
+            "stricter raw session_duration pattern",
+            access_application_fixture_with_stricter_duration_pattern(&complete),
+        ),
+        (
+            "stricter raw session_duration const",
+            access_application_fixture_with_stricter_duration_const(&complete),
+        ),
+    ] {
+        let snapshot = normalize_openapi(&fixture).expect("drifted Access application catalog");
+        for capability_id in capability_ids {
+            let capability = snapshot
+                .get(capability_id)
+                .expect("derived capability remains discoverable");
+            if capability.adapter_status != AdapterStatus::Blocked {
+                unsafe_derivations.push(format!(
+                    "{drift}: {capability_id} remained {:?}",
+                    capability.adapter_status
+                ));
+            }
+        }
+    }
+
+    assert!(
+        unsafe_derivations.is_empty(),
+        "curated Access writes survived incompatible source PUT schemas: {unsafe_derivations:?}"
+    );
+}
+
+fn access_application_put_request_schema_mut(fixture: &mut Value) -> &mut Value {
+    &mut fixture["paths"]["/accounts/{account_id}/access/apps/{app_id}"]["put"]["requestBody"]["content"]
+        ["application/json"]["schema"]
+}
+
+#[test]
+fn access_application_login_methods_raw_put_reference_contract_is_fail_closed() {
+    let mut complete = access_application_login_methods_fixture();
+    let complete_body = access_application_put_request_schema_mut(&mut complete).clone();
+    let capability_ids = [
+        "access-applications-update-self-hosted-login-methods",
+        "access-applications-update-app-launcher-login-methods",
+    ];
+    let assert_status = |label: &str, fixture: &Value, expected: AdapterStatus| {
+        let snapshot = normalize_openapi(fixture).expect("Access application catalog");
+        for capability_id in capability_ids {
+            let capability = snapshot
+                .get(capability_id)
+                .expect("derived capability remains discoverable");
+            assert_eq!(
+                capability.adapter_status, expected,
+                "{label}: {capability_id} blocked reason: {:?}",
+                capability.blocked_reason
+            );
+        }
+    };
+
+    let mut compatible_local_ref = complete.clone();
+    compatible_local_ref["components"]["schemas"]["CompleteAccessApplicationPut"] =
+        complete_body.clone();
+    *access_application_put_request_schema_mut(&mut compatible_local_ref) =
+        json!({"$ref":"#/components/schemas/CompleteAccessApplicationPut"});
+    assert_status(
+        "compatible local PUT reference",
+        &compatible_local_ref,
+        AdapterStatus::DynamicApi,
+    );
+
+    let mut self_hosted_body = complete_body.clone();
+    self_hosted_body["properties"]["type"]["enum"] = json!(["self_hosted"]);
+    let mut app_launcher_body = complete_body.clone();
+    app_launcher_body["properties"]["type"]["enum"] = json!(["app_launcher"]);
+    let mut disjoint_one_of = complete.clone();
+    *access_application_put_request_schema_mut(&mut disjoint_one_of) = json!({
+        "oneOf":[self_hosted_body, app_launcher_body]
+    });
+    assert_status(
+        "disjoint type-discriminated PUT oneOf",
+        &disjoint_one_of,
+        AdapterStatus::DynamicApi,
+    );
+
+    let mut unresolved_local_ref = complete.clone();
+    *access_application_put_request_schema_mut(&mut unresolved_local_ref) =
+        json!({"$ref":"#/components/schemas/MissingAccessApplicationPut"});
+
+    let mut reference_cycle = complete.clone();
+    reference_cycle["components"]["schemas"]["AccessApplicationPutA"] =
+        json!({"$ref":"#/components/schemas/AccessApplicationPutB"});
+    reference_cycle["components"]["schemas"]["AccessApplicationPutB"] =
+        json!({"$ref":"#/components/schemas/AccessApplicationPutA"});
+    *access_application_put_request_schema_mut(&mut reference_cycle) =
+        json!({"$ref":"#/components/schemas/AccessApplicationPutA"});
+
+    let mut external_ref = complete.clone();
+    *access_application_put_request_schema_mut(&mut external_ref) =
+        json!({"$ref":"https://example.com/access-application-put.json"});
+
+    let mut reference_with_assertion_sibling = compatible_local_ref;
+    *access_application_put_request_schema_mut(&mut reference_with_assertion_sibling) = json!({
+        "$ref":"#/components/schemas/CompleteAccessApplicationPut",
+        "type":"object"
+    });
+
+    for (label, fixture) in [
+        ("unresolved local PUT reference", unresolved_local_ref),
+        ("cyclic local PUT reference", reference_cycle),
+        ("external PUT reference", external_ref),
+        (
+            "PUT reference with assertion sibling",
+            reference_with_assertion_sibling,
+        ),
+    ] {
+        assert_status(label, &fixture, AdapterStatus::Blocked);
+    }
 }
 
 fn access_service_token_fixture() -> serde_json::Value {

@@ -13,7 +13,7 @@ use cfctl_core::{
     SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
     StandingAuthorityV1, TimeRangeContractV1, TimestampFormatV1, TransactionStageV1,
     UpdatedResourceContractV1, guide_stages, guide_topic_document, hash_value, redact_json,
-    render_guide_topic_markdown,
+    redact_json_schema, render_guide_topic_markdown,
 };
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
@@ -3015,6 +3015,37 @@ fn redaction_recurses_through_objects_and_arrays() {
     assert_eq!(redacted["safe"], "visible");
 }
 
+#[test]
+fn redaction_preserves_only_the_typed_access_binding_cookie_toggle() {
+    let value = json!({
+        "enable_binding_cookie": true,
+        "object_value": {
+            "enable_binding_cookie": {
+                "type": "boolean",
+                "value": "opaque"
+            }
+        },
+        "invalid_value": {
+            "enable_binding_cookie": "opaque-value"
+        },
+        "session_cookie": "secret-a",
+        "cookie": "secret-b"
+    });
+
+    let redacted = redact_json(&value);
+    assert_eq!(redacted["enable_binding_cookie"], true);
+    assert_eq!(
+        redacted["object_value"]["enable_binding_cookie"],
+        "[REDACTED]"
+    );
+    assert_eq!(
+        redacted["invalid_value"]["enable_binding_cookie"],
+        "[REDACTED]"
+    );
+    assert_eq!(redacted["session_cookie"], "[REDACTED]");
+    assert_eq!(redacted["cookie"], "[REDACTED]");
+}
+
 fn standing_authority_fixture() -> StandingAuthorityV1 {
     StandingAuthorityV1::draft(
         "account-a",
@@ -4032,5 +4063,86 @@ fn asynchronous_list_security_action_pins_poll_correlation_and_exact_removal() {
             .mutation_contract_gaps()
             .iter()
             .any(|gap| gap.contains("verification strategy"))
+    );
+}
+
+#[test]
+fn schema_redaction_preserves_property_names_without_exempting_secret_values() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "token": {"type": "string", "writeOnly": true},
+            "client_secret": {"type": "string", "writeOnly": true},
+            "nested": {
+                "type": "object",
+                "properties": {
+                    "password": {"type": "string", "writeOnly": true}
+                }
+            }
+        },
+        "metadata": {
+            "client_secret": "must-not-survive"
+        }
+    });
+
+    let redacted = redact_json_schema(&schema);
+    assert_eq!(
+        redacted["properties"]["token"],
+        schema["properties"]["token"]
+    );
+    assert_eq!(
+        redacted["properties"]["client_secret"],
+        schema["properties"]["client_secret"]
+    );
+    assert_eq!(
+        redacted["properties"]["nested"]["properties"]["password"],
+        schema["properties"]["nested"]["properties"]["password"]
+    );
+    assert_eq!(
+        redacted["metadata"]["client_secret"],
+        Value::String("[REDACTED]".to_owned())
+    );
+
+    let malformed = json!({"properties":{"token":"plaintext-secret"}});
+    assert_eq!(
+        redact_json_schema(&malformed)["properties"]["token"],
+        Value::String("[REDACTED]".to_owned())
+    );
+
+    let referenced = json!({
+        "type": "object",
+        "properties": {
+            "client_secret": {"$ref": "#/$defs/Credential"}
+        },
+        "$defs": {
+            "Credential": {
+                "type": "string",
+                "default": "referenced-secret-must-not-survive"
+            }
+        }
+    });
+    assert_ne!(
+        redact_json_schema(&referenced),
+        referenced,
+        "secret-bearing annotations reached through a local schema reference must be rejected"
+    );
+
+    let cyclic = json!({
+        "type": "object",
+        "properties": {
+            "token": {"$ref": "#/$defs/A"}
+        },
+        "$defs": {
+            "A": {"$ref": "#/$defs/B"},
+            "B": {
+                "$ref": "#/$defs/A",
+                "examples": ["cyclic-secret-must-not-survive"]
+            }
+        }
+    });
+    assert_ne!(
+        redact_json_schema(&cyclic),
+        cyclic,
+        "cyclic local references must terminate and retain the sensitive-property context"
     );
 }

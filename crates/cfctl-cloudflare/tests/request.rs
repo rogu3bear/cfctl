@@ -1152,12 +1152,13 @@ fn unchecked_request_enforces_executable_string_formats() {
     let mut capability = CapabilityV1::new("formatted-create", "Create", "POST", "/formatted");
     capability.request_schema = Some(json!({
         "type": "object",
-        "required": ["timestamp", "hostname", "ipv4", "ipv6"],
+        "required": ["timestamp", "hostname", "ipv4", "ipv6", "cloudflare_uuid"],
         "properties": {
             "timestamp": {"type": "string", "format": "date-time"},
             "hostname": {"type": "string", "format": "hostname"},
             "ipv4": {"type": "string", "format": "ipv4"},
-            "ipv6": {"type": "string", "format": "ipv6"}
+            "ipv6": {"type": "string", "format": "ipv6"},
+            "cloudflare_uuid": {"type": "string", "format": "cloudflare-uuid"}
         }
     }));
     let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
@@ -1166,7 +1167,8 @@ fn unchecked_request_enforces_executable_string_formats() {
             "timestamp": "2026-07-15T03:45:00-05:00",
             "hostname": "service.example.com.",
             "ipv4": "192.0.2.1",
-            "ipv6": "2001:db8::1"
+            "ipv6": "2001:db8::1",
+            "cloudflare_uuid": "699d98642c564d2e855e9661899b7252"
         })),
         ..CallInput::default()
     };
@@ -1174,12 +1176,21 @@ fn unchecked_request_enforces_executable_string_formats() {
     let mut root_hostname = valid.clone();
     root_hostname.body.as_mut().expect("valid body")["hostname"] = json!(".");
     assert!(builder.build_unchecked(&capability, &root_hostname).is_ok());
+    let mut canonical_uuid = valid.clone();
+    canonical_uuid.body.as_mut().expect("valid body")["cloudflare_uuid"] =
+        json!("7b0bc477-5d42-4dab-b0ea-c97d0aef7810");
+    assert!(
+        builder
+            .build_unchecked(&capability, &canonical_uuid)
+            .is_ok()
+    );
 
     for (field, value) in [
         ("timestamp", "2026-07-15 03:45:00"),
         ("hostname", "_invalid.example.com"),
         ("ipv4", "999.0.2.1"),
         ("ipv6", "2001:db8::1::1"),
+        ("cloudflare_uuid", "7b0bc4775-d42-4dab-b0ea-c97d0aef7810"),
     ] {
         let mut body = valid.body.clone().expect("valid body");
         body[field] = json!(value);
@@ -1196,6 +1207,101 @@ fn unchecked_request_enforces_executable_string_formats() {
             error,
             CloudflareError::InvalidRequestBody(reason)
                 if reason.contains("pinned") && !reason.contains(value)
+        ));
+    }
+}
+
+#[test]
+fn unchecked_request_enforces_bounded_ascii_email_format() {
+    let mut capability = CapabilityV1::new("email-create", "Create", "POST", "/email");
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "required":["email"],
+        "properties":{"email":{"type":"string","format":"email"}}
+    }));
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    for email in ["person@example.com", "o'connor+founder@sub.example.com"] {
+        assert!(
+            builder
+                .build_unchecked(
+                    &capability,
+                    &CallInput {
+                        body: Some(json!({"email":email})),
+                        ..CallInput::default()
+                    }
+                )
+                .is_ok(),
+            "ordinary ASCII mailbox was rejected: {email}"
+        );
+    }
+    let local = "a".repeat(64);
+    let domain = |last_label_length| {
+        format!(
+            "{}.{}.{}",
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(last_label_length)
+        )
+    };
+    let at_limit = format!("{local}@{}", domain(61));
+    let over_limit = format!("{local}@{}", domain(62));
+    assert_eq!(at_limit.len(), 254);
+    assert_eq!(over_limit.len(), 255);
+    assert!(
+        builder
+            .build_unchecked(
+                &capability,
+                &CallInput {
+                    body: Some(json!({"email":at_limit})),
+                    ..CallInput::default()
+                }
+            )
+            .is_ok(),
+        "a valid 254-byte mailbox must remain inside the pinned schema"
+    );
+    assert!(
+        builder
+            .build_unchecked(
+                &capability,
+                &CallInput {
+                    body: Some(json!({"email":over_limit})),
+                    ..CallInput::default()
+                }
+            )
+            .is_err(),
+        "a valid-shape 255-byte mailbox must exceed the pinned schema"
+    );
+
+    let oversized_local = format!("{}@example.com", "a".repeat(65));
+    for email in [
+        oversized_local.as_str(),
+        "pérson@example.com",
+        "person.example.com",
+        "person@@example.com",
+        "@example.com",
+        "person@",
+        ".person@example.com",
+        "person.@example.com",
+        "person..tag@example.com",
+        "person tag@example.com",
+        "person@example..com",
+        "person@-example.com",
+        "person@example.com.",
+        "person@.",
+    ] {
+        let error = builder
+            .build_unchecked(
+                &capability,
+                &CallInput {
+                    body: Some(json!({"email":email})),
+                    ..CallInput::default()
+                },
+            )
+            .expect_err("malformed email must fail before request construction");
+        assert!(matches!(
+            error,
+            CloudflareError::InvalidRequestBody(reason)
+                if reason.contains("pinned email format") && !reason.contains(email)
         ));
     }
 }

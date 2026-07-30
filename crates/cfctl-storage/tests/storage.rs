@@ -8,7 +8,7 @@ use cfctl_core::{
 };
 use cfctl_storage::{RuntimePaths, StateStore, StorageError, StoredPlanRecord};
 use chrono::{Duration, Utc};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 fn sha256(byte: char) -> String {
@@ -40,6 +40,24 @@ fn draft_plan() -> PlanV1 {
         json!({"account_id":"account-a"}),
     )
     .expect("draft plan")
+}
+
+fn pinned_plan_v2(plan: PlanV1) -> cfctl_core::PlanV2 {
+    let catalog_hash = plan.catalog_hash.clone();
+    cfctl_core::PlanV2::new(
+        plan,
+        cfctl_core::PlanPinsV2 {
+            build_identity_hash: "sha256:build".to_owned(),
+            catalog_hash,
+            credential_generation_id: GENERATION_A.to_owned(),
+            admission_policy_hash: "sha256:policy".to_owned(),
+            authority_hash: None,
+            workspace_graph_hash: "sha256:workspace".to_owned(),
+            resource_observation_hashes: std::collections::BTreeMap::default(),
+            cost_budget: None,
+        },
+    )
+    .expect("plan v2")
 }
 
 fn draft_authority() -> StandingAuthorityV1 {
@@ -525,6 +543,182 @@ fn plans_are_atomic_and_raw_secret_material_is_rejected() {
     store.save_plan(&plan).expect("safe plan stores");
     let loaded = store.load_plan(&plan.operation_id).expect("plan loads");
     assert_eq!(loaded.content_hash, plan.content_hash);
+}
+
+#[test]
+fn plan_v2_storage_preserves_secret_named_request_schema_properties() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let mut capability = CapabilityV1::new(
+        "access-applications-add-an-application",
+        "Add an Access application",
+        "POST",
+        "/accounts/{account_id}/access/apps",
+    );
+    capability.request_schema = Some(json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "enable_binding_cookie": {"type": "boolean"},
+            "scim_config": {
+                "type": "object",
+                "properties": {
+                    "authentication": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "scheme": {"enum": ["oauthbearertoken"], "type": "string"},
+                                    "token": {"type": "string", "writeOnly": true}
+                                },
+                                "required": ["scheme", "token"]
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "client_id": {"type": "string"},
+                                    "client_secret": {"type": "string", "writeOnly": true},
+                                    "scheme": {"enum": ["oauth2"], "type": "string"}
+                                },
+                                "required": ["scheme", "client_id", "client_secret"]
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        "required": ["name"],
+        "x-cfctl-body-required": true
+    }));
+    let mut plan = PlanV1::draft(
+        "minter",
+        "account-a",
+        "sha256:catalog",
+        capability,
+        json!({"account_id":"account-a"}),
+    )
+    .expect("plan");
+    plan.input = json!({
+        "selectors": {"account_id": "account-a"},
+        "body": {
+            "name": "Advisor",
+            "enable_binding_cookie": true
+        }
+    });
+    plan.refresh_hash().expect("refresh plan hash");
+    let plan_v2 = pinned_plan_v2(plan.clone());
+
+    store
+        .save_plan_v2(&plan_v2)
+        .expect("catalog schema field names are not submitted secret values");
+
+    let loaded = store
+        .load_plan_v2(&plan.operation_id)
+        .expect("plan v2 reloads");
+    assert_eq!(
+        loaded.plan.capability.request_schema,
+        plan.capability.request_schema
+    );
+    assert_eq!(loaded.plan.input, plan.input);
+}
+
+#[test]
+fn plan_v2_storage_rejects_secret_bearing_schema_annotations_but_preserves_safe_labels() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let mut capability = CapabilityV1::new(
+        "access-applications-add-an-application",
+        "Add an Access application",
+        "POST",
+        "/accounts/{account_id}/access/apps",
+    );
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{
+            "client_secret":{
+                "type":"string",
+                "writeOnly":true,
+                "default":"default-must-not-persist"
+            },
+            "token":{
+                "type":"string",
+                "writeOnly":true,
+                "const":"const-must-not-persist"
+            },
+            "password":{
+                "type":"string",
+                "writeOnly":true,
+                "examples":["example-must-not-persist"]
+            }
+        }
+    }));
+    let mut plan = PlanV1::draft(
+        "minter",
+        "account-a",
+        "sha256:catalog",
+        capability,
+        json!({"account_id":"account-a"}),
+    )
+    .expect("plan");
+    plan.input = json!({
+        "selectors":{"account_id":"account-a"},
+        "body":{"name":"Advisor"}
+    });
+    plan.refresh_hash().expect("refresh plan hash");
+
+    let error = store
+        .save_plan_v2(&pinned_plan_v2(plan.clone()))
+        .expect_err("secret-bearing schema annotations must never persist");
+    assert!(matches!(error, StorageError::SensitiveData));
+
+    let properties = plan
+        .capability
+        .request_schema
+        .as_mut()
+        .and_then(|schema| schema.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+        .expect("schema properties");
+    properties
+        .get_mut("client_secret")
+        .and_then(Value::as_object_mut)
+        .expect("client secret schema")
+        .remove("default");
+    properties
+        .get_mut("token")
+        .and_then(Value::as_object_mut)
+        .expect("token schema")
+        .remove("const");
+    properties
+        .get_mut("password")
+        .and_then(Value::as_object_mut)
+        .expect("password schema")
+        .remove("examples");
+    plan.refresh_hash().expect("refresh safe plan hash");
+    store
+        .save_plan_v2(&pinned_plan_v2(plan.clone()))
+        .expect("safe secret-named schema labels remain usable");
+    let loaded = store
+        .load_plan_v2(&plan.operation_id)
+        .expect("safe plan reloads");
+    assert_eq!(
+        loaded.plan.capability.request_schema,
+        plan.capability.request_schema
+    );
+}
+
+#[test]
+fn plan_v2_storage_still_rejects_submitted_secret_values() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let mut plan = draft_plan();
+    plan.input = json!({"client_secret":"plaintext-secret"});
+    plan.refresh_hash().expect("refresh plan hash");
+    let plan_v2 = pinned_plan_v2(plan);
+
+    let error = store
+        .save_plan_v2(&plan_v2)
+        .expect_err("submitted secret values must remain blocked");
+    assert!(matches!(error, StorageError::SensitiveData));
 }
 
 #[test]

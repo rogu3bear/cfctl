@@ -2278,15 +2278,21 @@ impl Executor {
         let readback = self.send(&request, credential).await?;
         let mismatches =
             mismatched_verifiable_planned_fields(&plan.capability, planned, &readback.result);
-        let passed = apply_response.success && readback.success && mismatches.is_empty();
+        let identity_matches =
+            exact_resource_readback_identity_matches(&plan.capability, input, &readback.result);
+        let passed =
+            apply_response.success && readback.success && identity_matches && mismatches.is_empty();
         let basis = if passed {
-            format!("the exact resource readback contained every planned {operation} field")
+            format!(
+                "the exact resource readback matched its planned identity and contained every planned {operation} field"
+            )
         } else {
             format!(
-                "exact resource {operation} was not proven (apply success={}, readback HTTP {}, readback success={}, fields={})",
+                "exact resource {operation} was not proven (apply success={}, readback HTTP {}, readback success={}, identity match={}, fields={})",
                 apply_response.success,
                 readback.status,
                 readback.success,
+                identity_matches,
                 render_field_names(&mismatches)
             )
         };
@@ -4622,15 +4628,78 @@ fn mismatched_planned_fields(
         .collect()
 }
 
+fn exact_resource_readback_identity_matches(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    actual: &Value,
+) -> bool {
+    let selector = match (
+        capability.id.as_str(),
+        capability.method.as_str(),
+        capability.path.as_str(),
+    ) {
+        (
+            "access-applications-update-self-hosted-login-methods"
+            | "access-applications-update-app-launcher-login-methods",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}",
+        ) => Some("app_id"),
+        (
+            "access-policies-update-human-access-controls",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}",
+        ) => Some("policy_id"),
+        _ => None,
+    };
+    let Some(selector) = selector else {
+        return true;
+    };
+    let Some(expected_identity) = input
+        .selectors
+        .get(selector)
+        .and_then(Value::as_str)
+        .filter(|identity| !identity.is_empty())
+    else {
+        return false;
+    };
+    actual
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|identity| !identity.is_empty())
+        == Some(expected_identity)
+}
+
 fn mismatched_verifiable_planned_fields(
     capability: &CapabilityV1,
     planned: &serde_json::Map<String, Value>,
     actual: &Value,
 ) -> Vec<String> {
     let schema = capability.request_schema.as_ref();
-    planned
+    let mut mismatches = planned
         .iter()
         .filter(|(name, planned_value)| {
+            if access_application_field_is_order_insensitive(&capability.id, name)
+                && capability.method == "PUT"
+                && capability.path == "/accounts/{account_id}/access/apps/{app_id}"
+            {
+                return !access_application_set_field_matches(
+                    name,
+                    actual.get(name.as_str()),
+                    planned_value,
+                );
+            }
+            if capability.id == "access-policies-update-human-access-controls"
+                && capability.method == "PUT"
+                && capability.path
+                    == "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}"
+                && matches!(name.as_str(), "include" | "exclude" | "mfa_config")
+            {
+                return !access_human_policy_field_matches(
+                    name,
+                    actual.get(name.as_str()),
+                    planned_value,
+                );
+            }
             let mut path = vec![RequestSchemaPathStep::Property((*name).clone())];
             let response_field =
                 verification_response_field(capability, name).unwrap_or_else(|| (*name).clone());
@@ -4643,7 +4712,1061 @@ fn mismatched_verifiable_planned_fields(
             )
         })
         .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    mismatches.extend(access_exact_snapshot_optional_absence_mismatches(
+        capability, planned, actual,
+    ));
+    mismatches.extend(access_application_complete_snapshot_mismatches(
+        capability, planned, actual,
+    ));
+    mismatches.extend(access_human_policy_complete_snapshot_mismatches(
+        capability, actual,
+    ));
+    mismatches.sort();
+    mismatches.dedup();
+    mismatches
+}
+
+fn access_application_field_is_order_insensitive(capability_id: &str, field: &str) -> bool {
+    match capability_id {
+        "access-applications-update-self-hosted-login-methods" => {
+            matches!(field, "allowed_idps" | "policies" | "self_hosted_domains")
+        }
+        "access-applications-update-app-launcher-login-methods" => {
+            matches!(field, "allowed_idps" | "custom_pages" | "policies")
+        }
+        _ => false,
+    }
+}
+
+fn access_application_complete_snapshot_mismatches(
+    capability: &CapabilityV1,
+    planned: &serde_json::Map<String, Value>,
+    actual: &Value,
+) -> Vec<String> {
+    const COMMON_RESPONSE_ONLY_FIELDS: &[&str] = &["aud", "created_at", "id", "uid", "updated_at"];
+    match (
+        capability.id.as_str(),
+        capability.method.as_str(),
+        capability.path.as_str(),
+    ) {
+        (
+            "access-applications-update-self-hosted-login-methods"
+            | "access-applications-update-app-launcher-login-methods",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}",
+        ) => {}
+        _ => return Vec::new(),
+    }
+    let Some(actual) = actual.as_object() else {
+        return vec!["access_application_snapshot".to_owned()];
+    };
+    let mut mismatches = actual
+        .keys()
+        .filter(|field| {
+            let launcher_response_only = capability.id
+                == "access-applications-update-app-launcher-login-methods"
+                && matches!(field.as_str(), "domain" | "name");
+            !planned.contains_key(field.as_str())
+                && !COMMON_RESPONSE_ONLY_FIELDS.contains(&field.as_str())
+                && !launcher_response_only
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for (name, planned_value) in planned {
+        if matches!(name.as_str(), "allowed_idps" | "policies") {
+            continue;
+        }
+        let response_field =
+            verification_response_field(capability, name).unwrap_or_else(|| name.clone());
+        if actual
+            .get(response_field.as_str())
+            .is_some_and(|actual_value| {
+                has_unplanned_recursive_members(actual_value, planned_value)
+            })
+        {
+            mismatches.push(name.clone());
+        }
+    }
+    mismatches
+}
+
+fn has_unplanned_recursive_members(actual: &Value, planned: &Value) -> bool {
+    match (actual, planned) {
+        (Value::Object(actual), Value::Object(planned)) => actual.iter().any(|(name, value)| {
+            planned
+                .get(name)
+                .is_none_or(|planned| has_unplanned_recursive_members(value, planned))
+        }),
+        (Value::Array(actual), Value::Array(planned)) => {
+            actual.len() != planned.len()
+                || actual
+                    .iter()
+                    .zip(planned)
+                    .any(|(actual, planned)| has_unplanned_recursive_members(actual, planned))
+        }
+        _ => false,
+    }
+}
+
+fn access_human_policy_complete_snapshot_mismatches(
+    capability: &CapabilityV1,
+    actual: &Value,
+) -> Vec<String> {
+    if capability.id != "access-policies-update-human-access-controls"
+        || capability.method != "PUT"
+        || capability.path != "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}"
+    {
+        return Vec::new();
+    }
+    let Some(actual) = actual.as_object() else {
+        return vec!["human_policy_snapshot".to_owned(), "reusable".to_owned()];
+    };
+    let mut mismatches = actual
+        .keys()
+        .filter(|field| {
+            !matches!(
+                field.as_str(),
+                "created_at"
+                    | "decision"
+                    | "exclude"
+                    | "id"
+                    | "include"
+                    | "mfa_config"
+                    | "name"
+                    | "precedence"
+                    | "require"
+                    | "reusable"
+                    | "session_duration"
+                    | "uid"
+                    | "updated_at"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if actual.get("reusable").and_then(Value::as_bool) != Some(false) {
+        mismatches.push("reusable".to_owned());
+    }
+    mismatches
+}
+
+fn access_exact_snapshot_optional_absence_mismatches(
+    capability: &CapabilityV1,
+    planned: &serde_json::Map<String, Value>,
+    actual: &Value,
+) -> Vec<String> {
+    let is_application_snapshot = matches!(
+        capability.id.as_str(),
+        "access-applications-update-self-hosted-login-methods"
+            | "access-applications-update-app-launcher-login-methods"
+    ) && capability.method == "PUT"
+        && capability.path == "/accounts/{account_id}/access/apps/{app_id}";
+    let is_policy_snapshot = capability.id == "access-policies-update-human-access-controls"
+        && capability.method == "PUT"
+        && capability.path == "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
+    let is_exact_access_snapshot = is_application_snapshot || is_policy_snapshot;
+    if !is_exact_access_snapshot {
+        return Vec::new();
+    }
+    let Some(read) = capability.same_path_read.as_ref() else {
+        return vec!["same_path_read".to_owned()];
+    };
+    read.verified_response_fields
+        .iter()
+        .filter(|field| !planned.contains_key(field.as_str()))
+        .filter(|field| {
+            let Some(actual_value) = actual.get(field.as_str()) else {
+                return false;
+            };
+            !(is_policy_snapshot
+                && field.as_str() == "session_duration"
+                && actual_value.as_str() == Some(""))
+        })
+        .cloned()
         .collect()
+}
+
+fn access_application_set_field_matches(
+    name: &str,
+    actual: Option<&Value>,
+    planned: &Value,
+) -> bool {
+    let Some(actual) = actual.and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(planned) = planned.as_array() else {
+        return false;
+    };
+    match name {
+        "allowed_idps" => {
+            let normalized = |values: &[Value]| -> Option<Vec<String>> {
+                let mut values = values
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .map(canonical_cloudflare_uuid)
+                    .collect::<Option<Vec<_>>>()?;
+                values.sort();
+                (!values.is_empty() && !values.windows(2).any(|pair| pair[0] == pair[1]))
+                    .then_some(values)
+            };
+            normalized(actual)
+                .zip(normalized(planned))
+                .is_some_and(|(actual, planned)| actual == planned)
+        }
+        "custom_pages" | "self_hosted_domains" => normalized_access_string_set(actual)
+            .zip(normalized_access_string_set(planned))
+            .is_some_and(|(actual, planned)| actual == planned),
+        "policies" => {
+            let normalized = |values: &[Value]| -> Option<Vec<(String, u64)>> {
+                let mut values = values
+                    .iter()
+                    .map(|value| {
+                        Some((
+                            value
+                                .get("id")?
+                                .as_str()
+                                .filter(|identity| !identity.is_empty())?
+                                .to_owned(),
+                            value
+                                .get("precedence")?
+                                .as_u64()
+                                .filter(|precedence| *precedence > 0)?,
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                values.sort();
+                (!values.is_empty() && !values.windows(2).any(|pair| pair[0].0 == pair[1].0))
+                    .then_some(values)
+            };
+            normalized(actual)
+                .zip(normalized(planned))
+                .is_some_and(|(actual, planned)| actual == planned)
+        }
+        _ => false,
+    }
+}
+
+fn normalized_access_string_set(values: &[Value]) -> Option<Vec<String>> {
+    let mut values = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    values.sort();
+    (!values.windows(2).any(|pair| pair[0] == pair[1])).then_some(values)
+}
+
+fn canonical_cloudflare_uuid(value: &str) -> Option<String> {
+    is_valid_cloudflare_uuid(value).then(|| {
+        value
+            .bytes()
+            .filter(|byte| *byte != b'-')
+            .map(|byte| char::from(byte.to_ascii_lowercase()))
+            .collect()
+    })
+}
+
+fn access_human_policy_field_matches(name: &str, actual: Option<&Value>, planned: &Value) -> bool {
+    match name {
+        "include" | "exclude" => {
+            let Some(actual) = actual.and_then(Value::as_array) else {
+                return false;
+            };
+            let Some(planned) = planned.as_array() else {
+                return false;
+            };
+            let require_nonempty = name == "include";
+            normalized_access_human_identity_rules(actual, require_nonempty)
+                .zip(normalized_access_human_identity_rules(
+                    planned,
+                    require_nonempty,
+                ))
+                .is_some_and(|(actual, planned)| actual == planned)
+        }
+        "mfa_config" => {
+            let Some(actual) = actual.and_then(Value::as_object) else {
+                return false;
+            };
+            let Some(planned) = planned.as_object() else {
+                return false;
+            };
+            normalized_access_human_mfa_config(actual, true)
+                .zip(normalized_access_human_mfa_config(planned, false))
+                .is_some_and(|(actual, planned)| actual == planned)
+        }
+        _ => false,
+    }
+}
+
+fn normalized_access_human_mfa_config(
+    config: &serde_json::Map<String, Value>,
+    tolerate_empty_provider_duration: bool,
+) -> Option<(Vec<String>, bool, Option<String>)> {
+    let known_fields = ["allowed_authenticators", "mfa_disabled", "session_duration"];
+    if config
+        .keys()
+        .any(|field| !known_fields.contains(&field.as_str()))
+    {
+        return None;
+    }
+    let authenticators =
+        normalized_access_authenticators(config.get("allowed_authenticators")?.as_array()?)?;
+    let mfa_disabled = config.get("mfa_disabled")?.as_bool()?;
+    let session_duration = match config.get("session_duration") {
+        None => None,
+        Some(duration) => {
+            let duration = duration.as_str()?;
+            if duration.is_empty() {
+                if !tolerate_empty_provider_duration {
+                    return None;
+                }
+                None
+            } else {
+                Some(duration.to_owned())
+            }
+        }
+    };
+    Some((authenticators, mfa_disabled, session_duration))
+}
+
+fn normalized_access_human_identity_rules(
+    values: &[Value],
+    require_nonempty: bool,
+) -> Option<Vec<(String, String)>> {
+    if require_nonempty && values.is_empty() {
+        return None;
+    }
+    let mut rules = values
+        .iter()
+        .map(|value| {
+            let rule = value.as_object()?;
+            if rule.len() != 1 {
+                return None;
+            }
+            if let Some(email) = rule.get("email") {
+                let email = email.as_object()?;
+                if email.len() != 1 {
+                    return None;
+                }
+                return Some((
+                    "email".to_owned(),
+                    email
+                        .get("email")?
+                        .as_str()
+                        .filter(|value| !value.is_empty())?
+                        .to_owned(),
+                ));
+            }
+            let domain = rule.get("email_domain")?.as_object()?;
+            if domain.len() != 1 {
+                return None;
+            }
+            Some((
+                "email_domain".to_owned(),
+                domain
+                    .get("domain")?
+                    .as_str()
+                    .filter(|value| !value.is_empty())?
+                    .to_owned(),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    rules.sort();
+    (!rules.windows(2).any(|pair| pair[0] == pair[1])).then_some(rules)
+}
+
+fn normalized_access_authenticators(values: &[Value]) -> Option<Vec<String>> {
+    let mut authenticators = values
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    authenticators.sort();
+    (!authenticators.is_empty() && !authenticators.windows(2).any(|pair| pair[0] == pair[1]))
+        .then_some(authenticators)
+}
+
+#[cfg(test)]
+mod access_application_projection_tests {
+    use super::{
+        CallInput, access_application_set_field_matches,
+        access_exact_snapshot_optional_absence_mismatches, access_human_policy_field_matches,
+        exact_resource_readback_identity_matches,
+    };
+    use cfctl_core::CapabilityV1;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn identity_provider_and_policy_sets_verify_without_order_dependence() {
+        let id_a = "699d98642c564d2e855e9661899b7252";
+        let id_b = "7b0bc4775d424dabb0eac97d0aef7810";
+        assert!(access_application_set_field_matches(
+            "allowed_idps",
+            Some(&json!([id_b, id_a])),
+            &json!([id_a, id_b]),
+        ));
+        assert!(access_application_set_field_matches(
+            "policies",
+            Some(&json!([
+                {"id":"policy-b","precedence":2,"name":"B"},
+                {"id":"policy-a","precedence":1,"name":"A"}
+            ])),
+            &json!([
+                {"id":"policy-a","precedence":1},
+                {"id":"policy-b","precedence":2}
+            ]),
+        ));
+        assert!(!access_application_set_field_matches(
+            "policies",
+            Some(&json!([{"id":"policy-b","precedence":1}])),
+            &json!([{"id":"policy-a","precedence":1}]),
+        ));
+        assert!(!access_application_set_field_matches(
+            "policies",
+            Some(&json!([{"id":"policy-a"}])),
+            &json!([{"id":"policy-a","precedence":1}]),
+        ));
+    }
+
+    #[test]
+    fn preserved_access_string_sets_verify_without_order_dependence_or_duplicate_tolerance() {
+        for (capability_id, field) in [
+            (
+                "access-applications-update-self-hosted-login-methods",
+                "self_hosted_domains",
+            ),
+            (
+                "access-applications-update-app-launcher-login-methods",
+                "custom_pages",
+            ),
+        ] {
+            assert!(
+                access_application_set_field_matches(
+                    field,
+                    Some(&json!(["second.example", "first.example"])),
+                    &json!(["first.example", "second.example"]),
+                ),
+                "{field} provider reordering must not fail exact readback verification"
+            );
+            assert!(
+                !access_application_set_field_matches(
+                    field,
+                    Some(&json!(["first.example", "first.example"])),
+                    &json!(["first.example"]),
+                ),
+                "{field} duplicate readback values must not satisfy the planned set"
+            );
+            assert!(
+                !access_application_set_field_matches(
+                    field,
+                    Some(&json!(["first.example"])),
+                    &json!(["first.example", "second.example"]),
+                ),
+                "{field} cardinality drift must not satisfy the planned set"
+            );
+
+            let mut capability = CapabilityV1::new(
+                capability_id,
+                "Update Access application login methods",
+                "PUT",
+                "/accounts/{account_id}/access/apps/{app_id}",
+            );
+            capability.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+                path: capability.path.clone(),
+                read_capability_id: "access-applications-get-an-access-application".to_owned(),
+                verified_response_fields: vec![field.to_owned()],
+            });
+            let planned = serde_json::Map::from_iter([(
+                field.to_owned(),
+                json!(["first.example", "second.example"]),
+            )]);
+            assert!(
+                super::mismatched_verifiable_planned_fields(
+                    &capability,
+                    &planned,
+                    &json!({field:["second.example", "first.example"]}),
+                )
+                .is_empty(),
+                "{field} reordered provider readback must close verification"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_provider_set_verification_rejects_duplicates() {
+        let id = "699d98642c564d2e855e9661899b7252";
+        assert!(!access_application_set_field_matches(
+            "allowed_idps",
+            Some(&json!([id, id])),
+            &json!([id]),
+        ));
+        assert!(!access_application_set_field_matches(
+            "policies",
+            Some(&json!([
+                {"id":"policy-a","precedence":1},
+                {"id":"policy-a","precedence":2}
+            ])),
+            &json!([
+                {"id":"policy-a","precedence":1},
+                {"id":"policy-a","precedence":2}
+            ]),
+        ));
+    }
+
+    #[test]
+    fn identity_provider_set_verification_normalizes_cloudflare_uuid_spelling() {
+        let compact = "7b0bc4775d424dabb0eac97d0aef7810";
+        let canonical = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810";
+        assert!(access_application_set_field_matches(
+            "allowed_idps",
+            Some(&json!([compact])),
+            &json!([canonical]),
+        ));
+        assert!(!access_application_set_field_matches(
+            "allowed_idps",
+            Some(&json!([compact, canonical])),
+            &json!([canonical]),
+        ));
+    }
+
+    #[test]
+    fn human_policy_identity_and_authenticator_sets_verify_without_order_dependence() {
+        assert!(access_human_policy_field_matches(
+            "include",
+            Some(&json!([
+                {"email":{"email":"person@example.com"}},
+                {"email_domain":{"domain":"example.com"}}
+            ])),
+            &json!([
+                {"email_domain":{"domain":"example.com"}},
+                {"email":{"email":"person@example.com"}}
+            ]),
+        ));
+        assert!(access_human_policy_field_matches(
+            "mfa_config",
+            Some(&json!({
+                "allowed_authenticators":["biometrics","totp"],
+                "mfa_disabled":false
+            })),
+            &json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false
+            }),
+        ));
+    }
+
+    #[test]
+    fn human_policy_set_verification_rejects_duplicates_and_authenticator_drift() {
+        assert!(!access_human_policy_field_matches(
+            "include",
+            Some(&json!([
+                {"email_domain":{"domain":"example.com"}},
+                {"email_domain":{"domain":"example.com"}}
+            ])),
+            &json!([{"email_domain":{"domain":"example.com"}}]),
+        ));
+        assert!(!access_human_policy_field_matches(
+            "include",
+            Some(&json!([{
+                "email":{
+                    "email":"person@example.com",
+                    "unclassified":"must-not-be-ignored"
+                }
+            }])),
+            &json!([{"email":{"email":"person@example.com"}}]),
+        ));
+        assert!(!access_human_policy_field_matches(
+            "mfa_config",
+            Some(&json!({
+                "allowed_authenticators":["totp","biometrics","security_key"],
+                "mfa_disabled":false
+            })),
+            &json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false
+            }),
+        ));
+        assert!(!access_human_policy_field_matches(
+            "mfa_config",
+            Some(&json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false,
+                "session_duration":"12h"
+            })),
+            &json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false
+            }),
+        ));
+        assert!(!access_human_policy_field_matches(
+            "mfa_config",
+            Some(&json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false,
+                "unclassified":true
+            })),
+            &json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false
+            }),
+        ));
+        assert!(access_human_policy_field_matches(
+            "mfa_config",
+            Some(&json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false,
+                "session_duration":""
+            })),
+            &json!({
+                "allowed_authenticators":["totp","biometrics"],
+                "mfa_disabled":false
+            }),
+        ));
+    }
+
+    #[test]
+    fn human_policy_complete_readback_rejects_reusable_or_unclassified_snapshot() {
+        let mut policy = CapabilityV1::new(
+            "access-policies-update-human-access-controls",
+            "Update human Access eligibility and independent MFA",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}",
+        );
+        policy.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+            path: policy.path.clone(),
+            read_capability_id: "access-policies-get-an-access-policy".to_owned(),
+            verified_response_fields: [
+                "decision",
+                "exclude",
+                "include",
+                "mfa_config",
+                "name",
+                "precedence",
+                "require",
+                "session_duration",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        });
+        let Value::Object(planned) = json!({
+            "decision":"allow",
+            "exclude":[],
+            "include":[{"email_domain":{"domain":"example.com"}}],
+            "mfa_config":{
+                "allowed_authenticators":["biometrics","totp"],
+                "mfa_disabled":false
+            },
+            "name":"Allow Example Humans",
+            "precedence":1,
+            "require":[],
+            "session_duration":"24h"
+        }) else {
+            unreachable!("literal human policy body must be an object");
+        };
+        let mut classified = Value::Object(planned.clone());
+        classified["reusable"] = json!(false);
+        assert!(
+            super::mismatched_verifiable_planned_fields(&policy, &planned, &classified).is_empty(),
+            "fully classified matching human-policy readback must verify"
+        );
+        let mut reusable = classified.clone();
+        reusable["reusable"] = json!(true);
+        let mut unclassified = classified;
+        unclassified["approval_groups"] = json!([{"email_list_uuid":"list-id"}]);
+
+        for (case, readback, expected) in [
+            ("reusable routing drift", reusable, "reusable"),
+            (
+                "unclassified top-level field",
+                unclassified,
+                "approval_groups",
+            ),
+        ] {
+            assert_eq!(
+                super::mismatched_verifiable_planned_fields(&policy, &planned, &readback),
+                vec![expected],
+                "complete human-policy verification accepted {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn human_policy_readback_treats_empty_session_duration_as_absent_without_masking_drift() {
+        let mut policy = CapabilityV1::new(
+            "access-policies-update-human-access-controls",
+            "Update human Access eligibility and independent MFA",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}",
+        );
+        policy.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+            path: policy.path.clone(),
+            read_capability_id: "access-policies-get-an-access-policy".to_owned(),
+            verified_response_fields: vec!["session_duration".to_owned()],
+        });
+        let planned = serde_json::Map::new();
+
+        assert!(
+            super::mismatched_verifiable_planned_fields(
+                &policy,
+                &planned,
+                &json!({"reusable":false,"session_duration":""})
+            )
+            .is_empty(),
+            "Cloudflare's empty optional-duration sentinel must equal absence"
+        );
+        assert_eq!(
+            super::mismatched_verifiable_planned_fields(
+                &policy,
+                &planned,
+                &json!({"reusable":false,"session_duration":"24h"})
+            ),
+            vec!["session_duration"]
+        );
+    }
+
+    #[test]
+    fn human_policy_readback_requires_the_exact_planned_policy_identity() {
+        let capability = CapabilityV1::new(
+            "access-policies-update-human-access-controls",
+            "Update human Access eligibility and independent MFA",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}",
+        );
+        let input = CallInput {
+            selectors: json!({"policy_id":"policy-a"}),
+            ..CallInput::default()
+        };
+        assert!(exact_resource_readback_identity_matches(
+            &capability,
+            &input,
+            &json!({"id":"policy-a"})
+        ));
+        assert!(!exact_resource_readback_identity_matches(
+            &capability,
+            &input,
+            &json!({"id":"policy-b"})
+        ));
+        assert!(!exact_resource_readback_identity_matches(
+            &capability,
+            &input,
+            &json!({})
+        ));
+        assert!(!exact_resource_readback_identity_matches(
+            &capability,
+            &CallInput::default(),
+            &json!({})
+        ));
+    }
+
+    #[test]
+    fn access_exact_snapshot_verification_matches_optional_presence_and_absence() {
+        let mut launcher = CapabilityV1::new(
+            "access-applications-update-app-launcher-login-methods",
+            "Update Access App Launcher login methods",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}",
+        );
+        launcher.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+            path: launcher.path.clone(),
+            read_capability_id: "access-applications-get-an-access-application".to_owned(),
+            verified_response_fields: vec!["allowed_idps".to_owned(), "custom_deny_url".to_owned()],
+        });
+        let planned = serde_json::Map::from_iter([("allowed_idps".to_owned(), json!(["id-a"]))]);
+        assert_eq!(
+            access_exact_snapshot_optional_absence_mismatches(
+                &launcher,
+                &planned,
+                &json!({"allowed_idps":["id-a"],"custom_deny_url":"https://unexpected.example"})
+            ),
+            vec!["custom_deny_url"]
+        );
+        assert!(
+            access_exact_snapshot_optional_absence_mismatches(
+                &launcher,
+                &planned,
+                &json!({"allowed_idps":["id-a"]})
+            )
+            .is_empty()
+        );
+        let mut missing_contract = launcher.clone();
+        missing_contract.same_path_read = None;
+        assert_eq!(
+            access_exact_snapshot_optional_absence_mismatches(
+                &missing_contract,
+                &planned,
+                &json!({"allowed_idps":["id-a"]})
+            ),
+            vec!["same_path_read"]
+        );
+
+        launcher.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{
+                "custom_deny_url":{"type":"string"}
+            }
+        }));
+        let requested = serde_json::Map::from_iter([(
+            "custom_deny_url".to_owned(),
+            json!("https://expected.example"),
+        )]);
+        assert_eq!(
+            super::mismatched_verifiable_planned_fields(&launcher, &requested, &json!({})),
+            vec!["custom_deny_url"]
+        );
+    }
+
+    #[test]
+    fn access_application_complete_readback_rejects_unplanned_top_level_and_nested_drift() {
+        let variants = [
+            (
+                "access-applications-update-self-hosted-login-methods",
+                "destinations",
+                json!([{"type":"public","uri":"investors.mlnavigator.com"}]),
+                json!([{
+                    "type":"public",
+                    "uri":"investors.mlnavigator.com",
+                    "future_routing_flag":true
+                }]),
+                "tags",
+                json!(["customer:unexpected"]),
+            ),
+            (
+                "access-applications-update-app-launcher-login-methods",
+                "landing_page_design",
+                json!({}),
+                json!({"future_layout_mode":"provider-materialized"}),
+                "bg_color",
+                json!("#000000"),
+            ),
+        ];
+        let mut certified_drift = Vec::new();
+
+        for (
+            capability_id,
+            nested_field,
+            planned_nested,
+            drifted_nested,
+            known_unplanned_field,
+            known_unplanned_value,
+        ) in variants
+        {
+            let mut capability = CapabilityV1::new(
+                capability_id,
+                "Update Access application login methods",
+                "PUT",
+                "/accounts/{account_id}/access/apps/{app_id}",
+            );
+            capability.request_schema = Some(json!({
+                "type":"object",
+                "additionalProperties":false,
+                "properties":{
+                    "allowed_idps":{"type":"array","items":{"type":"string"}},
+                    nested_field: {}
+                }
+            }));
+            capability.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+                path: capability.path.clone(),
+                read_capability_id: "access-applications-get-an-access-application".to_owned(),
+                verified_response_fields: vec!["allowed_idps".to_owned(), nested_field.to_owned()],
+            });
+            let planned = serde_json::Map::from_iter([
+                (
+                    "allowed_idps".to_owned(),
+                    json!(["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"]),
+                ),
+                (nested_field.to_owned(), planned_nested.clone()),
+            ]);
+            let matching = json!({
+                "allowed_idps":["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"],
+                nested_field:planned_nested
+            });
+            assert!(
+                super::mismatched_verifiable_planned_fields(&capability, &planned, &matching)
+                    .is_empty(),
+                "{capability_id} matching readback must remain valid"
+            );
+
+            let mut top_level_drift = matching.clone();
+            top_level_drift["future_writable_field"] = json!({"must_be_preserved":true});
+            let mut known_top_level_drift = matching.clone();
+            known_top_level_drift[known_unplanned_field] = known_unplanned_value;
+            let nested_drift = json!({
+                "allowed_idps":["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"],
+                nested_field:drifted_nested
+            });
+            for (kind, readback) in [
+                ("unplanned top-level field", top_level_drift),
+                ("known but unplanned mutable field", known_top_level_drift),
+                ("unplanned nested field", nested_drift),
+            ] {
+                if super::mismatched_verifiable_planned_fields(&capability, &planned, &readback)
+                    .is_empty()
+                {
+                    certified_drift.push(format!("{capability_id}: {kind}"));
+                }
+            }
+        }
+
+        assert!(
+            certified_drift.is_empty(),
+            "closed Access application verification certified drifted readbacks: {certified_drift:?}"
+        );
+    }
+
+    #[test]
+    fn access_app_launcher_readback_allows_documented_response_only_domain_and_name() {
+        let mut capability = CapabilityV1::new(
+            "access-applications-update-app-launcher-login-methods",
+            "Update Access App Launcher login methods",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}",
+        );
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{
+                "allowed_idps":{"type":"array","items":{"type":"string"}},
+                "landing_page_design":{"type":"object"}
+            }
+        }));
+        capability.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+            path: capability.path.clone(),
+            read_capability_id: "access-applications-get-an-access-application".to_owned(),
+            verified_response_fields: vec![
+                "allowed_idps".to_owned(),
+                "landing_page_design".to_owned(),
+            ],
+        });
+        let planned = serde_json::Map::from_iter([
+            (
+                "allowed_idps".to_owned(),
+                json!(["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"]),
+            ),
+            ("landing_page_design".to_owned(), json!({})),
+        ]);
+        let readback = json!({
+            "allowed_idps":["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"],
+            "domain":"launcher.mlnavigator.com",
+            "landing_page_design":{},
+            "name":"MLNavigator App Launcher"
+        });
+
+        let mismatches =
+            super::mismatched_verifiable_planned_fields(&capability, &planned, &readback);
+        assert!(
+            mismatches.is_empty(),
+            "documented App Launcher response-only fields were rejected: {mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn self_hosted_cookie_readback_requires_exact_presence_and_value() {
+        let mut application = CapabilityV1::new(
+            "access-applications-update-self-hosted-login-methods",
+            "Update self-hosted Access application login methods",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}",
+        );
+        application.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{
+                "same_site_cookie_attribute":{"type":"string"}
+            }
+        }));
+        application.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+            path: application.path.clone(),
+            read_capability_id: "access-applications-get-an-access-application".to_owned(),
+            verified_response_fields: vec!["same_site_cookie_attribute".to_owned()],
+        });
+        let planned =
+            serde_json::Map::from_iter([("same_site_cookie_attribute".to_owned(), json!("lax"))]);
+        assert!(
+            super::mismatched_verifiable_planned_fields(
+                &application,
+                &planned,
+                &json!({"same_site_cookie_attribute":"lax"})
+            )
+            .is_empty()
+        );
+        for readback in [json!({}), json!({"same_site_cookie_attribute":"strict"})] {
+            assert_eq!(
+                super::mismatched_verifiable_planned_fields(&application, &planned, &readback),
+                vec!["same_site_cookie_attribute"]
+            );
+        }
+    }
+
+    #[test]
+    fn self_hosted_tags_readback_preserves_presence_value_and_empty_state() {
+        let mut application = CapabilityV1::new(
+            "access-applications-update-self-hosted-login-methods",
+            "Update self-hosted Access application login methods",
+            "PUT",
+            "/accounts/{account_id}/access/apps/{app_id}",
+        );
+        application.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{
+                "tags":{"type":"array","items":{"type":"string"}}
+            }
+        }));
+        application.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+            path: application.path.clone(),
+            read_capability_id: "access-applications-get-an-access-application".to_owned(),
+            verified_response_fields: vec!["tags".to_owned()],
+        });
+
+        let populated =
+            serde_json::Map::from_iter([("tags".to_owned(), json!(["customer:a", "env:b"]))]);
+        assert!(
+            super::mismatched_verifiable_planned_fields(
+                &application,
+                &populated,
+                &json!({"tags":["customer:a","env:b"]})
+            )
+            .is_empty()
+        );
+        for readback in [
+            json!({}),
+            json!({"tags":[]}),
+            json!({"tags":["env:b","customer:a"]}),
+        ] {
+            assert_eq!(
+                super::mismatched_verifiable_planned_fields(&application, &populated, &readback),
+                vec!["tags"]
+            );
+        }
+
+        let empty = serde_json::Map::from_iter([("tags".to_owned(), json!([]))]);
+        assert!(
+            super::mismatched_verifiable_planned_fields(&application, &empty, &json!({"tags":[]}))
+                .is_empty()
+        );
+        assert_eq!(
+            super::mismatched_verifiable_planned_fields(&application, &empty, &json!({})),
+            vec!["tags"]
+        );
+        assert_eq!(
+            access_exact_snapshot_optional_absence_mismatches(
+                &application,
+                &serde_json::Map::new(),
+                &json!({"tags":[]})
+            ),
+            vec!["tags"]
+        );
+    }
 }
 
 fn verification_response_field(capability: &CapabilityV1, request_field: &str) -> Option<String> {
@@ -7212,15 +8335,84 @@ fn validate_string_format(schema: &Value, value: &str, path: &str) -> Result<()>
     };
     let valid = match format {
         "date-time" => DateTime::parse_from_rfc3339(value).is_ok(),
+        "email" => is_valid_ascii_email(value),
         "hostname" => is_valid_hostname(value),
         "ipv4" => value.parse::<Ipv4Addr>().is_ok(),
         "ipv6" => value.parse::<Ipv6Addr>().is_ok(),
+        "cloudflare-uuid" => is_valid_cloudflare_uuid(value),
         _ => true,
     };
     if valid {
         return Ok(());
     }
     invalid_request_bound(path, &format!("does not match the pinned {format} format"))
+}
+
+fn is_valid_cloudflare_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    match bytes.len() {
+        32 => bytes.iter().all(u8::is_ascii_hexdigit),
+        36 => bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        }),
+        _ => false,
+    }
+}
+
+fn is_valid_ascii_email(value: &str) -> bool {
+    if !value.is_ascii()
+        || value.len() > 254
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        return false;
+    }
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || local.len() > 64
+        || domain.is_empty()
+        || domain.contains('@')
+        || domain == "."
+        || domain.ends_with('.')
+    {
+        return false;
+    }
+    local
+        .split('.')
+        .all(|atom| !atom.is_empty() && atom.bytes().all(is_ascii_email_atext))
+        && is_valid_hostname(domain)
+}
+
+fn is_ascii_email_atext(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'/'
+                | b'='
+                | b'?'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'{'
+                | b'|'
+                | b'}'
+                | b'~'
+        )
 }
 
 fn is_valid_hostname(value: &str) -> bool {

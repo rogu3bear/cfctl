@@ -998,6 +998,7 @@ async fn catalog_command(store: &StateStore, command: CatalogCommand) -> Result<
                 .search(&arguments.query)
                 .into_iter()
                 .take(arguments.limit)
+                .map(caller_facing_capability)
                 .collect();
             Ok(ResultEnvelopeV2::success(
                 "catalog search",
@@ -1011,7 +1012,7 @@ async fn catalog_command(store: &StateStore, command: CatalogCommand) -> Result<
                 .ok_or_else(|| capability_missing(&selector.capability_id))?;
             Ok(ResultEnvelopeV2::success(
                 "catalog show",
-                serde_json::to_value(capability)?,
+                serde_json::to_value(caller_facing_capability(capability))?,
             ))
         }
         CatalogCommand::Changes => {
@@ -1213,7 +1214,13 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     let mut prepared = call_input(&capability, &arguments)?;
     prepare_r2_temporary_credentials_input(&capability, &mut prepared.input)?;
     let security_action = prepare_security_action_input(&capability, &mut prepared.input)?;
-    preflight_call_input(&capability, &prepared.input, prepared.secret_body.as_ref())?;
+    if is_access_application_login_methods_mutation(&capability) {
+        validate_access_application_login_methods_desired_input(&capability, &prepared.input)?;
+    } else if is_access_human_policy_mutation(&capability) {
+        validate_access_human_policy_desired_input(&capability, &prepared.input)?;
+    } else {
+        preflight_call_input(&capability, &prepared.input, prepared.secret_body.as_ref())?;
+    }
     if !capability.mutating {
         if prepared.secret_body.is_some() {
             return Err(CliError::Input(
@@ -4762,11 +4769,1250 @@ const DNS_RECORD_STATE_PRECONDITION: &str = "dns_record_state";
 const DNS_RECORD_RESTORE_CAPABILITY_ID: &str = "dns-records-for-a-zone-update-dns-record";
 const SAME_PATH_PRIOR_STATE_PRECONDITION: &str = "same_path_prior_state";
 const SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY: &str = "restore_same_path_prior_snapshot";
+const ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID: &str =
+    "access-applications-update-self-hosted-login-methods";
+const ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID: &str =
+    "access-applications-update-app-launcher-login-methods";
+const ACCESS_APP_READ_CAPABILITY_ID: &str = "access-applications-get-an-access-application";
+const ACCESS_APP_DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}";
+const ACCESS_APP_IMPLICIT_OPEN_ROLLBACK_WARNING: &str = "the prior implicit-open identity-provider state cannot be restored automatically; manual rollback requires a separately reviewed Cloudflare Access application change";
+const ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID: &str =
+    "access-policies-update-human-access-controls";
+const ACCESS_POLICY_READ_CAPABILITY_ID: &str = "access-policies-get-an-access-policy";
+const ACCESS_POLICY_DETAIL_PATH: &str =
+    "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
 const OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID: &str = "oauth-clients-get";
 const OAUTH_CLIENT_DETAIL_PATH: &str = "/accounts/{account_id}/oauth_clients/{oauth_client_id}";
 const OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION: &str = "oauth_client_key_overlap";
 const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str = "zone-subscription-zone-subscription-details";
+
+const ACCESS_APP_MUTABLE_FIELDS: [&str; 17] = [
+    "allowed_idps",
+    "app_launcher_visible",
+    "auto_redirect_to_identity",
+    "destinations",
+    "domain",
+    "eager_redirect_cookie_setting",
+    "enable_binding_cookie",
+    "http_only_cookie_attribute",
+    "name",
+    "options_preflight_bypass",
+    "path_cookie_attribute",
+    "policies",
+    "same_site_cookie_attribute",
+    "self_hosted_domains",
+    "session_duration",
+    "tags",
+    "type",
+];
+const ACCESS_APP_REQUIRED_FIELDS: [&str; 13] = [
+    "allowed_idps",
+    "app_launcher_visible",
+    "auto_redirect_to_identity",
+    "destinations",
+    "domain",
+    "enable_binding_cookie",
+    "http_only_cookie_attribute",
+    "name",
+    "options_preflight_bypass",
+    "policies",
+    "self_hosted_domains",
+    "session_duration",
+    "type",
+];
+const ACCESS_APP_READ_ONLY_FIELDS: [&str; 5] = ["aud", "created_at", "id", "uid", "updated_at"];
+
+const ACCESS_APP_LAUNCHER_MUTABLE_FIELDS: [&str; 14] = [
+    "allowed_idps",
+    "app_launcher_logo_url",
+    "auto_redirect_to_identity",
+    "bg_color",
+    "custom_deny_url",
+    "custom_non_identity_deny_url",
+    "custom_pages",
+    "footer_links",
+    "header_bg_color",
+    "landing_page_design",
+    "policies",
+    "session_duration",
+    "skip_app_launcher_login_page",
+    "type",
+];
+const ACCESS_APP_LAUNCHER_REQUIRED_FIELDS: [&str; 7] = [
+    "allowed_idps",
+    "auto_redirect_to_identity",
+    "landing_page_design",
+    "policies",
+    "session_duration",
+    "skip_app_launcher_login_page",
+    "type",
+];
+const ACCESS_APP_LAUNCHER_READ_ONLY_FIELDS: [&str; 7] = [
+    "aud",
+    "created_at",
+    "domain",
+    "id",
+    "name",
+    "uid",
+    "updated_at",
+];
+
+const ACCESS_HUMAN_POLICY_MUTABLE_FIELDS: [&str; 8] = [
+    "decision",
+    "exclude",
+    "include",
+    "mfa_config",
+    "name",
+    "precedence",
+    "require",
+    "session_duration",
+];
+const ACCESS_HUMAN_POLICY_REQUIRED_FIELDS: [&str; 6] = [
+    "decision",
+    "exclude",
+    "include",
+    "name",
+    "precedence",
+    "require",
+];
+const ACCESS_HUMAN_POLICY_DESIRED_FIELDS: [&str; 3] = ["exclude", "include", "mfa_config"];
+const ACCESS_HUMAN_POLICY_READ_ONLY_FIELDS: [&str; 5] =
+    ["created_at", "id", "reusable", "uid", "updated_at"];
+
+#[derive(Clone, Copy)]
+struct AccessApplicationLoginMethodsVariant {
+    app_type: &'static str,
+    mutable_fields: &'static [&'static str],
+    required_fields: &'static [&'static str],
+    read_only_fields: &'static [&'static str],
+}
+
+fn access_application_login_methods_variant(
+    capability_id: &str,
+) -> Option<AccessApplicationLoginMethodsVariant> {
+    match capability_id {
+        ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID => Some(AccessApplicationLoginMethodsVariant {
+            app_type: "self_hosted",
+            mutable_fields: &ACCESS_APP_MUTABLE_FIELDS,
+            required_fields: &ACCESS_APP_REQUIRED_FIELDS,
+            read_only_fields: &ACCESS_APP_READ_ONLY_FIELDS,
+        }),
+        ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID => {
+            Some(AccessApplicationLoginMethodsVariant {
+                app_type: "app_launcher",
+                mutable_fields: &ACCESS_APP_LAUNCHER_MUTABLE_FIELDS,
+                required_fields: &ACCESS_APP_LAUNCHER_REQUIRED_FIELDS,
+                read_only_fields: &ACCESS_APP_LAUNCHER_READ_ONLY_FIELDS,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn access_application_login_methods_contract_supported(capability: &CapabilityV1) -> bool {
+    let Some(variant) = access_application_login_methods_variant(&capability.id) else {
+        return false;
+    };
+    capability.method == "PUT"
+        && capability.path == ACCESS_APP_DETAIL_PATH
+        && capability.product == "Access applications"
+        && capability.account_scope == "account"
+        && capability.mutating
+        && capability.permissions == ["Access: Apps and Policies Write"]
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.verification.strategy
+            == "same_path_result_contains_planned_fields_after_update"
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path == ACCESS_APP_DETAIL_PATH
+                && read.read_capability_id == ACCESS_APP_READ_CAPABILITY_ID
+                && read.verified_response_fields
+                    == variant
+                        .mutable_fields
+                        .iter()
+                        .map(|field| (*field).to_owned())
+                        .collect::<Vec<_>>()
+        })
+        && capability.verification_contract_supported()
+}
+
+fn is_access_application_login_methods_mutation(capability: &CapabilityV1) -> bool {
+    access_application_login_methods_contract_supported(capability)
+        && capability.rollback.supported
+        && capability.rollback.strategy.as_deref() == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
+        && capability.rollback_contract_supported()
+}
+
+fn is_access_application_implicit_open_concurrency_plan(capability: &CapabilityV1) -> bool {
+    access_application_login_methods_contract_supported(capability)
+        && !capability.rollback.supported
+        && capability.rollback.strategy.is_none()
+        && capability.rollback.warning.as_deref() == Some(ACCESS_APP_IMPLICIT_OPEN_ROLLBACK_WARNING)
+        && capability.mutation_contract_gaps().is_empty()
+}
+
+fn access_application_login_methods_desired_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["allowed_idps"],
+        "properties":{
+            "allowed_idps":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":25,
+                "uniqueItems":true,
+                "items":cfctl_catalog::access_identity_provider_id_schema()
+            }
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn validate_access_application_login_methods_desired_input(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    if !is_access_application_login_methods_mutation(capability) {
+        return Err(CliError::Input(
+            "Access application login-method capability drifted from its governed exact-update contract"
+                .to_owned(),
+        ));
+    }
+    let mut desired_capability = capability.clone();
+    desired_capability.request_schema = Some(access_application_login_methods_desired_schema());
+    validate_request_contract(&desired_capability, input)?;
+    access_application_desired_idps(input)?;
+    Ok(())
+}
+
+fn parse_access_identity_provider_id(value: &str) -> Option<Uuid> {
+    let bytes = value.as_bytes();
+    let valid_rendering = match bytes.len() {
+        32 => bytes.iter().all(u8::is_ascii_hexdigit),
+        36 => bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        }),
+        _ => false,
+    };
+    valid_rendering
+        .then(|| Uuid::parse_str(value).ok())
+        .flatten()
+}
+
+fn access_application_desired_idps(input: &CallInput) -> Result<Vec<String>> {
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|body| body.len() == 1)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Access login-method input must contain only a non-empty `allowed_idps` array"
+                    .to_owned(),
+            )
+        })?;
+    let values = body
+        .get("allowed_idps")
+        .and_then(Value::as_array)
+        .filter(|values| !values.is_empty() && values.len() <= 25)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Access login-method input requires between 1 and 25 identity-provider IDs; an empty list would allow every login method"
+                    .to_owned(),
+            )
+        })?;
+    let mut desired = values
+        .iter()
+        .map(|value| {
+            let value = value.as_str().ok_or_else(|| {
+                CliError::Input("every Access identity-provider ID must be a valid UUID".to_owned())
+            })?;
+            parse_access_identity_provider_id(value)
+                .map(|id| id.hyphenated().to_string())
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "every Access identity-provider ID must be a valid UUID".to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    desired.sort();
+    if desired.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(CliError::Input(
+            "Access identity-provider IDs must be unique".to_owned(),
+        ));
+    }
+    Ok(desired)
+}
+
+fn normalize_access_application_policies(value: &Value) -> Result<Value> {
+    let policies = value
+        .as_array()
+        .filter(|policies| !policies.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "live Access application has no restorable policy references; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?;
+    let mut normalized = policies
+        .iter()
+        .map(|policy| {
+            let id = policy
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "live Access application policy omitted its identity; the mutation boundary was not crossed"
+                            .to_owned(),
+                    )
+                })?;
+            let precedence = policy
+                .get("precedence")
+                .and_then(Value::as_u64)
+                .filter(|precedence| *precedence > 0)
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "live Access application policy omitted a positive precedence; the mutation boundary was not crossed"
+                            .to_owned(),
+                    )
+                })?;
+            Ok(json!({"id":id,"precedence":precedence}))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let policy_identities = normalized
+        .iter()
+        .filter_map(|policy| policy.get("id").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    if policy_identities.len() != normalized.len() {
+        return Err(CliError::Input(
+            "live Access application returned duplicate policy identities; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    normalized.sort_by(|left, right| {
+        let left_precedence = left
+            .get("precedence")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let right_precedence = right
+            .get("precedence")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        left_precedence.cmp(&right_precedence).then_with(|| {
+            left.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .cmp(right.get("id").and_then(Value::as_str).unwrap_or_default())
+        })
+    });
+    Ok(Value::Array(normalized))
+}
+
+fn normalized_access_application_idps(value: &Value) -> Result<Vec<String>> {
+    let mut idps = value
+        .as_array()
+        .ok_or_else(|| {
+            CliError::Input(
+                "live Access application returned an invalid identity-provider allowlist; the mutation boundary was not crossed"
+                    .to_owned(),
+            )
+        })?
+        .iter()
+        .map(|idp| {
+            let idp = idp.as_str().ok_or_else(|| {
+                CliError::Input(
+                    "live Access application returned an invalid identity-provider ID; the mutation boundary was not crossed"
+                        .to_owned(),
+                )
+            })?;
+            parse_access_identity_provider_id(idp)
+                .map(|id| id.hyphenated().to_string())
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "live Access application returned an invalid identity-provider ID; the mutation boundary was not crossed"
+                            .to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    idps.sort();
+    if idps.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(CliError::Input(
+            "live Access application returned duplicate identity-provider IDs; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    Ok(idps)
+}
+
+/// Rollback-only validation keeps an implicit-open prior state from being
+/// represented as a restorable empty allowlist.
+fn access_application_rollback_idps(value: &Value) -> Result<Vec<String>> {
+    let idps = normalized_access_application_idps(value)?;
+    if idps.is_empty() {
+        return Err(CliError::Input(
+            "live Access application has an empty identity-provider allowlist; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    Ok(idps)
+}
+
+fn access_application_mutable_body(
+    result: &Value,
+    desired_idps: &[String],
+    variant: AccessApplicationLoginMethodsVariant,
+) -> Result<Value> {
+    let result = result.as_object().ok_or_else(|| {
+        CliError::Input(
+            "live Access application read did not return an object; the mutation boundary was not crossed"
+                .to_owned(),
+        )
+    })?;
+    let known_fields = variant
+        .mutable_fields
+        .iter()
+        .chain(variant.read_only_fields.iter())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let unknown_fields = result
+        .keys()
+        .filter(|field| !known_fields.contains(field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown_fields.is_empty() {
+        return Err(CliError::Input(format!(
+            "live Access application contains unclassified field(s) {}; the preservation-safe mutation boundary was not crossed",
+            unknown_fields.join(",")
+        )));
+    }
+    if variant.app_type == "self_hosted" {
+        let (Some(destinations), Some(self_hosted_domains)) = (
+            result.get("destinations").and_then(Value::as_array),
+            result.get("self_hosted_domains").and_then(Value::as_array),
+        ) else {
+            return Err(CliError::Input(
+                "live self-hosted Access application has no populated destination representation; the mutation boundary was not crossed"
+                    .to_owned(),
+            ));
+        };
+        if destinations.is_empty() && self_hosted_domains.is_empty() {
+            return Err(CliError::Input(
+                "live self-hosted Access application has no populated destination representation; the mutation boundary was not crossed"
+                    .to_owned(),
+            ));
+        }
+    }
+    let mut body = Map::new();
+    for &field in variant.mutable_fields {
+        let Some(value) = result.get(field).cloned() else {
+            if variant.required_fields.contains(&field) {
+                return Err(CliError::Input(format!(
+                    "live Access application omitted required mutable field `{field}`; the mutation boundary was not crossed"
+                )));
+            }
+            continue;
+        };
+        let value = match field {
+            "allowed_idps" => json!(desired_idps),
+            "policies" => normalize_access_application_policies(&value)?,
+            _ => value,
+        };
+        body.insert(field.to_owned(), value);
+    }
+    Ok(Value::Object(body))
+}
+
+fn access_application_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == ACCESS_APP_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == ACCESS_APP_DETAIL_PATH
+        && capability.product == "Access applications"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.selectors.len() == 2
+        && ["account_id", "app_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.body_mode == cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                    && response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+            })
+}
+
+async fn prepare_access_application_login_methods_plan_input(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &mut CapabilityV1,
+    input: &mut CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !is_access_application_login_methods_mutation(capability) {
+        return Ok(None);
+    }
+    let variant = access_application_login_methods_variant(&capability.id).ok_or_else(|| {
+        CliError::Input(
+            "Access application login-method capability omitted its exact application variant"
+                .to_owned(),
+        )
+    })?;
+    let body_field_count = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .map_or(0, serde_json::Map::len);
+    if body_field_count != 1 {
+        preflight_call_input(capability, input, None)?;
+        return read_live_same_path_prior_state(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await
+        .map(Some);
+    }
+    let desired_idps = access_application_desired_idps(input)?;
+    input
+        .selectors
+        .get("app_id")
+        .and_then(Value::as_str)
+        .filter(|app_id| !app_id.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Access login-method plan requires an exact `app_id` selector".to_owned(),
+            )
+        })?;
+    let source = catalog
+        .get(ACCESS_APP_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(ACCESS_APP_READ_CAPABILITY_ID))?;
+    if !access_application_read_contract_supported(source) {
+        return Err(CliError::Input(
+            "Access application state source drifted from the governed exact-app read".to_owned(),
+        ));
+    }
+    let response = Executor::new(http_client()?, API_BASE_URL)?
+        .execute_read(
+            source,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let Some(receipt) = finalize_access_application_login_methods_plan_input(
+        capability,
+        input,
+        &desired_idps,
+        variant,
+        account_id,
+        &response,
+    )?
+    else {
+        return Ok(None);
+    };
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok(Some((receipt, evidence)))
+}
+
+fn finalize_access_application_login_methods_plan_input(
+    capability: &mut CapabilityV1,
+    input: &mut CallInput,
+    desired_idps: &[String],
+    variant: AccessApplicationLoginMethodsVariant,
+    account_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Option<Value>> {
+    if !response.success || response.status != 200 {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the Access application state read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    let app_id = input
+        .selectors
+        .get("app_id")
+        .and_then(Value::as_str)
+        .filter(|app_id| !app_id.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Access login-method plan requires an exact `app_id` selector".to_owned(),
+            )
+        })?
+        .to_owned();
+    if response.result.get("id").and_then(Value::as_str) != Some(app_id.as_str())
+        || response.result.get("type").and_then(Value::as_str) != Some(variant.app_type)
+    {
+        return Err(CliError::Input(format!(
+            "Access application state read returned a different app or a non-{} app; the mutation boundary was not crossed",
+            variant.app_type
+        )));
+    }
+    let current_idps = normalized_access_application_idps(
+        response.result.get("allowed_idps").unwrap_or(&Value::Null),
+    )?;
+    if current_idps == desired_idps {
+        return Err(CliError::Input(
+            "Access application already has the exact requested identity-provider allowlist; no mutation plan was created"
+                .to_owned(),
+        ));
+    }
+    input.body = Some(access_application_mutable_body(
+        &response.result,
+        desired_idps,
+        variant,
+    )?);
+    if variant.app_type == "self_hosted" {
+        capability.request_schema =
+            Some(cfctl_catalog::access_application_login_methods_materialized_schema());
+    }
+    preflight_call_input(capability, input, None)?;
+    if current_idps.is_empty() {
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(ACCESS_APP_IMPLICIT_OPEN_ROLLBACK_WARNING.to_owned());
+        return apply_same_path_prior_state_response(capability, input, account_id, response)
+            .map(Some);
+    }
+    apply_same_path_prior_state_response(capability, input, account_id, response).map(Some)
+}
+
+fn is_access_human_policy_mutation(capability: &CapabilityV1) -> bool {
+    capability.id == ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID
+        && capability.method == "PUT"
+        && capability.path == ACCESS_POLICY_DETAIL_PATH
+        && capability.product == "Access application-scoped policies"
+        && capability.account_scope == "account"
+        && capability.mutating
+        && capability.permissions == ["Access: Apps and Policies Write"]
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.verification.strategy
+            == "same_path_result_contains_planned_fields_after_update"
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path == ACCESS_POLICY_DETAIL_PATH
+                && read.read_capability_id == ACCESS_POLICY_READ_CAPABILITY_ID
+                && read.verified_response_fields
+                    == ACCESS_HUMAN_POLICY_MUTABLE_FIELDS
+                        .iter()
+                        .map(|field| (*field).to_owned())
+                        .collect::<Vec<_>>()
+        })
+        && capability.rollback.strategy.as_deref() == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
+        && capability.verification_contract_supported()
+        && capability.rollback_contract_supported()
+}
+
+fn access_human_policy_identity_rule_schema() -> Value {
+    json!({
+        "oneOf":[
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["email"],
+                "properties":{
+                    "email":{
+                        "type":"object",
+                        "additionalProperties":false,
+                        "required":["email"],
+                        "properties":{
+                            "email":{
+                                "type":"string",
+                                "format":"email",
+                                "minLength":3,
+                                "maxLength":254
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["email_domain"],
+                "properties":{
+                    "email_domain":{
+                        "type":"object",
+                        "additionalProperties":false,
+                        "required":["domain"],
+                        "properties":{
+                            "domain":{
+                                "type":"string",
+                                "format":"hostname",
+                                "minLength":3,
+                                "maxLength":253
+                            }
+                        }
+                    }
+                }
+            }
+        ]
+    })
+}
+
+fn access_human_policy_mfa_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["allowed_authenticators","mfa_disabled"],
+        "properties":{
+            "allowed_authenticators":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":3,
+                "uniqueItems":true,
+                "items":{
+                    "type":"string",
+                    "enum":["totp","biometrics","security_key"]
+                }
+            },
+            "mfa_disabled":{"type":"boolean"},
+            "session_duration":{"type":"string","minLength":2,"maxLength":16}
+        }
+    })
+}
+
+fn access_human_policy_desired_schema() -> Value {
+    let identity_rule = access_human_policy_identity_rule_schema();
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "minProperties":1,
+        "properties":{
+            "include":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":100,
+                "uniqueItems":true,
+                "items":identity_rule.clone()
+            },
+            "exclude":{
+                "type":"array",
+                "maxItems":100,
+                "uniqueItems":true,
+                "items":identity_rule
+            },
+            "mfa_config":access_human_policy_mfa_schema()
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn caller_facing_capability(capability: &CapabilityV1) -> CapabilityV1 {
+    let mut public = capability.clone();
+    if is_access_application_login_methods_mutation(capability) {
+        public.request_schema = Some(access_application_login_methods_desired_schema());
+    } else if is_access_human_policy_mutation(capability) {
+        public.request_schema = Some(access_human_policy_desired_schema());
+    }
+    public
+}
+
+fn validate_access_human_policy_desired_input(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    if !is_access_human_policy_mutation(capability) {
+        return Err(CliError::Input(
+            "human Access policy capability drifted from its governed preservation-safe contract"
+                .to_owned(),
+        ));
+    }
+    let mut desired_capability = capability.clone();
+    desired_capability.request_schema = Some(access_human_policy_desired_schema());
+    validate_request_contract(&desired_capability, input)?;
+    access_human_policy_desired_changes(input)?;
+    Ok(())
+}
+
+fn normalized_access_human_identity_rules(value: &Value, require_nonempty: bool) -> Result<Value> {
+    let values = value.as_array().ok_or_else(|| {
+        CliError::Input("human Access identity rules must be an array".to_owned())
+    })?;
+    if require_nonempty && values.is_empty() {
+        return Err(CliError::Input(
+            "human Access policy include rules must not be empty".to_owned(),
+        ));
+    }
+    if values.len() > 100 {
+        return Err(CliError::Input(
+            "human Access policy identity rules exceed the bounded 100-rule contract".to_owned(),
+        ));
+    }
+    let mut normalized = values
+        .iter()
+        .map(|value| {
+            let rule = value.as_object().filter(|rule| rule.len() == 1).ok_or_else(|| {
+                CliError::Input(
+                    "human Access policy rules must contain exactly one email or email_domain selector"
+                        .to_owned(),
+                )
+            })?;
+            if let Some(email) = rule.get("email") {
+                let email = email
+                    .as_object()
+                    .filter(|email| email.len() == 1)
+                    .and_then(|email| email.get("email"))
+                    .and_then(Value::as_str)
+                    .filter(|email| !email.is_empty())
+                    .ok_or_else(|| {
+                        CliError::Input(
+                            "human Access email rules require one non-empty email value".to_owned(),
+                        )
+                    })?;
+                return Ok(("email".to_owned(), email.to_owned()));
+            }
+            let domain = rule
+                .get("email_domain")
+                .and_then(Value::as_object)
+                .filter(|domain| domain.len() == 1)
+                .and_then(|domain| domain.get("domain"))
+                .and_then(Value::as_str)
+                .filter(|domain| !domain.is_empty())
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "human Access policy rules admit only one non-empty email or email_domain selector"
+                            .to_owned(),
+                    )
+                })?;
+            Ok(("email_domain".to_owned(), domain.to_owned()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    normalized.sort();
+    if normalized.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(CliError::Input(
+            "human Access policy identity rules must be unique".to_owned(),
+        ));
+    }
+    Ok(Value::Array(
+        normalized
+            .into_iter()
+            .map(|(kind, value)| match kind.as_str() {
+                "email" => json!({"email":{"email":value}}),
+                _ => json!({"email_domain":{"domain":value}}),
+            })
+            .collect(),
+    ))
+}
+
+fn normalized_access_human_mfa_config(
+    value: &Value,
+    tolerate_empty_provider_duration: bool,
+) -> Result<Value> {
+    let config = value.as_object().ok_or_else(|| {
+        CliError::Input("human Access MFA configuration must be an object".to_owned())
+    })?;
+    let known_fields = ["allowed_authenticators", "mfa_disabled", "session_duration"];
+    let unknown_fields = config
+        .keys()
+        .filter(|field| !known_fields.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown_fields.is_empty() {
+        return Err(CliError::Input(format!(
+            "human Access MFA configuration contains unclassified field(s) {}",
+            unknown_fields.join(",")
+        )));
+    }
+    let mut authenticators = config
+        .get("allowed_authenticators")
+        .and_then(Value::as_array)
+        .filter(|values| !values.is_empty() && values.len() <= 3)
+        .ok_or_else(|| {
+            CliError::Input(
+                "human Access MFA requires between one and three authenticators".to_owned(),
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| matches!(*value, "totp" | "biometrics" | "security_key"))
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    CliError::Input(
+                        "human Access MFA admits only totp, biometrics, and security_key"
+                            .to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    authenticators.sort();
+    if authenticators.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(CliError::Input(
+            "human Access MFA authenticators must be unique".to_owned(),
+        ));
+    }
+    let mfa_disabled = config
+        .get("mfa_disabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            CliError::Input(
+                "human Access MFA configuration requires a boolean mfa_disabled value".to_owned(),
+            )
+        })?;
+    let mut normalized = Map::new();
+    normalized.insert("allowed_authenticators".to_owned(), json!(authenticators));
+    normalized.insert("mfa_disabled".to_owned(), json!(mfa_disabled));
+    if let Some(duration) = config.get("session_duration") {
+        let duration = duration.as_str().ok_or_else(|| {
+            CliError::Input("human Access MFA session duration must be a string".to_owned())
+        })?;
+        if duration.is_empty() && tolerate_empty_provider_duration {
+            return Ok(Value::Object(normalized));
+        }
+        if duration.is_empty() {
+            return Err(CliError::Input(
+                "human Access MFA session duration must not be empty".to_owned(),
+            ));
+        }
+        normalized.insert("session_duration".to_owned(), json!(duration));
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn access_human_policy_desired_changes(input: &CallInput) -> Result<Map<String, Value>> {
+    let desired = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|desired| !desired.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "human Access policy input requires at least one eligibility or MFA change"
+                    .to_owned(),
+            )
+        })?;
+    let unknown_fields = desired
+        .keys()
+        .filter(|field| !ACCESS_HUMAN_POLICY_DESIRED_FIELDS.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown_fields.is_empty() {
+        return Err(CliError::Input(format!(
+            "human Access policy desired input contains unclassified field(s) {}",
+            unknown_fields.join(",")
+        )));
+    }
+    let mut normalized = Map::new();
+    for (field, value) in desired {
+        let value = match field.as_str() {
+            "include" => normalized_access_human_identity_rules(value, true)?,
+            "exclude" => normalized_access_human_identity_rules(value, false)?,
+            "mfa_config" => normalized_access_human_mfa_config(value, false)?,
+            _ => unreachable!("unknown desired fields were rejected"),
+        };
+        normalized.insert(field.clone(), value);
+    }
+    Ok(normalized)
+}
+
+fn access_human_policy_mutable_body(result: &Value, desired: &Map<String, Value>) -> Result<Value> {
+    access_human_policy_projected_body(
+        result,
+        desired,
+        AccessHumanPolicySnapshotMode::LiveApplicationScoped,
+    )
+}
+
+fn access_human_policy_restorable_body(result: &Value) -> Result<Value> {
+    access_human_policy_projected_body(
+        result,
+        &Map::new(),
+        AccessHumanPolicySnapshotMode::CuratedRollback,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum AccessHumanPolicySnapshotMode {
+    LiveApplicationScoped,
+    CuratedRollback,
+}
+
+fn validate_access_human_policy_snapshot(
+    result: &Map<String, Value>,
+    mode: AccessHumanPolicySnapshotMode,
+) -> Result<()> {
+    let mut known_fields = ACCESS_HUMAN_POLICY_MUTABLE_FIELDS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if matches!(mode, AccessHumanPolicySnapshotMode::LiveApplicationScoped) {
+        known_fields.extend(ACCESS_HUMAN_POLICY_READ_ONLY_FIELDS);
+    }
+    let unknown_fields = result
+        .keys()
+        .filter(|field| !known_fields.contains(field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown_fields.is_empty() {
+        return Err(CliError::Input(format!(
+            "live human Access policy contains unclassified field(s) {}; the preservation-safe mutation boundary was not crossed",
+            unknown_fields.join(",")
+        )));
+    }
+    if matches!(mode, AccessHumanPolicySnapshotMode::LiveApplicationScoped)
+        && result.get("reusable").and_then(Value::as_bool) != Some(false)
+    {
+        return Err(CliError::Input(
+            "live Access policy is reusable or omitted its reusable classification; application-scoped policy updates cannot preserve that routing contract, so the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn access_human_policy_projected_body(
+    result: &Value,
+    desired: &Map<String, Value>,
+    mode: AccessHumanPolicySnapshotMode,
+) -> Result<Value> {
+    let result = result.as_object().ok_or_else(|| {
+        CliError::Input(
+            "live human Access policy read did not return an object; the mutation boundary was not crossed"
+                .to_owned(),
+        )
+    })?;
+    validate_access_human_policy_snapshot(result, mode)?;
+    if result.get("decision").and_then(Value::as_str) != Some("allow") {
+        return Err(CliError::Input(
+            "live Access policy is not a human allow policy; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    if result
+        .get("require")
+        .and_then(Value::as_array)
+        .is_none_or(|rules| !rules.is_empty())
+    {
+        return Err(CliError::Input(
+            "live Access policy has non-empty require rules; the human-only mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+
+    let mut body = Map::new();
+    for field in ACCESS_HUMAN_POLICY_MUTABLE_FIELDS {
+        let value = desired.get(field).or_else(|| result.get(field));
+        let Some(value) = value else {
+            if ACCESS_HUMAN_POLICY_REQUIRED_FIELDS.contains(&field) {
+                return Err(CliError::Input(format!(
+                    "live human Access policy omitted required mutable field `{field}`; the mutation boundary was not crossed"
+                )));
+            }
+            continue;
+        };
+        let value = match field {
+            "include" => normalized_access_human_identity_rules(value, true)?,
+            "exclude" => normalized_access_human_identity_rules(value, false)?,
+            "mfa_config" => {
+                normalized_access_human_mfa_config(value, !desired.contains_key(field))?
+            }
+            "session_duration" => {
+                let duration = value.as_str().ok_or_else(|| {
+                    CliError::Input(
+                        "live human Access policy session duration is not a string; the mutation boundary was not crossed"
+                            .to_owned(),
+                    )
+                })?;
+                if duration.is_empty() {
+                    continue;
+                }
+                json!(duration)
+            }
+            "name" => {
+                let name = value
+                    .as_str()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        CliError::Input(
+                            "live human Access policy omitted its name; the mutation boundary was not crossed"
+                                .to_owned(),
+                        )
+                    })?;
+                json!(name)
+            }
+            "precedence" => {
+                let precedence = value
+                    .as_u64()
+                    .filter(|precedence| *precedence > 0)
+                    .ok_or_else(|| {
+                        CliError::Input(
+                            "live human Access policy omitted a positive precedence; the mutation boundary was not crossed"
+                                .to_owned(),
+                        )
+                    })?;
+                json!(precedence)
+            }
+            "decision" => json!("allow"),
+            "require" => json!([]),
+            _ => unreachable!("human Access policy field set is closed"),
+        };
+        body.insert(field.to_owned(), value);
+    }
+    Ok(Value::Object(body))
+}
+
+fn access_human_policy_prior_state(result: &Value) -> Result<Value> {
+    access_human_policy_mutable_body(result, &Map::new())
+}
+
+fn access_human_policy_desired_matches_live(
+    result: &Value,
+    desired: &Map<String, Value>,
+) -> Result<bool> {
+    let current = access_human_policy_prior_state(result)?;
+    let updated = access_human_policy_mutable_body(result, desired)?;
+    Ok(desired
+        .keys()
+        .all(|field| current.get(field) == updated.get(field)))
+}
+
+fn access_policy_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == ACCESS_POLICY_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == ACCESS_POLICY_DETAIL_PATH
+        && capability.product == "Access application-scoped policies"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && capability.selectors.len() == 3
+        && ["account_id", "app_id", "policy_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.body_mode == cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+                    && response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+            })
+}
+
+async fn prepare_access_human_policy_plan_input(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &mut CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !is_access_human_policy_mutation(capability) {
+        return Ok(None);
+    }
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input("human Access policy plan requires an object body".to_owned())
+        })?;
+    let materialized_body = body
+        .keys()
+        .any(|field| !ACCESS_HUMAN_POLICY_DESIRED_FIELDS.contains(&field.as_str()));
+    let desired = if materialized_body {
+        preflight_call_input(capability, input, None)?;
+        None
+    } else {
+        Some(access_human_policy_desired_changes(input)?)
+    };
+    let policy_id = input
+        .selectors
+        .get("policy_id")
+        .and_then(Value::as_str)
+        .filter(|policy_id| !policy_id.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "human Access policy plan requires an exact `policy_id` selector".to_owned(),
+            )
+        })?;
+    let source = catalog
+        .get(ACCESS_POLICY_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(ACCESS_POLICY_READ_CAPABILITY_ID))?;
+    if !access_policy_read_contract_supported(source) {
+        return Err(CliError::Input(
+            "Access policy state source drifted from the governed exact-policy read".to_owned(),
+        ));
+    }
+    let response = Executor::new(http_client()?, API_BASE_URL)?
+        .execute_read(
+            source,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    if !response.success || response.status != 200 {
+        return Err(CliError::Input(format!(
+            "Cloudflare rejected the human Access policy state read with HTTP {}; the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    if response.result.get("id").and_then(Value::as_str) != Some(policy_id) {
+        return Err(CliError::Input(
+            "Access policy state read returned a different or missing policy id; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    access_human_policy_prior_state(&response.result)?;
+    if let Some(desired) = desired {
+        if access_human_policy_desired_matches_live(&response.result, &desired)? {
+            return Err(CliError::Input(
+                "human Access policy already has the exact requested eligibility and MFA state; no mutation plan was created"
+                    .to_owned(),
+            ));
+        }
+        input.body = Some(access_human_policy_mutable_body(
+            &response.result,
+            &desired,
+        )?);
+        preflight_call_input(capability, input, None)?;
+    }
+    let receipt = apply_same_path_prior_state_response(capability, input, account_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok(Some((receipt, evidence)))
+}
 
 fn oauth_client_secret_expected_prior_state(capability: &CapabilityV1) -> Option<bool> {
     match (
@@ -5340,6 +6586,11 @@ fn should_bind_same_path_prior_state(capability: &CapabilityV1) -> bool {
         && capability.rollback_contract_supported()
 }
 
+fn requires_same_path_state_precondition(capability: &CapabilityV1) -> bool {
+    should_bind_same_path_prior_state(capability)
+        || is_access_application_implicit_open_concurrency_plan(capability)
+}
+
 fn same_path_read_source_contract_supported(
     capability: &CapabilityV1,
     source: &CapabilityV1,
@@ -5427,6 +6678,81 @@ fn project_same_path_prior_state(
     input: &CallInput,
     result: &Value,
 ) -> Result<Value> {
+    if is_access_human_policy_mutation(capability) {
+        let policy_id = input
+            .selectors
+            .get("policy_id")
+            .and_then(Value::as_str)
+            .filter(|policy_id| !policy_id.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "human Access policy prior-state read omitted its exact policy selector"
+                        .to_owned(),
+                )
+            })?;
+        if result.get("id").and_then(Value::as_str) != Some(policy_id) {
+            return Err(CliError::Input(
+                "human Access policy prior-state read returned a different or missing policy id; the mutation boundary was not crossed"
+                    .to_owned(),
+            ));
+        }
+        let prior = access_human_policy_prior_state(result)?;
+        let mut restore_input = input.clone();
+        restore_input.query = json!({});
+        restore_input.body = Some(prior.clone());
+        preflight_call_input(capability, &restore_input, None).map_err(|error| {
+            CliError::Input(format!(
+                "live human Access policy is outside the exact restorable request contract; the mutation boundary was not crossed: {error}"
+            ))
+        })?;
+        return Ok(prior);
+    }
+    if access_application_login_methods_contract_supported(capability) {
+        let app_id = input
+            .selectors
+            .get("app_id")
+            .and_then(Value::as_str)
+            .filter(|app_id| !app_id.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "Access application prior-state read omitted its exact app selector".to_owned(),
+                )
+            })?;
+        let variant =
+            access_application_login_methods_variant(&capability.id).ok_or_else(|| {
+                CliError::Input(
+                    "Access application prior-state contract omitted its exact application variant"
+                        .to_owned(),
+                )
+            })?;
+        if result.get("id").and_then(Value::as_str) != Some(app_id)
+            || result.get("type").and_then(Value::as_str) != Some(variant.app_type)
+        {
+            return Err(CliError::Input(format!(
+                "Access application prior-state read returned a different app or a non-{} app; the mutation boundary was not crossed",
+                variant.app_type
+            )));
+        }
+        let concurrency_only = is_access_application_implicit_open_concurrency_plan(capability);
+        let current_idps = if concurrency_only {
+            normalized_access_application_idps(result.get("allowed_idps").unwrap_or(&Value::Null))?
+        } else {
+            access_application_rollback_idps(result.get("allowed_idps").unwrap_or(&Value::Null))?
+        };
+        let prior = access_application_mutable_body(result, &current_idps, variant)?;
+        if concurrency_only && current_idps.is_empty() {
+            return Ok(prior);
+        }
+        let mut restore_input = input.clone();
+        restore_input.query = json!({});
+        restore_input.body = Some(prior.clone());
+        preflight_call_input(capability, &restore_input, None).map_err(|error| {
+            CliError::Input(format!(
+                "live Access application is outside the exact restorable request contract; the mutation boundary was not crossed: {error}"
+            ))
+        })?;
+        return Ok(prior);
+    }
     let mut prior = serde_json::Map::new();
     for field in same_path_prior_state_fields(capability, input)? {
         let response_field = capability
@@ -5491,7 +6817,7 @@ async fn read_live_same_path_prior_state(
     account_id: &str,
     credential: &AuthCredential,
 ) -> Result<(Value, EvidenceV1)> {
-    if !should_bind_same_path_prior_state(capability) {
+    if !requires_same_path_state_precondition(capability) {
         return Err(CliError::Input(
             "mutation drifted from its governed same-path prior-state contract".to_owned(),
         ));
@@ -6910,6 +8236,8 @@ fn plan_requires_live_credential(capability: &CapabilityV1, adapter_targets: &Va
         || should_bind_security_action_state(capability, adapter_targets)
         || should_bind_oauth_client_secret_state(capability)
         || should_bind_r2_parent_token(capability)
+        || is_access_application_login_methods_mutation(capability)
+        || is_access_human_policy_mutation(capability)
 }
 
 #[expect(
@@ -6941,6 +8269,39 @@ async fn create_plan(
     let resolve_entitlement = should_resolve_zone_entitlement(&capability);
     let credential = if plan_requires_live_credential(&capability, &adapter_targets) {
         Some(fresh_credential(profile, &platform_secrets(store)).await?)
+    } else {
+        None
+    };
+    let access_state_precondition = if is_access_application_login_methods_mutation(&capability) {
+        let credential = credential.as_ref().ok_or_else(|| {
+            CliError::Input(
+                "Access application state precondition credential was not resolved".to_owned(),
+            )
+        })?;
+        prepare_access_application_login_methods_plan_input(
+            store,
+            catalog,
+            &mut capability,
+            &mut input,
+            account_id,
+            credential,
+        )
+        .await?
+    } else if is_access_human_policy_mutation(&capability) {
+        let credential = credential.as_ref().ok_or_else(|| {
+            CliError::Input(
+                "human Access policy state precondition credential was not resolved".to_owned(),
+            )
+        })?;
+        prepare_access_human_policy_plan_input(
+            store,
+            catalog,
+            &capability,
+            &mut input,
+            account_id,
+            credential,
+        )
+        .await?
     } else {
         None
     };
@@ -7015,6 +8376,8 @@ async fn create_plan(
     live_preconditions.entitlement = entitlement_precondition;
     live_preconditions.zone_account = zone_account_precondition;
     live_preconditions.r2_parent_token = r2_parent_token_precondition;
+    live_preconditions.same_path_prior_state =
+        access_state_precondition.or(live_preconditions.same_path_prior_state);
     resolve_kv_empty_namespace_delete_cost(&mut capability, &live_preconditions);
     persist_prepared_plan(
         store,
@@ -7529,7 +8892,10 @@ async fn prepare_same_path_prior_state_precondition(
     account_id: &str,
     credential: Option<&AuthCredential>,
 ) -> Result<Option<(Value, EvidenceV1)>> {
-    if !should_bind_same_path_prior_state(capability) {
+    if !should_bind_same_path_prior_state(capability)
+        || is_access_application_login_methods_mutation(capability)
+        || is_access_human_policy_mutation(capability)
+    {
         return Ok(None);
     }
     let credential = credential.ok_or_else(|| {
@@ -11028,19 +12394,70 @@ fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Res
                 "same-path prior-state receipt omitted its restorable object snapshot; create a new plan"
                     .to_owned(),
             )
-        })?;
-    let expected_fields = same_path_prior_state_fields(&plan.capability, &input)?;
-    let observed_fields = prior_state.keys().cloned().collect::<Vec<_>>();
-    if !exact_identity || observed_fields != expected_fields {
+    })?;
+    let prior_state = Value::Object(prior_state);
+    let access_application_concurrency_only =
+        is_access_application_implicit_open_concurrency_plan(&plan.capability);
+    let valid_state_shape = if is_access_human_policy_mutation(&plan.capability) {
+        access_human_policy_restorable_body(&prior_state)
+            .is_ok_and(|normalized| normalized == prior_state)
+    } else if access_application_login_methods_contract_supported(&plan.capability) {
+        let expected_fields = same_path_prior_state_fields(&plan.capability, &input)?;
+        let observed_fields = prior_state
+            .as_object()
+            .map(|state| state.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let variant = access_application_login_methods_variant(&plan.capability.id);
+        let current_idps = prior_state
+            .get("allowed_idps")
+            .ok_or_else(|| {
+                CliError::Input(
+                    "same-path Access application receipt omitted `allowed_idps`; create a new plan"
+                        .to_owned(),
+                )
+            })
+            .and_then(|allowed_idps| {
+                if access_application_concurrency_only {
+                    let idps = normalized_access_application_idps(allowed_idps)?;
+                    if idps.is_empty() {
+                        Ok(idps)
+                    } else {
+                        Err(CliError::Input(
+                            "implicit-open Access application receipt contains a non-empty identity-provider allowlist; create a new plan"
+                                .to_owned(),
+                        ))
+                    }
+                } else {
+                    access_application_rollback_idps(allowed_idps)
+                }
+            });
+        observed_fields == expected_fields
+            && variant
+                .zip(current_idps.ok())
+                .is_some_and(|(variant, current_idps)| {
+                    access_application_mutable_body(&prior_state, &current_idps, variant)
+                        .is_ok_and(|normalized| normalized == prior_state)
+                })
+    } else {
+        let expected_fields = same_path_prior_state_fields(&plan.capability, &input)?;
+        let observed_fields = prior_state
+            .as_object()
+            .map(|state| state.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        observed_fields == expected_fields
+    };
+    if !exact_identity || !valid_state_shape {
         return Err(CliError::Input(
             "same-path prior-state receipt has an invalid source, target, selector, or field set; create a new plan"
                 .to_owned(),
         ));
     }
-    let prior_state = Value::Object(prior_state);
     let mut restore_input = input;
     restore_input.query = json!({});
     restore_input.body = Some(prior_state.clone());
+    if access_application_concurrency_only {
+        return Ok(prior_state);
+    }
     preflight_call_input(&plan.capability, &restore_input, None).map_err(|error| {
         CliError::Input(format!(
             "same-path prior-state receipt is outside the exact restorable request contract; create a new plan: {error}"
@@ -11050,11 +12467,15 @@ fn validate_same_path_prior_state_receipt(plan: &PlanV1, receipt: &Value) -> Res
 }
 
 fn required_same_path_prior_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
-    if plan.capability.rollback.strategy.as_deref() != Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
-    {
+    let declares_same_path_state = plan.capability.rollback.strategy.as_deref()
+        == Some(SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY)
+        || (access_application_login_methods_contract_supported(&plan.capability)
+            && !plan.capability.rollback.supported
+            && plan.capability.rollback.strategy.is_none());
+    if !declares_same_path_state {
         return Ok(None);
     }
-    if !should_bind_same_path_prior_state(&plan.capability) {
+    if !requires_same_path_state_precondition(&plan.capability) {
         return Err(CliError::Input(
             "plan is inconsistent with its hash-bound same-path prior-state contract; create a new plan"
                 .to_owned(),
@@ -11089,6 +12510,11 @@ fn required_same_path_prior_state_precondition(plan: &PlanV1) -> Result<Option<&
 }
 
 fn same_path_prior_snapshot(plan: &PlanV1) -> Result<Value> {
+    if !should_bind_same_path_prior_state(&plan.capability) {
+        return Err(CliError::Input(
+            "same-path compensation requires a supported automatic rollback contract".to_owned(),
+        ));
+    }
     required_same_path_prior_state_precondition(plan)?.ok_or_else(|| {
         CliError::Input(
             "same-path compensation requires a hash-bound prior-state precondition".to_owned(),
@@ -11103,6 +12529,19 @@ fn same_path_prior_snapshot(plan: &PlanV1) -> Result<Value> {
             )
         })?;
     validate_same_path_prior_state_receipt(plan, receipt)
+}
+
+fn validate_same_path_prior_state_receipt_precondition(
+    expected_hash: &str,
+    current_receipt: &Value,
+) -> Result<()> {
+    if hash_value(current_receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live same-path state drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn validate_live_same_path_prior_state_precondition(
@@ -11124,12 +12563,7 @@ async fn validate_live_same_path_prior_state_precondition(
         credential,
     )
     .await?;
-    if hash_value(&receipt)? != expected_hash {
-        return Err(CliError::Input(
-            "live same-path state drifted after planning; the mutation boundary was not crossed and a new plan is required"
-                .to_owned(),
-        ));
-    }
+    validate_same_path_prior_state_receipt_precondition(expected_hash, &receipt)?;
     Ok(Some(evidence))
 }
 
@@ -15313,9 +16747,9 @@ fn stage_required(stage: cfctl_core::GuideStage, capability: &cfctl_core::Capabi
 
 fn guide_document(capability: &CapabilityV1) -> CapabilityGuideV1 {
     let blocking_gaps = capability.mutation_contract_gaps();
-    let post_resolution_call_argv = capability_call_argv(capability);
     let contract_ready =
         capability.adapter_status != AdapterStatus::Blocked && blocking_gaps.is_empty();
+    let post_resolution_call_argv = capability_call_argv(capability);
     let call_argv = contract_ready.then(|| post_resolution_call_argv.clone());
     let stages = guide_stages()
         .iter()
@@ -15331,23 +16765,23 @@ fn guide_document(capability: &CapabilityV1) -> CapabilityGuideV1 {
             )
         })
         .collect::<Vec<_>>();
+    let blocked_reason = capability.blocked_reason.clone();
+    let next_action =
+        guide_next_action(capability, contract_ready, Some(&post_resolution_call_argv));
+    let capability = caller_facing_capability(capability);
 
     CapabilityGuideV1 {
-        capability: capability.clone(),
+        capability,
         contract_state: if contract_ready {
             GuideContractStateV1::Available
         } else {
             GuideContractStateV1::Blocked
         },
         blocking_gaps,
-        blocked_reason: capability.blocked_reason.clone(),
+        blocked_reason,
         call_argv,
         post_resolution_call_argv: post_resolution_call_argv.clone(),
-        next_action: guide_next_action(
-            capability,
-            contract_ready,
-            Some(&post_resolution_call_argv),
-        ),
+        next_action,
         stages,
     }
 }
@@ -17174,8 +18608,8 @@ mod tests {
     };
     use crate::profiles::ProfilesConfig;
     use crate::{
-        CallArgs, KeyMutationArgs, KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicySelector,
-        PlanApproveArgs, PlanSelector,
+        CallArgs, CapabilitySelector, CatalogCommand, KeyMutationArgs, KeyPermissionArgs,
+        KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs, PlanSelector, SearchArgs,
     };
     use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::CatalogSnapshot;
@@ -26903,6 +28337,1722 @@ mod tests {
             .collect();
         let (result, _error) = super::resolve_result("cap", &ranked, None, 3);
         assert_eq!(result["matched"].as_array().map(Vec::len), Some(3));
+    }
+
+    fn access_application_live_result() -> Value {
+        json!({
+            "allowed_idps":[
+                "7b0bc477-5d42-4dab-b0ea-c97d0aef7810",
+                "6f88b4fc-0ed2-48fa-95ea-3f7336c90053"
+            ],
+            "app_launcher_visible":true,
+            "aud":"aud-value",
+            "auto_redirect_to_identity":false,
+            "created_at":"2026-03-24T02:31:11Z",
+            "destinations":[{"type":"public","uri":"investors.mlnavigator.com"}],
+            "domain":"investors.mlnavigator.com",
+            "enable_binding_cookie":true,
+            "http_only_cookie_attribute":true,
+            "id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+            "name":"MLNavigator Investor Portal",
+            "options_preflight_bypass":false,
+            "policies":[{
+                "created_at":"2026-07-14T09:51:08Z",
+                "decision":"allow",
+                "id":"45e44306-0e2a-460a-94aa-34c21eefdb4a",
+                "include":[{"email_domain":{"domain":"mlnavigator.com"}}],
+                "name":"Allow MLNavigator Investor Staff",
+                "precedence":1,
+                "updated_at":"2026-07-14T09:51:08Z"
+            }],
+            "same_site_cookie_attribute":"lax",
+            "self_hosted_domains":["investors.mlnavigator.com"],
+            "session_duration":"24h",
+            "tags":["customer:investors","env:production"],
+            "type":"self_hosted",
+            "uid":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+            "updated_at":"2026-07-14T09:51:47Z"
+        })
+    }
+
+    fn access_app_launcher_live_result() -> Value {
+        json!({
+            "allowed_idps":["6f88b4fc-0ed2-48fa-95ea-3f7336c90053"],
+            "aud":"aud-value",
+            "auto_redirect_to_identity":false,
+            "created_at":"2026-04-17T15:14:52Z",
+            "domain":"auch-id.cloudflareaccess.com",
+            "id":"564ba110-aca0-401a-850d-b706c2c1a642",
+            "landing_page_design":{},
+            "name":"App Launcher",
+            "policies":[{
+                "created_at":"2026-04-28T20:10:14Z",
+                "decision":"allow",
+                "id":"89cae51e-3bb6-480f-a9a1-9abdf0964b82",
+                "include":[{"email_domain":{"domain":"mlnavigator.com"}}],
+                "name":"Allow MLNavigator Staff",
+                "precedence":1,
+                "updated_at":"2026-04-28T20:10:14Z"
+            }],
+            "session_duration":"24h",
+            "skip_app_launcher_login_page":false,
+            "type":"app_launcher",
+            "uid":"564ba110-aca0-401a-850d-b706c2c1a642",
+            "updated_at":"2026-07-03T03:57:20Z"
+        })
+    }
+
+    #[test]
+    fn access_application_login_method_body_preserves_mutable_state_and_normalizes_policies() {
+        let otp = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let body = super::access_application_mutable_body(
+            &access_application_live_result(),
+            &[otp],
+            variant,
+        )
+        .expect("preservation-safe body");
+        assert_eq!(
+            body["allowed_idps"],
+            json!(["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"])
+        );
+        assert_eq!(
+            body["policies"],
+            json!([{
+                "id":"45e44306-0e2a-460a-94aa-34c21eefdb4a",
+                "precedence":1
+            }])
+        );
+        assert_eq!(body["auto_redirect_to_identity"], json!(false));
+        assert_eq!(body["enable_binding_cookie"], json!(true));
+        assert_eq!(body["domain"], json!("investors.mlnavigator.com"));
+        assert_eq!(body["same_site_cookie_attribute"], json!("lax"));
+        assert!(body.get("id").is_none());
+        assert!(body.get("aud").is_none());
+        assert!(body.get("created_at").is_none());
+        assert!(body.get("updated_at").is_none());
+        assert_eq!(
+            body["tags"],
+            json!(["customer:investors", "env:production"])
+        );
+    }
+
+    #[test]
+    fn access_application_empty_tags_remain_distinct_from_absence() {
+        let otp = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut with_empty_tags = access_application_live_result();
+        with_empty_tags["tags"] = json!([]);
+        let body = super::access_application_mutable_body(
+            &with_empty_tags,
+            std::slice::from_ref(&otp),
+            variant,
+        )
+        .expect("explicit empty tags remain in the full PUT");
+        assert_eq!(body.get("tags"), Some(&json!([])));
+
+        let mut without_tags = access_application_live_result();
+        without_tags
+            .as_object_mut()
+            .expect("application object")
+            .remove("tags");
+        let body = super::access_application_mutable_body(&without_tags, &[otp], variant)
+            .expect("absent optional tags remain absent");
+        assert!(body.get("tags").is_none());
+    }
+
+    #[test]
+    fn access_app_launcher_login_method_body_preserves_launcher_state() {
+        let otp = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("App Launcher variant");
+        let body = super::access_application_mutable_body(
+            &access_app_launcher_live_result(),
+            &[otp],
+            variant,
+        )
+        .expect("preservation-safe App Launcher body");
+        assert_eq!(
+            body["allowed_idps"],
+            json!(["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"])
+        );
+        assert_eq!(
+            body["policies"],
+            json!([{
+                "id":"89cae51e-3bb6-480f-a9a1-9abdf0964b82",
+                "precedence":1
+            }])
+        );
+        assert_eq!(body["auto_redirect_to_identity"], json!(false));
+        assert_eq!(body["landing_page_design"], json!({}));
+        assert_eq!(body["skip_app_launcher_login_page"], json!(false));
+        assert_eq!(body["type"], json!("app_launcher"));
+        assert!(body.get("domain").is_none());
+        assert!(body.get("name").is_none());
+        assert!(body.get("aud").is_none());
+        assert!(body.get("id").is_none());
+    }
+
+    #[test]
+    fn access_application_login_method_body_fails_closed_on_unclassified_live_state() {
+        let mut result = access_application_live_result();
+        result["future_writable_field"] = json!({"must_be_preserved":true});
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let error = super::access_application_mutable_body(
+            &result,
+            &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
+            variant,
+        )
+        .expect_err("unclassified app override must block");
+        assert!(error.to_string().contains("future_writable_field"));
+    }
+
+    fn access_application_login_methods_capability() -> CapabilityV1 {
+        let mut properties = json!({
+            "allowed_idps":{"type":"array","items":{"type":"string"}},
+            "app_launcher_visible":{"type":"boolean"},
+            "auto_redirect_to_identity":{"type":"boolean"},
+            "destinations":{"type":"array","items":{"type":"object"}},
+            "domain":{"type":"string"},
+            "eager_redirect_cookie_setting":{"type":"boolean"},
+            "enable_binding_cookie":{"type":"boolean"},
+            "http_only_cookie_attribute":{"type":"boolean"},
+            "name":{"type":"string"},
+            "options_preflight_bypass":{"type":"boolean"},
+            "path_cookie_attribute":{"type":"boolean"},
+            "policies":{"type":"array","items":{"type":"object"}},
+            "same_site_cookie_attribute":{"type":"string"},
+            "self_hosted_domains":{"type":"array","items":{"type":"string"}},
+            "session_duration":{"type":"string"},
+            "tags":{"type":"array","items":{"type":"string"}},
+            "type":{"type":"string","enum":["self_hosted"]}
+        })
+        .as_object()
+        .cloned()
+        .expect("object properties");
+        properties.retain(|field, _| super::ACCESS_APP_MUTABLE_FIELDS.contains(&field.as_str()));
+        let required = super::ACCESS_APP_MUTABLE_FIELDS
+            .iter()
+            .filter(|field| {
+                !matches!(
+                    **field,
+                    "eager_redirect_cookie_setting"
+                        | "path_cookie_attribute"
+                        | "same_site_cookie_attribute"
+                        | "tags"
+                )
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let mut capability = CapabilityV1::new(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+            "Update self-hosted Access application login methods",
+            "PUT",
+            super::ACCESS_APP_DETAIL_PATH,
+        );
+        capability.product = "Access applications".to_owned();
+        capability.account_scope = "account".to_owned();
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.permissions = vec!["Access: Apps and Policies Write".to_owned()];
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::IdentityOrOwnership;
+        capability.cost.known = true;
+        capability.cost.maximum = Some(0.0);
+        capability.entitlement.available = Some(true);
+        capability.selectors = ["account_id", "app_id"]
+            .into_iter()
+            .map(|name| SelectorV1 {
+                name: name.to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            })
+            .collect();
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":required,
+            "properties":properties,
+            "x-cfctl-body-required":true
+        }));
+        capability.verification.required = true;
+        capability.verification.strategy =
+            "same_path_result_contains_planned_fields_after_update".to_owned();
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: super::ACCESS_APP_DETAIL_PATH.to_owned(),
+            read_capability_id: super::ACCESS_APP_READ_CAPABILITY_ID.to_owned(),
+            verified_response_fields: super::ACCESS_APP_MUTABLE_FIELDS
+                .iter()
+                .map(|field| (*field).to_owned())
+                .collect(),
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy =
+            Some(super::SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY.to_owned());
+        capability.rollback.warning =
+            Some("restoration requires a separate approved plan".to_owned());
+        capability
+    }
+
+    fn assert_access_application_optional_fields(body: &Value) {
+        assert_eq!(body["same_site_cookie_attribute"], json!("lax"));
+        assert_eq!(body["eager_redirect_cookie_setting"], json!(true));
+        assert_eq!(
+            body["tags"],
+            json!(["customer:investors", "env:production"])
+        );
+    }
+
+    fn assert_eager_redirect_cookie_contract(capability: &CapabilityV1) {
+        let materialized_schema =
+            cfctl_catalog::access_application_login_methods_materialized_schema();
+        assert_eq!(
+            materialized_schema["properties"]["eager_redirect_cookie_setting"]["type"],
+            "boolean"
+        );
+        assert!(
+            !materialized_schema["required"]
+                .as_array()
+                .expect("required fields")
+                .iter()
+                .any(|field| field == "eager_redirect_cookie_setting"),
+            "eager redirect is an optional provider field"
+        );
+        assert!(
+            capability
+                .same_path_read
+                .as_ref()
+                .expect("same-path read")
+                .verified_response_fields
+                .iter()
+                .any(|field| field == "eager_redirect_cookie_setting")
+        );
+    }
+
+    #[test]
+    fn access_application_path_cookie_round_trips_through_snapshot_contract() {
+        let capability = access_application_login_methods_capability();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut live = access_application_live_result();
+        live["path_cookie_attribute"] = json!(true);
+        let body = super::access_application_mutable_body(
+            &live,
+            &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
+            variant,
+        )
+        .expect("path-scoped cookie configuration must be preserved");
+        assert_eq!(body["path_cookie_attribute"], json!(true));
+
+        let materialized_schema =
+            cfctl_catalog::access_application_login_methods_materialized_schema();
+        assert_eq!(
+            materialized_schema["properties"]["path_cookie_attribute"]["type"],
+            "boolean"
+        );
+        assert!(
+            !materialized_schema["required"]
+                .as_array()
+                .expect("required fields")
+                .iter()
+                .any(|field| field == "path_cookie_attribute"),
+            "path-scoped cookies are an optional provider field"
+        );
+        assert!(
+            capability
+                .same_path_read
+                .as_ref()
+                .expect("same-path read")
+                .verified_response_fields
+                .iter()
+                .any(|field| field == "path_cookie_attribute")
+        );
+
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(body),
+            ..CallInput::default()
+        };
+        let receipt = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: live,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect("path-scoped cookie configuration must enter the concurrency receipt");
+        assert_eq!(receipt["prior_state"]["path_cookie_attribute"], json!(true));
+    }
+
+    #[test]
+    fn access_application_same_site_cookie_round_trips_through_rollback() {
+        let capability = access_application_login_methods_capability();
+        assert!(
+            super::is_access_application_login_methods_mutation(&capability),
+            "gaps: {:?}",
+            capability.mutation_contract_gaps()
+        );
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut planned_source = access_application_live_result();
+        planned_source["eager_redirect_cookie_setting"] = json!(true);
+        if !variant
+            .mutable_fields
+            .contains(&"same_site_cookie_attribute")
+        {
+            planned_source
+                .as_object_mut()
+                .expect("application object")
+                .remove("same_site_cookie_attribute");
+        }
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(
+                super::access_application_mutable_body(
+                    &planned_source,
+                    &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
+                    variant,
+                )
+                .expect("preservation-safe full PUT body"),
+            ),
+            ..CallInput::default()
+        };
+        assert_access_application_optional_fields(input.body.as_ref().expect("materialized body"));
+        assert_eager_redirect_cookie_contract(&capability);
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: planned_source,
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let receipt = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &response,
+        )
+        .expect("exact prior-state receipt");
+        assert_access_application_optional_fields(&receipt["prior_state"]);
+
+        let receipt_hash = hash_value(&receipt).expect("receipt hash");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({
+                "selectors":input.selectors,
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{
+                    "same_path_prior_state":receipt
+                }
+            }),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(&input).expect("plan input");
+        plan.precondition_hashes.insert(
+            super::SAME_PATH_PRIOR_STATE_PRECONDITION.to_owned(),
+            receipt_hash,
+        );
+        let compensation =
+            super::same_path_prior_state_compensation_request(&plan).expect("restoration request");
+        assert_access_application_optional_fields(
+            compensation.input.body.as_ref().expect("restoration body"),
+        );
+    }
+
+    #[test]
+    fn access_application_precondition_distinguishes_absence_from_empty_optional_state() {
+        let capability = access_application_login_methods_capability();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut planned_source = access_application_live_result();
+        planned_source
+            .as_object_mut()
+            .expect("application object")
+            .remove("tags");
+        planned_source
+            .as_object_mut()
+            .expect("application object")
+            .remove("same_site_cookie_attribute");
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(
+                super::access_application_mutable_body(
+                    &planned_source,
+                    &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
+                    variant,
+                )
+                .expect("preservation-safe full PUT body"),
+            ),
+            ..CallInput::default()
+        };
+        let planned = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: planned_source.clone(),
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect("planned absence receipt");
+        assert!(planned["prior_state"].get("tags").is_none());
+
+        let mut drifted_source = planned_source;
+        drifted_source["tags"] = json!([]);
+        let drifted = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: drifted_source,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect("drifted empty-state receipt");
+        assert_eq!(drifted["prior_state"]["tags"], json!([]));
+        let planned_hash = hash_value(&planned).expect("planned hash");
+        let error =
+            super::validate_same_path_prior_state_receipt_precondition(&planned_hash, &drifted);
+        assert!(
+            error
+                .expect_err("an optional field appearing after planning must block execution")
+                .to_string()
+                .contains("drifted after planning")
+        );
+    }
+
+    #[test]
+    fn access_application_precondition_rejects_new_null_optional_state() {
+        let capability = access_application_login_methods_capability();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut planned_source = access_application_live_result();
+        planned_source
+            .as_object_mut()
+            .expect("application object")
+            .remove("same_site_cookie_attribute");
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(
+                super::access_application_mutable_body(
+                    &planned_source,
+                    &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
+                    variant,
+                )
+                .expect("preservation-safe full PUT body"),
+            ),
+            ..CallInput::default()
+        };
+        planned_source["same_site_cookie_attribute"] = Value::Null;
+        let error = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: planned_source,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect_err("null is present state, not absence");
+        assert!(
+            error.to_string().contains("same_site_cookie_attribute"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn access_application_execution_precondition_rejects_new_unclassified_state() {
+        let capability = access_application_login_methods_capability();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let planned_source = access_application_live_result();
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(
+                super::access_application_mutable_body(
+                    &planned_source,
+                    &["7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned()],
+                    variant,
+                )
+                .expect("preservation-safe full PUT body"),
+            ),
+            ..CallInput::default()
+        };
+        let mut drifted_source = planned_source;
+        drifted_source["future_writable_field"] = json!({"must_be_preserved":true});
+        let error = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: drifted_source,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect_err("new unclassified state must block execution");
+        assert!(error.to_string().contains("future_writable_field"));
+    }
+
+    #[test]
+    fn access_application_policy_projection_rejects_duplicate_stable_identity() {
+        let policies = json!([
+            {"id":"policy-a","precedence":1},
+            {"id":"policy-a","precedence":2}
+        ]);
+        assert!(
+            super::normalize_access_application_policies(&policies)
+                .expect_err("one policy identity cannot occupy two precedences")
+                .to_string()
+                .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn access_application_forward_pinning_accepts_implicit_open_current_state_without_weakening_guards()
+     {
+        let desired_idp = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned();
+        let desired_input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(json!({"allowed_idps":[desired_idp.clone()]})),
+            ..CallInput::default()
+        };
+        let empty_desired_input = CallInput {
+            body: Some(json!({"allowed_idps":[]})),
+            ..desired_input.clone()
+        };
+        assert!(
+            super::access_application_desired_idps(&empty_desired_input).is_err(),
+            "an empty desired IdP set must continue to fail closed"
+        );
+
+        let capability = access_application_login_methods_capability();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut implicit_open = access_application_live_result();
+        implicit_open["allowed_idps"] = json!([]);
+        let planned_body = super::access_application_mutable_body(
+            &implicit_open,
+            std::slice::from_ref(&desired_idp),
+            variant,
+        )
+        .expect("non-empty desired IdP set produces a preservation-safe forward body");
+        assert_eq!(planned_body["allowed_idps"], json!([desired_idp]));
+
+        let rollback_error = super::apply_same_path_prior_state_response(
+            &capability,
+            &CallInput {
+                body: Some(planned_body),
+                ..desired_input
+            },
+            "account-a",
+            &CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: implicit_open.clone(),
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        )
+        .expect_err("an implicit-open prior state must retain an explicit rollback limitation");
+        assert!(
+            rollback_error
+                .to_string()
+                .contains("empty identity-provider allowlist"),
+            "{rollback_error}"
+        );
+
+        assert_eq!(
+            super::normalized_access_application_idps(&implicit_open["allowed_idps"])
+                .expect("forward pinning must accept an implicit-open current IdP set"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn access_application_plan_accepts_one_populated_destination_representation() {
+        let desired_idp = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut failures = Vec::new();
+
+        for (label, empty_field) in [
+            ("self-hosted domains only", "destinations"),
+            ("destinations only", "self_hosted_domains"),
+        ] {
+            let mut capability = access_application_login_methods_capability();
+            let schema = capability
+                .request_schema
+                .as_mut()
+                .expect("materialized application request schema");
+            schema["properties"]["destinations"]["minItems"] = json!(1);
+            schema["properties"]["self_hosted_domains"]["minItems"] = json!(1);
+
+            let mut input = CallInput {
+                selectors: json!({
+                    "account_id":"account-a",
+                    "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+                }),
+                body: Some(json!({"allowed_idps":[desired_idp.clone()]})),
+                ..CallInput::default()
+            };
+            super::validate_access_application_login_methods_desired_input(&capability, &input)
+                .expect("narrow desired input remains valid");
+
+            let mut live = access_application_live_result();
+            live[empty_field] = json!([]);
+            let populated_field = if empty_field == "destinations" {
+                "self_hosted_domains"
+            } else {
+                "destinations"
+            };
+            assert!(
+                live[empty_field].as_array().is_some_and(Vec::is_empty)
+                    && live[populated_field]
+                        .as_array()
+                        .is_some_and(|values| !values.is_empty()),
+                "{label} fixture must contain exactly one populated representation"
+            );
+
+            let response = CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: live,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            };
+            match super::finalize_access_application_login_methods_plan_input(
+                &mut capability,
+                &mut input,
+                std::slice::from_ref(&desired_idp),
+                variant,
+                "account-a",
+                &response,
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) => failures.push(format!("{label}: plan omitted its prior-state receipt")),
+                Err(error) => failures.push(format!("{label}: {error}")),
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "one valid destination representation must be sufficient for planning: {failures:?}"
+        );
+    }
+
+    fn assert_implicit_open_concurrency_receipt_blocks_drift_without_rollback(
+        capability: CapabilityV1,
+        input: &CallInput,
+        prior_state: Option<Value>,
+        expected_current_state: &Value,
+    ) {
+        let receipt = prior_state.expect(
+            "implicit-open plans still need a hash-bound closed current-state receipt for apply-time concurrency checks",
+        );
+        assert_eq!(
+            receipt.get("prior_state"),
+            Some(expected_current_state),
+            "the concurrency receipt must retain the exact closed mutable snapshot"
+        );
+        let receipt_hash = hash_value(&receipt).expect("concurrency receipt hash");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability,
+            json!({
+                "selectors":input.selectors,
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{
+                    "same_path_prior_state":receipt.clone()
+                }
+            }),
+        )
+        .expect("implicit-open plan");
+        plan.input = serde_json::to_value(input).expect("plan input");
+        plan.precondition_hashes.insert(
+            super::SAME_PATH_PRIOR_STATE_PRECONDITION.to_owned(),
+            receipt_hash.clone(),
+        );
+        assert_eq!(
+            super::required_same_path_prior_state_precondition(&plan)
+                .expect("apply must require the concurrency precondition"),
+            Some(receipt_hash.as_str()),
+            "unsupported rollback must not disable apply-time live re-read"
+        );
+
+        let mut drifted_receipt = receipt.clone();
+        drifted_receipt["prior_state"]["name"] = json!("Concurrent application rename");
+        let drift_error = super::validate_same_path_prior_state_receipt_precondition(
+            &receipt_hash,
+            &drifted_receipt,
+        )
+        .expect_err("a mutable-field change between plan and apply must block execution");
+        assert!(
+            drift_error.to_string().contains("drifted after planning"),
+            "{drift_error}"
+        );
+
+        plan.refresh_hash().expect("bind concurrency precondition");
+        plan.approve(true, None).expect("approve test plan");
+        plan.mark_consumed().expect("consume test plan");
+        plan.record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("record boundary attempt");
+        plan.record_transaction_stage_with_artifact(
+            TransactionStageV1::BoundaryResponsePersisted,
+            json!({"success":true,"http_status":200}),
+        )
+        .expect("record successful boundary response");
+        assert!(
+            super::compensation_request(&plan)
+                .expect("compensation selection")
+                .is_none(),
+            "the concurrency receipt must not become automatic rollback authority"
+        );
+    }
+
+    #[test]
+    fn access_application_implicit_open_plan_is_concurrency_guarded_without_automatic_rollback() {
+        let desired_idp = "7b0bc477-5d42-4dab-b0ea-c97d0aef7810".to_owned();
+        let mut input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(json!({"allowed_idps":[desired_idp.clone()]})),
+            ..CallInput::default()
+        };
+        let desired_idps = super::access_application_desired_idps(&input)
+            .expect("a non-empty UUID-validated desired IdP set");
+        let mut capability = access_application_login_methods_capability();
+        let variant = super::access_application_login_methods_variant(
+            super::ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+        )
+        .expect("self-hosted variant");
+        let mut implicit_open = access_application_live_result();
+        implicit_open["allowed_idps"] = json!([]);
+        let expected_current_state =
+            super::access_application_mutable_body(&implicit_open, &[], variant)
+                .expect("the implicit-open application state has a closed mutable projection");
+        let expected_body =
+            super::access_application_mutable_body(&implicit_open, &desired_idps, variant)
+                .expect("the desired IdP set materializes a preservation-safe full PUT body");
+        let response = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: implicit_open,
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+
+        let prior_state = super::finalize_access_application_login_methods_plan_input(
+            &mut capability,
+            &mut input,
+            &desired_idps,
+            variant,
+            "account-a",
+            &response,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "an implicit-open current IdP state must produce a plan with explicit non-restorable rollback metadata: {error}"
+            )
+        });
+
+        assert_eq!(
+            input.body.as_ref(),
+            Some(&expected_body),
+            "plan preparation must retain the fully materialized desired application body"
+        );
+        assert!(!capability.rollback.supported);
+        assert!(capability.rollback.strategy.is_none());
+        assert_eq!(
+            capability.rollback.warning.as_deref(),
+            Some(
+                "the prior implicit-open identity-provider state cannot be restored automatically; manual rollback requires a separately reviewed Cloudflare Access application change"
+            )
+        );
+        assert!(
+            capability.mutation_contract_gaps().is_empty(),
+            "explicitly unsupported rollback must remain a complete mutation contract: {:?}",
+            capability.mutation_contract_gaps()
+        );
+
+        assert_implicit_open_concurrency_receipt_blocks_drift_without_rollback(
+            capability,
+            &input,
+            prior_state,
+            &expected_current_state,
+        );
+    }
+
+    #[test]
+    fn access_application_desired_idps_rejects_empty_duplicate_and_non_uuid_sets() {
+        let input = |allowed_idps: Value| CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(json!({"allowed_idps":allowed_idps})),
+            ..CallInput::default()
+        };
+        let capability = access_application_login_methods_capability();
+        let mut desired_schema_capability = capability.clone();
+        desired_schema_capability.request_schema =
+            Some(super::access_application_login_methods_desired_schema());
+        assert_eq!(
+            desired_schema_capability
+                .request_schema
+                .as_ref()
+                .and_then(|schema| schema.pointer("/properties/allowed_idps/items")),
+            Some(&cfctl_catalog::access_identity_provider_id_schema()),
+            "runtime and catalog must share the exact identity-provider schema"
+        );
+        for documented_id in [
+            "699d98642c564d2e855e9661899b7252",
+            "7b0bc477-5d42-4dab-b0ea-c97d0aef7810",
+        ] {
+            super::validate_request_contract(
+                &desired_schema_capability,
+                &input(json!([documented_id])),
+            )
+            .unwrap_or_else(|error| {
+                panic!("schema should accept documented ID {documented_id}: {error}")
+            });
+            super::validate_access_application_login_methods_desired_input(
+                &capability,
+                &input(json!([documented_id])),
+            )
+            .unwrap_or_else(|error| panic!("{documented_id} should be accepted: {error}"));
+        }
+        assert!(super::access_application_desired_idps(&input(json!([]))).is_err());
+        assert!(
+            super::access_application_desired_idps(&input(json!([
+                "7b0bc477-5d42-4dab-b0ea-c97d0aef7810",
+                "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+            ])))
+            .is_err()
+        );
+        assert!(
+            super::access_application_desired_idps(&input(json!([
+                "7b0bc4775d424dabb0eac97d0aef7810",
+                "7b0bc477-5d42-4dab-b0ea-c97d0aef7810"
+            ])))
+            .is_err(),
+            "one stable IdP identity rendered two ways must remain a duplicate"
+        );
+        assert!(super::access_application_desired_idps(&input(json!(["github"]))).is_err());
+        for malformed in [
+            "699d98642c564d2e855e9661899b725",
+            "699d98642c564d2e855e9661899b72520",
+            "7b0bc477-5d42-4dab-b0ea-c97d0aef781",
+            "g99d98642c564d2e855e9661899b7252",
+            "7b0bc477-5d42-4dab-b0ea-c97d0aef781z",
+            "7b0bc4775-d42-4dab-b0ea-c97d0aef7810",
+        ] {
+            assert!(
+                super::validate_request_contract(
+                    &desired_schema_capability,
+                    &input(json!([malformed])),
+                )
+                .is_err(),
+                "pinned schema accepted malformed identity-provider ID: {malformed}"
+            );
+            assert!(
+                super::validate_access_application_login_methods_desired_input(
+                    &capability,
+                    &input(json!([malformed])),
+                )
+                .is_err(),
+                "malformed identity-provider ID was accepted: {malformed}"
+            );
+        }
+    }
+
+    fn access_human_policy_live_result() -> Value {
+        json!({
+            "created_at":"2026-07-14T09:51:08Z",
+            "decision":"allow",
+            "exclude":[{"email":{"email":"founders@mlnavigator.com"}}],
+            "id":"45e44306-0e2a-460a-94aa-34c21eefdb4a",
+            "include":[{"email_domain":{"domain":"mlnavigator.com"}}],
+            "mfa_config":{
+                "allowed_authenticators":["biometrics","totp"],
+                "mfa_disabled":false,
+                "session_duration":""
+            },
+            "name":"Allow MLNavigator Investor Staff",
+            "precedence":1,
+            "require":[],
+            "reusable":false,
+            "session_duration":"24h",
+            "uid":"45e44306-0e2a-460a-94aa-34c21eefdb4a",
+            "updated_at":"2026-07-29T02:40:54Z"
+        })
+    }
+
+    fn access_human_policy_capability() -> CapabilityV1 {
+        let identity_rule = super::access_human_policy_identity_rule_schema();
+        let mut capability = CapabilityV1::new(
+            super::ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID,
+            "Update human Access eligibility and independent MFA",
+            "PUT",
+            super::ACCESS_POLICY_DETAIL_PATH,
+        );
+        capability.product = "Access application-scoped policies".to_owned();
+        capability.account_scope = "account".to_owned();
+        capability.mutating = true;
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.permissions = vec!["Access: Apps and Policies Write".to_owned()];
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::IdentityOrOwnership;
+        capability.cost.known = true;
+        capability.cost.maximum = Some(0.0);
+        capability.entitlement.available = Some(true);
+        capability.selectors = ["account_id", "app_id", "policy_id"]
+            .into_iter()
+            .map(|name| SelectorV1 {
+                name: name.to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            })
+            .collect();
+        capability.request_schema = Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "required":["name","decision","include","exclude","require","precedence"],
+            "properties":{
+                "name":{"type":"string","minLength":1,"maxLength":350},
+                "decision":{"type":"string","enum":["allow"]},
+                "include":{
+                    "type":"array",
+                    "minItems":1,
+                    "maxItems":100,
+                    "uniqueItems":true,
+                    "items":identity_rule.clone()
+                },
+                "exclude":{
+                    "type":"array",
+                    "maxItems":100,
+                    "uniqueItems":true,
+                    "items":identity_rule
+                },
+                "require":{"type":"array","maxItems":0},
+                "precedence":{"type":"integer","minimum":1},
+                "session_duration":{"type":"string","minLength":2,"maxLength":16},
+                "mfa_config":super::access_human_policy_mfa_schema()
+            },
+            "x-cfctl-body-required":true
+        }));
+        capability.verification.required = true;
+        capability.verification.strategy =
+            "same_path_result_contains_planned_fields_after_update".to_owned();
+        capability.same_path_read = Some(SamePathReadContractV1 {
+            path: super::ACCESS_POLICY_DETAIL_PATH.to_owned(),
+            read_capability_id: super::ACCESS_POLICY_READ_CAPABILITY_ID.to_owned(),
+            verified_response_fields: super::ACCESS_HUMAN_POLICY_MUTABLE_FIELDS
+                .iter()
+                .map(|field| (*field).to_owned())
+                .collect(),
+        });
+        capability.rollback.supported = true;
+        capability.rollback.strategy =
+            Some(super::SAME_PATH_PRIOR_STATE_ROLLBACK_STRATEGY.to_owned());
+        capability.rollback.warning =
+            Some("restoration requires a separate approved plan".to_owned());
+        capability
+    }
+
+    #[test]
+    fn access_human_policy_guide_readiness_uses_canonical_executable_contract() {
+        let capability = access_human_policy_capability();
+        assert!(
+            capability.mutation_contract_gaps().is_empty(),
+            "positive control requires an executable canonical human-policy contract"
+        );
+
+        let guide = guide_json(&capability);
+        assert_eq!(
+            guide["capability"]["request_schema"],
+            super::access_human_policy_desired_schema(),
+            "guide presentation must expose the caller-facing desired-state schema"
+        );
+        assert_eq!(
+            guide["contract_state"], "available",
+            "an executable human-policy operation must remain guide-ready: {:?}",
+            guide["blocking_gaps"]
+        );
+        assert_eq!(guide["blocking_gaps"], json!([]));
+        assert!(
+            guide["call_argv"].as_array().is_some(),
+            "an available human-policy guide must expose its governed call"
+        );
+        let stages = guide["stages"].as_array().expect("guide stages");
+        for stage_name in ["verify", "rectify"] {
+            let stage = stages
+                .iter()
+                .find(|stage| stage["name"] == stage_name)
+                .expect("governed lifecycle stage");
+            assert_eq!(
+                stage["contract_state"], "available",
+                "{stage_name} must be evaluated against the canonical executable contract"
+            );
+            assert!(
+                stage["commands"]
+                    .as_array()
+                    .is_some_and(|commands| !commands.is_empty()),
+                "{stage_name} must retain its governed command"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_search_exposes_same_access_caller_schema_as_show_and_call() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = access_human_policy_capability();
+        let capability_id = capability.id.clone();
+        let expected_schema = super::access_human_policy_desired_schema();
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "https://example.invalid/openapi.json".to_owned(),
+            source_hash: "source-sha".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability_id.clone(), capability.clone())]),
+        };
+        catalog.refresh_hash().expect("catalog hash");
+        store
+            .write_json(&store.paths().catalog_file(), &catalog)
+            .expect("current catalog");
+
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+                "policy_id":"45e44306-0e2a-460a-94aa-34c21eefdb4a"
+            }),
+            body: Some(json!({
+                "mfa_config":{
+                    "allowed_authenticators":["biometrics","totp"],
+                    "mfa_disabled":false
+                }
+            })),
+            ..CallInput::default()
+        };
+        super::validate_access_human_policy_desired_input(&capability, &input)
+            .expect("the real call branch accepts the caller-facing body");
+
+        let shown = super::catalog_command(
+            &store,
+            CatalogCommand::Show(CapabilitySelector {
+                capability_id: capability_id.clone(),
+            }),
+        )
+        .await
+        .expect("catalog show");
+        assert_eq!(
+            shown.result["request_schema"], expected_schema,
+            "catalog show positive control must expose the caller-facing schema"
+        );
+
+        let searched = super::catalog_command(
+            &store,
+            CatalogCommand::Search(SearchArgs {
+                query: capability_id.clone(),
+                limit: 1,
+            }),
+        )
+        .await
+        .expect("catalog search");
+        let result = searched
+            .result
+            .as_array()
+            .and_then(|results| results.first())
+            .filter(|result| result.get("id").and_then(Value::as_str) == Some(&capability_id))
+            .expect("catalog search returns the human-policy capability");
+        assert_eq!(
+            result["request_schema"], shown.result["request_schema"],
+            "catalog search must expose the same caller-facing schema as show and call"
+        );
+    }
+
+    #[test]
+    fn access_discovery_matches_call_schema_and_keeps_materialization_internal() {
+        let application = access_application_login_methods_capability();
+        let application_input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426"
+            }),
+            body: Some(json!({
+                "allowed_idps":["7b0bc477-5d42-4dab-b0ea-c97d0aef7810"]
+            })),
+            ..CallInput::default()
+        };
+        super::validate_access_application_login_methods_desired_input(
+            &application,
+            &application_input,
+        )
+        .expect("the real call branch accepts the narrow application input");
+
+        let human_policy = access_human_policy_capability();
+        let human_input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+                "policy_id":"45e44306-0e2a-460a-94aa-34c21eefdb4a"
+            }),
+            body: Some(json!({
+                "mfa_config":{
+                    "allowed_authenticators":["biometrics","totp"],
+                    "mfa_disabled":false
+                }
+            })),
+            ..CallInput::default()
+        };
+        super::validate_access_human_policy_desired_input(&human_policy, &human_input)
+            .expect("the real call branch accepts the narrow human-policy input");
+
+        let application_body = super::access_application_mutable_body(
+            &access_application_live_result(),
+            &super::access_application_desired_idps(&application_input)
+                .expect("validated desired identity providers"),
+            super::access_application_login_methods_variant(&application.id)
+                .expect("self-hosted application variant"),
+        )
+        .expect("application materialization");
+        assert!(
+            application_body.get("name").is_some() && application_body.get("policies").is_some(),
+            "the provider PUT body remains an internal full-state materialization"
+        );
+        let human_body = super::access_human_policy_mutable_body(
+            &access_human_policy_live_result(),
+            &super::access_human_policy_desired_changes(&human_input)
+                .expect("validated desired human-policy changes"),
+        )
+        .expect("human-policy materialization");
+        assert!(
+            human_body.get("name").is_some() && human_body.get("decision").is_some(),
+            "the provider policy PUT body remains an internal full-state materialization"
+        );
+
+        let mut mismatches = Vec::new();
+        for (label, capability, input, desired_schema) in [
+            (
+                "application",
+                application,
+                application_input,
+                super::access_application_login_methods_desired_schema(),
+            ),
+            (
+                "human policy",
+                human_policy,
+                human_input,
+                super::access_human_policy_desired_schema(),
+            ),
+        ] {
+            let discovered_schema = guide_json(&capability)
+                .pointer("/capability/request_schema")
+                .cloned()
+                .expect("guide advertises a request schema");
+            let mut discovered_capability = capability;
+            discovered_capability.request_schema = Some(discovered_schema.clone());
+            if let Err(error) = super::validate_request_contract(&discovered_capability, &input) {
+                mismatches.push(format!(
+                    "{label} discovery rejects the body accepted by call: {error}"
+                ));
+            }
+            if discovered_schema != desired_schema {
+                mismatches.push(format!(
+                    "{label} discovery exposes the internal materialized PUT schema"
+                ));
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "Access discovery and call disagree on caller-facing bodies: {mismatches:?}"
+        );
+    }
+
+    fn access_human_policy_materialized_input(policy_id: &str) -> CallInput {
+        CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+                "policy_id":policy_id
+            }),
+            body: Some(json!({
+                "decision":"allow",
+                "exclude":[{"email":{"email":"founders@mlnavigator.com"}}],
+                "include":[
+                    {"email_domain":{"domain":"mlnavigator.com"}},
+                    {"email":{"email":"advisor@mlnavigator.com"}}
+                ],
+                "mfa_config":{
+                    "allowed_authenticators":["biometrics","totp"],
+                    "mfa_disabled":false
+                },
+                "name":"Allow MLNavigator Investor Staff",
+                "precedence":1,
+                "require":[]
+            })),
+            ..CallInput::default()
+        }
+    }
+
+    fn access_human_policy_response_without_optional_fields() -> CloudflareResponseV1 {
+        let mut live = access_human_policy_live_result();
+        live.as_object_mut()
+            .expect("policy object")
+            .remove("mfa_config");
+        live.as_object_mut()
+            .expect("policy object")
+            .remove("session_duration");
+        CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: live,
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        }
+    }
+
+    #[test]
+    fn access_human_policy_body_preserves_live_state_and_applies_narrow_eligibility_change() {
+        let input = CallInput {
+            body: Some(json!({
+                "include":[
+                    {"email_domain":{"domain":"mlnavigator.com"}},
+                    {"email":{"email":"advisor@mlnavigator.com"}}
+                ]
+            })),
+            ..CallInput::default()
+        };
+        let desired =
+            super::access_human_policy_desired_changes(&input).expect("narrow desired state");
+        let body =
+            super::access_human_policy_mutable_body(&access_human_policy_live_result(), &desired)
+                .expect("preservation-safe human policy body");
+
+        assert_eq!(
+            body["include"],
+            json!([
+                {"email":{"email":"advisor@mlnavigator.com"}},
+                {"email_domain":{"domain":"mlnavigator.com"}}
+            ])
+        );
+        assert_eq!(
+            body["exclude"],
+            json!([{"email":{"email":"founders@mlnavigator.com"}}])
+        );
+        assert_eq!(
+            body["mfa_config"],
+            json!({
+                "allowed_authenticators":["biometrics","totp"],
+                "mfa_disabled":false
+            })
+        );
+        assert_eq!(body["name"], json!("Allow MLNavigator Investor Staff"));
+        assert_eq!(body["decision"], json!("allow"));
+        assert_eq!(body["require"], json!([]));
+        assert_eq!(body["precedence"], json!(1));
+        assert_eq!(body["session_duration"], json!("24h"));
+        assert!(body.get("id").is_none());
+        assert!(body.get("uid").is_none());
+        assert!(body.get("created_at").is_none());
+        assert!(body.get("updated_at").is_none());
+        assert!(body.get("reusable").is_none());
+    }
+
+    #[test]
+    fn access_human_policy_body_replaces_only_requested_mfa_state() {
+        let input = CallInput {
+            body: Some(json!({
+                "mfa_config":{
+                    "allowed_authenticators":["totp","biometrics"],
+                    "mfa_disabled":false,
+                    "session_duration":"12h"
+                }
+            })),
+            ..CallInput::default()
+        };
+        let desired =
+            super::access_human_policy_desired_changes(&input).expect("narrow desired state");
+        let body =
+            super::access_human_policy_mutable_body(&access_human_policy_live_result(), &desired)
+                .expect("preservation-safe human policy body");
+
+        assert_eq!(
+            body["include"],
+            json!([{"email_domain":{"domain":"mlnavigator.com"}}])
+        );
+        assert_eq!(
+            body["exclude"],
+            json!([{"email":{"email":"founders@mlnavigator.com"}}])
+        );
+        assert_eq!(
+            body["mfa_config"],
+            json!({
+                "allowed_authenticators":["biometrics","totp"],
+                "mfa_disabled":false,
+                "session_duration":"12h"
+            })
+        );
+    }
+
+    #[test]
+    fn access_human_policy_body_fails_closed_on_nonhuman_or_unclassified_live_state() {
+        let input = CallInput {
+            body: Some(json!({"exclude":[]})),
+            ..CallInput::default()
+        };
+        let desired =
+            super::access_human_policy_desired_changes(&input).expect("narrow desired state");
+
+        let mut nonhuman = access_human_policy_live_result();
+        nonhuman["decision"] = json!("bypass");
+        assert!(
+            super::access_human_policy_mutable_body(&nonhuman, &desired)
+                .expect_err("bypass policy must not enter the human mutation lane")
+                .to_string()
+                .contains("allow")
+        );
+
+        let mut unknown = access_human_policy_live_result();
+        unknown["approval_groups"] = json!([{"email_list_uuid":"list-id"}]);
+        assert!(
+            super::access_human_policy_mutable_body(&unknown, &desired)
+                .expect_err("unknown policy fields must block")
+                .to_string()
+                .contains("approval_groups")
+        );
+    }
+
+    #[test]
+    fn access_human_policy_body_rejects_reusable_policy_before_app_scoped_projection() {
+        let input = CallInput {
+            body: Some(json!({"exclude":[]})),
+            ..CallInput::default()
+        };
+        let desired =
+            super::access_human_policy_desired_changes(&input).expect("narrow desired state");
+        let mut reusable = access_human_policy_live_result();
+        reusable["reusable"] = json!(true);
+
+        let error = super::access_human_policy_mutable_body(&reusable, &desired)
+            .expect_err("reusable policy must not enter the application-scoped PUT lane");
+        assert!(error.to_string().contains("reusable"), "{error}");
+    }
+
+    #[test]
+    fn access_human_policy_live_projection_rejects_omitted_reusable_classification() {
+        let input = CallInput {
+            body: Some(json!({"exclude":[]})),
+            ..CallInput::default()
+        };
+        let desired =
+            super::access_human_policy_desired_changes(&input).expect("narrow desired state");
+        let mut unclassified = access_human_policy_live_result();
+        unclassified
+            .as_object_mut()
+            .expect("policy object")
+            .remove("reusable");
+
+        let error = super::access_human_policy_mutable_body(&unclassified, &desired)
+            .expect_err("live policy must explicitly classify reusable false");
+        assert!(error.to_string().contains("reusable"), "{error}");
+    }
+
+    #[test]
+    fn access_human_policy_curated_rollback_accepts_only_mutable_field_allowlist() {
+        let prior = super::access_human_policy_prior_state(&access_human_policy_live_result())
+            .expect("classified live snapshot projects a rollback body");
+        assert!(prior.get("reusable").is_none());
+        assert_eq!(
+            super::access_human_policy_restorable_body(&prior).expect("curated rollback body"),
+            prior
+        );
+
+        let mut injected = prior;
+        injected["reusable"] = json!(false);
+        let error = super::access_human_policy_restorable_body(&injected)
+            .expect_err("rollback body must reject read-only routing metadata");
+        assert!(error.to_string().contains("reusable"), "{error}");
+    }
+
+    #[test]
+    fn access_human_policy_prior_state_preserves_optional_field_absence_for_rollback() {
+        let mut live = access_human_policy_live_result();
+        live.as_object_mut()
+            .expect("policy object")
+            .remove("mfa_config");
+        live.as_object_mut()
+            .expect("policy object")
+            .remove("session_duration");
+
+        let prior =
+            super::access_human_policy_prior_state(&live).expect("restorable policy snapshot");
+        assert!(prior.get("mfa_config").is_none());
+        assert!(prior.get("session_duration").is_none());
+        assert_eq!(prior["name"], json!("Allow MLNavigator Investor Staff"));
+        assert_eq!(prior["decision"], json!("allow"));
+        assert_eq!(prior["require"], json!([]));
+    }
+
+    #[test]
+    fn access_human_policy_desired_input_rejects_empty_or_unclassified_changes() {
+        let input = |body: Value| CallInput {
+            body: Some(body),
+            ..CallInput::default()
+        };
+        assert!(super::access_human_policy_desired_changes(&input(json!({}))).is_err());
+        assert!(
+            super::access_human_policy_desired_changes(&input(json!({"name":"rename"}))).is_err()
+        );
+    }
+
+    #[test]
+    fn access_human_policy_desired_input_rejects_malformed_email_before_plan_creation() {
+        let capability = access_human_policy_capability();
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+                "policy_id":"45e44306-0e2a-460a-94aa-34c21eefdb4a"
+            }),
+            body: Some(json!({
+                "include":[{"email":{"email":"abc"}}]
+            })),
+            ..CallInput::default()
+        };
+
+        assert!(
+            super::validate_access_human_policy_desired_input(&capability, &input).is_err(),
+            "malformed email selector reached approval-ready plan input"
+        );
+    }
+
+    #[test]
+    fn access_human_policy_desired_input_rejects_malformed_email_domain_before_plan_creation() {
+        let capability = access_human_policy_capability();
+        assert_eq!(
+            capability.request_schema.as_ref().and_then(|schema| {
+                schema.pointer(
+                    "/properties/include/items/oneOf/1/properties/email_domain/properties/domain/format",
+                )
+            }),
+            Some(&json!("hostname")),
+            "runtime schema must mirror the catalog hostname contract"
+        );
+        let input = |domain: &str| CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "app_id":"82131ea1-c7a6-4fc7-ab99-b11ddd2ff426",
+                "policy_id":"45e44306-0e2a-460a-94aa-34c21eefdb4a"
+            }),
+            body: Some(json!({
+                "include":[{"email_domain":{"domain":domain}}]
+            })),
+            ..CallInput::default()
+        };
+
+        assert!(
+            super::validate_access_human_policy_desired_input(
+                &capability,
+                &input("advisors.mlnavigator.com"),
+            )
+            .is_ok(),
+            "ordinary hostname selector must remain valid"
+        );
+        assert!(
+            super::validate_access_human_policy_desired_input(&capability, &input("not a domain"),)
+                .is_err(),
+            "malformed email-domain selector reached approval-ready plan input"
+        );
+    }
+
+    #[test]
+    fn access_human_policy_snapshot_is_hash_bound_exact_and_reconstructs_rollback() {
+        let capability = access_human_policy_capability();
+        assert!(
+            super::is_access_human_policy_mutation(&capability),
+            "gaps: {:?}",
+            capability.mutation_contract_gaps()
+        );
+        let policy_id = "45e44306-0e2a-460a-94aa-34c21eefdb4a";
+        let input = access_human_policy_materialized_input(policy_id);
+        let response = access_human_policy_response_without_optional_fields();
+        let receipt = super::apply_same_path_prior_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &response,
+        )
+        .expect("exact prior-state receipt");
+        assert!(receipt["prior_state"].get("mfa_config").is_none());
+        assert!(receipt["prior_state"].get("session_duration").is_none());
+
+        let receipt_hash = hash_value(&receipt).expect("receipt hash");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability.clone(),
+            json!({
+                "selectors":input.selectors,
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{
+                    "same_path_prior_state":receipt
+                }
+            }),
+        )
+        .expect("plan");
+        plan.input = serde_json::to_value(&input).expect("plan input");
+        plan.precondition_hashes.insert(
+            super::SAME_PATH_PRIOR_STATE_PRECONDITION.to_owned(),
+            receipt_hash.clone(),
+        );
+        assert_eq!(
+            super::required_same_path_prior_state_precondition(&plan).expect("bound prior state"),
+            Some(receipt_hash.as_str())
+        );
+        let compensation =
+            super::same_path_prior_state_compensation_request(&plan).expect("restoration request");
+        assert_eq!(
+            compensation.input.body,
+            Some(json!({
+                "decision":"allow",
+                "exclude":[{"email":{"email":"founders@mlnavigator.com"}}],
+                "include":[{"email_domain":{"domain":"mlnavigator.com"}}],
+                "name":"Allow MLNavigator Investor Staff",
+                "precedence":1,
+                "require":[]
+            }))
+        );
+
+        let mut drifted = plan.targets["live_preconditions"]["same_path_prior_state"].clone();
+        drifted["prior_state"]["exclude"] = json!([]);
+        plan.targets["live_preconditions"]["same_path_prior_state"] = drifted;
+        assert!(
+            super::required_same_path_prior_state_precondition(&plan)
+                .expect_err("drifted state must not reuse the original hash")
+                .to_string()
+                .contains("does not match")
+        );
+    }
+
+    #[test]
+    fn access_human_policy_snapshot_requires_exact_policy_identity() {
+        let capability = access_human_policy_capability();
+        let policy_id = "45e44306-0e2a-460a-94aa-34c21eefdb4a";
+        let input = access_human_policy_materialized_input(policy_id);
+        let mut wrong_resource = access_human_policy_response_without_optional_fields();
+        wrong_resource.result["id"] = json!("different-policy");
+        assert!(
+            super::apply_same_path_prior_state_response(
+                &capability,
+                &input,
+                "account-a",
+                &wrong_resource
+            )
+            .expect_err("wrong policy identity must fail")
+            .to_string()
+            .contains("different or missing policy id")
+        );
     }
 
     #[test]

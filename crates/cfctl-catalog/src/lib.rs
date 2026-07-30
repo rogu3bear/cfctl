@@ -5797,6 +5797,8 @@ fn apply_post_normalization_contracts(
     finalize_queue_consumer_contracts(document, capabilities);
     finalize_worker_script_delete_contract(capabilities);
     finalize_access_application_create_contract(document, capabilities);
+    finalize_access_application_login_methods_contract(document, capabilities);
+    finalize_access_human_policy_contract(document, capabilities);
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
@@ -13295,6 +13297,2134 @@ const QUEUE_CONFIGURATION_CONTRACTS: &[QueueConfigurationContract] = &[
 
 const ACCESS_APP_COLLECTION_PATH: &str = "/accounts/{account_id}/access/apps";
 const ACCESS_APP_DETAIL_PATH: &str = "/accounts/{account_id}/access/apps/{app_id}";
+const ACCESS_APP_UPDATE_REQUEST_SCHEMA_POINTER: &str = "/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}/put/requestBody/content/application~1json/schema";
+const ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID: &str =
+    "access-applications-update-self-hosted-login-methods";
+const ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID: &str =
+    "access-applications-update-app-launcher-login-methods";
+const ACCESS_APP_UPDATE_CAPABILITY_ID: &str = "access-applications-update-an-access-application";
+const ACCESS_APP_READ_CAPABILITY_ID: &str = "access-applications-get-an-access-application";
+const ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID: &str =
+    "access-policies-update-human-access-controls";
+const ACCESS_POLICY_UPDATE_CAPABILITY_ID: &str = "access-policies-update-an-access-policy";
+const ACCESS_POLICY_READ_CAPABILITY_ID: &str = "access-policies-get-an-access-policy";
+const ACCESS_POLICY_DETAIL_PATH: &str =
+    "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
+const ACCESS_POLICY_UPDATE_REQUEST_SCHEMA_POINTER: &str = "/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}~1policies~1{policy_id}/put/requestBody/content/application~1json/schema";
+
+/// Exact Cloudflare Access identity-provider identifier renderings accepted by
+/// the API: 32 hexadecimal characters or the canonical 36-character
+/// hyphenated UUID form.
+#[must_use]
+pub fn access_identity_provider_id_schema() -> Value {
+    serde_json::json!({
+        "oneOf":[
+            {
+                "type":"string",
+                "minLength":32,
+                "maxLength":32,
+                "format":"cloudflare-uuid",
+                "pattern":"^[0-9A-Fa-f]{32}$"
+            },
+            {
+                "type":"string",
+                "minLength":36,
+                "maxLength":36,
+                "format":"cloudflare-uuid",
+                "pattern":"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+            }
+        ]
+    })
+}
+
+/// Complete provider body used internally when materializing a self-hosted
+/// Access application login-method update.
+#[must_use]
+pub fn access_application_login_methods_materialized_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":[
+            "allowed_idps",
+            "app_launcher_visible",
+            "auto_redirect_to_identity",
+            "destinations",
+            "domain",
+            "enable_binding_cookie",
+            "http_only_cookie_attribute",
+            "name",
+            "options_preflight_bypass",
+            "policies",
+            "self_hosted_domains",
+            "session_duration",
+            "type"
+        ],
+        "properties":{
+            "allowed_idps":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":25,
+                "uniqueItems":true,
+                "items":access_identity_provider_id_schema()
+            },
+            "app_launcher_visible":{"type":"boolean"},
+            "auto_redirect_to_identity":{"type":"boolean"},
+            "destinations":{
+                "type":"array",
+                "items":{
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["type","uri"],
+                    "properties":{
+                        "type":{"type":"string","enum":["public"]},
+                        "uri":{"type":"string","minLength":1}
+                    }
+                }
+            },
+            "domain":{"type":"string","minLength":1},
+            "eager_redirect_cookie_setting":{"type":"boolean"},
+            "enable_binding_cookie":{"type":"boolean"},
+            "http_only_cookie_attribute":{"type":"boolean"},
+            "name":{"type":"string","minLength":1},
+            "options_preflight_bypass":{"type":"boolean"},
+            "path_cookie_attribute":{"type":"boolean"},
+            "policies":{
+                "type":"array",
+                "minItems":1,
+                "items":{
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["id","precedence"],
+                    "properties":{
+                        "id":{"type":"string","minLength":1,"maxLength":36},
+                        "precedence":{"type":"integer","minimum":1}
+                    }
+                }
+            },
+            "same_site_cookie_attribute":{"type":"string"},
+            "self_hosted_domains":{
+                "type":"array",
+                "uniqueItems":true,
+                "items":{"type":"string","minLength":1}
+            },
+            "session_duration":{"type":"string","minLength":1},
+            "tags":{
+                "type":"array",
+                "items":{"type":"string"}
+            },
+            "type":{"type":"string","enum":["self_hosted"]}
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn access_app_launcher_login_methods_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":[
+            "allowed_idps",
+            "auto_redirect_to_identity",
+            "landing_page_design",
+            "policies",
+            "session_duration",
+            "skip_app_launcher_login_page",
+            "type"
+        ],
+        "properties":{
+            "allowed_idps":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":25,
+                "uniqueItems":true,
+                "items":access_identity_provider_id_schema()
+            },
+            "app_launcher_logo_url":{"type":"string"},
+            "auto_redirect_to_identity":{"type":"boolean"},
+            "bg_color":{"type":"string"},
+            "custom_deny_url":{"type":"string"},
+            "custom_non_identity_deny_url":{"type":"string"},
+            "custom_pages":{
+                "type":"array",
+                "uniqueItems":true,
+                "items":{"type":"string","minLength":1}
+            },
+            "footer_links":{
+                "type":"array",
+                "items":{
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["name","url"],
+                    "properties":{
+                        "name":{"type":"string","minLength":1},
+                        "url":{"type":"string","minLength":1}
+                    }
+                }
+            },
+            "header_bg_color":{"type":"string"},
+            "landing_page_design":{
+                "type":"object",
+                "additionalProperties":false,
+                "properties":{
+                    "button_color":{"type":"string"},
+                    "button_text_color":{"type":"string"},
+                    "image_url":{"type":"string"},
+                    "message":{"type":"string"},
+                    "title":{"type":"string"}
+                }
+            },
+            "policies":{
+                "type":"array",
+                "minItems":1,
+                "items":{
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["id","precedence"],
+                    "properties":{
+                        "id":{"type":"string","minLength":1,"maxLength":36},
+                        "precedence":{"type":"integer","minimum":1}
+                    }
+                }
+            },
+            "session_duration":{"type":"string","minLength":1},
+            "skip_app_launcher_login_page":{"type":"boolean"},
+            "type":{"type":"string","enum":["app_launcher"]}
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn access_application_update_identity_supported(capability: &CapabilityV1) -> bool {
+    capability.method == "PUT"
+        && capability.path == ACCESS_APP_DETAIL_PATH
+        && capability.product == "Access applications"
+        && capability.account_scope == "account"
+        && capability.permissions == ["Access: Apps and Policies Write"]
+        && capability.selectors.len() == 2
+        && ["account_id", "app_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                    && response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+            })
+}
+
+fn access_application_read_identity_supported(
+    capabilities: &BTreeMap<String, CapabilityV1>,
+) -> bool {
+    capabilities
+        .get(ACCESS_APP_READ_CAPABILITY_ID)
+        .is_some_and(|read| {
+            read.method == "GET"
+                && read.path == ACCESS_APP_DETAIL_PATH
+                && read.product == "Access applications"
+                && !read.mutating
+                && read.request_schema.is_none()
+                && read.selectors.len() == 2
+                && ["account_id", "app_id"].iter().all(|name| {
+                    read.selectors.iter().any(|selector| {
+                        selector.name == *name
+                            && selector.location == "path"
+                            && selector.required
+                            && selector.value_type == "string"
+                    })
+                })
+                && read.response_contract.as_ref().is_some_and(|response| {
+                    response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                        && response.success_statuses == ["200"]
+                        && response.success_media_types == ["application/json"]
+                })
+        })
+}
+
+fn access_application_missing_readback_fields(
+    document: &Value,
+    app_type: &str,
+    verified_response_fields: &[String],
+) -> Vec<String> {
+    let read_operation =
+        document.pointer("/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}/get");
+    read_operation.map_or_else(
+        || verified_response_fields.to_vec(),
+        |operation| {
+            verified_response_fields
+                .iter()
+                .filter(|field| {
+                    !success_response_declares_access_application_variant_field(
+                        document, operation, app_type, field,
+                    )
+                })
+                .cloned()
+                .collect()
+        },
+    )
+}
+
+fn success_response_declares_access_application_variant_field(
+    document: &Value,
+    operation: &Value,
+    app_type: &str,
+    field: &str,
+) -> bool {
+    operation
+        .get("responses")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(status, _)| status.starts_with('2'))
+        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
+        .any(|schema| {
+            access_application_response_declares_variant_field(document, schema, app_type, field, 0)
+        })
+}
+
+fn access_application_response_declares_variant_field(
+    document: &Value,
+    schema: &Value,
+    app_type: &str,
+    field: &str,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                access_application_response_declares_variant_field(
+                    document,
+                    resolved,
+                    app_type,
+                    field,
+                    depth + 1,
+                )
+            });
+    }
+    if let Some(result) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get("result"))
+    {
+        return access_application_result_variant_declares_field(
+            document,
+            result,
+            app_type,
+            field,
+            depth + 1,
+        );
+    }
+    schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members.iter().any(|member| {
+                access_application_response_declares_variant_field(
+                    document,
+                    member,
+                    app_type,
+                    field,
+                    depth + 1,
+                )
+            })
+        })
+}
+
+fn access_application_result_variant_declares_field(
+    document: &Value,
+    schema: &Value,
+    app_type: &str,
+    field: &str,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .is_some_and(|resolved| {
+                access_application_result_variant_declares_field(
+                    document,
+                    resolved,
+                    app_type,
+                    field,
+                    depth + 1,
+                )
+            });
+    }
+    for composition in ["oneOf", "anyOf"] {
+        if let Some(members) = schema.get(composition).and_then(Value::as_array) {
+            let matching = members
+                .iter()
+                .filter(|member| {
+                    access_application_schema_matches_type(document, member, app_type, depth + 1)
+                })
+                .collect::<Vec<_>>();
+            let [matching] = matching.as_slice() else {
+                return false;
+            };
+            return schema_declares_path(document, matching, &[field], depth + 1);
+        }
+    }
+    schema_declares_path(document, schema, &[field], depth + 1)
+}
+
+fn access_application_schema_matches_type(
+    document: &Value,
+    schema: &Value,
+    app_type: &str,
+    depth: usize,
+) -> bool {
+    access_application_schema_type_annotation(document, schema, app_type, depth).unwrap_or(false)
+}
+
+fn access_application_schema_type_annotation(
+    document: &Value,
+    schema: &Value,
+    app_type: &str,
+    depth: usize,
+) -> Option<bool> {
+    if depth > 32 {
+        return None;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .and_then(|resolved| {
+                access_application_schema_type_annotation(document, resolved, app_type, depth + 1)
+            });
+    }
+    if let Some(matches) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get("type"))
+        .and_then(|type_schema| {
+            access_application_type_schema_annotation(
+                document,
+                type_schema,
+                app_type,
+                depth + 1,
+                true,
+            )
+        })
+    {
+        return Some(matches);
+    }
+    schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .and_then(|members| {
+            members.iter().rev().find_map(|member| {
+                access_application_schema_type_annotation(document, member, app_type, depth + 1)
+            })
+        })
+}
+
+fn access_application_type_schema_annotation(
+    document: &Value,
+    schema: &Value,
+    app_type: &str,
+    depth: usize,
+    allow_local_example: bool,
+) -> Option<bool> {
+    if depth > 32 {
+        return None;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return reference
+            .strip_prefix('#')
+            .and_then(|pointer| document.pointer(pointer))
+            .and_then(|resolved| {
+                access_application_type_schema_annotation(
+                    document,
+                    resolved,
+                    app_type,
+                    depth + 1,
+                    false,
+                )
+            });
+    }
+    if let Some(constant) = schema.get("const") {
+        return Some(constant.as_str() == Some(app_type));
+    }
+    if let Some(values) = schema.get("enum") {
+        let values = values.as_array()?;
+        if !values.iter().any(|value| value.as_str() == Some(app_type)) {
+            return Some(false);
+        }
+        if values.len() == 1 {
+            return Some(true);
+        }
+    }
+    if allow_local_example && let Some(example) = schema.get("example") {
+        return Some(example.as_str() == Some(app_type));
+    }
+    schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .and_then(|members| {
+            members.iter().rev().find_map(|member| {
+                access_application_type_schema_annotation(
+                    document,
+                    member,
+                    app_type,
+                    depth + 1,
+                    allow_local_example,
+                )
+            })
+        })
+}
+
+/// Derives one narrow Access application update from the polymorphic generic
+/// PUT. The runtime accepts only a desired non-empty `allowed_idps` set from
+/// the caller, reads the exact live application variant, and materializes the
+/// variant's closed full-body schema before a plan is persisted.
+///
+/// This keeps the generic 13-variant update blocked while restoring the v1
+/// preservation invariant: read-only fields are dropped, policy objects are
+/// reduced to `{id, precedence}`, and every other configured mutable field is
+/// replayed and verified by the same-path GET.
+struct AccessApplicationLoginMethodsContractSpec {
+    capability_id: &'static str,
+    app_type: &'static str,
+    title: &'static str,
+    description: &'static str,
+    aliases: &'static [&'static str],
+    request_schema: Value,
+}
+
+fn access_application_source_request_body_compatible(
+    document: &Value,
+    source_schema: &Value,
+    curated_schema: &Value,
+) -> bool {
+    let Some(curated_properties) = curated_schema.get("properties").and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let mut active_references = BTreeSet::new();
+    curated_properties.keys().all(|field| {
+        source_schema_declares_top_level_field(
+            document,
+            source_schema,
+            field,
+            0,
+            &mut active_references,
+        )
+    }) && source_schema_accepts_curated(
+        document,
+        source_schema,
+        curated_schema,
+        0,
+        &mut active_references,
+    )
+}
+
+fn access_source_annotation_keyword(key: &str) -> bool {
+    key.starts_with("x-")
+        || matches!(
+            key,
+            "$comment"
+                | "default"
+                | "deprecated"
+                | "description"
+                | "discriminator"
+                | "example"
+                | "examples"
+                | "externalDocs"
+                | "readOnly"
+                | "title"
+                | "writeOnly"
+                | "xml"
+        )
+}
+
+fn access_source_schema_uses_supported_keywords(source: &Map<String, Value>) -> bool {
+    source.keys().all(|key| {
+        access_source_annotation_keyword(key)
+            || matches!(
+                key.as_str(),
+                "type"
+                    | "enum"
+                    | "const"
+                    | "format"
+                    | "pattern"
+                    | "nullable"
+                    | "minimum"
+                    | "maximum"
+                    | "exclusiveMinimum"
+                    | "exclusiveMaximum"
+                    | "multipleOf"
+                    | "minLength"
+                    | "maxLength"
+                    | "minItems"
+                    | "maxItems"
+                    | "uniqueItems"
+                    | "items"
+                    | "minProperties"
+                    | "maxProperties"
+                    | "required"
+                    | "properties"
+                    | "additionalProperties"
+                    | "allOf"
+                    | "oneOf"
+                    | "anyOf"
+            )
+    })
+}
+
+fn access_source_reference_target<'a>(
+    document: &'a Value,
+    source: &'a Map<String, Value>,
+) -> std::result::Result<Option<(String, &'a Value)>, ()> {
+    let Some(reference) = source.get("$ref") else {
+        return Ok(None);
+    };
+    if source
+        .keys()
+        .any(|key| key != "$ref" && !access_source_annotation_keyword(key))
+    {
+        return Err(());
+    }
+    let reference = reference.as_str().ok_or(())?;
+    let pointer = reference
+        .strip_prefix('#')
+        .filter(|pointer| pointer.starts_with('/'))
+        .ok_or(())?;
+    let target = document.pointer(pointer).ok_or(())?;
+    Ok(Some((reference.to_owned(), target)))
+}
+
+fn source_schema_declares_top_level_field(
+    document: &Value,
+    source_schema: &Value,
+    field: &str,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if depth >= MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
+        return false;
+    }
+    let Some(source) = source_schema.as_object() else {
+        return false;
+    };
+    let Ok(reference) = access_source_reference_target(document, source) else {
+        return false;
+    };
+    if let Some((reference, target)) = reference {
+        if !active_references.insert(reference.clone()) {
+            return false;
+        }
+        let declared = source_schema_declares_top_level_field(
+            document,
+            target,
+            field,
+            depth + 1,
+            active_references,
+        );
+        active_references.remove(&reference);
+        return declared;
+    }
+    if !access_source_schema_uses_supported_keywords(source) {
+        return false;
+    }
+    if source_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| properties.contains_key(field))
+    {
+        return true;
+    }
+    ["allOf", "oneOf", "anyOf"].into_iter().any(|composition| {
+        source_schema
+            .get(composition)
+            .and_then(Value::as_array)
+            .is_some_and(|members| {
+                !members.is_empty()
+                    && members.iter().any(|member| {
+                        source_schema_declares_top_level_field(
+                            document,
+                            member,
+                            field,
+                            depth + 1,
+                            active_references,
+                        )
+                    })
+            })
+    })
+}
+
+fn source_schema_accepts_curated(
+    document: &Value,
+    source_schema: &Value,
+    curated_schema: &Value,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if depth >= MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
+        return false;
+    }
+    let Some(source) = source_schema.as_object() else {
+        return false;
+    };
+    let Ok(reference) = access_source_reference_target(document, source) else {
+        return false;
+    };
+    if let Some((reference, target)) = reference {
+        if !active_references.insert(reference.clone()) {
+            return false;
+        }
+        let accepted = source_schema_accepts_curated(
+            document,
+            target,
+            curated_schema,
+            depth + 1,
+            active_references,
+        );
+        active_references.remove(&reference);
+        return accepted;
+    }
+    if !access_source_schema_uses_supported_keywords(source) {
+        return false;
+    }
+    let Some(curated) = curated_schema.as_object() else {
+        return false;
+    };
+
+    let curated_one_of = schema_composition_members(curated, "oneOf");
+    let curated_any_of = schema_composition_members(curated, "anyOf");
+    if curated_one_of.is_err()
+        || curated_any_of.is_err()
+        || (curated_one_of.as_ref().is_ok_and(Option::is_some)
+            && curated_any_of.as_ref().is_ok_and(Option::is_some))
+    {
+        return false;
+    }
+    if let Some(members) = curated_one_of
+        .ok()
+        .flatten()
+        .or_else(|| curated_any_of.ok().flatten())
+    {
+        return curated_composition_is_accepted(
+            document,
+            source_schema,
+            curated,
+            members,
+            depth,
+            active_references,
+        );
+    }
+    if curated.get("allOf").is_some() {
+        return false;
+    }
+    source_direct_constraints_accept_curated(document, source, curated, depth, active_references)
+        && source_compositions_accept_curated(
+            document,
+            source,
+            curated_schema,
+            depth,
+            active_references,
+        )
+}
+
+fn curated_composition_is_accepted(
+    document: &Value,
+    source_schema: &Value,
+    curated: &Map<String, Value>,
+    members: &[Value],
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    !members.is_empty()
+        && !schema_has_direct_constraints(curated)
+        && members.iter().all(|member| {
+            source_schema_accepts_curated(
+                document,
+                source_schema,
+                member,
+                depth + 1,
+                active_references,
+            )
+        })
+}
+
+fn source_compositions_accept_curated(
+    document: &Value,
+    source: &Map<String, Value>,
+    curated_schema: &Value,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    let Ok(source_all_of) = schema_composition_members(source, "allOf") else {
+        return false;
+    };
+    if source_all_of.is_some_and(|members| {
+        members.is_empty()
+            || !members.iter().all(|member| {
+                source_schema_accepts_curated(
+                    document,
+                    member,
+                    curated_schema,
+                    depth + 1,
+                    active_references,
+                )
+            })
+    }) {
+        return false;
+    }
+
+    let source_one_of = schema_composition_members(source, "oneOf");
+    let source_any_of = schema_composition_members(source, "anyOf");
+    if source_one_of.is_err()
+        || source_any_of.is_err()
+        || (source_one_of.as_ref().is_ok_and(Option::is_some)
+            && source_any_of.as_ref().is_ok_and(Option::is_some))
+    {
+        return false;
+    }
+    if let Some(members) = source_one_of.ok().flatten() {
+        return source_one_of_accepts_curated(
+            document,
+            members,
+            curated_schema,
+            depth + 1,
+            active_references,
+        );
+    }
+    source_any_of.ok().flatten().is_none_or(|members| {
+        !members.is_empty()
+            && members.iter().any(|member| {
+                source_schema_accepts_curated(
+                    document,
+                    member,
+                    curated_schema,
+                    depth + 1,
+                    active_references,
+                )
+            })
+    })
+}
+
+fn source_one_of_accepts_curated(
+    document: &Value,
+    members: &[Value],
+    curated_schema: &Value,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if members.is_empty() {
+        return false;
+    }
+    let mut accepting_member = None;
+    for (index, member) in members.iter().enumerate() {
+        if source_schema_accepts_curated(document, member, curated_schema, depth, active_references)
+            && accepting_member.replace(index).is_some()
+        {
+            return false;
+        }
+    }
+    let Some(accepting_member) = accepting_member else {
+        return false;
+    };
+    members.iter().enumerate().all(|(index, member)| {
+        index == accepting_member
+            || source_schema_is_provably_disjoint(
+                document,
+                member,
+                curated_schema,
+                depth,
+                active_references,
+            )
+    })
+}
+
+fn source_schema_is_provably_disjoint(
+    document: &Value,
+    source_schema: &Value,
+    curated_schema: &Value,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if depth >= MAX_REQUEST_SCHEMA_CONTRACT_DEPTH {
+        return false;
+    }
+    let Some(source) = source_schema.as_object() else {
+        return false;
+    };
+    let Ok(reference) = access_source_reference_target(document, source) else {
+        return false;
+    };
+    if let Some((reference, target)) = reference {
+        if !active_references.insert(reference.clone()) {
+            return false;
+        }
+        let disjoint = source_schema_is_provably_disjoint(
+            document,
+            target,
+            curated_schema,
+            depth + 1,
+            active_references,
+        );
+        active_references.remove(&reference);
+        return disjoint;
+    }
+    if !access_source_schema_uses_supported_keywords(source) {
+        return false;
+    }
+    let Some(curated) = curated_schema.as_object() else {
+        return false;
+    };
+
+    if ["oneOf", "anyOf"]
+        .into_iter()
+        .any(|composition| curated.contains_key(composition))
+    {
+        return curated_union_compositions_prove_disjoint(
+            document,
+            source_schema,
+            curated,
+            depth,
+            active_references,
+        );
+    }
+    if let Some(members) = curated.get("allOf") {
+        let Some(members) = members.as_array().filter(|members| !members.is_empty()) else {
+            return false;
+        };
+        if curated_all_of_proves_disjoint(
+            document,
+            source_schema,
+            members,
+            depth,
+            active_references,
+        ) {
+            return true;
+        }
+    }
+    if !scalar_constraints_are_well_formed(source, curated) {
+        return false;
+    }
+    if scalar_constraints_prove_disjoint(source, curated) {
+        return true;
+    }
+    if source_union_composition_is_empty(source) {
+        return false;
+    }
+    if source_compositions_prove_disjoint(
+        document,
+        source,
+        curated_schema,
+        depth,
+        active_references,
+    ) {
+        return true;
+    }
+    required_object_property_proves_disjoint(document, source, curated, depth, active_references)
+}
+
+fn curated_union_compositions_prove_disjoint(
+    document: &Value,
+    source_schema: &Value,
+    curated: &Map<String, Value>,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    for composition in ["oneOf", "anyOf"] {
+        if let Some(members) = curated.get(composition) {
+            let Some(members) = members.as_array().filter(|members| !members.is_empty()) else {
+                return false;
+            };
+            return members.iter().all(|member| {
+                source_schema_is_provably_disjoint(
+                    document,
+                    source_schema,
+                    member,
+                    depth + 1,
+                    active_references,
+                )
+            });
+        }
+    }
+    false
+}
+
+fn curated_all_of_proves_disjoint(
+    document: &Value,
+    source_schema: &Value,
+    members: &[Value],
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    members.iter().any(|member| {
+        source_schema_is_provably_disjoint(
+            document,
+            source_schema,
+            member,
+            depth + 1,
+            active_references,
+        )
+    })
+}
+
+fn scalar_constraints_are_well_formed(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+) -> bool {
+    schema_possible_types(source).is_ok()
+        && schema_possible_types(curated).is_ok()
+        && schema_finite_values(source).is_ok()
+        && schema_finite_values(curated).is_ok()
+}
+
+fn scalar_constraints_prove_disjoint(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+) -> bool {
+    let (Ok(source_types), Ok(curated_types)) = (
+        schema_possible_types(source),
+        schema_possible_types(curated),
+    ) else {
+        return false;
+    };
+    if let (Some(source_types), Some(curated_types)) =
+        (source_types.as_ref(), curated_types.as_ref())
+        && !json_schema_type_sets_overlap(source_types, curated_types)
+    {
+        return true;
+    }
+
+    let (Ok(source_values), Ok(curated_values)) =
+        (schema_finite_values(source), schema_finite_values(curated))
+    else {
+        return false;
+    };
+    matches!(
+        (source_values.as_ref(), curated_values.as_ref()),
+        (Some(source_values), Some(curated_values))
+            if source_values
+                .iter()
+                .all(|source_value| !curated_values.contains(source_value))
+    )
+}
+
+fn source_union_composition_is_empty(source: &Map<String, Value>) -> bool {
+    ["oneOf", "anyOf"].into_iter().any(|composition| {
+        matches!(
+            schema_composition_members(source, composition),
+            Ok(Some(members)) if members.is_empty()
+        )
+    })
+}
+
+fn source_compositions_prove_disjoint(
+    document: &Value,
+    source: &Map<String, Value>,
+    curated_schema: &Value,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if let Ok(Some(members)) = schema_composition_members(source, "allOf")
+        && !members.is_empty()
+        && members.iter().any(|member| {
+            source_schema_is_provably_disjoint(
+                document,
+                member,
+                curated_schema,
+                depth + 1,
+                active_references,
+            )
+        })
+    {
+        return true;
+    }
+    for composition in ["oneOf", "anyOf"] {
+        if let Ok(Some(members)) = schema_composition_members(source, composition)
+            && members.iter().all(|member| {
+                source_schema_is_provably_disjoint(
+                    document,
+                    member,
+                    curated_schema,
+                    depth + 1,
+                    active_references,
+                )
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn required_object_property_proves_disjoint(
+    document: &Value,
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    let Ok(curated_types) = schema_possible_types(curated) else {
+        return false;
+    };
+    if curated_types
+        .as_ref()
+        .is_none_or(|types| types != &BTreeSet::from(["object".to_owned()]))
+    {
+        return false;
+    }
+    let (Ok(source_required), Ok(curated_required)) = (
+        schema_required_fields(source),
+        schema_required_fields(curated),
+    ) else {
+        return false;
+    };
+    let source_properties = match source.get("properties") {
+        None => None,
+        Some(Value::Object(properties)) => Some(properties),
+        Some(_) => return false,
+    };
+    let curated_properties = match curated.get("properties") {
+        None => None,
+        Some(Value::Object(properties)) => Some(properties),
+        Some(_) => return false,
+    };
+    let (Ok(source_additional), Ok(curated_additional)) = (
+        schema_allowance(source.get("additionalProperties")),
+        schema_allowance(curated.get("additionalProperties")),
+    ) else {
+        return false;
+    };
+    if source_required.iter().any(|field| {
+        let source_property = source_properties
+            .and_then(|properties| properties.get(field))
+            .map_or(source_additional, SchemaAllowance::Schema);
+        let curated_property = curated_properties
+            .and_then(|properties| properties.get(field))
+            .map_or(curated_additional, SchemaAllowance::Schema);
+        match (source_property, curated_property) {
+            (SchemaAllowance::Forbidden, _) | (_, SchemaAllowance::Forbidden) => true,
+            (
+                SchemaAllowance::Schema(source_property),
+                SchemaAllowance::Schema(curated_property),
+            ) => source_schema_is_provably_disjoint(
+                document,
+                source_property,
+                curated_property,
+                depth + 1,
+                active_references,
+            ),
+            _ => false,
+        }
+    }) {
+        return true;
+    }
+    curated_required.iter().any(|field| {
+        let source_property = source_properties
+            .and_then(|properties| properties.get(field))
+            .map_or(source_additional, SchemaAllowance::Schema);
+        let curated_property = curated_properties
+            .and_then(|properties| properties.get(field))
+            .map_or(curated_additional, SchemaAllowance::Schema);
+        match (source_property, curated_property) {
+            (SchemaAllowance::Forbidden, SchemaAllowance::Schema(_)) => true,
+            (
+                SchemaAllowance::Schema(source_property),
+                SchemaAllowance::Schema(curated_property),
+            ) => source_schema_is_provably_disjoint(
+                document,
+                source_property,
+                curated_property,
+                depth + 1,
+                active_references,
+            ),
+            _ => false,
+        }
+    })
+}
+
+fn json_schema_type_sets_overlap(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
+    left.iter().any(|left_type| {
+        right.iter().any(|right_type| {
+            left_type == right_type
+                || matches!(
+                    (left_type.as_str(), right_type.as_str()),
+                    ("number", "integer") | ("integer", "number")
+                )
+        })
+    })
+}
+
+fn schema_composition_members<'a>(
+    schema: &'a Map<String, Value>,
+    key: &str,
+) -> std::result::Result<Option<&'a [Value]>, ()> {
+    schema
+        .get(key)
+        .map(|value| value.as_array().map(Vec::as_slice).ok_or(()))
+        .transpose()
+}
+
+fn schema_has_direct_constraints(schema: &Map<String, Value>) -> bool {
+    [
+        "type",
+        "enum",
+        "const",
+        "format",
+        "pattern",
+        "nullable",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minProperties",
+        "maxProperties",
+        "required",
+        "properties",
+        "additionalProperties",
+        "items",
+    ]
+    .iter()
+    .any(|key| schema.contains_key(*key))
+}
+
+fn source_direct_constraints_accept_curated(
+    document: &Value,
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    let Ok(source_types) = schema_possible_types(source) else {
+        return false;
+    };
+    let Ok(curated_types) = schema_possible_types(curated) else {
+        return false;
+    };
+    if source_types.as_ref().is_some_and(|source_types| {
+        curated_types.as_ref().is_none_or(|curated_types| {
+            curated_types.iter().any(|curated_type| {
+                !(source_types.contains(curated_type)
+                    || curated_type == "integer" && source_types.contains("number"))
+            })
+        })
+    }) {
+        return false;
+    }
+
+    let Ok(source_values) = schema_finite_values(source) else {
+        return false;
+    };
+    let Ok(curated_values) = schema_finite_values(curated) else {
+        return false;
+    };
+    if source_values.as_ref().is_some_and(|source_values| {
+        curated_values.as_ref().is_none_or(|curated_values| {
+            curated_values
+                .iter()
+                .any(|curated_value| !source_values.contains(curated_value))
+        })
+    }) {
+        return false;
+    }
+
+    let curated_may_be_string = schema_may_include_type(curated_types.as_ref(), "string");
+    if curated_may_be_string
+        && (!source_exact_constraint_accepts_curated(source, curated, "format")
+            || !source_exact_constraint_accepts_curated(source, curated, "pattern")
+            || !source_minimum_u64_accepts_curated(source, curated, "minLength")
+            || !source_maximum_u64_accepts_curated(source, curated, "maxLength"))
+    {
+        return false;
+    }
+
+    let curated_may_be_number = schema_may_include_type(curated_types.as_ref(), "number")
+        || schema_may_include_type(curated_types.as_ref(), "integer");
+    if curated_may_be_number
+        && (!source_numeric_lower_bound_accepts_curated(source, curated)
+            || !source_numeric_upper_bound_accepts_curated(source, curated)
+            || !source_exact_constraint_accepts_curated(source, curated, "multipleOf"))
+    {
+        return false;
+    }
+
+    let source_has_array_constraints = ["minItems", "maxItems", "uniqueItems", "items"]
+        .iter()
+        .any(|key| source.contains_key(*key));
+    if source_has_array_constraints
+        && schema_may_include_type(curated_types.as_ref(), "array")
+        && !source_array_constraints_accept_curated(
+            document,
+            source,
+            curated,
+            depth,
+            active_references,
+        )
+    {
+        return false;
+    }
+
+    let source_has_object_constraints = [
+        "minProperties",
+        "maxProperties",
+        "required",
+        "properties",
+        "additionalProperties",
+    ]
+    .iter()
+    .any(|key| source.contains_key(*key));
+    !source_has_object_constraints
+        || !schema_may_include_type(curated_types.as_ref(), "object")
+        || source_object_constraints_accept_curated(
+            document,
+            source,
+            curated,
+            depth,
+            active_references,
+        )
+}
+
+fn schema_possible_types(
+    schema: &Map<String, Value>,
+) -> std::result::Result<Option<BTreeSet<String>>, ()> {
+    let mut types = match schema.get("type") {
+        None => None,
+        Some(Value::String(value)) => Some(BTreeSet::from([value.clone()])),
+        Some(Value::Array(values)) if !values.is_empty() => {
+            let types = values
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()
+                .ok_or(())?;
+            Some(types.into_iter().map(str::to_owned).collect())
+        }
+        Some(_) => return Err(()),
+    };
+    if let Some(nullable) = schema.get("nullable") {
+        let nullable = nullable.as_bool().ok_or(())?;
+        if nullable && let Some(types) = types.as_mut() {
+            types.insert("null".to_owned());
+        }
+    }
+    Ok(types)
+}
+
+fn schema_may_include_type(types: Option<&BTreeSet<String>>, expected: &str) -> bool {
+    types.is_none_or(|types| types.contains(expected))
+}
+
+fn schema_finite_values(
+    schema: &Map<String, Value>,
+) -> std::result::Result<Option<Vec<&Value>>, ()> {
+    let enumeration = schema
+        .get("enum")
+        .map(|value| {
+            value
+                .as_array()
+                .filter(|values| !values.is_empty())
+                .ok_or(())
+        })
+        .transpose()?;
+    if let Some(constant) = schema.get("const") {
+        if enumeration.is_some_and(|values| !values.contains(constant)) {
+            return Err(());
+        }
+        return Ok(Some(vec![constant]));
+    }
+    Ok(enumeration.map(|values| values.iter().collect()))
+}
+
+fn source_exact_constraint_accepts_curated(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    key: &str,
+) -> bool {
+    source
+        .get(key)
+        .is_none_or(|source_value| curated.get(key) == Some(source_value))
+}
+
+fn source_minimum_u64_accepts_curated(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    key: &str,
+) -> bool {
+    let Some(source_minimum) = source.get(key) else {
+        return true;
+    };
+    let Some(source_minimum) = source_minimum.as_u64() else {
+        return false;
+    };
+    curated
+        .get(key)
+        .and_then(Value::as_u64)
+        .is_some_and(|curated_minimum| curated_minimum >= source_minimum)
+        || source_minimum == 0
+}
+
+fn source_maximum_u64_accepts_curated(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    key: &str,
+) -> bool {
+    let Some(source_maximum) = source.get(key) else {
+        return true;
+    };
+    let Some(source_maximum) = source_maximum.as_u64() else {
+        return false;
+    };
+    curated
+        .get(key)
+        .and_then(Value::as_u64)
+        .is_some_and(|curated_maximum| curated_maximum <= source_maximum)
+}
+
+fn schema_numeric_lower_bound(
+    schema: &Map<String, Value>,
+) -> std::result::Result<Option<(f64, bool)>, ()> {
+    let minimum = schema
+        .get("minimum")
+        .map(|value| value.as_f64().ok_or(()))
+        .transpose()?;
+    let exclusive = match schema.get("exclusiveMinimum") {
+        None | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some((minimum.ok_or(())?, true)),
+        Some(value) => Some((value.as_f64().ok_or(())?, true)),
+    };
+    Ok(stricter_numeric_lower_bound(
+        minimum.map(|minimum| (minimum, false)),
+        exclusive,
+    ))
+}
+
+fn schema_numeric_upper_bound(
+    schema: &Map<String, Value>,
+) -> std::result::Result<Option<(f64, bool)>, ()> {
+    let maximum = schema
+        .get("maximum")
+        .map(|value| value.as_f64().ok_or(()))
+        .transpose()?;
+    let exclusive = match schema.get("exclusiveMaximum") {
+        None | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some((maximum.ok_or(())?, true)),
+        Some(value) => Some((value.as_f64().ok_or(())?, true)),
+    };
+    Ok(stricter_numeric_upper_bound(
+        maximum.map(|maximum| (maximum, false)),
+        exclusive,
+    ))
+}
+
+fn stricter_numeric_lower_bound(
+    left: Option<(f64, bool)>,
+    right: Option<(f64, bool)>,
+) -> Option<(f64, bool)> {
+    match (left, right) {
+        (None, bound) | (bound, None) => bound,
+        (Some((left, left_exclusive)), Some((right, right_exclusive))) => {
+            if left > right {
+                Some((left, left_exclusive))
+            } else if right > left {
+                Some((right, right_exclusive))
+            } else {
+                Some((left, left_exclusive || right_exclusive))
+            }
+        }
+    }
+}
+
+fn stricter_numeric_upper_bound(
+    left: Option<(f64, bool)>,
+    right: Option<(f64, bool)>,
+) -> Option<(f64, bool)> {
+    match (left, right) {
+        (None, bound) | (bound, None) => bound,
+        (Some((left, left_exclusive)), Some((right, right_exclusive))) => {
+            if left < right {
+                Some((left, left_exclusive))
+            } else if right < left {
+                Some((right, right_exclusive))
+            } else {
+                Some((left, left_exclusive || right_exclusive))
+            }
+        }
+    }
+}
+
+fn source_numeric_lower_bound_accepts_curated(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+) -> bool {
+    let (Ok(source), Ok(curated)) = (
+        schema_numeric_lower_bound(source),
+        schema_numeric_lower_bound(curated),
+    ) else {
+        return false;
+    };
+    source.is_none_or(|(source_value, source_exclusive)| {
+        curated.is_some_and(|(curated_value, curated_exclusive)| {
+            match curated_value.partial_cmp(&source_value) {
+                Some(std::cmp::Ordering::Greater) => true,
+                Some(std::cmp::Ordering::Equal) => !source_exclusive || curated_exclusive,
+                Some(std::cmp::Ordering::Less) | None => false,
+            }
+        })
+    })
+}
+
+fn source_numeric_upper_bound_accepts_curated(
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+) -> bool {
+    let (Ok(source), Ok(curated)) = (
+        schema_numeric_upper_bound(source),
+        schema_numeric_upper_bound(curated),
+    ) else {
+        return false;
+    };
+    source.is_none_or(|(source_value, source_exclusive)| {
+        curated.is_some_and(|(curated_value, curated_exclusive)| {
+            match curated_value.partial_cmp(&source_value) {
+                Some(std::cmp::Ordering::Less) => true,
+                Some(std::cmp::Ordering::Equal) => !source_exclusive || curated_exclusive,
+                Some(std::cmp::Ordering::Greater) | None => false,
+            }
+        })
+    })
+}
+
+fn source_array_constraints_accept_curated(
+    document: &Value,
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if !source_minimum_u64_accepts_curated(source, curated, "minItems")
+        || !source_maximum_u64_accepts_curated(source, curated, "maxItems")
+    {
+        return false;
+    }
+    if curated.get("maxItems").and_then(Value::as_u64) == Some(0) {
+        return true;
+    }
+    if let Some(unique) = source.get("uniqueItems") {
+        let Some(unique) = unique.as_bool() else {
+            return false;
+        };
+        if unique && curated.get("uniqueItems").and_then(Value::as_bool) != Some(true) {
+            return false;
+        }
+    }
+    match source.get("items") {
+        None | Some(Value::Bool(true)) => true,
+        Some(Value::Bool(false)) => false,
+        Some(source_items) if source_items.is_object() => {
+            curated.get("items").is_some_and(|curated_items| {
+                curated_items.is_object()
+                    && source_schema_accepts_curated(
+                        document,
+                        source_items,
+                        curated_items,
+                        depth + 1,
+                        active_references,
+                    )
+            })
+        }
+        Some(_) => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SchemaAllowance<'a> {
+    Any,
+    Forbidden,
+    Schema(&'a Value),
+}
+
+fn schema_allowance(value: Option<&Value>) -> std::result::Result<SchemaAllowance<'_>, ()> {
+    match value {
+        None | Some(Value::Bool(true)) => Ok(SchemaAllowance::Any),
+        Some(Value::Bool(false)) => Ok(SchemaAllowance::Forbidden),
+        Some(value) if value.is_object() => Ok(SchemaAllowance::Schema(value)),
+        Some(_) => Err(()),
+    }
+}
+
+fn source_allowance_accepts_curated(
+    document: &Value,
+    source: SchemaAllowance<'_>,
+    curated: SchemaAllowance<'_>,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    match (source, curated) {
+        (SchemaAllowance::Any, _) | (_, SchemaAllowance::Forbidden) => true,
+        (SchemaAllowance::Forbidden, _) | (SchemaAllowance::Schema(_), SchemaAllowance::Any) => {
+            false
+        }
+        (SchemaAllowance::Schema(source), SchemaAllowance::Schema(curated)) => {
+            source_schema_accepts_curated(document, source, curated, depth + 1, active_references)
+        }
+    }
+}
+
+fn schema_required_fields(
+    schema: &Map<String, Value>,
+) -> std::result::Result<BTreeSet<String>, ()> {
+    schema.get("required").map_or_else(
+        || Ok(BTreeSet::new()),
+        |required| {
+            required
+                .as_array()
+                .ok_or(())?
+                .iter()
+                .map(|field| field.as_str().map(str::to_owned).ok_or(()))
+                .collect()
+        },
+    )
+}
+
+fn source_object_constraints_accept_curated(
+    document: &Value,
+    source: &Map<String, Value>,
+    curated: &Map<String, Value>,
+    depth: usize,
+    active_references: &mut BTreeSet<String>,
+) -> bool {
+    if !source_minimum_u64_accepts_curated(source, curated, "minProperties")
+        || !source_maximum_u64_accepts_curated(source, curated, "maxProperties")
+    {
+        return false;
+    }
+    let (Ok(source_required), Ok(curated_required)) = (
+        schema_required_fields(source),
+        schema_required_fields(curated),
+    ) else {
+        return false;
+    };
+    if !source_required.is_subset(&curated_required) {
+        return false;
+    }
+    let source_properties = match source.get("properties") {
+        None => None,
+        Some(Value::Object(properties)) => Some(properties),
+        Some(_) => return false,
+    };
+    let curated_properties = match curated.get("properties") {
+        None => None,
+        Some(Value::Object(properties)) => Some(properties),
+        Some(_) => return false,
+    };
+    let (Ok(source_additional), Ok(curated_additional)) = (
+        schema_allowance(source.get("additionalProperties")),
+        schema_allowance(curated.get("additionalProperties")),
+    ) else {
+        return false;
+    };
+
+    if curated_properties.is_some_and(|properties| {
+        properties.iter().any(|(name, curated_property)| {
+            let source_allowance = source_properties
+                .and_then(|properties| properties.get(name))
+                .map_or(source_additional, SchemaAllowance::Schema);
+            !source_allowance_accepts_curated(
+                document,
+                source_allowance,
+                SchemaAllowance::Schema(curated_property),
+                depth,
+                active_references,
+            )
+        })
+    }) {
+        return false;
+    }
+
+    if source_properties.is_some_and(|properties| {
+        properties.iter().any(|(name, source_property)| {
+            curated_properties.is_none_or(|properties| !properties.contains_key(name))
+                && !source_allowance_accepts_curated(
+                    document,
+                    SchemaAllowance::Schema(source_property),
+                    curated_additional,
+                    depth,
+                    active_references,
+                )
+        })
+    }) {
+        return false;
+    }
+
+    source_allowance_accepts_curated(
+        document,
+        source_additional,
+        curated_additional,
+        depth,
+        active_references,
+    )
+}
+
+fn insert_access_application_login_methods_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+    source: &CapabilityV1,
+    spec: AccessApplicationLoginMethodsContractSpec,
+) {
+    let mut capability = source.clone();
+    spec.capability_id.clone_into(&mut capability.id);
+    spec.title.clone_into(&mut capability.title);
+    capability.description = Some(spec.description.to_owned());
+    capability.aliases = spec
+        .aliases
+        .iter()
+        .map(|alias| (*alias).to_owned())
+        .collect();
+
+    let source_identity_supported = access_application_update_identity_supported(&capability);
+    let read_identity_supported = access_application_read_identity_supported(capabilities);
+    let source_request_schema = document.pointer(ACCESS_APP_UPDATE_REQUEST_SCHEMA_POINTER);
+    let source_request_schema_present = source_request_schema.is_some();
+    let source_request_body_compatible = source_request_schema.is_some_and(|source_schema| {
+        access_application_source_request_body_compatible(
+            document,
+            source_schema,
+            &spec.request_schema,
+        )
+    });
+
+    capability.request_schema = Some(spec.request_schema);
+    let verified_response_fields = capability
+        .verifiable_request_object_fields()
+        .unwrap_or_default();
+    let missing_readback_fields = access_application_missing_readback_fields(
+        document,
+        spec.app_type,
+        &verified_response_fields,
+    );
+
+    if !source_identity_supported
+        || !read_identity_supported
+        || !source_request_schema_present
+        || !source_request_body_compatible
+        || verified_response_fields.is_empty()
+        || !missing_readback_fields.is_empty()
+    {
+        let mut drift = Vec::new();
+        if !source_identity_supported {
+            drift.push("update identity".to_owned());
+        }
+        if !read_identity_supported {
+            drift.push("detail-read identity".to_owned());
+        }
+        if !source_request_schema_present {
+            drift.push("source PUT request body".to_owned());
+        }
+        if source_request_schema_present && !source_request_body_compatible {
+            drift.push("source PUT request body incompatibility".to_owned());
+        }
+        if verified_response_fields.is_empty() {
+            drift.push("closed mutable request fields".to_owned());
+        }
+        if !missing_readback_fields.is_empty() {
+            drift.push(format!(
+                "readback field(s) {}",
+                missing_readback_fields.join(",")
+            ));
+        }
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(format!(
+            "schema drift: the Access application update/read pair no longer exposes the preservation-safe login-method contract ({})",
+            drift.join("; ")
+        ));
+        capabilities.insert(spec.capability_id.to_owned(), capability);
+        return;
+    }
+
+    capability.risk = RiskClass::IdentityOrOwnership;
+    capability.effect = EffectClass::IdentityOrOwnership;
+    zero_cost_mutation(
+        &mut capability,
+        "changing an Access application identity-provider allowlist has no per-operation charge; Access seat and plan billing are unchanged",
+        official_reference(
+            "Update an Access application",
+            "https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/applications/methods/update/",
+        ),
+    );
+    capability.verification.required = true;
+    "same_path_result_contains_planned_fields_after_update"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: ACCESS_APP_DETAIL_PATH.to_owned(),
+        read_capability_id: ACCESS_APP_READ_CAPABILITY_ID.to_owned(),
+        verified_response_fields,
+    });
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+    capability.rollback.warning = Some(
+        "cfctl binds and rechecks the exact pre-change application snapshot; rollback is a separate approval-required restoration plan and does not invalidate sessions already issued"
+            .to_owned(),
+    );
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    capability.blocked_reason = None;
+    refresh_dynamic_mutation_contract(&mut capability);
+    capabilities.insert(spec.capability_id.to_owned(), capability);
+}
+
+fn finalize_access_application_login_methods_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let Some(source) = capabilities.get(ACCESS_APP_UPDATE_CAPABILITY_ID).cloned() else {
+        return;
+    };
+    insert_access_application_login_methods_contract(
+        document,
+        capabilities,
+        &source,
+        AccessApplicationLoginMethodsContractSpec {
+            capability_id: ACCESS_APP_LOGIN_METHODS_CAPABILITY_ID,
+            app_type: "self_hosted",
+            title: "Update self-hosted Access application login methods",
+            description: "Sets the non-empty identity-provider allowlist on one exact public self-hosted Access application. cfctl first reads the live application and builds a full mutable PUT body so policies, domains, cookie settings, launcher visibility, and redirect behavior are preserved.",
+            aliases: &[
+                "set Access application identity providers",
+                "remove GitHub login from Access application",
+                "allow Access one-time PIN login",
+            ],
+            request_schema: access_application_login_methods_materialized_schema(),
+        },
+    );
+    insert_access_application_login_methods_contract(
+        document,
+        capabilities,
+        &source,
+        AccessApplicationLoginMethodsContractSpec {
+            capability_id: ACCESS_APP_LAUNCHER_LOGIN_METHODS_CAPABILITY_ID,
+            app_type: "app_launcher",
+            title: "Update Access App Launcher login methods",
+            description: "Sets the non-empty identity-provider allowlist on the exact account App Launcher. cfctl first reads the live launcher and builds a preservation-safe PUT body so authentication routing, policy links, session duration, and configured launcher design remain unchanged.",
+            aliases: &[
+                "set App Launcher identity providers",
+                "allow one-time PIN for MFA enrollment",
+                "remove GitHub login from App Launcher",
+            ],
+            request_schema: access_app_launcher_login_methods_schema(),
+        },
+    );
+}
+
+fn access_human_policy_identity_rule_schema() -> Value {
+    serde_json::json!({
+        "oneOf":[
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["email"],
+                "properties":{
+                    "email":{
+                        "type":"object",
+                        "additionalProperties":false,
+                        "required":["email"],
+                        "properties":{
+                            "email":{
+                                "type":"string",
+                                "format":"email",
+                                "minLength":3,
+                                "maxLength":254
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["email_domain"],
+                "properties":{
+                    "email_domain":{
+                        "type":"object",
+                        "additionalProperties":false,
+                        "required":["domain"],
+                        "properties":{
+                            "domain":{
+                                "type":"string",
+                                "format":"hostname",
+                                "minLength":3,
+                                "maxLength":253
+                            }
+                        }
+                    }
+                }
+            }
+        ]
+    })
+}
+
+fn access_human_policy_schema() -> Value {
+    let identity_rule = access_human_policy_identity_rule_schema();
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":[
+            "name",
+            "decision",
+            "include",
+            "exclude",
+            "require",
+            "precedence"
+        ],
+        "properties":{
+            "name":{"type":"string","minLength":1,"maxLength":350},
+            "decision":{"type":"string","enum":["allow"]},
+            "include":{
+                "type":"array",
+                "minItems":1,
+                "maxItems":100,
+                "uniqueItems":true,
+                "items":identity_rule.clone()
+            },
+            "exclude":{
+                "type":"array",
+                "maxItems":100,
+                "uniqueItems":true,
+                "items":identity_rule
+            },
+            "require":{"type":"array","maxItems":0},
+            "precedence":{"type":"integer","minimum":1},
+            "session_duration":{"type":"string","minLength":2,"maxLength":16},
+            "mfa_config":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["allowed_authenticators","mfa_disabled"],
+                "properties":{
+                    "allowed_authenticators":{
+                        "type":"array",
+                        "minItems":1,
+                        "maxItems":3,
+                        "uniqueItems":true,
+                        "items":{
+                            "type":"string",
+                            "enum":["totp","biometrics","security_key"]
+                        }
+                    },
+                    "mfa_disabled":{"type":"boolean"},
+                    "session_duration":{"type":"string","minLength":2,"maxLength":16}
+                }
+            }
+        },
+        "x-cfctl-body-required":true
+    })
+}
+
+fn access_policy_update_identity_supported(capability: &CapabilityV1) -> bool {
+    capability.method == "PUT"
+        && capability.path == ACCESS_POLICY_DETAIL_PATH
+        && capability.product == "Access application-scoped policies"
+        && capability.account_scope == "account"
+        && capability.permissions == ["Access: Apps and Policies Write"]
+        && capability.selectors.len() == 3
+        && ["account_id", "app_id", "policy_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                    && response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+            })
+}
+
+fn access_policy_read_identity_supported(capabilities: &BTreeMap<String, CapabilityV1>) -> bool {
+    capabilities
+        .get(ACCESS_POLICY_READ_CAPABILITY_ID)
+        .is_some_and(|read| {
+            read.method == "GET"
+                && read.path == ACCESS_POLICY_DETAIL_PATH
+                && read.product == "Access application-scoped policies"
+                && !read.mutating
+                && read.request_schema.is_none()
+                && read.selectors.len() == 3
+                && ["account_id", "app_id", "policy_id"].iter().all(|name| {
+                    read.selectors.iter().any(|selector| {
+                        selector.name == *name
+                            && selector.location == "path"
+                            && selector.required
+                            && selector.value_type == "string"
+                    })
+                })
+                && read.response_contract.as_ref().is_some_and(|response| {
+                    response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                        && response.success_statuses == ["200"]
+                        && response.success_media_types == ["application/json"]
+                })
+        })
+}
+
+fn access_policy_missing_readback_fields(
+    document: &Value,
+    verified_response_fields: &[String],
+) -> Vec<String> {
+    let read_operation = document.pointer(
+        "/paths/~1accounts~1{account_id}~1access~1apps~1{app_id}~1policies~1{policy_id}/get",
+    );
+    read_operation.map_or_else(
+        || verified_response_fields.to_vec(),
+        |operation| {
+            verified_response_fields
+                .iter()
+                .filter(|field| {
+                    !success_response_declares_result_field_union(document, operation, &[field])
+                })
+                .cloned()
+                .collect()
+        },
+    )
+}
+
+/// Derives a closed, application-scoped Access policy update for human
+/// eligibility and independent MFA. The broad Cloudflare policy union remains
+/// available for other callers, while this contract admits only allow
+/// policies composed of email/domain selectors, an empty `require` set, and
+/// the documented TOTP/biometric/security-key MFA controls.
+///
+/// The runtime accepts only the intended eligibility/MFA subset from a caller,
+/// reads the exact live policy, rejects unclassified fields, and materializes
+/// the full closed PUT body. Its prior-state projection preserves optional
+/// field absence, making a separately approved restoration plan honest.
+fn finalize_access_human_policy_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let Some(source) = capabilities
+        .get(ACCESS_POLICY_UPDATE_CAPABILITY_ID)
+        .cloned()
+    else {
+        return;
+    };
+    let mut capability = source;
+    ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID.clone_into(&mut capability.id);
+    "Update human Access eligibility and independent MFA".clone_into(&mut capability.title);
+    capability.description = Some(
+        "Updates one exact application-scoped human allow policy. cfctl first reads the live policy and builds a preservation-safe full body from the requested email/domain eligibility or independent MFA changes; service tokens, bypass/non-identity decisions, device rules, external evaluation, arbitrary rule variants, and unclassified live fields are rejected."
+            .to_owned(),
+    );
+    capability.aliases = vec![
+        "allow Access OTP users to enroll MFA".to_owned(),
+        "enable Access TOTP and biometrics".to_owned(),
+        "add human email to App Launcher policy".to_owned(),
+    ];
+    "cfctl-safe-human-access-policy-v1+cloudflare-access-api".clone_into(&mut capability.source);
+
+    let source_identity_supported = access_policy_update_identity_supported(&capability);
+    let read_identity_supported = access_policy_read_identity_supported(capabilities);
+    let curated_request_schema = access_human_policy_schema();
+    let source_request_schema = document.pointer(ACCESS_POLICY_UPDATE_REQUEST_SCHEMA_POINTER);
+    let source_request_schema_present = source_request_schema.is_some();
+    let source_request_body_compatible = source_request_schema.is_some_and(|source_schema| {
+        access_application_source_request_body_compatible(
+            document,
+            source_schema,
+            &curated_request_schema,
+        )
+    });
+
+    capability.request_schema = Some(curated_request_schema);
+    let verified_response_fields = capability
+        .verifiable_request_object_fields()
+        .unwrap_or_default();
+    let missing_readback_fields =
+        access_policy_missing_readback_fields(document, &verified_response_fields);
+
+    if !source_identity_supported
+        || !read_identity_supported
+        || !source_request_schema_present
+        || !source_request_body_compatible
+        || verified_response_fields.is_empty()
+        || !missing_readback_fields.is_empty()
+    {
+        let mut drift = Vec::new();
+        if !source_identity_supported {
+            drift.push("update identity".to_owned());
+        }
+        if !read_identity_supported {
+            drift.push("detail-read identity".to_owned());
+        }
+        if !source_request_schema_present {
+            drift.push("source PUT request body".to_owned());
+        }
+        if source_request_schema_present && !source_request_body_compatible {
+            drift.push("source PUT request body incompatibility".to_owned());
+        }
+        if verified_response_fields.is_empty() {
+            drift.push("closed human policy fields".to_owned());
+        }
+        if !missing_readback_fields.is_empty() {
+            drift.push(format!(
+                "readback field(s) {}",
+                missing_readback_fields.join(",")
+            ));
+        }
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(format!(
+            "schema drift: the Access policy update/read pair no longer exposes the closed human eligibility and MFA contract ({})",
+            drift.join("; ")
+        ));
+        capabilities.insert(
+            ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID.to_owned(),
+            capability,
+        );
+        return;
+    }
+
+    capability.risk = RiskClass::IdentityOrOwnership;
+    capability.effect = EffectClass::IdentityOrOwnership;
+    capability.verification.required = true;
+    "same_path_result_contains_planned_fields_after_update"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: ACCESS_POLICY_DETAIL_PATH.to_owned(),
+        read_capability_id: ACCESS_POLICY_READ_CAPABILITY_ID.to_owned(),
+        verified_response_fields,
+    });
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+    capability.rollback.warning = Some(
+        "cfctl binds and rechecks the exact pre-change human policy snapshot, including optional-field absence; rollback is a separate approval-required restoration plan and does not invalidate sessions already issued"
+            .to_owned(),
+    );
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    capability.blocked_reason = None;
+    refresh_dynamic_mutation_contract(&mut capability);
+    capabilities.insert(
+        ACCESS_HUMAN_POLICY_UPDATE_CAPABILITY_ID.to_owned(),
+        capability,
+    );
+}
 
 /// Govern Access application creation. The delete side is already governed by
 /// the generic exact-resource path; the get and list readbacks exist. Create
