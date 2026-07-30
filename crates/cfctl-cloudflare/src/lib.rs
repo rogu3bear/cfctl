@@ -1288,7 +1288,15 @@ mod mln_0143_invariant_tests {
             .as_object_mut()
             .expect("meta")
             .remove("rows_read");
-        assert!(sanitize_mln_0143_data_invariants_response(&mut response, &request).is_err());
+        let error = sanitize_mln_0143_data_invariants_response(&mut response, &request)
+            .expect_err("ambiguous provider metadata must fail closed");
+        assert!(matches!(
+            error,
+            super::CloudflareError::Mln0143ResponseClassification {
+                status: 200,
+                classification: "invariant_contract_violation"
+            }
+        ));
     }
 
     #[test]
@@ -5571,7 +5579,10 @@ fn reviewed_table_sql_hash(value: &str) -> Option<String> {
 }
 
 fn invariant_response_error(status: u16) -> CloudflareError {
-    CloudflareError::InvalidResponseEnvelope { status }
+    CloudflareError::Mln0143ResponseClassification {
+        status,
+        classification: "invariant_contract_violation",
+    }
 }
 
 #[expect(
