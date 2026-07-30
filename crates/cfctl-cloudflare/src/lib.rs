@@ -894,7 +894,7 @@ mod mln_0143_invariant_tests {
                     "foreign_key_violations":0,
                     "duplicate_hash_groups":0,
                     "invalid_evidence_kinds":0,
-                    "invalid_advanced_events":99
+                    "invalid_advanced_events":0
                 }]
             }]),
             errors: Vec::new(),
@@ -1064,6 +1064,14 @@ mod mln_0143_invariant_tests {
     }
 
     #[test]
+    fn pre_import_rejects_invalid_advanced_advisor_events() {
+        let request = prepared("pre_import");
+        let mut response = pre_response(0);
+        response.result[0]["results"][0]["invalid_advanced_events"] = json!(1);
+        assert!(sanitize_mln_0143_data_invariants_response(&mut response, &request).is_err());
+    }
+
+    #[test]
     fn post_import_requires_the_new_packet_and_all_three_trigger_definitions() {
         let mut request = prepared("post_import");
         let trigger_sql = [
@@ -1100,6 +1108,20 @@ mod mln_0143_invariant_tests {
             row.insert(field.to_owned(), Value::String(sql.to_owned()));
         }
         row.insert("invalid_advanced_events".to_owned(), json!(0));
+        let mut invalid_post = response.clone();
+        invalid_post.result[0]["results"][0]["invalid_advanced_events"] = json!(1);
+        assert!(sanitize_mln_0143_data_invariants_response(&mut invalid_post, &request).is_err());
+        let mut restore_request = request.clone();
+        restore_request
+            .query_receipt
+            .as_mut()
+            .expect("query receipt")["phase"] = json!("post_restore");
+        let mut invalid_restore = response.clone();
+        invalid_restore.result[0]["results"][0]["invalid_advanced_events"] = json!(1);
+        assert!(
+            sanitize_mln_0143_data_invariants_response(&mut invalid_restore, &restore_request)
+                .is_err()
+        );
         sanitize_mln_0143_data_invariants_response(&mut response, &request)
             .expect("exact post-import state");
         assert_eq!(
@@ -4775,6 +4797,9 @@ fn sanitize_mln_0143_data_invariants_response(
         "trigger_immutable_sql",
         "trigger_final_required_sql",
     ];
+    if number("invalid_advanced_events")? != 0 {
+        return Err(invariant_response_error(response.status));
+    }
     let trigger_hashes = if pre {
         if trigger_fields
             .iter()
@@ -4784,9 +4809,6 @@ fn sanitize_mln_0143_data_invariants_response(
         }
         Vec::new()
     } else {
-        if number("invalid_advanced_events")? != 0 {
-            return Err(invariant_response_error(response.status));
-        }
         let hashes = trigger_fields
             .iter()
             .map(|field| text(field).map(normalized_sql_hash))
@@ -4826,7 +4848,7 @@ fn sanitize_mln_0143_data_invariants_response(
             "foreign_key_check_empty":true,
             "duplicate_hash_groups_zero":true,
             "invalid_evidence_kinds_zero":true,
-            "invalid_advanced_events_zero": if pre { Value::Null } else { Value::Bool(true) },
+            "invalid_advanced_events_zero":true,
         },
         "query":{
             "sha256":hash_value(&Value::String(MLN_0143_QUERY.to_owned()))?,
