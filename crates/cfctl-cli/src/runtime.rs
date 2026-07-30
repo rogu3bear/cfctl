@@ -19758,6 +19758,7 @@ fn remove_staged_rotation_profile(
 
 async fn revoke_rotation_child(
     store: &StateStore,
+    minter_profile: &str,
     account: &str,
     token_id: &str,
     authority_id: &str,
@@ -19766,6 +19767,7 @@ async fn revoke_rotation_child(
     let plan = Box::pin(key_revoke(
         store,
         &KeyRevokeArgs {
+            profile: Some(minter_profile.to_owned()),
             user: false,
             id: token_id.to_owned(),
             account: Some(account.to_owned()),
@@ -19863,6 +19865,64 @@ async fn key_renew_analytics_profile(
         return Err(CliError::Input(
             "minter profile must be an API token pinned to the requested account".to_owned(),
         ));
+    }
+    if let Some(pending_token_id) = old_profile.managed_api_token.as_ref().and_then(|managed| {
+        (managed.pending_revoke_operation_id.is_none())
+            .then(|| managed.pending_revoke_token_id.clone())
+            .flatten()
+    }) {
+        let revoke_plan = match Box::pin(key_revoke(
+            store,
+            &KeyRevokeArgs {
+                profile: Some(arguments.minter_profile.clone()),
+                user: false,
+                id: pending_token_id.clone(),
+                account: Some(arguments.account.clone()),
+                under_policy: None,
+            },
+        ))
+        .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                let mut pending = rotation_failure(
+                    "CFCTL_ANALYTICS_ROTATION_REVOKE_PLAN_FAILED",
+                    format!(
+                        "the active child remains healthy, but governed old-child revoke-plan creation is still failing: {error}"
+                    ),
+                    "Repair the explicit minter-profile planning failure; later hourly runs keep retrying only plan creation and refuse another mint.",
+                    Vec::new(),
+                    json!({
+                        "profile":arguments.profile,
+                        "state":"active_old_revoke_plan_pending",
+                        "active_token_id":old_profile
+                            .managed_api_token
+                            .as_ref()
+                            .map(|managed| managed.token_id.as_str()),
+                        "old_token_id":pending_token_id,
+                        "observable_failure_signal":"nonzero process exit with CFCTL_ANALYTICS_ROTATION_REVOKE_PLAN_FAILED",
+                    }),
+                );
+                pending.profile_id = Some(arguments.profile.clone());
+                pending.account_id = Some(arguments.account.clone());
+                return Ok(pending);
+            }
+        };
+        let revoke_operation_id = revoke_plan.operation_id.clone().ok_or_else(|| {
+            CliError::Input("bootstrap revoke plan omitted its operation ID".to_owned())
+        })?;
+        let mut repaired_profile = old_profile.clone();
+        let repaired_managed = repaired_profile
+            .managed_api_token
+            .as_mut()
+            .ok_or_else(|| CliError::Input("managed profile binding disappeared".to_owned()))?;
+        repaired_managed.pending_revoke_operation_id = Some(revoke_operation_id);
+        let mut repaired_profiles = profiles.clone();
+        repaired_profiles
+            .profiles
+            .insert(arguments.profile.clone(), repaired_profile.clone());
+        repaired_profiles.save(store)?;
+        old_profile = repaired_profile;
     }
     if let Some(managed) = old_profile.managed_api_token.as_ref()
         && let (Some(pending_token_id), Some(pending_operation_id)) = (
@@ -20074,6 +20134,7 @@ async fn key_renew_analytics_profile(
         );
         let cleanup = Box::pin(revoke_rotation_child(
             store,
+            &arguments.minter_profile,
             &arguments.account,
             &new_token_id,
             &arguments.under_policy,
@@ -20106,6 +20167,7 @@ async fn key_renew_analytics_profile(
     {
         let _ = revoke_rotation_child(
             store,
+            &arguments.minter_profile,
             &arguments.account,
             &new_token_id,
             &arguments.under_policy,
@@ -20165,6 +20227,7 @@ async fn key_renew_analytics_profile(
         rollback_profiles.save(store)?;
         let cleanup = Box::pin(revoke_rotation_child(
             store,
+            &arguments.minter_profile,
             &arguments.account,
             &new_token_id,
             &arguments.under_policy,
@@ -20206,16 +20269,55 @@ async fn key_renew_analytics_profile(
             .flat_map(|envelope| envelope.evidence),
     );
     if !old_is_lineage_bound {
-        let revoke_plan = Box::pin(key_revoke(
+        let revoke_plan = match Box::pin(key_revoke(
             store,
             &KeyRevokeArgs {
+                profile: Some(arguments.minter_profile.clone()),
                 user: false,
                 id: old_token_id.clone(),
                 account: Some(arguments.account.clone()),
                 under_policy: None,
             },
         ))
-        .await?;
+        .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                let mut pending_profiles = ProfilesConfig::load(store)?;
+                let pending_profile = pending_profiles
+                    .profiles
+                    .get_mut(&arguments.profile)
+                    .ok_or_else(|| {
+                        CliError::Input("activated publisher profile disappeared".to_owned())
+                    })?;
+                let managed = pending_profile.managed_api_token.as_mut().ok_or_else(|| {
+                    CliError::Input(
+                        "activated publisher profile lost its managed binding".to_owned(),
+                    )
+                })?;
+                managed.pending_revoke_token_id = Some(old_token_id.clone());
+                managed.pending_revoke_operation_id = None;
+                managed
+                    .pending_revoke_slot_id
+                    .clone_from(&old_profile.api_token_slot_id);
+                pending_profiles.save(store)?;
+                return Ok(rotation_failure(
+                    "CFCTL_ANALYTICS_ROTATION_REVOKE_PLAN_FAILED",
+                    format!(
+                        "the fresh child is active and verified, but the old-child revoke plan could not be prepared: {error}"
+                    ),
+                    "The overlap is durably pending. A later hourly run retries only governed revoke-plan creation before permitting another mint.",
+                    evidence,
+                    json!({
+                        "profile":arguments.profile,
+                        "state":"active_old_revoke_plan_pending",
+                        "active_token_id":new_token_id,
+                        "old_token_id":old_token_id,
+                        "observable_failure_signal":"nonzero process exit with CFCTL_ANALYTICS_ROTATION_REVOKE_PLAN_FAILED",
+                    }),
+                ));
+            }
+        };
         evidence.extend(revoke_plan.evidence.clone());
         let revoke_operation_id = revoke_plan.operation_id.clone().ok_or_else(|| {
             CliError::Input("bootstrap revoke plan omitted its operation ID".to_owned())
@@ -20260,6 +20362,7 @@ async fn key_renew_analytics_profile(
 
     let revoke = Box::pin(revoke_rotation_child(
         store,
+        &arguments.minter_profile,
         &arguments.account,
         &old_token_id,
         &arguments.under_policy,
@@ -20367,7 +20470,7 @@ async fn key_revoke(store: &StateStore, arguments: &KeyRevokeArgs) -> Result<Res
             body: None,
             ..CallInput::default()
         },
-        None,
+        arguments.profile.as_deref(),
         Some(account),
         Value::Null,
     ))

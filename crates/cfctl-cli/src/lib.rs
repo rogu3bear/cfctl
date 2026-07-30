@@ -278,6 +278,8 @@ pub struct KeyMutationArgs {
 
 #[derive(Debug, Args)]
 pub struct KeyRevokeArgs {
+    #[arg(long, help = "Explicit profile used to plan and execute revocation")]
+    pub profile: Option<String>,
     #[arg(
         long,
         help = "Revoke a user-owned token instead of an account-owned token"

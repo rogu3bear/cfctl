@@ -163,9 +163,11 @@ before the fresh child is revoked. Old-child revocation is unattended only
 when the standing authority's durable lineage contains that ID. A bootstrap
 child outside lineage produces a normal revoke plan and a persistent nonzero
 failure state until the exact approved plan reaches verified not-found
-closure. A failed lineage-bound revoke persists the same old-child overlap and
-operation reference, so later hourly checks refuse another mint and remain
-nonzero until that exact operation is reconciled to `Verified`. Successful
+closure. If planning itself fails after activation, the old-child identity is
+persisted without an operation reference; later hourly checks retry only
+explicit-minter-profile plan creation and refuse another mint. A failed
+lineage-bound revoke persists the same old-child overlap and operation
+reference until that exact operation is reconciled to `Verified`. Successful
 later rotations use two standing run reservations: mint and old-child revoke.
 
 Profile metadata contains only opaque slot, token identity, expiry, authority,

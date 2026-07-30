@@ -695,6 +695,8 @@ fn user_owned_key_lifecycle_requires_an_explicit_owner_flag_and_account_context(
         ];
         if action == "rotate" {
             arguments.extend(["--value-out", "/tmp/rotated-token"]);
+        } else {
+            arguments.extend(["--profile", "minter"]);
         }
         let parsed = Cli::try_parse_from(arguments).expect("user-owned lifecycle parses");
         let Some(Command::Keys(arguments)) = parsed.command else {
@@ -702,7 +704,10 @@ fn user_owned_key_lifecycle_requires_an_explicit_owner_flag_and_account_context(
         };
         match arguments.command {
             cfctl_cli::KeysCommand::Rotate(rotate) => assert!(rotate.user),
-            cfctl_cli::KeysCommand::Revoke(revoke) => assert!(revoke.user),
+            cfctl_cli::KeysCommand::Revoke(revoke) => {
+                assert!(revoke.user);
+                assert_eq!(revoke.profile.as_deref(), Some("minter"));
+            }
             _ => panic!("unexpected key command"),
         }
     }

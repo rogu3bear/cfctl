@@ -102,7 +102,9 @@ Exit `1` is the observable failure signal: do not suppress it. In particular,
 checks until the one-time bootstrap revoke operation is approved, run, and
 verified. The same persistent signal guards any later lineage-bound revoke
 that did not reach verified closure; the scheduler cannot silently return to
-healthy or mint another child while two children may remain active.
+healthy or mint another child while two children may remain active. A
+post-activation revoke-planning failure is also durable and nonzero; later
+checks retry only plan creation through the explicit minter profile.
 
 ## Authentication
 
