@@ -10,13 +10,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use cfctl_catalog::CatalogSnapshot;
 use cfctl_cloudflare::CallInput;
 use cfctl_core::{
-    AdapterStatus, CapabilityV1, EvidenceClass, OperationalProofFreshnessV1,
-    OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, PlanStatus, PlanV1,
-    ResultEnvelopeV2, TransactionStageV1, VerificationState, hash_value,
+    AdapterStatus, CapabilityV1, EvidenceClass, Mln0143GovernedExecutionBindingV1,
+    OperationalProofFreshnessV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
+    OperationalProofV1, PlanStatus, PlanV1, ResultEnvelopeV2, TransactionStageV1,
+    VerificationState, hash_value,
 };
 use cfctl_storage::{OperationalProofPageV1, StateStore};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::profiles::ProfilesConfig;
 use crate::runtime::{
@@ -194,7 +196,7 @@ pub(crate) fn record_operational_proof(
             ))
         })?;
     let input_hash = hash_value(&serde_json::to_value(input)?)?;
-    let proof = OperationalProofV1::new(
+    let mut proof = OperationalProofV1::new(
         envelope.generated_at,
         &capability.id,
         &catalog.schema_hash,
@@ -211,6 +213,68 @@ pub(crate) fn record_operational_proof(
         },
         evidence,
     );
+    if let Some(contract) = capability.mln_0143_data_invariants.as_ref() {
+        let manifest = envelope.result.get("result").unwrap_or(&envelope.result);
+        let phase = input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("phase"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::Input("MLN 0143 runtime phase is missing".to_owned()))?;
+        let target_scope_hash = hash_value(&json!({
+            "account_id": contract.account_id,
+            "database_id": contract.database_id,
+        }))?;
+        if !envelope.ok
+            || manifest.get("complete").and_then(Value::as_bool) != Some(true)
+            || manifest.get("capability_id").and_then(Value::as_str) != Some(capability.id.as_str())
+            || manifest.get("capability_version").and_then(Value::as_u64)
+                != Some(u64::from(contract.capability_version))
+            || manifest
+                .get("validator_contract_hash")
+                .and_then(Value::as_str)
+                != Some(contract.validator_contract_hash.as_str())
+            || manifest.get("phase").and_then(Value::as_str) != Some(phase)
+            || manifest.get("target_scope_hash").and_then(Value::as_str)
+                != Some(target_scope_hash.as_str())
+            || manifest.pointer("/query/sha256").and_then(Value::as_str)
+                != Some(contract.fixed_query_sha256.as_str())
+            || manifest
+                .pointer("/query/bounds_saturated")
+                .and_then(Value::as_bool)
+                != Some(false)
+        {
+            return Err(CliError::Input(
+                "MLN 0143 runtime result is not a completed validated manifest".to_owned(),
+            ));
+        }
+        let profile_id = envelope.profile_id.as_deref().ok_or_else(|| {
+            CliError::Input("MLN 0143 runtime proof requires a profile identity".to_owned())
+        })?;
+        let credential_generation_id = credential_generation_id.ok_or_else(|| {
+            CliError::Input("MLN 0143 runtime proof requires a credential generation".to_owned())
+        })?;
+        proof.bind_mln_0143_governed_execution(Mln0143GovernedExecutionBindingV1 {
+            schema_version: 1,
+            operation_id: Uuid::new_v4().to_string(),
+            capability_id: capability.id.clone(),
+            capability_version: contract.capability_version,
+            validator_contract_hash: contract.validator_contract_hash.clone(),
+            fixed_query_sha256: contract.fixed_query_sha256.clone(),
+            catalog_hash: catalog.schema_hash.clone(),
+            target_scope_hash,
+            phase: phase.to_owned(),
+            manifest_evidence_hash: proof.evidence.content_hash.clone(),
+            request_hash: input_hash,
+            profile_identity_hash: hash_value(&json!({
+                "profile_id": profile_id,
+                "credential_generation_id": credential_generation_id,
+            }))?,
+            credential_generation_id: credential_generation_id.to_owned(),
+            completion_status: "completed".to_owned(),
+            completed_at: envelope.generated_at,
+        })?;
+    }
     store.record_operational_proof(&proof)?;
     Ok(())
 }

@@ -3896,6 +3896,7 @@ struct ExecutedRead {
 )]
 fn mln_0143_parent_manifests(
     store: &StateStore,
+    catalog: &CatalogSnapshot,
     capability: &CapabilityV1,
     input: &CallInput,
 ) -> Result<Vec<(String, Value)>> {
@@ -3943,6 +3944,30 @@ fn mln_0143_parent_manifests(
             let evidence_hash = body.get(*field).and_then(Value::as_str).ok_or_else(|| {
                 CliError::Input(format!("MLN 0143 `{phase}` requires `{field}`"))
             })?;
+            let matching_proofs = store
+                .list_operational_proofs()?
+                .into_iter()
+                .filter(|proof| {
+                    proof.evidence.content_hash == evidence_hash
+                        && proof.mln_0143_governed_execution().is_some_and(|binding| {
+                            binding.capability_id == capability.id
+                                && binding.capability_version == contract.capability_version
+                                && binding.validator_contract_hash
+                                    == contract.validator_contract_hash
+                                && binding.fixed_query_sha256 == contract.fixed_query_sha256
+                                && binding.catalog_hash == catalog.schema_hash
+                                && binding.target_scope_hash == target_scope_hash
+                                && binding.phase == *expected_phase
+                                && binding.manifest_evidence_hash == evidence_hash
+                                && binding.completion_status == "completed"
+                        })
+                })
+                .collect::<Vec<_>>();
+            if matching_proofs.len() != 1 {
+                return Err(CliError::Input(format!(
+                    "MLN 0143 parent evidence `{field}` requires exactly one matching completed governed execution proof"
+                )));
+            }
             let stored = store.read_evidence_value(evidence_hash)?;
             let manifest = stored.get("result").unwrap_or(&stored);
             let expected_table_hash = if *expected_phase == "post_import" {
@@ -4190,7 +4215,7 @@ async fn execute_read(
         }
         AdapterStatus::Native | AdapterStatus::DynamicApi => {}
     }
-    let mln_0143_parents = mln_0143_parent_manifests(store, capability, input)?;
+    let mln_0143_parents = mln_0143_parent_manifests(store, catalog, capability, input)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(requested_profile)?;
     let credential_generation_id = credential_generation_for_read(profile)?;
@@ -17470,6 +17495,7 @@ mod tests {
         wrangler_deploy_version_id, wrangler_status_has_promoted_version, zone_target,
     };
     use crate::profiles::ProfilesConfig;
+    use crate::telemetry_product::record_operational_proof;
     use crate::{
         CallArgs, KeyMutationArgs, KeyPermissionArgs, KeyPolicyApproveArgs, KeyPolicySelector,
         PlanApproveArgs, PlanSelector,
@@ -17656,9 +17682,49 @@ mod tests {
                 "lineage":{}
             })
         };
-        let pre = store
+        let synthetic_pre = store
             .write_evidence(EvidenceClass::LiveRead, &base("pre_import"))
-            .expect("pre evidence");
+            .expect("synthetic pre evidence");
+        let synthetic_input = CallInput {
+            body: Some(json!({
+                "migration_id":"0143",
+                "phase":"post_import",
+                "pre_import_evidence_hash":synthetic_pre.content_hash
+            })),
+            ..CallInput::default()
+        };
+        assert!(
+            mln_0143_parent_manifests(&store, &catalog, capability, &synthetic_input).is_err(),
+            "direct evidence persistence must not mint governed-execution provenance"
+        );
+        let credential_generation_id = "11111111-1111-4111-8111-111111111111";
+        let register = |manifest: Value, phase: &str| {
+            let response = json!({"result": manifest});
+            let evidence = store
+                .write_evidence(EvidenceClass::LiveRead, &response)
+                .expect("runtime evidence");
+            let mut envelope = cfctl_core::ResultEnvelopeV2::success("call", response)
+                .with_evidence(evidence.clone());
+            envelope.performed = true;
+            envelope.capability_id = Some(capability.id.clone());
+            envelope.profile_id = Some("default".to_owned());
+            envelope.account_id = Some(contract.account_id.clone());
+            let proof_input = CallInput {
+                body: Some(json!({"migration_id":"0143","phase":phase})),
+                ..CallInput::default()
+            };
+            record_operational_proof(
+                &store,
+                &catalog,
+                capability,
+                &proof_input,
+                Some(credential_generation_id),
+                &envelope,
+            )
+            .expect("governed runtime proof");
+            evidence
+        };
+        let pre = register(base("pre_import"), "pre_import");
         for (label, mut stale) in [
             ("v1", base("pre_import")),
             ("missing query hash", base("pre_import")),
@@ -17705,16 +17771,14 @@ mod tests {
                 ..CallInput::default()
             };
             assert!(
-                mln_0143_parent_manifests(&store, capability, &stale_input).is_err(),
+                mln_0143_parent_manifests(&store, &catalog, capability, &stale_input).is_err(),
                 "{label}"
             );
         }
         let mut post_manifest = base("post_import");
         post_manifest["lineage"]["pre_import_evidence_hash"] =
             Value::String(pre.content_hash.clone());
-        let post = store
-            .write_evidence(EvidenceClass::LiveRead, &post_manifest)
-            .expect("post evidence");
+        let post = register(post_manifest, "post_import");
         let input = CallInput {
             body: Some(json!({
                 "migration_id":"0143",
@@ -17724,8 +17788,8 @@ mod tests {
             })),
             ..CallInput::default()
         };
-        let parents =
-            mln_0143_parent_manifests(&store, capability, &input).expect("valid parent lineage");
+        let parents = mln_0143_parent_manifests(&store, &catalog, capability, &input)
+            .expect("valid parent lineage");
         validate_mln_0143_lineage_result(&input, &base("post_restore"), &parents)
             .expect("restored result equals pre baseline");
 
@@ -17751,6 +17815,12 @@ mod tests {
         non_target_restore_drift["packet_count"] = json!(2);
         assert!(
             validate_mln_0143_lineage_result(&input, &non_target_restore_drift, &parents).is_err()
+        );
+        let duplicate_pre = register(base("pre_import"), "pre_import");
+        assert_eq!(duplicate_pre.content_hash, pre.content_hash);
+        assert!(
+            mln_0143_parent_manifests(&store, &catalog, capability, &input).is_err(),
+            "duplicate governed executions for one parent manifest fail closed"
         );
     }
 

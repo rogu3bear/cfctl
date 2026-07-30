@@ -1892,7 +1892,7 @@ fn mln_0143_data_invariants_capability() -> CapabilityV1 {
         post_table_definition_hash:
             "sha256:2fbdacd011abca8024507b99d179071b8b920271576e4cb3a2f06c4f3ffd2d7f".to_owned(),
         validator_contract_hash:
-            "sha256:481f9ca0fd6defbc3e6c20e81d6391d5b26ae74174389935690b86dbc30c00e3".to_owned(),
+            "sha256:f064cfc6b9e5177b6b5aa5ee6ac8b306ef321342f0278bf7fe2085e6aa3b29be".to_owned(),
         capability_version: 2,
         max_evidence_rows: 256,
         probe_rows: 257,

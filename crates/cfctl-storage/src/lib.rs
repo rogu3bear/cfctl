@@ -11,7 +11,8 @@ use std::{
 
 use cfctl_core::{
     AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, EvidenceClass, EvidenceV1,
-    OperationalProofV1, PlanV1, PlanV2, StandingAuthorityStatus, StandingAuthorityV1, redact_json,
+    OperationalProofV1, PlanV1, PlanV2, StandingAuthorityStatus, StandingAuthorityV1, hash_value,
+    redact_json,
 };
 use cfctl_workspace::{
     WORKSPACE_MANIFEST_SCHEMA_VERSION, WorkspaceManifestV1, WorkspaceRegistrationV1,
@@ -19,7 +20,7 @@ use cfctl_workspace::{
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -1268,6 +1269,70 @@ fn validate_operational_proof(
         ));
     }
     validate_sha256_identity("evidence", &proof.evidence.content_hash)?;
+    validate_mln_0143_execution_binding(proof)?;
+    Ok(())
+}
+
+fn validate_mln_0143_execution_binding(proof: &OperationalProofV1) -> Result<()> {
+    let binding = proof.mln_0143_governed_execution();
+    if proof.capability_id == "mln-0143-data-invariants" && binding.is_none() {
+        return Err(StorageError::InvalidOperationalProof(
+            "MLN 0143 operational proof requires governed-execution provenance".to_owned(),
+        ));
+    }
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    let profile_id = proof.profile_id.as_deref().ok_or_else(|| {
+        StorageError::InvalidOperationalProof(
+            "MLN 0143 execution binding requires a profile identity".to_owned(),
+        )
+    })?;
+    let credential_generation_id = proof.credential_generation_id.as_deref().ok_or_else(|| {
+        StorageError::InvalidOperationalProof(
+            "MLN 0143 execution binding requires a credential generation".to_owned(),
+        )
+    })?;
+    for (label, value) in [
+        (
+            "validator contract",
+            binding.validator_contract_hash.as_str(),
+        ),
+        ("fixed query", binding.fixed_query_sha256.as_str()),
+        ("binding catalog", binding.catalog_hash.as_str()),
+        ("target scope", binding.target_scope_hash.as_str()),
+        ("manifest evidence", binding.manifest_evidence_hash.as_str()),
+        ("request", binding.request_hash.as_str()),
+        ("profile identity", binding.profile_identity_hash.as_str()),
+    ] {
+        validate_sha256_identity(label, value)?;
+    }
+    let expected_profile_identity = hash_value(&json!({
+        "profile_id": profile_id,
+        "credential_generation_id": credential_generation_id,
+    }))
+    .map_err(|error| StorageError::InvalidOperationalProof(error.to_string()))?;
+    if binding.schema_version != 1
+        || Uuid::parse_str(&binding.operation_id).is_err()
+        || binding.capability_id != proof.capability_id
+        || binding.capability_version != 2
+        || binding.catalog_hash != proof.catalog_hash
+        || binding.manifest_evidence_hash != proof.evidence.content_hash
+        || binding.request_hash != proof.input_hash
+        || binding.profile_identity_hash != expected_profile_identity
+        || binding.credential_generation_id != credential_generation_id
+        || !matches!(
+            binding.phase.as_str(),
+            "pre_import" | "post_import" | "post_restore"
+        )
+        || binding.completion_status != "completed"
+        || binding.completed_at != proof.observed_at
+    {
+        return Err(StorageError::InvalidOperationalProof(
+            "MLN 0143 governed-execution provenance is incomplete or does not match its operational proof"
+                .to_owned(),
+        ));
+    }
     Ok(())
 }
 

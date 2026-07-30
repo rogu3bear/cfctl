@@ -780,6 +780,8 @@ pub enum CoreError {
     InvalidPlanV2(String),
     #[error("event envelope is invalid: {0}")]
     InvalidEventEnvelope(String),
+    #[error("operational proof binding is invalid: {0}")]
+    InvalidOperationalProofBinding(String),
     #[error("standing authority {authority_id} is {actual}; expected {expected}")]
     InvalidStandingAuthorityState {
         authority_id: String,
@@ -986,6 +988,13 @@ impl Mln0143DataInvariantsContractV1 {
                 "required":["schema_version","capability_id","capability_version","validator_contract_hash","migration_id","migration_sha256","phase","target_scope_hash","complete","projection","semantic_schema_hash","packet_hash","packet_count","packet_non_target_hash","packet_non_target_count","trigger_definition_hashes","assertions","query","lineage"],
                 "assertions":["old_table_absent","unique_hash_index_present","event_index_exact_non_unique_shape","document_index_exact_non_unique_shape","foreign_key_check_empty","duplicate_hash_groups_zero","invalid_evidence_kinds_zero","invalid_advanced_events_zero"],
                 "query":["sha256","row_limit","probe_rows","byte_limit","timeout_seconds","received_rows","provider_rows_read","provider_duration","bounds_saturated"],
+            },
+            "governed_execution_provenance":{
+                "schema_version":1,
+                "required":["operation_id","capability_id","capability_version","validator_contract_hash","fixed_query_sha256","catalog_hash","target_scope_hash","phase","manifest_evidence_hash","request_hash","profile_identity_hash","credential_generation_id","completion_status","completed_at"],
+                "completion_status":"completed",
+                "parent_cardinality":"exactly_one",
+                "boundary":"governed_cfctl_runtime_provenance_not_hostile_filesystem_or_code_tamper_resistance",
             },
         }))
     }
@@ -5889,6 +5898,27 @@ pub struct OperationalProofV1 {
     pub credential_generation_id: Option<String>,
     pub outcome: OperationalProofOutcomeV1,
     pub evidence: EvidenceV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mln_0143_execution: Option<Mln0143GovernedExecutionBindingV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mln0143GovernedExecutionBindingV1 {
+    pub schema_version: u8,
+    pub operation_id: String,
+    pub capability_id: String,
+    pub capability_version: u8,
+    pub validator_contract_hash: String,
+    pub fixed_query_sha256: String,
+    pub catalog_hash: String,
+    pub target_scope_hash: String,
+    pub phase: String,
+    pub manifest_evidence_hash: String,
+    pub request_hash: String,
+    pub profile_identity_hash: String,
+    pub credential_generation_id: String,
+    pub completion_status: String,
+    pub completed_at: DateTime<Utc>,
 }
 
 impl OperationalProofV1 {
@@ -5913,7 +5943,37 @@ impl OperationalProofV1 {
             credential_generation_id: scope.credential_generation_id,
             outcome,
             evidence,
+            mln_0143_execution: None,
         }
+    }
+
+    pub fn bind_mln_0143_governed_execution(
+        &mut self,
+        binding: Mln0143GovernedExecutionBindingV1,
+    ) -> Result<()> {
+        if self.mln_0143_execution.is_some()
+            || self.capability_id != "mln-0143-data-invariants"
+            || self.outcome != OperationalProofOutcomeV1::Succeeded
+            || self.evidence.content_hash != binding.manifest_evidence_hash
+            || self.catalog_hash != binding.catalog_hash
+            || self.input_hash != binding.request_hash
+            || self.credential_generation_id.as_deref()
+                != Some(binding.credential_generation_id.as_str())
+            || binding.schema_version != 1
+            || binding.completion_status != "completed"
+        {
+            return Err(CoreError::InvalidOperationalProofBinding(
+                "MLN governed execution binding does not match its completed operational proof"
+                    .to_owned(),
+            ));
+        }
+        self.mln_0143_execution = Some(binding);
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn mln_0143_governed_execution(&self) -> Option<&Mln0143GovernedExecutionBindingV1> {
+        self.mln_0143_execution.as_ref()
     }
 
     #[must_use]

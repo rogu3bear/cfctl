@@ -2,9 +2,9 @@
 
 use cfctl_core::{
     AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1, CapabilityV1,
-    EvidenceClass, OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1,
-    PlanStatus, PlanV1, PolicyDisposition, StandingAuthorityStatus, StandingAuthorityV1,
-    TransactionStageV1,
+    EvidenceClass, Mln0143GovernedExecutionBindingV1, OperationalProofOutcomeV1,
+    OperationalProofScopeV1, OperationalProofV1, PlanStatus, PlanV1, PolicyDisposition,
+    StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, hash_value,
 };
 use cfctl_storage::{RuntimePaths, StateStore, StorageError, StoredPlanRecord};
 use chrono::{Duration, Utc};
@@ -369,6 +369,109 @@ fn operational_proof_requires_exact_hashes_and_nonempty_scope() {
         Err(StorageError::InvalidOperationalProof(message))
             if message.contains("credential-generation")
     ));
+}
+
+#[test]
+fn mln_0143_operational_proof_requires_exact_completed_runtime_binding() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let observed_at = Utc::now();
+    let evidence = store
+        .write_evidence(
+            EvidenceClass::LiveRead,
+            &json!({"result":{"complete":true}}),
+        )
+        .expect("evidence writes");
+    let valid_binding = Mln0143GovernedExecutionBindingV1 {
+        schema_version: 1,
+        operation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+        capability_id: "mln-0143-data-invariants".to_owned(),
+        capability_version: 2,
+        validator_contract_hash: sha256('c'),
+        fixed_query_sha256: sha256('d'),
+        catalog_hash: sha256('a'),
+        target_scope_hash: sha256('e'),
+        phase: "pre_import".to_owned(),
+        manifest_evidence_hash: evidence.content_hash.clone(),
+        request_hash: sha256('b'),
+        profile_identity_hash: hash_value(&json!({
+            "profile_id":"profile-a",
+            "credential_generation_id":GENERATION_A,
+        }))
+        .expect("profile identity hash"),
+        credential_generation_id: GENERATION_A.to_owned(),
+        completion_status: "completed".to_owned(),
+        completed_at: observed_at,
+    };
+    let build = |binding: Mln0143GovernedExecutionBindingV1| {
+        let mut proof = OperationalProofV1::new(
+            observed_at,
+            "mln-0143-data-invariants",
+            &sha256('a'),
+            &sha256('b'),
+            OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+            OperationalProofOutcomeV1::Succeeded,
+            evidence.clone(),
+        );
+        proof
+            .bind_mln_0143_governed_execution(binding)
+            .map(|()| proof)
+    };
+    store
+        .record_operational_proof(&build(valid_binding.clone()).expect("valid binding"))
+        .expect("valid governed proof indexes");
+
+    let mut invalid_bindings = Vec::new();
+    for mutate in [
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.operation_id = "not-an-operation".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.capability_id = "zones-list".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.request_hash = sha256('9');
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.credential_generation_id = "33333333-3333-4333-8333-333333333333".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.target_scope_hash = "not-a-hash".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.phase = "during_import".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.validator_contract_hash = "not-a-hash".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.fixed_query_sha256 = "not-a-hash".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.manifest_evidence_hash = sha256('8');
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.profile_identity_hash = sha256('7');
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.completion_status = "started".to_owned();
+        },
+        |binding: &mut Mln0143GovernedExecutionBindingV1| {
+            binding.completed_at += Duration::seconds(1);
+        },
+    ] {
+        let mut binding = valid_binding.clone();
+        mutate(&mut binding);
+        invalid_bindings.push(binding);
+    }
+    for binding in invalid_bindings {
+        if let Ok(proof) = build(binding) {
+            assert!(matches!(
+                store.record_operational_proof(&proof),
+                Err(StorageError::InvalidOperationalProof(_))
+            ));
+        }
+    }
 }
 
 #[test]
