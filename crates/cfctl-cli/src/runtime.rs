@@ -14159,6 +14159,138 @@ fn known_import_action_response_failure_envelope(
 }
 
 #[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "canonical poll authority binds every immutable lineage dimension explicitly"
+)]
+fn exact_in_progress_poll_receipt(
+    store: &StateStore,
+    plan: &PlanV1,
+    hash: &str,
+    checkpoint: &Value,
+    expected_attempt: u64,
+    target: &Value,
+    input_hash: &str,
+    migration_id: &str,
+    bookmark: &str,
+) -> bool {
+    let expected_step = format!("poll_response_{expected_attempt}");
+    let Some(receipt) = checkpoint.get("receipt").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(result) = receipt.get("result").and_then(Value::as_object) else {
+        return false;
+    };
+    let receipt_fields = [
+        "http_status",
+        "success",
+        "response_action",
+        "provider",
+        "effect",
+        "migration_id",
+        "target",
+        "plan_input_hash",
+        "result",
+        "errors",
+        "provider_errors_present",
+        "no_replay",
+        "etag_present",
+        "etag_sha256",
+        "cf_ray",
+    ];
+    let result_fields = [
+        "type",
+        "status",
+        "success",
+        "at_bookmark",
+        "result",
+        "provider_error_present",
+    ];
+    let nested_result = result.get("result").and_then(Value::as_object);
+    let etag_present = receipt.get("etag_present").and_then(Value::as_bool);
+    let etag_hash = receipt.get("etag_sha256");
+    let etag_exact = match (etag_present, etag_hash) {
+        (Some(false), Some(value)) => value.is_null(),
+        (Some(true), Some(value)) => value
+            .as_str()
+            .and_then(|hash| hash.strip_prefix("sha256:"))
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
+        _ => false,
+    };
+    let cf_ray_exact = receipt.get("cf_ray").is_some_and(|value| {
+        value.is_null()
+            || value.as_str().is_some_and(|ray| {
+                !ray.is_empty()
+                    && ray.len() <= 128
+                    && ray
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+    });
+    checkpoint
+        .as_object()
+        .is_some_and(|object| object.len() == 6)
+        && checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && checkpoint.get("operation_id").and_then(Value::as_str)
+            == Some(plan.operation_id.as_str())
+        && checkpoint.get("step").and_then(Value::as_str) == Some(expected_step.as_str())
+        && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+        && checkpoint
+            .get("rectification_required")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && receipt.len() == receipt_fields.len()
+        && receipt_fields
+            .iter()
+            .all(|field| receipt.contains_key(*field))
+        && receipt.get("http_status").and_then(Value::as_u64) == Some(200)
+        && receipt.get("success").and_then(Value::as_bool) == Some(true)
+        && receipt.get("response_action").and_then(Value::as_str) == Some("poll")
+        && receipt.get("provider").and_then(Value::as_str) == Some("cloudflare")
+        && receipt.get("effect").and_then(Value::as_str) == Some("d1_import_response")
+        && receipt.get("migration_id").and_then(Value::as_str) == Some(migration_id)
+        && receipt.get("target") == Some(target)
+        && receipt.get("plan_input_hash").and_then(Value::as_str) == Some(input_hash)
+        && result.len() == result_fields.len()
+        && result_fields
+            .iter()
+            .all(|field| result.contains_key(*field))
+        && result.get("type").and_then(Value::as_str) == Some("import")
+        && matches!(
+            result.get("status").and_then(Value::as_str),
+            Some("active" | "pending")
+        )
+        && result.get("success").and_then(Value::as_bool) == Some(true)
+        && result.get("at_bookmark").and_then(Value::as_str) == Some(bookmark)
+        && result
+            .get("provider_error_present")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && nested_result.is_some_and(|nested| {
+            nested.len() == 1
+                && nested.contains_key("final_bookmark")
+                && nested.get("final_bookmark").is_some_and(Value::is_null)
+        })
+        && receipt
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        && receipt
+            .get("provider_errors_present")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && receipt.get("no_replay").and_then(Value::as_bool) == Some(false)
+        && etag_exact
+        && cf_ray_exact
+        && checkpoint.get("error").is_none()
+        && store
+            .read_evidence_value(hash)
+            .is_ok_and(|evidence| evidence == *checkpoint)
+}
+
+#[expect(
     clippy::too_many_lines,
     reason = "poll exhaustion authority joins ingest lineage every bounded poll and terminal receipt"
 )]
@@ -14227,41 +14359,17 @@ fn exact_durable_poll_exhaustion(
         .filter_map(|(index, (hash, checkpoint))| {
             let step = checkpoint.get("step").and_then(Value::as_str)?;
             let attempt = step.strip_prefix("poll_response_")?.parse::<u64>().ok()?;
-            let exact = checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
-                && checkpoint
-                    .get("rectification_required")
-                    .and_then(Value::as_bool)
-                    == Some(false)
-                && checkpoint
-                    .pointer("/receipt/response_action")
-                    .and_then(Value::as_str)
-                    == Some("poll")
-                && checkpoint.pointer("/receipt/target") == Some(&target)
-                && checkpoint
-                    .pointer("/receipt/plan_input_hash")
-                    .and_then(Value::as_str)
-                    == Some(input_hash.as_str())
-                && checkpoint
-                    .pointer("/receipt/result/type")
-                    .and_then(Value::as_str)
-                    == Some("import")
-                && matches!(
-                    checkpoint
-                        .pointer("/receipt/result/status")
-                        .and_then(Value::as_str),
-                    Some("active" | "pending")
-                )
-                && checkpoint
-                    .pointer("/receipt/result/success")
-                    .and_then(Value::as_bool)
-                    == Some(true)
-                && checkpoint
-                    .pointer("/receipt/result/at_bookmark")
-                    .and_then(Value::as_str)
-                    == Some(bookmark.as_str())
-                && store
-                    .read_evidence_value(hash)
-                    .is_ok_and(|evidence| evidence == *checkpoint);
+            let exact = exact_in_progress_poll_receipt(
+                store,
+                plan,
+                hash,
+                checkpoint,
+                attempt,
+                &target,
+                &input_hash,
+                migration_id,
+                bookmark,
+            );
             exact.then_some((index, attempt))
         })
         .collect::<Vec<_>>();
@@ -20484,17 +20592,17 @@ mod tests {
         credential_generation_for_read, d1_recovery_anchor_matches, delegated_read_envelope,
         entitlement_probe_selectors, exact_accepted_ingest_bookmarks,
         exact_durable_poll_exhaustion, exact_durable_provider_complete_boundary,
-        exact_durable_provider_failure_boundary, execute_native_workflow, execute_read,
-        find_secret_value, force_ipv4_from, governed_cli_environment_contract,
-        governed_cli_workspace_env, guide_document, guide_stage_commands, http_client,
-        is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
-        key_policy_list, key_policy_revoke, list_security_action_state_receipt,
-        mln_0142_terminal_import_state, mln_0143_parent_manifests,
-        mln_0143_pre_import_authority_matches, mln_0143_pre_import_matches,
-        mln_0143_restore_anchor_matches, non_readback_verification_basis,
-        normalize_reviewed_mln_repository_id, operational_proof_coverage,
-        permission_inventory_call, permission_inventory_envelope, persist_d1_import_checkpoint,
-        persist_prepared_plan, persist_secret_lifecycle,
+        exact_durable_provider_failure_boundary, exact_in_progress_poll_receipt,
+        execute_native_workflow, execute_read, find_secret_value, force_ipv4_from,
+        governed_cli_environment_contract, governed_cli_workspace_env, guide_document,
+        guide_stage_commands, http_client, is_live_plan_precondition_hash,
+        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
+        list_security_action_state_receipt, mln_0142_terminal_import_state,
+        mln_0143_parent_manifests, mln_0143_pre_import_authority_matches,
+        mln_0143_pre_import_matches, mln_0143_restore_anchor_matches,
+        non_readback_verification_basis, normalize_reviewed_mln_repository_id,
+        operational_proof_coverage, permission_inventory_call, permission_inventory_envelope,
+        persist_d1_import_checkpoint, persist_prepared_plan, persist_secret_lifecycle,
         persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
         preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
@@ -22665,41 +22773,124 @@ mod tests {
         };
         persist_d1_import_checkpoint(&exhaustion_store, &exhaustion_plan.operation_id, &accepted)
             .expect("accepted ingest authority");
-        for attempt in 1..=2 {
-            let poll = D1ImportCheckpointV1 {
-                schema_version: 1,
-                operation_id: exhaustion_plan.operation_id.clone(),
-                step: format!("poll_response_{attempt}"),
-                performed: true,
-                rectification_required: false,
-                receipt: json!({
-                    "http_status":200,
+        let exhaustion_operation_id = exhaustion_plan.operation_id.clone();
+        let poll_checkpoint = |attempt| D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: exhaustion_operation_id.clone(),
+            step: format!("poll_response_{attempt}"),
+            performed: true,
+            rectification_required: false,
+            receipt: json!({
+                "http_status":200,
+                "success":true,
+                "response_action":"poll",
+                "provider":"cloudflare",
+                "effect":"d1_import_response",
+                "migration_id":"0143",
+                "target":target,
+                "plan_input_hash":input_hash,
+                "result":{
+                    "type":"import",
+                    "status":"active",
                     "success":true,
-                    "response_action":"poll",
-                    "provider":"cloudflare",
-                    "effect":"d1_import_response",
-                    "migration_id":"0143",
-                    "target":target,
-                    "plan_input_hash":input_hash,
-                    "result":{
-                        "type":"import",
-                        "status":"active",
-                        "success":true,
-                        "at_bookmark":"owned",
-                        "result":{"final_bookmark":null},
-                        "provider_error_present":false,
-                    },
-                    "errors":[],
-                    "provider_errors_present":false,
-                    "no_replay":false,
-                    "etag_present":false,
-                    "etag_sha256":null,
-                    "cf_ray":null,
-                }),
-            };
+                    "at_bookmark":"owned",
+                    "result":{"final_bookmark":null},
+                    "provider_error_present":false,
+                },
+                "errors":[],
+                "provider_errors_present":false,
+                "no_replay":false,
+                "etag_present":false,
+                "etag_sha256":null,
+                "cf_ray":null,
+            }),
+        };
+        for attempt in 1..=2 {
+            let poll = poll_checkpoint(attempt);
             persist_d1_import_checkpoint(&exhaustion_store, &exhaustion_plan.operation_id, &poll)
                 .expect("durable in-progress poll");
         }
+        let exact_poll = serde_json::to_value(poll_checkpoint(1)).expect("exact poll");
+        let exact_poll_hash = exhaustion_store
+            .read_d1_import_checkpoints(&exhaustion_plan.operation_id)
+            .expect("poll checkpoints")
+            .into_iter()
+            .find(|(_, checkpoint)| checkpoint == &exact_poll)
+            .map(|(hash, _)| hash)
+            .expect("exact poll hash");
+        assert!(exact_in_progress_poll_receipt(
+            &exhaustion_store,
+            &exhaustion_plan,
+            &exact_poll_hash,
+            &exact_poll,
+            1,
+            &target,
+            &input_hash,
+            "0143",
+            "owned",
+        ));
+        for (pointer, replacement) in [
+            ("/schema_version", json!(2)),
+            ("/operation_id", json!("different")),
+            ("/step", json!("poll_response_2")),
+            ("/performed", json!(false)),
+            ("/rectification_required", json!(true)),
+            ("/receipt/http_status", json!(201)),
+            ("/receipt/success", json!(false)),
+            ("/receipt/response_action", json!("ingest")),
+            ("/receipt/provider", json!("different")),
+            ("/receipt/effect", json!("different")),
+            ("/receipt/migration_id", json!("0142")),
+            ("/receipt/target/database_id", json!("different")),
+            ("/receipt/plan_input_hash", json!("sha256:different")),
+            ("/receipt/result/type", json!("export")),
+            ("/receipt/result/status", json!("complete")),
+            ("/receipt/result/success", json!(false)),
+            ("/receipt/result/at_bookmark", json!("grafted")),
+            ("/receipt/result/provider_error_present", json!(true)),
+            ("/receipt/result/result/final_bookmark", json!("unexpected")),
+            ("/receipt/errors", json!(["SECRET"])),
+            ("/receipt/provider_errors_present", json!(true)),
+            ("/receipt/no_replay", json!(true)),
+            ("/receipt/etag_present", json!(true)),
+            ("/receipt/etag_sha256", json!("raw-etag")),
+            ("/receipt/unknown", json!("SECRET")),
+        ] {
+            let mut drifted = exact_poll.clone();
+            if pointer == "/receipt/unknown" {
+                drifted["receipt"]["unknown"] = replacement;
+            } else {
+                *drifted.pointer_mut(pointer).expect("mutation pointer") = replacement;
+            }
+            assert!(
+                !exact_in_progress_poll_receipt(
+                    &exhaustion_store,
+                    &exhaustion_plan,
+                    &exact_poll_hash,
+                    &drifted,
+                    1,
+                    &target,
+                    &input_hash,
+                    "0143",
+                    "owned",
+                ),
+                "{pointer}"
+            );
+        }
+        assert!(
+            !exact_in_progress_poll_receipt(
+                &exhaustion_store,
+                &exhaustion_plan,
+                "sha256:missing",
+                &exact_poll,
+                1,
+                &target,
+                &input_hash,
+                "0143",
+                "owned",
+            ),
+            "missing or mismatched evidence must fail"
+        );
         let exhausted = D1ImportCheckpointV1 {
             schema_version: 1,
             operation_id: exhaustion_plan.operation_id.clone(),
@@ -22743,11 +22934,15 @@ mod tests {
                 .is_some_and(|hash| hash.starts_with("sha256:"))
         );
         assert_ne!(exhaustion_plan.status, PlanStatus::Running);
-        persist_d1_import_checkpoint(&exhaustion_store, &exhaustion_plan.operation_id, &exhausted)
-            .expect("later grafted exhaustion");
+        persist_d1_import_checkpoint(
+            &exhaustion_store,
+            &exhaustion_plan.operation_id,
+            &poll_checkpoint(2),
+        )
+        .expect("later duplicate poll");
         assert!(
             exact_durable_poll_exhaustion(&exhaustion_store, &exhaustion_plan).is_err(),
-            "the exhaustion authority must be unique and the journal tail"
+            "a duplicate poll after exhaustion must invalidate chronology and tail authority"
         );
 
         let root = tempfile::tempdir().expect("known failure root");
