@@ -465,6 +465,12 @@ SELECT evidence_rows,evidence_received,evidence_window_total,
  (SELECT sql FROM sqlite_schema WHERE type='table' AND name='equity_issuance_evidence_links') AS table_sql,
  (SELECT COALESCE(json_group_array(name),'[]') FROM (SELECT name FROM pragma_table_info('equity_issuance_evidence_links') ORDER BY cid)) AS column_names,
  (SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='equity_issuance_evidence_links_0143_old') AS old_table_count,
+ (SELECT sql FROM sqlite_schema WHERE type='index' AND name='idx_equity_issuance_evidence_event') AS event_index_sql,
+ (SELECT [unique] FROM pragma_index_list('equity_issuance_evidence_links') WHERE name='idx_equity_issuance_evidence_event') AS event_index_unique,
+ (SELECT COALESCE(json_group_array(name),'[]') FROM (SELECT name FROM pragma_index_info('idx_equity_issuance_evidence_event') ORDER BY seqno)) AS event_index_columns,
+ (SELECT sql FROM sqlite_schema WHERE type='index' AND name='idx_equity_issuance_evidence_document') AS document_index_sql,
+ (SELECT [unique] FROM pragma_index_list('equity_issuance_evidence_links') WHERE name='idx_equity_issuance_evidence_document') AS document_index_unique,
+ (SELECT COALESCE(json_group_array(name),'[]') FROM (SELECT name FROM pragma_index_info('idx_equity_issuance_evidence_document') ORDER BY seqno)) AS document_index_columns,
  (SELECT sql FROM sqlite_schema WHERE type='index' AND name='idx_equity_issuance_evidence_unique_hash') AS unique_hash_index_sql,
  (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_equity_instrument_evidence_contract') AS trigger_contract_sql,
  (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_equity_instrument_evidence_immutable') AS trigger_immutable_sql,
@@ -866,6 +872,12 @@ mod mln_0143_invariant_tests {
                     "table_sql":format!("CREATE TABLE equity_issuance_evidence_links (evidence_kind TEXT CHECK (evidence_kind IN ({old_allowlist})))"),
                     "column_names":"[\"id\",\"org_id\",\"issuance_event_id\",\"evidence_kind\",\"document_id\",\"company_event_id\",\"document_hash\",\"required\",\"created_by\",\"created_at\"]",
                     "old_table_count":0,
+                    "event_index_sql":"CREATE INDEX idx_equity_issuance_evidence_event ON equity_issuance_evidence_links(org_id, issuance_event_id, evidence_kind)",
+                    "event_index_unique":0,
+                    "event_index_columns":"[\"org_id\",\"issuance_event_id\",\"evidence_kind\"]",
+                    "document_index_sql":"CREATE INDEX idx_equity_issuance_evidence_document ON equity_issuance_evidence_links(org_id, document_id)",
+                    "document_index_unique":0,
+                    "document_index_columns":"[\"org_id\",\"document_id\"]",
                     "unique_hash_index_sql":"CREATE UNIQUE INDEX idx_equity_issuance_evidence_unique_hash ON equity_issuance_evidence_links(org_id, issuance_event_id, evidence_kind, document_hash) WHERE document_hash IS NOT NULL",
                     "trigger_contract_sql":null,
                     "trigger_immutable_sql":null,
@@ -927,6 +939,47 @@ mod mln_0143_invariant_tests {
             .expect("meta")
             .remove("rows_read");
         assert!(sanitize_mln_0143_data_invariants_response(&mut response, &request).is_err());
+    }
+
+    #[test]
+    fn both_non_unique_indexes_fail_closed_on_absence_order_or_uniqueness_drift() {
+        let request = prepared("pre_import");
+        for (sql_field, unique_field, columns_field, wrong_columns) in [
+            (
+                "event_index_sql",
+                "event_index_unique",
+                "event_index_columns",
+                "[\"evidence_kind\",\"issuance_event_id\",\"org_id\"]",
+            ),
+            (
+                "document_index_sql",
+                "document_index_unique",
+                "document_index_columns",
+                "[\"document_id\",\"org_id\"]",
+            ),
+        ] {
+            let mut absent = pre_response(0);
+            absent.result[0]["results"][0][sql_field] = Value::Null;
+            assert!(
+                sanitize_mln_0143_data_invariants_response(&mut absent, &request).is_err(),
+                "{sql_field} absence"
+            );
+
+            let mut reordered = pre_response(0);
+            reordered.result[0]["results"][0][columns_field] =
+                Value::String(wrong_columns.to_owned());
+            assert!(
+                sanitize_mln_0143_data_invariants_response(&mut reordered, &request).is_err(),
+                "{columns_field} order"
+            );
+
+            let mut unique = pre_response(0);
+            unique.result[0]["results"][0][unique_field] = json!(1);
+            assert!(
+                sanitize_mln_0143_data_invariants_response(&mut unique, &request).is_err(),
+                "{unique_field} drift"
+            );
+        }
     }
 
     #[test]
@@ -4555,6 +4608,37 @@ fn sanitize_mln_0143_data_invariants_response(
     {
         return Err(invariant_response_error(response.status));
     }
+    for (sql_field, unique_field, columns_field, index_name, expected_columns) in [
+        (
+            "event_index_sql",
+            "event_index_unique",
+            "event_index_columns",
+            "idx_equity_issuance_evidence_event",
+            serde_json::json!(["org_id", "issuance_event_id", "evidence_kind"]),
+        ),
+        (
+            "document_index_sql",
+            "document_index_unique",
+            "document_index_columns",
+            "idx_equity_issuance_evidence_document",
+            serde_json::json!(["org_id", "document_id"]),
+        ),
+    ] {
+        let sql = text(sql_field)?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        let columns: Value = serde_json::from_str(text(columns_field)?)
+            .map_err(|_| invariant_response_error(response.status))?;
+        if number(unique_field)? != 0
+            || columns != expected_columns
+            || !sql.starts_with(&format!("create index {index_name} on "))
+            || sql.contains("create unique index")
+        {
+            return Err(invariant_response_error(response.status));
+        }
+    }
     let index_sql = text("unique_hash_index_sql")?;
     let index_normalized = index_sql
         .split_whitespace()
@@ -4636,6 +4720,8 @@ fn sanitize_mln_0143_data_invariants_response(
         "assertions":{
             "old_table_absent":true,
             "unique_hash_index_present":true,
+            "event_index_exact_non_unique_shape":true,
+            "document_index_exact_non_unique_shape":true,
             "foreign_key_check_empty":true,
             "duplicate_hash_groups_zero":true,
             "invalid_evidence_kinds_zero":true,
