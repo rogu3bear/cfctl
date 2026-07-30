@@ -108,6 +108,8 @@ pub enum CloudflareError {
     D1ImportProviderFailure,
     #[error("D1 import upload response failed its integrity contract")]
     D1ImportUploadResponseIntegrityFailure,
+    #[error("D1 import init returned a known rejected or invalid provider response")]
+    D1ImportInitResponseFailure,
     #[error("plan or capability `{capability_id}` is not an exact consumed event batch contract")]
     InvalidEventBatchPlan { capability_id: String },
     #[error("Cloudflare API base URL cannot accept path segments")]
@@ -2507,14 +2509,14 @@ impl Executor {
             }
         };
         if !init.success {
-            persist_import_response(&mut persist, plan, "init_response", &init, None)?;
-            plan.status = PlanStatus::Failed;
-            return Ok(init);
-        }
-        if let Err(error) = accepted_d1_import_init_response(&init) {
-            persist_import_response(&mut persist, plan, "init_response", &init, None)?;
             plan.status = PlanStatus::RectificationRequired;
-            return Err(error);
+            persist_import_response(&mut persist, plan, "init_response", &init, None)?;
+            return Err(CloudflareError::D1ImportInitResponseFailure);
+        }
+        if accepted_d1_import_init_response(&init).is_err() {
+            plan.status = PlanStatus::RectificationRequired;
+            persist_import_response(&mut persist, plan, "init_response", &init, None)?;
+            return Err(CloudflareError::D1ImportInitResponseFailure);
         }
         let upload_url_raw = init.result.get("upload_url").and_then(Value::as_str);
         let filename_raw = init.result.get("filename").and_then(Value::as_str);
@@ -9007,6 +9009,10 @@ fn accepted_d1_import_poll_outcome<'a>(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one projection boundary binds every action receipt and its durability metadata"
+)]
 fn persist_import_response<F>(
     persist: &mut F,
     plan: &PlanV1,
@@ -9041,7 +9047,33 @@ where
         .get("body")
         .and_then(|body| body.get("migration_id"))
         .and_then(Value::as_str);
-    let mut result = replacement_result.unwrap_or_else(|| response.result.clone());
+    let mut result = if response_action == "init" {
+        let upload_url = response.result.get("upload_url").and_then(Value::as_str);
+        let filename = response.result.get("filename").and_then(Value::as_str);
+        serde_json::json!({
+            "type":response.result.get("type"),
+            "status":response.result.get("status"),
+            "success":response.result.get("success"),
+            "at_bookmark":response.result.get("at_bookmark"),
+            "upload_url_present":upload_url.is_some(),
+            "upload_url_sha256":upload_url.map(|value| format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))),
+            "filename_present":filename.is_some(),
+            "filename_sha256":filename.map(|value| format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))),
+            "provider_error_present":response.result.get("error").is_some(),
+        })
+    } else {
+        let source = replacement_result.as_ref().unwrap_or(&response.result);
+        serde_json::json!({
+            "type":source.get("type"),
+            "status":source.get("status"),
+            "success":source.get("success"),
+            "at_bookmark":source.get("at_bookmark"),
+            "result":{
+                "final_bookmark":source.pointer("/result/final_bookmark"),
+            },
+            "provider_error_present":source.get("error").is_some(),
+        })
+    };
     let successful_nonterminal_ingest = step == "ingest_response"
         && response.success
         && result.get("type").and_then(Value::as_str) == Some("import")
@@ -9077,7 +9109,9 @@ where
         operation_id: plan.operation_id.clone(),
         step: step.to_owned(),
         performed: true,
-        rectification_required: !response.success || terminal_provider_failure,
+        rectification_required: matches!(plan.status, PlanStatus::RectificationRequired)
+            || !response.success
+            || terminal_provider_failure,
         receipt: serde_json::json!({
             "http_status":response.status,
             "success":response.success,
@@ -9090,8 +9124,9 @@ where
             "result":result,
             "errors":[],
             "provider_errors_present":!response.errors.is_empty(),
-            "no_replay":terminal_provider_failure,
-            "etag":response.etag,
+            "no_replay":terminal_provider_failure || matches!(plan.status, PlanStatus::RectificationRequired),
+            "etag_present":response.etag.is_some(),
+            "etag_sha256":response.etag.as_ref().map(|value| format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))),
             "cf_ray":response.cf_ray,
         }),
     })
@@ -9150,11 +9185,11 @@ mod approved_mln_import_tests {
     use super::{
         CloudflareError, D1ImportPollOutcome, accepted_d1_import_ingest_response,
         accepted_d1_import_init_response, accepted_d1_import_poll_outcome,
-        bounded_d1_import_upload, parse_response, persist_import_uncertainty,
-        validate_d1_import_poll_response, validate_d1_import_upload_url,
-        validated_d1_import_upload_etag,
+        bounded_d1_import_upload, parse_response, persist_import_response,
+        persist_import_uncertainty, validate_d1_import_poll_response,
+        validate_d1_import_upload_url, validated_d1_import_upload_etag,
     };
-    use cfctl_core::{CapabilityV1, D1ApprovedMlnImportContractV1, PlanV1};
+    use cfctl_core::{CapabilityV1, D1ApprovedMlnImportContractV1, PlanStatus, PlanV1};
     use reqwest::header::{ETAG, HeaderMap, HeaderValue};
     use serde_json::json;
     use std::time::{Duration, Instant};
@@ -9369,6 +9404,122 @@ mod approved_mln_import_tests {
             })))
             .is_err()
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one confidentiality regression compares init ingest and poll projections"
+    )]
+    fn approved_import_response_checkpoints_are_always_action_projected() {
+        let secret_url = "https://upload.invalid/object?X-Amz-Signature=SECRET";
+        let mut capability = CapabilityV1::new(
+            "d1-import-approved-mln-migration",
+            "Approved import",
+            "POST",
+            "/accounts/{account_id}/d1/database/{database_id}/import",
+        );
+        capability.d1_approved_mln_import = Some(contract());
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:catalog",
+            capability,
+            json!({}),
+        )
+        .expect("import plan");
+        plan.input = json!({
+            "selectors":{
+                "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "database_id":"11111111-1111-4111-8111-111111111111",
+            },
+            "body":{"migration_id":"0143"},
+        });
+        plan.status = PlanStatus::RectificationRequired;
+        let malformed_init = parse_response(
+            200,
+            &json!({
+                "success":true,
+                "result":{
+                    "type":"import",
+                    "status":"unsupported",
+                    "success":true,
+                    "upload_url":secret_url,
+                    "filename":"SECRET.sql",
+                    "nested":{"credential":"SECRET"},
+                    "error":{"message":"SECRET"},
+                },
+                "errors":[{"message":"SECRET"}],
+            }),
+            Some("SECRET-etag".to_owned()),
+            Some("safe-ray".to_owned()),
+        );
+        assert!(accepted_d1_import_init_response(&malformed_init).is_err());
+        let mut checkpoints = Vec::new();
+        persist_import_response(
+            &mut |checkpoint| {
+                checkpoints.push(serde_json::to_value(checkpoint).expect("checkpoint"));
+                Ok(())
+            },
+            &plan,
+            "init_response",
+            &malformed_init,
+            None,
+        )
+        .expect("redacted init receipt");
+        let checkpoint = &checkpoints[0];
+        assert_eq!(checkpoint["performed"], true);
+        assert_eq!(checkpoint["rectification_required"], true);
+        assert_eq!(checkpoint["receipt"]["response_action"], "init");
+        assert_eq!(checkpoint["receipt"]["no_replay"], true);
+        assert_eq!(checkpoint["receipt"]["result"]["upload_url_present"], true);
+        assert_eq!(checkpoint["receipt"]["result"]["filename_present"], true);
+        let durable = checkpoint.to_string();
+        for forbidden in [
+            "X-Amz-Signature",
+            "SECRET",
+            "upload.invalid",
+            "credential",
+            "SECRET.sql",
+            "SECRET-etag",
+        ] {
+            assert!(!durable.contains(forbidden), "{forbidden}");
+        }
+
+        for (step, action) in [("ingest_response", "ingest"), ("poll_response_1", "poll")] {
+            let response = parse_response(
+                200,
+                &json!({
+                    "success":true,
+                    "result":{
+                        "type":"import",
+                        "status":"unsupported",
+                        "success":true,
+                        "at_bookmark":"safe-bookmark",
+                        "upload_url":secret_url,
+                        "credential":"SECRET",
+                    }
+                }),
+                None,
+                None,
+            );
+            let mut projected = Vec::new();
+            persist_import_response(
+                &mut |checkpoint| {
+                    projected.push(serde_json::to_value(checkpoint).expect("checkpoint"));
+                    Ok(())
+                },
+                &plan,
+                step,
+                &response,
+                None,
+            )
+            .expect("projected action receipt");
+            assert_eq!(projected[0]["receipt"]["response_action"], action);
+            assert!(!projected[0].to_string().contains("SECRET"));
+            assert!(!projected[0].to_string().contains("upload_url"));
+            assert!(!projected[0].to_string().contains("credential"));
+        }
     }
 
     #[tokio::test]
