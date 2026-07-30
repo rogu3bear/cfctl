@@ -13194,6 +13194,179 @@ fn exact_durable_provider_complete_boundary(
     Ok((hash.clone(), checkpoint.clone()))
 }
 
+fn exact_durable_provider_failure_boundary(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<(EvidenceV1, Value)> {
+    let failures = store
+        .read_d1_import_checkpoints(&plan.operation_id)?
+        .into_iter()
+        .filter(|(_, checkpoint)| {
+            checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+                && checkpoint.get("operation_id").and_then(Value::as_str)
+                    == Some(plan.operation_id.as_str())
+                && checkpoint
+                    .get("step")
+                    .and_then(Value::as_str)
+                    .is_some_and(|step| step.starts_with("poll_response_"))
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/success")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/result/type")
+                    .and_then(Value::as_str)
+                    == Some("import")
+                && checkpoint
+                    .pointer("/receipt/result/status")
+                    .and_then(Value::as_str)
+                    == Some("error")
+                && checkpoint
+                    .pointer("/receipt/result/success")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && checkpoint
+                    .pointer("/receipt/result/at_bookmark")
+                    .and_then(Value::as_str)
+                    .is_some_and(|bookmark| !bookmark.is_empty())
+                && checkpoint
+                    .pointer("/receipt/result/provider_error_present")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint.pointer("/receipt/result/error").is_none()
+                && checkpoint
+                    .pointer("/receipt/errors")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+        })
+        .collect::<Vec<_>>();
+    if failures.len() != 1 {
+        return Err(CliError::Input(
+            "known import provider failure requires exactly one durable redacted poll checkpoint"
+                .to_owned(),
+        ));
+    }
+    let (hash, checkpoint) = &failures[0];
+    if store.read_evidence_value(hash)? != *checkpoint {
+        return Err(CliError::Input(
+            "known import provider-failure evidence does not match its immutable checkpoint"
+                .to_owned(),
+        ));
+    }
+    Ok((
+        EvidenceV1::new(
+            EvidenceClass::Apply,
+            hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!("{}.json", hash.trim_start_matches("sha256:")))
+                .display()
+                .to_string(),
+        ),
+        checkpoint.clone(),
+    ))
+}
+
+fn known_import_provider_failure_envelope(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    secrets: &dyn SecretStore,
+) -> ResultEnvelopeV2 {
+    plan.status = PlanStatus::RectificationRequired;
+    match exact_durable_provider_failure_boundary(store, plan) {
+        Ok((evidence, _checkpoint)) => {
+            let artifact = json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":"provider_rejected",
+                "receipt_available":true,
+                "provider_failure_evidence_hash":evidence.content_hash,
+            });
+            let mut local_failures = Vec::new();
+            if let Err(error) = persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                artifact,
+            ) {
+                local_failures.push(format!("provider-failure receipt binding failed: {error}"));
+            }
+            if let Err(error) = persist_secret_lifecycle(store, plan, false, None, secrets) {
+                local_failures.push(format!(
+                    "provider-failure secret lifecycle persistence failed: {error}"
+                ));
+            }
+            let detail = if local_failures.is_empty() {
+                "Cloudflare reported a terminal D1 import failure".to_owned()
+            } else {
+                format!(
+                    "Cloudflare reported a terminal D1 import failure; {}",
+                    local_failures.join("; ")
+                )
+            };
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":"provider_rejected",
+                    "receipt_available":true,
+                    "provider_status":"error",
+                }),
+                Some(evidence),
+                None,
+                &CliError::Input(detail),
+                true,
+                "the exact redacted Cloudflare provider-failure response is durable; the import did not complete and must not be replayed",
+            )
+        }
+        Err(error) => {
+            let _ = store.save_plan(plan);
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":"provider_rejected_receipt_invalid",
+                    "receipt_available":false,
+                }),
+                None,
+                None,
+                &error,
+                true,
+                "Cloudflare reported a terminal provider failure, but its exact durable redacted checkpoint could not be uniquely resolved; do not replay",
+            )
+        }
+    }
+}
+
+fn approved_mln_import_execution_error_envelope(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    error: CloudflareError,
+    secrets: &dyn SecretStore,
+) -> ResultEnvelopeV2 {
+    if matches!(error, CloudflareError::D1ImportProviderFailure) {
+        return known_import_provider_failure_envelope(store, plan, secrets);
+    }
+    if !matches!(
+        plan.status,
+        PlanStatus::RectificationRequired | PlanStatus::Failed
+    ) {
+        plan.status = PlanStatus::RectificationRequired;
+    }
+    let _ = store.save_plan(plan);
+    let mut envelope = process_api_transport_failure(store, plan, &CliError::from(error), secrets);
+    envelope.performed = true;
+    envelope
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "special import execution durably binds checkpoints evidence and pending verification"
@@ -13241,6 +13414,28 @@ async fn execute_approved_mln_import_plan(
                         );
                     }
                 }
+                if checkpoint.step.starts_with("poll_response_")
+                    && checkpoint
+                        .receipt
+                        .pointer("/result/status")
+                        .and_then(Value::as_str)
+                        == Some("error")
+                    && checkpoint
+                        .receipt
+                        .pointer("/result/success")
+                        .and_then(Value::as_bool)
+                        == Some(false)
+                {
+                    let evidence = store
+                        .write_evidence(EvidenceClass::Apply, &value)
+                        .map_err(|error| error.to_string())?;
+                    if evidence.content_hash != checkpoint_hash {
+                        return Err(
+                            "provider-failure checkpoint and apply evidence hashes diverged"
+                                .to_owned(),
+                        );
+                    }
+                }
                 Ok(())
             },
         )
@@ -13248,17 +13443,9 @@ async fn execute_approved_mln_import_plan(
     {
         Ok(response) => response,
         Err(error) => {
-            if !matches!(
-                plan.status,
-                PlanStatus::RectificationRequired | PlanStatus::Failed
-            ) {
-                plan.status = PlanStatus::RectificationRequired;
-            }
-            store.save_plan(plan)?;
-            let error = CliError::from(error);
-            let mut envelope = process_api_transport_failure(store, plan, &error, secrets);
-            envelope.performed = true;
-            return Ok(envelope);
+            return Ok(approved_mln_import_execution_error_envelope(
+                store, plan, error, secrets,
+            ));
         }
     };
     let (response_value, apply_evidence, lineage_evidence) =
@@ -19153,23 +19340,25 @@ mod tests {
         apply_oauth_client_secret_state_response, apply_operational_proof_index_result,
         apply_r2_parent_token_response, apply_warp_connector_configuration_state_response,
         apply_web_analytics_rum_state_response, apply_zone_account_response,
-        apply_zone_entitlement_response, approve_plan, bind_required_empty_compensation_body,
+        apply_zone_entitlement_response, approve_plan,
+        approved_mln_import_execution_error_envelope, bind_required_empty_compensation_body,
         blocked_capability_envelope, boundary_response_artifact, build_mint_policy_body,
         call_command, cancel_plan, capability_call_argv, compensation_request,
         credential_generation_for_read, d1_recovery_anchor_matches, delegated_read_envelope,
         entitlement_probe_selectors, exact_durable_provider_complete_boundary,
-        execute_native_workflow, execute_read, find_secret_value, force_ipv4_from,
-        governed_cli_environment_contract, governed_cli_workspace_env, guide_document,
-        guide_stage_commands, http_client, is_live_plan_precondition_hash,
-        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
-        list_security_action_state_receipt, mln_0142_terminal_import_state,
-        mln_0143_parent_manifests, mln_0143_pre_import_authority_matches,
-        mln_0143_pre_import_matches, mln_0143_restore_anchor_matches,
-        non_readback_verification_basis, normalize_reviewed_mln_repository_id,
-        operational_proof_coverage, permission_inventory_call, permission_inventory_envelope,
-        persist_prepared_plan, persist_secret_lifecycle,
-        persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
-        preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
+        exact_durable_provider_failure_boundary, execute_native_workflow, execute_read,
+        find_secret_value, force_ipv4_from, governed_cli_environment_contract,
+        governed_cli_workspace_env, guide_document, guide_stage_commands, http_client,
+        is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
+        key_policy_list, key_policy_revoke, list_security_action_state_receipt,
+        mln_0142_terminal_import_state, mln_0143_parent_manifests,
+        mln_0143_pre_import_authority_matches, mln_0143_pre_import_matches,
+        mln_0143_restore_anchor_matches, non_readback_verification_basis,
+        normalize_reviewed_mln_repository_id, operational_proof_coverage,
+        permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
+        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
+        plan_state_next_step, plan_status_label, preflight_call_input,
+        preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
         read_import_secret, read_r2_log_retrieval_credentials, read_secret_file,
         reconcile_standing_lineage_from_plan, rectify_plan, redact_response_for_capability,
@@ -19210,7 +19399,9 @@ mod tests {
     };
     use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
     use cfctl_catalog::{CatalogSnapshot, ingest_native_control_capabilities};
-    use cfctl_cloudflare::{CloudflareApiErrorV1, CloudflareResponseV1, OperationVerificationV1};
+    use cfctl_cloudflare::{
+        CloudflareApiErrorV1, CloudflareError, CloudflareResponseV1, OperationVerificationV1,
+    };
     use cfctl_core::{
         AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
         AsyncCollectionMutationContractV1, CapabilityV1, CostV1,
@@ -20626,6 +20817,178 @@ mod tests {
             exact_durable_provider_complete_boundary(&mismatch_store, &mismatch_plan, &response)
                 .is_err()
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one state-machine regression proves known provider failure versus transport ambiguity"
+    )]
+    fn approved_mln_provider_failure_uses_its_durable_receipt_not_transport_unknown() {
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://native".to_owned(),
+            source_hash: "sha256:test".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native overlay");
+        let capability = catalog
+            .capabilities
+            .remove("d1-import-approved-mln-migration")
+            .expect("native import capability");
+        let contract = capability
+            .d1_approved_mln_import
+            .as_ref()
+            .expect("import contract");
+        let build_plan = || {
+            let mut plan = PlanV1::draft(
+                "profile-a",
+                &contract.account_id,
+                "catalog-sha",
+                capability.clone(),
+                json!({}),
+            )
+            .expect("import plan");
+            plan.input = serde_json::to_value(CallInput {
+                selectors: json!({
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                }),
+                body: Some(json!({"migration_id":"0143"})),
+                ..CallInput::default()
+            })
+            .expect("input");
+            plan.refresh_hash().expect("refresh import plan");
+            plan.status = PlanStatus::RectificationRequired;
+            plan
+        };
+        let checkpoint = |plan: &PlanV1| {
+            json!({
+                "schema_version":1,
+                "operation_id":plan.operation_id,
+                "step":"poll_response_1",
+                "performed":true,
+                "rectification_required":true,
+                "receipt":{
+                    "http_status":200,
+                    "success":true,
+                    "result":{
+                        "type":"import",
+                        "status":"error",
+                        "success":false,
+                        "at_bookmark":"before",
+                        "provider_error_present":true,
+                    },
+                    "errors":[],
+                    "etag":null,
+                    "cf_ray":null,
+                }
+            })
+        };
+
+        let root = tempfile::tempdir().expect("known failure root");
+        let store =
+            StateStore::open(RuntimePaths::from_root(root.path())).expect("known failure store");
+        let mut plan = build_plan();
+        let receipt = checkpoint(&plan);
+        let hash = store
+            .record_d1_import_checkpoint(&plan.operation_id, &receipt)
+            .expect("provider-failure checkpoint");
+        assert_eq!(
+            store
+                .write_evidence(EvidenceClass::Apply, &receipt)
+                .expect("provider-failure evidence")
+                .content_hash,
+            hash
+        );
+        let envelope = approved_mln_import_execution_error_envelope(
+            &store,
+            &mut plan,
+            CloudflareError::D1ImportProviderFailure,
+            &MemorySecretStore::default(),
+        );
+        assert!(!envelope.ok);
+        assert!(envelope.performed);
+        assert_eq!(envelope.result["outcome"], "provider_rejected");
+        assert_eq!(envelope.result["receipt_available"], true);
+        assert!(
+            envelope
+                .verification
+                .basis
+                .as_deref()
+                .is_some_and(|basis| basis.contains("provider-failure response is durable"))
+        );
+        assert!(
+            !envelope
+                .result
+                .to_string()
+                .contains("provider rejected import")
+        );
+        assert_eq!(plan.status, PlanStatus::RectificationRequired);
+        assert_ne!(plan.status, PlanStatus::Running);
+
+        store
+            .record_d1_import_checkpoint(&plan.operation_id, &receipt)
+            .expect("duplicate known failure");
+        assert!(exact_durable_provider_failure_boundary(&store, &plan).is_err());
+
+        for receipt_fixture in [
+            None,
+            Some({
+                let mut mismatched = checkpoint(&build_plan());
+                mismatched["receipt"]["result"]["provider_error_present"] = json!(false);
+                mismatched
+            }),
+        ] {
+            let invalid_root = tempfile::tempdir().expect("invalid receipt root");
+            let invalid_store =
+                StateStore::open(RuntimePaths::from_root(invalid_root.path())).expect("store");
+            let mut invalid_plan = build_plan();
+            if let Some(mut invalid_receipt) = receipt_fixture {
+                invalid_receipt["operation_id"] = json!(invalid_plan.operation_id);
+                invalid_store
+                    .record_d1_import_checkpoint(&invalid_plan.operation_id, &invalid_receipt)
+                    .expect("invalid provider checkpoint");
+                invalid_store
+                    .write_evidence(EvidenceClass::Apply, &invalid_receipt)
+                    .expect("invalid provider evidence");
+            }
+            let invalid = approved_mln_import_execution_error_envelope(
+                &invalid_store,
+                &mut invalid_plan,
+                CloudflareError::D1ImportProviderFailure,
+                &MemorySecretStore::default(),
+            );
+            assert_eq!(
+                invalid.result["outcome"],
+                "provider_rejected_receipt_invalid"
+            );
+            assert_eq!(invalid.result["receipt_available"], false);
+            assert_ne!(invalid_plan.status, PlanStatus::Running);
+        }
+
+        let transport_root = tempfile::tempdir().expect("transport root");
+        let transport_store =
+            StateStore::open(RuntimePaths::from_root(transport_root.path())).expect("store");
+        let mut transport_plan = build_plan();
+        let transport = approved_mln_import_execution_error_envelope(
+            &transport_store,
+            &mut transport_plan,
+            CloudflareError::InvalidRequestBody("injected transport timeout".to_owned()),
+            &MemorySecretStore::default(),
+        );
+        assert_eq!(transport.result["outcome"], "unknown");
+        assert_eq!(transport.result["receipt_available"], false);
+        assert!(
+            transport
+                .verification
+                .basis
+                .as_deref()
+                .is_some_and(|basis| basis.contains("no Cloudflare response was received"))
+        );
+        assert_eq!(transport_plan.status, PlanStatus::RectificationRequired);
     }
 
     fn security_action_create_capability() -> CapabilityV1 {

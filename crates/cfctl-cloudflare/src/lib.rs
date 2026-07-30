@@ -8796,17 +8796,31 @@ fn persist_import_response<F>(
 where
     F: FnMut(&D1ImportCheckpointV1) -> std::result::Result<(), String>,
 {
+    let result = replacement_result.unwrap_or_else(|| response.result.clone());
+    let terminal_provider_failure = result.get("status").and_then(Value::as_str) == Some("error")
+        && result.get("success").and_then(Value::as_bool) == Some(false);
+    let result = if terminal_provider_failure {
+        serde_json::json!({
+            "type":result.get("type"),
+            "status":"error",
+            "success":false,
+            "at_bookmark":result.get("at_bookmark"),
+            "provider_error_present":result.get("error").is_some(),
+        })
+    } else {
+        result
+    };
     persist(&D1ImportCheckpointV1 {
         schema_version: 1,
         operation_id: plan.operation_id.clone(),
         step: step.to_owned(),
         performed: true,
-        rectification_required: !response.success,
+        rectification_required: !response.success || terminal_provider_failure,
         receipt: serde_json::json!({
             "http_status":response.status,
             "success":response.success,
-            "result":replacement_result.unwrap_or_else(|| response.result.clone()),
-            "errors":response.errors,
+            "result":result,
+            "errors":if terminal_provider_failure { Vec::new() } else { response.errors.clone() },
             "etag":response.etag,
             "cf_ray":response.cf_ray,
         }),
