@@ -13230,6 +13230,108 @@ struct DurableProviderCompleteBoundary {
     checkpoint: Value,
 }
 
+fn validate_canonical_poll_child_lifecycle(
+    store: &StateStore,
+    current: &PlanV2,
+) -> Result<Option<DurableProviderCompleteBoundary>> {
+    let plan = &current.plan;
+    plan.validate_transaction_journal()?;
+    let terminal_status = match plan.status {
+        PlanStatus::Running => PlanStatus::Running,
+        PlanStatus::RectificationRequired => PlanStatus::RectificationRequired,
+        _ => {
+            return Err(CliError::Input(
+                "poll child has no authentic terminal provider outcome".to_owned(),
+            ));
+        }
+    };
+    let expected = [
+        (TransactionStageV1::ApprovalPersisted, PlanStatus::Approved),
+        (
+            TransactionStageV1::ConsumptionPersisted,
+            PlanStatus::Consumed,
+        ),
+        (
+            TransactionStageV1::BoundaryAttemptPersisted,
+            PlanStatus::Consumed,
+        ),
+        (
+            TransactionStageV1::BoundaryResponsePersisted,
+            terminal_status,
+        ),
+        (TransactionStageV1::SecretSinkPersisted, terminal_status),
+    ];
+    if plan.transaction_stage != TransactionStageV1::SecretSinkPersisted
+        || expected.into_iter().any(|(stage, status)| {
+            plan.transaction_journal
+                .iter()
+                .filter(|checkpoint| checkpoint.stage == stage && checkpoint.plan_status == status)
+                .count()
+                != 1
+        })
+    {
+        return Err(CliError::Input(
+            "poll child journal does not match the exact production boundary lifecycle".to_owned(),
+        ));
+    }
+    let response_artifact = plan
+        .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+        .ok_or_else(|| {
+            CliError::Input("poll child boundary response artifact is missing".to_owned())
+        })?;
+    let secret_artifact = plan
+        .transaction_artifact(TransactionStageV1::SecretSinkPersisted)
+        .ok_or_else(|| {
+            CliError::Input("poll child secret lifecycle artifact is missing".to_owned())
+        })?;
+    if secret_artifact
+        != &json!({
+            "completed":true,
+            "failure":Value::Null,
+            "input_cleanup":{"required":false,"completed":true},
+            "output_sink":{"required":false,"completed":true,"create_new":false,
+                "format":Value::Null,"unix_mode":if cfg!(unix) { Value::String("0600".to_owned()) } else { Value::Null }},
+            "path":Value::Null,
+        })
+    {
+        return Err(CliError::Input(
+            "poll child secret lifecycle artifact drifted".to_owned(),
+        ));
+    }
+    if terminal_status == PlanStatus::Running {
+        let boundary = exact_durable_resume_provider_complete_boundary(store, plan)?;
+        if response_artifact.get("success").and_then(Value::as_bool) != Some(true)
+            || response_artifact
+                .get("apply_evidence_hash")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return Err(CliError::Input(
+                "completed poll child lacks its exact successful response artifact".to_owned(),
+            ));
+        }
+        Ok(Some(boundary))
+    } else {
+        let exhaustion = exact_resume_poll_exhaustion(store, plan)?;
+        if response_artifact
+            != &json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":"poll_in_progress_exhausted",
+                "receipt_available":true,
+                "poll_exhaustion_evidence_hash":exhaustion.exhaustion_evidence.content_hash,
+                "accepted_ingest_evidence_hash":exhaustion.accepted_ingest_evidence.content_hash,
+            })
+        {
+            return Err(CliError::Input(
+                "exhausted poll child lacks its exact exhaustion response artifact".to_owned(),
+            ));
+        }
+        Ok(None)
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one fail-closed join authenticates every stored-plan, stage, ingest, and terminal receipt field"
@@ -13491,58 +13593,22 @@ fn exact_linear_poll_child_provider_complete(
                 || current.pins.credential_generation_id.is_empty()
                 || current.plan.capability.id != "d1-resume-approved-mln-import-poll"
                 || current.plan.approval.is_none()
-                || current.plan.validate_transaction_journal().is_err()
-                || ![
-                    (
-                        TransactionStageV1::ApprovalPersisted,
-                        PlanStatus::Approved,
-                    ),
-                    (
-                        TransactionStageV1::ConsumptionPersisted,
-                        PlanStatus::Consumed,
-                    ),
-                    (
-                        TransactionStageV1::BoundaryAttemptPersisted,
-                        PlanStatus::Consumed,
-                    ),
-                    (
-                        TransactionStageV1::BoundaryResponsePersisted,
-                        PlanStatus::Consumed,
-                    ),
-                ]
-                .into_iter()
-                .all(|(stage, status)| {
-                    current
-                        .plan
-                        .transaction_journal
-                        .iter()
-                        .filter(|checkpoint| {
-                            checkpoint.stage == stage && checkpoint.plan_status == status
-                        })
-                        .count()
-                        == 1
-                })
-                || current
-                    .plan
-                    .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
-                    .is_none()
-                || current.plan.transaction_stage
-                    != TransactionStageV1::BoundaryResponsePersisted
-                || current.plan.status != PlanStatus::Consumed
             {
                 return Err(CliError::Input(
                     "poll child PlanV2 projection, pins, approval, consumption, or boundary lifecycle is invalid"
                         .to_owned(),
                 ));
             }
+            validate_canonical_poll_child_lifecycle(store, &current)?;
             Ok(current)
         })
         .collect::<Result<Vec<_>>>()?;
     let completed = children
         .iter()
         .filter_map(|child| {
-            exact_durable_resume_provider_complete_boundary(store, &child.plan)
+            validate_canonical_poll_child_lifecycle(store, child)
                 .ok()
+                .flatten()
                 .map(|boundary| (child, boundary))
         })
         .collect::<Vec<_>>();
@@ -23025,12 +23091,32 @@ mod tests {
                     }
                 });
                 persist_poll_lineage_checkpoint(&store, &child.operation_id, &completion);
-                child
-                    .record_transaction_stage_with_artifact(
-                        TransactionStageV1::BoundaryResponsePersisted,
-                        completion,
+                child.status = PlanStatus::Running;
+                let response = CloudflareResponseV1 {
+                    status: 200,
+                    success: true,
+                    result: json!({
+                        "type":"import",
+                        "status":"complete",
+                        "success":true,
+                        "at_bookmark":"accepted",
+                        "final_bookmark":"completed",
+                    }),
+                    errors: Vec::new(),
+                    result_info: None,
+                    etag: None,
+                    cf_ray: None,
+                };
+                assert!(matches!(
+                    super::process_api_boundary_response(
+                        &store,
+                        &mut child,
+                        &response,
+                        &MemorySecretStore::default(),
                     )
-                    .expect("child completion response");
+                    .expect("production completion lifecycle"),
+                    super::ApiBoundaryResponseOutcome::Ready { .. }
+                ));
             } else {
                 let child_poll = json!({
                     "schema_version":1,
@@ -23067,12 +23153,13 @@ mod tests {
                 });
                 parent_exhaustion_hash =
                     persist_poll_lineage_checkpoint(&store, &child.operation_id, &exhaustion);
-                child
-                    .record_transaction_stage_with_artifact(
-                        TransactionStageV1::BoundaryResponsePersisted,
-                        exhaustion,
-                    )
-                    .expect("child exhaustion response");
+                let envelope = super::known_import_poll_exhausted_envelope(
+                    &store,
+                    &mut child,
+                    &MemorySecretStore::default(),
+                );
+                assert!(!envelope.ok);
+                assert_eq!(child.status, PlanStatus::RectificationRequired);
             }
             save_current_test_plan(&store, &child);
             parent = child.clone();
