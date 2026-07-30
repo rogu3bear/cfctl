@@ -42,7 +42,9 @@ directories = "6.0.0"
 futures-util = "0.3.33"
 hex = "0.4.3"
 http = "1.4.2"
+libc = "=0.2.186"
 memchr = "2.7.6"
+md-5 = "0.11.0"
 rand = "0.10.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "rustls"] }
 rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }

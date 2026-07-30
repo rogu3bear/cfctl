@@ -136,6 +136,10 @@ fn apply_effect_policy(
 ) {
     match capability.effect {
         EffectClass::ReadOnly => {}
+        EffectClass::DataWrite => {
+            *disposition = PolicyDisposition::ApprovalRequired;
+            reasons.push("operation writes database state".to_owned());
+        }
         EffectClass::ReversibleWrite => {
             if capability.risk != RiskClass::ScopedWrite || !capability.rollback.supported {
                 *disposition = PolicyDisposition::ApprovalRequired;
@@ -175,5 +179,58 @@ fn decision<const N: usize>(
         disposition,
         reasons: reasons.into_iter().map(str::to_owned).collect(),
         requires_cost_ceiling,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cfctl_core::{
+        AdapterStatus, D1RestoreExactBookmarkContractV1, PolicyDisposition, RollbackSpecV1,
+        VerificationSpecV1,
+    };
+
+    #[test]
+    fn d1_recovery_data_write_requires_explicit_approval_without_cost_ceiling() {
+        let mut capability = CapabilityV1::new(
+            "d1-restore-exact-bookmark",
+            "Restore D1 database to exact bookmark",
+            "POST",
+            "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore",
+        );
+        capability.product = "D1".to_owned();
+        capability.account_scope = "account".to_owned();
+        capability.adapter_status = AdapterStatus::Native;
+        capability.risk = RiskClass::Recovery;
+        capability.effect = EffectClass::DataWrite;
+        capability.cost.known = true;
+        capability.cost.incremental = false;
+        capability.verification = VerificationSpecV1 {
+            required: true,
+            strategy: "d1_current_bookmark_equals_restore_result_bookmark".to_owned(),
+        };
+        capability.rollback = RollbackSpecV1 {
+            supported: true,
+            strategy: Some("new_approved_exact_bookmark_restore_from_previous_bookmark".to_owned()),
+            warning: Some("recovery is a new approved plan".to_owned()),
+        };
+        capability.d1_restore_exact_bookmark = Some(D1RestoreExactBookmarkContractV1 {
+            bookmark_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/bookmark"
+                .to_owned(),
+            restore_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore"
+                .to_owned(),
+            max_response_bytes: 64 * 1024,
+            max_timeout_seconds: 30,
+            post_retry_count: 0,
+        });
+        let decision = PolicyEngine.evaluate(&capability, &ImpactContext::default());
+        assert_eq!(decision.disposition, PolicyDisposition::ApprovalRequired);
+        assert!(!decision.requires_cost_ceiling);
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason == "operation writes database state")
+        );
     }
 }

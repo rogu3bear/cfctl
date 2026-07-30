@@ -408,9 +408,13 @@ dependencies = [
  "chrono",
  "clap",
  "futures-util",
+ "hex",
+ "libc",
+ "md-5",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror",
  "tokio",
@@ -432,6 +436,8 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "libc",
+ "md-5",
  "memchr",
  "reqwest",
  "serde",
@@ -1553,6 +1559,16 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "md-5"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
+dependencies = [
+ "cfg-if",
+ "digest 0.11.3",
+]
 
 [[package]]
 name = "memchr"

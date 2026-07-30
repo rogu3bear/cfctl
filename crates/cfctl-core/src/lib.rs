@@ -780,6 +780,8 @@ pub enum CoreError {
     InvalidPlanV2(String),
     #[error("event envelope is invalid: {0}")]
     InvalidEventEnvelope(String),
+    #[error("operational proof binding is invalid: {0}")]
+    InvalidOperationalProofBinding(String),
     #[error("standing authority {authority_id} is {actual}; expected {expected}")]
     InvalidStandingAuthorityState {
         authority_id: String,
@@ -818,6 +820,7 @@ pub enum AdapterStatus {
 #[serde(rename_all = "snake_case")]
 pub enum RiskClass {
     Read,
+    Recovery,
     ScopedWrite,
     CrossConfig,
     Destructive,
@@ -833,6 +836,7 @@ pub enum RiskClass {
 #[serde(rename_all = "snake_case")]
 pub enum EffectClass {
     ReadOnly,
+    DataWrite,
     ReversibleWrite,
     Destructive,
     ExternalCommunication,
@@ -915,6 +919,182 @@ pub enum AnalyticsQueryKindV1 {
     LogExplorerSql,
     GraphqlAnalytics,
     WorkersObservability,
+}
+
+/// A fixed, read-only compiler contract for D1 schema assertions. Callers
+/// supply only the closed assertion object declared by the capability request
+/// schema; the executor owns every SQL token sent to Cloudflare.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1SchemaIntrospectionContractV1 {
+    pub max_rows: u64,
+    pub max_bytes: u64,
+    pub max_timeout_seconds: u64,
+}
+
+/// Exact post-import schema authority for `MLNavigator` migration 0142.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mln0142PostImportSchemaContractV1 {
+    pub account_id: String,
+    pub database_id: String,
+    pub migration_sha256: String,
+    pub trigger_name: String,
+    pub trigger_definition: String,
+    pub trigger_definition_sha256: String,
+    pub capability_version: u8,
+}
+
+/// A closed, product-specific D1 read that proves the data and schema
+/// invariants surrounding `MLNavigator` migration 0143. The executor owns all
+/// SQL and replaces volatile row material with a digest-only manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mln0143DataInvariantsContractV1 {
+    pub account_id: String,
+    pub database_id: String,
+    pub migration_sha256: String,
+    pub prior_0142_trigger_definition_hash: String,
+    pub trigger_definition_hashes: Vec<String>,
+    pub fixed_query_sha256: String,
+    pub pre_table_definition_hash: String,
+    pub post_table_definition_hash: String,
+    pub validator_contract_hash: String,
+    pub capability_version: u8,
+    pub max_evidence_rows: u64,
+    pub probe_rows: u64,
+    pub max_bytes: u64,
+    pub max_timeout_seconds: u64,
+}
+
+impl Mln0143DataInvariantsContractV1 {
+    pub fn expected_validator_contract_hash(&self) -> Result<String> {
+        hash_value(&serde_json::json!({
+            "capability_id":"mln-0143-data-invariants",
+            "capability_version":self.capability_version,
+            "migration_sha256":self.migration_sha256,
+            "prior_0142_trigger_definition_hash":self.prior_0142_trigger_definition_hash,
+            "target_scope":{"account_id":self.account_id,"database_id":self.database_id},
+            "fixed_query_sha256":self.fixed_query_sha256,
+            "phase_table_definition_hashes":{
+                "pre_import":self.pre_table_definition_hash,
+                "post_import":self.post_table_definition_hash,
+                "post_restore":self.pre_table_definition_hash,
+            },
+            "packet_authority":{
+                "scope":"full issuance_profile_packet_kinds table",
+                "ordered_columns":["profile","evidence_kind","signature_required","sort_order"],
+                "authorized_delta":{
+                    "remove":["advisor_grant","election_83b"],
+                    "insert":["advisor_grant","advisor_equity_instrument",1,2],
+                },
+            },
+            "index_assertions":[
+                ["idx_equity_issuance_evidence_event",false,["org_id","issuance_event_id","evidence_kind"]],
+                ["idx_equity_issuance_evidence_document",false,["org_id","document_id"]],
+                ["idx_equity_issuance_evidence_unique_hash",true,["org_id","issuance_event_id","evidence_kind","document_hash"],"document_hash IS NOT NULL"],
+            ],
+            "trigger_definition_hashes":self.trigger_definition_hashes,
+            "bounds":{
+                "max_evidence_rows":self.max_evidence_rows,
+                "probe_rows":self.probe_rows,
+                "max_bytes":self.max_bytes,
+                "max_timeout_seconds":self.max_timeout_seconds,
+            },
+            "manifest_contract":{
+                "required":["schema_version","capability_id","capability_version","validator_contract_hash","migration_id","migration_sha256","phase","target_scope_hash","complete","projection","semantic_schema_hash","packet_hash","packet_count","packet_non_target_hash","packet_non_target_count","prior_0142_trigger_definition_hash","trigger_definition_hashes","assertions","query","lineage"],
+                "assertions":["old_table_absent","unique_hash_index_present","event_index_exact_non_unique_shape","document_index_exact_non_unique_shape","foreign_key_check_empty","duplicate_hash_groups_zero","invalid_evidence_kinds_zero","invalid_advanced_events_zero","prior_0142_terminal_trigger_present"],
+                "query":["sha256","row_limit","probe_rows","byte_limit","timeout_seconds","received_rows","provider_rows_read","provider_duration","bounds_saturated"],
+            },
+            "governed_execution_provenance":{
+                "schema_version":1,
+                "required":["operation_id","capability_id","capability_version","validator_contract_hash","fixed_query_sha256","catalog_hash","target_scope_hash","phase","manifest_evidence_hash","request_hash","profile_identity_hash","credential_generation_id","completion_status","completed_at"],
+                "completion_status":"completed",
+                "parent_cardinality":"exactly_one",
+                "boundary":"governed_cfctl_runtime_provenance_not_hostile_filesystem_or_code_tamper_resistance",
+            },
+            "cross_operation_lineage":{
+                "pre_import":{
+                    "authority":"current catalog, exact closed request and selectors, target, profile, credential generation, validator contract, and fixed query",
+                    "chronology":"verified 0142 closed before governed recovery export before selected pre_import proof before immutable 0143 plan cutoff",
+                    "cardinality":"exactly one current-authority proof in the post-export-to-plan window",
+                    "nonclaim":"ordered governed evidence does not prove absence of out-of-band provider writes"
+                },
+                "post_import_required":["import_operation_id","import_boundary_evidence_hash","import_source_sha256","import_plan_hash"],
+                "post_restore_required":[
+                    "import_operation_id","import_boundary_evidence_hash","import_source_sha256","import_plan_hash",
+                    "restore_operation_id","restore_evidence_hash","restore_previous_bookmark_hash",
+                    "restore_requested_bookmark_hash","restore_observed_bookmark_hash"
+                ],
+                "post_restore_anchor":"restore input and receipt source operation/evidence plus requested and observed bookmark must equal the import plan's distinct post-0142 governed recovery anchor under the same target, profile, credential generation, catalog, and chronology",
+                "post_restore_0142_preservation":"the closed invariant query requires the exact 0142 terminal-generation trigger definition after restore",
+                "cardinality":"exactly_one",
+                "state_order":["provider_complete","post_import_proved","verified"],
+            },
+        }))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1FullExportContractV1 {
+    pub max_bytes: u64,
+    pub max_poll_response_bytes: u64,
+    pub max_poll_attempts: u64,
+    pub max_timeout_seconds: u64,
+    pub max_download_seconds: u64,
+    pub requires_new_mode_0600_file: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1RestoreExactBookmarkContractV1 {
+    pub bookmark_path: String,
+    pub restore_path: String,
+    pub max_response_bytes: u64,
+    pub max_timeout_seconds: u64,
+    pub post_retry_count: u64,
+}
+
+/// Closed catalogue for the only D1 imports cfctl may execute. Source bytes
+/// are staged and hash-bound while the plan is created; execution never
+/// accepts SQL, a path, or provider protocol controls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1ApprovedMlnMigrationV1 {
+    pub migration_id: String,
+    pub basename: String,
+    pub repository_relative_path: String,
+    pub git_blob_oid: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub md5: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1ApprovedMlnImportContractV1 {
+    pub repository_id: String,
+    pub repository_head: String,
+    pub pre_import_capability_version: u8,
+    pub pre_import_validator_contract_hash: String,
+    pub pre_import_fixed_query_sha256: String,
+    pub account_id: String,
+    pub database_id: String,
+    pub import_path: String,
+    pub migrations: Vec<D1ApprovedMlnMigrationV1>,
+    pub max_response_bytes: u64,
+    pub max_poll_attempts: u64,
+    pub max_timeout_seconds: u64,
+    pub upload_url_suffix: String,
+    pub requires_create_new_mode_0600_stage: bool,
+}
+
+/// A separately approved, poll-only continuation for an approved `MLNavigator`
+/// import. The caller supplies only immutable parent receipt identities; the
+/// runtime derives every provider control and root-import field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1ApprovedMlnImportPollResumeContractV1 {
+    pub root_capability_id: String,
+    pub account_id: String,
+    pub database_id: String,
+    pub import_path: String,
+    pub max_response_bytes: u64,
+    pub max_poll_attempts: u64,
+    pub max_timeout_seconds: u64,
 }
 
 /// Timestamp wire representation at the pointers declared by a query contract.
@@ -1480,6 +1660,20 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analytics_query: Option<AnalyticsQueryContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d1_schema_introspection: Option<D1SchemaIntrospectionContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mln_0142_post_import_schema: Option<Mln0142PostImportSchemaContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mln_0143_data_invariants: Option<Mln0143DataInvariantsContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d1_full_export: Option<D1FullExportContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d1_restore_exact_bookmark: Option<D1RestoreExactBookmarkContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d1_approved_mln_import: Option<D1ApprovedMlnImportContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d1_approved_mln_import_poll_resume: Option<D1ApprovedMlnImportPollResumeContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2_log_retrieval: Option<R2LogRetrievalContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphql: Option<GraphqlAnalyticsContractV1>,
@@ -1580,6 +1774,13 @@ impl CapabilityV1 {
             request_schema: None,
             response_contract: None,
             analytics_query: None,
+            d1_schema_introspection: None,
+            mln_0142_post_import_schema: None,
+            mln_0143_data_invariants: None,
+            d1_full_export: None,
+            d1_restore_exact_bookmark: None,
+            d1_approved_mln_import: None,
+            d1_approved_mln_import_poll_resume: None,
             r2_log_retrieval: None,
             graphql: None,
             workflow: None,
@@ -1757,6 +1958,23 @@ impl CapabilityV1 {
         }
 
         match self.verification.strategy.as_str() {
+            "mln_import_requires_governed_post_import_proof" => {
+                matches!(
+                    self.id.as_str(),
+                    "d1-import-approved-mln-migration" | "d1-resume-approved-mln-import-poll"
+                ) && self.method == "POST"
+                    && self.risk == RiskClass::Irreversible
+                    && self.effect == EffectClass::DataWrite
+                    && (self.d1_approved_mln_import.is_some()
+                        ^ self.d1_approved_mln_import_poll_resume.is_some())
+            }
+            "d1_current_bookmark_equals_restore_result_bookmark" => {
+                self.id == "d1-restore-exact-bookmark"
+                    && self.method == "POST"
+                    && self.risk == RiskClass::Recovery
+                    && self.effect == EffectClass::DataWrite
+                    && self.d1_restore_exact_bookmark.is_some()
+            }
             "event_batch_registry_commit_and_queue_acknowledgement_receipt" => {
                 self.event_batch_contract_supported()
             }
@@ -2111,6 +2329,12 @@ impl CapabilityV1 {
             }
             Some("restore_same_path_prior_snapshot") => {
                 self.same_path_prior_snapshot_rollback_supported()
+            }
+            Some("new_approved_exact_bookmark_restore_from_previous_bookmark") => {
+                exact_bookmark_restore_recovery_contract_supported(self)
+            }
+            Some("no_automatic_rollback_use_separately_approved_bookmark_restore") => {
+                approved_mln_import_recovery_contract_supported(self)
             }
             _ => false,
         }
@@ -2734,6 +2958,25 @@ impl CapabilityV1 {
                     .all(|fields| fields[0] < fields[1])
         })
     }
+}
+
+fn approved_mln_import_recovery_contract_supported(capability: &CapabilityV1) -> bool {
+    matches!(
+        capability.id.as_str(),
+        "d1-import-approved-mln-migration" | "d1-resume-approved-mln-import-poll"
+    ) && capability.method == "POST"
+        && capability.risk == RiskClass::Irreversible
+        && capability.effect == EffectClass::DataWrite
+        && (capability.d1_approved_mln_import.is_some()
+            ^ capability.d1_approved_mln_import_poll_resume.is_some())
+}
+
+fn exact_bookmark_restore_recovery_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "d1-restore-exact-bookmark"
+        && capability.method == "POST"
+        && capability.risk == RiskClass::Recovery
+        && capability.effect == EffectClass::DataWrite
+        && capability.d1_restore_exact_bookmark.is_some()
 }
 
 fn secret_lifecycle_verification_contract_supported(capability: &CapabilityV1) -> bool {
@@ -5770,6 +6013,72 @@ pub struct OperationalProofV1 {
     pub credential_generation_id: Option<String>,
     pub outcome: OperationalProofOutcomeV1,
     pub evidence: EvidenceV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mln_0143_execution: Option<Mln0143GovernedExecutionBindingV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mln_0142_execution: Option<Mln0142GovernedExecutionBindingV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    d1_full_export_execution: Option<D1FullExportGovernedExecutionBindingV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1FullExportGovernedExecutionBindingV1 {
+    pub schema_version: u8,
+    pub operation_id: String,
+    pub capability_id: String,
+    pub catalog_hash: String,
+    pub target_scope_hash: String,
+    pub output_file_sha256: String,
+    pub at_bookmark_hash: String,
+    pub manifest_evidence_hash: String,
+    pub request_hash: String,
+    pub profile_id: String,
+    pub credential_generation_id: String,
+    pub completion_status: String,
+    pub completed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mln0142GovernedExecutionBindingV1 {
+    pub schema_version: u8,
+    pub operation_id: String,
+    pub capability_id: String,
+    pub capability_version: u8,
+    pub catalog_hash: String,
+    pub target_scope_hash: String,
+    pub import_operation_id: String,
+    pub import_boundary_evidence_hash: String,
+    pub import_source_sha256: String,
+    pub import_plan_hash: String,
+    pub final_bookmark_hash: String,
+    pub trigger_name: String,
+    pub trigger_definition_sha256: String,
+    pub manifest_evidence_hash: String,
+    pub request_hash: String,
+    pub credential_generation_id: String,
+    pub completion_status: String,
+    pub completed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mln0143GovernedExecutionBindingV1 {
+    pub schema_version: u8,
+    pub operation_id: String,
+    pub capability_id: String,
+    pub capability_version: u8,
+    pub validator_contract_hash: String,
+    pub fixed_query_sha256: String,
+    pub catalog_hash: String,
+    pub target_scope_hash: String,
+    pub phase: String,
+    pub manifest_evidence_hash: String,
+    pub request_hash: String,
+    pub profile_identity_hash: String,
+    pub credential_generation_id: String,
+    pub completion_status: String,
+    pub completed_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_operation_lineage_hash: Option<String>,
 }
 
 impl OperationalProofV1 {
@@ -5794,7 +6103,100 @@ impl OperationalProofV1 {
             credential_generation_id: scope.credential_generation_id,
             outcome,
             evidence,
+            mln_0143_execution: None,
+            mln_0142_execution: None,
+            d1_full_export_execution: None,
         }
+    }
+
+    pub fn bind_d1_full_export_governed_execution(
+        &mut self,
+        binding: D1FullExportGovernedExecutionBindingV1,
+    ) -> Result<()> {
+        if self.d1_full_export_execution.is_some()
+            || self.capability_id != "d1-full-export"
+            || self.outcome != OperationalProofOutcomeV1::Succeeded
+            || self.evidence.content_hash != binding.manifest_evidence_hash
+            || self.catalog_hash != binding.catalog_hash
+            || self.input_hash != binding.request_hash
+            || self.profile_id.as_deref() != Some(binding.profile_id.as_str())
+            || self.credential_generation_id.as_deref()
+                != Some(binding.credential_generation_id.as_str())
+            || binding.schema_version != 1
+            || binding.completion_status != "completed"
+        {
+            return Err(CoreError::InvalidOperationalProofBinding(
+                "D1 full-export binding does not match its completed operational proof".to_owned(),
+            ));
+        }
+        self.d1_full_export_execution = Some(binding);
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn d1_full_export_governed_execution(
+        &self,
+    ) -> Option<&D1FullExportGovernedExecutionBindingV1> {
+        self.d1_full_export_execution.as_ref()
+    }
+
+    pub fn bind_mln_0143_governed_execution(
+        &mut self,
+        binding: Mln0143GovernedExecutionBindingV1,
+    ) -> Result<()> {
+        if self.mln_0143_execution.is_some()
+            || self.capability_id != "mln-0143-data-invariants"
+            || self.outcome != OperationalProofOutcomeV1::Succeeded
+            || self.evidence.content_hash != binding.manifest_evidence_hash
+            || self.catalog_hash != binding.catalog_hash
+            || self.input_hash != binding.request_hash
+            || self.credential_generation_id.as_deref()
+                != Some(binding.credential_generation_id.as_str())
+            || binding.schema_version != 1
+            || binding.completion_status != "completed"
+            || (binding.phase == "pre_import") != binding.cross_operation_lineage_hash.is_none()
+        {
+            return Err(CoreError::InvalidOperationalProofBinding(
+                "MLN governed execution binding does not match its completed operational proof"
+                    .to_owned(),
+            ));
+        }
+        self.mln_0143_execution = Some(binding);
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn mln_0143_governed_execution(&self) -> Option<&Mln0143GovernedExecutionBindingV1> {
+        self.mln_0143_execution.as_ref()
+    }
+
+    pub fn bind_mln_0142_governed_execution(
+        &mut self,
+        binding: Mln0142GovernedExecutionBindingV1,
+    ) -> Result<()> {
+        if self.mln_0142_execution.is_some()
+            || self.capability_id != "mln-0142-post-import-schema"
+            || self.outcome != OperationalProofOutcomeV1::Succeeded
+            || self.evidence.content_hash != binding.manifest_evidence_hash
+            || self.catalog_hash != binding.catalog_hash
+            || self.input_hash != binding.request_hash
+            || self.credential_generation_id.as_deref()
+                != Some(binding.credential_generation_id.as_str())
+            || binding.schema_version != 1
+            || binding.completion_status != "completed"
+        {
+            return Err(CoreError::InvalidOperationalProofBinding(
+                "MLN 0142 governed schema binding does not match its completed operational proof"
+                    .to_owned(),
+            ));
+        }
+        self.mln_0142_execution = Some(binding);
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn mln_0142_governed_execution(&self) -> Option<&Mln0142GovernedExecutionBindingV1> {
+        self.mln_0142_execution.as_ref()
     }
 
     #[must_use]

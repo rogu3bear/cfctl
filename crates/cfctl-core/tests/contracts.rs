@@ -4,16 +4,17 @@ use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
     AsyncCollectionMutationContractV1, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1,
     CostV1, CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
-    CreatedResourceContractV1, DeletedNestedResourceContractV1, EffectClass, EntitlementProbeV1,
-    EvidenceClass, EvidenceV1, GraphqlAnalyticsContractV1, GuideActionV1, GuideCloudflareEffectV1,
-    GuideContractStateV1, GuideStage, GuideTopicV1, OperationalProofFreshnessV1,
-    OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, OutputFormatV1,
-    PaginationModeV1, PlanStatus, PlanV1, R2LogRetrievalContractV1, ResultEnvelopeV2, RiskClass,
-    SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
-    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
-    StandingAuthorityV1, TimeRangeContractV1, TimestampFormatV1, TransactionStageV1,
-    UpdatedResourceContractV1, guide_stages, guide_topic_document, hash_value, redact_json,
-    redact_json_schema, render_guide_topic_markdown,
+    CreatedResourceContractV1, D1FullExportContractV1, D1SchemaIntrospectionContractV1,
+    DeletedNestedResourceContractV1, EffectClass, EntitlementProbeV1, EvidenceClass, EvidenceV1,
+    GraphqlAnalyticsContractV1, GuideActionV1, GuideCloudflareEffectV1, GuideContractStateV1,
+    GuideStage, GuideTopicV1, OperationalProofFreshnessV1, OperationalProofOutcomeV1,
+    OperationalProofScopeV1, OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanStatus,
+    PlanV1, R2LogRetrievalContractV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1,
+    SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
+    SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
+    TimeRangeContractV1, TimestampFormatV1, TransactionStageV1, UpdatedResourceContractV1,
+    guide_stages, guide_topic_document, hash_value, redact_json, redact_json_schema,
+    render_guide_topic_markdown,
 };
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
@@ -57,6 +58,103 @@ fn registry_contracts_preserve_scope_identity_and_redact_observations() {
     )
     .expect("deserialize registry observation");
     assert_eq!(round_trip, observation);
+}
+
+#[test]
+fn d1_schema_introspection_contract_is_hash_bound_and_serializable() {
+    let mut capability = CapabilityV1::new(
+        "d1-schema-introspection",
+        "Assert bounded D1 schema state",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/query",
+    );
+    capability.mutating = false;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.d1_schema_introspection = Some(D1SchemaIntrospectionContractV1 {
+        max_rows: 1,
+        max_bytes: 65_536,
+        max_timeout_seconds: 10,
+    });
+    let before = hash_value(&serde_json::to_value(&capability).expect("serialize capability"))
+        .expect("hash capability");
+    let encoded = serde_json::to_vec(&capability).expect("encode capability");
+    let decoded: CapabilityV1 = serde_json::from_slice(&encoded).expect("decode capability");
+    assert_eq!(decoded, capability);
+
+    capability
+        .d1_schema_introspection
+        .as_mut()
+        .expect("contract")
+        .max_bytes += 1;
+    let after = hash_value(&serde_json::to_value(&capability).expect("serialize drifted"))
+        .expect("hash drifted");
+    assert_ne!(before, after);
+}
+
+#[test]
+fn d1_full_export_contract_is_hash_bound_and_serializable() {
+    let mut capability = CapabilityV1::new(
+        "d1-full-export",
+        "Export full D1 database to SQL",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/export",
+    );
+    capability.d1_full_export = Some(D1FullExportContractV1 {
+        max_bytes: 10 * 1024 * 1024 * 1024,
+        max_poll_response_bytes: 1024 * 1024,
+        max_poll_attempts: 120,
+        max_timeout_seconds: 30,
+        max_download_seconds: 3600,
+        requires_new_mode_0600_file: true,
+    });
+    let hash = hash_value(&serde_json::to_value(&capability).expect("serialize capability"))
+        .expect("hash export contract");
+    let encoded = serde_json::to_value(&capability).expect("serialize capability");
+    assert_eq!(encoded["d1_full_export"]["max_poll_attempts"], 120);
+    capability
+        .d1_full_export
+        .as_mut()
+        .expect("export contract")
+        .max_poll_attempts = 119;
+    let changed = hash_value(&serde_json::to_value(&capability).expect("serialize changed"))
+        .expect("hash changed contract");
+    assert_ne!(changed, hash);
+}
+
+#[test]
+fn d1_restore_exact_bookmark_contract_is_hash_bound_and_serializable() {
+    let mut capability = CapabilityV1::new(
+        "d1-restore-exact-bookmark",
+        "Restore D1 database to exact bookmark",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore",
+    );
+    capability.risk = RiskClass::Recovery;
+    capability.effect = EffectClass::DataWrite;
+    capability.d1_restore_exact_bookmark = Some(cfctl_core::D1RestoreExactBookmarkContractV1 {
+        bookmark_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/bookmark"
+            .to_owned(),
+        restore_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore"
+            .to_owned(),
+        max_response_bytes: 64 * 1024,
+        max_timeout_seconds: 30,
+        post_retry_count: 0,
+    });
+    let before = hash_value(&serde_json::to_value(&capability).expect("serialize capability"))
+        .expect("hash capability");
+    let encoded = serde_json::to_vec(&capability).expect("encode capability");
+    let mut decoded: CapabilityV1 = serde_json::from_slice(&encoded).expect("decode capability");
+    assert_eq!(decoded, capability);
+    decoded
+        .d1_restore_exact_bookmark
+        .as_mut()
+        .expect("restore contract")
+        .post_retry_count = 1;
+    let after = hash_value(&serde_json::to_value(decoded).expect("serialize drifted"))
+        .expect("hash drifted");
+    assert_ne!(before, after);
 }
 
 #[test]

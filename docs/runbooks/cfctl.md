@@ -293,6 +293,134 @@ hash receipt rather than the rows. See
 [`telemetry-control-plane.md`](../telemetry-control-plane.md) for exact IDs and
 contracts.
 
+D1 schema checks use the native `d1-schema-introspection` read. The caller
+provides one exact account, one exact database, and one closed assertion object;
+cfctl compiles the only SQL sent to Cloudflare and returns a bounded boolean
+result with ordinary redacted live-read evidence:
+
+```bash
+printf '%s' \
+  '{"assertion":"trigger_exists","trigger":"document_render_jobs_terminal_generation_guard"}' |
+  cfctl call d1-schema-introspection \
+    --selector account_id=<account-id> \
+    --selector database_id=<database-id> \
+    --body-stdin --json
+```
+
+MLNavigator migration 0143 has a narrower product-bound proof capability:
+`mln-0143-data-invariants`. It is pinned to the reviewed MLNavigator account
+and Founder database and accepts only migration `0143` plus one phase:
+`pre_import`, `post_import`, or `post_restore`. Post-import requires the
+content hash of a successful pre-import receipt. Post-restore requires both
+that pre-import hash and a post-import receipt that names the same baseline.
+Version 2 receipts also carry a validator-contract hash and the fixed-query
+hash; parent lookup rejects older or synthetic receipts that omit the current
+schema, packet, assertion, bounds, or validator identities.
+
+The capability owns its SQL, probes with `COUNT(*) OVER()` and `LIMIT 257`,
+and accepts at most 256 complete evidence rows. It hashes the exact
+ten-column ordered projection in volatile memory, then discards raw rows,
+MLNavigator identifiers, and document hashes before stdout, errors, logs, or
+durable evidence. A saturated or ambiguous result fails with
+`invariant_not_feasible_under_safe_bounds`; generic D1 SQL remains blocked.
+The same read projects the complete ordered packet-kind table with a 513-row
+probe and accepts at most 512 rows. Evidence retains only full and non-target
+packet digests/counts: post-import permits exactly the reviewed advisor delta,
+and post-restore must reproduce the pre-import full-table digest and count.
+
+```sh
+printf '%s' '{"migration_id":"0143","phase":"pre_import"}' |
+  cfctl call mln-0143-data-invariants \
+    --selector account_id=ca30e922fda7f5578e49873542e4aaca \
+    --selector database_id=7c282983-2e48-4ea4-9f0d-09b0d718fe65 \
+    --body-stdin --json
+```
+
+The allowed assertions are `table_exists`, `column_exists`, `index_exists`,
+`trigger_exists`, `schema_contains`, and `foreign_key_check_empty`. Caller SQL,
+parameters, arbitrary PRAGMAs, multiple statements, and database retargeting
+are not inputs. The generic `d1-query-database`, `d1-raw-database-query`, and
+`wrangler.d1` capabilities remain blocked.
+
+Use `d1-full-export` to capture a full schema-and-data SQL snapshot immediately
+before a separately governed migration:
+
+```bash
+cfctl call d1-full-export \
+  --selector account_id=<account-id> \
+  --selector database_id=<database-id> \
+  --out <new-mode-0600-sql-path> --json
+```
+
+This is a read/export-only capability. It accepts no body, SQL, parameters,
+table filters, schema-only/data-only switches, apply input, or restore target.
+cfctl owns the provider polling body, bounds each polling response, and streams
+the completed signed download into a newly created mode-0600 file. Output paths
+must be normalized, have an existing real-directory parent chain, contain no
+traversal or symlink components, and name a file that does not already exist.
+On Unix the final create also uses `O_NOFOLLOW`. The parent check and final open
+are separate filesystem operations, so callers must use a directory not writable
+by an untrusted concurrent local process. Any failure after file creation removes
+only that newly created file; a cleanup failure is surfaced instead of producing
+a success receipt. The live-read
+evidence binds the account and database identity, exact output path, SHA-256,
+byte count, file-exists/hash-match verification, and the provider filename and
+time-travel bookmark when returned. Cloudflare may temporarily make the
+database unavailable while producing a large export, so capture the snapshot
+in the migration window. The receipt proves only the local pre-migration
+snapshot; importing or applying it is a separate protected workflow.
+
+Approved MLNavigator imports use `d1-import-approved-mln-migration`. If its
+bounded provider polling ends while the import is still active, do not rerun
+that consumed plan: init, upload, and ingest are one-shot boundaries. Create a
+new `d1-resume-approved-mln-import-poll` plan whose body contains only the
+parent operation ID, immutable parent PlanV2 hash, canonical exhaustion
+evidence hash, accepted-ingest evidence hash, and accepted-bookmark hash.
+cfctl re-derives the migration, source, target, profile, credential generation,
+catalog, and plaintext bookmark from managed parent authority. The separately
+approved child sends only bounded zero-retry `poll` requests. One exact
+exhaustion admits at most one child; a child that crossed consumption or any
+provider boundary permanently consumes that exhaustion even if later
+cancelled. A later canonical child exhaustion can admit the next child in the
+same linear root lineage. Provider completion remains pending until the
+migration-specific governed post-import proof closes the root import.
+
+Restore only through the native `d1-restore-exact-bookmark` recovery
+capability. Raw D1 query/restore operations and Wrangler remain blocked:
+
+```bash
+cfctl call d1-restore-exact-bookmark \
+  --selector account_id=<account-id> \
+  --selector database_id=<database-id> \
+  --body-stdin --json
+```
+
+The stdin body is a closed object with exactly `target_bookmark`,
+`expected_current_bookmark`, `source_operation_id`, and
+`source_evidence_hash`. It accepts no timestamp, SQL, import, or raw URL. The
+call creates a destructive Recovery/DataWrite plan and never restores during
+planning. Review and explicitly approve the exact operation ID before
+`plans run`.
+
+At execution, cfctl reads the database's current time-travel bookmark and
+fails before the mutation unless it exactly equals
+`expected_current_bookmark`. It then sends exactly one restore POST containing
+only `{"bookmark":"<target_bookmark>"}`. A rate limit, provider error,
+timeout, or uncertain transport outcome is not retried; inspect the original
+operation with `plans status`/`plans rectify`. A successful provider response
+must include non-empty `bookmark`, `message`, and `previous_bookmark`. cfctl
+then reads the current bookmark again and verifies that it equals the returned
+restore bookmark.
+
+The receipt binds target, expected, pre-restore, returned, previous, and
+post-restore bookmarks; source operation/evidence linkage; the closed request
+digest; provider response metadata; and performed/verified truth. Cloudflare
+documents no incremental restore operation charge, but restoring overwrites
+the database and cancels in-flight queries. Undo is never automatic: create a
+new `d1-restore-exact-bookmark` plan targeting the prior receipt's
+`previous_bookmark`, bind a fresh expected current bookmark, review it, and
+approve it separately.
+
 Logs Engine retrieval is the one reserved-header exception and remains
 operation-specific. Supply a mode-0600 JSON bundle containing exactly
 `access_key_id` and `secret_access_key`, plus a new output path:

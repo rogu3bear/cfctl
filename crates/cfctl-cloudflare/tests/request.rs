@@ -8,10 +8,12 @@ use cfctl_cloudflare::{
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
     AsyncCollectionMutationContractV1, CapabilityV1, CreatedCollectionResourceContractV1,
-    CreatedNestedResourceContractV1, CreatedResourceContractV1, DeletedNestedResourceContractV1,
-    DeletedResourceContractV1, EffectClass, EventBatchContractV1, GraphqlAnalyticsContractV1,
-    KnowledgeReferenceV1, OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1,
-    QUEUE_ACK_CAPABILITY_ID, QUEUE_ACK_PATH, QUEUE_PULL_CAPABILITY_ID, QUEUE_PULL_PATH,
+    CreatedNestedResourceContractV1, CreatedResourceContractV1,
+    D1ApprovedMlnImportPollResumeContractV1, D1FullExportContractV1,
+    D1RestoreExactBookmarkContractV1, D1SchemaIntrospectionContractV1,
+    DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass, EventBatchContractV1,
+    GraphqlAnalyticsContractV1, KnowledgeReferenceV1, OutputFormatV1, PaginationModeV1, PlanStatus,
+    PlanV1, QUEUE_ACK_CAPABILITY_ID, QUEUE_ACK_PATH, QUEUE_PULL_CAPABILITY_ID, QUEUE_PULL_PATH,
     QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
     RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
     TimestampFormatV1, TransactionStageV1, UpdatedResourceContractV1,
@@ -78,6 +80,680 @@ async fn single_raw_response_server(
             .expect("write response");
     });
     (address.to_string(), server)
+}
+
+fn d1_approved_mln_import_poll_resume_fixture(
+    max_poll_attempts: u64,
+) -> (CapabilityV1, CallInput, Value) {
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let database_id = "11111111-2222-4333-8444-555555555555";
+    let mut capability = CapabilityV1::new(
+        "d1-resume-approved-mln-import-poll",
+        "Resume approved MLN import polling",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/import",
+    );
+    "D1".clone_into(&mut capability.product);
+    "account".clone_into(&mut capability.account_scope);
+    capability.adapter_status = AdapterStatus::Native;
+    capability.mutating = true;
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.risk = RiskClass::Irreversible;
+    capability.effect = EffectClass::DataWrite;
+    capability.selectors = ["account_id", "database_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .to_vec();
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_approved_mln_import_poll_resume = Some(D1ApprovedMlnImportPollResumeContractV1 {
+        root_capability_id: "d1-import-approved-mln-migration".to_owned(),
+        account_id: account_id.to_owned(),
+        database_id: database_id.to_owned(),
+        import_path: "/accounts/{account_id}/d1/database/{database_id}/import".to_owned(),
+        max_response_bytes: 1024 * 1024,
+        max_poll_attempts,
+        max_timeout_seconds: 1,
+    });
+    let input = CallInput {
+        selectors: json!({"account_id":account_id,"database_id":database_id}),
+        query: json!({}),
+        body: Some(json!({
+            "parent_operation_id":"parent-operation",
+            "parent_plan_hash":format!("sha256:{}", "1".repeat(64)),
+            "exhaustion_evidence_hash":format!("sha256:{}", "2".repeat(64)),
+            "accepted_ingest_evidence_hash":format!("sha256:{}", "3".repeat(64)),
+            "accepted_bookmark_hash":format!("sha256:{}", "4".repeat(64)),
+        })),
+        ..CallInput::default()
+    };
+    let targets = json!({
+        "adapter":{
+            "approved_mln_import_poll_resume":{
+                "accepted_bookmark":"derived-bookmark",
+                "root_operation_id":"root-operation",
+                "root_plan_hash":format!("sha256:{}", "5".repeat(64)),
+                "parent_operation_id":"parent-operation",
+                "parent_exhaustion_evidence_hash":format!("sha256:{}", "2".repeat(64)),
+                "root_input":{"body":{"migration_id":"0143"}},
+                "root_stage":{
+                    "sha256":format!("sha256:{}", "6".repeat(64)),
+                    "md5":"0123456789abcdef0123456789abcdef",
+                    "bytes":123,
+                    "source_authority_hash":format!("sha256:{}", "7".repeat(64)),
+                }
+            }
+        }
+    });
+    (capability, input, targets)
+}
+
+fn d1_approved_mln_import_poll_resume_plan(max_poll_attempts: u64) -> (PlanV1, CallInput) {
+    let (capability, input, targets) =
+        d1_approved_mln_import_poll_resume_fixture(max_poll_attempts);
+    let mut plan = PlanV1::draft(
+        "profile",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:catalog",
+        capability,
+        targets,
+    )
+    .expect("draft poll continuation");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    (plan, input)
+}
+
+fn assert_exact_poll_request(request: &str) {
+    assert!(request.starts_with(
+        "POST /accounts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/d1/database/11111111-2222-4333-8444-555555555555/import "
+    ));
+    let body = request
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .expect("request body");
+    assert_eq!(
+        serde_json::from_str::<Value>(body).expect("JSON request body"),
+        json!({"action":"poll","current_bookmark":"derived-bookmark"})
+    );
+    for forbidden in [
+        "init",
+        "ingest",
+        "upload",
+        "filename",
+        "etag",
+        "migration_id",
+        "max_poll_attempts",
+        "max_timeout_seconds",
+    ] {
+        assert!(!body.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[tokio::test]
+async fn d1_approved_mln_import_poll_resume_sends_only_exact_derived_poll_until_complete() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"type":"import","status":"pending","success":true,"at_bookmark":"derived-bookmark"},"errors":[]}"#,
+        r#"{"success":true,"result":{"type":"import","status":"complete","success":true,"at_bookmark":"derived-bookmark","result":{"final_bookmark":"final-bookmark"}},"errors":[]}"#,
+    ])
+    .await;
+    let (mut plan, input) = d1_approved_mln_import_poll_resume_plan(3);
+    let mut checkpoints = Vec::new();
+    let response = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .execute_d1_approved_mln_import_poll_resume(
+            &mut plan,
+            &input,
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            "derived-bookmark",
+            |checkpoint| {
+                checkpoints.push(checkpoint.clone());
+                Ok(())
+            },
+        )
+        .await
+        .expect("completed poll continuation");
+    assert_eq!(
+        response.result["_cfctl"]["final_bookmark"],
+        "final-bookmark"
+    );
+    assert_eq!(plan.status, PlanStatus::Running);
+    assert_eq!(
+        checkpoints.last().expect("completion").step,
+        "provider_complete"
+    );
+    let requests = server.await.expect("server");
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_exact_poll_request(request);
+    }
+}
+
+#[tokio::test]
+async fn d1_approved_mln_import_poll_resume_exhausts_at_exact_bound_with_only_poll_requests() {
+    let pending = r#"{"success":true,"result":{"type":"import","status":"active","success":true,"at_bookmark":"derived-bookmark"},"errors":[]}"#;
+    let (address, server) = json_response_sequence_server(vec![pending, pending]).await;
+    let (mut plan, input) = d1_approved_mln_import_poll_resume_plan(2);
+    let mut checkpoints = Vec::new();
+    let error = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .execute_d1_approved_mln_import_poll_resume(
+            &mut plan,
+            &input,
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            "derived-bookmark",
+            |checkpoint| {
+                checkpoints.push(checkpoint.clone());
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("bounded polling must exhaust");
+    assert!(matches!(
+        error,
+        CloudflareError::D1ImportPollInProgressExhausted
+    ));
+    assert_eq!(plan.status, PlanStatus::RectificationRequired);
+    assert_eq!(
+        checkpoints.last().expect("exhaustion").step,
+        "poll_in_progress_exhausted"
+    );
+    let requests = server.await.expect("server");
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_exact_poll_request(request);
+    }
+}
+
+#[tokio::test]
+async fn d1_approved_mln_import_poll_resume_provider_error_stops_after_one_exact_poll() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"type":"import","status":"error","success":false,"at_bookmark":"derived-bookmark","error":"provider rejected"},"errors":[]}"#,
+    ])
+    .await;
+    let (mut plan, input) = d1_approved_mln_import_poll_resume_plan(3);
+    let mut checkpoints = Vec::new();
+    let error = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .execute_d1_approved_mln_import_poll_resume(
+            &mut plan,
+            &input,
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            "derived-bookmark",
+            |checkpoint| {
+                checkpoints.push(checkpoint.clone());
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("provider error must fail closed");
+    assert!(matches!(
+        error,
+        CloudflareError::D1ImportPollResponseFailure
+    ));
+    assert_eq!(plan.status, PlanStatus::RectificationRequired);
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(checkpoints[0].step, "poll_response_1");
+    let requests = server.await.expect("server");
+    assert_eq!(requests.len(), 1);
+    assert_exact_poll_request(&requests[0]);
+}
+
+#[tokio::test]
+async fn d1_approved_mln_import_poll_resume_rejects_bookmark_drift_before_transport() {
+    let (mut plan, input) = d1_approved_mln_import_poll_resume_plan(3);
+    let error = Executor::new(reqwest::Client::new(), "http://127.0.0.1:1")
+        .expect("executor")
+        .execute_d1_approved_mln_import_poll_resume(
+            &mut plan,
+            &input,
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            "caller-controlled-bookmark",
+            |_| Ok(()),
+        )
+        .await
+        .expect_err("bookmark drift must fail before transport");
+    assert!(matches!(error, CloudflareError::InvalidRequestBody(_)));
+    assert_eq!(plan.status, PlanStatus::Draft);
+}
+
+fn d1_restore_exact_bookmark_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "d1-restore-exact-bookmark",
+        "Restore D1 database to exact bookmark",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore",
+    );
+    "D1".clone_into(&mut capability.product);
+    "account".clone_into(&mut capability.account_scope);
+    capability.adapter_status = AdapterStatus::Native;
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.risk = RiskClass::Recovery;
+    capability.effect = EffectClass::DataWrite;
+    "d1_current_bookmark_equals_restore_result_bookmark"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("new_approved_exact_bookmark_restore_from_previous_bookmark".to_owned());
+    capability.selectors = ["account_id", "database_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: if name == "account_id" {
+                    json!({"type":"string","minLength":32,"maxLength":32})
+                } else {
+                    json!({"type":"string","minLength":36,"maxLength":36})
+                },
+                query: None,
+            }),
+        })
+        .to_vec();
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["target_bookmark","expected_current_bookmark","source_operation_id","source_evidence_hash"],
+        "properties":{
+            "target_bookmark":{"type":"string","minLength":1},
+            "expected_current_bookmark":{"type":"string","minLength":1},
+            "source_operation_id":{"type":"string","minLength":1},
+            "source_evidence_hash":{"type":"string","minLength":1}
+        }
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_restore_exact_bookmark = Some(D1RestoreExactBookmarkContractV1 {
+        bookmark_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/bookmark"
+            .to_owned(),
+        restore_path: "/accounts/{account_id}/d1/database/{database_id}/time_travel/restore"
+            .to_owned(),
+        max_response_bytes: 64 * 1024,
+        max_timeout_seconds: 30,
+        post_retry_count: 0,
+    });
+    capability
+}
+
+#[tokio::test]
+async fn d1_restore_prechecks_posts_once_and_postchecks_exact_returned_bookmark() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"bookmark":"current-7"},"errors":[]}"#,
+        r#"{"success":true,"result":{"bookmark":"restored-8","message":"Database restored","previous_bookmark":"current-7"},"errors":[]}"#,
+        r#"{"success":true,"result":{"bookmark":"restored-8"},"errors":[]}"#,
+    ])
+    .await;
+    let capability = d1_restore_exact_bookmark_capability();
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        body: Some(json!({
+            "target_bookmark":"target-1",
+            "expected_current_bookmark":"current-7",
+            "source_operation_id":"source-op",
+            "source_evidence_hash":format!("sha256:{}", "a".repeat(64))
+        })),
+        ..CallInput::default()
+    };
+    let mut plan = PlanV1::draft(
+        "profile",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("draft plan");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    plan.refresh_hash().expect("refresh plan");
+    plan.approve(true, None).expect("approve plan");
+    plan.mark_consumed().expect("consume plan");
+    let response = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            "sha256:catalog",
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect("restore");
+    assert!(response.success);
+    assert_eq!(response.result["bookmark"], "restored-8");
+    assert_eq!(response.result["previous_bookmark"], "current-7");
+    assert_eq!(
+        response.result["_cfctl"]["pre_restore_bookmark"],
+        "current-7"
+    );
+    assert_eq!(
+        response.result["_cfctl"]["source_operation_id"],
+        "source-op"
+    );
+    assert_eq!(response.result["_cfctl"]["verified"], false);
+    let verification = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .verify_plan_with_input(
+            &plan,
+            &response,
+            &input,
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification");
+    assert!(verification.passed);
+    assert_eq!(
+        verification.readback.result["_cfctl"]["post_restore_bookmark"],
+        "restored-8"
+    );
+    assert_eq!(verification.readback.result["_cfctl"]["verified"], true);
+    let requests = server.await.expect("server");
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with("GET "));
+    assert!(requests[1].starts_with("POST "));
+    assert!(requests[2].starts_with("GET "));
+    assert!(requests[1].contains(r#"{"bookmark":"target-1"}"#));
+    assert!(!requests[1].contains("source_operation_id"));
+    assert!(!requests[1].contains("expected_current_bookmark"));
+}
+
+#[tokio::test]
+async fn d1_restore_preserves_success_response_when_post_read_fails() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"bookmark":"current-7"},"errors":[]}"#,
+        r#"{"success":true,"result":{"bookmark":"restored-8","message":"Database restored","previous_bookmark":"current-7"},"errors":[]}"#,
+    ])
+    .await;
+    let capability = d1_restore_exact_bookmark_capability();
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        body: Some(json!({
+            "target_bookmark":"target-1",
+            "expected_current_bookmark":"current-7",
+            "source_operation_id":"source-op",
+            "source_evidence_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        })),
+        ..CallInput::default()
+    };
+    let mut plan = PlanV1::draft(
+        "profile",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("draft plan");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    plan.refresh_hash().expect("refresh plan");
+    plan.approve(true, None).expect("approve plan");
+    plan.mark_consumed().expect("consume plan");
+    let executor =
+        Executor::new(reqwest::Client::new(), &format!("http://{address}")).expect("executor");
+    let response = executor
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            "sha256:catalog",
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect("successful POST response");
+    assert_eq!(server.await.expect("server").len(), 2);
+    let error = executor
+        .verify_plan_with_input(
+            &plan,
+            &response,
+            &input,
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+        )
+        .await
+        .expect_err("post-read must fail");
+    assert!(matches!(error, CloudflareError::Http(_)));
+    assert!(response.success);
+    assert_eq!(response.result["bookmark"], "restored-8");
+    assert_eq!(response.result["previous_bookmark"], "current-7");
+    assert_eq!(response.result["_cfctl"]["performed"], true);
+    assert_eq!(response.result["_cfctl"]["verified"], false);
+}
+
+#[tokio::test]
+async fn d1_restore_preserves_success_response_when_post_read_mismatches() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"bookmark":"current-7"},"errors":[]}"#,
+        r#"{"success":true,"result":{"bookmark":"restored-8","message":"Database restored","previous_bookmark":"current-7"},"errors":[]}"#,
+        r#"{"success":true,"result":{"bookmark":"unexpected-9"},"errors":[]}"#,
+    ])
+    .await;
+    let capability = d1_restore_exact_bookmark_capability();
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        body: Some(json!({
+            "target_bookmark":"target-1",
+            "expected_current_bookmark":"current-7",
+            "source_operation_id":"source-op",
+            "source_evidence_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        })),
+        ..CallInput::default()
+    };
+    let mut plan = PlanV1::draft(
+        "profile",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("draft plan");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    plan.refresh_hash().expect("refresh plan");
+    plan.approve(true, None).expect("approve plan");
+    plan.mark_consumed().expect("consume plan");
+    let executor =
+        Executor::new(reqwest::Client::new(), &format!("http://{address}")).expect("executor");
+    let response = executor
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            "sha256:catalog",
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect("successful POST response");
+    let verification = executor
+        .verify_plan_with_input(
+            &plan,
+            &response,
+            &input,
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+        )
+        .await
+        .expect("mismatch verification");
+    assert_eq!(server.await.expect("server").len(), 3);
+    assert!(!verification.passed);
+    assert!(verification.basis.contains("unexpected-9"));
+    assert!(response.success);
+    assert_eq!(response.result["bookmark"], "restored-8");
+    assert_eq!(response.result["previous_bookmark"], "current-7");
+    assert_eq!(response.result["_cfctl"]["performed"], true);
+    assert_eq!(response.result["_cfctl"]["verified"], false);
+    assert_eq!(
+        verification.readback.result["_cfctl"]["previous_bookmark"],
+        "current-7"
+    );
+    assert_eq!(
+        verification.readback.result["_cfctl"]["post_restore_bookmark"],
+        "unexpected-9"
+    );
+    assert_eq!(verification.readback.result["_cfctl"]["performed"], true);
+    assert_eq!(verification.readback.result["_cfctl"]["verified"], false);
+}
+
+#[tokio::test]
+async fn d1_restore_expected_bookmark_mismatch_fails_before_post() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"bookmark":"unexpected"},"errors":[]}"#,
+    ])
+    .await;
+    let capability = d1_restore_exact_bookmark_capability();
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        body: Some(json!({
+            "target_bookmark":"target-1",
+            "expected_current_bookmark":"expected",
+            "source_operation_id":"source-op",
+            "source_evidence_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        })),
+        ..CallInput::default()
+    };
+    let mut plan = PlanV1::draft(
+        "profile",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("draft plan");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    plan.refresh_hash().expect("refresh plan");
+    plan.approve(true, None).expect("approve plan");
+    plan.mark_consumed().expect("consume plan");
+    let error = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            "sha256:catalog",
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect_err("bookmark drift");
+    assert!(error.to_string().contains("expected current bookmark"));
+    assert_eq!(server.await.expect("server").len(), 1);
+}
+
+#[tokio::test]
+async fn d1_restore_does_not_retry_post_after_provider_500() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for (status, body) in [
+            (
+                "200 OK",
+                r#"{"success":true,"result":{"bookmark":"current-7"},"errors":[]}"#,
+            ),
+            (
+                "500 Internal Server Error",
+                r#"{"success":false,"result":{},"errors":[{"message":"uncertain"}]}"#,
+            ),
+        ] {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).await.expect("read");
+            requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write");
+        }
+        let retried =
+            tokio::time::timeout(std::time::Duration::from_millis(150), listener.accept())
+                .await
+                .is_ok();
+        (requests, retried)
+    });
+    let capability = d1_restore_exact_bookmark_capability();
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        body: Some(json!({
+            "target_bookmark":"target-1",
+            "expected_current_bookmark":"current-7",
+            "source_operation_id":"source-op",
+            "source_evidence_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        })),
+        ..CallInput::default()
+    };
+    let mut plan = PlanV1::draft(
+        "profile",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("draft plan");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    plan.refresh_hash().expect("refresh plan");
+    plan.approve(true, None).expect("approve plan");
+    plan.mark_consumed().expect("consume plan");
+    let response = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            "sha256:catalog",
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect("provider rejection is a response");
+    assert!(!response.success);
+    let (requests, retried) = server.await.expect("server");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].starts_with("POST "));
+    assert!(!retried, "destructive restore POST must never retry");
 }
 
 #[test]
@@ -7795,4 +8471,690 @@ fn token_plan(
     })
     .expect("input");
     plan
+}
+
+fn d1_schema_introspection_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "d1-schema-introspection",
+        "Assert bounded D1 schema state",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/query",
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native D1 schema assertion adapter".clone_into(&mut capability.source);
+    capability.permissions = vec!["D1 Read".to_owned()];
+    capability.mutating = false;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.verification.required = true;
+    "not_applicable".clone_into(&mut capability.verification.strategy);
+    capability.rollback.warning = None;
+    capability.selectors = ["account_id", "database_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: if name == "account_id" {
+                    json!({"type":"string","minLength":32,"maxLength":32})
+                } else {
+                    json!({"type":"string","minLength":36,"maxLength":36})
+                },
+                query: None,
+            }),
+        })
+        .to_vec();
+    let name = json!({"type":"string","minLength":1,"maxLength":255});
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "x-cfctl-body-required":true,
+        "oneOf":[
+            {"type":"object","additionalProperties":false,"required":["assertion","table"],"properties":{"assertion":{"type":"string","enum":["table_exists"]},"table":name}},
+            {"type":"object","additionalProperties":false,"required":["assertion","table","column"],"properties":{"assertion":{"type":"string","enum":["column_exists"]},"table":name,"column":name}},
+            {"type":"object","additionalProperties":false,"required":["assertion","index"],"properties":{"assertion":{"type":"string","enum":["index_exists"]},"index":name}},
+            {"type":"object","additionalProperties":false,"required":["assertion","trigger"],"properties":{"assertion":{"type":"string","enum":["trigger_exists"]},"trigger":name}},
+            {"type":"object","additionalProperties":false,"required":["assertion","object_type","name","fragment"],"properties":{"assertion":{"type":"string","enum":["schema_contains"]},"object_type":{"type":"string","enum":["table","index","trigger"]},"name":name,"fragment":{"type":"string","minLength":1,"maxLength":512}}},
+            {"type":"object","additionalProperties":false,"required":["assertion"],"properties":{"assertion":{"type":"string","enum":["foreign_key_check_empty"]}}}
+        ]
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_schema_introspection = Some(D1SchemaIntrospectionContractV1 {
+        max_rows: 1,
+        max_bytes: 64 * 1024,
+        max_timeout_seconds: 10,
+    });
+    capability
+}
+
+fn d1_full_export_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "d1-full-export",
+        "Export full D1 database to SQL",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/export",
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native governed D1 full-export adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.permissions = vec!["D1 Read".to_owned()];
+    capability.mutating = false;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.verification.required = true;
+    "same_output_file_exists_and_sha256_matches".clone_into(&mut capability.verification.strategy);
+    capability.selectors = ["account_id", "database_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: if name == "account_id" {
+                    json!({"type":"string","minLength":32,"maxLength":32})
+                } else {
+                    json!({"type":"string","minLength":36,"maxLength":36})
+                },
+                query: None,
+            }),
+        })
+        .to_vec();
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_full_export = Some(D1FullExportContractV1 {
+        max_bytes: 1024 * 1024,
+        max_poll_response_bytes: 64 * 1024,
+        max_poll_attempts: 3,
+        max_timeout_seconds: 5,
+        max_download_seconds: 5,
+        requires_new_mode_0600_file: true,
+    });
+    capability
+}
+
+fn d1_full_export_input() -> CallInput {
+    CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        query: json!({}),
+        ..CallInput::default()
+    }
+}
+
+#[test]
+fn d1_full_export_builds_only_fixed_polling_body_and_rejects_caller_controls() {
+    let capability = d1_full_export_capability();
+    let prepared = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("builder")
+        .build(&capability, &d1_full_export_input())
+        .expect("closed export request");
+    assert_eq!(prepared.body, Some(json!({"output_format":"polling"})));
+    assert_eq!(
+        prepared
+            .query_receipt
+            .as_ref()
+            .and_then(|value| value.get("scope")),
+        Some(&json!("full_schema_and_data"))
+    );
+    for input in [
+        CallInput {
+            body: Some(json!({"sql":"SELECT 1"})),
+            ..d1_full_export_input()
+        },
+        CallInput {
+            body: Some(json!({"dump_options":{"tables":["users"]}})),
+            ..d1_full_export_input()
+        },
+        CallInput {
+            query: json!({"bookmark":"caller-controlled"}),
+            ..d1_full_export_input()
+        },
+    ] {
+        assert!(validate_request_contract(&capability, &input).is_err());
+    }
+}
+
+#[test]
+fn d1_full_export_rejects_every_execution_relevant_identity_drift() {
+    let input = d1_full_export_input();
+    let mut drifted = Vec::new();
+
+    let mut capability = d1_full_export_capability();
+    capability.account_scope = "zone".to_owned();
+    drifted.push(capability);
+
+    let mut capability = d1_full_export_capability();
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    drifted.push(capability);
+
+    let mut capability = d1_full_export_capability();
+    capability.selectors.push(SelectorV1 {
+        name: "x-grafted".to_owned(),
+        location: "header".to_owned(),
+        required: false,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    });
+    drifted.push(capability);
+
+    let mut capability = d1_full_export_capability();
+    capability.selectors.swap(0, 1);
+    drifted.push(capability);
+
+    let mut capability = d1_full_export_capability();
+    capability.selectors[0].required = false;
+    drifted.push(capability);
+
+    let mut capability = d1_full_export_capability();
+    capability.selectors[1]
+        .contract
+        .as_mut()
+        .expect("selector contract")
+        .schema = json!({"type":"string"});
+    drifted.push(capability);
+
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    for capability in drifted {
+        assert!(validate_request_contract(&capability, &input).is_err());
+        assert!(builder.build(&capability, &input).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn d1_full_export_rejects_unsafe_paths_before_server_contact() {
+    use std::os::unix::fs::symlink;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let root = tempfile::tempdir().expect("root");
+    let root = std::fs::canonicalize(root.path()).expect("canonical root");
+    let target = root.join("target");
+    std::fs::create_dir(&target).expect("target");
+    let linked = root.join("linked");
+    symlink(&target, &linked).expect("symlink");
+
+    for output in [
+        root.join("nested/../snapshot.sql"),
+        root.join("missing/snapshot.sql"),
+        linked.join("snapshot.sql"),
+    ] {
+        let error = Executor::new(
+            reqwest::Client::new(),
+            &format!("http://{address}/client/v4"),
+        )
+        .expect("executor")
+        .execute_read_to_file(
+            &d1_full_export_capability(),
+            &d1_full_export_input(),
+            &AuthCredential::Bearer {
+                token: "selected-token".to_owned(),
+            },
+            &output,
+        )
+        .await
+        .expect_err("unsafe path fails closed");
+        assert!(matches!(error, CloudflareError::OutputFile { .. }));
+        assert!(!output.exists());
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "path validation must happen before server contact"
+    );
+}
+
+#[tokio::test]
+async fn d1_full_export_polls_streams_and_verifies_same_path_hash() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for response in [
+            r#"{"success":true,"result":{"type":"export","success":true,"at_bookmark":"bookmark-42"}}"#
+                .to_owned(),
+            format!(
+                r#"{{"success":true,"result":{{"type":"export","status":"complete","success":true,"at_bookmark":"bookmark-42","result":{{"filename":"snapshot.sql","signed_url":"http://{address}/download"}}}}}}"#
+            ),
+            "CREATE TABLE users(id INTEGER);\nINSERT INTO users VALUES (1);\n".to_owned(),
+        ] {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let read = socket.read(&mut buffer).await.expect("read");
+            request.extend_from_slice(&buffer[..read]);
+            requests.push(String::from_utf8_lossy(&request).into_owned());
+            let content_type = if response.starts_with('{') {
+                "application/json"
+            } else {
+                "application/sql"
+            };
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write");
+        }
+        requests
+    });
+    let output_root = tempfile::tempdir().expect("output root");
+    let output = std::fs::canonicalize(output_root.path())
+        .expect("canonical output root")
+        .join("snapshot.sql");
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read_to_file(
+        &d1_full_export_capability(),
+        &d1_full_export_input(),
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+        &output,
+    )
+    .await
+    .expect("full export");
+    assert!(response.success);
+    assert_eq!(
+        response.result["database"]["database_id"],
+        "11111111-2222-3333-4444-555555555555"
+    );
+    assert_eq!(response.result["provider"]["at_bookmark"], "bookmark-42");
+    assert_eq!(response.result["output_file"]["bytes"], 62);
+    assert_eq!(response.result["output_file"]["exists"], true);
+    assert_eq!(response.result["output_file"]["hash_matches"], true);
+    assert_eq!(
+        std::fs::read_to_string(&output).expect("export file"),
+        "CREATE TABLE users(id INTEGER);\nINSERT INTO users VALUES (1);\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&output)
+                .expect("export metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let requests = server.await.expect("server");
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].contains("\"output_format\":\"polling\""));
+    assert!(!requests[0].contains("sql"));
+    assert!(requests[1].contains("\"current_bookmark\":\"bookmark-42\""));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn d1_full_export_rejects_existing_file_or_final_symlink_without_changes_or_contact() {
+    use std::os::unix::fs::symlink;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let root = tempfile::tempdir().expect("root");
+    let root = std::fs::canonicalize(root.path()).expect("canonical root");
+    let existing = root.join("existing.sql");
+    std::fs::write(&existing, "keep").expect("existing file");
+    let target = root.join("target.sql");
+    std::fs::write(&target, "target").expect("target file");
+    let linked = root.join("linked.sql");
+    symlink(&target, &linked).expect("final symlink");
+
+    for output in [&existing, &linked] {
+        Executor::new(
+            reqwest::Client::new(),
+            &format!("http://{address}/client/v4"),
+        )
+        .expect("executor")
+        .execute_read_to_file(
+            &d1_full_export_capability(),
+            &d1_full_export_input(),
+            &AuthCredential::Bearer {
+                token: "selected-token".to_owned(),
+            },
+            output,
+        )
+        .await
+        .expect_err("existing output fails closed");
+    }
+    assert_eq!(std::fs::read_to_string(existing).expect("existing"), "keep");
+    assert_eq!(std::fs::read_to_string(target).expect("target"), "target");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "existing output validation must happen before server contact"
+    );
+}
+
+#[tokio::test]
+async fn d1_full_export_removes_new_file_after_partial_stream_or_byte_overflow() {
+    for (download, declared_length, max_bytes) in [
+        ("partial", 100_usize, 1024_u64),
+        ("overflow", 8_usize, 4_u64),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            for (index, response) in [
+                format!(
+                    r#"{{"success":true,"result":{{"type":"export","status":"complete","success":true,"at_bookmark":"bookmark-42","result":{{"filename":"snapshot.sql","signed_url":"http://{address}/download"}}}}}}"#
+                ),
+                download.to_owned(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buffer = [0_u8; 4096];
+                let _read = socket.read(&mut buffer).await.expect("read");
+                let length = if index == 0 {
+                    response.len()
+                } else {
+                    declared_length
+                };
+                let content_type = if index == 0 {
+                    "application/json"
+                } else {
+                    "application/octet-stream"
+                };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{response}"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write");
+            }
+        });
+        let root = tempfile::tempdir().expect("root");
+        let output = std::fs::canonicalize(root.path())
+            .expect("canonical root")
+            .join("snapshot.sql");
+        let mut capability = d1_full_export_capability();
+        capability
+            .d1_full_export
+            .as_mut()
+            .expect("export contract")
+            .max_bytes = max_bytes;
+        capability
+            .d1_full_export
+            .as_mut()
+            .expect("export contract")
+            .max_poll_attempts = 1;
+        Executor::new(
+            reqwest::Client::new(),
+            &format!("http://{address}/client/v4"),
+        )
+        .expect("executor")
+        .execute_read_to_file(
+            &capability,
+            &d1_full_export_input(),
+            &AuthCredential::Bearer {
+                token: "selected-token".to_owned(),
+            },
+            &output,
+        )
+        .await
+        .expect_err("failed stream must not retain output");
+        assert!(!output.exists(), "partial output must be removed");
+        server.await.expect("server");
+    }
+}
+
+fn d1_schema_input(body: Value) -> CallInput {
+    CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        query: json!({}),
+        body: Some(body),
+        ..CallInput::default()
+    }
+}
+
+#[test]
+fn d1_schema_introspection_compiles_closed_assertions_without_caller_sql() {
+    let capability = d1_schema_introspection_capability();
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    let injection = "advisor_equity_instrument'); DROP TABLE users; --";
+    let prepared = builder
+        .build(
+            &capability,
+            &d1_schema_input(json!({
+                "assertion":"schema_contains",
+                "object_type":"table",
+                "name":"equity_issuance_evidence_links",
+                "fragment":injection
+            })),
+        )
+        .expect("closed schema assertion");
+
+    assert_eq!(prepared.method, "POST");
+    assert_eq!(
+        prepared.url.as_str(),
+        "https://api.cloudflare.com/client/v4/accounts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/d1/database/11111111-2222-3333-4444-555555555555/query"
+    );
+    assert_eq!(prepared.max_rows, 1);
+    assert_eq!(prepared.max_bytes, 64 * 1024);
+    assert_eq!(prepared.timeout_seconds, 10);
+    let wire = prepared.body.expect("compiler-owned body");
+    let sql = wire["sql"].as_str().expect("fixed SQL");
+    assert_eq!(
+        sql,
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2 AND instr(COALESCE(sql, ''), ?3) > 0) AS present"
+    );
+    assert!(!sql.contains(injection));
+    assert_eq!(wire["params"][2], injection);
+    assert_eq!(
+        prepared
+            .query_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.get("caller_sql"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+}
+
+#[test]
+fn d1_schema_introspection_supports_every_closed_migration_assertion() {
+    let capability = d1_schema_introspection_capability();
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    for body in [
+        json!({"assertion":"table_exists","table":"document_render_jobs"}),
+        json!({"assertion":"column_exists","table":"document_render_jobs","column":"claim_generation"}),
+        json!({"assertion":"index_exists","index":"idx_document_render_jobs_claim"}),
+        json!({"assertion":"trigger_exists","trigger":"document_render_jobs_terminal_generation_guard"}),
+        json!({"assertion":"schema_contains","object_type":"table","name":"equity_issuance_evidence_links","fragment":"advisor_equity_instrument"}),
+        json!({"assertion":"foreign_key_check_empty"}),
+    ] {
+        let prepared = builder
+            .build(&capability, &d1_schema_input(body))
+            .expect("supported assertion");
+        let wire = prepared.body.expect("compiler-owned D1 body");
+        assert!(wire["sql"].as_str().is_some_and(|sql| {
+            sql.starts_with("SELECT ") && !sql.contains(';') && !sql.contains("--")
+        }));
+        assert!(wire["params"].is_array());
+    }
+}
+
+#[test]
+fn d1_schema_introspection_rejects_raw_sql_and_contract_drift() {
+    let capability = d1_schema_introspection_capability();
+    let raw_sql = d1_schema_input(json!({
+        "assertion":"table_exists",
+        "table":"users",
+        "sql":"DROP TABLE users"
+    }));
+    assert!(matches!(
+        validate_request_contract(&capability, &raw_sql),
+        Err(CloudflareError::InvalidRequestBody(_))
+    ));
+
+    let arbitrary = d1_schema_input(json!({"assertion":"pragma","name":"writable_schema"}));
+    assert!(matches!(
+        validate_request_contract(&capability, &arbitrary),
+        Err(CloudflareError::InvalidRequestBody(_))
+    ));
+
+    let mut drifted = capability;
+    drifted.permissions = vec!["D1 Write".to_owned()];
+    assert!(matches!(
+        validate_request_contract(
+            &drifted,
+            &d1_schema_input(json!({"assertion":"foreign_key_check_empty"}))
+        ),
+        Err(CloudflareError::InvalidAnalyticsQuery(_))
+    ));
+}
+
+#[test]
+fn d1_schema_introspection_rejects_missing_or_permissive_request_schema_drift() {
+    let input = d1_schema_input(json!({"assertion":"foreign_key_check_empty"}));
+
+    let mut missing = d1_schema_introspection_capability();
+    missing.request_schema = None;
+    assert!(matches!(
+        validate_request_contract(&missing, &input),
+        Err(CloudflareError::InvalidAnalyticsQuery(_))
+    ));
+
+    let mut permissive = d1_schema_introspection_capability();
+    permissive
+        .request_schema
+        .as_mut()
+        .and_then(|schema| schema.pointer_mut("/oneOf/0"))
+        .and_then(Value::as_object_mut)
+        .expect("first assertion schema")
+        .remove("additionalProperties");
+    assert!(matches!(
+        validate_request_contract(&permissive, &input),
+        Err(CloudflareError::InvalidAnalyticsQuery(_))
+    ));
+}
+
+#[tokio::test]
+async fn d1_schema_introspection_executes_as_one_bounded_read_only_post() {
+    let capability = d1_schema_introspection_capability();
+    let input = d1_schema_input(json!({
+        "assertion":"trigger_exists",
+        "trigger":"document_render_jobs_terminal_generation_guard"
+    }));
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"errors":[],"messages":[],"result":[{"results":[{"present":1}],"success":true,"meta":{"rows_read":1,"rows_written":0}}]}"#,
+    ])
+    .await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &input,
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("bounded D1 schema read");
+    assert!(response.success);
+    assert_eq!(
+        response.result.pointer("/0/results/0/present"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        response
+            .result_info
+            .as_ref()
+            .and_then(|info| info.pointer("/query/kind")),
+        Some(&json!("d1_schema_introspection"))
+    );
+    assert_eq!(
+        response
+            .result_info
+            .as_ref()
+            .and_then(|info| info.pointer("/coverage/classification")),
+        Some(&json!("complete_assertion_response"))
+    );
+    assert_eq!(
+        response
+            .result_info
+            .as_ref()
+            .and_then(|info| info.pointer("/output/byte_limit")),
+        Some(&json!(64 * 1024))
+    );
+
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with(
+        "POST /client/v4/accounts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/d1/database/11111111-2222-3333-4444-555555555555/query "
+    ));
+    assert!(
+        requests[0].contains("\"params\":[\"document_render_jobs_terminal_generation_guard\"]")
+    );
+    assert!(requests[0].contains(
+        "\"sql\":\"SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = ?1) AS present\""
+    ));
+    assert!(!requests[0].contains("DROP TABLE"));
+}
+
+#[tokio::test]
+async fn d1_schema_introspection_rejects_non_boolean_or_write_reporting_responses() {
+    let capability = d1_schema_introspection_capability();
+    let input = d1_schema_input(json!({"assertion":"foreign_key_check_empty"}));
+    for body in [
+        r#"{"success":true,"result":[{"results":[{"present":"yes"}],"success":true,"meta":{"rows_written":0}}]}"#,
+        r#"{"success":true,"result":[{"results":[{"present":1}],"success":true,"meta":{"rows_written":1}}]}"#,
+        r#"{"success":true,"result":[{"results":[{"present":1},{"present":0}],"success":true,"meta":{"rows_written":0}}]}"#,
+    ] {
+        let (address, server) = json_response_sequence_server(vec![body]).await;
+        let error = Executor::new(
+            reqwest::Client::new(),
+            &format!("http://{address}/client/v4"),
+        )
+        .expect("executor")
+        .execute_read(
+            &capability,
+            &input,
+            &AuthCredential::Bearer {
+                token: "selected-token".to_owned(),
+            },
+        )
+        .await
+        .expect_err("malformed or write-reporting response must fail closed");
+        assert!(matches!(
+            error,
+            CloudflareError::InvalidResponseEnvelope { status: 200 }
+        ));
+        assert_eq!(server.await.expect("server joins").len(), 1);
+    }
 }

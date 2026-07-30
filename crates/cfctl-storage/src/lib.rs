@@ -11,8 +11,8 @@ use std::{
 
 use cfctl_core::{
     AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, EvidenceClass, EvidenceV1,
-    OperationalProofV1, PlanV1, PlanV2, StandingAuthorityStatus, StandingAuthorityV1, redact_json,
-    redact_json_schema,
+    OperationalProofV1, PlanV1, PlanV2, StandingAuthorityStatus, StandingAuthorityV1, hash_value,
+    redact_json, redact_json_schema,
 };
 use cfctl_workspace::{
     WORKSPACE_MANIFEST_SCHEMA_VERSION, WorkspaceManifestV1, WorkspaceRegistrationV1,
@@ -20,7 +20,7 @@ use cfctl_workspace::{
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -265,6 +265,7 @@ impl StateStore {
                 .join("bundles"),
             &paths.data_dir.join("catalog"),
             &paths.data_dir.join("authorities"),
+            &paths.data_dir.join("d1-import-checkpoints"),
         ] {
             create_dir_all(path)?;
         }
@@ -294,6 +295,134 @@ impl StateStore {
             &content_hash,
             &path.display().to_string(),
         ))
+    }
+
+    /// Appends one immutable import-protocol checkpoint. The plan lock held by
+    /// the CLI serializes writers; create-new files and content hashes make a
+    /// crash or replacement visible before a later provider request.
+    pub fn record_d1_import_checkpoint(
+        &self,
+        operation_id: &str,
+        checkpoint: &Value,
+    ) -> Result<String> {
+        validate_plan_id(operation_id)?;
+        if checkpoint.get("operation_id").and_then(Value::as_str) != Some(operation_id)
+            || checkpoint.get("schema_version").and_then(Value::as_u64) != Some(1)
+            || checkpoint
+                .get("step")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return Err(StorageError::UnsafeManagedDocument {
+                path: "d1-import-checkpoint".to_owned(),
+                reason: "checkpoint identity, version, and step must match the locked plan"
+                    .to_owned(),
+            });
+        }
+        let directory = self
+            .paths
+            .data_dir
+            .join("d1-import-checkpoints")
+            .join(operation_id);
+        create_dir_all(&directory)?;
+        let mut sequence = 0_u64;
+        for entry in fs::read_dir(&directory).map_err(|source| io_error(&directory, source))? {
+            let entry = entry.map_err(|source| io_error(&directory, source))?;
+            if entry.path().extension().and_then(std::ffi::OsStr::to_str) == Some("json") {
+                sequence = sequence.saturating_add(1);
+            }
+        }
+        let redacted = redact_json(checkpoint);
+        if redacted != *checkpoint {
+            return Err(StorageError::SensitiveData);
+        }
+        let encoded = serde_json::to_vec_pretty(checkpoint)?;
+        let hash = format!("sha256:{}", hex::encode(Sha256::digest(&encoded)));
+        let path = directory.join(format!("{sequence:04}-{}.json", &hash[7..23]));
+        atomic_create(&path, &encoded)?;
+        Ok(hash)
+    }
+
+    pub fn read_d1_import_checkpoints(&self, operation_id: &str) -> Result<Vec<(String, Value)>> {
+        validate_plan_id(operation_id)?;
+        let directory = self
+            .paths
+            .data_dir
+            .join("d1-import-checkpoints")
+            .join(operation_id);
+        let mut paths = fs::read_dir(&directory)
+            .map_err(|source| io_error(&directory, source))?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .map_err(|source| io_error(&directory, source))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        paths.sort();
+        let mut checkpoints = Vec::new();
+        for path in paths {
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json")
+                || !validate_existing_managed_file(&path)?
+            {
+                return Err(unsafe_managed_document(
+                    &path,
+                    "import checkpoint is not an immutable JSON file",
+                ));
+            }
+            let bytes = fs::read(&path).map_err(|source| io_error(&path, source))?;
+            let hash = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+            let expected_suffix = format!("-{}.json", &hash[7..23]);
+            if !path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.ends_with(&expected_suffix))
+            {
+                return Err(unsafe_managed_document(
+                    &path,
+                    "import checkpoint bytes do not match the immutable filename hash",
+                ));
+            }
+            let value: Value = serde_json::from_slice(&bytes)?;
+            if value.get("operation_id").and_then(Value::as_str) != Some(operation_id) {
+                return Err(unsafe_managed_document(
+                    &path,
+                    "import checkpoint operation identity drifted",
+                ));
+            }
+            checkpoints.push((hash, value));
+        }
+        Ok(checkpoints)
+    }
+
+    /// Loads one immutable evidence body by its content hash and revalidates
+    /// that the stored bytes still match the requested identity.
+    pub fn read_evidence_value(&self, content_hash: &str) -> Result<Value> {
+        let digest = content_hash.strip_prefix("sha256:").filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+        let digest = digest.ok_or_else(|| StorageError::UnsafeManagedDocument {
+            path: "evidence".to_owned(),
+            reason: "evidence hash must be canonical lowercase sha256".to_owned(),
+        })?;
+        let path = self
+            .paths
+            .data_dir
+            .join("evidence")
+            .join(format!("{digest}.json"));
+        let bytes = std::fs::read(&path).map_err(|source| StorageError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if hex::encode(Sha256::digest(&bytes)) != digest {
+            return Err(StorageError::UnsafeManagedDocument {
+                path: path.display().to_string(),
+                reason: "evidence bytes do not match the requested content hash".to_owned(),
+            });
+        }
+        serde_json::from_slice(&bytes).map_err(StorageError::Json)
     }
 
     /// Indexes a live-read receipt by public contract and account scope. The
@@ -1248,6 +1377,176 @@ fn validate_operational_proof(
         ));
     }
     validate_sha256_identity("evidence", &proof.evidence.content_hash)?;
+    validate_d1_full_export_execution_binding(proof)?;
+    validate_mln_0142_execution_binding(proof)?;
+    validate_mln_0143_execution_binding(proof)?;
+    Ok(())
+}
+
+fn validate_d1_full_export_execution_binding(proof: &OperationalProofV1) -> Result<()> {
+    let binding = proof.d1_full_export_governed_execution();
+    if proof.capability_id == "d1-full-export" && binding.is_none() {
+        return Err(StorageError::InvalidOperationalProof(
+            "D1 full-export operational proof requires governed-execution provenance".to_owned(),
+        ));
+    }
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    for (label, value) in [
+        ("binding catalog", binding.catalog_hash.as_str()),
+        ("target scope", binding.target_scope_hash.as_str()),
+        ("output file", binding.output_file_sha256.as_str()),
+        ("captured bookmark", binding.at_bookmark_hash.as_str()),
+        ("manifest evidence", binding.manifest_evidence_hash.as_str()),
+        ("request", binding.request_hash.as_str()),
+    ] {
+        validate_sha256_identity(label, value)?;
+    }
+    if binding.schema_version != 1
+        || binding.capability_id != "d1-full-export"
+        || proof.capability_id != binding.capability_id
+        || proof.catalog_hash != binding.catalog_hash
+        || proof.input_hash != binding.request_hash
+        || proof.evidence.content_hash != binding.manifest_evidence_hash
+        || proof.profile_id.as_deref() != Some(binding.profile_id.as_str())
+        || proof.credential_generation_id.as_deref()
+            != Some(binding.credential_generation_id.as_str())
+        || Uuid::parse_str(&binding.operation_id).is_err()
+        || Uuid::parse_str(&binding.credential_generation_id).is_err()
+        || binding.profile_id.trim().is_empty()
+        || binding.completion_status != "completed"
+        || proof.outcome != cfctl_core::OperationalProofOutcomeV1::Succeeded
+        || proof.observed_at != binding.completed_at
+    {
+        return Err(StorageError::InvalidOperationalProof(
+            "D1 full-export binding drifted from its immutable completed proof".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mln_0142_execution_binding(proof: &OperationalProofV1) -> Result<()> {
+    let binding = proof.mln_0142_governed_execution();
+    if proof.capability_id == "mln-0142-post-import-schema" && binding.is_none() {
+        return Err(StorageError::InvalidOperationalProof(
+            "MLN 0142 operational proof requires governed-execution provenance".to_owned(),
+        ));
+    }
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    for (label, value) in [
+        ("binding catalog", binding.catalog_hash.as_str()),
+        ("target scope", binding.target_scope_hash.as_str()),
+        (
+            "import boundary",
+            binding.import_boundary_evidence_hash.as_str(),
+        ),
+        ("import source", binding.import_source_sha256.as_str()),
+        ("import plan", binding.import_plan_hash.as_str()),
+        ("final bookmark", binding.final_bookmark_hash.as_str()),
+        (
+            "trigger definition",
+            binding.trigger_definition_sha256.as_str(),
+        ),
+        ("manifest evidence", binding.manifest_evidence_hash.as_str()),
+        ("request", binding.request_hash.as_str()),
+    ] {
+        validate_sha256_identity(label, value)?;
+    }
+    let credential_generation_id = proof.credential_generation_id.as_deref().ok_or_else(|| {
+        StorageError::InvalidOperationalProof(
+            "MLN 0142 execution binding requires a credential generation".to_owned(),
+        )
+    })?;
+    if binding.schema_version != 1
+        || Uuid::parse_str(&binding.operation_id).is_err()
+        || Uuid::parse_str(&binding.import_operation_id).is_err()
+        || binding.capability_id != proof.capability_id
+        || binding.capability_version != 1
+        || binding.catalog_hash != proof.catalog_hash
+        || binding.manifest_evidence_hash != proof.evidence.content_hash
+        || binding.request_hash != proof.input_hash
+        || binding.credential_generation_id != credential_generation_id
+        || binding.trigger_name != "document_render_jobs_terminal_generation_guard"
+        || binding.trigger_definition_sha256
+            != "sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b"
+        || binding.completion_status != "completed"
+        || binding.completed_at != proof.observed_at
+    {
+        return Err(StorageError::InvalidOperationalProof(
+            "MLN 0142 governed-execution provenance is incomplete or does not match its operational proof"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mln_0143_execution_binding(proof: &OperationalProofV1) -> Result<()> {
+    let binding = proof.mln_0143_governed_execution();
+    if proof.capability_id == "mln-0143-data-invariants" && binding.is_none() {
+        return Err(StorageError::InvalidOperationalProof(
+            "MLN 0143 operational proof requires governed-execution provenance".to_owned(),
+        ));
+    }
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    let profile_id = proof.profile_id.as_deref().ok_or_else(|| {
+        StorageError::InvalidOperationalProof(
+            "MLN 0143 execution binding requires a profile identity".to_owned(),
+        )
+    })?;
+    let credential_generation_id = proof.credential_generation_id.as_deref().ok_or_else(|| {
+        StorageError::InvalidOperationalProof(
+            "MLN 0143 execution binding requires a credential generation".to_owned(),
+        )
+    })?;
+    for (label, value) in [
+        (
+            "validator contract",
+            binding.validator_contract_hash.as_str(),
+        ),
+        ("fixed query", binding.fixed_query_sha256.as_str()),
+        ("binding catalog", binding.catalog_hash.as_str()),
+        ("target scope", binding.target_scope_hash.as_str()),
+        ("manifest evidence", binding.manifest_evidence_hash.as_str()),
+        ("request", binding.request_hash.as_str()),
+        ("profile identity", binding.profile_identity_hash.as_str()),
+    ] {
+        validate_sha256_identity(label, value)?;
+    }
+    if let Some(lineage_hash) = binding.cross_operation_lineage_hash.as_deref() {
+        validate_sha256_identity("cross-operation lineage", lineage_hash)?;
+    }
+    let expected_profile_identity = hash_value(&json!({
+        "profile_id": profile_id,
+        "credential_generation_id": credential_generation_id,
+    }))
+    .map_err(|error| StorageError::InvalidOperationalProof(error.to_string()))?;
+    if binding.schema_version != 1
+        || Uuid::parse_str(&binding.operation_id).is_err()
+        || binding.capability_id != proof.capability_id
+        || binding.capability_version != 5
+        || binding.catalog_hash != proof.catalog_hash
+        || binding.manifest_evidence_hash != proof.evidence.content_hash
+        || binding.request_hash != proof.input_hash
+        || binding.profile_identity_hash != expected_profile_identity
+        || binding.credential_generation_id != credential_generation_id
+        || !matches!(
+            binding.phase.as_str(),
+            "pre_import" | "post_import" | "post_restore"
+        )
+        || binding.completion_status != "completed"
+        || binding.completed_at != proof.observed_at
+        || (binding.phase == "pre_import") != binding.cross_operation_lineage_hash.is_none()
+    {
+        return Err(StorageError::InvalidOperationalProof(
+            "MLN 0143 governed-execution provenance is incomplete or does not match its operational proof"
+                .to_owned(),
+        ));
+    }
     Ok(())
 }
 

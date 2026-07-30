@@ -27,6 +27,10 @@ CLI, tunnels, and Access:
 - Wrangler configuration: https://developers.cloudflare.com/workers/wrangler/configuration/
 - Wrangler system environment variables: https://developers.cloudflare.com/workers/wrangler/system-environment-variables/
 - Wrangler auth token changelog entry: https://developers.cloudflare.com/changelog/post/2025-12-18-wrangler-auth-token/
+- D1 Time Travel: https://developers.cloudflare.com/d1/reference/time-travel/
+- D1 pricing: https://developers.cloudflare.com/d1/platform/pricing/
+- D1 bookmark API: https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/get_bookmark/
+- D1 restore API: https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/restore/
 - Cloudflare Tunnel local management: https://developers.cloudflare.com/tunnel/advanced/local-management/
 - Cloudflare Tunnel tokens: https://developers.cloudflare.com/tunnel/advanced/tunnel-tokens/
 - Access service tokens: https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/
