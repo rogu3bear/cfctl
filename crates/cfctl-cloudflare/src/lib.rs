@@ -472,6 +472,10 @@ SELECT evidence_rows,evidence_received,evidence_window_total,
  (SELECT [unique] FROM pragma_index_list('equity_issuance_evidence_links') WHERE name='idx_equity_issuance_evidence_document') AS document_index_unique,
  (SELECT COALESCE(json_group_array(name),'[]') FROM (SELECT name FROM pragma_index_info('idx_equity_issuance_evidence_document') ORDER BY seqno)) AS document_index_columns,
  (SELECT sql FROM sqlite_schema WHERE type='index' AND name='idx_equity_issuance_evidence_unique_hash') AS unique_hash_index_sql,
+ (SELECT tbl_name FROM sqlite_schema WHERE type='index' AND name='idx_equity_issuance_evidence_unique_hash') AS unique_hash_index_table,
+ (SELECT [unique] FROM pragma_index_list('equity_issuance_evidence_links') WHERE name='idx_equity_issuance_evidence_unique_hash') AS unique_hash_index_unique,
+ (SELECT partial FROM pragma_index_list('equity_issuance_evidence_links') WHERE name='idx_equity_issuance_evidence_unique_hash') AS unique_hash_index_partial,
+ (SELECT COALESCE(json_group_array(name),'[]') FROM (SELECT name FROM pragma_index_info('idx_equity_issuance_evidence_unique_hash') ORDER BY seqno)) AS unique_hash_index_columns,
  (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_equity_instrument_evidence_contract') AS trigger_contract_sql,
  (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_equity_instrument_evidence_immutable') AS trigger_immutable_sql,
  (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_grant_final_instrument_required') AS trigger_final_required_sql,
@@ -879,6 +883,10 @@ mod mln_0143_invariant_tests {
                     "document_index_unique":0,
                     "document_index_columns":"[\"org_id\",\"document_id\"]",
                     "unique_hash_index_sql":"CREATE UNIQUE INDEX idx_equity_issuance_evidence_unique_hash ON equity_issuance_evidence_links(org_id, issuance_event_id, evidence_kind, document_hash) WHERE document_hash IS NOT NULL",
+                    "unique_hash_index_table":"equity_issuance_evidence_links",
+                    "unique_hash_index_unique":1,
+                    "unique_hash_index_partial":1,
+                    "unique_hash_index_columns":"[\"org_id\",\"issuance_event_id\",\"evidence_kind\",\"document_hash\"]",
                     "trigger_contract_sql":null,
                     "trigger_immutable_sql":null,
                     "trigger_final_required_sql":null,
@@ -978,6 +986,46 @@ mod mln_0143_invariant_tests {
             assert!(
                 sanitize_mln_0143_data_invariants_response(&mut unique, &request).is_err(),
                 "{unique_field} drift"
+            );
+        }
+    }
+
+    #[test]
+    fn unique_hash_index_fails_closed_on_structural_or_predicate_drift() {
+        let request = prepared("pre_import");
+        for (field, value, label) in [
+            (
+                "unique_hash_index_table",
+                json!("other_table"),
+                "wrong table",
+            ),
+            (
+                "unique_hash_index_columns",
+                json!(
+                    "[\"org_id\",\"issuance_event_id\",\"evidence_kind\",\"document_hash\",\"id\"]"
+                ),
+                "extra column",
+            ),
+            (
+                "unique_hash_index_columns",
+                json!("[\"org_id\",\"evidence_kind\",\"issuance_event_id\",\"document_hash\"]"),
+                "reordered column",
+            ),
+            ("unique_hash_index_unique", json!(0), "nonunique"),
+            ("unique_hash_index_partial", json!(0), "nonpartial"),
+            (
+                "unique_hash_index_sql",
+                json!(
+                    "CREATE UNIQUE INDEX idx_equity_issuance_evidence_unique_hash ON equity_issuance_evidence_links(org_id, issuance_event_id, evidence_kind, document_hash) WHERE document_hash IS NOT NULL AND evidence_kind != 'other'"
+                ),
+                "predicate drift",
+            ),
+        ] {
+            let mut response = pre_response(0);
+            response.result[0]["results"][0][field] = value;
+            assert!(
+                sanitize_mln_0143_data_invariants_response(&mut response, &request).is_err(),
+                "{label}"
             );
         }
     }
@@ -4639,15 +4687,29 @@ fn sanitize_mln_0143_data_invariants_response(
             return Err(invariant_response_error(response.status));
         }
     }
-    let index_sql = text("unique_hash_index_sql")?;
-    let index_normalized = index_sql
+    let index_normalized = text("unique_hash_index_sql")?
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase();
-    if !index_normalized.contains("create unique index idx_equity_issuance_evidence_unique_hash")
-        || !index_normalized.contains("org_id, issuance_event_id, evidence_kind, document_hash")
-        || !index_normalized.contains("where document_hash is not null")
+    let index_columns: Value = serde_json::from_str(text("unique_hash_index_columns")?)
+        .map_err(|_| invariant_response_error(response.status))?;
+    let expected_index_prefix = "create unique index idx_equity_issuance_evidence_unique_hash on equity_issuance_evidence_links";
+    let Some((definition, predicate)) = index_normalized.rsplit_once(" where ") else {
+        return Err(invariant_response_error(response.status));
+    };
+    if text("unique_hash_index_table")? != "equity_issuance_evidence_links"
+        || number("unique_hash_index_unique")? != 1
+        || number("unique_hash_index_partial")? != 1
+        || index_columns
+            != serde_json::json!([
+                "org_id",
+                "issuance_event_id",
+                "evidence_kind",
+                "document_hash"
+            ])
+        || !definition.starts_with(expected_index_prefix)
+        || predicate != "document_hash is not null"
     {
         return Err(invariant_response_error(response.status));
     }
