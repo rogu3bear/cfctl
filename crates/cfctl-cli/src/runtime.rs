@@ -13463,7 +13463,7 @@ fn exact_linear_poll_child_provider_complete(
     store: &StateStore,
     root: &PlanV1,
 ) -> Result<DurableProviderCompleteBoundary> {
-    let children = store
+    let discovered = store
         .list_plans()?
         .into_iter()
         .filter(|candidate| {
@@ -13475,10 +13475,47 @@ fn exact_linear_poll_child_provider_complete(
                     == Some(root.operation_id.as_str())
         })
         .collect::<Vec<_>>();
+    let children = discovered
+        .into_iter()
+        .map(|projection| {
+            let StoredPlanRecord::Current(current) =
+                store.load_stored_plan_record(&projection.operation_id)?
+            else {
+                return Err(CliError::Input(
+                    "every root-claiming poll child must have an authentic PlanV2 sidecar"
+                        .to_owned(),
+                ));
+            };
+            if serde_json::to_value(&projection)? != serde_json::to_value(&current.plan)?
+                || current.pins.catalog_hash != current.plan.catalog_hash
+                || current.pins.credential_generation_id.is_empty()
+                || current.plan.capability.id != "d1-resume-approved-mln-import-poll"
+                || current.plan.approval.is_none()
+                || current
+                    .plan
+                    .transaction_artifact(TransactionStageV1::ConsumptionPersisted)
+                    .is_none()
+                || current
+                    .plan
+                    .transaction_artifact(TransactionStageV1::BoundaryAttemptPersisted)
+                    .is_none()
+                || current
+                    .plan
+                    .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                    .is_none()
+            {
+                return Err(CliError::Input(
+                    "poll child PlanV2 projection, pins, approval, consumption, or boundary lifecycle is invalid"
+                        .to_owned(),
+                ));
+            }
+            Ok(current)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let completed = children
         .iter()
         .filter_map(|child| {
-            exact_durable_resume_provider_complete_boundary(store, child)
+            exact_durable_resume_provider_complete_boundary(store, &child.plan)
                 .ok()
                 .map(|boundary| (child, boundary))
         })
@@ -13490,23 +13527,24 @@ fn exact_linear_poll_child_provider_complete(
         ));
     }
     let (terminal, boundary) = &completed[0];
-    let mut current = *terminal;
+    let mut current = terminal.as_ref();
     let mut visited = BTreeSet::new();
     loop {
-        if !visited.insert(current.operation_id.clone()) {
+        if !visited.insert(current.plan.operation_id.clone()) {
             return Err(CliError::Input(
                 "poll continuation lineage contains a cycle".to_owned(),
             ));
         }
         let authority = current
+            .plan
             .targets
             .pointer("/adapter/approved_mln_import_poll_resume")
             .ok_or_else(|| CliError::Input("poll child authority is missing".to_owned()))?;
         if authority.get("root_plan_hash").and_then(Value::as_str)
             != Some(root.content_hash.as_str())
-            || current.profile_id != root.profile_id
-            || current.catalog_hash != root.catalog_hash
-            || current.account_id != root.account_id
+            || current.plan.profile_id != root.profile_id
+            || current.plan.catalog_hash != root.catalog_hash
+            || current.plan.account_id != root.account_id
         {
             return Err(CliError::Input(
                 "poll child drifted from root plan, profile, account, or catalog".to_owned(),
@@ -13524,7 +13562,7 @@ fn exact_linear_poll_child_provider_complete(
         let parent = &parent_v2.plan;
         if authority.get("parent_plan_hash").and_then(Value::as_str)
             != Some(parent.content_hash.as_str())
-            || parent.created_at >= current.created_at
+            || parent.created_at >= current.plan.created_at
             || parent_v2.pins.credential_generation_id
                 != store
                     .load_plan_v2(&root.operation_id)?
@@ -13581,7 +13619,8 @@ fn exact_linear_poll_child_provider_complete(
         }
         current = children
             .iter()
-            .find(|candidate| candidate.operation_id == parent.operation_id)
+            .find(|candidate| candidate.plan.operation_id == parent.operation_id)
+            .map(Box::as_ref)
             .ok_or_else(|| {
                 CliError::Input("poll child chain escaped its exact root lineage".to_owned())
             })?;
