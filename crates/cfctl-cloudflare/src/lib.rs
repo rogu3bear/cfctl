@@ -4678,13 +4678,9 @@ fn mismatched_verifiable_planned_fields(
     let mut mismatches = planned
         .iter()
         .filter(|(name, planned_value)| {
-            if matches!(
-                capability.id.as_str(),
-                "access-applications-update-self-hosted-login-methods"
-                    | "access-applications-update-app-launcher-login-methods"
-            ) && capability.method == "PUT"
+            if access_application_field_is_order_insensitive(&capability.id, name)
+                && capability.method == "PUT"
                 && capability.path == "/accounts/{account_id}/access/apps/{app_id}"
-                && matches!(name.as_str(), "allowed_idps" | "policies")
             {
                 return !access_application_set_field_matches(
                     name,
@@ -4729,6 +4725,18 @@ fn mismatched_verifiable_planned_fields(
     mismatches.sort();
     mismatches.dedup();
     mismatches
+}
+
+fn access_application_field_is_order_insensitive(capability_id: &str, field: &str) -> bool {
+    match capability_id {
+        "access-applications-update-self-hosted-login-methods" => {
+            matches!(field, "allowed_idps" | "policies" | "self_hosted_domains")
+        }
+        "access-applications-update-app-launcher-login-methods" => {
+            matches!(field, "allowed_idps" | "custom_pages" | "policies")
+        }
+        _ => false,
+    }
 }
 
 fn access_application_complete_snapshot_mismatches(
@@ -4907,6 +4915,9 @@ fn access_application_set_field_matches(
                 .zip(normalized(planned))
                 .is_some_and(|(actual, planned)| actual == planned)
         }
+        "custom_pages" | "self_hosted_domains" => normalized_access_string_set(actual)
+            .zip(normalized_access_string_set(planned))
+            .is_some_and(|(actual, planned)| actual == planned),
         "policies" => {
             let normalized = |values: &[Value]| -> Option<Vec<(String, u64)>> {
                 let mut values = values
@@ -4935,6 +4946,20 @@ fn access_application_set_field_matches(
         }
         _ => false,
     }
+}
+
+fn normalized_access_string_set(values: &[Value]) -> Option<Vec<String>> {
+    let mut values = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    values.sort();
+    (!values.windows(2).any(|pair| pair[0] == pair[1])).then_some(values)
 }
 
 fn canonical_cloudflare_uuid(value: &str) -> Option<String> {
@@ -5109,6 +5134,70 @@ mod access_application_projection_tests {
             Some(&json!([{"id":"policy-a"}])),
             &json!([{"id":"policy-a","precedence":1}]),
         ));
+    }
+
+    #[test]
+    fn preserved_access_string_sets_verify_without_order_dependence_or_duplicate_tolerance() {
+        for (capability_id, field) in [
+            (
+                "access-applications-update-self-hosted-login-methods",
+                "self_hosted_domains",
+            ),
+            (
+                "access-applications-update-app-launcher-login-methods",
+                "custom_pages",
+            ),
+        ] {
+            assert!(
+                access_application_set_field_matches(
+                    field,
+                    Some(&json!(["second.example", "first.example"])),
+                    &json!(["first.example", "second.example"]),
+                ),
+                "{field} provider reordering must not fail exact readback verification"
+            );
+            assert!(
+                !access_application_set_field_matches(
+                    field,
+                    Some(&json!(["first.example", "first.example"])),
+                    &json!(["first.example"]),
+                ),
+                "{field} duplicate readback values must not satisfy the planned set"
+            );
+            assert!(
+                !access_application_set_field_matches(
+                    field,
+                    Some(&json!(["first.example"])),
+                    &json!(["first.example", "second.example"]),
+                ),
+                "{field} cardinality drift must not satisfy the planned set"
+            );
+
+            let mut capability = CapabilityV1::new(
+                capability_id,
+                "Update Access application login methods",
+                "PUT",
+                "/accounts/{account_id}/access/apps/{app_id}",
+            );
+            capability.same_path_read = Some(cfctl_core::SamePathReadContractV1 {
+                path: capability.path.clone(),
+                read_capability_id: "access-applications-get-an-access-application".to_owned(),
+                verified_response_fields: vec![field.to_owned()],
+            });
+            let planned = serde_json::Map::from_iter([(
+                field.to_owned(),
+                json!(["first.example", "second.example"]),
+            )]);
+            assert!(
+                super::mismatched_verifiable_planned_fields(
+                    &capability,
+                    &planned,
+                    &json!({field:["second.example", "first.example"]}),
+                )
+                .is_empty(),
+                "{field} reordered provider readback must close verification"
+            );
+        }
     }
 
     #[test]
