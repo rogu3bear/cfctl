@@ -10,13 +10,14 @@ use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
     AsyncCollectionMutationContractV1, BillingModelV1, CapabilityV1, CostExposureV1, CostV1,
     CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
-    CreatedResourceContractV1, DeletedNestedResourceContractV1, DeletedResourceContractV1,
-    EffectClass, EntitlementProbeV1, EntitlementV1, EventBatchContractV1,
-    GraphqlAnalyticsContractV1, KnowledgeReferenceV1, Maturity, OutputFormatV1, PaginationModeV1,
-    QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
-    RiskClass, SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
-    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
-    TimestampFormatV1, UpdatedResourceContractV1, WorkflowContractV1, WorkflowStepV1, hash_value,
+    CreatedResourceContractV1, D1SchemaIntrospectionContractV1, DeletedNestedResourceContractV1,
+    DeletedResourceContractV1, EffectClass, EntitlementProbeV1, EntitlementV1,
+    EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1, Maturity,
+    OutputFormatV1, PaginationModeV1, QuerySerializationV1, R2LogRetrievalContractV1,
+    ResponseBodyModeV1, ResponseContractV1, RiskClass, SamePathReadContractV1,
+    SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
+    SelectorContractV1, SelectorV1, TimeRangeContractV1, TimestampFormatV1,
+    UpdatedResourceContractV1, WorkflowContractV1, WorkflowStepV1, hash_value,
     request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
@@ -1748,6 +1749,180 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
             .insert(capability.id.clone(), capability);
     }
     snapshot.refresh_hash()
+}
+
+/// Adds operation-specific native control-plane capabilities whose wire
+/// contracts cannot be represented safely by Cloudflare's raw OpenAPI
+/// operation. These capabilities compile closed inputs into fixed requests;
+/// they never expose the underlying generic provider operation.
+pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
+    let capability = d1_schema_introspection_capability();
+    snapshot
+        .capabilities
+        .insert(capability.id.clone(), capability);
+    snapshot.refresh_hash()
+}
+
+fn d1_schema_introspection_capability() -> CapabilityV1 {
+    const ID: &str = "d1-schema-introspection";
+    let mut capability = CapabilityV1::new(
+        ID,
+        "Assert bounded D1 schema state",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/query",
+    );
+    capability.description = Some(
+        "Run one closed, compiler-owned sqlite_schema or table-valued PRAGMA assertion without accepting caller SQL."
+            .to_owned(),
+    );
+    capability.product = "D1".to_owned();
+    capability.source = "cfctl native D1 schema assertion adapter".to_owned();
+    capability.account_scope = "account".to_owned();
+    capability.aliases = vec![
+        "check D1 migration schema".to_owned(),
+        "inspect D1 table column index trigger check constraint".to_owned(),
+        "verify D1 foreign keys".to_owned(),
+    ];
+    capability.permissions = vec!["D1 Read".to_owned()];
+    capability.mutating = false;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.blocked_reason = None;
+    capability.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: None,
+        basis: Some(
+            "one bounded metadata assertion has no separate operation charge; ordinary D1 rows-read accounting may apply"
+                .to_owned(),
+        ),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![KnowledgeReferenceV1 {
+            title: "D1 pricing".to_owned(),
+            url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        }],
+    };
+    capability.entitlement.available = Some(true);
+    capability.entitlement.plans =
+        BTreeMap::from([("free".to_owned(), true), ("paid".to_owned(), true)]);
+    capability.entitlement.source =
+        Some("https://developers.cloudflare.com/d1/platform/pricing/".to_owned());
+    capability.verification.required = false;
+    capability.verification.strategy = "not_applicable".to_owned();
+    capability.rollback.supported = false;
+    capability.rollback.strategy = None;
+    capability.rollback.warning = None;
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "account_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some("Exact Cloudflare account identifier.".to_owned()),
+            contract: Some(SelectorContractV1 {
+                schema: serde_json::json!({
+                    "type":"string",
+                    "minLength":32,
+                    "maxLength":32
+                }),
+                query: None,
+            }),
+        },
+        SelectorV1 {
+            name: "database_id".to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some("Exact D1 database UUID.".to_owned()),
+            contract: Some(SelectorContractV1 {
+                schema: serde_json::json!({
+                    "type":"string",
+                    "minLength":36,
+                    "maxLength":36
+                }),
+                query: None,
+            }),
+        },
+    ];
+    let name = serde_json::json!({"type":"string","minLength":1,"maxLength":255});
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object",
+        "x-cfctl-body-required":true,
+        "oneOf":[
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["assertion","table"],
+                "properties":{
+                    "assertion":{"type":"string","enum":["table_exists"]},
+                    "table":name
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["assertion","table","column"],
+                "properties":{
+                    "assertion":{"type":"string","enum":["column_exists"]},
+                    "table":name,
+                    "column":name
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["assertion","index"],
+                "properties":{
+                    "assertion":{"type":"string","enum":["index_exists"]},
+                    "index":name
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["assertion","trigger"],
+                "properties":{
+                    "assertion":{"type":"string","enum":["trigger_exists"]},
+                    "trigger":name
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["assertion","object_type","name","fragment"],
+                "properties":{
+                    "assertion":{"type":"string","enum":["schema_contains"]},
+                    "object_type":{"type":"string","enum":["table","index","trigger"]},
+                    "name":name,
+                    "fragment":{"type":"string","minLength":1,"maxLength":512}
+                }
+            },
+            {
+                "type":"object",
+                "additionalProperties":false,
+                "required":["assertion"],
+                "properties":{
+                    "assertion":{"type":"string","enum":["foreign_key_check_empty"]}
+                }
+            }
+        ]
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_schema_introspection = Some(D1SchemaIntrospectionContractV1 {
+        max_rows: 1,
+        max_bytes: 64 * 1024,
+        max_timeout_seconds: 10,
+    });
+    capability
 }
 
 fn reserve_queue_message_operations_for_event_consumer(snapshot: &mut CatalogSnapshot) {

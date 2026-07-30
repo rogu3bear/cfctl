@@ -4,16 +4,16 @@ use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
     AsyncCollectionMutationContractV1, CapabilityGuideStageV1, CapabilityGuideV1, CapabilityV1,
     CostV1, CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
-    CreatedResourceContractV1, DeletedNestedResourceContractV1, EffectClass, EntitlementProbeV1,
-    EvidenceClass, EvidenceV1, GraphqlAnalyticsContractV1, GuideActionV1, GuideCloudflareEffectV1,
-    GuideContractStateV1, GuideStage, GuideTopicV1, OperationalProofFreshnessV1,
-    OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, OutputFormatV1,
-    PaginationModeV1, PlanStatus, PlanV1, R2LogRetrievalContractV1, ResultEnvelopeV2, RiskClass,
-    SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
-    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
-    StandingAuthorityV1, TimeRangeContractV1, TimestampFormatV1, TransactionStageV1,
-    UpdatedResourceContractV1, guide_stages, guide_topic_document, hash_value, redact_json,
-    render_guide_topic_markdown,
+    CreatedResourceContractV1, D1SchemaIntrospectionContractV1, DeletedNestedResourceContractV1,
+    EffectClass, EntitlementProbeV1, EvidenceClass, EvidenceV1, GraphqlAnalyticsContractV1,
+    GuideActionV1, GuideCloudflareEffectV1, GuideContractStateV1, GuideStage, GuideTopicV1,
+    OperationalProofFreshnessV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
+    OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1,
+    R2LogRetrievalContractV1, ResultEnvelopeV2, RiskClass, SamePathReadContractV1,
+    SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
+    SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
+    TimeRangeContractV1, TimestampFormatV1, TransactionStageV1, UpdatedResourceContractV1,
+    guide_stages, guide_topic_document, hash_value, redact_json, render_guide_topic_markdown,
 };
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
@@ -57,6 +57,39 @@ fn registry_contracts_preserve_scope_identity_and_redact_observations() {
     )
     .expect("deserialize registry observation");
     assert_eq!(round_trip, observation);
+}
+
+#[test]
+fn d1_schema_introspection_contract_is_hash_bound_and_serializable() {
+    let mut capability = CapabilityV1::new(
+        "d1-schema-introspection",
+        "Assert bounded D1 schema state",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/query",
+    );
+    capability.mutating = false;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.d1_schema_introspection = Some(D1SchemaIntrospectionContractV1 {
+        max_rows: 1,
+        max_bytes: 65_536,
+        max_timeout_seconds: 10,
+    });
+    let before = hash_value(&serde_json::to_value(&capability).expect("serialize capability"))
+        .expect("hash capability");
+    let encoded = serde_json::to_vec(&capability).expect("encode capability");
+    let decoded: CapabilityV1 = serde_json::from_slice(&encoded).expect("decode capability");
+    assert_eq!(decoded, capability);
+
+    capability
+        .d1_schema_introspection
+        .as_mut()
+        .expect("contract")
+        .max_bytes += 1;
+    let after = hash_value(&serde_json::to_value(&capability).expect("serialize drifted"))
+        .expect("hash drifted");
+    assert_ne!(before, after);
 }
 
 #[test]

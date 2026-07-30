@@ -293,6 +293,26 @@ hash receipt rather than the rows. See
 [`telemetry-control-plane.md`](../telemetry-control-plane.md) for exact IDs and
 contracts.
 
+D1 schema checks use the native `d1-schema-introspection` read. The caller
+provides one exact account, one exact database, and one closed assertion object;
+cfctl compiles the only SQL sent to Cloudflare and returns a bounded boolean
+result with ordinary redacted live-read evidence:
+
+```bash
+printf '%s' \
+  '{"assertion":"trigger_exists","trigger":"document_render_jobs_terminal_generation_guard"}' |
+  cfctl call d1-schema-introspection \
+    --selector account_id=<account-id> \
+    --selector database_id=<database-id> \
+    --body-stdin --json
+```
+
+The allowed assertions are `table_exists`, `column_exists`, `index_exists`,
+`trigger_exists`, `schema_contains`, and `foreign_key_check_empty`. Caller SQL,
+parameters, arbitrary PRAGMAs, multiple statements, and database retargeting
+are not inputs. The generic `d1-query-database`, `d1-raw-database-query`, and
+`wrangler.d1` capabilities remain blocked.
+
 Logs Engine retrieval is the one reserved-header exception and remains
 operation-specific. Supply a mode-0600 JSON bundle containing exactly
 `access_key_id` and `secret_access_key`, plus a new output path:

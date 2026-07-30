@@ -11,10 +11,10 @@ use std::{
 
 use cfctl_auth::AuthCredential;
 use cfctl_core::{
-    AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1, GraphqlAnalyticsContractV1,
-    OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1, R2LogRetrievalContractV1,
-    ResponseBodyModeV1, ResponseContractV1, RiskClass, SelectorV1, TimestampFormatV1,
-    TransactionStageV1, hash_value, request_header_is_reserved,
+    AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1, D1SchemaIntrospectionContractV1,
+    GraphqlAnalyticsContractV1, OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1,
+    R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1, RiskClass, SelectorV1,
+    TimestampFormatV1, TransactionStageV1, hash_value, request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
@@ -195,6 +195,7 @@ pub struct PreparedRequest {
     pub text_body: Option<String>,
     pub response_contract: Option<ResponseContractV1>,
     pub analytics_query: Option<AnalyticsQueryContractV1>,
+    pub d1_schema_introspection: Option<D1SchemaIntrospectionContractV1>,
     pub r2_log_retrieval: Option<R2LogRetrievalContractV1>,
     pub graphql: Option<GraphqlAnalyticsContractV1>,
     pub output_format: OutputFormatV1,
@@ -304,41 +305,51 @@ impl RequestBuilder {
         )?;
         let (output_format, max_rows, max_bytes, timeout_seconds) =
             read_runtime_options(capability, input)?;
-        let (body, text_body) = match capability
-            .analytics_query
-            .as_ref()
-            .map(|contract| contract.kind)
-        {
-            Some(AnalyticsQueryKindV1::StructuredSql) => {
-                let sql = render_structured_analytics_sql(
+        let (body, text_body) = if capability.d1_schema_introspection.is_some() {
+            (
+                Some(render_d1_schema_introspection_body(
                     input.body.as_ref().ok_or_else(|| {
                         CloudflareError::MissingRequestBody(capability.id.clone())
                     })?,
-                    output_format,
-                )?;
-                url.query_pairs_mut().append_pair("query", &sql);
-                (None, None)
+                )?),
+                None,
+            )
+        } else {
+            match capability
+                .analytics_query
+                .as_ref()
+                .map(|contract| contract.kind)
+            {
+                Some(AnalyticsQueryKindV1::StructuredSql) => {
+                    let sql = render_structured_analytics_sql(
+                        input.body.as_ref().ok_or_else(|| {
+                            CloudflareError::MissingRequestBody(capability.id.clone())
+                        })?,
+                        output_format,
+                    )?;
+                    url.query_pairs_mut().append_pair("query", &sql);
+                    (None, None)
+                }
+                Some(AnalyticsQueryKindV1::LogExplorerSql) => {
+                    let sql = render_structured_log_explorer_sql(input.body.as_ref().ok_or_else(
+                        || CloudflareError::MissingRequestBody(capability.id.clone()),
+                    )?)?;
+                    headers.insert(
+                        reqwest::header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/plain"),
+                    );
+                    (None, Some(sql))
+                }
+                Some(AnalyticsQueryKindV1::GraphqlAnalytics) => {
+                    let graphql = capability.graphql.as_ref().ok_or_else(|| {
+                        CloudflareError::InvalidAnalyticsQuery(
+                            "GraphQL query contract is missing its fixed document".to_owned(),
+                        )
+                    })?;
+                    (Some(graphql_request_body(graphql, input)?), None)
+                }
+                _ => (input.body.clone(), None),
             }
-            Some(AnalyticsQueryKindV1::LogExplorerSql) => {
-                let sql =
-                    render_structured_log_explorer_sql(input.body.as_ref().ok_or_else(|| {
-                        CloudflareError::MissingRequestBody(capability.id.clone())
-                    })?)?;
-                headers.insert(
-                    reqwest::header::CONTENT_TYPE,
-                    HeaderValue::from_static("text/plain"),
-                );
-                (None, Some(sql))
-            }
-            Some(AnalyticsQueryKindV1::GraphqlAnalytics) => {
-                let graphql = capability.graphql.as_ref().ok_or_else(|| {
-                    CloudflareError::InvalidAnalyticsQuery(
-                        "GraphQL query contract is missing its fixed document".to_owned(),
-                    )
-                })?;
-                (Some(graphql_request_body(graphql, input)?), None)
-            }
-            _ => (input.body.clone(), None),
         };
         headers.insert(
             reqwest::header::ACCEPT,
@@ -352,16 +363,36 @@ impl RequestBuilder {
             text_body,
             response_contract: capability.response_contract.clone(),
             analytics_query: capability.analytics_query.clone(),
+            d1_schema_introspection: capability.d1_schema_introspection.clone(),
             r2_log_retrieval: capability.r2_log_retrieval.clone(),
             graphql: capability.graphql.clone(),
             output_format,
             max_rows,
             max_bytes,
             timeout_seconds,
-            query_receipt: analytics_query_receipt(capability, input, output_format)
+            query_receipt: d1_schema_introspection_receipt(capability, input)
+                .or_else(|| analytics_query_receipt(capability, input, output_format))
                 .or_else(|| r2_log_retrieval_receipt(capability, input)),
         })
     }
+}
+
+fn d1_schema_introspection_receipt(capability: &CapabilityV1, input: &CallInput) -> Option<Value> {
+    let contract = capability.d1_schema_introspection.as_ref()?;
+    let body = input.body.as_ref()?;
+    let assertion = body.get("assertion")?.as_str()?;
+    let input_hash = hash_value(body).ok()?;
+    Some(serde_json::json!({
+        "capability_id": capability.id,
+        "kind": "d1_schema_introspection",
+        "assertion": assertion,
+        "assertion_input_sha256": input_hash,
+        "row_limit": contract.max_rows,
+        "byte_limit": contract.max_bytes,
+        "timeout_seconds": contract.max_timeout_seconds,
+        "read_only": true,
+        "caller_sql": false,
+    }))
 }
 
 fn r2_log_retrieval_receipt(capability: &CapabilityV1, input: &CallInput) -> Option<Value> {
@@ -417,6 +448,14 @@ fn read_runtime_options(
     capability: &CapabilityV1,
     input: &CallInput,
 ) -> Result<(OutputFormatV1, u64, u64, u64)> {
+    if let Some(contract) = capability.d1_schema_introspection.as_ref() {
+        return Ok((
+            OutputFormatV1::Json,
+            contract.max_rows,
+            contract.max_bytes,
+            contract.max_timeout_seconds,
+        ));
+    }
     let Some(contract) = capability.analytics_query.as_ref() else {
         return Ok(capability.r2_log_retrieval.as_ref().map_or(
             (OutputFormatV1::Json, 10_000, 16 * 1024 * 1024, 30),
@@ -448,6 +487,84 @@ fn read_runtime_options(
         .and_then(Value::as_u64)
         .unwrap_or(contract.max_timeout_seconds);
     Ok((output_format, max_rows, contract.max_bytes, timeout_seconds))
+}
+
+fn render_d1_schema_introspection_body(body: &Value) -> Result<Value> {
+    let body = body.as_object().ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery(
+            "D1 schema assertion input must be an object".to_owned(),
+        )
+    })?;
+    let assertion = body
+        .get("assertion")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CloudflareError::InvalidAnalyticsQuery("D1 schema assertion kind is missing".to_owned())
+        })?;
+    let bounded = |field: &str, maximum: usize| -> Result<String> {
+        body.get(field)
+            .and_then(Value::as_str)
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= maximum
+                    && !value.chars().any(char::is_control)
+            })
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                CloudflareError::InvalidAnalyticsQuery(format!(
+                    "D1 schema assertion field `{field}` must be a non-empty control-free string of at most {maximum} bytes"
+                ))
+            })
+    };
+    let (sql, params) = match assertion {
+        "table_exists" => (
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1) AS present",
+            vec![Value::String(bounded("table", 255)?)],
+        ),
+        "column_exists" => (
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2) AS present",
+            vec![
+                Value::String(bounded("table", 255)?),
+                Value::String(bounded("column", 255)?),
+            ],
+        ),
+        "index_exists" => (
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1) AS present",
+            vec![Value::String(bounded("index", 255)?)],
+        ),
+        "trigger_exists" => (
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = ?1) AS present",
+            vec![Value::String(bounded("trigger", 255)?)],
+        ),
+        "schema_contains" => (
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2 AND instr(COALESCE(sql, ''), ?3) > 0) AS present",
+            vec![
+                Value::String(
+                    body.get("object_type")
+                        .and_then(Value::as_str)
+                        .filter(|value| matches!(*value, "table" | "index" | "trigger"))
+                        .ok_or_else(|| {
+                            CloudflareError::InvalidAnalyticsQuery(
+                                "D1 schema object_type must be table, index, or trigger".to_owned(),
+                            )
+                        })?
+                        .to_owned(),
+                ),
+                Value::String(bounded("name", 255)?),
+                Value::String(bounded("fragment", 512)?),
+            ],
+        ),
+        "foreign_key_check_empty" => (
+            "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check LIMIT 1) AS present",
+            Vec::new(),
+        ),
+        _ => {
+            return Err(CloudflareError::InvalidAnalyticsQuery(format!(
+                "unsupported D1 schema assertion `{assertion}`"
+            )));
+        }
+    };
+    Ok(serde_json::json!({"sql":sql,"params":params}))
 }
 
 fn parse_output_format(value: &str) -> Result<OutputFormatV1> {
@@ -3360,7 +3477,7 @@ async fn parse_success_response(
             require_json_media(status, content_type.as_deref())?;
             let (bytes, truncated) = read_bounded_body(response, request.max_bytes).await?;
             if truncated {
-                if request.analytics_query.is_some() {
+                if request.analytics_query.is_some() || request.d1_schema_introspection.is_some() {
                     return Ok(partial_output_response(
                         status,
                         Value::Null,
@@ -3381,8 +3498,8 @@ async fn parse_success_response(
                 return Err(CloudflareError::InvalidResponseEnvelope { status });
             }
             let parsed = parse_response(status, &body, etag, cf_ray);
-            if request.analytics_query.is_some() {
-                bound_enveloped_analytics_response(parsed, request, bytes.len() as u64, output_path)
+            if request.analytics_query.is_some() || request.d1_schema_introspection.is_some() {
+                bound_enveloped_query_response(parsed, request, bytes.len() as u64, output_path)
                     .await
             } else {
                 Ok(parsed)
@@ -3444,12 +3561,15 @@ async fn parse_success_response(
     }
 }
 
-async fn bound_enveloped_analytics_response(
+async fn bound_enveloped_query_response(
     mut response: CloudflareResponseV1,
     request: &PreparedRequest,
     bytes: u64,
     output_path: Option<&Path>,
 ) -> Result<CloudflareResponseV1> {
+    if request.d1_schema_introspection.is_some() {
+        validate_d1_schema_assertion_response(&response)?;
+    }
     let mut truncated = false;
     let max_rows = bounded_usize(request.max_rows);
     let rows = if let Some(rows) = response.result.as_array_mut() {
@@ -3475,6 +3595,36 @@ async fn bound_enveloped_analytics_response(
         !response.success,
     ));
     Ok(response)
+}
+
+fn validate_d1_schema_assertion_response(response: &CloudflareResponseV1) -> Result<()> {
+    let Some(result) = response
+        .result
+        .as_array()
+        .filter(|results| results.len() == 1)
+        .and_then(|results| results.first())
+    else {
+        return Err(CloudflareError::InvalidResponseEnvelope {
+            status: response.status,
+        });
+    };
+    let present = result
+        .pointer("/results")
+        .and_then(Value::as_array)
+        .filter(|rows| rows.len() == 1)
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("present"));
+    let valid_present = present.is_some_and(|present| {
+        present.is_boolean() || present.as_u64().is_some_and(|value| matches!(value, 0 | 1))
+    });
+    let no_writes = result.pointer("/meta/rows_written").and_then(Value::as_u64) == Some(0);
+    if result.get("success").and_then(Value::as_bool) != Some(true) || !valid_present || !no_writes
+    {
+        return Err(CloudflareError::InvalidResponseEnvelope {
+            status: response.status,
+        });
+    }
+    Ok(())
 }
 
 fn require_declared_media_type(
@@ -3972,23 +4122,41 @@ fn output_result_info(
     } else {
         Value::Null
     };
-    let coverage = request.analytics_query.as_ref().map(|contract| {
-        let limit_reached = rows >= request.max_rows;
-        let classification = if partial || truncated {
-            "partial_response"
-        } else if contract.sampling.is_some() {
-            "bounded_sample"
-        } else if limit_reached {
-            "bounded_result_at_limit"
-        } else {
-            "bounded_response"
-        };
-        serde_json::json!({
-            "classification": classification,
-            "limit_reached": limit_reached,
-            "dataset_completeness": "not_proven",
+    let coverage = request
+        .analytics_query
+        .as_ref()
+        .map(|contract| {
+            let limit_reached = rows >= request.max_rows;
+            let classification = if partial || truncated {
+                "partial_response"
+            } else if contract.sampling.is_some() {
+                "bounded_sample"
+            } else if limit_reached {
+                "bounded_result_at_limit"
+            } else {
+                "bounded_response"
+            };
+            serde_json::json!({
+                "classification": classification,
+                "limit_reached": limit_reached,
+                "dataset_completeness": "not_proven",
+            })
         })
-    });
+        .or_else(|| {
+            request.d1_schema_introspection.as_ref().map(|_| {
+                serde_json::json!({
+                    "classification": if partial || truncated {
+                        "partial_response"
+                    } else if rows == 1 {
+                        "complete_assertion_response"
+                    } else {
+                        "invalid_assertion_response"
+                    },
+                    "limit_reached": rows > 1,
+                    "dataset_completeness": "not_applicable",
+                })
+            })
+        });
     serde_json::json!({
         "query": request.query_receipt,
         "coverage": coverage,
@@ -6044,6 +6212,7 @@ pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -
     validate_selector_contract(capability, &input.selectors)?;
     validate_query_contract(capability, &input.query)?;
     validate_request_body(capability, input.body.as_ref())?;
+    validate_d1_schema_introspection_contract(capability, input)?;
     validate_analytics_query_contract(capability, input)?;
     validate_r2_log_retrieval_contract(capability, input)
 }
@@ -6058,6 +6227,67 @@ fn validate_response_contract(capability: &CapabilityV1) -> Result<()> {
             response.success_media_types.join(", "),
         ));
     }
+    Ok(())
+}
+
+fn validate_d1_schema_introspection_contract(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let Some(contract) = capability.d1_schema_introspection.as_ref() else {
+        return Ok(());
+    };
+    let identity_supported = capability.id == "d1-schema-introspection"
+        && capability.method == "POST"
+        && capability.path == "/accounts/{account_id}/d1/database/{database_id}/query"
+        && capability.product == "D1"
+        && capability.account_scope == "account"
+        && !capability.mutating
+        && capability.risk == RiskClass::Read
+        && capability.effect == cfctl_core::EffectClass::ReadOnly
+        && capability.adapter_status == cfctl_core::AdapterStatus::Native
+        && capability.permissions == ["D1 Read"]
+        && capability.analytics_query.is_none()
+        && capability.graphql.is_none()
+        && capability.r2_log_retrieval.is_none()
+        && capability.selectors.len() == 2
+        && ["account_id", "database_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && contract.max_rows == 1
+        && (1..=64 * 1024).contains(&contract.max_bytes)
+        && (1..=10).contains(&contract.max_timeout_seconds)
+        && capability
+            .response_contract
+            .as_ref()
+            .is_some_and(|response| {
+                response.success_statuses == ["200"]
+                    && response.success_media_types == ["application/json"]
+                    && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+            });
+    if !identity_supported {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "D1 schema introspection identity, permission, response, or runtime bounds drifted"
+                .to_owned(),
+        ));
+    }
+    if input
+        .query
+        .as_object()
+        .is_none_or(|query| !query.is_empty())
+    {
+        return Err(CloudflareError::InvalidAnalyticsQuery(
+            "D1 schema introspection does not accept query controls".to_owned(),
+        ));
+    }
+    render_d1_schema_introspection_body(input.body.as_ref().ok_or_else(|| {
+        CloudflareError::InvalidAnalyticsQuery("D1 schema assertion body is missing".to_owned())
+    })?)?;
     Ok(())
 }
 

@@ -8,10 +8,10 @@ use cfctl_cloudflare::{
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
     AsyncCollectionMutationContractV1, CapabilityV1, CreatedCollectionResourceContractV1,
-    CreatedNestedResourceContractV1, CreatedResourceContractV1, DeletedNestedResourceContractV1,
-    DeletedResourceContractV1, EffectClass, EventBatchContractV1, GraphqlAnalyticsContractV1,
-    KnowledgeReferenceV1, OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1,
-    QUEUE_ACK_CAPABILITY_ID, QUEUE_ACK_PATH, QUEUE_PULL_CAPABILITY_ID, QUEUE_PULL_PATH,
+    CreatedNestedResourceContractV1, CreatedResourceContractV1, D1SchemaIntrospectionContractV1,
+    DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass, EventBatchContractV1,
+    GraphqlAnalyticsContractV1, KnowledgeReferenceV1, OutputFormatV1, PaginationModeV1, PlanStatus,
+    PlanV1, QUEUE_ACK_CAPABILITY_ID, QUEUE_ACK_PATH, QUEUE_PULL_CAPABILITY_ID, QUEUE_PULL_PATH,
     QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
     RiskClass, SamePathReadContractV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
     TimestampFormatV1, TransactionStageV1, UpdatedResourceContractV1,
@@ -7689,4 +7689,270 @@ fn token_plan(
     })
     .expect("input");
     plan
+}
+
+fn d1_schema_introspection_capability() -> CapabilityV1 {
+    let mut capability = CapabilityV1::new(
+        "d1-schema-introspection",
+        "Assert bounded D1 schema state",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/query",
+    );
+    capability.product = "D1".to_owned();
+    capability.source = "cfctl native D1 schema assertion adapter".to_owned();
+    capability.permissions = vec!["D1 Read".to_owned()];
+    capability.mutating = false;
+    capability.risk = RiskClass::Read;
+    capability.effect = EffectClass::ReadOnly;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.verification.required = false;
+    capability.verification.strategy = "not_applicable".to_owned();
+    capability.rollback.warning = None;
+    capability.selectors = ["account_id", "database_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: if name == "account_id" {
+                    json!({"type":"string","minLength":32,"maxLength":32})
+                } else {
+                    json!({"type":"string","minLength":36,"maxLength":36})
+                },
+                query: None,
+            }),
+        })
+        .to_vec();
+    let name = json!({"type":"string","minLength":1,"maxLength":255});
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "x-cfctl-body-required":true,
+        "oneOf":[
+            {"type":"object","additionalProperties":false,"required":["assertion","table"],"properties":{"assertion":{"type":"string","enum":["table_exists"]},"table":name}},
+            {"type":"object","additionalProperties":false,"required":["assertion","table","column"],"properties":{"assertion":{"type":"string","enum":["column_exists"]},"table":name,"column":name}},
+            {"type":"object","additionalProperties":false,"required":["assertion","index"],"properties":{"assertion":{"type":"string","enum":["index_exists"]},"index":name}},
+            {"type":"object","additionalProperties":false,"required":["assertion","trigger"],"properties":{"assertion":{"type":"string","enum":["trigger_exists"]},"trigger":name}},
+            {"type":"object","additionalProperties":false,"required":["assertion","object_type","name","fragment"],"properties":{"assertion":{"type":"string","enum":["schema_contains"]},"object_type":{"type":"string","enum":["table","index","trigger"]},"name":name,"fragment":{"type":"string","minLength":1,"maxLength":512}}},
+            {"type":"object","additionalProperties":false,"required":["assertion"],"properties":{"assertion":{"type":"string","enum":["foreign_key_check_empty"]}}}
+        ]
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_schema_introspection = Some(D1SchemaIntrospectionContractV1 {
+        max_rows: 1,
+        max_bytes: 64 * 1024,
+        max_timeout_seconds: 10,
+    });
+    capability
+}
+
+fn d1_schema_input(body: Value) -> CallInput {
+    CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        query: json!({}),
+        body: Some(body),
+        ..CallInput::default()
+    }
+}
+
+#[test]
+fn d1_schema_introspection_compiles_closed_assertions_without_caller_sql() {
+    let capability = d1_schema_introspection_capability();
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    let injection = "advisor_equity_instrument'); DROP TABLE users; --";
+    let prepared = builder
+        .build(
+            &capability,
+            &d1_schema_input(json!({
+                "assertion":"schema_contains",
+                "object_type":"table",
+                "name":"equity_issuance_evidence_links",
+                "fragment":injection
+            })),
+        )
+        .expect("closed schema assertion");
+
+    assert_eq!(prepared.method, "POST");
+    assert_eq!(
+        prepared.url.as_str(),
+        "https://api.cloudflare.com/client/v4/accounts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/d1/database/11111111-2222-3333-4444-555555555555/query"
+    );
+    assert_eq!(prepared.max_rows, 1);
+    assert_eq!(prepared.max_bytes, 64 * 1024);
+    assert_eq!(prepared.timeout_seconds, 10);
+    let wire = prepared.body.expect("compiler-owned body");
+    let sql = wire["sql"].as_str().expect("fixed SQL");
+    assert_eq!(
+        sql,
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2 AND instr(COALESCE(sql, ''), ?3) > 0) AS present"
+    );
+    assert!(!sql.contains(injection));
+    assert_eq!(wire["params"][2], injection);
+    assert_eq!(
+        prepared
+            .query_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.get("caller_sql"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+}
+
+#[test]
+fn d1_schema_introspection_supports_every_closed_migration_assertion() {
+    let capability = d1_schema_introspection_capability();
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    for body in [
+        json!({"assertion":"table_exists","table":"document_render_jobs"}),
+        json!({"assertion":"column_exists","table":"document_render_jobs","column":"claim_generation"}),
+        json!({"assertion":"index_exists","index":"idx_document_render_jobs_claim"}),
+        json!({"assertion":"trigger_exists","trigger":"document_render_jobs_terminal_generation_guard"}),
+        json!({"assertion":"schema_contains","object_type":"table","name":"equity_issuance_evidence_links","fragment":"advisor_equity_instrument"}),
+        json!({"assertion":"foreign_key_check_empty"}),
+    ] {
+        let prepared = builder
+            .build(&capability, &d1_schema_input(body))
+            .expect("supported assertion");
+        let wire = prepared.body.expect("compiler-owned D1 body");
+        assert!(wire["sql"].as_str().is_some_and(|sql| {
+            sql.starts_with("SELECT ") && !sql.contains(';') && !sql.contains("--")
+        }));
+        assert!(wire["params"].is_array());
+    }
+}
+
+#[test]
+fn d1_schema_introspection_rejects_raw_sql_and_contract_drift() {
+    let capability = d1_schema_introspection_capability();
+    let raw_sql = d1_schema_input(json!({
+        "assertion":"table_exists",
+        "table":"users",
+        "sql":"DROP TABLE users"
+    }));
+    assert!(matches!(
+        validate_request_contract(&capability, &raw_sql),
+        Err(CloudflareError::InvalidRequestBody(_))
+    ));
+
+    let arbitrary = d1_schema_input(json!({"assertion":"pragma","name":"writable_schema"}));
+    assert!(matches!(
+        validate_request_contract(&capability, &arbitrary),
+        Err(CloudflareError::InvalidRequestBody(_))
+    ));
+
+    let mut drifted = capability;
+    drifted.permissions = vec!["D1 Write".to_owned()];
+    assert!(matches!(
+        validate_request_contract(
+            &drifted,
+            &d1_schema_input(json!({"assertion":"foreign_key_check_empty"}))
+        ),
+        Err(CloudflareError::InvalidAnalyticsQuery(_))
+    ));
+}
+
+#[tokio::test]
+async fn d1_schema_introspection_executes_as_one_bounded_read_only_post() {
+    let capability = d1_schema_introspection_capability();
+    let input = d1_schema_input(json!({
+        "assertion":"trigger_exists",
+        "trigger":"document_render_jobs_terminal_generation_guard"
+    }));
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"errors":[],"messages":[],"result":[{"results":[{"present":1}],"success":true,"meta":{"rows_read":1,"rows_written":0}}]}"#,
+    ])
+    .await;
+    let response = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .execute_read(
+        &capability,
+        &input,
+        &AuthCredential::Bearer {
+            token: "selected-token".to_owned(),
+        },
+    )
+    .await
+    .expect("bounded D1 schema read");
+    assert!(response.success);
+    assert_eq!(
+        response.result.pointer("/0/results/0/present"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        response
+            .result_info
+            .as_ref()
+            .and_then(|info| info.pointer("/query/kind")),
+        Some(&json!("d1_schema_introspection"))
+    );
+    assert_eq!(
+        response
+            .result_info
+            .as_ref()
+            .and_then(|info| info.pointer("/coverage/classification")),
+        Some(&json!("complete_assertion_response"))
+    );
+    assert_eq!(
+        response
+            .result_info
+            .as_ref()
+            .and_then(|info| info.pointer("/output/byte_limit")),
+        Some(&json!(64 * 1024))
+    );
+
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with(
+        "POST /client/v4/accounts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/d1/database/11111111-2222-3333-4444-555555555555/query "
+    ));
+    assert!(
+        requests[0].contains("\"params\":[\"document_render_jobs_terminal_generation_guard\"]")
+    );
+    assert!(requests[0].contains(
+        "\"sql\":\"SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = ?1) AS present\""
+    ));
+    assert!(!requests[0].contains("DROP TABLE"));
+}
+
+#[tokio::test]
+async fn d1_schema_introspection_rejects_non_boolean_or_write_reporting_responses() {
+    let capability = d1_schema_introspection_capability();
+    let input = d1_schema_input(json!({"assertion":"foreign_key_check_empty"}));
+    for body in [
+        r#"{"success":true,"result":[{"results":[{"present":"yes"}],"success":true,"meta":{"rows_written":0}}]}"#,
+        r#"{"success":true,"result":[{"results":[{"present":1}],"success":true,"meta":{"rows_written":1}}]}"#,
+        r#"{"success":true,"result":[{"results":[{"present":1},{"present":0}],"success":true,"meta":{"rows_written":0}}]}"#,
+    ] {
+        let (address, server) = json_response_sequence_server(vec![body]).await;
+        let error = Executor::new(
+            reqwest::Client::new(),
+            &format!("http://{address}/client/v4"),
+        )
+        .expect("executor")
+        .execute_read(
+            &capability,
+            &input,
+            &AuthCredential::Bearer {
+                token: "selected-token".to_owned(),
+            },
+        )
+        .await
+        .expect_err("malformed or write-reporting response must fail closed");
+        assert!(matches!(
+            error,
+            CloudflareError::InvalidResponseEnvelope { status: 200 }
+        ));
+        assert_eq!(server.await.expect("server joins").len(), 1);
+    }
 }

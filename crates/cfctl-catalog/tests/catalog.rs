@@ -2,8 +2,8 @@
 
 use cfctl_catalog::{
     CatalogChangeKind, CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1,
-    attach_official_product_knowledge, ingest_cli_help, ingest_telemetry_capabilities,
-    markdown_link, markdown_links, normalize_openapi,
+    attach_official_product_knowledge, ingest_cli_help, ingest_native_control_capabilities,
+    ingest_telemetry_capabilities, markdown_link, markdown_links, normalize_openapi,
 };
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryKindV1, BillingModelV1, CapabilityV1, CostExposureV1,
@@ -10769,4 +10769,75 @@ fn telemetry_overlay_closes_only_the_exact_bounded_r2_log_retrieval() {
             .is_some_and(|reason| reason.starts_with("schema drift:"))
     );
     assert!(drifted.r2_log_retrieval.is_none());
+}
+
+#[test]
+fn native_control_overlay_adds_only_closed_bounded_d1_schema_assertions() {
+    let blocked = ["d1-query-database", "d1-raw-database-query", "wrangler.d1"].map(|id| {
+        let mut capability = CapabilityV1::new(id, id, "POST", id);
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some("generic D1 execution remains blocked".to_owned());
+        (id.to_owned(), capability)
+    });
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: blocked.into_iter().collect(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+
+    let capability = snapshot
+        .get("d1-schema-introspection")
+        .expect("D1 schema capability");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.method, "POST");
+    assert!(!capability.mutating);
+    assert_eq!(capability.risk, RiskClass::Read);
+    assert_eq!(capability.effect, EffectClass::ReadOnly);
+    assert_eq!(capability.permissions, ["D1 Read"]);
+    assert_eq!(
+        capability.path,
+        "/accounts/{account_id}/d1/database/{database_id}/query"
+    );
+    assert_eq!(
+        capability
+            .selectors
+            .iter()
+            .map(|selector| selector.name.as_str())
+            .collect::<Vec<_>>(),
+        ["account_id", "database_id"]
+    );
+    let schema = capability
+        .request_schema
+        .as_ref()
+        .expect("closed assertion schema");
+    let variants = schema["oneOf"].as_array().expect("assertion variants");
+    assert_eq!(variants.len(), 6);
+    assert!(
+        variants
+            .iter()
+            .all(|variant| variant["additionalProperties"] == false)
+    );
+    let encoded = serde_json::to_string(schema).expect("schema JSON");
+    assert!(!encoded.contains("\"sql\""));
+    assert!(!encoded.contains("\"params\""));
+    let contract = capability
+        .d1_schema_introspection
+        .as_ref()
+        .expect("typed runtime contract");
+    assert_eq!(contract.max_rows, 1);
+    assert_eq!(contract.max_bytes, 64 * 1024);
+    assert_eq!(contract.max_timeout_seconds, 10);
+    assert!(capability.analytics_query.is_none());
+    for id in ["d1-query-database", "d1-raw-database-query", "wrangler.d1"] {
+        let generic = snapshot.get(id).expect("generic capability remains");
+        assert_eq!(generic.adapter_status, AdapterStatus::Blocked);
+        assert_eq!(
+            generic.blocked_reason.as_deref(),
+            Some("generic D1 execution remains blocked")
+        );
+    }
 }

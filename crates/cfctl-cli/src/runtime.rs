@@ -25,7 +25,8 @@ use cfctl_auth::{
 use cfctl_catalog::{
     CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1, attach_official_product_knowledge,
     fetch_official, fetch_official_text_feeds, ingest_cli_help, ingest_governed_ui_capabilities,
-    ingest_telemetry_capabilities, refresh_dynamic_mutation_contract,
+    ingest_native_control_capabilities, ingest_telemetry_capabilities,
+    refresh_dynamic_mutation_contract,
 };
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, Executor, OperationVerificationV1,
@@ -1046,6 +1047,7 @@ async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2> {
     let (mut catalog, feeds) =
         tokio::try_join!(fetch_official(&client), fetch_official_text_feeds(&client))?;
     ingest_telemetry_capabilities(&mut catalog)?;
+    ingest_native_control_capabilities(&mut catalog)?;
     attach_official_product_knowledge(&mut catalog, &feeds)?;
     for (program, version_argument) in [("wrangler", "--version"), ("cloudflared", "version")] {
         if which::which(program).is_ok() {
@@ -17178,7 +17180,7 @@ mod tests {
         PlanApproveArgs, PlanSelector,
     };
     use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
-    use cfctl_catalog::CatalogSnapshot;
+    use cfctl_catalog::{CatalogSnapshot, ingest_native_control_capabilities};
     use cfctl_cloudflare::{CloudflareApiErrorV1, CloudflareResponseV1, OperationVerificationV1};
     use cfctl_core::{
         AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
@@ -17205,6 +17207,43 @@ mod tests {
 
     fn guide_json(capability: &CapabilityV1) -> Value {
         serde_json::to_value(guide_document(capability)).expect("typed capability guide JSON")
+    }
+
+    #[test]
+    fn d1_schema_introspection_guide_emits_only_closed_body_and_exact_selectors() {
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let capability = catalog
+            .get("d1-schema-introspection")
+            .expect("D1 introspection");
+        let guide = guide_json(capability);
+
+        assert_eq!(guide["contract_state"], "available");
+        assert_eq!(
+            guide["call_argv"],
+            json!([
+                "cfctl",
+                "call",
+                "d1-schema-introspection",
+                "--selector",
+                "account_id=<account_id>",
+                "--selector",
+                "database_id=<database_id>",
+                "--body-stdin",
+                "--json"
+            ])
+        );
+        let schema = &guide["input_contract"]["request_schema"];
+        let encoded = serde_json::to_string(schema).expect("guide schema");
+        assert!(!encoded.contains("\"sql\""));
+        assert!(!encoded.contains("\"params\""));
     }
 
     fn save_current_test_plan(store: &StateStore, plan: &PlanV1) {

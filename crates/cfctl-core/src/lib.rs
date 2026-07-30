@@ -917,6 +917,16 @@ pub enum AnalyticsQueryKindV1 {
     WorkersObservability,
 }
 
+/// A fixed, read-only compiler contract for D1 schema assertions. Callers
+/// supply only the closed assertion object declared by the capability request
+/// schema; the executor owns every SQL token sent to Cloudflare.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1SchemaIntrospectionContractV1 {
+    pub max_rows: u64,
+    pub max_bytes: u64,
+    pub max_timeout_seconds: u64,
+}
+
 /// Timestamp wire representation at the pointers declared by a query contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1480,6 +1490,8 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analytics_query: Option<AnalyticsQueryContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d1_schema_introspection: Option<D1SchemaIntrospectionContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2_log_retrieval: Option<R2LogRetrievalContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphql: Option<GraphqlAnalyticsContractV1>,
@@ -1580,6 +1592,7 @@ impl CapabilityV1 {
             request_schema: None,
             response_contract: None,
             analytics_query: None,
+            d1_schema_introspection: None,
             r2_log_retrieval: None,
             graphql: None,
             workflow: None,
