@@ -370,6 +370,21 @@ database unavailable while producing a large export, so capture the snapshot
 in the migration window. The receipt proves only the local pre-migration
 snapshot; importing or applying it is a separate protected workflow.
 
+Approved MLNavigator imports use `d1-import-approved-mln-migration`. If its
+bounded provider polling ends while the import is still active, do not rerun
+that consumed plan: init, upload, and ingest are one-shot boundaries. Create a
+new `d1-resume-approved-mln-import-poll` plan whose body contains only the
+parent operation ID, immutable parent PlanV2 hash, canonical exhaustion
+evidence hash, accepted-ingest evidence hash, and accepted-bookmark hash.
+cfctl re-derives the migration, source, target, profile, credential generation,
+catalog, and plaintext bookmark from managed parent authority. The separately
+approved child sends only bounded zero-retry `poll` requests. One exact
+exhaustion admits at most one child; a child that crossed consumption or any
+provider boundary permanently consumes that exhaustion even if later
+cancelled. A later canonical child exhaustion can admit the next child in the
+same linear root lineage. Provider completion remains pending until the
+migration-specific governed post-import proof closes the root import.
+
 Restore only through the native `d1-restore-exact-bookmark` recovery
 capability. Raw D1 query/restore operations and Wrangler remain blocked:
 

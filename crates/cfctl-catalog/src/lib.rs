@@ -1763,6 +1763,7 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
         d1_full_export_capability(),
         d1_restore_exact_bookmark_capability(),
         d1_import_approved_mln_migration_capability(),
+        d1_resume_approved_mln_import_poll_capability(),
     ]
     .into_boxed_slice()
     {
@@ -2008,6 +2009,105 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
         upload_url_suffix: ".r2.cloudflarestorage.com".to_owned(),
         requires_create_new_mode_0600_stage: true,
     });
+    capability
+}
+
+fn d1_resume_approved_mln_import_poll_capability() -> CapabilityV1 {
+    let account_id = "ca30e922fda7f5578e49873542e4aaca";
+    let database_id = "7c282983-2e48-4ea4-9f0d-09b0d718fe65";
+    let hash = serde_json::json!({
+        "type":"string","pattern":"^sha256:[0-9a-f]{64}$","minLength":71,"maxLength":71
+    });
+    let operation = serde_json::json!({
+        "type":"string","format":"uuid","minLength":36,"maxLength":36
+    });
+    let mut capability = CapabilityV1::new(
+        "d1-resume-approved-mln-import-poll",
+        "Resume polling one approved MLNavigator import",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/import",
+    );
+    capability.description = Some(
+        "Create a separately approved poll-only child of one exact durable MLNavigator import exhaustion. The runtime derives the root migration, source, target, credential, catalog, accepted bookmark, and provider request from immutable parent authority. It never replays init, upload, or ingest; each exhaustion admits at most one non-cancelled child."
+            .to_owned(),
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native closed MLNavigator import poll continuation".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec!["continue approved MLN import polling".to_owned()];
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.mutating = true;
+    capability.risk = RiskClass::Irreversible;
+    capability.effect = EffectClass::DataWrite;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: Some(0.0),
+        basis: Some("Bounded D1 import polling has no incremental operation charge.".to_owned()),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![KnowledgeReferenceV1 {
+            title: "D1 pricing".to_owned(),
+            url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        }],
+    };
+    capability.entitlement.available = Some(true);
+    capability.verification.required = true;
+    "mln_import_requires_governed_post_import_proof"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("no_automatic_rollback_use_separately_approved_bookmark_restore".to_owned());
+    capability.rollback.warning = Some(
+        "Polling may observe provider completion. Recovery remains a separately approved exact-bookmark restore."
+            .to_owned(),
+    );
+    capability.selectors = [("account_id", account_id), ("database_id", database_id)]
+        .map(|(name, value)| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some(format!("Pinned MLNavigator {name}.")),
+            contract: Some(SelectorContractV1 {
+                schema: serde_json::json!({"type":"string","enum":[value]}),
+                query: None,
+            }),
+        })
+        .to_vec();
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object","additionalProperties":false,"x-cfctl-body-required":true,
+        "required":[
+            "parent_operation_id","parent_plan_hash","exhaustion_evidence_hash",
+            "accepted_ingest_evidence_hash","accepted_bookmark_hash"
+        ],
+        "properties":{
+            "parent_operation_id":operation,
+            "parent_plan_hash":hash,
+            "exhaustion_evidence_hash":hash,
+            "accepted_ingest_evidence_hash":hash,
+            "accepted_bookmark_hash":hash
+        }
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_approved_mln_import_poll_resume =
+        Some(cfctl_core::D1ApprovedMlnImportPollResumeContractV1 {
+            root_capability_id: "d1-import-approved-mln-migration".to_owned(),
+            account_id: account_id.to_owned(),
+            database_id: database_id.to_owned(),
+            import_path: capability.path.clone(),
+            max_response_bytes: 1024 * 1024,
+            max_poll_attempts: 120,
+            max_timeout_seconds: 30,
+        });
     capability
 }
 

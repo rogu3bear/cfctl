@@ -11076,6 +11076,62 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
 }
 
 #[test]
+fn native_control_overlay_adds_closed_poll_only_mln_import_continuation() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .get("d1-resume-approved-mln-import-poll")
+        .expect("poll-only continuation");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Irreversible);
+    assert_eq!(capability.effect, EffectClass::DataWrite);
+    assert!(capability.mutating);
+    assert_eq!(capability.permissions, ["D1 Write"]);
+    let contract = capability
+        .d1_approved_mln_import_poll_resume
+        .as_ref()
+        .expect("typed poll continuation");
+    assert_eq!(
+        contract.root_capability_id,
+        "d1-import-approved-mln-migration"
+    );
+    assert_eq!(contract.max_poll_attempts, 120);
+    assert_eq!(contract.max_timeout_seconds, 30);
+    assert_eq!(
+        capability.request_schema.as_ref().expect("closed request")["required"],
+        json!([
+            "parent_operation_id",
+            "parent_plan_hash",
+            "exhaustion_evidence_hash",
+            "accepted_ingest_evidence_hash",
+            "accepted_bookmark_hash"
+        ])
+    );
+    let encoded = serde_json::to_string(capability).expect("capability JSON");
+    for forbidden in [
+        "\"action\"",
+        "\"current_bookmark\"",
+        "\"source_file\"",
+        "\"sql\"",
+        "\"etag\"",
+        "\"filename\"",
+        "\"upload_url\"",
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "caller/provider control leaked into closed continuation: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn native_control_overlay_adds_exact_mln_0142_terminal_schema_proof() {
     let mut snapshot = CatalogSnapshot {
         schema_version: 1,

@@ -8,7 +8,8 @@ use cfctl_cloudflare::{
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
     AsyncCollectionMutationContractV1, CapabilityV1, CreatedCollectionResourceContractV1,
-    CreatedNestedResourceContractV1, CreatedResourceContractV1, D1FullExportContractV1,
+    CreatedNestedResourceContractV1, CreatedResourceContractV1,
+    D1ApprovedMlnImportPollResumeContractV1, D1FullExportContractV1,
     D1RestoreExactBookmarkContractV1, D1SchemaIntrospectionContractV1,
     DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass, EventBatchContractV1,
     GraphqlAnalyticsContractV1, KnowledgeReferenceV1, OutputFormatV1, PaginationModeV1, PlanStatus,
@@ -79,6 +80,257 @@ async fn single_raw_response_server(
             .expect("write response");
     });
     (address.to_string(), server)
+}
+
+fn d1_approved_mln_import_poll_resume_fixture(
+    max_poll_attempts: u64,
+) -> (CapabilityV1, CallInput, Value) {
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let database_id = "11111111-2222-4333-8444-555555555555";
+    let mut capability = CapabilityV1::new(
+        "d1-resume-approved-mln-import-poll",
+        "Resume approved MLN import polling",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/import",
+    );
+    "D1".clone_into(&mut capability.product);
+    "account".clone_into(&mut capability.account_scope);
+    capability.adapter_status = AdapterStatus::Native;
+    capability.mutating = true;
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.risk = RiskClass::Irreversible;
+    capability.effect = EffectClass::DataWrite;
+    capability.selectors = ["account_id", "database_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: None,
+        })
+        .to_vec();
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_approved_mln_import_poll_resume = Some(D1ApprovedMlnImportPollResumeContractV1 {
+        root_capability_id: "d1-import-approved-mln-migration".to_owned(),
+        account_id: account_id.to_owned(),
+        database_id: database_id.to_owned(),
+        import_path: "/accounts/{account_id}/d1/database/{database_id}/import".to_owned(),
+        max_response_bytes: 1024 * 1024,
+        max_poll_attempts,
+        max_timeout_seconds: 1,
+    });
+    let input = CallInput {
+        selectors: json!({"account_id":account_id,"database_id":database_id}),
+        query: json!({}),
+        body: Some(json!({
+            "parent_operation_id":"parent-operation",
+            "parent_plan_hash":format!("sha256:{}", "1".repeat(64)),
+            "exhaustion_evidence_hash":format!("sha256:{}", "2".repeat(64)),
+            "accepted_ingest_evidence_hash":format!("sha256:{}", "3".repeat(64)),
+            "accepted_bookmark_hash":format!("sha256:{}", "4".repeat(64)),
+        })),
+        ..CallInput::default()
+    };
+    let targets = json!({
+        "adapter":{
+            "approved_mln_import_poll_resume":{
+                "accepted_bookmark":"derived-bookmark",
+                "root_operation_id":"root-operation",
+                "root_plan_hash":format!("sha256:{}", "5".repeat(64)),
+                "parent_operation_id":"parent-operation",
+                "parent_exhaustion_evidence_hash":format!("sha256:{}", "2".repeat(64)),
+                "root_input":{"body":{"migration_id":"0143"}},
+                "root_stage":{
+                    "sha256":format!("sha256:{}", "6".repeat(64)),
+                    "md5":"0123456789abcdef0123456789abcdef",
+                    "bytes":123,
+                    "source_authority_hash":format!("sha256:{}", "7".repeat(64)),
+                }
+            }
+        }
+    });
+    (capability, input, targets)
+}
+
+fn d1_approved_mln_import_poll_resume_plan(max_poll_attempts: u64) -> (PlanV1, CallInput) {
+    let (capability, input, targets) =
+        d1_approved_mln_import_poll_resume_fixture(max_poll_attempts);
+    let mut plan = PlanV1::draft(
+        "profile",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:catalog",
+        capability,
+        targets,
+    )
+    .expect("draft poll continuation");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    (plan, input)
+}
+
+fn assert_exact_poll_request(request: &str) {
+    assert!(request.starts_with(
+        "POST /accounts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/d1/database/11111111-2222-4333-8444-555555555555/import "
+    ));
+    let body = request
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .expect("request body");
+    assert_eq!(
+        serde_json::from_str::<Value>(body).expect("JSON request body"),
+        json!({"action":"poll","current_bookmark":"derived-bookmark"})
+    );
+    for forbidden in [
+        "init",
+        "ingest",
+        "upload",
+        "filename",
+        "etag",
+        "migration_id",
+        "max_poll_attempts",
+        "max_timeout_seconds",
+    ] {
+        assert!(!body.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[tokio::test]
+async fn d1_approved_mln_import_poll_resume_sends_only_exact_derived_poll_until_complete() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"type":"import","status":"pending","success":true,"at_bookmark":"derived-bookmark"},"errors":[]}"#,
+        r#"{"success":true,"result":{"type":"import","status":"complete","success":true,"at_bookmark":"derived-bookmark","result":{"final_bookmark":"final-bookmark"}},"errors":[]}"#,
+    ])
+    .await;
+    let (mut plan, input) = d1_approved_mln_import_poll_resume_plan(3);
+    let mut checkpoints = Vec::new();
+    let response = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .execute_d1_approved_mln_import_poll_resume(
+            &mut plan,
+            &input,
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            "derived-bookmark",
+            |checkpoint| {
+                checkpoints.push(checkpoint.clone());
+                Ok(())
+            },
+        )
+        .await
+        .expect("completed poll continuation");
+    assert_eq!(
+        response.result["_cfctl"]["final_bookmark"],
+        "final-bookmark"
+    );
+    assert_eq!(plan.status, PlanStatus::Running);
+    assert_eq!(
+        checkpoints.last().expect("completion").step,
+        "provider_complete"
+    );
+    let requests = server.await.expect("server");
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_exact_poll_request(request);
+    }
+}
+
+#[tokio::test]
+async fn d1_approved_mln_import_poll_resume_exhausts_at_exact_bound_with_only_poll_requests() {
+    let pending = r#"{"success":true,"result":{"type":"import","status":"active","success":true,"at_bookmark":"derived-bookmark"},"errors":[]}"#;
+    let (address, server) = json_response_sequence_server(vec![pending, pending]).await;
+    let (mut plan, input) = d1_approved_mln_import_poll_resume_plan(2);
+    let mut checkpoints = Vec::new();
+    let error = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .execute_d1_approved_mln_import_poll_resume(
+            &mut plan,
+            &input,
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            "derived-bookmark",
+            |checkpoint| {
+                checkpoints.push(checkpoint.clone());
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("bounded polling must exhaust");
+    assert!(matches!(
+        error,
+        CloudflareError::D1ImportPollInProgressExhausted
+    ));
+    assert_eq!(plan.status, PlanStatus::RectificationRequired);
+    assert_eq!(
+        checkpoints.last().expect("exhaustion").step,
+        "poll_in_progress_exhausted"
+    );
+    let requests = server.await.expect("server");
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_exact_poll_request(request);
+    }
+}
+
+#[tokio::test]
+async fn d1_approved_mln_import_poll_resume_provider_error_stops_after_one_exact_poll() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"type":"import","status":"error","success":false,"at_bookmark":"derived-bookmark","error":"provider rejected"},"errors":[]}"#,
+    ])
+    .await;
+    let (mut plan, input) = d1_approved_mln_import_poll_resume_plan(3);
+    let mut checkpoints = Vec::new();
+    let error = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .execute_d1_approved_mln_import_poll_resume(
+            &mut plan,
+            &input,
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            "derived-bookmark",
+            |checkpoint| {
+                checkpoints.push(checkpoint.clone());
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("provider error must fail closed");
+    assert!(matches!(
+        error,
+        CloudflareError::D1ImportPollResponseFailure
+    ));
+    assert_eq!(plan.status, PlanStatus::RectificationRequired);
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(checkpoints[0].step, "poll_response_1");
+    let requests = server.await.expect("server");
+    assert_eq!(requests.len(), 1);
+    assert_exact_poll_request(&requests[0]);
+}
+
+#[tokio::test]
+async fn d1_approved_mln_import_poll_resume_rejects_bookmark_drift_before_transport() {
+    let (mut plan, input) = d1_approved_mln_import_poll_resume_plan(3);
+    let error = Executor::new(reqwest::Client::new(), "http://127.0.0.1:1")
+        .expect("executor")
+        .execute_d1_approved_mln_import_poll_resume(
+            &mut plan,
+            &input,
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            "caller-controlled-bookmark",
+            |_| Ok(()),
+        )
+        .await
+        .expect_err("bookmark drift must fail before transport");
+    assert!(matches!(error, CloudflareError::InvalidRequestBody(_)));
+    assert_eq!(plan.status, PlanStatus::Draft);
 }
 
 fn d1_restore_exact_bookmark_capability() -> CapabilityV1 {

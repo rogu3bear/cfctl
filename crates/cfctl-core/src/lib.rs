@@ -1083,6 +1083,20 @@ pub struct D1ApprovedMlnImportContractV1 {
     pub requires_create_new_mode_0600_stage: bool,
 }
 
+/// A separately approved, poll-only continuation for an approved `MLNavigator`
+/// import. The caller supplies only immutable parent receipt identities; the
+/// runtime derives every provider control and root-import field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1ApprovedMlnImportPollResumeContractV1 {
+    pub root_capability_id: String,
+    pub account_id: String,
+    pub database_id: String,
+    pub import_path: String,
+    pub max_response_bytes: u64,
+    pub max_poll_attempts: u64,
+    pub max_timeout_seconds: u64,
+}
+
 /// Timestamp wire representation at the pointers declared by a query contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1658,6 +1672,8 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_approved_mln_import: Option<D1ApprovedMlnImportContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d1_approved_mln_import_poll_resume: Option<D1ApprovedMlnImportPollResumeContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2_log_retrieval: Option<R2LogRetrievalContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphql: Option<GraphqlAnalyticsContractV1>,
@@ -1764,6 +1780,7 @@ impl CapabilityV1 {
             d1_full_export: None,
             d1_restore_exact_bookmark: None,
             d1_approved_mln_import: None,
+            d1_approved_mln_import_poll_resume: None,
             r2_log_retrieval: None,
             graphql: None,
             workflow: None,
@@ -1942,11 +1959,14 @@ impl CapabilityV1 {
 
         match self.verification.strategy.as_str() {
             "mln_import_requires_governed_post_import_proof" => {
-                self.id == "d1-import-approved-mln-migration"
-                    && self.method == "POST"
+                matches!(
+                    self.id.as_str(),
+                    "d1-import-approved-mln-migration" | "d1-resume-approved-mln-import-poll"
+                ) && self.method == "POST"
                     && self.risk == RiskClass::Irreversible
                     && self.effect == EffectClass::DataWrite
-                    && self.d1_approved_mln_import.is_some()
+                    && (self.d1_approved_mln_import.is_some()
+                        ^ self.d1_approved_mln_import_poll_resume.is_some())
             }
             "d1_current_bookmark_equals_restore_result_bookmark" => {
                 self.id == "d1-restore-exact-bookmark"
@@ -2941,11 +2961,14 @@ impl CapabilityV1 {
 }
 
 fn approved_mln_import_recovery_contract_supported(capability: &CapabilityV1) -> bool {
-    capability.id == "d1-import-approved-mln-migration"
-        && capability.method == "POST"
+    matches!(
+        capability.id.as_str(),
+        "d1-import-approved-mln-migration" | "d1-resume-approved-mln-import-poll"
+    ) && capability.method == "POST"
         && capability.risk == RiskClass::Irreversible
         && capability.effect == EffectClass::DataWrite
-        && capability.d1_approved_mln_import.is_some()
+        && (capability.d1_approved_mln_import.is_some()
+            ^ capability.d1_approved_mln_import_poll_resume.is_some())
 }
 
 fn exact_bookmark_restore_recovery_contract_supported(capability: &CapabilityV1) -> bool {

@@ -47,7 +47,7 @@ use cfctl_planner::{ImpactContext, PolicyEngine};
 use cfctl_registry::{InventoryProviderV1, OperationIndexRecordV1, Registry};
 use cfctl_storage::{RuntimePaths, StateStore, StoredPlanRecord};
 use cfctl_workspace::{RegisteredRoot, WorkspaceGraph};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{StreamExt, stream};
 use md5::Md5;
 use serde::Deserialize;
@@ -1184,9 +1184,17 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     let is_r2_log_retrieval = capability.r2_log_retrieval.is_some();
     let is_d1_full_export = capability.d1_full_export.is_some();
     let is_d1_approved_mln_import = capability.d1_approved_mln_import.is_some();
+    let is_d1_approved_mln_import_poll_resume =
+        capability.d1_approved_mln_import_poll_resume.is_some();
     if is_d1_approved_mln_import != arguments.source_file.is_some() {
         return Err(CliError::Input(
             "the approved MLNavigator D1 import requires exactly one plan-creation-only `--source-file`; no other capability accepts it"
+                .to_owned(),
+        ));
+    }
+    if is_d1_approved_mln_import_poll_resume && arguments.source_file.is_some() {
+        return Err(CliError::Input(
+            "approved MLNavigator import poll continuation derives source authority from its parent and never accepts `--source-file`"
                 .to_owned(),
         ));
     }
@@ -1269,6 +1277,22 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         .as_deref()
         .map(|source| stage_approved_mln_migration(store, &capability, &prepared.input, source))
         .transpose()?;
+    let resume_poll_authority = if is_d1_approved_mln_import_poll_resume {
+        let profiles = ProfilesConfig::load(store)?;
+        let profile = profiles.selected(arguments.profile.as_deref())?;
+        Some(validate_and_derive_resume_poll_authority(
+            store,
+            &capability,
+            &prepared.input,
+            &profile.id,
+            profile.credential_generation_id.as_deref(),
+            &catalog.schema_hash,
+            Utc::now(),
+            None,
+        )?)
+    } else {
+        None
+    };
     prepare_r2_temporary_credentials_input(&capability, &mut prepared.input)?;
     let security_action = prepare_security_action_input(&capability, &mut prepared.input)?;
     preflight_call_input(&capability, &prepared.input, prepared.secret_body.as_ref())?;
@@ -1332,6 +1356,9 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     }
     if let Some(import_stage) = import_stage {
         adapter_targets.insert("approved_mln_import".to_owned(), import_stage);
+    }
+    if let Some(authority) = resume_poll_authority {
+        adapter_targets.insert("approved_mln_import_poll_resume".to_owned(), authority);
     }
     let result = Box::pin(create_plan(
         store,
@@ -10582,6 +10609,10 @@ fn cancel_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnve
     Ok(envelope)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "execution revalidates capability-specific immutable authority before dispatch"
+)]
 async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
     let _lock = store.lock_plan(&selector.operation_id)?;
     let catalog = ensure_catalog(store).await?;
@@ -10625,6 +10656,29 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
                 before: plan.created_at,
             },
         )?;
+    }
+    if plan.capability.d1_approved_mln_import_poll_resume.is_some() {
+        let execution_input: CallInput = serde_json::from_value(plan.input.clone())?;
+        let derived = validate_and_derive_resume_poll_authority(
+            store,
+            &plan.capability,
+            &execution_input,
+            &plan.profile_id,
+            profile.credential_generation_id.as_deref(),
+            &plan.catalog_hash,
+            plan.created_at,
+            Some(&plan.operation_id),
+        )?;
+        if plan
+            .targets
+            .pointer("/adapter/approved_mln_import_poll_resume")
+            != Some(&derived)
+        {
+            return Err(CliError::Input(
+                "poll continuation authority drifted after planning; do not cross the provider boundary"
+                    .to_owned(),
+            ));
+        }
     }
     validate_plan_v2_runtime_pins(store, &plan, profile)?;
     if is_r2_temporary_credentials_operation_identity(&plan.capability)
@@ -11230,14 +11284,14 @@ async fn execute_consumed_plan(
         }
         return result;
     }
-    let mut envelope = execute_api_plan(
+    let mut envelope = Box::pin(execute_api_plan(
         store,
         &catalog.schema_hash,
         plan,
         execution_input,
         credential,
         secrets,
-    )
+    ))
     .await?;
     prepend_live_precondition_evidence(&mut envelope, evidence);
     Ok(envelope)
@@ -12984,6 +13038,17 @@ async fn execute_api_plan(
     secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    if plan.capability.d1_approved_mln_import_poll_resume.is_some() {
+        return execute_approved_mln_import_poll_resume_plan(
+            store,
+            &executor,
+            plan,
+            execution_input,
+            credential,
+            secrets,
+        )
+        .await;
+    }
     if plan.capability.d1_approved_mln_import.is_some() {
         return execute_approved_mln_import_plan(
             store,
@@ -13054,6 +13119,109 @@ async fn execute_api_plan(
         performed,
         finalization_error.as_ref(),
     ))
+}
+
+async fn execute_approved_mln_import_poll_resume_plan(
+    store: &StateStore,
+    executor: &Executor,
+    plan: &mut PlanV1,
+    execution_input: &CallInput,
+    credential: &AuthCredential,
+    secrets: &dyn SecretStore,
+) -> Result<ResultEnvelopeV2> {
+    let bookmark = plan
+        .targets
+        .pointer("/adapter/approved_mln_import_poll_resume/accepted_bookmark")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Input("poll continuation bookmark is missing".to_owned()))?
+        .to_owned();
+    let checkpoint_operation_id = plan.operation_id.clone();
+    let response = match executor
+        .execute_d1_approved_mln_import_poll_resume(
+            plan,
+            execution_input,
+            credential,
+            &bookmark,
+            |checkpoint| persist_d1_import_checkpoint(store, &checkpoint_operation_id, checkpoint),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(approved_mln_import_execution_error_envelope(
+                store, plan, error, secrets,
+            ));
+        }
+    };
+    let (response_value, apply_evidence, lineage_evidence) =
+        match process_api_boundary_response(store, plan, &response, secrets)? {
+            ApiBoundaryResponseOutcome::Ready {
+                response_value,
+                apply_evidence,
+                lineage_evidence,
+            } => (response_value, apply_evidence, lineage_evidence),
+            ApiBoundaryResponseOutcome::Recovery(envelope) => return Ok(envelope),
+        };
+    if !response.success {
+        return Ok(post_boundary_failure_envelope(
+            plan,
+            response_value,
+            Some(apply_evidence),
+            lineage_evidence,
+            &CliError::Input(
+                "Cloudflare did not complete the approved poll continuation".to_owned(),
+            ),
+            true,
+            "the poll-only boundary was crossed but provider completion was not proven",
+        ));
+    }
+    if let Err(error) = exact_durable_resume_provider_complete_boundary(store, plan) {
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+        return Ok(post_boundary_failure_envelope(
+            plan,
+            response_value,
+            Some(apply_evidence),
+            lineage_evidence,
+            &error,
+            true,
+            "the poll-only boundary was crossed but exact durable provider completion was not proven",
+        ));
+    }
+    plan.status = PlanStatus::Running;
+    store.save_plan(plan)?;
+    let mut envelope =
+        ResultEnvelopeV2::success("plans run", response_value).with_evidence(apply_evidence);
+    envelope.ok = false;
+    envelope.performed = true;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.policy_decision = Some(plan.policy.clone());
+    envelope.verification.state = VerificationState::Pending;
+    envelope.verification.basis = Some(
+        "poll-child provider_complete is durable and joined to the root import; governed post-import proof remains required"
+            .to_owned(),
+    );
+    envelope.error = Some(ErrorV1 {
+        code: "CFCTL_D1_IMPORT_POST_IMPORT_PROOF_REQUIRED".to_owned(),
+        message: "D1 import completed through a poll child but is not publication proof".to_owned(),
+        next_step: plan
+            .targets
+            .pointer("/adapter/approved_mln_import_poll_resume/root_operation_id")
+            .and_then(Value::as_str)
+            .map(|root| {
+                format!(
+                    "Run the governed migration-specific post_import read bound to root operation {root}, then run `cfctl plans rectify {root}`."
+                )
+            }),
+    });
+    if let Some(evidence) = lineage_evidence {
+        envelope.evidence.push(evidence);
+    }
+    Ok(envelope)
 }
 
 #[derive(Debug, Clone)]
@@ -13179,6 +13347,9 @@ fn exact_durable_provider_complete_boundary(
             checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
         })
         .collect::<Vec<_>>();
+    if provider_complete.is_empty() {
+        return exact_linear_poll_child_provider_complete(store, plan);
+    }
     if provider_complete.len() != 1 {
         return Err(CliError::Input(
             "approved MLN import requires exactly one total provider_complete checkpoint"
@@ -13284,6 +13455,140 @@ fn exact_durable_provider_complete_boundary(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear child completion joins every immutable root and parent authority pin"
+)]
+fn exact_linear_poll_child_provider_complete(
+    store: &StateStore,
+    root: &PlanV1,
+) -> Result<DurableProviderCompleteBoundary> {
+    let children = store
+        .list_plans()?
+        .into_iter()
+        .filter(|candidate| {
+            candidate.capability.id == "d1-resume-approved-mln-import-poll"
+                && candidate
+                    .targets
+                    .pointer("/adapter/approved_mln_import_poll_resume/root_operation_id")
+                    .and_then(Value::as_str)
+                    == Some(root.operation_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let completed = children
+        .iter()
+        .filter_map(|child| {
+            exact_durable_resume_provider_complete_boundary(store, child)
+                .ok()
+                .map(|boundary| (child, boundary))
+        })
+        .collect::<Vec<_>>();
+    if completed.len() != 1 {
+        return Err(CliError::Input(
+            "root import requires exactly one authentic linear poll-child provider completion"
+                .to_owned(),
+        ));
+    }
+    let (terminal, boundary) = &completed[0];
+    let mut current = *terminal;
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(current.operation_id.clone()) {
+            return Err(CliError::Input(
+                "poll continuation lineage contains a cycle".to_owned(),
+            ));
+        }
+        let authority = current
+            .targets
+            .pointer("/adapter/approved_mln_import_poll_resume")
+            .ok_or_else(|| CliError::Input("poll child authority is missing".to_owned()))?;
+        if authority.get("root_plan_hash").and_then(Value::as_str)
+            != Some(root.content_hash.as_str())
+            || current.profile_id != root.profile_id
+            || current.catalog_hash != root.catalog_hash
+            || current.account_id != root.account_id
+        {
+            return Err(CliError::Input(
+                "poll child drifted from root plan, profile, account, or catalog".to_owned(),
+            ));
+        }
+        let parent_id = authority
+            .get("parent_operation_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::Input("poll child parent is missing".to_owned()))?;
+        let StoredPlanRecord::Current(parent_v2) = store.load_stored_plan_record(parent_id)? else {
+            return Err(CliError::Input(
+                "poll child parent is not an immutable PlanV2".to_owned(),
+            ));
+        };
+        let parent = &parent_v2.plan;
+        if authority.get("parent_plan_hash").and_then(Value::as_str)
+            != Some(parent.content_hash.as_str())
+            || parent.created_at >= current.created_at
+            || parent_v2.pins.credential_generation_id
+                != store
+                    .load_plan_v2(&root.operation_id)?
+                    .pins
+                    .credential_generation_id
+        {
+            return Err(CliError::Input(
+                "poll child parent PlanV2, credential, or chronology drifted".to_owned(),
+            ));
+        }
+        let (exhaustion_hash, accepted_hash, bookmark) = if parent.operation_id == root.operation_id
+        {
+            let (exhaustion, checkpoint, accepted) = exact_durable_poll_exhaustion(store, parent)?;
+            (
+                exhaustion.content_hash,
+                accepted.content_hash,
+                checkpoint
+                    .pointer("/receipt/at_bookmark")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        CliError::Input("root exhaustion bookmark is missing".to_owned())
+                    })?,
+            )
+        } else {
+            let exhaustion = exact_resume_poll_exhaustion(store, parent)?;
+            (
+                exhaustion.exhaustion_evidence.content_hash,
+                exhaustion.accepted_ingest_evidence.content_hash,
+                exhaustion.accepted_bookmark,
+            )
+        };
+        if authority
+            .get("parent_exhaustion_evidence_hash")
+            .and_then(Value::as_str)
+            != Some(exhaustion_hash.as_str())
+            || authority
+                .get("accepted_ingest_evidence_hash")
+                .and_then(Value::as_str)
+                != Some(accepted_hash.as_str())
+            || authority.get("accepted_bookmark").and_then(Value::as_str) != Some(bookmark.as_str())
+            || authority
+                .get("accepted_bookmark_hash")
+                .and_then(Value::as_str)
+                != hash_value(&Value::String(bookmark)).ok().as_deref()
+        {
+            return Err(CliError::Input(
+                "poll child does not join its exact parent exhaustion and accepted bookmark"
+                    .to_owned(),
+            ));
+        }
+        if parent.operation_id == root.operation_id {
+            break;
+        }
+        current = children
+            .iter()
+            .find(|candidate| candidate.operation_id == parent.operation_id)
+            .ok_or_else(|| {
+                CliError::Input("poll child chain escaped its exact root lineage".to_owned())
+            })?;
+    }
+    Ok(boundary.clone())
+}
+
 fn exact_accepted_ingest_bookmarks(
     store: &StateStore,
     plan: &PlanV1,
@@ -13369,6 +13674,45 @@ fn exact_accepted_ingest_bookmarks(
         .collect()
 }
 
+fn import_plan_runtime_lineage(plan: &PlanV1) -> Result<(Value, String, Option<String>)> {
+    if let Some(contract) = plan.capability.d1_approved_mln_import.as_ref() {
+        let migration_id = plan
+            .input
+            .pointer("/body/migration_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("approved MLN import migration id is missing".to_owned())
+            })?;
+        return Ok((
+            json!({"account_id":contract.account_id,"database_id":contract.database_id}),
+            migration_id.to_owned(),
+            None,
+        ));
+    }
+    let contract = plan
+        .capability
+        .d1_approved_mln_import_poll_resume
+        .as_ref()
+        .ok_or_else(|| {
+            CliError::Input("approved MLN import poll contract is missing".to_owned())
+        })?;
+    let migration_id = plan
+        .targets
+        .pointer("/adapter/approved_mln_import_poll_resume/root_input/body/migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("poll continuation migration id is missing".to_owned()))?;
+    let bookmark = plan
+        .targets
+        .pointer("/adapter/approved_mln_import_poll_resume/accepted_bookmark")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("poll continuation bookmark is missing".to_owned()))?;
+    Ok((
+        json!({"account_id":contract.account_id,"database_id":contract.database_id}),
+        migration_id.to_owned(),
+        Some(bookmark.to_owned()),
+    ))
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "stage-specific init, ingest, and poll receipt authority is one fail-closed join"
@@ -13377,19 +13721,13 @@ fn exact_durable_provider_failure_boundary(
     store: &StateStore,
     plan: &PlanV1,
 ) -> Result<(EvidenceV1, Value)> {
-    let contract = plan
-        .capability
-        .d1_approved_mln_import
-        .as_ref()
-        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
-    let target = json!({
-        "account_id":contract.account_id,
-        "database_id":contract.database_id,
-    });
+    let (target, _migration_id, inherited_bookmark) = import_plan_runtime_lineage(plan)?;
     let input_hash = hash_value(&plan.input)?;
     let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
-    let accepted_ingest_bookmarks =
-        exact_accepted_ingest_bookmarks(store, plan, &checkpoints, &target, &input_hash);
+    let accepted_ingest_bookmarks = inherited_bookmark.map_or_else(
+        || exact_accepted_ingest_bookmarks(store, plan, &checkpoints, &target, &input_hash),
+        |bookmark| vec![bookmark],
+    );
     let failures = checkpoints
         .into_iter()
         .filter(|(_, checkpoint)| {
@@ -13571,20 +13909,7 @@ fn exact_durable_upload_response_failure(
     store: &StateStore,
     plan: &PlanV1,
 ) -> Result<(EvidenceV1, Value)> {
-    let contract = plan
-        .capability
-        .d1_approved_mln_import
-        .as_ref()
-        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
-    let migration_id = plan
-        .input
-        .pointer("/body/migration_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Input("approved MLN import migration id is missing".to_owned()))?;
-    let target = json!({
-        "account_id":contract.account_id,
-        "database_id":contract.database_id,
-    });
+    let (target, migration_id, _) = import_plan_runtime_lineage(plan)?;
     let input_hash = hash_value(&plan.input)?;
     let failures = store
         .read_d1_import_checkpoints(&plan.operation_id)?
@@ -13630,7 +13955,7 @@ fn exact_durable_upload_response_failure(
                 && checkpoint
                     .pointer("/receipt/migration_id")
                     .and_then(Value::as_str)
-                    == Some(migration_id)
+                    == Some(migration_id.as_str())
                 && checkpoint.pointer("/receipt/target") == Some(&target)
                 && checkpoint
                     .pointer("/receipt/plan_input_hash")
@@ -13953,29 +14278,12 @@ fn known_import_init_response_failure_envelope(
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the ingest and poll receipt join validates every action and authority field"
-)]
 fn exact_durable_action_response_failure(
     store: &StateStore,
     plan: &PlanV1,
     action: &str,
 ) -> Result<(EvidenceV1, Value)> {
-    let contract = plan
-        .capability
-        .d1_approved_mln_import
-        .as_ref()
-        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
-    let migration_id = plan
-        .input
-        .pointer("/body/migration_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Input("approved MLN import migration id is missing".to_owned()))?;
-    let target = json!({
-        "account_id":contract.account_id,
-        "database_id":contract.database_id,
-    });
+    let (target, migration_id, _) = import_plan_runtime_lineage(plan)?;
     let input_hash = hash_value(&plan.input)?;
     let failures = store
         .read_d1_import_checkpoints(&plan.operation_id)?
@@ -14033,7 +14341,7 @@ fn exact_durable_action_response_failure(
                 && checkpoint
                     .pointer("/receipt/migration_id")
                     .and_then(Value::as_str)
-                    == Some(migration_id)
+                    == Some(migration_id.as_str())
                 && checkpoint.pointer("/receipt/target") == Some(&target)
                 && checkpoint
                     .pointer("/receipt/plan_input_hash")
@@ -14500,13 +14808,531 @@ fn exact_durable_poll_exhaustion(
     ))
 }
 
+#[derive(Debug, Clone)]
+struct ResumePollExhaustionAuthority {
+    exhaustion_evidence: EvidenceV1,
+    exhaustion_checkpoint: Value,
+    accepted_ingest_evidence: EvidenceV1,
+    accepted_bookmark: String,
+    root_operation_id: String,
+    root_plan_hash: String,
+    root_input: Value,
+    root_stage: Value,
+}
+
+fn boundary_artifact_hash(plan: &PlanV1, stage: TransactionStageV1) -> Option<&str> {
+    plan.transaction_journal
+        .iter()
+        .find(|checkpoint| checkpoint.stage == stage)
+        .and_then(|checkpoint| checkpoint.artifact_hash.as_deref())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "continuation exhaustion validates every receipt and inherited authority field"
+)]
+fn exact_resume_poll_exhaustion(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<ResumePollExhaustionAuthority> {
+    let authority = plan
+        .targets
+        .pointer("/adapter/approved_mln_import_poll_resume")
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("poll continuation authority is missing".to_owned()))?;
+    let root_operation_id = authority
+        .get("root_operation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("poll continuation root operation is missing".to_owned()))?;
+    let root_plan_hash = authority
+        .get("root_plan_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("poll continuation root plan hash is missing".to_owned()))?;
+    let root_input = authority
+        .get("root_input")
+        .cloned()
+        .ok_or_else(|| CliError::Input("poll continuation root input is missing".to_owned()))?;
+    let root_stage = authority
+        .get("root_stage")
+        .cloned()
+        .ok_or_else(|| CliError::Input("poll continuation root stage is missing".to_owned()))?;
+    let accepted_hash = authority
+        .get("accepted_ingest_evidence_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("accepted-ingest evidence identity is missing".to_owned())
+        })?;
+    let accepted_bookmark = authority
+        .get("accepted_bookmark")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Input("accepted-ingest bookmark is missing".to_owned()))?;
+    let contract = plan
+        .capability
+        .d1_approved_mln_import_poll_resume
+        .as_ref()
+        .ok_or_else(|| CliError::Input("poll continuation contract is missing".to_owned()))?;
+    let target = json!({"account_id":contract.account_id,"database_id":contract.database_id});
+    let input_hash = hash_value(&plan.input)?;
+    let migration_id = root_input
+        .pointer("/body/migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("root migration identity is missing".to_owned()))?;
+    let source_sha256 = root_stage
+        .get("sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("root source identity is missing".to_owned()))?;
+    let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
+    let attempts = checkpoints
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (hash, checkpoint))| {
+            let attempt = checkpoint
+                .get("step")
+                .and_then(Value::as_str)?
+                .strip_prefix("poll_response_")?
+                .parse::<u64>()
+                .ok()?;
+            exact_in_progress_poll_receipt(
+                store,
+                plan,
+                hash,
+                checkpoint,
+                attempt,
+                &target,
+                &input_hash,
+                migration_id,
+                accepted_bookmark,
+            )
+            .then_some((index, attempt))
+        })
+        .collect::<Vec<_>>();
+    let expected = (1..=contract.max_poll_attempts)
+        .enumerate()
+        .collect::<Vec<_>>();
+    if attempts != expected {
+        return Err(CliError::Input(
+            "poll continuation exhaustion requires every bounded chronological in-progress receipt"
+                .to_owned(),
+        ));
+    }
+    let exhausted = checkpoints
+        .iter()
+        .enumerate()
+        .filter(|(index, (_, checkpoint))| {
+            *index == usize::try_from(contract.max_poll_attempts).unwrap_or(usize::MAX)
+                && *index + 1 == checkpoints.len()
+                && checkpoint.get("step").and_then(Value::as_str)
+                    == Some("poll_in_progress_exhausted")
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/provider")
+                    .and_then(Value::as_str)
+                    == Some("cloudflare")
+                && checkpoint
+                    .pointer("/receipt/effect")
+                    .and_then(Value::as_str)
+                    == Some("d1_import_poll_in_progress_exhausted")
+                && checkpoint
+                    .pointer("/receipt/migration_id")
+                    .and_then(Value::as_str)
+                    == Some(migration_id)
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash.as_str())
+                && checkpoint
+                    .pointer("/receipt/source_sha256")
+                    .and_then(Value::as_str)
+                    == Some(source_sha256)
+                && checkpoint
+                    .pointer("/receipt/at_bookmark")
+                    .and_then(Value::as_str)
+                    == Some(accepted_bookmark)
+                && checkpoint
+                    .pointer("/receipt/attempt_count")
+                    .and_then(Value::as_u64)
+                    == Some(contract.max_poll_attempts)
+                && checkpoint
+                    .pointer("/receipt/attempt_bound")
+                    .and_then(Value::as_u64)
+                    == Some(contract.max_poll_attempts)
+                && checkpoint
+                    .pointer("/receipt/no_replay")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+        .collect::<Vec<_>>();
+    if exhausted.len() != 1 {
+        return Err(CliError::Input(
+            "poll continuation requires exactly one terminal exhaustion receipt".to_owned(),
+        ));
+    }
+    let (_, (hash, checkpoint)) = exhausted[0];
+    if store.read_evidence_value(hash)? != *checkpoint
+        || store
+            .read_evidence_value(accepted_hash)?
+            .pointer("/receipt/result/at_bookmark")
+            .and_then(Value::as_str)
+            != Some(accepted_bookmark)
+    {
+        return Err(CliError::Input(
+            "poll continuation exhaustion or accepted-ingest evidence drifted".to_owned(),
+        ));
+    }
+    Ok(ResumePollExhaustionAuthority {
+        exhaustion_evidence: EvidenceV1::new(
+            EvidenceClass::Apply,
+            hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!("{}.json", hash.trim_start_matches("sha256:")))
+                .display()
+                .to_string(),
+        ),
+        exhaustion_checkpoint: checkpoint.clone(),
+        accepted_ingest_evidence: EvidenceV1::new(
+            EvidenceClass::Apply,
+            accepted_hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!(
+                    "{}.json",
+                    accepted_hash.trim_start_matches("sha256:")
+                ))
+                .display()
+                .to_string(),
+        ),
+        accepted_bookmark: accepted_bookmark.to_owned(),
+        root_operation_id: root_operation_id.to_owned(),
+        root_plan_hash: root_plan_hash.to_owned(),
+        root_input,
+        root_stage,
+    })
+}
+
+fn exact_durable_resume_provider_complete_boundary(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<DurableProviderCompleteBoundary> {
+    let authority = plan
+        .targets
+        .pointer("/adapter/approved_mln_import_poll_resume")
+        .ok_or_else(|| CliError::Input("poll continuation authority is missing".to_owned()))?;
+    let contract = plan
+        .capability
+        .d1_approved_mln_import_poll_resume
+        .as_ref()
+        .ok_or_else(|| CliError::Input("poll continuation contract is missing".to_owned()))?;
+    let root_input = authority
+        .get("root_input")
+        .ok_or_else(|| CliError::Input("root input is missing".to_owned()))?;
+    let root_stage = authority
+        .get("root_stage")
+        .ok_or_else(|| CliError::Input("root stage is missing".to_owned()))?;
+    let migration_id = root_input
+        .pointer("/body/migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("root migration identity is missing".to_owned()))?;
+    let accepted_bookmark = authority
+        .get("accepted_bookmark")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("accepted bookmark is missing".to_owned()))?;
+    let target = json!({"account_id":contract.account_id,"database_id":contract.database_id});
+    let input_hash = hash_value(&plan.input)?;
+    let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
+    let completed = checkpoints
+        .iter()
+        .filter(|(_, checkpoint)| {
+            checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+        })
+        .collect::<Vec<_>>();
+    if completed.len() != 1 {
+        return Err(CliError::Input(
+            "poll continuation requires exactly one provider completion".to_owned(),
+        ));
+    }
+    let (hash, checkpoint) = completed[0];
+    let exact = checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && checkpoint.get("operation_id").and_then(Value::as_str)
+            == Some(plan.operation_id.as_str())
+        && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+        && checkpoint
+            .get("rectification_required")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && checkpoint
+            .pointer("/receipt/provider")
+            .and_then(Value::as_str)
+            == Some("cloudflare")
+        && checkpoint
+            .pointer("/receipt/effect")
+            .and_then(Value::as_str)
+            == Some("d1_import_provider_complete")
+        && checkpoint
+            .pointer("/receipt/response_action")
+            .and_then(Value::as_str)
+            == Some("poll")
+        && checkpoint
+            .pointer("/receipt/migration_id")
+            .and_then(Value::as_str)
+            == Some(migration_id)
+        && checkpoint.pointer("/receipt/target") == Some(&target)
+        && checkpoint
+            .pointer("/receipt/plan_input_hash")
+            .and_then(Value::as_str)
+            == Some(input_hash.as_str())
+        && checkpoint.pointer("/receipt/source_sha256") == root_stage.get("sha256")
+        && checkpoint.pointer("/receipt/source_md5") == root_stage.get("md5")
+        && checkpoint.pointer("/receipt/source_bytes") == root_stage.get("bytes")
+        && checkpoint.pointer("/receipt/source_authority_hash")
+            == root_stage.get("source_authority_hash")
+        && checkpoint
+            .pointer("/receipt/stage_identity_hash")
+            .and_then(Value::as_str)
+            == hash_value(root_stage).ok().as_deref()
+        && checkpoint
+            .pointer("/receipt/at_bookmark")
+            .and_then(Value::as_str)
+            == Some(accepted_bookmark)
+        && checkpoint
+            .pointer("/receipt/final_bookmark")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && checkpoint.pointer("/receipt/root_operation_id") == authority.get("root_operation_id")
+        && checkpoint.pointer("/receipt/root_plan_hash") == authority.get("root_plan_hash")
+        && checkpoint.pointer("/receipt/parent_operation_id")
+            == authority.get("parent_operation_id")
+        && checkpoint.pointer("/receipt/parent_exhaustion_evidence_hash")
+            == authority.get("parent_exhaustion_evidence_hash");
+    if !exact || store.read_evidence_value(hash)? != *checkpoint {
+        return Err(CliError::Input(
+            "poll continuation provider completion is not exact and durable".to_owned(),
+        ));
+    }
+    Ok(DurableProviderCompleteBoundary {
+        evidence_hash: hash.clone(),
+        checkpoint: checkpoint.clone(),
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the child-plan admission joins immutable parent, root, evidence, and sibling authority"
+)]
+fn validate_and_derive_resume_poll_authority(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    profile_id: &str,
+    credential_generation_id: Option<&str>,
+    catalog_hash: &str,
+    before: DateTime<Utc>,
+    child_operation_id: Option<&str>,
+) -> Result<Value> {
+    let contract = capability
+        .d1_approved_mln_import_poll_resume
+        .as_ref()
+        .ok_or_else(|| CliError::Input("poll continuation contract is missing".to_owned()))?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("poll continuation body is missing".to_owned()))?;
+    let expected = [
+        "parent_operation_id",
+        "parent_plan_hash",
+        "exhaustion_evidence_hash",
+        "accepted_ingest_evidence_hash",
+        "accepted_bookmark_hash",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if body.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+        return Err(CliError::Input(
+            "poll continuation accepts only the five immutable parent receipt identities"
+                .to_owned(),
+        ));
+    }
+    let field = |name| required_body_string(body, name);
+    let parent_operation_id = field("parent_operation_id")?;
+    Uuid::parse_str(parent_operation_id).map_err(|_| {
+        CliError::Input("parent_operation_id must be one canonical UUID".to_owned())
+    })?;
+    let StoredPlanRecord::Current(parent_v2) =
+        store.load_stored_plan_record(parent_operation_id)?
+    else {
+        return Err(CliError::Input(
+            "poll continuation parent must be an immutable PlanV2".to_owned(),
+        ));
+    };
+    let parent = &parent_v2.plan;
+    if parent.content_hash != field("parent_plan_hash")?
+        || parent_v2.pins.catalog_hash != parent.catalog_hash
+        || parent_v2.pins.credential_generation_id.is_empty()
+        || parent.created_at >= before
+        || parent.profile_id != profile_id
+        || parent.catalog_hash != catalog_hash
+        || parent_v2.pins.credential_generation_id != credential_generation_id.unwrap_or_default()
+        || parent.account_id != contract.account_id
+    {
+        return Err(CliError::Input(
+            "poll continuation parent PlanV2, chronology, profile, credential, account, or catalog drifted"
+                .to_owned(),
+        ));
+    }
+    let exhaustion = if parent.capability.id == contract.root_capability_id {
+        let (exhaustion_evidence, exhaustion_checkpoint, accepted_ingest_evidence) =
+            exact_durable_poll_exhaustion(store, parent)?;
+        let accepted_bookmark = exhaustion_checkpoint
+            .pointer("/receipt/at_bookmark")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::Input("root exhaustion bookmark is missing".to_owned()))?
+            .to_owned();
+        ResumePollExhaustionAuthority {
+            exhaustion_evidence,
+            exhaustion_checkpoint,
+            accepted_ingest_evidence,
+            accepted_bookmark,
+            root_operation_id: parent.operation_id.clone(),
+            root_plan_hash: parent.content_hash.clone(),
+            root_input: parent.input.clone(),
+            root_stage: parent
+                .targets
+                .pointer("/adapter/approved_mln_import")
+                .cloned()
+                .ok_or_else(|| CliError::Input("root managed stage is missing".to_owned()))?,
+        }
+    } else if parent.capability.id == capability.id {
+        exact_resume_poll_exhaustion(store, parent)?
+    } else {
+        return Err(CliError::Input(
+            "poll continuation parent is neither the root import nor a poll child".to_owned(),
+        ));
+    };
+    let accepted_bookmark_hash = hash_value(&Value::String(exhaustion.accepted_bookmark.clone()))?;
+    if exhaustion.exhaustion_evidence.content_hash != field("exhaustion_evidence_hash")?
+        || exhaustion.accepted_ingest_evidence.content_hash
+            != field("accepted_ingest_evidence_hash")?
+        || accepted_bookmark_hash != field("accepted_bookmark_hash")?
+    {
+        return Err(CliError::Input(
+            "poll continuation caller receipt identities do not match canonical parent authority"
+                .to_owned(),
+        ));
+    }
+    let boundary = parent
+        .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+        .ok_or_else(|| {
+            CliError::Input("parent exhaustion boundary artifact is missing".to_owned())
+        })?;
+    if boundary.get("outcome").and_then(Value::as_str) != Some("poll_in_progress_exhausted")
+        || boundary
+            .get("poll_exhaustion_evidence_hash")
+            .and_then(Value::as_str)
+            != Some(exhaustion.exhaustion_evidence.content_hash.as_str())
+        || boundary
+            .get("accepted_ingest_evidence_hash")
+            .and_then(Value::as_str)
+            != Some(exhaustion.accepted_ingest_evidence.content_hash.as_str())
+        || boundary_artifact_hash(parent, TransactionStageV1::BoundaryResponsePersisted)
+            != hash_value(boundary).ok().as_deref()
+    {
+        return Err(CliError::Input(
+            "parent BoundaryResponse artifact does not authenticate its exhaustion".to_owned(),
+        ));
+    }
+    for sibling in store.list_plans()? {
+        if child_operation_id == Some(sibling.operation_id.as_str()) {
+            continue;
+        }
+        let sibling_authority = sibling
+            .targets
+            .pointer("/adapter/approved_mln_import_poll_resume");
+        let same_exhaustion = sibling_authority
+            .and_then(|value| value.get("parent_operation_id"))
+            .and_then(Value::as_str)
+            == Some(parent_operation_id)
+            && sibling_authority
+                .and_then(|value| value.get("parent_exhaustion_evidence_hash"))
+                .and_then(Value::as_str)
+                == Some(exhaustion.exhaustion_evidence.content_hash.as_str());
+        if same_exhaustion {
+            let crossed_consumption = sibling.transaction_journal.iter().any(|checkpoint| {
+                matches!(
+                    checkpoint.stage,
+                    TransactionStageV1::ConsumptionPersisted
+                        | TransactionStageV1::BoundaryAttemptPersisted
+                        | TransactionStageV1::BoundaryResponsePersisted
+                        | TransactionStageV1::VerificationAttemptPersisted
+                        | TransactionStageV1::VerificationResponsePersisted
+                        | TransactionStageV1::CompensationAttemptPersisted
+                        | TransactionStageV1::CompensationResponsePersisted
+                        | TransactionStageV1::Closed
+                )
+            });
+            let provider_checkpoint_exists = !store
+                .read_d1_import_checkpoints(&sibling.operation_id)?
+                .is_empty();
+            let replaceable = sibling.status == PlanStatus::Cancelled
+                && !crossed_consumption
+                && !provider_checkpoint_exists;
+            if !replaceable {
+                return Err(CliError::Input(
+                    "this exact exhaustion already has a poll child or crossed child boundary"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(json!({
+        "schema_version":1,
+        "parent_operation_id":parent.operation_id,
+        "parent_plan_hash":parent.content_hash,
+        "parent_boundary_artifact_hash":boundary_artifact_hash(parent,TransactionStageV1::BoundaryResponsePersisted),
+        "parent_exhaustion_evidence_hash":exhaustion.exhaustion_evidence.content_hash,
+        "accepted_ingest_evidence_hash":exhaustion.accepted_ingest_evidence.content_hash,
+        "accepted_bookmark":exhaustion.accepted_bookmark,
+        "accepted_bookmark_hash":accepted_bookmark_hash,
+        "root_operation_id":exhaustion.root_operation_id,
+        "root_plan_hash":exhaustion.root_plan_hash,
+        "root_input":exhaustion.root_input,
+        "root_stage":exhaustion.root_stage,
+        "target":{"account_id":contract.account_id,"database_id":contract.database_id},
+        "profile_id":profile_id,
+        "credential_generation_id":credential_generation_id,
+        "catalog_hash":catalog_hash,
+    }))
+}
+
 fn known_import_poll_exhausted_envelope(
     store: &StateStore,
     plan: &mut PlanV1,
     secrets: &dyn SecretStore,
 ) -> ResultEnvelopeV2 {
     plan.status = PlanStatus::RectificationRequired;
-    match exact_durable_poll_exhaustion(store, plan) {
+    let authority = if plan.capability.d1_approved_mln_import.is_some() {
+        exact_durable_poll_exhaustion(store, plan)
+    } else {
+        exact_resume_poll_exhaustion(store, plan).map(|authority| {
+            (
+                authority.exhaustion_evidence,
+                authority.exhaustion_checkpoint,
+                authority.accepted_ingest_evidence,
+            )
+        })
+    };
+    match authority {
         Ok((evidence, checkpoint, accepted_ingest_evidence)) => {
             let artifact = json!({
                 "adapter":"dynamic_api",
@@ -32950,5 +33776,134 @@ mod tests {
             Some("example.com")
         );
         assert_eq!(super::extract_domain("enable email routing"), None);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fixture proves every bounded child receipt and inherited authority pin"
+    )]
+    fn poll_child_exhaustion_is_exact_bounded_and_carries_root_ingest_authority() {
+        let root = tempfile::tempdir().expect("poll child root");
+        let store =
+            StateStore::open(RuntimePaths::from_root(root.path())).expect("poll child store");
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://native".to_owned(),
+            source_hash: "sha256:test".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native overlay");
+        let mut capability = catalog
+            .capabilities
+            .remove("d1-resume-approved-mln-import-poll")
+            .expect("poll child capability");
+        capability
+            .d1_approved_mln_import_poll_resume
+            .as_mut()
+            .expect("poll child contract")
+            .max_poll_attempts = 2;
+        let contract = capability
+            .d1_approved_mln_import_poll_resume
+            .clone()
+            .expect("poll child contract");
+        let accepted = json!({
+            "schema_version":1,
+            "operation_id":"00000000-0000-4000-8000-000000000001",
+            "step":"ingest_response",
+            "performed":true,
+            "rectification_required":false,
+            "receipt":{"result":{"at_bookmark":"accepted"}}
+        });
+        let accepted_evidence = store
+            .write_evidence(EvidenceClass::Apply, &accepted)
+            .expect("accepted evidence");
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            &contract.account_id,
+            "catalog-sha",
+            capability,
+            json!({}),
+        )
+        .expect("poll child plan");
+        plan.input = serde_json::to_value(CallInput {
+            selectors: json!({
+                "account_id":contract.account_id,
+                "database_id":contract.database_id,
+            }),
+            body: Some(json!({
+                "parent_operation_id":"00000000-0000-4000-8000-000000000001",
+                "parent_plan_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "exhaustion_evidence_hash":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "accepted_ingest_evidence_hash":accepted_evidence.content_hash,
+                "accepted_bookmark_hash":hash_value(&json!("accepted")).expect("bookmark hash"),
+            })),
+            ..CallInput::default()
+        })
+        .expect("poll child input");
+        plan.targets = json!({"adapter":{"approved_mln_import_poll_resume":{
+            "root_operation_id":"00000000-0000-4000-8000-000000000001",
+            "root_plan_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "root_input":{"body":{"migration_id":"0143"}},
+            "root_stage":{"sha256":"sha256:source"},
+            "accepted_ingest_evidence_hash":accepted_evidence.content_hash,
+            "accepted_bookmark":"accepted"
+        }}});
+        plan.refresh_hash().expect("poll child hash");
+        let target = json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        });
+        let input_hash = hash_value(&plan.input).expect("input hash");
+        for attempt in 1..=2 {
+            let checkpoint = D1ImportCheckpointV1 {
+                schema_version: 1,
+                operation_id: plan.operation_id.clone(),
+                step: format!("poll_response_{attempt}"),
+                performed: true,
+                rectification_required: false,
+                receipt: json!({
+                    "http_status":200,"success":true,"response_action":"poll",
+                    "provider":"cloudflare","effect":"d1_import_response",
+                    "migration_id":"0143","target":target,"plan_input_hash":input_hash,
+                    "result":{"type":"import","status":"active","success":true,
+                        "at_bookmark":"accepted","result":{"final_bookmark":null},
+                        "provider_error_present":false},
+                    "errors":[],"provider_errors_present":false,"no_replay":false,
+                    "etag_present":false,"etag_sha256":null,"cf_ray":null
+                }),
+            };
+            persist_d1_import_checkpoint(&store, &plan.operation_id, &checkpoint)
+                .expect("poll checkpoint");
+        }
+        let exhausted = D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: plan.operation_id.clone(),
+            step: "poll_in_progress_exhausted".to_owned(),
+            performed: true,
+            rectification_required: true,
+            receipt: json!({
+                "provider":"cloudflare","effect":"d1_import_poll_in_progress_exhausted",
+                "migration_id":"0143","target":target,"plan_input_hash":input_hash,
+                "source_sha256":"sha256:source","at_bookmark":"accepted",
+                "attempt_count":2,"attempt_bound":2,
+                "outcome":"poll_in_progress_exhausted","receipt_available":true,"no_replay":true
+            }),
+        };
+        persist_d1_import_checkpoint(&store, &plan.operation_id, &exhausted)
+            .expect("exhaustion checkpoint");
+        let exact =
+            super::exact_resume_poll_exhaustion(&store, &plan).expect("exact child exhaustion");
+        assert_eq!(exact.accepted_bookmark, "accepted");
+        assert_eq!(
+            exact.accepted_ingest_evidence.content_hash,
+            accepted_evidence.content_hash
+        );
+        let mut grafted = plan.clone();
+        grafted.targets["adapter"]["approved_mln_import_poll_resume"]["accepted_bookmark"] =
+            json!("grafted");
+        assert!(super::exact_resume_poll_exhaustion(&store, &grafted).is_err());
     }
 }
