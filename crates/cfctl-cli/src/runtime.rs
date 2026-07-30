@@ -13608,6 +13608,12 @@ fn exact_linear_poll_child_provider_complete(
     store: &StateStore,
     root: &PlanV1,
 ) -> Result<DurableProviderCompleteBoundary> {
+    let root_v2 = store.load_plan_v2(&root.operation_id)?;
+    if root_v2.plan != *root {
+        return Err(CliError::Input(
+            "root import projection does not match its canonical PlanV2".to_owned(),
+        ));
+    }
     let discovered = store
         .list_plans()?
         .into_iter()
@@ -13633,12 +13639,88 @@ fn exact_linear_poll_child_provider_complete(
             };
             if serde_json::to_value(&projection)? != serde_json::to_value(&current.plan)?
                 || current.pins.catalog_hash != current.plan.catalog_hash
-                || current.pins.credential_generation_id.is_empty()
+                || current.pins.catalog_hash != root_v2.pins.catalog_hash
+                || current.pins.credential_generation_id
+                    != root_v2.pins.credential_generation_id
                 || current.plan.capability.id != "d1-resume-approved-mln-import-poll"
                 || current.plan.approval.is_none()
             {
                 return Err(CliError::Input(
                     "poll child PlanV2 projection, pins, approval, consumption, or boundary lifecycle is invalid"
+                        .to_owned(),
+                ));
+            }
+            let authority = current
+                .plan
+                .targets
+                .pointer("/adapter/approved_mln_import_poll_resume")
+                .ok_or_else(|| CliError::Input("poll child authority is missing".to_owned()))?;
+            let contract_hash = hash_value(&serde_json::to_value(&current.plan.capability)?)?;
+            let contract = current
+                .plan
+                .capability
+                .d1_approved_mln_import_poll_resume
+                .as_ref()
+                .ok_or_else(|| CliError::Input("poll child contract is missing".to_owned()))?;
+            let target = json!({
+                "account_id":contract.account_id,
+                "database_id":contract.database_id,
+            });
+            let input: CallInput = serde_json::from_value(current.plan.input.clone())?;
+            let body = input
+                .body
+                .as_ref()
+                .and_then(Value::as_object)
+                .ok_or_else(|| CliError::Input("poll child input body is missing".to_owned()))?;
+            let exact_input_fields = [
+                "parent_operation_id",
+                "parent_plan_hash",
+                "exhaustion_evidence_hash",
+                "accepted_ingest_evidence_hash",
+                "accepted_bookmark_hash",
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+            if authority.get("profile_id").and_then(Value::as_str)
+                != Some(root.profile_id.as_str())
+                || current.plan.profile_id != root.profile_id
+                || current.plan.account_id != root.account_id
+                || authority
+                    .get("credential_generation_id")
+                    .and_then(Value::as_str)
+                    != Some(root_v2.pins.credential_generation_id.as_str())
+                || authority.get("catalog_hash").and_then(Value::as_str)
+                    != Some(root.catalog_hash.as_str())
+                || authority
+                    .get("capability_contract_hash")
+                    .and_then(Value::as_str)
+                    != Some(contract_hash.as_str())
+                || authority.get("root_operation_id").and_then(Value::as_str)
+                    != Some(root.operation_id.as_str())
+                || authority.get("root_plan_hash").and_then(Value::as_str)
+                    != Some(root.content_hash.as_str())
+                || authority.get("root_input") != Some(&root.input)
+                || authority.get("root_stage")
+                    != root.targets.pointer("/adapter/approved_mln_import")
+                || authority.get("target") != Some(&target)
+                || input.selectors != target
+                || !input
+                    .query
+                    .as_object()
+                    .is_none_or(serde_json::Map::is_empty)
+                || body.keys().map(String::as_str).collect::<BTreeSet<_>>()
+                    != exact_input_fields
+                || body.get("parent_operation_id") != authority.get("parent_operation_id")
+                || body.get("parent_plan_hash") != authority.get("parent_plan_hash")
+                || body.get("exhaustion_evidence_hash")
+                    != authority.get("parent_exhaustion_evidence_hash")
+                || body.get("accepted_ingest_evidence_hash")
+                    != authority.get("accepted_ingest_evidence_hash")
+                || body.get("accepted_bookmark_hash")
+                    != authority.get("accepted_bookmark_hash")
+            {
+                return Err(CliError::Input(
+                    "poll child profile, credential, catalog, contract, input, or root authority drifted"
                         .to_owned(),
                 ));
             }
@@ -15534,6 +15616,7 @@ fn validate_and_derive_resume_poll_authority(
             }
         }
     }
+    let capability_contract_hash = hash_value(&serde_json::to_value(capability)?)?;
     Ok(json!({
         "schema_version":1,
         "parent_operation_id":parent.operation_id,
@@ -15551,6 +15634,7 @@ fn validate_and_derive_resume_poll_authority(
         "profile_id":profile_id,
         "credential_generation_id":credential_generation_id,
         "catalog_hash":catalog_hash,
+        "capability_contract_hash":capability_contract_hash,
     }))
 }
 
@@ -23168,6 +23252,13 @@ mod tests {
                 "accepted_bookmark_hash":hash_value(&json!("accepted")).expect("bookmark hash"),
                 "root_input":root_plan.input,
                 "root_stage":root_stage,
+                "profile_id":"profile-a",
+                "credential_generation_id":"test-credential-generation",
+                "catalog_hash":"catalog-sha",
+                "capability_contract_hash":hash_value(
+                    &serde_json::to_value(&child_capability).expect("child capability value")
+                ).expect("child capability hash"),
+                "target":target,
             }}});
             child.refresh_hash().expect("child hash");
             child.approve(true, None).expect("approve child");
@@ -23554,8 +23645,7 @@ mod tests {
         })
     }
 
-    fn rebind_poll_child_terminal_lifecycle(
-        store: &StateStore,
+    fn rebuild_poll_child_terminal_lifecycle(
         child: &mut PlanV1,
         terminal_status: PlanStatus,
         response_artifact: Value,
@@ -23580,7 +23670,40 @@ mod tests {
                 exact_poll_test_secret_artifact(),
             )
             .expect("rebound secret lifecycle");
+    }
+
+    fn rebind_poll_child_terminal_lifecycle(
+        store: &StateStore,
+        child: &mut PlanV1,
+        terminal_status: PlanStatus,
+        response_artifact: Value,
+    ) {
+        rebuild_poll_child_terminal_lifecycle(child, terminal_status, response_artifact);
         persist_rebound_poll_child(store, child);
+    }
+
+    fn persist_poll_test_plan_v2(store: &StateStore, plan: &PlanV1, pins: PlanPinsV2) {
+        let document = PlanV2::new(plan.clone(), pins).expect("valid drifted PlanV2");
+        let projection_path = store
+            .paths()
+            .data_dir
+            .join("plans")
+            .join(format!("{}.json", plan.operation_id));
+        let current_path = store
+            .paths()
+            .data_dir
+            .join("plans-v2")
+            .join(format!("{}.json", plan.operation_id));
+        fs::write(
+            projection_path,
+            serde_json::to_vec_pretty(plan).expect("encode drifted projection"),
+        )
+        .expect("persist drifted projection");
+        fs::write(
+            current_path,
+            serde_json::to_vec_pretty(&document).expect("encode drifted PlanV2"),
+        )
+        .expect("persist drifted PlanV2");
     }
 
     fn rebind_completed_poll_child_apply_evidence(
@@ -23874,6 +23997,153 @@ mod tests {
             super::validate_canonical_poll_child_lifecycle(&fixture.store, &current).is_err(),
             "semantically mismatched exhaustion evidence must fail closed"
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the matrix rebuilds valid PlanV2 children across every pinned authority drift"
+    )]
+    fn poll_child_resolver_rejects_canonical_terminal_and_intermediate_authority_drift() {
+        let drift_cases = [
+            "credential_pin",
+            "profile",
+            "catalog",
+            "capability_contract_hash",
+            "capability",
+            "root_input",
+            "root_stage",
+            "target_account",
+        ];
+        for generations in [1, 2] {
+            for drift_case in drift_cases {
+                let fixture = build_poll_child_lineage(generations);
+                let child_index = generations - 1;
+                let mut child = fixture.children[child_index].clone();
+                let response_artifact = child
+                    .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                    .expect("terminal response artifact")
+                    .clone();
+                let terminal_status = child.status;
+                let mut pins = fixture
+                    .store
+                    .load_plan_v2(&child.operation_id)
+                    .expect("canonical child")
+                    .pins;
+                match drift_case {
+                    "credential_pin" => {
+                        pins.credential_generation_id = "drifted-credential".to_owned();
+                    }
+                    "profile" => {
+                        child.profile_id = "profile-b".to_owned();
+                    }
+                    "catalog" => {
+                        child.catalog_hash = "drifted-catalog".to_owned();
+                        pins.catalog_hash = child.catalog_hash.clone();
+                    }
+                    "capability_contract_hash" => {
+                        child.targets["adapter"]["approved_mln_import_poll_resume"]["capability_contract_hash"] = json!(
+                            hash_value(&json!({
+                                "different":"capability"
+                            }))
+                            .expect("drifted contract hash")
+                        );
+                    }
+                    "capability" => {
+                        child.capability.title.push_str(" drifted");
+                    }
+                    "root_input" => {
+                        child.targets["adapter"]["approved_mln_import_poll_resume"]["root_input"]
+                            ["body"]["migration_id"] = json!("0142");
+                    }
+                    "root_stage" => {
+                        child.targets["adapter"]["approved_mln_import_poll_resume"]["root_stage"]
+                            ["sha256"] = json!("sha256:drifted");
+                    }
+                    "target_account" => {
+                        child.account_id = "drifted-account".to_owned();
+                    }
+                    _ => unreachable!("closed drift matrix"),
+                }
+                rebuild_poll_child_terminal_lifecycle(
+                    &mut child,
+                    terminal_status,
+                    response_artifact,
+                );
+                persist_poll_test_plan_v2(&fixture.store, &child, pins);
+                assert!(
+                    super::exact_linear_poll_child_provider_complete(
+                        &fixture.store,
+                        &fixture.root_plan
+                    )
+                    .is_err(),
+                    "{drift_case} must be rejected for a {generations}-generation terminal child"
+                );
+            }
+        }
+
+        for drift_case in drift_cases {
+            let fixture = build_poll_child_lineage(2);
+            let mut child = fixture.children[0].clone();
+            let response_artifact = child
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .expect("intermediate exhaustion response artifact")
+                .clone();
+            let mut pins = fixture
+                .store
+                .load_plan_v2(&child.operation_id)
+                .expect("canonical intermediate child")
+                .pins;
+            match drift_case {
+                "credential_pin" => {
+                    pins.credential_generation_id = "drifted-credential".to_owned();
+                }
+                "profile" => {
+                    child.profile_id = "profile-b".to_owned();
+                }
+                "catalog" => {
+                    child.catalog_hash = "drifted-catalog".to_owned();
+                    pins.catalog_hash = child.catalog_hash.clone();
+                }
+                "capability_contract_hash" => {
+                    child.targets["adapter"]["approved_mln_import_poll_resume"]["capability_contract_hash"] = json!(
+                        hash_value(&json!({
+                            "different":"capability"
+                        }))
+                        .expect("drifted contract hash")
+                    );
+                }
+                "capability" => {
+                    child.capability.title.push_str(" drifted");
+                }
+                "root_input" => {
+                    child.targets["adapter"]["approved_mln_import_poll_resume"]["root_input"]["body"]
+                        ["migration_id"] = json!("0142");
+                }
+                "root_stage" => {
+                    child.targets["adapter"]["approved_mln_import_poll_resume"]["root_stage"]["sha256"] =
+                        json!("sha256:drifted");
+                }
+                "target_account" => {
+                    child.account_id = "drifted-account".to_owned();
+                }
+                _ => unreachable!("closed drift matrix"),
+            }
+            rebuild_poll_child_terminal_lifecycle(
+                &mut child,
+                PlanStatus::RectificationRequired,
+                response_artifact,
+            );
+            persist_poll_test_plan_v2(&fixture.store, &child, pins);
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err(),
+                "{drift_case} must be rejected for an intermediate exhausted child"
+            );
+        }
     }
 
     #[test]
