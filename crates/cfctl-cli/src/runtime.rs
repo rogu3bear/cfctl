@@ -20007,14 +20007,31 @@ async fn key_renew_analytics_profile(
         let renew_at =
             managed.expires_at - ChronoDuration::hours(i64::from(arguments.renew_before_hours));
         if Utc::now() < renew_at {
+            let active_reads = Box::pin(analytics_rotation_reads(
+                store,
+                &arguments.profile,
+                &arguments.account,
+                &arguments.zone,
+                &arguments.hostname,
+            ))
+            .await?;
+            if !analytics_reads_passed(&active_reads) {
+                return Ok(rotation_failure(
+                    "CFCTL_ANALYTICS_PROFILE_READ_FAILED",
+                    "the active managed analytics profile failed its settings or hostname-bound RUM read",
+                    "Inspect the redacted live-read receipts and restore credential-store access before the next scheduled attempt.",
+                    active_reads
+                        .into_iter()
+                        .flat_map(|envelope| envelope.evidence)
+                        .collect(),
+                    json!({
+                        "profile":arguments.profile,
+                        "state":"active_read_failed",
+                    }),
+                ));
+            }
             let secrets = platform_secrets(store);
-            let retired_legacy_credential =
-                if secrets.locate_api_token(&arguments.profile)?.is_some() {
-                    secrets.delete_api_token(&arguments.profile)?;
-                    true
-                } else {
-                    false
-                };
+            secrets.delete_api_token(&arguments.profile)?;
             let mut envelope = ResultEnvelopeV2::success(
                 "keys renew-analytics-profile",
                 json!({
@@ -20023,13 +20040,17 @@ async fn key_renew_analytics_profile(
                     "active_token_id":managed.token_id,
                     "expires_at":managed.expires_at,
                     "renew_at":renew_at,
-                    "retired_legacy_profile_credential":retired_legacy_credential,
+                    "legacy_profile_credential_cleanup":"completed_idempotently",
                     "observable_failure_signal":"nonzero process exit with ResultEnvelopeV2 error",
-                    "message":"Managed analytics child is healthy and outside its renewal window."
+                    "message":"Managed analytics child is outside its renewal window and passed account settings, zone settings, and exact-hostname RUM reads."
                 }),
             );
             envelope.profile_id = Some(arguments.profile.clone());
             envelope.account_id = Some(arguments.account.clone());
+            envelope.evidence = active_reads
+                .into_iter()
+                .flat_map(|read| read.evidence)
+                .collect();
             return Ok(envelope);
         }
     }

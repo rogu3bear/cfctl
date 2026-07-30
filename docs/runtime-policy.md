@@ -173,10 +173,13 @@ later rotations use two standing run reservations: mint and old-child revoke.
 Profile metadata contains only opaque slot, token identity, expiry, authority,
 and pending-revocation references. Secret slots remain in the platform
 credential store or its private mode-0600 fallback. Slot activation is
-old-or-new atomic. A healthy managed-profile check retires any unreachable
-legacy profile-keyed credential left by the one-time migration without
-touching the active immutable slot. No token value enters stdout, arguments,
-profiles, plans, evidence, or repository files.
+old-or-new atomic. A healthy managed-profile check repeats all three live reads
+and retires any unreachable legacy profile-keyed credential left by the
+one-time migration without touching the active immutable slot. On macOS,
+Keychain reads and deletes use a bounded native subprocess so an interactive
+access prompt becomes a nonzero scheduler failure instead of an indefinite
+hang. No token value enters stdout, arguments, profiles, plans, evidence, or
+repository files.
 
 ## Secrets
 

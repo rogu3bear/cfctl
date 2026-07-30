@@ -7,7 +7,7 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::{
     collections::BTreeMap,
     fmt, fs,
-    io::Write as _,
+    io::{Read as _, Write as _},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -508,26 +508,115 @@ impl SecretStore for KeyringSecretStore {
     }
 
     fn get(&self, key: &str) -> Result<Option<String>> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, key)
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-        match entry.get_password() {
-            Ok(value) => Ok(Some(value)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(AuthError::SecretStore(error.to_string())),
+        #[cfg(target_os = "macos")]
+        {
+            let mut child = std::process::Command::new("/usr/bin/security")
+                .args([
+                    "find-generic-password",
+                    "-s",
+                    KEYRING_SERVICE,
+                    "-a",
+                    key,
+                    "-w",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+            let status = wait_for_macos_keychain_child(&mut child)?;
+            if status.code() == Some(44) {
+                return Ok(None);
+            }
+            if !status.success() {
+                return Err(AuthError::SecretStore(format!(
+                    "platform keyring credential read failed with exit status {status}"
+                )));
+            }
+            let mut value = String::new();
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| {
+                    AuthError::SecretStore(
+                        "platform keyring credential read produced no sink".to_owned(),
+                    )
+                })?
+                .read_to_string(&mut value)
+                .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+            while value.ends_with(['\n', '\r']) {
+                value.pop();
+            }
+            Ok(Some(value))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let entry = keyring::Entry::new(KEYRING_SERVICE, key)
+                .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+            match entry.get_password() {
+                Ok(value) => Ok(Some(value)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(error) => Err(AuthError::SecretStore(error.to_string())),
+            }
         }
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, key)
-            .map_err(|error| AuthError::SecretStore(error.to_string()))?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(AuthError::SecretStore(error.to_string())),
+        #[cfg(target_os = "macos")]
+        {
+            let mut child = std::process::Command::new("/usr/bin/security")
+                .args(["delete-generic-password", "-s", KEYRING_SERVICE, "-a", key])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+            let status = wait_for_macos_keychain_child(&mut child)?;
+            if status.success() || status.code() == Some(44) {
+                Ok(())
+            } else {
+                Err(AuthError::SecretStore(format!(
+                    "platform keyring credential deletion failed with exit status {status}"
+                )))
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let entry = keyring::Entry::new(KEYRING_SERVICE, key)
+                .map_err(|error| AuthError::SecretStore(error.to_string()))?;
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(error) => Err(AuthError::SecretStore(error.to_string())),
+            }
         }
     }
 
     fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
         Ok(self.get(key)?.map(|_| SecretBackend::PlatformKeyring))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_macos_keychain_child(
+    child: &mut std::process::Child,
+) -> Result<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child
+            .try_wait()
+            .map_err(|error| AuthError::SecretStore(error.to_string()))?
+        {
+            Some(status) => return Ok(status),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AuthError::SecretStore(
+                    "platform keyring operation timed out after 5 seconds; unlock the login keychain and retry"
+                        .to_owned(),
+                ));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
     }
 }
 

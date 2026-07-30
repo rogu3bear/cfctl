@@ -193,7 +193,9 @@ Later renewals are fully unattended because both children are lineage-bound.
 The fresh secret exists only in cfctl's private sink and immutable credential
 slot. The publisher profile switches slots through one atomic metadata write.
 Before that switch and again afterward, cfctl requires successful account RUM
-settings, zone analytics settings, and exact-hostname RUM reads. Any failure
+settings, zone analytics settings, and exact-hostname RUM reads. Healthy
+hourly checks repeat the same three reads, so inaccessible credentials or
+analytics contract drift cannot be reported as `healthy_not_due`. Any failure
 preserves or restores the prior profile, revokes the fresh child when safely
 lineage-bound, emits redacted evidence, and exits nonzero.
 
