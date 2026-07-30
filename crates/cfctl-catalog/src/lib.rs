@@ -13,12 +13,12 @@ use cfctl_core::{
     CreatedResourceContractV1, D1FullExportContractV1, D1SchemaIntrospectionContractV1,
     DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass, EntitlementProbeV1,
     EntitlementV1, EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1,
-    Maturity, Mln0143DataInvariantsContractV1, OutputFormatV1, PaginationModeV1,
-    QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
-    RiskClass, SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
-    SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, TimeRangeContractV1,
-    TimestampFormatV1, UpdatedResourceContractV1, WorkflowContractV1, WorkflowStepV1, hash_value,
-    request_header_is_reserved,
+    Maturity, Mln0142PostImportSchemaContractV1, Mln0143DataInvariantsContractV1, OutputFormatV1,
+    PaginationModeV1, QuerySerializationV1, R2LogRetrievalContractV1, ResponseBodyModeV1,
+    ResponseContractV1, RiskClass, SamePathReadContractV1, SecurityActionContractV1,
+    SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1,
+    TimeRangeContractV1, TimestampFormatV1, UpdatedResourceContractV1, WorkflowContractV1,
+    WorkflowStepV1, hash_value, request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -1758,6 +1758,7 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
 pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
     for capability in vec![
         mln_0143_data_invariants_capability(),
+        mln_0142_post_import_schema_capability(),
         d1_schema_introspection_capability(),
         d1_full_export_capability(),
         d1_restore_exact_bookmark_capability(),
@@ -1770,6 +1771,76 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
             .insert(capability.id.clone(), capability);
     }
     snapshot.refresh_hash()
+}
+
+const MLN_0142_TRIGGER_DEFINITION: &str = r"CREATE TRIGGER document_render_jobs_terminal_generation_guard
+BEFORE UPDATE OF state ON document_render_jobs
+FOR EACH ROW
+WHEN NEW.state IN ('ready', 'failed')
+ AND (
+   OLD.state <> 'rendering'
+   OR OLD.attempts < 1
+   OR OLD.claimed_by IS NULL
+   OR trim(OLD.claimed_by) = ''
+   OR NEW.attempts <> OLD.attempts
+   OR NEW.claimed_by IS NOT OLD.claimed_by
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'document_render_terminal_generation_stale');
+END";
+
+fn mln_0142_post_import_schema_capability() -> CapabilityV1 {
+    const ACCOUNT: &str = "ca30e922fda7f5578e49873542e4aaca";
+    const DATABASE: &str = "7c282983-2e48-4ea4-9f0d-09b0d718fe65";
+    const SOURCE: &str = "sha256:07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0";
+    const DEFINITION: &str =
+        "sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b";
+    let mut capability = d1_schema_introspection_capability();
+    "mln-0142-post-import-schema".clone_into(&mut capability.id);
+    "Prove MLN 0142 post-import trigger authority".clone_into(&mut capability.title);
+    capability.description = Some(
+        "Run one exact compiler-owned equality assertion for the reviewed MLNavigator 0142 trigger and bind the result to its durable import boundary."
+            .to_owned(),
+    );
+    capability.aliases = vec!["verify MLN 0142 migration".to_owned()];
+    capability.selectors[0].contract = Some(SelectorContractV1 {
+        schema: serde_json::json!({"type":"string","enum":[ACCOUNT]}),
+        query: None,
+    });
+    capability.selectors[1].contract = Some(SelectorContractV1 {
+        schema: serde_json::json!({"type":"string","enum":[DATABASE]}),
+        query: None,
+    });
+    let hash = serde_json::json!({"type":"string","pattern":"^sha256:[0-9a-f]{64}$"});
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "x-cfctl-body-required":true,
+        "required":[
+            "assertion","import_operation_id","import_boundary_evidence_hash",
+            "import_source_sha256","import_plan_hash","final_bookmark_hash",
+            "trigger_definition_sha256"
+        ],
+        "properties":{
+            "assertion":{"type":"string","enum":["mln_0142_trigger_definition"]},
+            "import_operation_id":{"type":"string","format":"uuid"},
+            "import_boundary_evidence_hash":hash,
+            "import_source_sha256":{"type":"string","enum":[SOURCE]},
+            "import_plan_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+            "final_bookmark_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+            "trigger_definition_sha256":{"type":"string","enum":[DEFINITION]}
+        }
+    }));
+    capability.mln_0142_post_import_schema = Some(Mln0142PostImportSchemaContractV1 {
+        account_id: ACCOUNT.to_owned(),
+        database_id: DATABASE.to_owned(),
+        migration_sha256: SOURCE.to_owned(),
+        trigger_name: "document_render_jobs_terminal_generation_guard".to_owned(),
+        trigger_definition: MLN_0142_TRIGGER_DEFINITION.to_owned(),
+        trigger_definition_sha256: DEFINITION.to_owned(),
+        capability_version: 1,
+    });
+    capability
 }
 
 #[expect(
@@ -1863,6 +1934,8 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
             "pre_bookmark_evidence_hash":hash,
             "prior_0142_operation_id":operation,
             "prior_0142_boundary_evidence_hash":hash,
+            "prior_0142_schema_proof_operation_id":operation,
+            "prior_0142_verification_evidence_hash":hash,
             "post_0142_anchor_operation_id":operation,
             "post_0142_anchor_evidence_hash":hash,
             "pre_import_invariant_operation_id":operation,
@@ -1872,12 +1945,14 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
             {"if":{"properties":{"migration_id":{"const":"0142"}}},
              "then":{"not":{"anyOf":[
                  {"required":["prior_0142_operation_id"]},{"required":["prior_0142_boundary_evidence_hash"]},
+                 {"required":["prior_0142_schema_proof_operation_id"]},{"required":["prior_0142_verification_evidence_hash"]},
                  {"required":["post_0142_anchor_operation_id"]},{"required":["post_0142_anchor_evidence_hash"]},
                  {"required":["pre_import_invariant_operation_id"]},{"required":["pre_import_invariant_evidence_hash"]}
              ]}}},
             {"if":{"properties":{"migration_id":{"const":"0143"}}},
              "then":{"required":[
                  "prior_0142_operation_id","prior_0142_boundary_evidence_hash",
+                 "prior_0142_schema_proof_operation_id","prior_0142_verification_evidence_hash",
                  "post_0142_anchor_operation_id","post_0142_anchor_evidence_hash",
                  "pre_import_invariant_operation_id","pre_import_invariant_evidence_hash"
              ]}}

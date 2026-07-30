@@ -1248,6 +1248,9 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     if is_d1_approved_mln_import {
         validate_approved_mln_import_prerequisites(store, &capability, &prepared.input)?;
     }
+    if capability.mln_0142_post_import_schema.is_some() {
+        validate_mln_0142_post_import_schema_input(store, &capability, &prepared.input)?;
+    }
     let import_stage = arguments
         .source_file
         .as_deref()
@@ -1590,9 +1593,22 @@ fn validate_approved_mln_import_prerequisites(
         .ok_or_else(|| {
             CliError::Input("0143 requires prior_0142_boundary_evidence_hash".to_owned())
         })?;
+    let prior_proof_operation = body
+        .get("prior_0142_schema_proof_operation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("0143 requires prior_0142_schema_proof_operation_id".to_owned())
+        })?;
+    let prior_verification_hash = body
+        .get("prior_0142_verification_evidence_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("0143 requires prior_0142_verification_evidence_hash".to_owned())
+        })?;
     let prior_plan = store.load_plan(prior_operation)?;
     let prior_input: CallInput = serde_json::from_value(prior_plan.input.clone())?;
     let prior_exact = prior_plan.capability.id == capability.id
+        && mln_0142_terminal_import_state(&prior_plan)
         && prior_plan.account_id == contract.account_id
         && prior_input.selectors == input.selectors
         && prior_input
@@ -1601,24 +1617,80 @@ fn validate_approved_mln_import_prerequisites(
             .and_then(|body| body.get("migration_id"))
             .and_then(Value::as_str)
             == Some("0142");
+    let verification_artifact_matches = prior_plan
+        .transaction_artifact(TransactionStageV1::VerificationResponsePersisted)
+        .and_then(|artifact| artifact.get("evidence_hash"))
+        .and_then(Value::as_str)
+        == Some(prior_verification_hash);
+    let verification_evidence = store.read_evidence_value(prior_verification_hash)?;
+    let verification_receipt_matches = verification_evidence.get("state").and_then(Value::as_str)
+        == Some("verified")
+        && verification_evidence
+            .get("operation_id")
+            .and_then(Value::as_str)
+            == Some(prior_operation)
+        && verification_evidence
+            .get("provider_complete_evidence_hash")
+            .and_then(Value::as_str)
+            == Some(prior_hash)
+        && verification_evidence
+            .get("post_import_operation_id")
+            .and_then(Value::as_str)
+            == Some(prior_proof_operation);
     let checkpoints = store.read_d1_import_checkpoints(prior_operation)?;
-    let matching = checkpoints.iter().filter(|(hash, checkpoint)| {
-        hash == prior_hash
-            && checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
-            && checkpoint.pointer("/receipt/state").and_then(Value::as_str)
-                == Some("provider_complete")
-            && checkpoint
-                .pointer("/receipt/target/account_id")
-                .and_then(Value::as_str)
-                == Some(contract.account_id.as_str())
-            && checkpoint
-                .pointer("/receipt/target/database_id")
-                .and_then(Value::as_str)
-                == Some(contract.database_id.as_str())
-    });
-    if !prior_exact || matching.count() != 1 {
+    let matching_boundaries = checkpoints
+        .iter()
+        .filter(|(hash, checkpoint)| {
+            hash == prior_hash
+                && checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+                && checkpoint.pointer("/receipt/state").and_then(Value::as_str)
+                    == Some("provider_complete")
+                && checkpoint
+                    .pointer("/receipt/target/account_id")
+                    .and_then(Value::as_str)
+                    == Some(contract.account_id.as_str())
+                && checkpoint
+                    .pointer("/receipt/target/database_id")
+                    .and_then(Value::as_str)
+                    == Some(contract.database_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let expected_final_bookmark_hash = matching_boundaries
+        .first()
+        .and_then(|(_, checkpoint)| checkpoint.pointer("/receipt/final_bookmark"))
+        .and_then(Value::as_str)
+        .and_then(|bookmark| hash_value(&Value::String(bookmark.to_owned())).ok());
+    let expected_target_hash = hash_value(&json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    }))?;
+    let proof_matches = store
+        .list_operational_proofs()?
+        .into_iter()
+        .filter(|proof| {
+            proof.mln_0142_governed_execution().is_some_and(|binding| {
+                proof.capability_id == "mln-0142-post-import-schema"
+                    && binding.operation_id == prior_proof_operation
+                    && binding.import_operation_id == prior_operation
+                    && binding.import_boundary_evidence_hash == prior_hash
+                    && binding.import_plan_hash == prior_plan.content_hash
+                    && binding.import_source_sha256
+                        == "sha256:07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0"
+                    && binding.target_scope_hash == expected_target_hash
+                    && Some(binding.final_bookmark_hash.as_str())
+                        == expected_final_bookmark_hash.as_deref()
+                    && binding.completion_status == "completed"
+            })
+        })
+        .count();
+    if !prior_exact
+        || !verification_artifact_matches
+        || !verification_receipt_matches
+        || proof_matches != 1
+        || matching_boundaries.len() != 1
+    {
         return Err(CliError::Input(
-            "0143 requires exactly one same-target successful 0142 provider-complete receipt"
+            "0143 requires one terminal verified 0142 import joined to its exact schema proof, verification evidence, and provider boundary"
                 .to_owned(),
         ));
     }
@@ -1682,6 +1754,89 @@ fn validate_approved_mln_import_prerequisites(
     if operation_ids.contains(anchor_operation) || anchor_operation == prior_operation {
         return Err(CliError::Input(
             "0143 post-0142 recovery anchor must be distinct from import and pre-0143 operations"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn mln_0142_terminal_import_state(plan: &PlanV1) -> bool {
+    plan.status == PlanStatus::Verified && plan.transaction_stage == TransactionStageV1::Closed
+}
+
+fn validate_mln_0142_post_import_schema_input(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let contract = capability
+        .mln_0142_post_import_schema
+        .as_ref()
+        .ok_or_else(|| CliError::Input("MLN 0142 schema contract is missing".to_owned()))?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("MLN 0142 schema proof body is missing".to_owned()))?;
+    let field = |name: &str| {
+        body.get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::Input(format!("MLN 0142 schema proof requires `{name}`")))
+    };
+    let operation_id = field("import_operation_id")?;
+    let boundary_hash = field("import_boundary_evidence_hash")?;
+    let source_sha256 = field("import_source_sha256")?;
+    let plan_hash = field("import_plan_hash")?;
+    let final_bookmark_hash = field("final_bookmark_hash")?;
+    let import_plan = store.load_plan(operation_id)?;
+    let import_input: CallInput = serde_json::from_value(import_plan.input.clone())?;
+    let exact_plan = import_plan.capability.id == "d1-import-approved-mln-migration"
+        && import_plan.status == PlanStatus::Running
+        && import_plan.transaction_stage == TransactionStageV1::SecretSinkPersisted
+        && import_plan.content_hash == plan_hash
+        && import_plan.account_id == contract.account_id
+        && import_input.selectors == input.selectors
+        && import_input
+            .body
+            .as_ref()
+            .and_then(|value| value.get("migration_id"))
+            .and_then(Value::as_str)
+            == Some("0142");
+    let matching = store
+        .read_d1_import_checkpoints(operation_id)?
+        .into_iter()
+        .filter(|(hash, checkpoint)| {
+            hash == boundary_hash
+                && checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+                && checkpoint.pointer("/receipt/state").and_then(Value::as_str)
+                    == Some("provider_complete")
+                && checkpoint
+                    .pointer("/receipt/source_sha256")
+                    .and_then(Value::as_str)
+                    == Some(source_sha256)
+                && checkpoint
+                    .pointer("/receipt/target/account_id")
+                    .and_then(Value::as_str)
+                    == Some(contract.account_id.as_str())
+                && checkpoint
+                    .pointer("/receipt/target/database_id")
+                    .and_then(Value::as_str)
+                    == Some(contract.database_id.as_str())
+                && checkpoint
+                    .pointer("/receipt/final_bookmark")
+                    .and_then(Value::as_str)
+                    .and_then(|bookmark| hash_value(&Value::String(bookmark.to_owned())).ok())
+                    .as_deref()
+                    == Some(final_bookmark_hash)
+        })
+        .count();
+    if !exact_plan
+        || matching != 1
+        || source_sha256 != contract.migration_sha256
+        || field("trigger_definition_sha256")? != contract.trigger_definition_sha256
+    {
+        return Err(CliError::Input(
+            "MLN 0142 schema proof must bind the exact running import plan, provider boundary, source, target, final bookmark, and trigger definition"
                 .to_owned(),
         ));
     }
@@ -13880,10 +14035,34 @@ fn rectify_approved_mln_import(store: &StateStore, plan: &mut PlanV1) -> Result<
         ));
     }
     let provider_complete_hash = &provider_boundaries[0].0;
+    let import_input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let migration_id = import_input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("import migration identity is missing".to_owned()))?;
     let matching = store
         .list_operational_proofs()?
         .into_iter()
         .filter_map(|proof| {
+            if migration_id == "0142" {
+                let binding = proof.mln_0142_governed_execution()?;
+                let boundary = &provider_boundaries[0].1;
+                let final_bookmark_hash = boundary
+                    .pointer("/receipt/final_bookmark")
+                    .and_then(Value::as_str)
+                    .and_then(|bookmark| hash_value(&Value::String(bookmark.to_owned())).ok())?;
+                let exact = proof.capability_id == "mln-0142-post-import-schema"
+                    && binding.completion_status == "completed"
+                    && binding.import_operation_id == plan.operation_id
+                    && binding.import_boundary_evidence_hash == *provider_complete_hash
+                    && binding.import_source_sha256 == source_sha256
+                    && binding.import_plan_hash == plan.content_hash
+                    && binding.final_bookmark_hash == final_bookmark_hash
+                    && binding.target_scope_hash == hash_value(staged.get("target")?).ok()?;
+                return exact.then_some(proof);
+            }
             let binding = proof.mln_0143_governed_execution()?;
             if proof.capability_id != "mln-0143-data-invariants"
                 || binding.phase != "post_import"
@@ -13930,7 +14109,7 @@ fn rectify_approved_mln_import(store: &StateStore, plan: &mut PlanV1) -> Result<
         "state":"verified",
         "operation_id":plan.operation_id,
         "provider_complete_evidence_hash":provider_complete_hash,
-        "post_import_operation_id":proof.mln_0143_governed_execution().map(|binding| binding.operation_id.as_str()),
+        "post_import_operation_id":proof.mln_0143_governed_execution().map(|binding| binding.operation_id.as_str()).or_else(|| proof.mln_0142_governed_execution().map(|binding| binding.operation_id.as_str())),
         "post_import_evidence_hash":proof.evidence.content_hash,
         "source_sha256":source_sha256,
         "target":staged.get("target"),
@@ -13958,7 +14137,7 @@ fn rectify_approved_mln_import(store: &StateStore, plan: &mut PlanV1) -> Result<
     envelope.policy_decision = Some(plan.policy.clone());
     envelope.verification.state = VerificationState::Passed;
     envelope.verification.basis = Some(
-        "the exact provider_complete import boundary is joined to one governed post_import invariant proof; this local transition performed no additional provider mutation"
+        "the exact provider_complete import boundary is joined to one governed migration-specific post-import proof; this local transition performed no additional provider mutation"
             .to_owned(),
     );
     Ok(envelope)
@@ -18219,11 +18398,12 @@ mod tests {
         governed_cli_environment_contract, governed_cli_workspace_env, guide_document,
         guide_stage_commands, http_client, is_live_plan_precondition_hash,
         is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
-        list_security_action_state_receipt, mln_0143_parent_manifests,
-        non_readback_verification_basis, operational_proof_coverage, permission_inventory_call,
-        permission_inventory_envelope, persist_prepared_plan, persist_secret_lifecycle,
-        persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
-        preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
+        list_security_action_state_receipt, mln_0142_terminal_import_state,
+        mln_0143_parent_manifests, non_readback_verification_basis, operational_proof_coverage,
+        permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
+        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
+        plan_state_next_step, plan_status_label, preflight_call_input,
+        preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
         read_import_secret, read_r2_log_retrieval_credentials, read_secret_file,
         reconcile_standing_lineage_from_plan, rectify_plan, redact_response_for_capability,
@@ -18361,6 +18541,40 @@ mod tests {
         for forbidden in ["\"sql\"", "\"table\"", "\"document_hash\"", "\"output\""] {
             assert!(!encoded.contains(forbidden), "{forbidden}");
         }
+    }
+
+    #[test]
+    fn mln_0143_admission_requires_0142_verified_and_terminal_not_provider_complete_running() {
+        let capability = CapabilityV1::new(
+            "d1-import-approved-mln-migration",
+            "fixture",
+            "POST",
+            "/accounts/{account_id}/d1/database/{database_id}/import",
+        );
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "ca30e922fda7f5578e49873542e4aaca",
+            "catalog-a",
+            capability,
+            json!({}),
+        )
+        .expect("draft plan");
+        plan.status = PlanStatus::Running;
+        plan.transaction_stage = TransactionStageV1::SecretSinkPersisted;
+        assert!(
+            !mln_0142_terminal_import_state(&plan),
+            "provider_complete Running cannot authorize 0143"
+        );
+        plan.status = PlanStatus::Verified;
+        assert!(
+            !mln_0142_terminal_import_state(&plan),
+            "Verified without terminal journal closure cannot authorize 0143"
+        );
+        plan.transaction_stage = TransactionStageV1::Closed;
+        assert!(
+            mln_0142_terminal_import_state(&plan),
+            "only Verified plus Closed is admissible"
+        );
     }
 
     #[test]

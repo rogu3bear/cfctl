@@ -1367,7 +1367,65 @@ fn validate_operational_proof(
         ));
     }
     validate_sha256_identity("evidence", &proof.evidence.content_hash)?;
+    validate_mln_0142_execution_binding(proof)?;
     validate_mln_0143_execution_binding(proof)?;
+    Ok(())
+}
+
+fn validate_mln_0142_execution_binding(proof: &OperationalProofV1) -> Result<()> {
+    let binding = proof.mln_0142_governed_execution();
+    if proof.capability_id == "mln-0142-post-import-schema" && binding.is_none() {
+        return Err(StorageError::InvalidOperationalProof(
+            "MLN 0142 operational proof requires governed-execution provenance".to_owned(),
+        ));
+    }
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    for (label, value) in [
+        ("binding catalog", binding.catalog_hash.as_str()),
+        ("target scope", binding.target_scope_hash.as_str()),
+        (
+            "import boundary",
+            binding.import_boundary_evidence_hash.as_str(),
+        ),
+        ("import source", binding.import_source_sha256.as_str()),
+        ("import plan", binding.import_plan_hash.as_str()),
+        ("final bookmark", binding.final_bookmark_hash.as_str()),
+        (
+            "trigger definition",
+            binding.trigger_definition_sha256.as_str(),
+        ),
+        ("manifest evidence", binding.manifest_evidence_hash.as_str()),
+        ("request", binding.request_hash.as_str()),
+    ] {
+        validate_sha256_identity(label, value)?;
+    }
+    let credential_generation_id = proof.credential_generation_id.as_deref().ok_or_else(|| {
+        StorageError::InvalidOperationalProof(
+            "MLN 0142 execution binding requires a credential generation".to_owned(),
+        )
+    })?;
+    if binding.schema_version != 1
+        || Uuid::parse_str(&binding.operation_id).is_err()
+        || Uuid::parse_str(&binding.import_operation_id).is_err()
+        || binding.capability_id != proof.capability_id
+        || binding.capability_version != 1
+        || binding.catalog_hash != proof.catalog_hash
+        || binding.manifest_evidence_hash != proof.evidence.content_hash
+        || binding.request_hash != proof.input_hash
+        || binding.credential_generation_id != credential_generation_id
+        || binding.trigger_name != "document_render_jobs_terminal_generation_guard"
+        || binding.trigger_definition_sha256
+            != "sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b"
+        || binding.completion_status != "completed"
+        || binding.completed_at != proof.observed_at
+    {
+        return Err(StorageError::InvalidOperationalProof(
+            "MLN 0142 governed-execution provenance is incomplete or does not match its operational proof"
+                .to_owned(),
+        ));
+    }
     Ok(())
 }
 

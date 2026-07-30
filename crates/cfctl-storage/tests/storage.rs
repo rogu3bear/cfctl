@@ -2,9 +2,10 @@
 
 use cfctl_core::{
     AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1, CapabilityV1,
-    EvidenceClass, Mln0143GovernedExecutionBindingV1, OperationalProofOutcomeV1,
-    OperationalProofScopeV1, OperationalProofV1, PlanStatus, PlanV1, PolicyDisposition,
-    StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, hash_value,
+    EvidenceClass, Mln0142GovernedExecutionBindingV1, Mln0143GovernedExecutionBindingV1,
+    OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, PlanStatus, PlanV1,
+    PolicyDisposition, StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1,
+    hash_value,
 };
 use cfctl_storage::{RuntimePaths, StateStore, StorageError, StoredPlanRecord};
 use chrono::{Duration, Utc};
@@ -473,6 +474,90 @@ fn mln_0143_operational_proof_requires_exact_completed_runtime_binding() {
             ));
         }
     }
+}
+
+#[test]
+fn mln_0142_operational_proof_rejects_synthetic_or_drifted_authority() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let observed_at = Utc::now();
+    let evidence = store
+        .write_evidence(EvidenceClass::LiveRead, &json!({"present":true}))
+        .expect("evidence writes");
+    let valid = Mln0142GovernedExecutionBindingV1 {
+        schema_version: 1,
+        operation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+        capability_id: "mln-0142-post-import-schema".to_owned(),
+        capability_version: 1,
+        catalog_hash: sha256('a'),
+        target_scope_hash: sha256('b'),
+        import_operation_id: "33333333-3333-4333-8333-333333333333".to_owned(),
+        import_boundary_evidence_hash: sha256('c'),
+        import_source_sha256: sha256('d'),
+        import_plan_hash: sha256('e'),
+        final_bookmark_hash: sha256('f'),
+        trigger_name: "document_render_jobs_terminal_generation_guard".to_owned(),
+        trigger_definition_sha256:
+            "sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b".to_owned(),
+        manifest_evidence_hash: evidence.content_hash.clone(),
+        request_hash: sha256('1'),
+        credential_generation_id: GENERATION_A.to_owned(),
+        completion_status: "completed".to_owned(),
+        completed_at: observed_at,
+    };
+    let build = |binding: Mln0142GovernedExecutionBindingV1| {
+        let mut proof = OperationalProofV1::new(
+            observed_at,
+            "mln-0142-post-import-schema",
+            &sha256('a'),
+            &sha256('1'),
+            OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+            OperationalProofOutcomeV1::Succeeded,
+            evidence.clone(),
+        );
+        proof
+            .bind_mln_0142_governed_execution(binding)
+            .map(|()| proof)
+    };
+    store
+        .record_operational_proof(&build(valid.clone()).expect("valid binding"))
+        .expect("valid proof indexes");
+    for mutate in [
+        |binding: &mut Mln0142GovernedExecutionBindingV1| {
+            binding.import_source_sha256 = "not-a-hash".to_owned();
+        },
+        |binding: &mut Mln0142GovernedExecutionBindingV1| {
+            binding.import_plan_hash = "not-a-hash".to_owned();
+        },
+        |binding: &mut Mln0142GovernedExecutionBindingV1| {
+            binding.target_scope_hash = "not-a-hash".to_owned();
+        },
+        |binding: &mut Mln0142GovernedExecutionBindingV1| {
+            binding.trigger_definition_sha256 = sha256('9');
+        },
+    ] {
+        let mut binding = valid.clone();
+        mutate(&mut binding);
+        if let Ok(proof) = build(binding) {
+            assert!(matches!(
+                store.record_operational_proof(&proof),
+                Err(StorageError::InvalidOperationalProof(_))
+            ));
+        }
+    }
+    let synthetic = OperationalProofV1::new(
+        observed_at,
+        "mln-0142-post-import-schema",
+        &sha256('a'),
+        &sha256('1'),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+    assert!(matches!(
+        store.record_operational_proof(&synthetic),
+        Err(StorageError::InvalidOperationalProof(_))
+    ));
 }
 
 #[test]

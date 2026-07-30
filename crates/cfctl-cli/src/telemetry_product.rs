@@ -10,10 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use cfctl_catalog::CatalogSnapshot;
 use cfctl_cloudflare::CallInput;
 use cfctl_core::{
-    AdapterStatus, CapabilityV1, EvidenceClass, Mln0143GovernedExecutionBindingV1,
-    OperationalProofFreshnessV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
-    OperationalProofV1, PlanStatus, PlanV1, ResultEnvelopeV2, TransactionStageV1,
-    VerificationState, hash_value,
+    AdapterStatus, CapabilityV1, EvidenceClass, Mln0142GovernedExecutionBindingV1,
+    Mln0143GovernedExecutionBindingV1, OperationalProofFreshnessV1, OperationalProofOutcomeV1,
+    OperationalProofScopeV1, OperationalProofV1, PlanStatus, PlanV1, ResultEnvelopeV2,
+    TransactionStageV1, VerificationState, hash_value,
 };
 use cfctl_storage::{OperationalProofPageV1, StateStore};
 use chrono::{DateTime, Utc};
@@ -269,7 +269,7 @@ pub(crate) fn record_operational_proof(
             target_scope_hash,
             phase: phase.to_owned(),
             manifest_evidence_hash: proof.evidence.content_hash.clone(),
-            request_hash: input_hash,
+            request_hash: input_hash.clone(),
             profile_identity_hash: hash_value(&json!({
                 "profile_id": profile_id,
                 "credential_generation_id": credential_generation_id,
@@ -290,6 +290,71 @@ pub(crate) fn record_operational_proof(
                         .and_then(|lineage| hash_value(lineage).map_err(CliError::from))
                 })
                 .transpose()?,
+        })?;
+    }
+    if let Some(contract) = capability.mln_0142_post_import_schema.as_ref() {
+        let body = input
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or_else(|| CliError::Input("MLN 0142 proof body is missing".to_owned()))?;
+        let field = |name: &str| {
+            body.get(name)
+                .and_then(Value::as_str)
+                .ok_or_else(|| CliError::Input(format!("MLN 0142 proof requires `{name}`")))
+        };
+        let present = envelope
+            .result
+            .pointer("/result/0/results/0/present")
+            .is_some_and(|value| value == &Value::Bool(true) || value.as_u64() == Some(1));
+        let receipt = envelope
+            .result
+            .pointer("/result_info/query/mln_0142")
+            .ok_or_else(|| CliError::Input("MLN 0142 runtime receipt is missing".to_owned()))?;
+        if !envelope.ok
+            || !present
+            || receipt.get("import_operation_id").and_then(Value::as_str)
+                != Some(field("import_operation_id")?)
+            || receipt
+                .get("import_boundary_evidence_hash")
+                .and_then(Value::as_str)
+                != Some(field("import_boundary_evidence_hash")?)
+            || receipt.get("trigger_name").and_then(Value::as_str)
+                != Some(contract.trigger_name.as_str())
+            || receipt
+                .get("trigger_definition_sha256")
+                .and_then(Value::as_str)
+                != Some(contract.trigger_definition_sha256.as_str())
+        {
+            return Err(CliError::Input(
+                "MLN 0142 runtime result is not the exact completed trigger proof".to_owned(),
+            ));
+        }
+        let credential_generation_id = credential_generation_id.ok_or_else(|| {
+            CliError::Input("MLN 0142 runtime proof requires a credential generation".to_owned())
+        })?;
+        proof.bind_mln_0142_governed_execution(Mln0142GovernedExecutionBindingV1 {
+            schema_version: 1,
+            operation_id: Uuid::new_v4().to_string(),
+            capability_id: capability.id.clone(),
+            capability_version: contract.capability_version,
+            catalog_hash: catalog.schema_hash.clone(),
+            target_scope_hash: hash_value(&json!({
+                "account_id":contract.account_id,
+                "database_id":contract.database_id,
+            }))?,
+            import_operation_id: field("import_operation_id")?.to_owned(),
+            import_boundary_evidence_hash: field("import_boundary_evidence_hash")?.to_owned(),
+            import_source_sha256: field("import_source_sha256")?.to_owned(),
+            import_plan_hash: field("import_plan_hash")?.to_owned(),
+            final_bookmark_hash: field("final_bookmark_hash")?.to_owned(),
+            trigger_name: contract.trigger_name.clone(),
+            trigger_definition_sha256: contract.trigger_definition_sha256.clone(),
+            manifest_evidence_hash: proof.evidence.content_hash.clone(),
+            request_hash: input_hash,
+            credential_generation_id: credential_generation_id.to_owned(),
+            completion_status: "completed".to_owned(),
+            completed_at: envelope.generated_at,
         })?;
     }
     store.record_operational_proof(&proof)?;

@@ -11015,6 +11015,41 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
 }
 
 #[test]
+fn native_control_overlay_adds_exact_mln_0142_terminal_schema_proof() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .get("mln-0142-post-import-schema")
+        .expect("MLN 0142 schema proof");
+    assert_eq!(capability.risk, RiskClass::Read);
+    assert_eq!(capability.effect, EffectClass::ReadOnly);
+    let contract = capability
+        .mln_0142_post_import_schema
+        .as_ref()
+        .expect("typed contract");
+    assert_eq!(
+        contract.migration_sha256,
+        "sha256:07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0"
+    );
+    assert_eq!(
+        contract.trigger_definition_sha256,
+        "sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b"
+    );
+    assert_eq!(contract.trigger_definition.len(), 437);
+    let encoded = serde_json::to_string(capability.request_schema.as_ref().expect("closed schema"))
+        .expect("schema JSON");
+    assert!(!encoded.contains("\"sql\""));
+    assert!(!encoded.contains("prior_0142"));
+}
+
+#[test]
 fn native_control_overlay_adds_exact_bookmark_restore_as_approval_required_recovery() {
     let mut snapshot = CatalogSnapshot {
         schema_version: 1,

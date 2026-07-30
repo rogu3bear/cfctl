@@ -931,6 +931,18 @@ pub struct D1SchemaIntrospectionContractV1 {
     pub max_timeout_seconds: u64,
 }
 
+/// Exact post-import schema authority for `MLNavigator` migration 0142.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mln0142PostImportSchemaContractV1 {
+    pub account_id: String,
+    pub database_id: String,
+    pub migration_sha256: String,
+    pub trigger_name: String,
+    pub trigger_definition: String,
+    pub trigger_definition_sha256: String,
+    pub capability_version: u8,
+}
+
 /// A closed, product-specific D1 read that proves the data and schema
 /// invariants surrounding `MLNavigator` migration 0143. The executor owns all
 /// SQL and replaces volatile row material with a digest-only manifest.
@@ -1621,6 +1633,8 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_schema_introspection: Option<D1SchemaIntrospectionContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mln_0142_post_import_schema: Option<Mln0142PostImportSchemaContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mln_0143_data_invariants: Option<Mln0143DataInvariantsContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_full_export: Option<D1FullExportContractV1>,
@@ -1730,6 +1744,7 @@ impl CapabilityV1 {
             response_contract: None,
             analytics_query: None,
             d1_schema_introspection: None,
+            mln_0142_post_import_schema: None,
             mln_0143_data_invariants: None,
             d1_full_export: None,
             d1_restore_exact_bookmark: None,
@@ -5962,6 +5977,30 @@ pub struct OperationalProofV1 {
     pub evidence: EvidenceV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mln_0143_execution: Option<Mln0143GovernedExecutionBindingV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mln_0142_execution: Option<Mln0142GovernedExecutionBindingV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mln0142GovernedExecutionBindingV1 {
+    pub schema_version: u8,
+    pub operation_id: String,
+    pub capability_id: String,
+    pub capability_version: u8,
+    pub catalog_hash: String,
+    pub target_scope_hash: String,
+    pub import_operation_id: String,
+    pub import_boundary_evidence_hash: String,
+    pub import_source_sha256: String,
+    pub import_plan_hash: String,
+    pub final_bookmark_hash: String,
+    pub trigger_name: String,
+    pub trigger_definition_sha256: String,
+    pub manifest_evidence_hash: String,
+    pub request_hash: String,
+    pub credential_generation_id: String,
+    pub completion_status: String,
+    pub completed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6008,6 +6047,7 @@ impl OperationalProofV1 {
             outcome,
             evidence,
             mln_0143_execution: None,
+            mln_0142_execution: None,
         }
     }
 
@@ -6039,6 +6079,35 @@ impl OperationalProofV1 {
     #[must_use]
     pub const fn mln_0143_governed_execution(&self) -> Option<&Mln0143GovernedExecutionBindingV1> {
         self.mln_0143_execution.as_ref()
+    }
+
+    pub fn bind_mln_0142_governed_execution(
+        &mut self,
+        binding: Mln0142GovernedExecutionBindingV1,
+    ) -> Result<()> {
+        if self.mln_0142_execution.is_some()
+            || self.capability_id != "mln-0142-post-import-schema"
+            || self.outcome != OperationalProofOutcomeV1::Succeeded
+            || self.evidence.content_hash != binding.manifest_evidence_hash
+            || self.catalog_hash != binding.catalog_hash
+            || self.input_hash != binding.request_hash
+            || self.credential_generation_id.as_deref()
+                != Some(binding.credential_generation_id.as_str())
+            || binding.schema_version != 1
+            || binding.completion_status != "completed"
+        {
+            return Err(CoreError::InvalidOperationalProofBinding(
+                "MLN 0142 governed schema binding does not match its completed operational proof"
+                    .to_owned(),
+            ));
+        }
+        self.mln_0142_execution = Some(binding);
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn mln_0142_governed_execution(&self) -> Option<&Mln0142GovernedExecutionBindingV1> {
+        self.mln_0142_execution.as_ref()
     }
 
     #[must_use]

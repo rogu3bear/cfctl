@@ -439,7 +439,7 @@ fn d1_schema_introspection_receipt(capability: &CapabilityV1, input: &CallInput)
     let body = input.body.as_ref()?;
     let assertion = body.get("assertion")?.as_str()?;
     let input_hash = hash_value(body).ok()?;
-    Some(serde_json::json!({
+    let mut receipt = serde_json::json!({
         "capability_id": capability.id,
         "kind": "d1_schema_introspection",
         "assertion": assertion,
@@ -449,7 +449,22 @@ fn d1_schema_introspection_receipt(capability: &CapabilityV1, input: &CallInput)
         "timeout_seconds": contract.max_timeout_seconds,
         "read_only": true,
         "caller_sql": d1_schema_introspection_caller_sql(body),
-    }))
+    });
+    if let Some(contract) = capability.mln_0142_post_import_schema.as_ref() {
+        receipt["mln_0142"] = serde_json::json!({
+            "capability_version":contract.capability_version,
+            "migration_sha256":contract.migration_sha256,
+            "target":{"account_id":contract.account_id,"database_id":contract.database_id},
+            "trigger_name":contract.trigger_name,
+            "trigger_definition_sha256":contract.trigger_definition_sha256,
+            "import_operation_id":body.get("import_operation_id"),
+            "import_boundary_evidence_hash":body.get("import_boundary_evidence_hash"),
+            "import_source_sha256":body.get("import_source_sha256"),
+            "import_plan_hash":body.get("import_plan_hash"),
+            "final_bookmark_hash":body.get("final_bookmark_hash"),
+        });
+    }
+    Some(receipt)
 }
 
 fn d1_schema_introspection_caller_sql(body: &Value) -> bool {
@@ -739,6 +754,10 @@ fn read_runtime_options(
     Ok((output_format, max_rows, contract.max_bytes, timeout_seconds))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one closed compiler owns every accepted schema assertion and its SQL"
+)]
 fn render_d1_schema_introspection_body(body: &Value) -> Result<Value> {
     let body = body.as_object().ok_or_else(|| {
         CloudflareError::InvalidAnalyticsQuery(
@@ -758,6 +777,15 @@ fn render_d1_schema_introspection_body(body: &Value) -> Result<Value> {
         "trigger_exists" => &["assertion", "trigger"],
         "schema_contains" => &["assertion", "object_type", "name", "fragment"],
         "foreign_key_check_empty" => &["assertion"],
+        "mln_0142_trigger_definition" => &[
+            "assertion",
+            "import_operation_id",
+            "import_boundary_evidence_hash",
+            "import_source_sha256",
+            "import_plan_hash",
+            "final_bookmark_hash",
+            "trigger_definition_sha256",
+        ],
         _ => {
             return Err(CloudflareError::InvalidAnalyticsQuery(format!(
                 "unsupported D1 schema assertion `{assertion}`"
@@ -829,6 +857,27 @@ fn render_d1_schema_introspection_body(body: &Value) -> Result<Value> {
             "SELECT NOT EXISTS(SELECT 1 FROM pragma_foreign_key_check LIMIT 1) AS present",
             Vec::new(),
         ),
+        "mln_0142_trigger_definition" => (
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = 'document_render_jobs_terminal_generation_guard' AND sql = ?1) AS present",
+            vec![Value::String(
+                r"CREATE TRIGGER document_render_jobs_terminal_generation_guard
+BEFORE UPDATE OF state ON document_render_jobs
+FOR EACH ROW
+WHEN NEW.state IN ('ready', 'failed')
+ AND (
+   OLD.state <> 'rendering'
+   OR OLD.attempts < 1
+   OR OLD.claimed_by IS NULL
+   OR trim(OLD.claimed_by) = ''
+   OR NEW.attempts <> OLD.attempts
+   OR NEW.claimed_by IS NOT OLD.claimed_by
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'document_render_terminal_generation_stale');
+END"
+                .to_owned(),
+            )],
+        ),
         _ => unreachable!("assertion variants were closed above"),
     };
     Ok(serde_json::json!({"sql":sql,"params":params}))
@@ -847,6 +896,29 @@ fn d1_schema_introspection_request_schema() -> Value {
             {"type":"object","additionalProperties":false,"required":["assertion","object_type","name","fragment"],"properties":{"assertion":{"type":"string","enum":["schema_contains"]},"object_type":{"type":"string","enum":["table","index","trigger"]},"name":name,"fragment":{"type":"string","minLength":1,"maxLength":512}}},
             {"type":"object","additionalProperties":false,"required":["assertion"],"properties":{"assertion":{"type":"string","enum":["foreign_key_check_empty"]}}}
         ]
+    })
+}
+
+fn mln_0142_post_import_schema_request_schema() -> Value {
+    let hash = serde_json::json!({"type":"string","pattern":"^sha256:[0-9a-f]{64}$"});
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "x-cfctl-body-required":true,
+        "required":[
+            "assertion","import_operation_id","import_boundary_evidence_hash",
+            "import_source_sha256","import_plan_hash","final_bookmark_hash",
+            "trigger_definition_sha256"
+        ],
+        "properties":{
+            "assertion":{"type":"string","enum":["mln_0142_trigger_definition"]},
+            "import_operation_id":{"type":"string","format":"uuid"},
+            "import_boundary_evidence_hash":hash,
+            "import_source_sha256":{"type":"string","enum":["sha256:07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0"]},
+            "import_plan_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+            "final_bookmark_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+            "trigger_definition_sha256":{"type":"string","enum":["sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b"]}
+        }
     })
 }
 
@@ -877,6 +949,32 @@ mod d1_schema_introspection_tests {
         assert!(d1_schema_introspection_caller_sql(
             &json!({"assertion":"foreign_key_check_empty","sql":"SELECT 1"})
         ));
+    }
+
+    #[test]
+    fn mln_0142_renderer_owns_the_exact_trigger_definition_and_ignores_no_lineage_field() {
+        let body = serde_json::json!({
+            "assertion":"mln_0142_trigger_definition",
+            "import_operation_id":"11111111-1111-4111-8111-111111111111",
+            "import_boundary_evidence_hash":format!("sha256:{}", "a".repeat(64)),
+            "import_source_sha256":format!("sha256:{}", "b".repeat(64)),
+            "import_plan_hash":format!("sha256:{}", "c".repeat(64)),
+            "final_bookmark_hash":format!("sha256:{}", "d".repeat(64)),
+            "trigger_definition_sha256":format!("sha256:{}", "e".repeat(64)),
+        });
+        let rendered = render_d1_schema_introspection_body(&body).unwrap_or_default();
+        assert_eq!(
+            rendered["sql"],
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = 'document_render_jobs_terminal_generation_guard' AND sql = ?1) AS present"
+        );
+        assert_eq!(rendered["params"].as_array().map(Vec::len), Some(1));
+        assert!(rendered["params"][0].as_str().is_some_and(|definition| {
+            definition.starts_with("CREATE TRIGGER document_render_jobs_terminal_generation_guard")
+        }));
+        let encoded = serde_json::to_string(&rendered).unwrap_or_default();
+        for graftable in ["11111111", &"a".repeat(16), &"c".repeat(16)] {
+            assert!(!encoded.contains(graftable));
+        }
     }
 }
 
@@ -8841,8 +8939,15 @@ fn validate_d1_schema_introspection_contract(
     let Some(contract) = capability.d1_schema_introspection.as_ref() else {
         return Ok(());
     };
-    let identity_supported = capability.id == "d1-schema-introspection"
-        && capability.method == "POST"
+    let expected_schema = if capability.id == "mln-0142-post-import-schema" {
+        mln_0142_post_import_schema_request_schema()
+    } else {
+        d1_schema_introspection_request_schema()
+    };
+    let identity_supported = matches!(
+        capability.id.as_str(),
+        "d1-schema-introspection" | "mln-0142-post-import-schema"
+    ) && capability.method == "POST"
         && capability.path == "/accounts/{account_id}/d1/database/{database_id}/query"
         && capability.product == "D1"
         && capability.account_scope == "account"
@@ -8857,7 +8962,7 @@ fn validate_d1_schema_introspection_contract(
         && capability
             .request_schema
             .as_ref()
-            .is_some_and(|schema| schema == &d1_schema_introspection_request_schema())
+            .is_some_and(|schema| schema == &expected_schema)
         && capability.selectors.len() == 2
         && ["account_id", "database_id"].iter().all(|name| {
             capability.selectors.iter().any(|selector| {
@@ -8870,6 +8975,7 @@ fn validate_d1_schema_introspection_contract(
         && contract.max_rows == 1
         && (1..=64 * 1024).contains(&contract.max_bytes)
         && (1..=10).contains(&contract.max_timeout_seconds)
+        && mln_0142_schema_contract_supported(capability)
         && capability
             .response_contract
             .as_ref()
@@ -8897,6 +9003,38 @@ fn validate_d1_schema_introspection_contract(
         CloudflareError::InvalidAnalyticsQuery("D1 schema assertion body is missing".to_owned())
     })?)?;
     Ok(())
+}
+
+fn mln_0142_schema_contract_supported(capability: &CapabilityV1) -> bool {
+    let Some(contract) = capability.mln_0142_post_import_schema.as_ref() else {
+        return capability.id == "d1-schema-introspection";
+    };
+    contract.account_id == "ca30e922fda7f5578e49873542e4aaca"
+        && contract.database_id == "7c282983-2e48-4ea4-9f0d-09b0d718fe65"
+        && contract.migration_sha256
+            == "sha256:07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0"
+        && contract.trigger_name == "document_render_jobs_terminal_generation_guard"
+        && contract.trigger_definition_sha256
+            == "sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b"
+        && hex::encode(Sha256::digest(contract.trigger_definition.as_bytes()))
+            == contract
+                .trigger_definition_sha256
+                .trim_start_matches("sha256:")
+        && contract.capability_version == 1
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "account_id"
+                && selector.contract.as_ref().is_some_and(|contract| {
+                    contract.schema
+                        == serde_json::json!({"type":"string","enum":["ca30e922fda7f5578e49873542e4aaca"]})
+                })
+        })
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "database_id"
+                && selector.contract.as_ref().is_some_and(|contract| {
+                    contract.schema
+                        == serde_json::json!({"type":"string","enum":["7c282983-2e48-4ea4-9f0d-09b0d718fe65"]})
+                })
+        })
 }
 
 #[expect(
