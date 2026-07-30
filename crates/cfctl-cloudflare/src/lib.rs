@@ -104,6 +104,8 @@ pub enum CloudflareError {
     UnexpectedResponseBody { status: u16, received_bytes: usize },
     #[error("capability `{0}` mutates state and requires a consumable approved plan")]
     ApprovedPlanRequired(String),
+    #[error("D1 import provider reported terminal failure after the mutation boundary")]
+    D1ImportProviderFailure,
     #[error("plan or capability `{capability_id}` is not an exact consumed event batch contract")]
     InvalidEventBatchPlan { capability_id: String },
     #[error("Cloudflare API base URL cannot accept path segments")]
@@ -2629,7 +2631,7 @@ impl Executor {
                 plan.status = PlanStatus::RectificationRequired;
                 return Ok(poll);
             }
-            let poll_outcome = match validate_d1_import_poll_response(&poll, &at_bookmark) {
+            let poll_outcome = match accepted_d1_import_poll_outcome(&poll, &at_bookmark) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     plan.status = PlanStatus::RectificationRequired;
@@ -2654,6 +2656,8 @@ impl Executor {
                             "prerequisites":input.body,
                             "at_bookmark":at_bookmark,
                             "final_bookmark":final_bookmark,
+                            "provider_status":"complete",
+                            "provider_success":true,
                             "state":"provider_complete",
                         }),
                     };
@@ -2663,11 +2667,10 @@ impl Executor {
                     plan.status = PlanStatus::Running;
                     return Ok(completed);
                 }
-                D1ImportPollOutcome::ProviderError => {
-                    plan.status = PlanStatus::RectificationRequired;
-                    return Ok(poll);
-                }
                 D1ImportPollOutcome::InProgress => {}
+                D1ImportPollOutcome::ProviderError => unreachable!(
+                    "accepted_d1_import_poll_outcome converts provider failure to an error"
+                ),
             }
         }
         persist_import_uncertainty(&mut persist, plan, "poll_exhausted")?;
@@ -8773,6 +8776,16 @@ fn validate_d1_import_poll_response<'a>(
     }
 }
 
+fn accepted_d1_import_poll_outcome<'a>(
+    response: &'a CloudflareResponseV1,
+    expected_at_bookmark: &str,
+) -> Result<D1ImportPollOutcome<'a>> {
+    match validate_d1_import_poll_response(response, expected_at_bookmark)? {
+        D1ImportPollOutcome::ProviderError => Err(CloudflareError::D1ImportProviderFailure),
+        outcome => Ok(outcome),
+    }
+}
+
 fn persist_import_response<F>(
     persist: &mut F,
     plan: &PlanV1,
@@ -8823,8 +8836,8 @@ where
 #[cfg(test)]
 mod approved_mln_import_tests {
     use super::{
-        D1ImportPollOutcome, parse_response, validate_d1_import_poll_response,
-        validate_d1_import_upload_url,
+        CloudflareError, D1ImportPollOutcome, accepted_d1_import_poll_outcome, parse_response,
+        validate_d1_import_poll_response, validate_d1_import_upload_url,
     };
     use cfctl_core::D1ApprovedMlnImportContractV1;
     use serde_json::json;
@@ -9022,6 +9035,10 @@ mod approved_mln_import_tests {
         assert!(matches!(
             validate_d1_import_poll_response(&nested_error, "before"),
             Ok(D1ImportPollOutcome::ProviderError)
+        ));
+        assert!(matches!(
+            accepted_d1_import_poll_outcome(&nested_error, "before"),
+            Err(CloudflareError::D1ImportProviderFailure)
         ));
     }
 }

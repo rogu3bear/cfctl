@@ -13105,6 +13105,95 @@ async fn execute_api_plan(
     ))
 }
 
+fn exact_durable_provider_complete_boundary(
+    store: &StateStore,
+    plan: &PlanV1,
+    response: &CloudflareResponseV1,
+) -> Result<(String, Value)> {
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let migration_id = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("import migration identity is missing".to_owned()))?;
+    let completed = response.success
+        && response.result.get("status").and_then(Value::as_str) == Some("complete")
+        && response.result.get("success").and_then(Value::as_bool) == Some(true);
+    let final_bookmark = response
+        .result
+        .pointer("/result/final_bookmark")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    if !completed || final_bookmark.is_none() {
+        return Err(CliError::Input(
+            "approved MLN import lacks terminal provider completion".to_owned(),
+        ));
+    }
+    let target = json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    });
+    let boundaries = store
+        .read_d1_import_checkpoints(&plan.operation_id)?
+        .into_iter()
+        .filter(|(_, checkpoint)| {
+            checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+                && checkpoint.get("operation_id").and_then(Value::as_str)
+                    == Some(plan.operation_id.as_str())
+                && checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && checkpoint.pointer("/receipt/state").and_then(Value::as_str)
+                    == Some("provider_complete")
+                && checkpoint
+                    .pointer("/receipt/provider_status")
+                    .and_then(Value::as_str)
+                    == Some("complete")
+                && checkpoint
+                    .pointer("/receipt/provider_success")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/migration_id")
+                    .and_then(Value::as_str)
+                    == Some(migration_id)
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    .is_some_and(|hash| {
+                        hash_value(&plan.input).is_ok_and(|expected| hash == expected)
+                    })
+                && checkpoint
+                    .pointer("/receipt/final_bookmark")
+                    .and_then(Value::as_str)
+                    == final_bookmark
+        })
+        .collect::<Vec<_>>();
+    if boundaries.len() != 1 {
+        return Err(CliError::Input(
+            "approved MLN import requires exactly one durable matching provider_complete boundary"
+                .to_owned(),
+        ));
+    }
+    let (hash, checkpoint) = &boundaries[0];
+    if store.read_evidence_value(hash)? != *checkpoint {
+        return Err(CliError::Input(
+            "provider_complete evidence does not match its immutable checkpoint".to_owned(),
+        ));
+    }
+    Ok((hash.clone(), checkpoint.clone()))
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "special import execution durably binds checkpoints evidence and pending verification"
@@ -13159,7 +13248,12 @@ async fn execute_approved_mln_import_plan(
     {
         Ok(response) => response,
         Err(error) => {
-            plan.status = PlanStatus::RectificationRequired;
+            if !matches!(
+                plan.status,
+                PlanStatus::RectificationRequired | PlanStatus::Failed
+            ) {
+                plan.status = PlanStatus::RectificationRequired;
+            }
             store.save_plan(plan)?;
             let error = CliError::from(error);
             let mut envelope = process_api_transport_failure(store, plan, &error, secrets);
@@ -13177,7 +13271,12 @@ async fn execute_approved_mln_import_plan(
             ApiBoundaryResponseOutcome::Recovery(envelope) => return Ok(envelope),
         };
     if !response.success {
-        plan.status = PlanStatus::RectificationRequired;
+        if !matches!(
+            plan.status,
+            PlanStatus::RectificationRequired | PlanStatus::Failed
+        ) {
+            plan.status = PlanStatus::RectificationRequired;
+        }
         store.save_plan(plan)?;
         return Ok(post_boundary_failure_envelope(
             plan,
@@ -13190,6 +13289,36 @@ async fn execute_approved_mln_import_plan(
             ),
             true,
             "the import boundary was crossed but provider completion was not proven",
+        ));
+    }
+    if let Err(error) = exact_durable_provider_complete_boundary(store, plan, &response) {
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+        return Ok(post_boundary_failure_envelope(
+            plan,
+            response_value,
+            Some(apply_evidence),
+            lineage_evidence,
+            &error,
+            true,
+            "the import boundary was crossed but exact durable provider completion was not proven",
+        ));
+    }
+    if matches!(
+        plan.status,
+        PlanStatus::RectificationRequired | PlanStatus::Failed
+    ) {
+        store.save_plan(plan)?;
+        return Ok(post_boundary_failure_envelope(
+            plan,
+            response_value,
+            Some(apply_evidence),
+            lineage_evidence,
+            &CliError::Input(
+                "approved MLN import ended in a terminal failure state; do not replay".to_owned(),
+            ),
+            true,
+            "terminal import evidence cannot be overwritten by a pending-proof state",
         ));
     }
     plan.status = PlanStatus::Running;
@@ -19028,9 +19157,10 @@ mod tests {
         blocked_capability_envelope, boundary_response_artifact, build_mint_policy_body,
         call_command, cancel_plan, capability_call_argv, compensation_request,
         credential_generation_for_read, d1_recovery_anchor_matches, delegated_read_envelope,
-        entitlement_probe_selectors, execute_native_workflow, execute_read, find_secret_value,
-        force_ipv4_from, governed_cli_environment_contract, governed_cli_workspace_env,
-        guide_document, guide_stage_commands, http_client, is_live_plan_precondition_hash,
+        entitlement_probe_selectors, exact_durable_provider_complete_boundary,
+        execute_native_workflow, execute_read, find_secret_value, force_ipv4_from,
+        governed_cli_environment_contract, governed_cli_workspace_env, guide_document,
+        guide_stage_commands, http_client, is_live_plan_precondition_hash,
         is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
         list_security_action_state_receipt, mln_0142_terminal_import_state,
         mln_0143_parent_manifests, mln_0143_pre_import_authority_matches,
@@ -20309,6 +20439,193 @@ mod tests {
         store
             .save_plan_v2(&document)
             .expect("persist current PlanV2 fixture");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one matrix proves missing, undurable, exact, duplicate, and mismatched completion"
+    )]
+    fn approved_mln_completion_requires_one_exact_durable_provider_boundary() {
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "test://native".to_owned(),
+            source_hash: "sha256:test".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native overlay");
+        let capability = catalog
+            .capabilities
+            .remove("d1-import-approved-mln-migration")
+            .expect("native import capability");
+        let contract = capability
+            .d1_approved_mln_import
+            .as_ref()
+            .expect("import contract");
+        let build = |root: &std::path::Path| {
+            let store =
+                StateStore::open(RuntimePaths::from_root(root)).expect("runtime state store");
+            let mut plan = PlanV1::draft(
+                "profile-a",
+                &contract.account_id,
+                "catalog-sha",
+                capability.clone(),
+                json!({}),
+            )
+            .expect("import plan");
+            plan.input = serde_json::to_value(CallInput {
+                selectors: json!({
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                }),
+                body: Some(json!({"migration_id":"0143"})),
+                ..CallInput::default()
+            })
+            .expect("input");
+            plan.refresh_hash().expect("refresh import plan");
+            let response = CloudflareResponseV1 {
+                status: 200,
+                success: true,
+                result: json!({
+                    "type":"import",
+                    "status":"complete",
+                    "success":true,
+                    "at_bookmark":"before",
+                    "result":{"final_bookmark":"after"}
+                }),
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            };
+            (store, plan, response)
+        };
+        let checkpoint = |plan: &PlanV1, target: Value| {
+            json!({
+                "schema_version":1,
+                "operation_id":plan.operation_id,
+                "step":"provider_complete",
+                "performed":true,
+                "rectification_required":false,
+                "receipt":{
+                    "migration_id":"0143",
+                    "target":target,
+                    "plan_input_hash":hash_value(&plan.input).expect("input hash"),
+                    "final_bookmark":"after",
+                    "provider_status":"complete",
+                    "provider_success":true,
+                    "state":"provider_complete",
+                }
+            })
+        };
+
+        let missing_root = tempfile::tempdir().expect("missing root");
+        let (missing_store, missing_plan, response) = build(missing_root.path());
+        assert!(
+            exact_durable_provider_complete_boundary(&missing_store, &missing_plan, &response)
+                .is_err()
+        );
+
+        let evidence_failure_root = tempfile::tempdir().expect("evidence failure root");
+        let (evidence_failure_store, evidence_failure_plan, response) =
+            build(evidence_failure_root.path());
+        let evidence_failure = checkpoint(
+            &evidence_failure_plan,
+            json!({
+                "account_id":contract.account_id,
+                "database_id":contract.database_id,
+            }),
+        );
+        evidence_failure_store
+            .record_d1_import_checkpoint(&evidence_failure_plan.operation_id, &evidence_failure)
+            .expect("checkpoint without evidence");
+        assert!(
+            exact_durable_provider_complete_boundary(
+                &evidence_failure_store,
+                &evidence_failure_plan,
+                &response
+            )
+            .is_err(),
+            "a checkpoint whose matching apply evidence did not persist cannot authorize Running"
+        );
+
+        let exact_root = tempfile::tempdir().expect("exact root");
+        let (exact_store, exact_plan, response) = build(exact_root.path());
+        let exact = checkpoint(
+            &exact_plan,
+            json!({
+                "account_id":contract.account_id,
+                "database_id":contract.database_id,
+            }),
+        );
+        let hash = exact_store
+            .record_d1_import_checkpoint(&exact_plan.operation_id, &exact)
+            .expect("checkpoint");
+        assert_eq!(
+            exact_store
+                .write_evidence(EvidenceClass::Apply, &exact)
+                .expect("checkpoint evidence")
+                .content_hash,
+            hash
+        );
+        assert_eq!(
+            exact_durable_provider_complete_boundary(&exact_store, &exact_plan, &response)
+                .expect("exact durable completion")
+                .0,
+            hash
+        );
+        let nested_provider_error = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "type":"import",
+                "status":"error",
+                "success":false,
+                "at_bookmark":"before",
+                "error":"provider rejected import"
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        assert!(
+            exact_durable_provider_complete_boundary(
+                &exact_store,
+                &exact_plan,
+                &nested_provider_error
+            )
+            .is_err(),
+            "outer success cannot lift an exact nested provider error into completion"
+        );
+        exact_store
+            .record_d1_import_checkpoint(&exact_plan.operation_id, &exact)
+            .expect("duplicate checkpoint");
+        assert!(
+            exact_durable_provider_complete_boundary(&exact_store, &exact_plan, &response).is_err()
+        );
+
+        let mismatch_root = tempfile::tempdir().expect("mismatch root");
+        let (mismatch_store, mismatch_plan, response) = build(mismatch_root.path());
+        let mismatch = checkpoint(
+            &mismatch_plan,
+            json!({
+                "account_id":contract.account_id,
+                "database_id":"different-database",
+            }),
+        );
+        mismatch_store
+            .record_d1_import_checkpoint(&mismatch_plan.operation_id, &mismatch)
+            .expect("mismatched checkpoint");
+        mismatch_store
+            .write_evidence(EvidenceClass::Apply, &mismatch)
+            .expect("mismatched evidence");
+        assert!(
+            exact_durable_provider_complete_boundary(&mismatch_store, &mismatch_plan, &response)
+                .is_err()
+        );
     }
 
     fn security_action_create_capability() -> CapabilityV1 {
