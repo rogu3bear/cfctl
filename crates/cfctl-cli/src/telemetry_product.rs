@@ -173,6 +173,10 @@ pub(crate) fn operational_proof_projection_json(page: &OperationalProofPageV1) -
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "proof recording validates and binds one complete governed execution"
+)]
 pub(crate) fn record_operational_proof(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -273,6 +277,19 @@ pub(crate) fn record_operational_proof(
             credential_generation_id: credential_generation_id.to_owned(),
             completion_status: "completed".to_owned(),
             completed_at: envelope.generated_at,
+            cross_operation_lineage_hash: (phase != "pre_import")
+                .then(|| {
+                    manifest
+                        .get("lineage")
+                        .ok_or_else(|| {
+                            CliError::Input(
+                                "MLN post-phase manifest omitted cross-operation lineage"
+                                    .to_owned(),
+                            )
+                        })
+                        .and_then(|lineage| hash_value(lineage).map_err(CliError::from))
+                })
+                .transpose()?,
         })?;
     }
     store.record_operational_proof(&proof)?;

@@ -410,6 +410,12 @@ pub struct CallArgs {
         help = "Stream a bounded analytics, governed log-retrieval, or D1 full-export result to a new mode-0600 file and return its hash receipt"
     )]
     pub out: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "REVIEWED_MIGRATION_SQL",
+        help = "Plan-creation-only source for the closed approved MLNavigator D1 import"
+    )]
+    pub source_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeSet,
     fs::OpenOptions,
-    io,
+    io::{self, Read},
     net::{Ipv4Addr, Ipv6Addr},
     path::{Component, Path, PathBuf},
     time::Duration,
@@ -12,25 +12,26 @@ use std::{
 use cfctl_auth::AuthCredential;
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1,
-    D1FullExportContractV1, D1RestoreExactBookmarkContractV1, D1SchemaIntrospectionContractV1,
-    GraphqlAnalyticsContractV1, Mln0143DataInvariantsContractV1, OutputFormatV1, PaginationModeV1,
-    PlanStatus, PlanV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
-    RiskClass, SelectorContractV1, SelectorV1, TimestampFormatV1, TransactionStageV1, hash_value,
-    request_header_is_reserved,
+    D1ApprovedMlnImportContractV1, D1FullExportContractV1, D1RestoreExactBookmarkContractV1,
+    D1SchemaIntrospectionContractV1, GraphqlAnalyticsContractV1, Mln0143DataInvariantsContractV1,
+    OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1, R2LogRetrievalContractV1,
+    ResponseBodyModeV1, ResponseContractV1, RiskClass, SelectorContractV1, SelectorV1,
+    TimestampFormatV1, TransactionStageV1, hash_value, request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
+use md5::Md5;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
-use url::Url;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+use url::Url;
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const _: () = assert!(libc::O_NOFOLLOW == 0x8000);
@@ -155,6 +156,16 @@ pub struct CallInput {
 pub struct R2LogRetrievalCredentials {
     access_key_id: String,
     secret_access_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct D1ImportCheckpointV1 {
+    pub schema_version: u8,
+    pub operation_id: String,
+    pub step: String,
+    pub performed: bool,
+    pub rectification_required: bool,
+    pub receipt: Value,
 }
 
 impl R2LogRetrievalCredentials {
@@ -587,6 +598,15 @@ fn mln_0143_data_invariants_receipt(capability: &CapabilityV1, input: &CallInput
         "phase":body.get("phase"),
         "pre_import_evidence_hash":body.get("pre_import_evidence_hash"),
         "post_import_evidence_hash":body.get("post_import_evidence_hash"),
+        "import_operation_id":body.get("import_operation_id"),
+        "import_boundary_evidence_hash":body.get("import_boundary_evidence_hash"),
+        "import_source_sha256":body.get("import_source_sha256"),
+        "import_plan_hash":body.get("import_plan_hash"),
+        "restore_operation_id":body.get("restore_operation_id"),
+        "restore_evidence_hash":body.get("restore_evidence_hash"),
+        "restore_previous_bookmark_hash":body.get("restore_previous_bookmark_hash"),
+        "restore_requested_bookmark_hash":body.get("restore_requested_bookmark_hash"),
+        "restore_observed_bookmark_hash":body.get("restore_observed_bookmark_hash"),
         "migration_sha256":contract.migration_sha256,
         "target_scope_hash":hash_value(&serde_json::json!({
             "account_id":contract.account_id,
@@ -885,7 +905,7 @@ mod mln_0143_invariant_tests {
             post_table_definition_hash:
                 "sha256:2fbdacd011abca8024507b99d179071b8b920271576e4cb3a2f06c4f3ffd2d7f".to_owned(),
             validator_contract_hash: String::new(),
-            capability_version: 2,
+            capability_version: 3,
             max_evidence_rows: 256,
             probe_rows: 257,
             max_bytes: 1024 * 1024,
@@ -2078,6 +2098,12 @@ impl Executor {
                 .execute_d1_restore_exact_bookmark(plan, input, credential)
                 .await;
         }
+        if plan.capability.d1_approved_mln_import.is_some() {
+            return Err(CloudflareError::InvalidRequestBody(
+                "approved MLN import requires the durable checkpoint executor; generic mutation execution is blocked"
+                    .to_owned(),
+            ));
+        }
         let mut request = self.builder.build_unchecked(&plan.capability, input)?;
         request.headers.insert(
             HeaderName::from_static("idempotency-key"),
@@ -2217,6 +2243,325 @@ impl Executor {
         });
         plan.status = PlanStatus::Running;
         Ok(response)
+    }
+
+    /// Executes the closed D1 import protocol. The caller must durably persist
+    /// every emitted checkpoint before this method advances to the next
+    /// request. A checkpoint failure or uncertain provider send stops the
+    /// state machine; no init, upload, or ingest request is replayed.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the import protocol is one linear durable checkpoint state machine"
+    )]
+    pub async fn execute_d1_approved_mln_import<F>(
+        &self,
+        plan: &mut PlanV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+        stage_path: &Path,
+        mut persist: F,
+    ) -> Result<CloudflareResponseV1>
+    where
+        F: FnMut(&D1ImportCheckpointV1) -> std::result::Result<(), String>,
+    {
+        let contract = plan
+            .capability
+            .d1_approved_mln_import
+            .as_ref()
+            .ok_or_else(|| {
+                CloudflareError::InvalidRequestBody(
+                    "approved MLN import contract is missing".to_owned(),
+                )
+            })?;
+        validate_d1_approved_mln_import_contract(&plan.capability, input)?;
+        let migration_id = input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("migration_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| CloudflareError::MissingRequestBody(plan.capability.id.clone()))?;
+        let migration = contract
+            .migrations
+            .iter()
+            .find(|migration| migration.migration_id == migration_id)
+            .ok_or_else(|| {
+                CloudflareError::InvalidRequestBody(
+                    "migration is absent from the approved catalogue".to_owned(),
+                )
+            })?;
+        if stage_path.file_name().and_then(|name| name.to_str())
+            != Some(migration.basename.as_str())
+        {
+            return Err(CloudflareError::InvalidRequestBody(
+                "managed stage basename drifted from the plan".to_owned(),
+            ));
+        }
+        let mut stage_options = OpenOptions::new();
+        stage_options.read(true);
+        #[cfg(unix)]
+        stage_options.custom_flags(libc::O_NOFOLLOW);
+        let mut stage_file =
+            stage_options
+                .open(stage_path)
+                .map_err(|source| CloudflareError::OutputFile {
+                    path: stage_path.display().to_string(),
+                    source,
+                })?;
+        let stage_metadata =
+            stage_file
+                .metadata()
+                .map_err(|source| CloudflareError::OutputFile {
+                    path: stage_path.display().to_string(),
+                    source,
+                })?;
+        if !stage_metadata.is_file() || stage_metadata.len() != migration.bytes {
+            return Err(CloudflareError::InvalidRequestBody(
+                "managed stage is no longer the approved regular file".to_owned(),
+            ));
+        }
+        let capacity = usize::try_from(migration.bytes).map_err(|_| {
+            CloudflareError::InvalidRequestBody(
+                "approved migration size exceeds this host".to_owned(),
+            )
+        })?;
+        let mut staged = Vec::with_capacity(capacity);
+        stage_file
+            .read_to_end(&mut staged)
+            .map_err(|source| CloudflareError::OutputFile {
+                path: stage_path.display().to_string(),
+                source,
+            })?;
+        let staged_sha = hex::encode(Sha256::digest(&staged));
+        let staged_md5 = hex::encode(Md5::digest(&staged));
+        if staged.len() as u64 != migration.bytes
+            || staged_sha != migration.sha256
+            || staged_md5 != migration.md5
+        {
+            return Err(CloudflareError::InvalidRequestBody(
+                "managed stage bytes drifted after planning".to_owned(),
+            ));
+        }
+        let provider_capability = import_provider_capability(&plan.capability);
+        let send_provider = |body: Value| {
+            let provider_capability = provider_capability.clone();
+            let request_input = CallInput {
+                selectors: input.selectors.clone(),
+                query: serde_json::json!({}),
+                body: Some(body),
+                ..CallInput::default()
+            };
+            async move {
+                let request = self
+                    .builder
+                    .build_unchecked(&provider_capability, &request_input)?;
+                self.clone()
+                    .with_max_retries(0)
+                    .send(&request, credential)
+                    .await
+            }
+        };
+        let init = match send_provider(serde_json::json!({
+            "action":"init",
+            "etag":migration.md5,
+        }))
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                persist_import_uncertainty(&mut persist, plan, "init_send_uncertain")?;
+                plan.status = PlanStatus::RectificationRequired;
+                return Err(error);
+            }
+        };
+        if !init.success {
+            persist_import_response(&mut persist, plan, "init_response", &init, None)?;
+            plan.status = PlanStatus::Failed;
+            return Ok(init);
+        }
+        let upload_url_raw = init.result.get("upload_url").and_then(Value::as_str);
+        let filename_raw = init.result.get("filename").and_then(Value::as_str);
+        persist_import_response(
+            &mut persist,
+            plan,
+            "init_response",
+            &init,
+            Some(serde_json::json!({
+                "filename":filename_raw,
+                "upload_url_sha256":upload_url_raw.map(|value| format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))),
+            })),
+        )?;
+        let Some(upload_url_raw) = upload_url_raw else {
+            plan.status = PlanStatus::RectificationRequired;
+            return Err(CloudflareError::InvalidRequestBody(
+                "D1 import init omitted upload_url; do not replay".to_owned(),
+            ));
+        };
+        let Some(filename) = filename_raw.filter(|value| !value.is_empty() && value.len() <= 512)
+        else {
+            plan.status = PlanStatus::RectificationRequired;
+            return Err(CloudflareError::InvalidRequestBody(
+                "D1 import init omitted filename; do not replay".to_owned(),
+            ));
+        };
+        let upload_url = match validate_d1_import_upload_url(upload_url_raw, contract) {
+            Ok(url) => url,
+            Err(error) => {
+                plan.status = PlanStatus::RectificationRequired;
+                return Err(error);
+            }
+        };
+        let upload = match self
+            .client
+            .put(upload_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(staged)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                persist_import_uncertainty(&mut persist, plan, "upload_send_uncertain")?;
+                plan.status = PlanStatus::RectificationRequired;
+                return Err(CloudflareError::Http(error));
+            }
+        };
+        let upload_status = upload.status().as_u16();
+        let upload_receipt = D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: plan.operation_id.clone(),
+            step: "upload_response".to_owned(),
+            performed: true,
+            rectification_required: !upload.status().is_success(),
+            receipt: serde_json::json!({"http_status":upload_status,"success":upload.status().is_success()}),
+        };
+        persist(&upload_receipt).map_err(CloudflareError::InvalidRequestBody)?;
+        if !upload.status().is_success() {
+            plan.status = PlanStatus::RectificationRequired;
+            return Err(CloudflareError::InvalidRequestBody(format!(
+                "D1 import upload returned HTTP {upload_status}; do not replay"
+            )));
+        }
+        let ingest = match send_provider(serde_json::json!({
+            "action":"ingest",
+            "etag":migration.md5,
+            "filename":filename,
+        }))
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                persist_import_uncertainty(&mut persist, plan, "ingest_send_uncertain")?;
+                plan.status = PlanStatus::RectificationRequired;
+                return Err(error);
+            }
+        };
+        persist_import_response(&mut persist, plan, "ingest_response", &ingest, None)?;
+        if !ingest.success {
+            plan.status = PlanStatus::RectificationRequired;
+            return Ok(ingest);
+        }
+        let Some(at_bookmark) = ingest
+            .result
+            .get("at_bookmark")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            plan.status = PlanStatus::RectificationRequired;
+            return Err(CloudflareError::InvalidRequestBody(
+                "D1 import ingest omitted at_bookmark; do not replay".to_owned(),
+            ));
+        };
+        let at_bookmark = at_bookmark.to_owned();
+        for attempt in 1..=contract.max_poll_attempts {
+            let poll = match send_provider(serde_json::json!({
+                "action":"poll",
+                "current_bookmark":at_bookmark,
+            }))
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    persist_import_uncertainty(
+                        &mut persist,
+                        plan,
+                        &format!("poll_send_uncertain_{attempt}"),
+                    )?;
+                    plan.status = PlanStatus::RectificationRequired;
+                    return Err(error);
+                }
+            };
+            persist_import_response(
+                &mut persist,
+                plan,
+                &format!("poll_response_{attempt}"),
+                &poll,
+                None,
+            )?;
+            if !poll.success {
+                plan.status = PlanStatus::RectificationRequired;
+                return Ok(poll);
+            }
+            match poll
+                .result
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+            {
+                "complete" => {
+                    let Some(final_bookmark) = poll
+                        .result
+                        .get("final_bookmark")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    else {
+                        plan.status = PlanStatus::RectificationRequired;
+                        return Err(CloudflareError::InvalidRequestBody(
+                            "completed D1 import omitted final_bookmark; do not replay".to_owned(),
+                        ));
+                    };
+                    let boundary = D1ImportCheckpointV1 {
+                        schema_version: 1,
+                        operation_id: plan.operation_id.clone(),
+                        step: "provider_complete".to_owned(),
+                        performed: true,
+                        rectification_required: false,
+                        receipt: serde_json::json!({
+                            "migration_id":migration_id,
+                            "source_sha256":format!("sha256:{}",migration.sha256),
+                            "source_md5":migration.md5,
+                            "source_bytes":migration.bytes,
+                            "target":{"account_id":contract.account_id,"database_id":contract.database_id},
+                            "plan_input_hash":hash_value(&plan.input)?,
+                            "prerequisites":input.body,
+                            "at_bookmark":at_bookmark,
+                            "final_bookmark":final_bookmark,
+                            "state":"provider_complete",
+                        }),
+                    };
+                    persist(&boundary).map_err(CloudflareError::InvalidRequestBody)?;
+                    let mut completed = poll;
+                    completed.result["_cfctl"] = boundary.receipt;
+                    plan.status = PlanStatus::Running;
+                    return Ok(completed);
+                }
+                "error" => {
+                    plan.status = PlanStatus::RectificationRequired;
+                    return Ok(poll);
+                }
+                "active" | "pending" => {}
+                _ => {
+                    plan.status = PlanStatus::RectificationRequired;
+                    return Err(CloudflareError::InvalidRequestBody(
+                        "D1 import poll returned unknown status; do not replay".to_owned(),
+                    ));
+                }
+            }
+        }
+        persist_import_uncertainty(&mut persist, plan, "poll_exhausted")?;
+        plan.status = PlanStatus::RectificationRequired;
+        Err(CloudflareError::InvalidRequestBody(
+            "D1 import poll bound exhausted; resume only the existing bookmark poll".to_owned(),
+        ))
     }
 
     /// Runs the operation-specific live readback declared by a plan. Unknown
@@ -5114,6 +5459,15 @@ fn sanitize_mln_0143_data_invariants_response(
         "lineage":{
             "pre_import_evidence_hash":request.query_receipt.as_ref().and_then(|v| v.get("pre_import_evidence_hash")),
             "post_import_evidence_hash":request.query_receipt.as_ref().and_then(|v| v.get("post_import_evidence_hash")),
+            "import_operation_id":request.query_receipt.as_ref().and_then(|v| v.get("import_operation_id")),
+            "import_boundary_evidence_hash":request.query_receipt.as_ref().and_then(|v| v.get("import_boundary_evidence_hash")),
+            "import_source_sha256":request.query_receipt.as_ref().and_then(|v| v.get("import_source_sha256")),
+            "import_plan_hash":request.query_receipt.as_ref().and_then(|v| v.get("import_plan_hash")),
+            "restore_operation_id":request.query_receipt.as_ref().and_then(|v| v.get("restore_operation_id")),
+            "restore_evidence_hash":request.query_receipt.as_ref().and_then(|v| v.get("restore_evidence_hash")),
+            "restore_previous_bookmark_hash":request.query_receipt.as_ref().and_then(|v| v.get("restore_previous_bookmark_hash")),
+            "restore_requested_bookmark_hash":request.query_receipt.as_ref().and_then(|v| v.get("restore_requested_bookmark_hash")),
+            "restore_observed_bookmark_hash":request.query_receipt.as_ref().and_then(|v| v.get("restore_observed_bookmark_hash")),
         },
         "privacy":"raw rows, row fingerprints, MLN identifiers, and document hashes were discarded before evidence persistence",
     });
@@ -7856,6 +8210,7 @@ pub fn validate_request_contract(capability: &CapabilityV1, input: &CallInput) -
     validate_request_body(capability, input.body.as_ref())?;
     validate_d1_full_export_contract(capability, input)?;
     validate_d1_restore_exact_bookmark_contract(capability, input)?;
+    validate_d1_approved_mln_import_contract(capability, input)?;
     validate_d1_schema_introspection_contract(capability, input)?;
     validate_mln_0143_data_invariants_contract(capability, input)?;
     validate_analytics_query_contract(capability, input)?;
@@ -7884,21 +8239,34 @@ fn mln_0143_request_schema() -> Value {
             },
             {
                 "type":"object","additionalProperties":false,
-                "required":["migration_id","phase","pre_import_evidence_hash"],
+                "required":["migration_id","phase","pre_import_evidence_hash","import_operation_id","import_boundary_evidence_hash","import_source_sha256","import_plan_hash"],
                 "properties":{
                     "migration_id":{"type":"string","enum":["0143"]},
                     "phase":{"type":"string","enum":["post_import"]},
-                    "pre_import_evidence_hash":hash
+                    "pre_import_evidence_hash":hash,
+                    "import_operation_id":{"type":"string","minLength":36,"maxLength":80},
+                    "import_boundary_evidence_hash":hash,
+                    "import_source_sha256":hash,
+                    "import_plan_hash":hash
                 }
             },
             {
                 "type":"object","additionalProperties":false,
-                "required":["migration_id","phase","pre_import_evidence_hash","post_import_evidence_hash"],
+                "required":["migration_id","phase","pre_import_evidence_hash","post_import_evidence_hash","import_operation_id","import_boundary_evidence_hash","import_source_sha256","import_plan_hash","restore_operation_id","restore_evidence_hash","restore_previous_bookmark_hash","restore_requested_bookmark_hash","restore_observed_bookmark_hash"],
                 "properties":{
                     "migration_id":{"type":"string","enum":["0143"]},
                     "phase":{"type":"string","enum":["post_restore"]},
                     "pre_import_evidence_hash":hash,
-                    "post_import_evidence_hash":hash
+                    "post_import_evidence_hash":hash,
+                    "import_operation_id":{"type":"string","minLength":36,"maxLength":80},
+                    "import_boundary_evidence_hash":hash,
+                    "import_source_sha256":hash,
+                    "import_plan_hash":hash,
+                    "restore_operation_id":{"type":"string","minLength":36,"maxLength":80},
+                    "restore_evidence_hash":hash,
+                    "restore_previous_bookmark_hash":hash,
+                    "restore_requested_bookmark_hash":hash,
+                    "restore_observed_bookmark_hash":hash
                 }
             }
         ]
@@ -7951,7 +8319,7 @@ fn validate_mln_0143_data_invariants_contract(
         && contract
             .expected_validator_contract_hash()
             .is_ok_and(|hash| hash == contract.validator_contract_hash)
-        && contract.capability_version == 2
+        && contract.capability_version == 3
         && contract.max_evidence_rows == 256
         && contract.probe_rows == 257
         && (1..=1024 * 1024).contains(&contract.max_bytes)
@@ -8026,6 +8394,236 @@ fn validate_d1_restore_exact_bookmark_contract(
         ));
     }
     Ok(())
+}
+
+fn validate_d1_approved_mln_import_contract(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let Some(contract) = capability.d1_approved_mln_import.as_ref() else {
+        return Ok(());
+    };
+    let body = input.body.as_ref().and_then(Value::as_object);
+    let migration_id = body
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str);
+    let required_common = [
+        "migration_id",
+        "pre_snapshot_operation_id",
+        "pre_snapshot_evidence_hash",
+        "pre_export_operation_id",
+        "pre_export_evidence_hash",
+        "pre_bookmark_operation_id",
+        "pre_bookmark_evidence_hash",
+    ];
+    let required_0143 = [
+        "prior_0142_operation_id",
+        "prior_0142_boundary_evidence_hash",
+        "post_0142_anchor_operation_id",
+        "post_0142_anchor_evidence_hash",
+        "pre_import_invariant_operation_id",
+        "pre_import_invariant_evidence_hash",
+    ];
+    let keys = body
+        .map(|body| body.keys().map(String::as_str).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let expected = required_common
+        .into_iter()
+        .chain(
+            (migration_id == Some("0143"))
+                .then_some(required_0143)
+                .into_iter()
+                .flatten(),
+        )
+        .collect::<BTreeSet<_>>();
+    let account = input.selectors.get("account_id").and_then(Value::as_str);
+    let database = input.selectors.get("database_id").and_then(Value::as_str);
+    let supported = capability.id == "d1-import-approved-mln-migration"
+        && capability.method == "POST"
+        && capability.path == contract.import_path
+        && capability.path == "/accounts/{account_id}/d1/database/{database_id}/import"
+        && capability.product == "D1"
+        && capability.account_scope == "account"
+        && capability.adapter_status == AdapterStatus::Native
+        && capability.mutating
+        && capability.risk == RiskClass::Irreversible
+        && capability.effect == cfctl_core::EffectClass::DataWrite
+        && capability.permissions == ["D1 Write"]
+        && account == Some(contract.account_id.as_str())
+        && database == Some(contract.database_id.as_str())
+        && migration_id.is_some_and(|id| matches!(id, "0142" | "0143"))
+        && keys == expected
+        && contract.migrations.len() == 2
+        && contract.migrations[0].migration_id == "0142"
+        && contract.migrations[0].basename == "0142_document_render_claim_generation.sql"
+        && contract.migrations[0].bytes == 1031
+        && contract.migrations[0].sha256
+            == "07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0"
+        && contract.migrations[0].md5 == "5dc9f871404bc6aede1dbf8becf881e5"
+        && contract.migrations[1].migration_id == "0143"
+        && contract.migrations[1].basename == "0143_advisor_final_equity_instrument.sql"
+        && contract.migrations[1].bytes == 9736
+        && contract.migrations[1].sha256
+            == "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
+        && contract.migrations[1].md5 == "bd50b7e05cc13c20f17eb8748472eb4b"
+        && contract.requires_create_new_mode_0600_stage
+        && contract.upload_url_suffix == ".cloudflare.com"
+        && (1..=1024 * 1024).contains(&contract.max_response_bytes)
+        && (1..=120).contains(&contract.max_poll_attempts)
+        && (1..=30).contains(&contract.max_timeout_seconds)
+        && capability.analytics_query.is_none()
+        && capability.d1_schema_introspection.is_none()
+        && capability.mln_0143_data_invariants.is_none()
+        && capability.d1_full_export.is_none()
+        && capability.d1_restore_exact_bookmark.is_none()
+        && capability.r2_log_retrieval.is_none()
+        && input
+            .query
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+    if !supported {
+        return Err(CloudflareError::InvalidRequestBody(
+            "approved MLN import identity, target, closed prerequisites, or bounds drifted"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn import_provider_capability(import: &CapabilityV1) -> CapabilityV1 {
+    let mut provider = CapabilityV1::new(
+        "cfctl-private-d1-import-protocol",
+        "Private D1 import protocol",
+        "POST",
+        &import.path,
+    );
+    "D1".clone_into(&mut provider.product);
+    "account".clone_into(&mut provider.account_scope);
+    provider.permissions = vec!["D1 Write".to_owned()];
+    provider.selectors.clone_from(&import.selectors);
+    provider.request_schema = Some(serde_json::json!({
+        "type":"object","additionalProperties":false,"required":["action"],
+        "properties":{
+            "action":{"type":"string","enum":["init","ingest","poll"]},
+            "etag":{"type":"string","pattern":"^[0-9a-f]{32}$"},
+            "filename":{"type":"string","minLength":1,"maxLength":512},
+            "current_bookmark":{"type":"string","minLength":1,"maxLength":512}
+        }
+    }));
+    provider
+        .response_contract
+        .clone_from(&import.response_contract);
+    provider
+}
+
+fn validate_d1_import_upload_url(
+    raw: &str,
+    contract: &D1ApprovedMlnImportContractV1,
+) -> Result<Url> {
+    let url = Url::parse(raw)?;
+    let host = url.host_str().unwrap_or_default();
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || !(host == "cloudflare.com" || host.ends_with(&contract.upload_url_suffix))
+    {
+        return Err(CloudflareError::InvalidRequestBody(
+            "D1 import upload URL is not a credential-free Cloudflare-owned HTTPS URL".to_owned(),
+        ));
+    }
+    Ok(url)
+}
+
+fn persist_import_response<F>(
+    persist: &mut F,
+    plan: &PlanV1,
+    step: &str,
+    response: &CloudflareResponseV1,
+    replacement_result: Option<Value>,
+) -> Result<()>
+where
+    F: FnMut(&D1ImportCheckpointV1) -> std::result::Result<(), String>,
+{
+    persist(&D1ImportCheckpointV1 {
+        schema_version: 1,
+        operation_id: plan.operation_id.clone(),
+        step: step.to_owned(),
+        performed: true,
+        rectification_required: !response.success,
+        receipt: serde_json::json!({
+            "http_status":response.status,
+            "success":response.success,
+            "result":replacement_result.unwrap_or_else(|| response.result.clone()),
+            "errors":response.errors,
+            "etag":response.etag,
+            "cf_ray":response.cf_ray,
+        }),
+    })
+    .map_err(CloudflareError::InvalidRequestBody)
+}
+
+fn persist_import_uncertainty<F>(persist: &mut F, plan: &PlanV1, step: &str) -> Result<()>
+where
+    F: FnMut(&D1ImportCheckpointV1) -> std::result::Result<(), String>,
+{
+    persist(&D1ImportCheckpointV1 {
+        schema_version: 1,
+        operation_id: plan.operation_id.clone(),
+        step: step.to_owned(),
+        performed: true,
+        rectification_required: true,
+        receipt: serde_json::json!({
+            "outcome":"unknown",
+            "receipt_available":false,
+            "no_replay":true,
+        }),
+    })
+    .map_err(CloudflareError::InvalidRequestBody)
+}
+
+#[cfg(test)]
+mod approved_mln_import_tests {
+    use super::validate_d1_import_upload_url;
+    use cfctl_core::D1ApprovedMlnImportContractV1;
+
+    fn contract() -> D1ApprovedMlnImportContractV1 {
+        D1ApprovedMlnImportContractV1 {
+            account_id: "ca30e922fda7f5578e49873542e4aaca".to_owned(),
+            database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
+            import_path: "/accounts/{account_id}/d1/database/{database_id}/import".to_owned(),
+            migrations: Vec::new(),
+            max_response_bytes: 1_048_576,
+            max_poll_attempts: 120,
+            max_timeout_seconds: 300,
+            upload_url_suffix: ".cloudflare.com".to_owned(),
+            requires_create_new_mode_0600_stage: true,
+        }
+    }
+
+    #[test]
+    fn approved_import_upload_url_is_https_cloudflare_owned_and_has_no_userinfo_or_fragment() {
+        let contract = contract();
+        assert!(
+            validate_d1_import_upload_url(
+                "https://upload.cloudflare.com/import?id=opaque",
+                &contract
+            )
+            .is_ok()
+        );
+        for rejected in [
+            "http://upload.cloudflare.com/import",
+            "https://attacker.example/import",
+            "https://user@upload.cloudflare.com/import",
+            "https://upload.cloudflare.com/import#secret",
+            "https://cloudflare.com.attacker.example/import",
+        ] {
+            assert!(
+                validate_d1_import_upload_url(rejected, &contract).is_err(),
+                "{rejected}"
+            );
+        }
+    }
 }
 
 fn d1_restore_selectors_are_pinned(selectors: &[SelectorV1]) -> bool {

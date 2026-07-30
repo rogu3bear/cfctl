@@ -10890,7 +10890,7 @@ fn native_control_overlay_adds_closed_pinned_mln_0143_invariant_read() {
         .expect("typed invariant contract");
     assert_eq!(contract.max_evidence_rows, 256);
     assert_eq!(contract.probe_rows, 257);
-    assert_eq!(contract.capability_version, 2);
+    assert_eq!(contract.capability_version, 3);
     assert_eq!(
         contract
             .expected_validator_contract_hash()
@@ -10950,6 +10950,68 @@ fn native_control_overlay_adds_governed_full_d1_export_without_sql_or_restore() 
             "The file is a pre-migration snapshot only; applying or restoring it is outside this capability."
         )
     );
+}
+
+#[test]
+fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .get("d1-import-approved-mln-migration")
+        .expect("approved MLN import");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Irreversible);
+    assert_eq!(capability.effect, EffectClass::DataWrite);
+    assert!(capability.mutating);
+    assert_eq!(capability.permissions, ["D1 Write"]);
+    let contract = capability
+        .d1_approved_mln_import
+        .as_ref()
+        .expect("typed import contract");
+    assert_eq!(contract.account_id, "ca30e922fda7f5578e49873542e4aaca");
+    assert_eq!(contract.database_id, "7c282983-2e48-4ea4-9f0d-09b0d718fe65");
+    assert_eq!(contract.migrations.len(), 2);
+    assert_eq!(
+        contract
+            .migrations
+            .iter()
+            .map(|migration| (
+                migration.migration_id.as_str(),
+                migration.bytes,
+                migration.sha256.as_str(),
+                migration.md5.as_str(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "0142",
+                1_031,
+                "07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0",
+                "5dc9f871404bc6aede1dbf8becf881e5",
+            ),
+            (
+                "0143",
+                9_736,
+                "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d",
+                "bd50b7e05cc13c20f17eb8748472eb4b",
+            ),
+        ]
+    );
+    assert!(capability.rollback.supported);
+    assert_eq!(
+        capability.rollback.strategy.as_deref(),
+        Some("no_automatic_rollback_use_separately_approved_bookmark_restore")
+    );
+    let encoded = serde_json::to_string(capability).expect("capability JSON");
+    assert!(!encoded.contains("\"sql\""));
+    assert!(!encoded.contains("\"protocol\""));
 }
 
 #[test]

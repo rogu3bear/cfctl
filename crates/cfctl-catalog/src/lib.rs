@@ -1756,17 +1756,173 @@ pub fn ingest_telemetry_capabilities(snapshot: &mut CatalogSnapshot) -> Result<(
 /// operation. These capabilities compile closed inputs into fixed requests;
 /// they never expose the underlying generic provider operation.
 pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Result<()> {
-    for capability in [
+    for capability in vec![
         mln_0143_data_invariants_capability(),
         d1_schema_introspection_capability(),
         d1_full_export_capability(),
         d1_restore_exact_bookmark_capability(),
-    ] {
+        d1_import_approved_mln_migration_capability(),
+    ]
+    .into_boxed_slice()
+    {
         snapshot
             .capabilities
             .insert(capability.id.clone(), capability);
     }
     snapshot.refresh_hash()
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the two-entry migration catalogue and immutable receipt prerequisites remain visible in one declaration"
+)]
+fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
+    let account_id = "ca30e922fda7f5578e49873542e4aaca";
+    let database_id = "7c282983-2e48-4ea4-9f0d-09b0d718fe65";
+    let hash = serde_json::json!({
+        "type":"string","pattern":"^sha256:[0-9a-f]{64}$","minLength":71,"maxLength":71
+    });
+    let operation = serde_json::json!({
+        "type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f-]{27,72}$","minLength":36,"maxLength":80
+    });
+    let mut capability = CapabilityV1::new(
+        "d1-import-approved-mln-migration",
+        "Import one approved MLNavigator migration",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/import",
+    );
+    capability.description = Some(
+        "Stage and import exactly MLNavigator migration 0142 or 0143. The plan binds reviewed source bytes, snapshot/export/bookmark receipts, and phase authority; provider completion remains unverified until the governed post-import proof is attached."
+            .to_owned(),
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native closed MLNavigator migration import adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![
+        "apply MLN migration 0142".to_owned(),
+        "apply MLN migration 0143".to_owned(),
+    ];
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.mutating = true;
+    capability.risk = RiskClass::Irreversible;
+    capability.effect = cfctl_core::EffectClass::DataWrite;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: Some(0.0),
+        basis: Some("D1 import has no incremental operation charge; ordinary D1 storage and rows-written accounting remains".to_owned()),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![KnowledgeReferenceV1 {
+            title: "D1 pricing".to_owned(),
+            url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        }],
+    };
+    capability.entitlement.available = Some(true);
+    capability.verification.required = true;
+    "mln_import_requires_governed_post_import_proof"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("no_automatic_rollback_use_separately_approved_bookmark_restore".to_owned());
+    capability.rollback.warning = Some(
+        "There is no automatic rollback. Recovery requires a new explicitly approved exact-bookmark restore after quiescence and impact review."
+            .to_owned(),
+    );
+    capability.selectors = [("account_id", account_id), ("database_id", database_id)]
+        .map(|(name, value)| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some(format!("Pinned MLNavigator {name}.")),
+            contract: Some(SelectorContractV1 {
+                schema: serde_json::json!({"type":"string","enum":[value]}),
+                query: None,
+            }),
+        })
+        .to_vec();
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object","additionalProperties":false,"x-cfctl-body-required":true,
+        "required":[
+            "migration_id","pre_snapshot_operation_id","pre_snapshot_evidence_hash",
+            "pre_export_operation_id","pre_export_evidence_hash",
+            "pre_bookmark_operation_id","pre_bookmark_evidence_hash"
+        ],
+        "properties":{
+            "migration_id":{"type":"string","enum":["0142","0143"]},
+            "pre_snapshot_operation_id":operation,
+            "pre_snapshot_evidence_hash":hash,
+            "pre_export_operation_id":operation,
+            "pre_export_evidence_hash":hash,
+            "pre_bookmark_operation_id":operation,
+            "pre_bookmark_evidence_hash":hash,
+            "prior_0142_operation_id":operation,
+            "prior_0142_boundary_evidence_hash":hash,
+            "post_0142_anchor_operation_id":operation,
+            "post_0142_anchor_evidence_hash":hash,
+            "pre_import_invariant_operation_id":operation,
+            "pre_import_invariant_evidence_hash":hash
+        },
+        "allOf":[
+            {"if":{"properties":{"migration_id":{"const":"0142"}}},
+             "then":{"not":{"anyOf":[
+                 {"required":["prior_0142_operation_id"]},{"required":["prior_0142_boundary_evidence_hash"]},
+                 {"required":["post_0142_anchor_operation_id"]},{"required":["post_0142_anchor_evidence_hash"]},
+                 {"required":["pre_import_invariant_operation_id"]},{"required":["pre_import_invariant_evidence_hash"]}
+             ]}}},
+            {"if":{"properties":{"migration_id":{"const":"0143"}}},
+             "then":{"required":[
+                 "prior_0142_operation_id","prior_0142_boundary_evidence_hash",
+                 "post_0142_anchor_operation_id","post_0142_anchor_evidence_hash",
+                 "pre_import_invariant_operation_id","pre_import_invariant_evidence_hash"
+             ]}}
+        ]
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_approved_mln_import = Some(cfctl_core::D1ApprovedMlnImportContractV1 {
+        account_id: account_id.to_owned(),
+        database_id: database_id.to_owned(),
+        import_path: capability.path.clone(),
+        migrations: vec![
+            cfctl_core::D1ApprovedMlnMigrationV1 {
+                migration_id: "0142".to_owned(),
+                basename: "0142_document_render_claim_generation.sql".to_owned(),
+                source_suffix:
+                    "crates/founder/migrations/d1/0142_document_render_claim_generation.sql"
+                        .to_owned(),
+                bytes: 1031,
+                sha256: "07e1c5bd77dd529bfe58f0eee80ad29c40fdd0f3e9c9a37163cfaa0683124af0"
+                    .to_owned(),
+                md5: "5dc9f871404bc6aede1dbf8becf881e5".to_owned(),
+            },
+            cfctl_core::D1ApprovedMlnMigrationV1 {
+                migration_id: "0143".to_owned(),
+                basename: "0143_advisor_final_equity_instrument.sql".to_owned(),
+                source_suffix:
+                    "crates/founder/migrations/d1/0143_advisor_final_equity_instrument.sql"
+                        .to_owned(),
+                bytes: 9736,
+                sha256: "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
+                    .to_owned(),
+                md5: "bd50b7e05cc13c20f17eb8748472eb4b".to_owned(),
+            },
+        ],
+        max_response_bytes: 1024 * 1024,
+        max_poll_attempts: 120,
+        max_timeout_seconds: 30,
+        upload_url_suffix: ".cloudflare.com".to_owned(),
+        requires_create_new_mode_0600_stage: true,
+    });
+    capability
 }
 
 #[expect(
@@ -1851,21 +2007,45 @@ fn mln_0143_data_invariants_capability() -> CapabilityV1 {
             },
             {
                 "type":"object","additionalProperties":false,
-                "required":["migration_id","phase","pre_import_evidence_hash"],
+                "required":[
+                    "migration_id","phase","pre_import_evidence_hash",
+                    "import_operation_id","import_boundary_evidence_hash",
+                    "import_source_sha256","import_plan_hash"
+                ],
                 "properties":{
                     "migration_id":{"type":"string","enum":["0143"]},
                     "phase":{"type":"string","enum":["post_import"]},
-                    "pre_import_evidence_hash":hash
+                    "pre_import_evidence_hash":hash,
+                    "import_operation_id":{"type":"string","minLength":36,"maxLength":80},
+                    "import_boundary_evidence_hash":hash,
+                    "import_source_sha256":hash,
+                    "import_plan_hash":hash
                 }
             },
             {
                 "type":"object","additionalProperties":false,
-                "required":["migration_id","phase","pre_import_evidence_hash","post_import_evidence_hash"],
+                "required":[
+                    "migration_id","phase","pre_import_evidence_hash","post_import_evidence_hash",
+                    "import_operation_id","import_boundary_evidence_hash",
+                    "import_source_sha256","import_plan_hash",
+                    "restore_operation_id","restore_evidence_hash",
+                    "restore_previous_bookmark_hash","restore_requested_bookmark_hash",
+                    "restore_observed_bookmark_hash"
+                ],
                 "properties":{
                     "migration_id":{"type":"string","enum":["0143"]},
                     "phase":{"type":"string","enum":["post_restore"]},
                     "pre_import_evidence_hash":hash,
-                    "post_import_evidence_hash":hash
+                    "post_import_evidence_hash":hash,
+                    "import_operation_id":{"type":"string","minLength":36,"maxLength":80},
+                    "import_boundary_evidence_hash":hash,
+                    "import_source_sha256":hash,
+                    "import_plan_hash":hash,
+                    "restore_operation_id":{"type":"string","minLength":36,"maxLength":80},
+                    "restore_evidence_hash":hash,
+                    "restore_previous_bookmark_hash":hash,
+                    "restore_requested_bookmark_hash":hash,
+                    "restore_observed_bookmark_hash":hash
                 }
             }
         ]
@@ -1875,7 +2055,7 @@ fn mln_0143_data_invariants_capability() -> CapabilityV1 {
         success_media_types: vec!["application/json".to_owned()],
         body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
     });
-    let contract = Mln0143DataInvariantsContractV1 {
+    let mut contract = Mln0143DataInvariantsContractV1 {
         account_id: "ca30e922fda7f5578e49873542e4aaca".to_owned(),
         database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
         migration_sha256: "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
@@ -1891,14 +2071,16 @@ fn mln_0143_data_invariants_capability() -> CapabilityV1 {
             "sha256:8aa5012ace3d946354e0baba7e645646ac97373b42e7c3d61e79b67a5f689fea".to_owned(),
         post_table_definition_hash:
             "sha256:2fbdacd011abca8024507b99d179071b8b920271576e4cb3a2f06c4f3ffd2d7f".to_owned(),
-        validator_contract_hash:
-            "sha256:f064cfc6b9e5177b6b5aa5ee6ac8b306ef321342f0278bf7fe2085e6aa3b29be".to_owned(),
-        capability_version: 2,
+        validator_contract_hash: String::new(),
+        capability_version: 3,
         max_evidence_rows: 256,
         probe_rows: 257,
         max_bytes: 1024 * 1024,
         max_timeout_seconds: 30,
     };
+    contract.validator_contract_hash = contract
+        .expected_validator_contract_hash()
+        .unwrap_or_default();
     capability.mln_0143_data_invariants = Some(contract);
     capability
 }

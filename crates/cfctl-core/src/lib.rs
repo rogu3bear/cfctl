@@ -996,6 +996,17 @@ impl Mln0143DataInvariantsContractV1 {
                 "parent_cardinality":"exactly_one",
                 "boundary":"governed_cfctl_runtime_provenance_not_hostile_filesystem_or_code_tamper_resistance",
             },
+            "cross_operation_lineage":{
+                "pre_import":"independent",
+                "post_import_required":["import_operation_id","import_boundary_evidence_hash","import_source_sha256","import_plan_hash"],
+                "post_restore_required":[
+                    "import_operation_id","import_boundary_evidence_hash","import_source_sha256","import_plan_hash",
+                    "restore_operation_id","restore_evidence_hash","restore_previous_bookmark_hash",
+                    "restore_requested_bookmark_hash","restore_observed_bookmark_hash"
+                ],
+                "cardinality":"exactly_one",
+                "state_order":["provider_complete","post_import_proved","verified"],
+            },
         }))
     }
 }
@@ -1017,6 +1028,32 @@ pub struct D1RestoreExactBookmarkContractV1 {
     pub max_response_bytes: u64,
     pub max_timeout_seconds: u64,
     pub post_retry_count: u64,
+}
+
+/// Closed catalogue for the only D1 imports cfctl may execute. Source bytes
+/// are staged and hash-bound while the plan is created; execution never
+/// accepts SQL, a path, or provider protocol controls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1ApprovedMlnMigrationV1 {
+    pub migration_id: String,
+    pub basename: String,
+    pub source_suffix: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub md5: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1ApprovedMlnImportContractV1 {
+    pub account_id: String,
+    pub database_id: String,
+    pub import_path: String,
+    pub migrations: Vec<D1ApprovedMlnMigrationV1>,
+    pub max_response_bytes: u64,
+    pub max_poll_attempts: u64,
+    pub max_timeout_seconds: u64,
+    pub upload_url_suffix: String,
+    pub requires_create_new_mode_0600_stage: bool,
 }
 
 /// Timestamp wire representation at the pointers declared by a query contract.
@@ -1590,6 +1627,8 @@ pub struct CapabilityV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d1_restore_exact_bookmark: Option<D1RestoreExactBookmarkContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d1_approved_mln_import: Option<D1ApprovedMlnImportContractV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r2_log_retrieval: Option<R2LogRetrievalContractV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphql: Option<GraphqlAnalyticsContractV1>,
@@ -1694,6 +1733,7 @@ impl CapabilityV1 {
             mln_0143_data_invariants: None,
             d1_full_export: None,
             d1_restore_exact_bookmark: None,
+            d1_approved_mln_import: None,
             r2_log_retrieval: None,
             graphql: None,
             workflow: None,
@@ -1871,6 +1911,13 @@ impl CapabilityV1 {
         }
 
         match self.verification.strategy.as_str() {
+            "mln_import_requires_governed_post_import_proof" => {
+                self.id == "d1-import-approved-mln-migration"
+                    && self.method == "POST"
+                    && self.risk == RiskClass::Irreversible
+                    && self.effect == EffectClass::DataWrite
+                    && self.d1_approved_mln_import.is_some()
+            }
             "d1_current_bookmark_equals_restore_result_bookmark" => {
                 self.id == "d1-restore-exact-bookmark"
                     && self.method == "POST"
@@ -2234,11 +2281,10 @@ impl CapabilityV1 {
                 self.same_path_prior_snapshot_rollback_supported()
             }
             Some("new_approved_exact_bookmark_restore_from_previous_bookmark") => {
-                self.id == "d1-restore-exact-bookmark"
-                    && self.method == "POST"
-                    && self.risk == RiskClass::Recovery
-                    && self.effect == EffectClass::DataWrite
-                    && self.d1_restore_exact_bookmark.is_some()
+                exact_bookmark_restore_recovery_contract_supported(self)
+            }
+            Some("no_automatic_rollback_use_separately_approved_bookmark_restore") => {
+                approved_mln_import_recovery_contract_supported(self)
             }
             _ => false,
         }
@@ -2862,6 +2908,22 @@ impl CapabilityV1 {
                     .all(|fields| fields[0] < fields[1])
         })
     }
+}
+
+fn approved_mln_import_recovery_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "d1-import-approved-mln-migration"
+        && capability.method == "POST"
+        && capability.risk == RiskClass::Irreversible
+        && capability.effect == EffectClass::DataWrite
+        && capability.d1_approved_mln_import.is_some()
+}
+
+fn exact_bookmark_restore_recovery_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == "d1-restore-exact-bookmark"
+        && capability.method == "POST"
+        && capability.risk == RiskClass::Recovery
+        && capability.effect == EffectClass::DataWrite
+        && capability.d1_restore_exact_bookmark.is_some()
 }
 
 fn secret_lifecycle_verification_contract_supported(capability: &CapabilityV1) -> bool {
@@ -5919,6 +5981,8 @@ pub struct Mln0143GovernedExecutionBindingV1 {
     pub credential_generation_id: String,
     pub completion_status: String,
     pub completed_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_operation_lineage_hash: Option<String>,
 }
 
 impl OperationalProofV1 {
@@ -5961,6 +6025,7 @@ impl OperationalProofV1 {
                 != Some(binding.credential_generation_id.as_str())
             || binding.schema_version != 1
             || binding.completion_status != "completed"
+            || (binding.phase == "pre_import") != binding.cross_operation_lineage_hash.is_none()
         {
             return Err(CoreError::InvalidOperationalProofBinding(
                 "MLN governed execution binding does not match its completed operational proof"

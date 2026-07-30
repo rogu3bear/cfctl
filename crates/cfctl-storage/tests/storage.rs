@@ -386,7 +386,7 @@ fn mln_0143_operational_proof_requires_exact_completed_runtime_binding() {
         schema_version: 1,
         operation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
         capability_id: "mln-0143-data-invariants".to_owned(),
-        capability_version: 2,
+        capability_version: 3,
         validator_contract_hash: sha256('c'),
         fixed_query_sha256: sha256('d'),
         catalog_hash: sha256('a'),
@@ -402,6 +402,7 @@ fn mln_0143_operational_proof_requires_exact_completed_runtime_binding() {
         credential_generation_id: GENERATION_A.to_owned(),
         completion_status: "completed".to_owned(),
         completed_at: observed_at,
+        cross_operation_lineage_hash: None,
     };
     let build = |binding: Mln0143GovernedExecutionBindingV1| {
         let mut proof = OperationalProofV1::new(
@@ -472,6 +473,65 @@ fn mln_0143_operational_proof_requires_exact_completed_runtime_binding() {
             ));
         }
     }
+}
+
+#[test]
+fn d1_import_checkpoints_are_append_only_hash_bound_and_operation_scoped() {
+    let root = tempfile::tempdir().expect("runtime root");
+    let paths = RuntimePaths::from_root(root.path());
+    let store = StateStore::open(paths.clone()).expect("store");
+    let operation_id = "11111111-1111-4111-8111-111111111111";
+    let first = json!({
+        "schema_version":1,
+        "operation_id":operation_id,
+        "step":"init_response",
+        "performed":true,
+        "rectification_required":false,
+        "receipt":{"upload_url_sha256":format!("sha256:{}", "a".repeat(64))}
+    });
+    let second = json!({
+        "schema_version":1,
+        "operation_id":operation_id,
+        "step":"provider_complete",
+        "performed":true,
+        "rectification_required":false,
+        "receipt":{"state":"provider_complete"}
+    });
+    let first_hash = store
+        .record_d1_import_checkpoint(operation_id, &first)
+        .expect("first checkpoint");
+    let second_hash = store
+        .record_d1_import_checkpoint(operation_id, &second)
+        .expect("second checkpoint");
+    let checkpoints = store
+        .read_d1_import_checkpoints(operation_id)
+        .expect("checkpoint journal");
+    assert_eq!(checkpoints, [(first_hash, first), (second_hash, second)]);
+
+    let checkpoint_path = paths
+        .data_dir
+        .join("d1-import-checkpoints")
+        .join(operation_id)
+        .read_dir()
+        .expect("checkpoint directory")
+        .next()
+        .expect("checkpoint entry")
+        .expect("checkpoint path")
+        .path();
+    std::fs::write(&checkpoint_path, b"{}").expect("tamper checkpoint");
+    assert!(
+        store.read_d1_import_checkpoints(operation_id).is_err(),
+        "tampered checkpoint bytes fail closed"
+    );
+    assert!(
+        store
+            .record_d1_import_checkpoint(
+                operation_id,
+                &json!({"schema_version":1,"operation_id":"22222222-2222-4222-8222-222222222222","step":"poll"})
+            )
+            .is_err(),
+        "a checkpoint cannot be grafted across operations"
+    );
 }
 
 #[test]

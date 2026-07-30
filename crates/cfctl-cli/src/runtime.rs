@@ -7,6 +7,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
+    fs::OpenOptions,
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
@@ -29,8 +30,8 @@ use cfctl_catalog::{
     refresh_dynamic_mutation_contract,
 };
 use cfctl_cloudflare::{
-    CallInput, CloudflareError, CloudflareResponseV1, Executor, OperationVerificationV1,
-    R2LogRetrievalCredentials, validate_request_contract,
+    CallInput, CloudflareError, CloudflareResponseV1, D1ImportCheckpointV1, Executor,
+    OperationVerificationV1, R2LogRetrievalCredentials, validate_request_contract,
 };
 use cfctl_core::{
     AdapterStatus, AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1,
@@ -48,11 +49,16 @@ use cfctl_storage::{RuntimePaths, StateStore, StoredPlanRecord};
 use cfctl_workspace::{RegisteredRoot, WorkspaceGraph};
 use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::{StreamExt, stream};
+use md5::Md5;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::process::Command as ProcessCommand;
 use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub(crate) use crate::telemetry_product::{
     OPERATIONAL_PROOF_PROJECTION_LIMIT, execute_native_workflow, operational_proof_coverage,
@@ -1177,6 +1183,13 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     }
     let is_r2_log_retrieval = capability.r2_log_retrieval.is_some();
     let is_d1_full_export = capability.d1_full_export.is_some();
+    let is_d1_approved_mln_import = capability.d1_approved_mln_import.is_some();
+    if is_d1_approved_mln_import != arguments.source_file.is_some() {
+        return Err(CliError::Input(
+            "the approved MLNavigator D1 import requires exactly one plan-creation-only `--source-file`; no other capability accepts it"
+                .to_owned(),
+        ));
+    }
     if arguments.credential_in.is_some() && !is_r2_log_retrieval {
         return Err(CliError::Input(
             "`--credential-in` is accepted only by the governed R2 log retrieval capability"
@@ -1232,6 +1245,14 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         ));
     }
     let mut prepared = call_input(&capability, &arguments)?;
+    if is_d1_approved_mln_import {
+        validate_approved_mln_import_prerequisites(store, &capability, &prepared.input)?;
+    }
+    let import_stage = arguments
+        .source_file
+        .as_deref()
+        .map(|source| stage_approved_mln_migration(store, &capability, &prepared.input, source))
+        .transpose()?;
     prepare_r2_temporary_credentials_input(&capability, &mut prepared.input)?;
     let security_action = prepare_security_action_input(&capability, &mut prepared.input)?;
     preflight_call_input(&capability, &prepared.input, prepared.secret_body.as_ref())?;
@@ -1293,6 +1314,9 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
             Value::String(value_out.display().to_string()),
         );
     }
+    if let Some(import_stage) = import_stage {
+        adapter_targets.insert("approved_mln_import".to_owned(), import_stage);
+    }
     let result = Box::pin(create_plan(
         store,
         &catalog,
@@ -1309,6 +1333,359 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         secrets.delete(&reference)?;
     }
     result
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "source identity and managed staging are one fail-closed boundary"
+)]
+fn stage_approved_mln_migration(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    source: &Path,
+) -> Result<Value> {
+    let contract = capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    if !source.is_absolute()
+        || source.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(CliError::Input(
+            "approved migration source must be an absolute normalized path".to_owned(),
+        ));
+    }
+    let migration_id = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("approved migration_id is missing".to_owned()))?;
+    let approved = contract
+        .migrations
+        .iter()
+        .find(|migration| migration.migration_id == migration_id)
+        .ok_or_else(|| CliError::Input("migration_id is not in the closed catalogue".to_owned()))?;
+    let suffix = Path::new(&approved.source_suffix);
+    if !source.ends_with(suffix)
+        || source.file_name().and_then(|name| name.to_str()) != Some(approved.basename.as_str())
+    {
+        return Err(CliError::Input(format!(
+            "migration {migration_id} source must end in the reviewed path `{}`",
+            approved.source_suffix
+        )));
+    }
+    let mut cursor = PathBuf::new();
+    for component in source.components() {
+        cursor.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&cursor).map_err(|source| CliError::Io {
+            path: cursor.display().to_string(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(CliError::Input(format!(
+                "approved migration source has symlink component `{}`",
+                cursor.display()
+            )));
+        }
+    }
+    let mut source_options = OpenOptions::new();
+    source_options.read(true);
+    #[cfg(unix)]
+    source_options.custom_flags(libc::O_NOFOLLOW);
+    let mut source_file = source_options
+        .open(source)
+        .map_err(|source_error| CliError::Io {
+            path: source.display().to_string(),
+            source: source_error,
+        })?;
+    let metadata = source_file
+        .metadata()
+        .map_err(|source_error| CliError::Io {
+            path: source.display().to_string(),
+            source: source_error,
+        })?;
+    if !metadata.is_file() || metadata.len() != approved.bytes {
+        return Err(CliError::Input(format!(
+            "migration {migration_id} source is not a regular {}-byte file",
+            approved.bytes
+        )));
+    }
+    let capacity = usize::try_from(approved.bytes)
+        .map_err(|_| CliError::Input("approved migration size exceeds this host".to_owned()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    source_file
+        .read_to_end(&mut bytes)
+        .map_err(|source_error| CliError::Io {
+            path: source.display().to_string(),
+            source: source_error,
+        })?;
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let md5 = hex::encode(Md5::digest(&bytes));
+    if sha256 != approved.sha256 || md5 != approved.md5 || bytes.len() as u64 != approved.bytes {
+        return Err(CliError::Input(format!(
+            "migration {migration_id} source bytes do not match the approved SHA-256/MD5/size catalogue"
+        )));
+    }
+    let stage_dir = store
+        .paths()
+        .data_dir
+        .join("import-stages")
+        .join(Uuid::new_v4().to_string());
+    fs::create_dir_all(&stage_dir).map_err(|source| CliError::Io {
+        path: stage_dir.display().to_string(),
+        source,
+    })?;
+    #[cfg(unix)]
+    fs::set_permissions(&stage_dir, fs::Permissions::from_mode(0o700)).map_err(|source| {
+        CliError::Io {
+            path: stage_dir.display().to_string(),
+            source,
+        }
+    })?;
+    let stage_path = stage_dir.join(&approved.basename);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let mut stage = options.open(&stage_path).map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    stage.write_all(&bytes).map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    stage.sync_all().map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    drop(stage);
+    let mut staged_options = OpenOptions::new();
+    staged_options.read(true);
+    #[cfg(unix)]
+    staged_options.custom_flags(libc::O_NOFOLLOW);
+    let mut staged_file = staged_options
+        .open(&stage_path)
+        .map_err(|source| CliError::Io {
+            path: stage_path.display().to_string(),
+            source,
+        })?;
+    let staged_metadata = staged_file.metadata().map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    if !staged_metadata.is_file() || staged_metadata.len() != approved.bytes {
+        return Err(CliError::Input(
+            "managed import stage is no longer the reviewed regular file".to_owned(),
+        ));
+    }
+    let mut staged = Vec::with_capacity(capacity);
+    staged_file
+        .read_to_end(&mut staged)
+        .map_err(|source| CliError::Io {
+            path: stage_path.display().to_string(),
+            source,
+        })?;
+    let staged_sha256 = hex::encode(Sha256::digest(&staged));
+    let staged_md5 = hex::encode(Md5::digest(&staged));
+    if staged.len() as u64 != approved.bytes
+        || staged_sha256 != approved.sha256
+        || staged_md5 != approved.md5
+    {
+        return Err(CliError::Input(
+            "managed import stage did not reopen with the reviewed identity; preserve it for inspection and do not plan"
+                .to_owned(),
+        ));
+    }
+    Ok(json!({
+        "schema_version":1,
+        "migration_id":migration_id,
+        "catalog_basename":approved.basename,
+        "catalog_source_suffix":approved.source_suffix,
+        "bytes":approved.bytes,
+        "sha256":format!("sha256:{}", approved.sha256),
+        "md5":approved.md5,
+        "stage_path":stage_path,
+        "stage_lifecycle":"preserve_until_verified_or_explicitly_retired",
+        "target":{
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        },
+        "prerequisites":input.body,
+    }))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the closed 0142 then 0143 prerequisite graph is validated as one contract"
+)]
+fn validate_approved_mln_import_prerequisites(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<()> {
+    let contract = capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("approved MLN import body is missing".to_owned()))?;
+    let migration_id = body
+        .get("migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("migration_id is missing".to_owned()))?;
+    let operation_fields = [
+        "pre_snapshot_operation_id",
+        "pre_export_operation_id",
+        "pre_bookmark_operation_id",
+    ];
+    let evidence_fields = [
+        "pre_snapshot_evidence_hash",
+        "pre_export_evidence_hash",
+        "pre_bookmark_evidence_hash",
+    ];
+    let mut operation_ids = BTreeSet::new();
+    for field in operation_fields {
+        let value = body
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| Uuid::parse_str(value).is_ok())
+            .ok_or_else(|| CliError::Input(format!("{field} must be a canonical operation id")))?;
+        if !operation_ids.insert(value) {
+            return Err(CliError::Input(
+                "snapshot, export, and bookmark must be distinct governed operations".to_owned(),
+            ));
+        }
+    }
+    for field in evidence_fields {
+        let hash = body.get(field).and_then(Value::as_str).ok_or_else(|| {
+            CliError::Input(format!("{field} must name immutable local evidence"))
+        })?;
+        store.read_evidence_value(hash).map_err(|error| {
+            CliError::Input(format!(
+                "{field} does not resolve to immutable local evidence: {error}"
+            ))
+        })?;
+    }
+    if migration_id == "0142" {
+        return Ok(());
+    }
+    let prior_operation = body
+        .get("prior_0142_operation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("0143 requires prior_0142_operation_id".to_owned()))?;
+    let prior_hash = body
+        .get("prior_0142_boundary_evidence_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("0143 requires prior_0142_boundary_evidence_hash".to_owned())
+        })?;
+    let prior_plan = store.load_plan(prior_operation)?;
+    let prior_input: CallInput = serde_json::from_value(prior_plan.input.clone())?;
+    let prior_exact = prior_plan.capability.id == capability.id
+        && prior_plan.account_id == contract.account_id
+        && prior_input.selectors == input.selectors
+        && prior_input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("migration_id"))
+            .and_then(Value::as_str)
+            == Some("0142");
+    let checkpoints = store.read_d1_import_checkpoints(prior_operation)?;
+    let matching = checkpoints.iter().filter(|(hash, checkpoint)| {
+        hash == prior_hash
+            && checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+            && checkpoint.pointer("/receipt/state").and_then(Value::as_str)
+                == Some("provider_complete")
+            && checkpoint
+                .pointer("/receipt/target/account_id")
+                .and_then(Value::as_str)
+                == Some(contract.account_id.as_str())
+            && checkpoint
+                .pointer("/receipt/target/database_id")
+                .and_then(Value::as_str)
+                == Some(contract.database_id.as_str())
+    });
+    if !prior_exact || matching.count() != 1 {
+        return Err(CliError::Input(
+            "0143 requires exactly one same-target successful 0142 provider-complete receipt"
+                .to_owned(),
+        ));
+    }
+    for field in [
+        "post_0142_anchor_evidence_hash",
+        "pre_import_invariant_evidence_hash",
+    ] {
+        let hash = body
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::Input(format!("0143 requires {field}")))?;
+        store.read_evidence_value(hash).map_err(|error| {
+            CliError::Input(format!(
+                "{field} does not resolve to immutable evidence: {error}"
+            ))
+        })?;
+    }
+    let invariant_operation = body
+        .get("pre_import_invariant_operation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("0143 requires pre_import_invariant_operation_id".to_owned())
+        })?;
+    let invariant_hash = body
+        .get("pre_import_invariant_evidence_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("0143 requires pre_import_invariant_evidence_hash".to_owned())
+        })?;
+    let exact_invariant_count = store
+        .list_operational_proofs()?
+        .into_iter()
+        .filter(|proof| {
+            proof.capability_id == "mln-0143-data-invariants"
+                && proof.evidence.content_hash == invariant_hash
+                && proof.mln_0143_governed_execution().is_some_and(|binding| {
+                    binding.operation_id == invariant_operation
+                        && binding.phase == "pre_import"
+                        && binding.target_scope_hash
+                            == hash_value(&json!({
+                                "account_id":contract.account_id,
+                                "database_id":contract.database_id,
+                            }))
+                            .unwrap_or_default()
+                })
+        })
+        .count();
+    if exact_invariant_count != 1 {
+        return Err(CliError::Input(
+            "0143 requires exactly one accepted current pre_import governed invariant proof"
+                .to_owned(),
+        ));
+    }
+    let anchor_operation = body
+        .get("post_0142_anchor_operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .ok_or_else(|| {
+            CliError::Input("0143 requires a distinct post-0142 recovery anchor".to_owned())
+        })?;
+    if operation_ids.contains(anchor_operation) || anchor_operation == prior_operation {
+        return Err(CliError::Input(
+            "0143 post-0142 recovery anchor must be distinct from import and pre-0143 operations"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 const SECURITY_IP_RULE_CREATE_ID: &str = "security-response-create-expiring-ip-access-rule";
@@ -3903,7 +4280,7 @@ fn mln_0143_parent_manifests(
     let Some(contract) = capability.mln_0143_data_invariants.as_ref() else {
         return Ok(Vec::new());
     };
-    if contract.capability_version != 2
+    if contract.capability_version != 3
         || !contract
             .expected_validator_contract_hash()
             .is_ok_and(|hash| hash == contract.validator_contract_hash)
@@ -3921,6 +4298,7 @@ fn mln_0143_parent_manifests(
         .get("phase")
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("MLN 0143 invariant phase is missing".to_owned()))?;
+    validate_mln_cross_operation_lineage(store, contract, input, phase)?;
     let required: &[(&str, &str)] = match phase {
         "pre_import" => &[],
         "post_import" => &[("pre_import_evidence_hash", "pre_import")],
@@ -4068,6 +4446,135 @@ fn mln_0143_parent_manifests(
             Ok((evidence_hash.to_owned(), manifest.clone()))
         })
         .collect()
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "cross-operation import and restore joins are one fail-closed lineage gate"
+)]
+fn validate_mln_cross_operation_lineage(
+    store: &StateStore,
+    contract: &cfctl_core::Mln0143DataInvariantsContractV1,
+    input: &CallInput,
+    phase: &str,
+) -> Result<()> {
+    if phase == "pre_import" {
+        return Ok(());
+    }
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("MLN lineage body is missing".to_owned()))?;
+    let field = |name: &str| {
+        body.get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| CliError::Input(format!("MLN lineage requires `{name}`")))
+    };
+    let import_operation_id = field("import_operation_id")?;
+    let boundary_hash = field("import_boundary_evidence_hash")?;
+    let import_source_sha256 = field("import_source_sha256")?;
+    let import_plan_hash = field("import_plan_hash")?;
+    let import_plan = store.load_plan(import_operation_id)?;
+    let import_input: CallInput = serde_json::from_value(import_plan.input.clone())?;
+    let exact_plan = import_plan.capability.id == "d1-import-approved-mln-migration"
+        && import_plan.account_id == contract.account_id
+        && import_plan.content_hash == import_plan_hash
+        && import_input.selectors == input.selectors
+        && import_input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("migration_id"))
+            .and_then(Value::as_str)
+            == Some("0143");
+    let boundary_matches = store
+        .read_d1_import_checkpoints(import_operation_id)?
+        .into_iter()
+        .filter(|(hash, checkpoint)| {
+            hash == boundary_hash
+                && checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+                && checkpoint.pointer("/receipt/state").and_then(Value::as_str)
+                    == Some("provider_complete")
+                && checkpoint
+                    .pointer("/receipt/source_sha256")
+                    .and_then(Value::as_str)
+                    == Some(import_source_sha256)
+                && checkpoint
+                    .pointer("/receipt/target/account_id")
+                    .and_then(Value::as_str)
+                    == Some(contract.account_id.as_str())
+                && checkpoint
+                    .pointer("/receipt/target/database_id")
+                    .and_then(Value::as_str)
+                    == Some(contract.database_id.as_str())
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == hash_value(&import_plan.input).ok().as_deref()
+        })
+        .count();
+    if !exact_plan
+        || import_source_sha256
+            != "sha256:9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
+        || boundary_matches != 1
+    {
+        return Err(CliError::Input(
+            "post-import lineage does not resolve to exactly one same-target approved 0143 provider-complete boundary"
+                .to_owned(),
+        ));
+    }
+    if phase != "post_restore" {
+        return Ok(());
+    }
+    let restore_operation_id = field("restore_operation_id")?;
+    let restore_evidence_hash = field("restore_evidence_hash")?;
+    let restore_plan = store.load_plan(restore_operation_id)?;
+    let restore_input: CallInput = serde_json::from_value(restore_plan.input.clone())?;
+    let restore_evidence = store.read_evidence_value(restore_evidence_hash)?;
+    let receipt = restore_evidence
+        .pointer("/result/_cfctl")
+        .or_else(|| restore_evidence.pointer("/result/result/_cfctl"))
+        .ok_or_else(|| {
+            CliError::Input("restore evidence omitted the exact bookmark receipt".to_owned())
+        })?;
+    let hash_bookmark = |value: Option<&str>| {
+        value
+            .map(|value| hash_value(&Value::String(value.to_owned())))
+            .transpose()
+    };
+    let previous_hash = hash_bookmark(receipt.get("previous_bookmark").and_then(Value::as_str))?
+        .ok_or_else(|| CliError::Input("restore previous bookmark is missing".to_owned()))?;
+    let requested_hash = hash_bookmark(receipt.get("target_bookmark").and_then(Value::as_str))?
+        .ok_or_else(|| CliError::Input("restore requested bookmark is missing".to_owned()))?;
+    let observed_hash = hash_bookmark(receipt.get("returned_bookmark").and_then(Value::as_str))?
+        .ok_or_else(|| CliError::Input("restore observed bookmark is missing".to_owned()))?;
+    let boundary_evidence_matches = restore_plan
+        .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+        .and_then(|artifact| artifact.get("apply_evidence_hash"))
+        .and_then(Value::as_str)
+        == Some(restore_evidence_hash);
+    let exact_restore = restore_plan.capability.id == "d1-restore-exact-bookmark"
+        && restore_plan.status == PlanStatus::Verified
+        && restore_plan.account_id == contract.account_id
+        && restore_input.selectors == input.selectors
+        && restore_input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("source_operation_id"))
+            .and_then(Value::as_str)
+            == Some(import_operation_id)
+        && boundary_evidence_matches
+        && previous_hash == field("restore_previous_bookmark_hash")?
+        && requested_hash == field("restore_requested_bookmark_hash")?
+        && observed_hash == field("restore_observed_bookmark_hash")?;
+    if !exact_restore {
+        return Err(CliError::Input(
+            "post_restore lineage does not resolve to the exact approved verified bookmark restore and import boundary"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_mln_0143_lineage_result(
@@ -11831,6 +12338,17 @@ async fn execute_api_plan(
     secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    if plan.capability.d1_approved_mln_import.is_some() {
+        return execute_approved_mln_import_plan(
+            store,
+            &executor,
+            plan,
+            execution_input,
+            credential,
+            secrets,
+        )
+        .await;
+    }
     let response_result = executor
         .execute_consumed_plan_with_input(plan, catalog_hash, credential, execution_input)
         .await;
@@ -11890,6 +12408,122 @@ async fn execute_api_plan(
         performed,
         finalization_error.as_ref(),
     ))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "special import execution durably binds checkpoints evidence and pending verification"
+)]
+async fn execute_approved_mln_import_plan(
+    store: &StateStore,
+    executor: &Executor,
+    plan: &mut PlanV1,
+    execution_input: &CallInput,
+    credential: &AuthCredential,
+    secrets: &dyn SecretStore,
+) -> Result<ResultEnvelopeV2> {
+    let stage_path = plan
+        .targets
+        .pointer("/adapter/approved_mln_import/stage_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            CliError::Input(
+                "approved MLN import plan omitted its managed stage identity; do not run"
+                    .to_owned(),
+            )
+        })?;
+    let checkpoint_operation_id = plan.operation_id.clone();
+    let response = match executor
+        .execute_d1_approved_mln_import(
+            plan,
+            execution_input,
+            credential,
+            &stage_path,
+            |checkpoint: &D1ImportCheckpointV1| {
+                let value = serde_json::to_value(checkpoint).map_err(|error| error.to_string())?;
+                let checkpoint_hash = store
+                    .record_d1_import_checkpoint(&checkpoint_operation_id, &value)
+                    .map_err(|error| error.to_string())?;
+                if checkpoint.step == "provider_complete" {
+                    let evidence = store
+                        .write_evidence(EvidenceClass::Apply, &value)
+                        .map_err(|error| error.to_string())?;
+                    if evidence.content_hash != checkpoint_hash {
+                        return Err(
+                            "provider_complete checkpoint and apply evidence hashes diverged"
+                                .to_owned(),
+                        );
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            plan.status = PlanStatus::RectificationRequired;
+            store.save_plan(plan)?;
+            let error = CliError::from(error);
+            let mut envelope = process_api_transport_failure(store, plan, &error, secrets);
+            envelope.performed = true;
+            return Ok(envelope);
+        }
+    };
+    let (response_value, apply_evidence, lineage_evidence) =
+        match process_api_boundary_response(store, plan, &response, secrets)? {
+            ApiBoundaryResponseOutcome::Ready {
+                response_value,
+                apply_evidence,
+                lineage_evidence,
+            } => (response_value, apply_evidence, lineage_evidence),
+            ApiBoundaryResponseOutcome::Recovery(envelope) => return Ok(envelope),
+        };
+    if !response.success {
+        plan.status = PlanStatus::RectificationRequired;
+        store.save_plan(plan)?;
+        return Ok(post_boundary_failure_envelope(
+            plan,
+            response_value,
+            Some(apply_evidence),
+            lineage_evidence,
+            &CliError::Input(
+                "Cloudflare did not complete the approved import; preserve all checkpoints and do not replay"
+                    .to_owned(),
+            ),
+            true,
+            "the import boundary was crossed but provider completion was not proven",
+        ));
+    }
+    plan.status = PlanStatus::Running;
+    store.save_plan(plan)?;
+    let mut envelope =
+        ResultEnvelopeV2::success("plans run", response_value).with_evidence(apply_evidence);
+    envelope.ok = false;
+    envelope.performed = true;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.policy_decision = Some(plan.policy.clone());
+    envelope.verification.state = VerificationState::Pending;
+    envelope.verification.basis = Some(
+        "provider_complete is durable; the operation remains unverified until the exact governed post_import MLN invariant proof is attached"
+            .to_owned(),
+    );
+    envelope.error = Some(ErrorV1 {
+        code: "CFCTL_D1_IMPORT_POST_IMPORT_PROOF_REQUIRED".to_owned(),
+        message: "D1 import crossed the provider boundary but is not publication proof".to_owned(),
+        next_step: Some(format!(
+            "Run the exact mln-0143-data-invariants post_import read bound to operation {}, then run `cfctl plans rectify {}`.",
+            plan.operation_id, plan.operation_id
+        )),
+    });
+    if let Some(evidence) = lineage_evidence {
+        envelope.evidence.push(evidence);
+    }
+    Ok(envelope)
 }
 
 enum ApiBoundaryResponseOutcome {
@@ -13101,7 +13735,10 @@ fn bind_required_empty_compensation_body(
 )]
 async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultEnvelopeV2> {
     let _plan_lock = store.lock_plan(&selector.operation_id)?;
-    let plan = load_validated_plan(store, &selector.operation_id)?;
+    let mut plan = load_validated_plan(store, &selector.operation_id)?;
+    if plan.capability.d1_approved_mln_import.is_some() {
+        return rectify_approved_mln_import(store, &mut plan);
+    }
     let lineage_evidence = reconcile_standing_lineage_from_plan(store, &plan)?;
     if let Some(mut request) = compensation_request(&plan)? {
         let catalog = ensure_catalog(store).await?;
@@ -13202,6 +13839,128 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
     if let Some(evidence) = lineage_evidence {
         envelope.evidence.push(evidence);
     }
+    Ok(envelope)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "rectification is one no-replay verified-state transition"
+)]
+fn rectify_approved_mln_import(store: &StateStore, plan: &mut PlanV1) -> Result<ResultEnvelopeV2> {
+    if plan.status != PlanStatus::Running
+        || plan.transaction_stage != TransactionStageV1::SecretSinkPersisted
+    {
+        return Err(CliError::Input(
+            "approved MLN import is not at the durable provider_complete boundary".to_owned(),
+        ));
+    }
+    let staged = plan
+        .targets
+        .pointer("/adapter/approved_mln_import")
+        .cloned()
+        .ok_or_else(|| CliError::Input("import stage binding is missing".to_owned()))?;
+    let source_sha256 = staged
+        .get("sha256")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| CliError::Input("import source SHA-256 is missing".to_owned()))?;
+    let provider_boundaries = store
+        .read_d1_import_checkpoints(&plan.operation_id)?
+        .into_iter()
+        .filter(|(_, checkpoint)| {
+            checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete")
+                && checkpoint.pointer("/receipt/state").and_then(Value::as_str)
+                    == Some("provider_complete")
+        })
+        .collect::<Vec<_>>();
+    if provider_boundaries.len() != 1 {
+        return Err(CliError::Input(
+            "import verification requires exactly one durable provider_complete boundary"
+                .to_owned(),
+        ));
+    }
+    let provider_complete_hash = &provider_boundaries[0].0;
+    let matching = store
+        .list_operational_proofs()?
+        .into_iter()
+        .filter_map(|proof| {
+            let binding = proof.mln_0143_governed_execution()?;
+            if proof.capability_id != "mln-0143-data-invariants"
+                || binding.phase != "post_import"
+                || binding.completion_status != "completed"
+                || binding.cross_operation_lineage_hash.is_none()
+            {
+                return None;
+            }
+            let evidence = store
+                .read_evidence_value(&proof.evidence.content_hash)
+                .ok()?;
+            let manifest = evidence.get("result").unwrap_or(&evidence);
+            let lineage = manifest.get("lineage")?;
+            let exact = lineage.get("import_operation_id").and_then(Value::as_str)
+                == Some(plan.operation_id.as_str())
+                && lineage
+                    .get("import_boundary_evidence_hash")
+                    .and_then(Value::as_str)
+                    == Some(provider_complete_hash.as_str())
+                && lineage.get("import_source_sha256").and_then(Value::as_str)
+                    == Some(source_sha256.as_str())
+                && lineage.get("import_plan_hash").and_then(Value::as_str)
+                    == Some(plan.content_hash.as_str())
+                && binding.cross_operation_lineage_hash.as_deref()
+                    == hash_value(lineage).ok().as_deref();
+            exact.then_some(proof)
+        })
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(CliError::Input(
+            "import verification requires exactly one governed post_import proof bound to this plan, source, target, and provider boundary"
+                .to_owned(),
+        ));
+    }
+    let proof = &matching[0];
+    persist_transaction_stage(
+        store,
+        plan,
+        TransactionStageV1::VerificationAttemptPersisted,
+    )?;
+    plan.status = PlanStatus::Verified;
+    let completion = json!({
+        "schema_version":1,
+        "state":"verified",
+        "operation_id":plan.operation_id,
+        "provider_complete_evidence_hash":provider_complete_hash,
+        "post_import_operation_id":proof.mln_0143_governed_execution().map(|binding| binding.operation_id.as_str()),
+        "post_import_evidence_hash":proof.evidence.content_hash,
+        "source_sha256":source_sha256,
+        "target":staged.get("target"),
+    });
+    let verification_evidence =
+        store.write_evidence(EvidenceClass::PostChangeVerification, &completion)?;
+    persist_transaction_stage_with_artifact(
+        store,
+        plan,
+        TransactionStageV1::VerificationResponsePersisted,
+        json!({
+            "state":"passed",
+            "evidence_hash":verification_evidence.content_hash,
+            "provider_complete_evidence_hash":provider_complete_hash,
+        }),
+    )?;
+    persist_transaction_stage(store, plan, TransactionStageV1::Closed)?;
+    let mut envelope =
+        ResultEnvelopeV2::success("plans rectify", completion).with_evidence(verification_evidence);
+    envelope.performed = false;
+    envelope.operation_id = Some(plan.operation_id.clone());
+    envelope.capability_id = Some(plan.capability.id.clone());
+    envelope.profile_id = Some(plan.profile_id.clone());
+    envelope.account_id = Some(plan.account_id.clone());
+    envelope.policy_decision = Some(plan.policy.clone());
+    envelope.verification.state = VerificationState::Passed;
+    envelope.verification.basis = Some(
+        "the exact provider_complete import boundary is joined to one governed post_import invariant proof; this local transition performed no additional provider mutation"
+            .to_owned(),
+    );
     Ok(envelope)
 }
 
@@ -13504,6 +14263,7 @@ fn permission_inventory_call(arguments: &KeyPermissionArgs) -> CallArgs {
         value_out: None,
         credential_in: None,
         out: None,
+        source_file: None,
     }
 }
 
@@ -17788,8 +18548,19 @@ mod tests {
             })),
             ..CallInput::default()
         };
-        let parents = mln_0143_parent_manifests(&store, &catalog, capability, &input)
-            .expect("valid parent lineage");
+        assert!(
+            mln_0143_parent_manifests(&store, &catalog, capability, &input).is_err(),
+            "post-restore evidence without the exact import and restore operation joins fails closed"
+        );
+        let parents = vec![
+            (pre.content_hash.clone(), base("pre_import")),
+            (post.content_hash.clone(), {
+                let mut manifest = base("post_import");
+                manifest["lineage"]["pre_import_evidence_hash"] =
+                    Value::String(pre.content_hash.clone());
+                manifest
+            }),
+        ];
         validate_mln_0143_lineage_result(&input, &base("post_restore"), &parents)
             .expect("restored result equals pre baseline");
 
@@ -17933,6 +18704,7 @@ mod tests {
             value_out: None,
             credential_in: None,
             out: None,
+            source_file: None,
         };
         let error = Box::pin(call_command(&store, arguments))
             .await
@@ -17960,6 +18732,7 @@ mod tests {
                 value_out: None,
                 credential_in: None,
                 out: Some(root.path().join("snapshot.sql")),
+                source_file: None,
             },
         ))
         .await
@@ -18001,6 +18774,7 @@ mod tests {
                 value_out: None,
                 credential_in: None,
                 out: Some(root.path().join("mutation.out")),
+                source_file: None,
             },
         ))
         .await
@@ -23900,6 +24674,7 @@ mod tests {
                 value_out: None,
                 credential_in: None,
                 out: None,
+                source_file: None,
             },
         ))
         .await

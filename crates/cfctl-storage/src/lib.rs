@@ -265,6 +265,7 @@ impl StateStore {
                 .join("bundles"),
             &paths.data_dir.join("catalog"),
             &paths.data_dir.join("authorities"),
+            &paths.data_dir.join("d1-import-checkpoints"),
         ] {
             create_dir_all(path)?;
         }
@@ -294,6 +295,103 @@ impl StateStore {
             &content_hash,
             &path.display().to_string(),
         ))
+    }
+
+    /// Appends one immutable import-protocol checkpoint. The plan lock held by
+    /// the CLI serializes writers; create-new files and content hashes make a
+    /// crash or replacement visible before a later provider request.
+    pub fn record_d1_import_checkpoint(
+        &self,
+        operation_id: &str,
+        checkpoint: &Value,
+    ) -> Result<String> {
+        validate_plan_id(operation_id)?;
+        if checkpoint.get("operation_id").and_then(Value::as_str) != Some(operation_id)
+            || checkpoint.get("schema_version").and_then(Value::as_u64) != Some(1)
+            || checkpoint
+                .get("step")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return Err(StorageError::UnsafeManagedDocument {
+                path: "d1-import-checkpoint".to_owned(),
+                reason: "checkpoint identity, version, and step must match the locked plan"
+                    .to_owned(),
+            });
+        }
+        let directory = self
+            .paths
+            .data_dir
+            .join("d1-import-checkpoints")
+            .join(operation_id);
+        create_dir_all(&directory)?;
+        let mut sequence = 0_u64;
+        for entry in fs::read_dir(&directory).map_err(|source| io_error(&directory, source))? {
+            let entry = entry.map_err(|source| io_error(&directory, source))?;
+            if entry.path().extension().and_then(std::ffi::OsStr::to_str) == Some("json") {
+                sequence = sequence.saturating_add(1);
+            }
+        }
+        let redacted = redact_json(checkpoint);
+        if redacted != *checkpoint {
+            return Err(StorageError::SensitiveData);
+        }
+        let encoded = serde_json::to_vec_pretty(checkpoint)?;
+        let hash = format!("sha256:{}", hex::encode(Sha256::digest(&encoded)));
+        let path = directory.join(format!("{sequence:04}-{}.json", &hash[7..23]));
+        atomic_create(&path, &encoded)?;
+        Ok(hash)
+    }
+
+    pub fn read_d1_import_checkpoints(&self, operation_id: &str) -> Result<Vec<(String, Value)>> {
+        validate_plan_id(operation_id)?;
+        let directory = self
+            .paths
+            .data_dir
+            .join("d1-import-checkpoints")
+            .join(operation_id);
+        let mut paths = fs::read_dir(&directory)
+            .map_err(|source| io_error(&directory, source))?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .map_err(|source| io_error(&directory, source))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        paths.sort();
+        let mut checkpoints = Vec::new();
+        for path in paths {
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json")
+                || !validate_existing_managed_file(&path)?
+            {
+                return Err(unsafe_managed_document(
+                    &path,
+                    "import checkpoint is not an immutable JSON file",
+                ));
+            }
+            let bytes = fs::read(&path).map_err(|source| io_error(&path, source))?;
+            let hash = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+            let expected_suffix = format!("-{}.json", &hash[7..23]);
+            if !path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.ends_with(&expected_suffix))
+            {
+                return Err(unsafe_managed_document(
+                    &path,
+                    "import checkpoint bytes do not match the immutable filename hash",
+                ));
+            }
+            let value: Value = serde_json::from_slice(&bytes)?;
+            if value.get("operation_id").and_then(Value::as_str) != Some(operation_id) {
+                return Err(unsafe_managed_document(
+                    &path,
+                    "import checkpoint operation identity drifted",
+                ));
+            }
+            checkpoints.push((hash, value));
+        }
+        Ok(checkpoints)
     }
 
     /// Loads one immutable evidence body by its content hash and revalidates
@@ -1307,6 +1405,9 @@ fn validate_mln_0143_execution_binding(proof: &OperationalProofV1) -> Result<()>
     ] {
         validate_sha256_identity(label, value)?;
     }
+    if let Some(lineage_hash) = binding.cross_operation_lineage_hash.as_deref() {
+        validate_sha256_identity("cross-operation lineage", lineage_hash)?;
+    }
     let expected_profile_identity = hash_value(&json!({
         "profile_id": profile_id,
         "credential_generation_id": credential_generation_id,
@@ -1315,7 +1416,7 @@ fn validate_mln_0143_execution_binding(proof: &OperationalProofV1) -> Result<()>
     if binding.schema_version != 1
         || Uuid::parse_str(&binding.operation_id).is_err()
         || binding.capability_id != proof.capability_id
-        || binding.capability_version != 2
+        || binding.capability_version != 3
         || binding.catalog_hash != proof.catalog_hash
         || binding.manifest_evidence_hash != proof.evidence.content_hash
         || binding.request_hash != proof.input_hash
@@ -1327,6 +1428,7 @@ fn validate_mln_0143_execution_binding(proof: &OperationalProofV1) -> Result<()>
         )
         || binding.completion_status != "completed"
         || binding.completed_at != proof.observed_at
+        || (binding.phase == "pre_import") != binding.cross_operation_lineage_hash.is_none()
     {
         return Err(StorageError::InvalidOperationalProof(
             "MLN 0143 governed-execution provenance is incomplete or does not match its operational proof"
