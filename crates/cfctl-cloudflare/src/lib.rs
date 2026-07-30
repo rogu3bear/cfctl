@@ -446,6 +446,61 @@ fn d1_schema_introspection_caller_sql(body: &Value) -> bool {
         .is_some_and(|body| body.contains_key("sql"))
 }
 
+// Reviewed from MLN migrations 0110 and 0143. These are the exact table
+// definitions SQLite records, excluding only comments and formatting.
+const MLN_0143_PRE_TABLE_SQL: &str = r"CREATE TABLE equity_issuance_evidence_links (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    issuance_event_id TEXT NOT NULL REFERENCES equity_issuance_events(id) ON DELETE CASCADE,
+    evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
+        'board_consent',
+        'stock_purchase_agreement',
+        'restricted_stock_purchase_agreement',
+        'safe_agreement',
+        'advisor_agreement',
+        'election_83b',
+        'consideration',
+        'funds_evidence',
+        'signature',
+        'stock_ledger',
+        'document_hash',
+        'other'
+    )),
+    document_id TEXT REFERENCES documents(id) ON DELETE SET NULL,
+    company_event_id TEXT REFERENCES company_events(id) ON DELETE SET NULL,
+    document_hash TEXT,
+    required INTEGER NOT NULL DEFAULT 1 CHECK (required IN (0, 1)),
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)";
+
+const MLN_0143_POST_TABLE_SQL: &str = r"CREATE TABLE equity_issuance_evidence_links (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    issuance_event_id TEXT NOT NULL REFERENCES equity_issuance_events(id) ON DELETE CASCADE,
+    evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
+        'board_consent',
+        'stock_purchase_agreement',
+        'restricted_stock_purchase_agreement',
+        'advisor_equity_instrument',
+        'safe_agreement',
+        'advisor_agreement',
+        'election_83b',
+        'consideration',
+        'funds_evidence',
+        'signature',
+        'stock_ledger',
+        'document_hash',
+        'other'
+    )),
+    document_id TEXT REFERENCES documents(id) ON DELETE SET NULL,
+    company_event_id TEXT REFERENCES company_events(id) ON DELETE SET NULL,
+    document_hash TEXT,
+    required INTEGER NOT NULL DEFAULT 1 CHECK (required IN (0, 1)),
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)";
+
 const MLN_0143_QUERY: &str = r"WITH evidence_projection AS (
  SELECT id,org_id,issuance_event_id,evidence_kind,document_id,company_event_id,document_hash,required,created_by,created_at,
         COUNT(*) OVER() AS projection_total
@@ -799,8 +854,9 @@ mod d1_schema_introspection_tests {
 #[allow(clippy::expect_used)]
 mod mln_0143_invariant_tests {
     use super::{
-        CloudflareResponseV1, Mln0143DataInvariantsContractV1, OutputFormatV1, PreparedRequest,
-        Url, normalized_sql_hash, sanitize_mln_0143_data_invariants_response,
+        CloudflareResponseV1, MLN_0143_POST_TABLE_SQL, MLN_0143_PRE_TABLE_SQL,
+        Mln0143DataInvariantsContractV1, OutputFormatV1, PreparedRequest, Url, normalized_sql_hash,
+        reviewed_table_sql_hash, sanitize_mln_0143_data_invariants_response,
     };
     use reqwest::header::HeaderMap;
     use serde_json::{Value, json};
@@ -860,7 +916,6 @@ mod mln_0143_invariant_tests {
 
     fn pre_response(count: usize) -> CloudflareResponseV1 {
         let rows = (0..count).map(evidence_row).collect::<Vec<_>>();
-        let old_allowlist = "'board_consent','stock_purchase_agreement','restricted_stock_purchase_agreement','safe_agreement','advisor_agreement','election_83b','consideration','funds_evidence','signature','stock_ledger','document_hash','other'";
         CloudflareResponseV1 {
             status: 200,
             success: true,
@@ -873,7 +928,7 @@ mod mln_0143_invariant_tests {
                     "evidence_window_total":count,
                     "evidence_total":count,
                     "evidence_kind_counts":"[{\"evidence_kind\":\"board_consent\",\"count\":1}]",
-                    "table_sql":format!("CREATE TABLE equity_issuance_evidence_links (evidence_kind TEXT CHECK (evidence_kind IN ({old_allowlist})))"),
+                    "table_sql":MLN_0143_PRE_TABLE_SQL,
                     "column_names":"[\"id\",\"org_id\",\"issuance_event_id\",\"evidence_kind\",\"document_id\",\"company_event_id\",\"document_hash\",\"required\",\"created_by\",\"created_at\"]",
                     "old_table_count":0,
                     "event_index_sql":"CREATE INDEX idx_equity_issuance_evidence_event ON equity_issuance_evidence_links(org_id, issuance_event_id, evidence_kind)",
@@ -1072,6 +1127,36 @@ mod mln_0143_invariant_tests {
     }
 
     #[test]
+    fn reviewed_table_hash_rejects_inert_allowlist_text_in_both_phases() {
+        let old_kinds = "'board_consent','stock_purchase_agreement','restricted_stock_purchase_agreement','safe_agreement','advisor_agreement','election_83b','consideration','funds_evidence','signature','stock_ledger','document_hash','other'";
+        let new_kinds = "'board_consent','stock_purchase_agreement','restricted_stock_purchase_agreement','advisor_equity_instrument','safe_agreement','advisor_agreement','election_83b','consideration','funds_evidence','signature','stock_ledger','document_hash','other'";
+        for (reviewed, kinds) in [
+            (MLN_0143_PRE_TABLE_SQL, old_kinds),
+            (MLN_0143_POST_TABLE_SQL, new_kinds),
+        ] {
+            let reviewed_hash = reviewed_table_sql_hash(reviewed).expect("reviewed SQL hash");
+            let escaped_kinds = kinds.replace('\'', "''");
+            for spoof in [
+                format!(
+                    "CREATE TABLE equity_issuance_evidence_links (evidence_kind TEXT /* CHECK (evidence_kind IN ({kinds})) */)"
+                ),
+                format!(
+                    "CREATE TABLE equity_issuance_evidence_links (evidence_kind TEXT -- CHECK (evidence_kind IN ({kinds}))\n)"
+                ),
+                format!(
+                    "CREATE TABLE equity_issuance_evidence_links (evidence_kind TEXT DEFAULT 'CHECK (evidence_kind IN ({escaped_kinds}))')"
+                ),
+            ] {
+                assert_ne!(
+                    reviewed_table_sql_hash(&spoof),
+                    Some(reviewed_hash.clone()),
+                    "inert SQL cannot satisfy the reviewed table definition"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn post_import_requires_the_new_packet_and_all_three_trigger_definitions() {
         let mut request = prepared("post_import");
         let trigger_sql = [
@@ -1088,13 +1173,12 @@ mod mln_0143_invariant_tests {
             .map(|sql| normalized_sql_hash(sql))
             .collect();
         let mut response = pre_response(0);
-        let post_allowlist = "'board_consent','stock_purchase_agreement','restricted_stock_purchase_agreement','advisor_equity_instrument','safe_agreement','advisor_agreement','election_83b','consideration','funds_evidence','signature','stock_ledger','document_hash','other'";
         let row = response.result[0]["results"][0]
             .as_object_mut()
             .expect("result row");
         row.insert(
             "table_sql".to_owned(),
-            Value::String(format!("CREATE TABLE equity_issuance_evidence_links (evidence_kind TEXT CHECK (evidence_kind IN ({post_allowlist})))")),
+            Value::String(MLN_0143_POST_TABLE_SQL.to_owned()),
         );
         row.insert(
             "advisor_packet_rows".to_owned(),
@@ -4555,6 +4639,104 @@ fn normalized_sql_hash(value: &str) -> String {
     )
 }
 
+fn reviewed_table_sql_hash(value: &str) -> Option<String> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Normal,
+        SingleQuote,
+        DoubleQuote,
+        LineComment,
+        BlockComment,
+    }
+
+    let mut state = State::Normal;
+    let mut chars = value.chars().peekable();
+    let mut normalized = String::new();
+    let mut pending_space = false;
+    while let Some(character) = chars.next() {
+        match state {
+            State::Normal => match character {
+                '-' if chars.peek() == Some(&'-') => {
+                    chars.next();
+                    state = State::LineComment;
+                    pending_space = true;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    state = State::BlockComment;
+                    pending_space = true;
+                }
+                '\'' => {
+                    if pending_space && !normalized.is_empty() {
+                        normalized.push(' ');
+                    }
+                    pending_space = false;
+                    normalized.push(character);
+                    state = State::SingleQuote;
+                }
+                '"' => {
+                    if pending_space && !normalized.is_empty() {
+                        normalized.push(' ');
+                    }
+                    pending_space = false;
+                    normalized.push(character);
+                    state = State::DoubleQuote;
+                }
+                character if character.is_whitespace() => pending_space = true,
+                character => {
+                    if pending_space && !normalized.is_empty() {
+                        normalized.push(' ');
+                    }
+                    pending_space = false;
+                    normalized.extend(character.to_lowercase());
+                }
+            },
+            State::SingleQuote => {
+                normalized.push(character);
+                if character == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        if let Some(escaped) = chars.next() {
+                            normalized.push(escaped);
+                        }
+                    } else {
+                        state = State::Normal;
+                    }
+                }
+            }
+            State::DoubleQuote => {
+                normalized.push(character);
+                if character == '"' {
+                    if chars.peek() == Some(&'"') {
+                        if let Some(escaped) = chars.next() {
+                            normalized.push(escaped);
+                        }
+                    } else {
+                        state = State::Normal;
+                    }
+                }
+            }
+            State::LineComment => {
+                if matches!(character, '\n' | '\r') {
+                    state = State::Normal;
+                }
+            }
+            State::BlockComment => {
+                if character == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    state = State::Normal;
+                }
+            }
+        }
+    }
+    if !matches!(state, State::Normal | State::LineComment) {
+        return None;
+    }
+    Some(format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(normalized.as_bytes()))
+    ))
+}
+
 fn invariant_response_error(status: u16) -> CloudflareError {
     CloudflareError::InvalidResponseEnvelope { status }
 }
@@ -4664,36 +4846,14 @@ fn sanitize_mln_0143_data_invariants_response(
     }
     let table_sql = text("table_sql")?;
     let pre = matches!(phase, "pre_import" | "post_restore");
-    let old_kinds = [
-        "board_consent",
-        "stock_purchase_agreement",
-        "restricted_stock_purchase_agreement",
-        "safe_agreement",
-        "advisor_agreement",
-        "election_83b",
-        "consideration",
-        "funds_evidence",
-        "signature",
-        "stock_ledger",
-        "document_hash",
-        "other",
-    ];
-    let mut expected_kinds = old_kinds.to_vec();
-    if !pre {
-        expected_kinds.insert(3, "advisor_equity_instrument");
+    let expected_table_sql = if pre {
+        MLN_0143_PRE_TABLE_SQL
+    } else {
+        MLN_0143_POST_TABLE_SQL
+    };
+    if reviewed_table_sql_hash(table_sql) != reviewed_table_sql_hash(expected_table_sql) {
+        return Err(invariant_response_error(response.status));
     }
-    let table_normalized = table_sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    let allowlist = table_normalized
-        .split("evidence_kind IN (")
-        .nth(1)
-        .and_then(|tail| tail.split("))").next())
-        .map(|values| {
-            values
-                .split(',')
-                .map(|value| value.trim().trim_matches('\''))
-                .collect::<Vec<_>>()
-        })
-        .ok_or_else(|| invariant_response_error(response.status))?;
     let columns: Value = serde_json::from_str(text("column_names")?)
         .map_err(|_| invariant_response_error(response.status))?;
     let expected_columns = serde_json::json!([
@@ -4708,8 +4868,7 @@ fn sanitize_mln_0143_data_invariants_response(
         "created_by",
         "created_at"
     ]);
-    if allowlist != expected_kinds
-        || columns != expected_columns
+    if columns != expected_columns
         || number("old_table_count")? != 0
         || number("foreign_key_violations")? != 0
         || number("duplicate_hash_groups")? != 0
@@ -4837,7 +4996,7 @@ fn sanitize_mln_0143_data_invariants_response(
             "count":total,
             "counts_by_kind":kind_counts,
         },
-        "semantic_schema_hash":normalized_sql_hash(table_sql),
+        "semantic_schema_hash":reviewed_table_sql_hash(table_sql).ok_or_else(|| invariant_response_error(response.status))?,
         "packet_hash":hash_value(&packet_rows)?,
         "trigger_definition_hashes":trigger_hashes,
         "assertions":{
