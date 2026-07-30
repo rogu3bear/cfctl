@@ -13194,6 +13194,91 @@ fn exact_durable_provider_complete_boundary(
     Ok((hash.clone(), checkpoint.clone()))
 }
 
+fn exact_accepted_ingest_bookmarks(
+    store: &StateStore,
+    plan: &PlanV1,
+    checkpoints: &[(String, Value)],
+    target: &Value,
+    input_hash: &str,
+) -> Vec<String> {
+    let migration_id = plan
+        .input
+        .pointer("/body/migration_id")
+        .and_then(Value::as_str);
+    checkpoints
+        .iter()
+        .filter_map(|(hash, checkpoint)| {
+            let exact = checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+                && checkpoint.get("operation_id").and_then(Value::as_str)
+                    == Some(plan.operation_id.as_str())
+                && checkpoint.get("step").and_then(Value::as_str) == Some("ingest_response")
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && checkpoint
+                    .pointer("/receipt/success")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/response_action")
+                    .and_then(Value::as_str)
+                    == Some("ingest")
+                && checkpoint
+                    .pointer("/receipt/provider")
+                    .and_then(Value::as_str)
+                    == Some("cloudflare")
+                && checkpoint
+                    .pointer("/receipt/effect")
+                    .and_then(Value::as_str)
+                    == Some("d1_import_ingest_accepted")
+                && checkpoint
+                    .pointer("/receipt/migration_id")
+                    .and_then(Value::as_str)
+                    == migration_id
+                && checkpoint.pointer("/receipt/target") == Some(target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash)
+                && checkpoint
+                    .pointer("/receipt/no_replay")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && checkpoint
+                    .pointer("/receipt/result/type")
+                    .and_then(Value::as_str)
+                    == Some("import")
+                && matches!(
+                    checkpoint
+                        .pointer("/receipt/result/status")
+                        .and_then(Value::as_str),
+                    Some("active" | "pending")
+                )
+                && checkpoint
+                    .pointer("/receipt/result/success")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/result/provider_error_present")
+                    .and_then(Value::as_bool)
+                    .is_none_or(|present| !present)
+                && checkpoint.pointer("/receipt/result/error").is_none()
+                && store
+                    .read_evidence_value(hash)
+                    .is_ok_and(|evidence| evidence == *checkpoint);
+            exact.then(|| {
+                checkpoint
+                    .pointer("/receipt/result/at_bookmark")
+                    .and_then(Value::as_str)
+                    .filter(|bookmark| !bookmark.is_empty())
+                    .map(str::to_owned)
+            })?
+        })
+        .collect()
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "stage-specific init, ingest, and poll receipt authority is one fail-closed join"
@@ -13213,42 +13298,8 @@ fn exact_durable_provider_failure_boundary(
     });
     let input_hash = hash_value(&plan.input)?;
     let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
-    let accepted_ingest_bookmarks = checkpoints
-        .iter()
-        .filter_map(|(_, checkpoint)| {
-            let exact = checkpoint.get("step").and_then(Value::as_str) == Some("ingest_response")
-                && checkpoint
-                    .pointer("/receipt/response_action")
-                    .and_then(Value::as_str)
-                    == Some("ingest")
-                && checkpoint.pointer("/receipt/target") == Some(&target)
-                && checkpoint
-                    .pointer("/receipt/plan_input_hash")
-                    .and_then(Value::as_str)
-                    == Some(input_hash.as_str())
-                && checkpoint
-                    .pointer("/receipt/result/type")
-                    .and_then(Value::as_str)
-                    == Some("import")
-                && matches!(
-                    checkpoint
-                        .pointer("/receipt/result/status")
-                        .and_then(Value::as_str),
-                    Some("active" | "pending")
-                )
-                && checkpoint
-                    .pointer("/receipt/result/success")
-                    .and_then(Value::as_bool)
-                    == Some(true);
-            exact.then(|| {
-                checkpoint
-                    .pointer("/receipt/result/at_bookmark")
-                    .and_then(Value::as_str)
-                    .filter(|bookmark| !bookmark.is_empty())
-                    .map(str::to_owned)
-            })?
-        })
-        .collect::<Vec<_>>();
+    let accepted_ingest_bookmarks =
+        exact_accepted_ingest_bookmarks(store, plan, &checkpoints, &target, &input_hash);
     let failures = checkpoints
         .into_iter()
         .filter(|(_, checkpoint)| {
@@ -13514,6 +13565,20 @@ async fn execute_approved_mln_import_plan(
                     if evidence.content_hash != checkpoint_hash {
                         return Err(
                             "provider-failure checkpoint and apply evidence hashes diverged"
+                                .to_owned(),
+                        );
+                    }
+                }
+                if checkpoint.step == "ingest_response"
+                    && checkpoint.receipt.get("effect").and_then(Value::as_str)
+                        == Some("d1_import_ingest_accepted")
+                {
+                    let evidence = store
+                        .write_evidence(EvidenceClass::Apply, &value)
+                        .map_err(|error| error.to_string())?;
+                    if evidence.content_hash != checkpoint_hash {
+                        return Err(
+                            "accepted-ingest checkpoint and apply evidence hashes diverged"
                                 .to_owned(),
                         );
                     }
@@ -19427,20 +19492,20 @@ mod tests {
         blocked_capability_envelope, boundary_response_artifact, build_mint_policy_body,
         call_command, cancel_plan, capability_call_argv, compensation_request,
         credential_generation_for_read, d1_recovery_anchor_matches, delegated_read_envelope,
-        entitlement_probe_selectors, exact_durable_provider_complete_boundary,
-        exact_durable_provider_failure_boundary, execute_native_workflow, execute_read,
-        find_secret_value, force_ipv4_from, governed_cli_environment_contract,
-        governed_cli_workspace_env, guide_document, guide_stage_commands, http_client,
-        is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
-        key_policy_list, key_policy_revoke, list_security_action_state_receipt,
-        mln_0142_terminal_import_state, mln_0143_parent_manifests,
-        mln_0143_pre_import_authority_matches, mln_0143_pre_import_matches,
-        mln_0143_restore_anchor_matches, non_readback_verification_basis,
-        normalize_reviewed_mln_repository_id, operational_proof_coverage,
-        permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
-        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
-        plan_state_next_step, plan_status_label, preflight_call_input,
-        preflight_standing_authority, prepare_r2_temporary_credentials_input,
+        entitlement_probe_selectors, exact_accepted_ingest_bookmarks,
+        exact_durable_provider_complete_boundary, exact_durable_provider_failure_boundary,
+        execute_native_workflow, execute_read, find_secret_value, force_ipv4_from,
+        governed_cli_environment_contract, governed_cli_workspace_env, guide_document,
+        guide_stage_commands, http_client, is_live_plan_precondition_hash,
+        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
+        list_security_action_state_receipt, mln_0142_terminal_import_state,
+        mln_0143_parent_manifests, mln_0143_pre_import_authority_matches,
+        mln_0143_pre_import_matches, mln_0143_restore_anchor_matches,
+        non_readback_verification_basis, normalize_reviewed_mln_repository_id,
+        operational_proof_coverage, permission_inventory_call, permission_inventory_envelope,
+        persist_prepared_plan, persist_secret_lifecycle,
+        persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
+        preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
         read_import_secret, read_r2_log_retrieval_credentials, read_secret_file,
         reconcile_standing_lineage_from_plan, rectify_plan, redact_response_for_capability,
@@ -21051,6 +21116,9 @@ mod tests {
         let poll_plan = build_plan();
         let mut accepted_ingest = checkpoint(&poll_plan);
         accepted_ingest["rectification_required"] = json!(false);
+        accepted_ingest["receipt"]["provider"] = json!("cloudflare");
+        accepted_ingest["receipt"]["effect"] = json!("d1_import_ingest_accepted");
+        accepted_ingest["receipt"]["migration_id"] = json!("0143");
         accepted_ingest["receipt"]["no_replay"] = json!(false);
         accepted_ingest["receipt"]["result"] = json!({
             "type":"import",
@@ -21058,9 +21126,145 @@ mod tests {
             "success":true,
             "at_bookmark":"before",
         });
-        poll_store
+        let accepted_hash = poll_store
             .record_d1_import_checkpoint(&poll_plan.operation_id, &accepted_ingest)
             .expect("accepted ingest checkpoint");
+        assert_eq!(
+            poll_store
+                .write_evidence(EvidenceClass::Apply, &accepted_ingest)
+                .expect("accepted ingest evidence")
+                .content_hash,
+            accepted_hash
+        );
+        let target = json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        });
+        let input_hash = hash_value(&poll_plan.input).expect("poll plan input hash");
+        assert_eq!(
+            exact_accepted_ingest_bookmarks(
+                &poll_store,
+                &poll_plan,
+                &[(accepted_hash.clone(), accepted_ingest.clone())],
+                &target,
+                &input_hash,
+            ),
+            vec!["before"]
+        );
+
+        for (pointer, replacement) in [
+            ("/schema_version", json!(2)),
+            ("/operation_id", json!("different-operation")),
+            ("/step", json!("poll_response_1")),
+            ("/performed", json!(false)),
+            ("/rectification_required", json!(true)),
+            ("/receipt/success", json!(false)),
+            ("/receipt/response_action", json!("poll")),
+            ("/receipt/provider", json!("different-provider")),
+            ("/receipt/effect", json!("d1_import_response")),
+            ("/receipt/migration_id", json!("0142")),
+            (
+                "/receipt/target",
+                json!({
+                    "account_id":contract.account_id,
+                    "database_id":"different-database",
+                }),
+            ),
+            ("/receipt/plan_input_hash", json!("sha256:different")),
+            ("/receipt/no_replay", json!(true)),
+            ("/receipt/result/type", json!("other")),
+            ("/receipt/result/status", json!("complete")),
+            ("/receipt/result/success", json!(false)),
+            ("/receipt/result/at_bookmark", json!("")),
+        ] {
+            let mut drifted = accepted_ingest.clone();
+            *drifted.pointer_mut(pointer).expect("mutation pointer") = replacement;
+            let drifted_hash = poll_store
+                .write_evidence(EvidenceClass::Apply, &drifted)
+                .expect("drifted accepted-ingest evidence")
+                .content_hash;
+            assert!(
+                exact_accepted_ingest_bookmarks(
+                    &poll_store,
+                    &poll_plan,
+                    &[(drifted_hash, drifted)],
+                    &target,
+                    &input_hash,
+                )
+                .is_empty(),
+                "accepted-ingest authority must reject drift at {pointer}"
+            );
+        }
+        for (pointer, replacement) in [
+            ("/receipt/result/provider_error_present", json!(true)),
+            ("/receipt/result/error", json!({"code":7500})),
+        ] {
+            let mut errored = accepted_ingest.clone();
+            errored
+                .pointer_mut("/receipt/result")
+                .and_then(Value::as_object_mut)
+                .expect("result object")
+                .insert(
+                    pointer.rsplit('/').next().expect("field").to_owned(),
+                    replacement,
+                );
+            let errored_hash = poll_store
+                .write_evidence(EvidenceClass::Apply, &errored)
+                .expect("errored accepted-ingest evidence")
+                .content_hash;
+            assert!(
+                exact_accepted_ingest_bookmarks(
+                    &poll_store,
+                    &poll_plan,
+                    &[(errored_hash, errored)],
+                    &target,
+                    &input_hash,
+                )
+                .is_empty(),
+                "accepted-ingest authority must reject {pointer}"
+            );
+        }
+        assert!(
+            exact_accepted_ingest_bookmarks(
+                &poll_store,
+                &poll_plan,
+                &[("sha256:missing".to_owned(), accepted_ingest.clone())],
+                &target,
+                &input_hash,
+            )
+            .is_empty(),
+            "accepted-ingest authority requires durable evidence"
+        );
+        let mismatched_hash = poll_store
+            .write_evidence(EvidenceClass::Apply, &json!({"different":"evidence"}))
+            .expect("mismatched evidence")
+            .content_hash;
+        assert!(
+            exact_accepted_ingest_bookmarks(
+                &poll_store,
+                &poll_plan,
+                &[(mismatched_hash, accepted_ingest.clone())],
+                &target,
+                &input_hash,
+            )
+            .is_empty(),
+            "accepted-ingest authority requires exact immutable evidence"
+        );
+        assert_eq!(
+            exact_accepted_ingest_bookmarks(
+                &poll_store,
+                &poll_plan,
+                &[
+                    (accepted_hash.clone(), accepted_ingest.clone()),
+                    (accepted_hash, accepted_ingest.clone()),
+                ],
+                &target,
+                &input_hash,
+            )
+            .len(),
+            2,
+            "duplicate accepted-ingest authorities remain visible to the exact-one gate"
+        );
         let mut poll_receipt = checkpoint(&poll_plan);
         poll_receipt["step"] = json!("poll_response_1");
         poll_receipt["receipt"]["response_action"] = json!("poll");

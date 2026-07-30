@@ -8954,7 +8954,20 @@ where
                 "database_id":contract.database_id,
             })
         });
+    let migration_id = plan
+        .input
+        .get("body")
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str);
     let mut result = replacement_result.unwrap_or_else(|| response.result.clone());
+    let successful_nonterminal_ingest = step == "ingest_response"
+        && response.success
+        && result.get("type").and_then(Value::as_str) == Some("import")
+        && matches!(
+            result.get("status").and_then(Value::as_str),
+            Some("active" | "pending")
+        )
+        && result.get("success").and_then(Value::as_bool) == Some(true);
     let terminal_provider_failure = result.get("status").and_then(Value::as_str) == Some("error")
         && result.get("success").and_then(Value::as_bool) == Some(false);
     let provider_error_present = if let Some(object) = result.as_object_mut() {
@@ -8987,6 +9000,9 @@ where
             "http_status":response.status,
             "success":response.success,
             "response_action":response_action,
+            "provider":"cloudflare",
+            "effect":if successful_nonterminal_ingest {"d1_import_ingest_accepted"} else {"d1_import_response"},
+            "migration_id":migration_id,
             "target":target,
             "plan_input_hash":hash_value(&plan.input)?,
             "result":result,
