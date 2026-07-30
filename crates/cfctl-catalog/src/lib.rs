@@ -2005,7 +2005,7 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
         max_response_bytes: 1024 * 1024,
         max_poll_attempts: 120,
         max_timeout_seconds: 30,
-        upload_url_suffix: ".cloudflare.com".to_owned(),
+        upload_url_suffix: ".r2.cloudflarestorage.com".to_owned(),
         requires_create_new_mode_0600_stage: true,
     });
     capability

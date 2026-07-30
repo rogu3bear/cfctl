@@ -1786,6 +1786,7 @@ pub struct OperationVerificationV1 {
 #[derive(Clone)]
 pub struct Executor {
     client: reqwest::Client,
+    upload_client: reqwest::Client,
     builder: RequestBuilder,
     max_retries: usize,
 }
@@ -1973,6 +1974,9 @@ impl Executor {
     pub fn new(client: reqwest::Client, base_url: &str) -> Result<Self> {
         Ok(Self {
             client,
+            upload_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
             builder: RequestBuilder::new(base_url)?,
             max_retries: 3,
         })
@@ -2508,20 +2512,20 @@ impl Executor {
                 return Err(error);
             }
         };
-        let upload = match self
-            .client
+        let Ok(upload) = self
+            .upload_client
             .put(upload_url)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(staged)
             .send()
             .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                persist_import_uncertainty(&mut persist, plan, "upload_send_uncertain")?;
-                plan.status = PlanStatus::RectificationRequired;
-                return Err(CloudflareError::Http(error));
-            }
+        else {
+            persist_import_uncertainty(&mut persist, plan, "upload_send_uncertain")?;
+            plan.status = PlanStatus::RectificationRequired;
+            return Err(CloudflareError::InvalidRequestBody(
+                "D1 import upload transport failed; presigned URL redacted; do not replay"
+                    .to_owned(),
+            ));
         };
         let upload_status = upload.status().as_u16();
         let upload_receipt = D1ImportCheckpointV1 {
@@ -8568,7 +8572,7 @@ fn validate_d1_approved_mln_import_contract(
             == "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
         && contract.migrations[1].md5 == "bd50b7e05cc13c20f17eb8748472eb4b"
         && contract.requires_create_new_mode_0600_stage
-        && contract.upload_url_suffix == ".cloudflare.com"
+        && contract.upload_url_suffix == ".r2.cloudflarestorage.com"
         && (1..=1024 * 1024).contains(&contract.max_response_bytes)
         && (1..=120).contains(&contract.max_poll_attempts)
         && (1..=30).contains(&contract.max_timeout_seconds)
@@ -8621,16 +8625,60 @@ fn validate_d1_import_upload_url(
     raw: &str,
     contract: &D1ApprovedMlnImportContractV1,
 ) -> Result<Url> {
+    let raw_authority = raw
+        .split_once("://")
+        .map(|(_, remainder)| remainder.split(['/', '?', '#']).next().unwrap_or_default())
+        .unwrap_or_default();
     let url = Url::parse(raw)?;
     let host = url.host_str().unwrap_or_default();
-    if url.scheme() != "https"
+    let expected_host = format!("{}{}", contract.account_id, contract.upload_url_suffix);
+    let required_query_keys = [
+        "X-Amz-Algorithm",
+        "X-Amz-Credential",
+        "X-Amz-Date",
+        "X-Amz-Expires",
+        "X-Amz-Signature",
+        "X-Amz-SignedHeaders",
+    ];
+    let query_pairs = url.query_pairs().collect::<Vec<_>>();
+    if raw_authority.contains('%')
+        || url.scheme() != "https"
         || url.username() != ""
         || url.password().is_some()
         || url.fragment().is_some()
-        || !(host == "cloudflare.com" || host.ends_with(&contract.upload_url_suffix))
+        || url.port().is_some()
+        || host != expected_host
+        || url.path().is_empty()
+        || url.path() == "/"
+        || query_pairs.is_empty()
+        || required_query_keys.iter().any(|required| {
+            let matching = query_pairs
+                .iter()
+                .filter(|(key, _)| key == required)
+                .collect::<Vec<_>>();
+            matching.len() != 1 || matching[0].1.is_empty()
+        })
     {
         return Err(CloudflareError::InvalidRequestBody(
-            "D1 import upload URL is not a credential-free Cloudflare-owned HTTPS URL".to_owned(),
+            "D1 import upload URL is not an exact account-owned R2 presigned HTTPS PUT URL"
+                .to_owned(),
+        ));
+    }
+    let query_value = |name: &str| {
+        query_pairs
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_ref())
+            .unwrap_or_default()
+    };
+    let signature = query_value("X-Amz-Signature");
+    if query_value("X-Amz-Algorithm") != "AWS4-HMAC-SHA256"
+        || query_value("X-Amz-SignedHeaders") != "host"
+        || signature.len() != 64
+        || !signature.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(CloudflareError::InvalidRequestBody(
+            "D1 import upload URL has an unsupported presigned signature contract".to_owned(),
         ));
     }
     Ok(url)
@@ -8761,30 +8809,86 @@ mod approved_mln_import_tests {
             max_response_bytes: 1_048_576,
             max_poll_attempts: 120,
             max_timeout_seconds: 300,
-            upload_url_suffix: ".cloudflare.com".to_owned(),
+            upload_url_suffix: ".r2.cloudflarestorage.com".to_owned(),
             requires_create_new_mode_0600_stage: true,
         }
     }
 
     #[test]
-    fn approved_import_upload_url_is_https_cloudflare_owned_and_has_no_userinfo_or_fragment() {
+    fn approved_import_upload_url_is_exact_account_owned_r2_presigned_put_target() {
         let contract = contract();
+        let signed_query = concat!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256",
+            "&X-Amz-Credential=credential",
+            "&X-Amz-Date=20260730T000000Z",
+            "&X-Amz-Expires=3600",
+            "&X-Amz-SignedHeaders=host",
+            "&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert!(
             validate_d1_import_upload_url(
-                "https://upload.cloudflare.com/import?id=opaque",
+                &format!(
+                    "https://ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object?{signed_query}"
+                ),
                 &contract
             )
             .is_ok()
         );
-        for rejected in [
-            "http://upload.cloudflare.com/import",
-            "https://attacker.example/import",
-            "https://user@upload.cloudflare.com/import",
-            "https://upload.cloudflare.com/import#secret",
-            "https://cloudflare.com.attacker.example/import",
-        ] {
+        let rejected = [
+            format!("https://cloudflarestorage.com/import/object?{signed_query}"),
+            format!("https://r2.cloudflarestorage.com/import/object?{signed_query}"),
+            format!(
+                "https://ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com.attacker.example/import/object?{signed_query}"
+            ),
+            format!(
+                "https://prefix-ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object?{signed_query}"
+            ),
+            format!(
+                "https://attacker.ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object?{signed_query}"
+            ),
+            format!(
+                "https://xn--ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object?{signed_query}"
+            ),
+            format!("https://127.0.0.1/import/object?{signed_query}"),
+            format!("https://[::1]/import/object?{signed_query}"),
+            format!("https://localhost/import/object?{signed_query}"),
+            format!(
+                "http://ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object?{signed_query}"
+            ),
+            format!(
+                "ftp://ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object?{signed_query}"
+            ),
+            format!(
+                "https://ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com:444/import/object?{signed_query}"
+            ),
+            format!(
+                "https://user@ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object?{signed_query}"
+            ),
+            format!(
+                "https://ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object?{signed_query}#fragment"
+            ),
+            format!(
+                "https://ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/?{signed_query}"
+            ),
+            "https://ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object"
+                .to_owned(),
+            "https://ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+                .to_owned(),
+            format!(
+                "https://ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object?{signed_query}&X-Amz-Signature="
+            ),
+            format!(
+                "https://ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object?{}",
+                signed_query.replace("AWS4-HMAC-SHA256", "unsupported")
+            ),
+            format!("https://upload.cloudflare.com/import/object?{signed_query}"),
+            format!(
+                "https://ca30e922fda7f5578e49873542e4aaca%2er2.cloudflarestorage.com/import/object?{signed_query}"
+            ),
+        ];
+        for rejected in rejected {
             assert!(
-                validate_d1_import_upload_url(rejected, &contract).is_err(),
+                validate_d1_import_upload_url(&rejected, &contract).is_err(),
                 "{rejected}"
             );
         }
