@@ -2556,13 +2556,45 @@ impl Executor {
             ));
         };
         let upload_status = upload.status().as_u16();
+        let upload_etag = if upload.status().is_success() {
+            match validated_d1_import_upload_etag(upload.headers(), &migration.md5) {
+                Ok(etag) => Some(etag),
+                Err(error) => {
+                    let receipt = D1ImportCheckpointV1 {
+                        schema_version: 1,
+                        operation_id: plan.operation_id.clone(),
+                        step: "upload_response".to_owned(),
+                        performed: true,
+                        rectification_required: true,
+                        receipt: serde_json::json!({
+                            "http_status":upload_status,
+                            "success":true,
+                            "etag_present":upload.headers().contains_key(reqwest::header::ETAG),
+                            "etag_matches":false,
+                            "no_replay":true,
+                        }),
+                    };
+                    persist(&receipt).map_err(CloudflareError::InvalidRequestBody)?;
+                    plan.status = PlanStatus::RectificationRequired;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let upload_receipt = D1ImportCheckpointV1 {
             schema_version: 1,
             operation_id: plan.operation_id.clone(),
             step: "upload_response".to_owned(),
             performed: true,
             rectification_required: !upload.status().is_success(),
-            receipt: serde_json::json!({"http_status":upload_status,"success":upload.status().is_success()}),
+            receipt: serde_json::json!({
+                "http_status":upload_status,
+                "success":upload.status().is_success(),
+                "etag_present":upload_etag.is_some(),
+                "etag_matches":upload_etag.is_some(),
+                "etag_sha256":upload_etag.as_ref().map(|etag| format!("sha256:{}",hex::encode(Sha256::digest(etag.as_bytes())))),
+            }),
         };
         persist(&upload_receipt).map_err(CloudflareError::InvalidRequestBody)?;
         if !upload.status().is_success() {
@@ -8723,6 +8755,50 @@ fn validate_d1_import_upload_url(
     Ok(url)
 }
 
+fn validated_d1_import_upload_etag(
+    headers: &reqwest::header::HeaderMap,
+    expected_md5: &str,
+) -> Result<String> {
+    let values = headers
+        .get_all(reqwest::header::ETAG)
+        .iter()
+        .collect::<Vec<_>>();
+    if values.len() != 1 {
+        return Err(CloudflareError::InvalidRequestBody(
+            "D1 import upload returned missing or ambiguous ETag; do not replay".to_owned(),
+        ));
+    }
+    let raw = values[0].to_str().map_err(|_| {
+        CloudflareError::InvalidRequestBody(
+            "D1 import upload returned a non-text ETag; do not replay".to_owned(),
+        )
+    })?;
+    if raw.is_empty()
+        || raw.starts_with("W/")
+        || raw.starts_with("w/")
+        || raw.contains(',')
+        || raw.trim() != raw
+    {
+        return Err(CloudflareError::InvalidRequestBody(
+            "D1 import upload returned an unsupported ETag; do not replay".to_owned(),
+        ));
+    }
+    let normalized = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(raw);
+    if normalized.len() != 32
+        || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !normalized.eq_ignore_ascii_case(expected_md5)
+    {
+        return Err(CloudflareError::InvalidRequestBody(
+            "D1 import upload ETag did not match the reviewed migration MD5; do not replay"
+                .to_owned(),
+        ));
+    }
+    Ok(normalized.to_ascii_lowercase())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum D1ImportPollOutcome<'a> {
     InProgress,
@@ -8848,12 +8924,15 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod approved_mln_import_tests {
     use super::{
         CloudflareError, D1ImportPollOutcome, accepted_d1_import_poll_outcome, parse_response,
         validate_d1_import_poll_response, validate_d1_import_upload_url,
+        validated_d1_import_upload_etag,
     };
     use cfctl_core::D1ApprovedMlnImportContractV1;
+    use reqwest::header::{ETAG, HeaderMap, HeaderValue};
     use serde_json::json;
 
     fn contract() -> D1ApprovedMlnImportContractV1 {
@@ -8954,6 +9033,52 @@ mod approved_mln_import_tests {
                 validate_d1_import_upload_url(&rejected, &contract).is_err(),
                 "{rejected}"
             );
+        }
+    }
+
+    #[test]
+    fn approved_import_ingest_requires_one_matching_strong_upload_etag() {
+        let expected = "bd50b7e05cc13c20f17eb8748472eb4b";
+        let evaluate = |values: &[&str]| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(ETAG, HeaderValue::from_str(value).expect("test header"));
+            }
+            let mut ingest_requests = 0_u8;
+            let result = validated_d1_import_upload_etag(&headers, expected).inspect(|_| {
+                ingest_requests += 1;
+            });
+            (result, ingest_requests)
+        };
+
+        for invalid in [
+            Vec::new(),
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            vec!["W/\"bd50b7e05cc13c20f17eb8748472eb4b\""],
+            vec!["bd50b7e05cc13c20f17eb8748472eb4b,other"],
+            vec![""],
+            vec!["short"],
+            vec!["zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"],
+            vec![
+                "bd50b7e05cc13c20f17eb8748472eb4b",
+                "bd50b7e05cc13c20f17eb8748472eb4b",
+            ],
+        ] {
+            let (result, ingest_requests) = evaluate(&invalid);
+            assert!(result.is_err(), "{invalid:?}");
+            assert_eq!(ingest_requests, 0, "{invalid:?}");
+        }
+        for exact in [
+            vec!["bd50b7e05cc13c20f17eb8748472eb4b"],
+            vec!["\"bd50b7e05cc13c20f17eb8748472eb4b\""],
+            vec!["BD50B7E05CC13C20F17EB8748472EB4B"],
+        ] {
+            let (result, ingest_requests) = evaluate(&exact);
+            assert_eq!(
+                result.expect("strong matching ETag"),
+                "bd50b7e05cc13c20f17eb8748472eb4b"
+            );
+            assert_eq!(ingest_requests, 1);
         }
     }
 
