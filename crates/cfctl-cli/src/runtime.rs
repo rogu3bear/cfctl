@@ -13278,6 +13278,21 @@ fn validate_trusted_root_import_plan(plan_v2: &PlanV2) -> Result<()> {
         .iter()
         .find(|migration| migration.migration_id == migration_id)
         .ok_or_else(|| CliError::Input("trusted import migration is not catalogued".to_owned()))?;
+    let expected_input = CallInput {
+        selectors: json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        }),
+        query: json!({}),
+        body: Some(json!({"migration_id":migration.migration_id})),
+        if_match: None,
+        if_none_match: None,
+    };
+    if input != expected_input {
+        return Err(CliError::Input(
+            "approved MLN import input is not the exact trusted migration request".to_owned(),
+        ));
+    }
     let stage = plan
         .targets
         .pointer("/adapter/approved_mln_import")
@@ -13291,6 +13306,16 @@ fn validate_trusted_root_import_plan(plan_v2: &PlanV2) -> Result<()> {
     });
     let source_hash = hash_value(source)?;
     if plan.account_id != contract.account_id
+        || source.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || source
+            .get("observed_worktree_root")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || source
+            .get("observed_git_common_dir")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || stage.get("schema_version").and_then(Value::as_u64) != Some(1)
         || stage.get("migration_id").and_then(Value::as_str) != Some(migration_id)
         || stage.get("catalog_basename").and_then(Value::as_str)
             != Some(migration.basename.as_str())
@@ -13300,6 +13325,13 @@ fn validate_trusted_root_import_plan(plan_v2: &PlanV2) -> Result<()> {
         || stage.get("md5").and_then(Value::as_str) != Some(migration.md5.as_str())
         || stage.get("target") != Some(&target)
         || stage.get("source_authority_hash").and_then(Value::as_str) != Some(source_hash.as_str())
+        || stage
+            .get("stage_path")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || stage.get("stage_lifecycle").and_then(Value::as_str)
+            != Some("preserve_until_verified_or_explicitly_retired")
+        || stage.get("prerequisites") != input.body.as_ref()
         || source.get("repository_id").and_then(Value::as_str)
             != Some(contract.repository_id.as_str())
         || source.get("head").and_then(Value::as_str) != Some(contract.repository_head.as_str())
@@ -22597,6 +22629,166 @@ mod tests {
     #[test]
     #[expect(
         clippy::too_many_lines,
+        reason = "the matrix rebinds every root-input dependent child receipt and PlanV2 lifecycle"
+    )]
+    fn poll_child_resolver_rejects_recomputed_valid_root_input_grafts() {
+        for graft in [
+            "if_match",
+            "if_none_match",
+            "missing_selector",
+            "extra_selector",
+            "wrong_selector",
+            "nonempty_query",
+            "extra_body_key",
+            "unknown_migration",
+        ] {
+            let fixture = build_poll_child_lineage(1);
+            let mut root = fixture.root_plan.clone();
+            let mut input: CallInput =
+                serde_json::from_value(root.input.clone()).expect("root input");
+            match graft {
+                "if_match" => input.if_match = Some("grafted-etag".to_owned()),
+                "if_none_match" => input.if_none_match = Some("grafted-etag".to_owned()),
+                "missing_selector" => {
+                    input
+                        .selectors
+                        .as_object_mut()
+                        .expect("root selectors")
+                        .remove("database_id");
+                }
+                "extra_selector" => {
+                    input
+                        .selectors
+                        .as_object_mut()
+                        .expect("root selectors")
+                        .insert("extra".to_owned(), json!("grafted"));
+                }
+                "wrong_selector" => {
+                    input.selectors["database_id"] = json!("22222222-2222-4222-8222-222222222222");
+                }
+                "nonempty_query" => input.query = json!({"extra":"grafted"}),
+                "extra_body_key" => {
+                    input
+                        .body
+                        .as_mut()
+                        .and_then(Value::as_object_mut)
+                        .expect("root body")
+                        .insert("extra".to_owned(), json!("grafted"));
+                }
+                "unknown_migration" => {
+                    input
+                        .body
+                        .as_mut()
+                        .and_then(Value::as_object_mut)
+                        .expect("root body")
+                        .insert("migration_id".to_owned(), json!("9999"));
+                }
+                _ => unreachable!("closed root input graft matrix"),
+            }
+            root.input = serde_json::to_value(input).expect("grafted root input");
+            if graft == "unknown_migration" {
+                root.targets["adapter"]["approved_mln_import"]["migration_id"] = json!("9999");
+            }
+            root.targets["adapter"]["approved_mln_import"]["prerequisites"] =
+                root.input.get("body").cloned().unwrap_or(Value::Null);
+            root.refresh_hash().expect("grafted root hash");
+            let root_pins = fixture
+                .store
+                .load_plan_v2(&root.operation_id)
+                .expect("canonical root")
+                .pins;
+            persist_poll_test_plan_v2(&fixture.store, &root, root_pins);
+
+            let mut child = fixture.children[0].clone();
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["root_plan_hash"] =
+                json!(root.content_hash);
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["parent_plan_hash"] =
+                json!(root.content_hash);
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["root_input"] =
+                root.input.clone();
+            child.targets["adapter"]["approved_mln_import_poll_resume"]["root_stage"] =
+                root.targets["adapter"]["approved_mln_import"].clone();
+            let mut child_input: CallInput =
+                serde_json::from_value(child.input.clone()).expect("child input");
+            child_input
+                .body
+                .as_mut()
+                .and_then(Value::as_object_mut)
+                .expect("child body")
+                .insert("parent_plan_hash".to_owned(), json!(root.content_hash));
+            child.input = serde_json::to_value(child_input).expect("rebound child input");
+
+            let checkpoint_dir = fixture
+                .store
+                .paths()
+                .data_dir
+                .join("d1-import-checkpoints")
+                .join(&child.operation_id);
+            let checkpoints = fixture
+                .store
+                .read_d1_import_checkpoints(&child.operation_id)
+                .expect("child checkpoints");
+            for entry in fs::read_dir(&checkpoint_dir).expect("child checkpoint directory") {
+                fs::remove_file(entry.expect("child checkpoint entry").path())
+                    .expect("remove child checkpoint");
+            }
+            let child_input_hash = hash_value(&child.input).expect("child input hash");
+            let mut completion = None;
+            for (_, mut checkpoint) in checkpoints {
+                checkpoint["receipt"]["plan_input_hash"] = json!(child_input_hash);
+                if checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete") {
+                    checkpoint["receipt"]["root_plan_hash"] = json!(root.content_hash);
+                    completion = Some(checkpoint.clone());
+                }
+                persist_poll_lineage_checkpoint(&fixture.store, &child.operation_id, &checkpoint);
+            }
+            let completion = completion.expect("rebound completion");
+            let mut apply_response = completed_poll_child_apply_response(&fixture);
+            apply_response["result"]["_cfctl"] = completion["receipt"].clone();
+            let apply = fixture
+                .store
+                .write_evidence(EvidenceClass::Apply, &apply_response)
+                .expect("rebound apply evidence");
+            let mut response_artifact = child
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .expect("child response artifact")
+                .clone();
+            response_artifact["apply_evidence_hash"] = json!(apply.content_hash);
+            rebuild_poll_child_terminal_lifecycle(
+                &mut child,
+                PlanStatus::Running,
+                response_artifact,
+            );
+            let child_pins = fixture
+                .store
+                .load_plan_v2(&child.operation_id)
+                .expect("canonical child")
+                .pins;
+            persist_poll_test_plan_v2(&fixture.store, &child, child_pins);
+
+            let root_v2 = fixture
+                .store
+                .load_plan_v2(&root.operation_id)
+                .expect("grafted root PlanV2");
+            assert!(
+                super::validate_trusted_root_import_plan(&root_v2).is_err(),
+                "{graft} must fail trusted-root input admission"
+            );
+            assert!(
+                super::exact_durable_provider_complete_boundary(&fixture.store, &root.operation_id)
+                    .is_err(),
+                "{graft} must fail direct completion resolution"
+            );
+            assert!(
+                super::exact_linear_poll_child_provider_complete(&fixture.store, &root).is_err(),
+                "{graft} must fail root-to-child completion resolution"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
         reason = "the adversarial anchor fixture keeps every joined authority dimension visible"
     )]
     fn mln_import_anchor_requires_the_exact_governed_export_join() {
@@ -23681,6 +23873,7 @@ mod tests {
                 "account_id":root_contract.account_id,
                 "database_id":root_contract.database_id,
             }),
+            query: json!({}),
             body: Some(json!({"migration_id":"0143"})),
             ..CallInput::default()
         })
@@ -24800,6 +24993,7 @@ mod tests {
                     "account_id":contract.account_id,
                     "database_id":contract.database_id,
                 }),
+                query: json!({}),
                 body: Some(json!({"migration_id":"0143"})),
                 ..CallInput::default()
             })
