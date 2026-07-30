@@ -13230,6 +13230,10 @@ struct DurableProviderCompleteBoundary {
     checkpoint: Value,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "canonical child admission joins journal, response, evidence, and terminal outcome"
+)]
 fn validate_canonical_poll_child_lifecycle(
     store: &StateStore,
     current: &PlanV2,
@@ -13300,14 +13304,53 @@ fn validate_canonical_poll_child_lifecycle(
     }
     if terminal_status == PlanStatus::Running {
         let boundary = exact_durable_resume_provider_complete_boundary(store, plan)?;
-        if response_artifact.get("success").and_then(Value::as_bool) != Some(true)
-            || response_artifact
-                .get("apply_evidence_hash")
+        let apply_hash = response_artifact
+            .get("apply_evidence_hash")
+            .and_then(Value::as_str)
+            .filter(|hash| !hash.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "completed poll child response artifact lacks apply evidence".to_owned(),
+                )
+            })?;
+        let apply_response = store.read_evidence_value(apply_hash)?;
+        let receipt = boundary
+            .checkpoint
+            .get("receipt")
+            .ok_or_else(|| CliError::Input("provider completion receipt is missing".to_owned()))?;
+        let exact_response = response_artifact.get("success").and_then(Value::as_bool)
+            == Some(true)
+            && response_artifact.get("http_status").and_then(Value::as_u64) == Some(200)
+            && apply_response.get("status").and_then(Value::as_u64) == Some(200)
+            && apply_response.get("success").and_then(Value::as_bool) == Some(true)
+            && apply_response
+                .get("errors")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            && apply_response.pointer("/result/_cfctl") == Some(receipt)
+            && apply_response
+                .pointer("/result/type")
                 .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-        {
+                == Some("import")
+            && apply_response
+                .pointer("/result/status")
+                .and_then(Value::as_str)
+                == Some("complete")
+            && apply_response
+                .pointer("/result/success")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && apply_response
+                .pointer("/result/at_bookmark")
+                .and_then(Value::as_str)
+                == receipt.get("at_bookmark").and_then(Value::as_str)
+            && apply_response
+                .pointer("/result/result/final_bookmark")
+                .and_then(Value::as_str)
+                == receipt.get("final_bookmark").and_then(Value::as_str);
+        if !exact_response {
             return Err(CliError::Input(
-                "completed poll child lacks its exact successful response artifact".to_owned(),
+                "completed poll child apply evidence does not match provider completion".to_owned(),
             ));
         }
         Ok(Some(boundary))
@@ -15097,6 +15140,14 @@ fn exact_resume_poll_exhaustion(
                     .pointer("/receipt/no_replay")
                     .and_then(Value::as_bool)
                     == Some(true)
+                && checkpoint
+                    .pointer("/receipt/outcome")
+                    .and_then(Value::as_str)
+                    == Some("poll_in_progress_exhausted")
+                && checkpoint
+                    .pointer("/receipt/receipt_available")
+                    .and_then(Value::as_bool)
+                    == Some(true)
         })
         .collect::<Vec<_>>();
     if exhausted.len() != 1 {
@@ -15105,13 +15156,70 @@ fn exact_resume_poll_exhaustion(
         ));
     }
     let (_, (hash, checkpoint)) = exhausted[0];
-    if store.read_evidence_value(hash)? != *checkpoint
-        || store
-            .read_evidence_value(accepted_hash)?
+    let accepted = store.read_evidence_value(accepted_hash)?;
+    let root_input_hash = hash_value(&root_input)?;
+    let accepted_exact = accepted.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && accepted.get("operation_id").and_then(Value::as_str) == Some(root_operation_id)
+        && accepted.get("step").and_then(Value::as_str) == Some("ingest_response")
+        && accepted.get("performed").and_then(Value::as_bool) == Some(true)
+        && accepted
+            .get("rectification_required")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && accepted
+            .pointer("/receipt/http_status")
+            .and_then(Value::as_u64)
+            == Some(200)
+        && accepted
+            .pointer("/receipt/success")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && accepted
+            .pointer("/receipt/response_action")
+            .and_then(Value::as_str)
+            == Some("ingest")
+        && accepted
+            .pointer("/receipt/provider")
+            .and_then(Value::as_str)
+            == Some("cloudflare")
+        && accepted.pointer("/receipt/effect").and_then(Value::as_str)
+            == Some("d1_import_ingest_accepted")
+        && accepted
+            .pointer("/receipt/migration_id")
+            .and_then(Value::as_str)
+            == Some(migration_id)
+        && accepted.pointer("/receipt/target") == Some(&target)
+        && accepted
+            .pointer("/receipt/plan_input_hash")
+            .and_then(Value::as_str)
+            == Some(root_input_hash.as_str())
+        && accepted
+            .pointer("/receipt/no_replay")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && accepted
+            .pointer("/receipt/result/type")
+            .and_then(Value::as_str)
+            == Some("import")
+        && matches!(
+            accepted
+                .pointer("/receipt/result/status")
+                .and_then(Value::as_str),
+            Some("active" | "pending")
+        )
+        && accepted
+            .pointer("/receipt/result/success")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && accepted
             .pointer("/receipt/result/at_bookmark")
             .and_then(Value::as_str)
-            != Some(accepted_bookmark)
-    {
+            == Some(accepted_bookmark)
+        && accepted
+            .pointer("/receipt/errors")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+    if store.read_evidence_value(hash)? != *checkpoint || !accepted_exact {
         return Err(CliError::Input(
             "poll continuation exhaustion or accepted-ingest evidence drifted".to_owned(),
         ));
@@ -21631,6 +21739,7 @@ mod tests {
         sync::{Arc, Barrier},
         thread,
     };
+    use uuid::Uuid;
 
     fn guide_json(capability: &CapabilityV1) -> Value {
         serde_json::to_value(guide_document(capability)).expect("typed capability guide JSON")
@@ -23100,7 +23209,8 @@ mod tests {
                         "status":"complete",
                         "success":true,
                         "at_bookmark":"accepted",
-                        "final_bookmark":"completed",
+                        "result":{"final_bookmark":"completed"},
+                        "_cfctl":completion["receipt"],
                     }),
                     errors: Vec::new(),
                     result_info: None,
@@ -23418,6 +23528,352 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    fn poll_test_evidence_path(store: &StateStore, hash: &str) -> PathBuf {
+        store
+            .paths()
+            .data_dir
+            .join("evidence")
+            .join(format!("{}.json", hash.trim_start_matches("sha256:")))
+    }
+
+    fn exact_poll_test_secret_artifact() -> Value {
+        json!({
+            "completed":true,
+            "failure":Value::Null,
+            "input_cleanup":{"required":false,"completed":true},
+            "output_sink":{"required":false,"completed":true,"create_new":false,
+                "format":Value::Null,
+                "unix_mode":if cfg!(unix) {
+                    Value::String("0600".to_owned())
+                } else {
+                    Value::Null
+                }},
+            "path":Value::Null,
+        })
+    }
+
+    fn rebind_poll_child_terminal_lifecycle(
+        store: &StateStore,
+        child: &mut PlanV1,
+        terminal_status: PlanStatus,
+        response_artifact: Value,
+    ) {
+        reset_poll_child_to_draft(child);
+        child.refresh_hash().expect("refresh rebound child");
+        child.approve(true, None).expect("approve rebound child");
+        child.mark_consumed().expect("consume rebound child");
+        child
+            .record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("rebound boundary attempt");
+        child.status = terminal_status;
+        child
+            .record_transaction_stage_with_artifact(
+                TransactionStageV1::BoundaryResponsePersisted,
+                response_artifact,
+            )
+            .expect("rebound boundary response");
+        child
+            .record_transaction_stage_with_artifact(
+                TransactionStageV1::SecretSinkPersisted,
+                exact_poll_test_secret_artifact(),
+            )
+            .expect("rebound secret lifecycle");
+        persist_rebound_poll_child(store, child);
+    }
+
+    fn rebind_completed_poll_child_apply_evidence(
+        fixture: &PollChildLineageFixture,
+        apply_response: &Value,
+    ) {
+        let mut child = fixture.children[0].clone();
+        let evidence = fixture
+            .store
+            .write_evidence(EvidenceClass::Apply, apply_response)
+            .expect("replacement apply evidence");
+        let mut response_artifact = child
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .expect("completion response artifact")
+            .clone();
+        response_artifact["apply_evidence_hash"] = json!(evidence.content_hash);
+        rebind_poll_child_terminal_lifecycle(
+            &fixture.store,
+            &mut child,
+            PlanStatus::Running,
+            response_artifact,
+        );
+    }
+
+    fn completed_poll_child_apply_response(fixture: &PollChildLineageFixture) -> Value {
+        let child = &fixture.children[0];
+        let hash = child
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .and_then(|artifact| artifact.get("apply_evidence_hash"))
+            .and_then(Value::as_str)
+            .expect("completion apply evidence hash");
+        fixture
+            .store
+            .read_evidence_value(hash)
+            .expect("completion apply evidence")
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_missing_or_corrupt_completion_apply_evidence() {
+        for corrupt in [false, true] {
+            let fixture = build_poll_child_lineage(1);
+            let child = &fixture.children[0];
+            let hash = child
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .and_then(|artifact| artifact.get("apply_evidence_hash"))
+                .and_then(Value::as_str)
+                .expect("completion apply evidence hash");
+            let path = poll_test_evidence_path(&fixture.store, hash);
+            if corrupt {
+                fs::write(path, b"{\"corrupt\":true}").expect("corrupt completion evidence");
+            } else {
+                fs::remove_file(path).expect("remove completion evidence");
+            }
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_grafted_or_semantically_drifted_completion_evidence() {
+        let mutations = [
+            ("/status", json!(202)),
+            ("/success", json!(false)),
+            ("/result/type", json!("export")),
+            ("/result/status", json!("active")),
+            ("/result/success", json!(false)),
+            ("/result/at_bookmark", json!("other")),
+            ("/result/result/final_bookmark", json!("other")),
+            ("/result/_cfctl/response_action", json!("init")),
+            ("/result/_cfctl/root_operation_id", json!(Uuid::new_v4())),
+            ("/result/_cfctl/final_bookmark", json!("other")),
+        ];
+        for (pointer, replacement) in mutations {
+            let fixture = build_poll_child_lineage(1);
+            let mut apply_response = completed_poll_child_apply_response(&fixture);
+            *apply_response
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing completion semantic pointer {pointer}")) =
+                replacement;
+            rebind_completed_poll_child_apply_evidence(&fixture, &apply_response);
+            assert!(
+                super::exact_linear_poll_child_provider_complete(
+                    &fixture.store,
+                    &fixture.root_plan
+                )
+                .is_err(),
+                "completion evidence drift at {pointer} must fail closed"
+            );
+        }
+
+        let fixture = build_poll_child_lineage(1);
+        let mut valid_other = completed_poll_child_apply_response(&fixture);
+        valid_other["result"]["_cfctl"]["root_operation_id"] = json!(Uuid::new_v4());
+        valid_other["result"]["_cfctl"]["parent_operation_id"] = json!(Uuid::new_v4());
+        rebind_completed_poll_child_apply_evidence(&fixture, &valid_other);
+        assert!(
+            super::exact_linear_poll_child_provider_complete(&fixture.store, &fixture.root_plan)
+                .is_err(),
+            "an otherwise valid response from another operation must not graft"
+        );
+    }
+
+    #[test]
+    fn poll_child_resolver_rejects_missing_or_corrupt_exhaustion_lineage_evidence() {
+        for evidence_kind in ["exhaustion", "accepted"] {
+            for corrupt in [false, true] {
+                let fixture = build_poll_child_lineage(2);
+                let exhausted = &fixture.children[0];
+                let artifact = exhausted
+                    .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                    .expect("exhaustion response artifact");
+                let hash = artifact
+                    .get(match evidence_kind {
+                        "exhaustion" => "poll_exhaustion_evidence_hash",
+                        _ => "accepted_ingest_evidence_hash",
+                    })
+                    .and_then(Value::as_str)
+                    .expect("lineage evidence hash");
+                let path = poll_test_evidence_path(&fixture.store, hash);
+                if corrupt {
+                    fs::write(path, b"{\"corrupt\":true}")
+                        .expect("corrupt exhaustion lineage evidence");
+                } else {
+                    fs::remove_file(path).expect("remove exhaustion lineage evidence");
+                }
+                assert!(
+                    super::exact_linear_poll_child_provider_complete(
+                        &fixture.store,
+                        &fixture.root_plan
+                    )
+                    .is_err(),
+                    "{evidence_kind} evidence must be authentic"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the matrix grafts every exhaustion and accepted-ingest semantic dimension"
+    )]
+    fn poll_child_resolver_rejects_grafted_or_semantically_drifted_exhaustion_evidence() {
+        let fixture = build_poll_child_lineage(2);
+        let mut exhausted = fixture.children[0].clone();
+        let unrelated = fixture
+            .store
+            .write_evidence(
+                EvidenceClass::Apply,
+                &json!({
+                    "schema_version":1,
+                    "operation_id":Uuid::new_v4(),
+                    "step":"ingest_response",
+                    "performed":true,
+                    "rectification_required":false,
+                    "receipt":{"result":{"at_bookmark":"accepted"}}
+                }),
+            )
+            .expect("grafted accepted evidence");
+        exhausted.targets["adapter"]["approved_mln_import_poll_resume"]["accepted_ingest_evidence_hash"] =
+            json!(unrelated.content_hash);
+        let exhaustion_hash = exhausted
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .and_then(|artifact| artifact.get("poll_exhaustion_evidence_hash"))
+            .and_then(Value::as_str)
+            .expect("exhaustion evidence hash")
+            .to_owned();
+        rebind_poll_child_terminal_lifecycle(
+            &fixture.store,
+            &mut exhausted,
+            PlanStatus::RectificationRequired,
+            json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":"poll_in_progress_exhausted",
+                "receipt_available":true,
+                "poll_exhaustion_evidence_hash":exhaustion_hash,
+                "accepted_ingest_evidence_hash":unrelated.content_hash,
+            }),
+        );
+        let current = fixture
+            .store
+            .load_plan_v2(&exhausted.operation_id)
+            .expect("rebound exhausted child");
+        assert!(
+            super::validate_canonical_poll_child_lifecycle(&fixture.store, &current).is_err(),
+            "semantically unrelated accepted evidence must not graft"
+        );
+
+        let fixture = build_poll_child_lineage(2);
+        let mut exhausted = fixture.children[0].clone();
+        let graft = fixture
+            .store
+            .write_evidence(EvidenceClass::Apply, &json!({"other":"exhaustion"}))
+            .expect("grafted exhaustion evidence");
+        let accepted_hash = exhausted
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .and_then(|artifact| artifact.get("accepted_ingest_evidence_hash"))
+            .and_then(Value::as_str)
+            .expect("accepted evidence hash")
+            .to_owned();
+        rebind_poll_child_terminal_lifecycle(
+            &fixture.store,
+            &mut exhausted,
+            PlanStatus::RectificationRequired,
+            json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":"poll_in_progress_exhausted",
+                "receipt_available":true,
+                "poll_exhaustion_evidence_hash":graft.content_hash,
+                "accepted_ingest_evidence_hash":accepted_hash,
+            }),
+        );
+        let current = fixture
+            .store
+            .load_plan_v2(&exhausted.operation_id)
+            .expect("rebound exhausted child");
+        assert!(
+            super::validate_canonical_poll_child_lifecycle(&fixture.store, &current).is_err(),
+            "a valid but unrelated exhaustion evidence object must not graft"
+        );
+
+        let fixture = build_poll_child_lineage(2);
+        let mut exhausted = fixture.children[0].clone();
+        let checkpoint_dir = fixture
+            .store
+            .paths()
+            .data_dir
+            .join("d1-import-checkpoints")
+            .join(&exhausted.operation_id);
+        let exhaustion_path = fs::read_dir(&checkpoint_dir)
+            .expect("exhaustion checkpoint directory")
+            .map(|entry| entry.expect("checkpoint entry").path())
+            .find(|path| {
+                fs::read(path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .and_then(|checkpoint| {
+                        checkpoint
+                            .get("step")
+                            .and_then(Value::as_str)
+                            .map(|step| step == "poll_in_progress_exhausted")
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("exhaustion checkpoint path");
+        let mut semantic_mismatch: Value = serde_json::from_slice(
+            &fs::read(&exhaustion_path).expect("read exhaustion checkpoint"),
+        )
+        .expect("decode exhaustion checkpoint");
+        fs::remove_file(exhaustion_path).expect("remove original exhaustion checkpoint");
+        semantic_mismatch["receipt"]["outcome"] = json!("different");
+        let exhaustion_hash = persist_poll_lineage_checkpoint(
+            &fixture.store,
+            &exhausted.operation_id,
+            &semantic_mismatch,
+        );
+        let accepted_hash = exhausted
+            .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+            .and_then(|artifact| artifact.get("accepted_ingest_evidence_hash"))
+            .and_then(Value::as_str)
+            .expect("accepted evidence hash")
+            .to_owned();
+        rebind_poll_child_terminal_lifecycle(
+            &fixture.store,
+            &mut exhausted,
+            PlanStatus::RectificationRequired,
+            json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":"poll_in_progress_exhausted",
+                "receipt_available":true,
+                "poll_exhaustion_evidence_hash":exhaustion_hash,
+                "accepted_ingest_evidence_hash":accepted_hash,
+            }),
+        );
+        let current = fixture
+            .store
+            .load_plan_v2(&exhausted.operation_id)
+            .expect("semantically drifted exhausted child");
+        assert!(
+            super::validate_canonical_poll_child_lifecycle(&fixture.store, &current).is_err(),
+            "semantically mismatched exhaustion evidence must fail closed"
+        );
     }
 
     #[test]
@@ -34524,13 +34980,27 @@ mod tests {
             .d1_approved_mln_import_poll_resume
             .clone()
             .expect("poll child contract");
+        let target = json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        });
+        let root_input = json!({"body":{"migration_id":"0143"}});
         let accepted = json!({
             "schema_version":1,
             "operation_id":"00000000-0000-4000-8000-000000000001",
             "step":"ingest_response",
             "performed":true,
             "rectification_required":false,
-            "receipt":{"result":{"at_bookmark":"accepted"}}
+            "receipt":{
+                "http_status":200,"success":true,"response_action":"ingest",
+                "provider":"cloudflare","effect":"d1_import_ingest_accepted",
+                "migration_id":"0143","target":target,
+                "plan_input_hash":hash_value(&root_input).expect("root input hash"),
+                "no_replay":false,
+                "result":{"type":"import","status":"active","success":true,
+                    "at_bookmark":"accepted"},
+                "errors":[]
+            }
         });
         let accepted_evidence = store
             .write_evidence(EvidenceClass::Apply, &accepted)
@@ -34561,16 +35031,12 @@ mod tests {
         plan.targets = json!({"adapter":{"approved_mln_import_poll_resume":{
             "root_operation_id":"00000000-0000-4000-8000-000000000001",
             "root_plan_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "root_input":{"body":{"migration_id":"0143"}},
+            "root_input":root_input,
             "root_stage":{"sha256":"sha256:source"},
             "accepted_ingest_evidence_hash":accepted_evidence.content_hash,
             "accepted_bookmark":"accepted"
         }}});
         plan.refresh_hash().expect("poll child hash");
-        let target = json!({
-            "account_id":contract.account_id,
-            "database_id":contract.database_id,
-        });
         let input_hash = hash_value(&plan.input).expect("input hash");
         for attempt in 1..=2 {
             let checkpoint = D1ImportCheckpointV1 {
