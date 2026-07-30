@@ -326,7 +326,14 @@ cfctl call d1-full-export \
 This is a read/export-only capability. It accepts no body, SQL, parameters,
 table filters, schema-only/data-only switches, apply input, or restore target.
 cfctl owns the provider polling body, bounds each polling response, and streams
-the completed signed download into a newly created mode-0600 file. The live-read
+the completed signed download into a newly created mode-0600 file. Output paths
+must be normalized, have an existing real-directory parent chain, contain no
+traversal or symlink components, and name a file that does not already exist.
+On Unix the final create also uses `O_NOFOLLOW`. The parent check and final open
+are separate filesystem operations, so callers must use a directory not writable
+by an untrusted concurrent local process. Any failure after file creation removes
+only that newly created file; a cleanup failure is surfaced instead of producing
+a success receipt. The live-read
 evidence binds the account and database identity, exact output path, SHA-256,
 byte count, file-exists/hash-match verification, and the provider filename and
 time-travel bookmark when returned. Cloudflare may temporarily make the

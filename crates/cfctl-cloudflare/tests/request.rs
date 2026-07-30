@@ -7846,6 +7846,98 @@ fn d1_full_export_builds_only_fixed_polling_body_and_rejects_caller_controls() {
     }
 }
 
+#[test]
+fn d1_full_export_rejects_every_execution_relevant_identity_drift() {
+    let input = d1_full_export_input();
+    let mut drifted = Vec::new();
+
+    let mut capability = d1_full_export_capability();
+    capability.account_scope = "zone".to_owned();
+    drifted.push(capability);
+
+    let mut capability = d1_full_export_capability();
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    drifted.push(capability);
+
+    let mut capability = d1_full_export_capability();
+    capability.selectors.push(SelectorV1 {
+        name: "x-grafted".to_owned(),
+        location: "header".to_owned(),
+        required: false,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    });
+    drifted.push(capability);
+
+    let mut capability = d1_full_export_capability();
+    capability.selectors.swap(0, 1);
+    drifted.push(capability);
+
+    let mut capability = d1_full_export_capability();
+    capability.selectors[0].required = false;
+    drifted.push(capability);
+
+    let mut capability = d1_full_export_capability();
+    capability.selectors[1]
+        .contract
+        .as_mut()
+        .expect("selector contract")
+        .schema = json!({"type":"string"});
+    drifted.push(capability);
+
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    for capability in drifted {
+        assert!(validate_request_contract(&capability, &input).is_err());
+        assert!(builder.build(&capability, &input).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn d1_full_export_rejects_unsafe_paths_before_server_contact() {
+    use std::os::unix::fs::symlink;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let root = tempfile::tempdir().expect("root");
+    let root = std::fs::canonicalize(root.path()).expect("canonical root");
+    let target = root.join("target");
+    std::fs::create_dir(&target).expect("target");
+    let linked = root.join("linked");
+    symlink(&target, &linked).expect("symlink");
+
+    for output in [
+        root.join("nested/../snapshot.sql"),
+        root.join("missing/snapshot.sql"),
+        linked.join("snapshot.sql"),
+    ] {
+        let error = Executor::new(
+            reqwest::Client::new(),
+            &format!("http://{address}/client/v4"),
+        )
+        .expect("executor")
+        .execute_read_to_file(
+            &d1_full_export_capability(),
+            &d1_full_export_input(),
+            &AuthCredential::Bearer {
+                token: "selected-token".to_owned(),
+            },
+            &output,
+        )
+        .await
+        .expect_err("unsafe path fails closed");
+        assert!(matches!(error, CloudflareError::OutputFile { .. }));
+        assert!(!output.exists());
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "path validation must happen before server contact"
+    );
+}
+
 #[tokio::test]
 async fn d1_full_export_polls_streams_and_verifies_same_path_hash() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
@@ -7885,7 +7977,9 @@ async fn d1_full_export_polls_streams_and_verifies_same_path_hash() {
         requests
     });
     let output_root = tempfile::tempdir().expect("output root");
-    let output = output_root.path().join("snapshot.sql");
+    let output = std::fs::canonicalize(output_root.path())
+        .expect("canonical output root")
+        .join("snapshot.sql");
     let response = Executor::new(
         reqwest::Client::new(),
         &format!("http://{address}/client/v4"),
@@ -7914,11 +8008,143 @@ async fn d1_full_export_polls_streams_and_verifies_same_path_hash() {
         std::fs::read_to_string(&output).expect("export file"),
         "CREATE TABLE users(id INTEGER);\nINSERT INTO users VALUES (1);\n"
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&output)
+                .expect("export metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
     let requests = server.await.expect("server");
     assert_eq!(requests.len(), 3);
     assert!(requests[0].contains("\"output_format\":\"polling\""));
     assert!(!requests[0].contains("sql"));
     assert!(requests[1].contains("\"current_bookmark\":\"bookmark-42\""));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn d1_full_export_rejects_existing_file_or_final_symlink_without_changes_or_contact() {
+    use std::os::unix::fs::symlink;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let root = tempfile::tempdir().expect("root");
+    let root = std::fs::canonicalize(root.path()).expect("canonical root");
+    let existing = root.join("existing.sql");
+    std::fs::write(&existing, "keep").expect("existing file");
+    let target = root.join("target.sql");
+    std::fs::write(&target, "target").expect("target file");
+    let linked = root.join("linked.sql");
+    symlink(&target, &linked).expect("final symlink");
+
+    for output in [&existing, &linked] {
+        Executor::new(
+            reqwest::Client::new(),
+            &format!("http://{address}/client/v4"),
+        )
+        .expect("executor")
+        .execute_read_to_file(
+            &d1_full_export_capability(),
+            &d1_full_export_input(),
+            &AuthCredential::Bearer {
+                token: "selected-token".to_owned(),
+            },
+            output,
+        )
+        .await
+        .expect_err("existing output fails closed");
+    }
+    assert_eq!(std::fs::read_to_string(existing).expect("existing"), "keep");
+    assert_eq!(std::fs::read_to_string(target).expect("target"), "target");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "existing output validation must happen before server contact"
+    );
+}
+
+#[tokio::test]
+async fn d1_full_export_removes_new_file_after_partial_stream_or_byte_overflow() {
+    for (download, declared_length, max_bytes) in [
+        ("partial", 100_usize, 1024_u64),
+        ("overflow", 8_usize, 4_u64),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            for (index, response) in [
+                format!(
+                    r#"{{"success":true,"result":{{"type":"export","status":"complete","success":true,"at_bookmark":"bookmark-42","result":{{"filename":"snapshot.sql","signed_url":"http://{address}/download"}}}}}}"#
+                ),
+                download.to_owned(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buffer = [0_u8; 4096];
+                let _read = socket.read(&mut buffer).await.expect("read");
+                let length = if index == 0 {
+                    response.len()
+                } else {
+                    declared_length
+                };
+                let content_type = if index == 0 {
+                    "application/json"
+                } else {
+                    "application/octet-stream"
+                };
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{response}"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write");
+            }
+        });
+        let root = tempfile::tempdir().expect("root");
+        let output = std::fs::canonicalize(root.path())
+            .expect("canonical root")
+            .join("snapshot.sql");
+        let mut capability = d1_full_export_capability();
+        capability
+            .d1_full_export
+            .as_mut()
+            .expect("export contract")
+            .max_bytes = max_bytes;
+        capability
+            .d1_full_export
+            .as_mut()
+            .expect("export contract")
+            .max_poll_attempts = 1;
+        Executor::new(
+            reqwest::Client::new(),
+            &format!("http://{address}/client/v4"),
+        )
+        .expect("executor")
+        .execute_read_to_file(
+            &capability,
+            &d1_full_export_input(),
+            &AuthCredential::Bearer {
+                token: "selected-token".to_owned(),
+            },
+            &output,
+        )
+        .await
+        .expect_err("failed stream must not retain output");
+        assert!(!output.exists(), "partial output must be removed");
+        server.await.expect("server");
+    }
 }
 
 fn d1_schema_input(body: Value) -> CallInput {

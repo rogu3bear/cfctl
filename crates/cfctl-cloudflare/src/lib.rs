@@ -5,17 +5,17 @@ use std::{
     fs::OpenOptions,
     io,
     net::{Ipv4Addr, Ipv6Addr},
-    path::Path,
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
 use cfctl_auth::AuthCredential;
 use cfctl_core::{
-    AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1, D1FullExportContractV1,
-    D1SchemaIntrospectionContractV1, GraphqlAnalyticsContractV1, OutputFormatV1, PaginationModeV1,
-    PlanStatus, PlanV1, R2LogRetrievalContractV1, ResponseBodyModeV1, ResponseContractV1,
-    RiskClass, SelectorV1, TimestampFormatV1, TransactionStageV1, hash_value,
-    request_header_is_reserved,
+    AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1, CapabilityV1,
+    D1FullExportContractV1, D1SchemaIntrospectionContractV1, GraphqlAnalyticsContractV1,
+    OutputFormatV1, PaginationModeV1, PlanStatus, PlanV1, R2LogRetrievalContractV1,
+    ResponseBodyModeV1, ResponseContractV1, RiskClass, SelectorContractV1, SelectorV1,
+    TimestampFormatV1, TransactionStageV1, hash_value, request_header_is_reserved,
 };
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
@@ -1310,10 +1310,11 @@ impl Executor {
         }
         if capability.d1_full_export.is_some() {
             let request = self.builder.build(capability, input)?;
+            let output_path = validate_d1_export_output_path(output_path)?;
             return Box::pin(self.execute_d1_full_export_to_file(
                 &request,
                 credential,
-                output_path,
+                &output_path,
             ))
             .await;
         }
@@ -4475,6 +4476,10 @@ async fn stream_r2_log_response(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the D1 export keeps streaming, cleanup, same-path verification, and its receipt in one fail-closed ownership boundary"
+)]
 async fn stream_d1_export_response(
     response: reqwest::Response,
     request: &PreparedRequest,
@@ -4488,74 +4493,100 @@ async fn stream_d1_export_response(
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    options.mode(0o600);
+    options.mode(0o600).custom_flags(o_nofollow());
     let file = options
         .open(output_path)
         .map_err(|source| CloudflareError::OutputFile {
             path: output_path.display().to_string(),
             source,
         })?;
-    let mut file = tokio::fs::File::from_std(file);
-    let mut stream = response.bytes_stream();
-    let mut hasher = Sha256::new();
-    let mut bytes_written = 0_u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        let remaining = contract.max_bytes.saturating_sub(bytes_written);
-        if chunk.len() as u64 > remaining {
-            return Err(CloudflareError::InvalidAnalyticsQuery(
-                "D1 export exceeded its governed byte bound; partial file retained".to_owned(),
-            ));
+    let mut cleanup = CreatedOutputGuard::new(output_path);
+    let result = async {
+        let mut file = tokio::fs::File::from_std(file);
+        let mut stream = response.bytes_stream();
+        let mut hasher = Sha256::new();
+        let mut bytes_written = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let remaining = contract.max_bytes.saturating_sub(bytes_written);
+            if chunk.len() as u64 > remaining {
+                return Err(CloudflareError::InvalidAnalyticsQuery(
+                    "D1 export exceeded its governed byte bound".to_owned(),
+                ));
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|source| CloudflareError::OutputFile {
+                    path: output_path.display().to_string(),
+                    source,
+                })?;
+            hasher.update(&chunk);
+            bytes_written += chunk.len() as u64;
         }
-        file.write_all(&chunk)
+        file.flush()
             .await
             .map_err(|source| CloudflareError::OutputFile {
                 path: output_path.display().to_string(),
                 source,
             })?;
-        hasher.update(&chunk);
-        bytes_written += chunk.len() as u64;
-    }
-    file.flush()
-        .await
-        .map_err(|source| CloudflareError::OutputFile {
-            path: output_path.display().to_string(),
-            source,
-        })?;
-    let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
-    let mut verification_file =
-        std::fs::File::open(output_path).map_err(|source| CloudflareError::OutputFile {
-            path: output_path.display().to_string(),
-            source,
-        })?;
-    let mut verification_hasher = Sha256::new();
-    let mut verification_bytes = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    loop {
-        let read = std::io::Read::read(&mut verification_file, &mut buffer).map_err(|source| {
-            CloudflareError::OutputFile {
+        drop(file);
+        let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+        let mut verification_file =
+            std::fs::File::open(output_path).map_err(|source| CloudflareError::OutputFile {
                 path: output_path.display().to_string(),
                 source,
+            })?;
+        let mut verification_hasher = Sha256::new();
+        let mut verification_bytes = 0_u64;
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+        loop {
+            let read =
+                std::io::Read::read(&mut verification_file, &mut buffer).map_err(|source| {
+                    CloudflareError::OutputFile {
+                        path: output_path.display().to_string(),
+                        source,
+                    }
+                })?;
+            if read == 0 {
+                break;
             }
-        })?;
-        if read == 0 {
-            break;
+            verification_hasher.update(&buffer[..read]);
+            verification_bytes += read as u64;
         }
-        verification_hasher.update(&buffer[..read]);
-        verification_bytes += read as u64;
+        let verification_digest = format!("sha256:{}", hex::encode(verification_hasher.finalize()));
+        if verification_bytes != bytes_written || verification_digest != digest {
+            return Err(CloudflareError::InvalidAnalyticsQuery(
+                "D1 export same-path hash verification failed".to_owned(),
+            ));
+        }
+        Ok((bytes_written, digest))
     }
-    let verification_digest = format!("sha256:{}", hex::encode(verification_hasher.finalize()));
-    let verified = verification_bytes == bytes_written && verification_digest == digest;
+    .await;
+    let (bytes_written, digest) = match result {
+        Ok(success) => {
+            cleanup.disarm();
+            success
+        }
+        Err(failure) => {
+            return match cleanup.remove() {
+                Ok(()) => Err(failure),
+                Err(cleanup) => Err(CloudflareError::InvalidAnalyticsQuery(format!(
+                    "{failure}; cleanup of newly-created `{}` failed: {cleanup}",
+                    output_path.display()
+                ))),
+            };
+        }
+    };
     Ok(CloudflareResponseV1 {
         status: 200,
-        success: verified,
+        success: true,
         result: serde_json::json!({
             "output_file": {
                 "path": output_path,
                 "sha256": digest,
                 "bytes": bytes_written,
                 "exists": true,
-                "hash_matches": verified,
+                "hash_matches": true,
                 "complete": true,
             },
             "database": {
@@ -4572,7 +4603,7 @@ async fn stream_d1_export_response(
         result_info: Some(serde_json::json!({
             "query": request.query_receipt,
             "output": {"bytes": bytes_written, "byte_limit": contract.max_bytes, "partial": false},
-            "verification": {"strategy":"same_output_file_exists_and_sha256_matches","passed":verified},
+            "verification": {"strategy":"same_output_file_exists_and_sha256_matches","passed":true},
         })),
         etag: None,
         cf_ray: None,
@@ -6527,6 +6558,9 @@ fn validate_d1_full_export_contract(capability: &CapabilityV1, input: &CallInput
         && capability.method == "POST"
         && capability.path == "/accounts/{account_id}/d1/database/{database_id}/export"
         && capability.product == "D1"
+        && capability.account_scope == "account"
+        && capability.adapter_status == AdapterStatus::Native
+        && capability.selectors == expected_d1_full_export_selectors()
         && !capability.mutating
         && capability.risk == RiskClass::Read
         && capability.effect == cfctl_core::EffectClass::ReadOnly
@@ -6553,6 +6587,147 @@ fn validate_d1_full_export_contract(capability: &CapabilityV1, input: &CallInput
         ));
     }
     Ok(())
+}
+
+fn expected_d1_full_export_selectors() -> Vec<SelectorV1> {
+    ["account_id", "database_id"]
+        .map(|name| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: None,
+            contract: Some(SelectorContractV1 {
+                schema: if name == "account_id" {
+                    serde_json::json!({"type":"string","minLength":32,"maxLength":32})
+                } else {
+                    serde_json::json!({"type":"string","minLength":36,"maxLength":36})
+                },
+                query: None,
+            }),
+        })
+        .to_vec()
+}
+
+fn validate_d1_export_output_path(output_path: &Path) -> Result<PathBuf> {
+    if output_path.file_name().is_none()
+        || output_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::CurDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(output_path_error(
+            output_path,
+            "D1 export output must be a normalized file path without traversal",
+        ));
+    }
+    let absolute = if output_path.is_absolute() {
+        output_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| CloudflareError::OutputFile {
+                path: output_path.display().to_string(),
+                source,
+            })?
+            .join(output_path)
+    };
+    let file_name = absolute
+        .file_name()
+        .ok_or_else(|| output_path_error(output_path, "D1 export output must name a file"))?;
+    let parent = absolute.parent().ok_or_else(|| {
+        output_path_error(
+            output_path,
+            "D1 export output must have an existing parent directory",
+        )
+    })?;
+    for ancestor in parent.ancestors() {
+        let metadata =
+            std::fs::symlink_metadata(ancestor).map_err(|source| CloudflareError::OutputFile {
+                path: output_path.display().to_string(),
+                source,
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(output_path_error(
+                output_path,
+                "D1 export output parent components must be real directories, not symlinks",
+            ));
+        }
+    }
+    match std::fs::symlink_metadata(&absolute) {
+        Ok(_) => {
+            return Err(CloudflareError::OutputFile {
+                path: output_path.display().to_string(),
+                source: io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "D1 export output must be a new file",
+                ),
+            });
+        }
+        Err(source) if source.kind() != io::ErrorKind::NotFound => {
+            return Err(CloudflareError::OutputFile {
+                path: output_path.display().to_string(),
+                source,
+            });
+        }
+        Err(_) => {}
+    }
+    let canonical_parent =
+        std::fs::canonicalize(parent).map_err(|source| CloudflareError::OutputFile {
+            path: output_path.display().to_string(),
+            source,
+        })?;
+    Ok(canonical_parent.join(file_name))
+}
+
+fn output_path_error(path: &Path, message: &str) -> CloudflareError {
+    CloudflareError::OutputFile {
+        path: path.display().to_string(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, message),
+    }
+}
+
+struct CreatedOutputGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl CreatedOutputGuard {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn remove(&mut self) -> io::Result<()> {
+        std::fs::remove_file(&self.path)?;
+        self.disarm();
+        Ok(())
+    }
+}
+
+impl Drop for CreatedOutputGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _cleanup = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+const fn o_nofollow() -> i32 {
+    0x0000_0100
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+const fn o_nofollow() -> i32 {
+    0x0002_0000
 }
 
 fn validate_response_contract(capability: &CapabilityV1) -> Result<()> {
