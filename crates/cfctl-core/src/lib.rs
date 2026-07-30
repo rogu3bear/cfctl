@@ -1009,7 +1009,12 @@ impl Mln0143DataInvariantsContractV1 {
                 "boundary":"governed_cfctl_runtime_provenance_not_hostile_filesystem_or_code_tamper_resistance",
             },
             "cross_operation_lineage":{
-                "pre_import":"independent",
+                "pre_import":{
+                    "authority":"current catalog, exact closed request and selectors, target, profile, credential generation, validator contract, and fixed query",
+                    "chronology":"verified 0142 closed before governed recovery export before selected pre_import proof before immutable 0143 plan cutoff",
+                    "cardinality":"exactly one current-authority proof in the post-export-to-plan window",
+                    "nonclaim":"ordered governed evidence does not prove absence of out-of-band provider writes"
+                },
                 "post_import_required":["import_operation_id","import_boundary_evidence_hash","import_source_sha256","import_plan_hash"],
                 "post_restore_required":[
                     "import_operation_id","import_boundary_evidence_hash","import_source_sha256","import_plan_hash",
@@ -1060,6 +1065,9 @@ pub struct D1ApprovedMlnMigrationV1 {
 pub struct D1ApprovedMlnImportContractV1 {
     pub repository_id: String,
     pub repository_head: String,
+    pub pre_import_capability_version: u8,
+    pub pre_import_validator_contract_hash: String,
+    pub pre_import_fixed_query_sha256: String,
     pub account_id: String,
     pub database_id: String,
     pub import_path: String,

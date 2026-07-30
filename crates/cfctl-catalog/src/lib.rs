@@ -1863,7 +1863,7 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
         "/accounts/{account_id}/d1/database/{database_id}/import",
     );
     capability.description = Some(
-        "Stage and import exactly MLNavigator migration 0142 or 0143. The reviewed source is one exact clean Git repository revision, relative path, and blob; local origin configuration establishes snapshot identity, not hosted ownership. The plan binds those reviewed source bytes, one governed full-export recovery anchor with its verified file and provider bookmark, and phase authority; provider completion remains unverified until the governed post-import proof is attached."
+        "Stage and import exactly MLNavigator migration 0142 or 0143. The reviewed source is one exact clean Git repository revision, relative path, and blob; local origin configuration establishes snapshot identity, not hosted ownership. For 0143, the shared admission and consumption gate requires verified 0142 closure, then the governed recovery export, then exactly one current-authority pre_import proof, all before the immutable plan cutoff. This is evidence chronology, not a claim that out-of-band provider writes were absent. The plan binds those reviewed source bytes, the recovery anchor with its verified file and provider bookmark, and phase authority; provider completion remains unverified until the governed post-import proof is attached."
             .to_owned(),
     );
     "D1".clone_into(&mut capability.product);
@@ -1964,9 +1964,15 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
         success_media_types: vec!["application/json".to_owned()],
         body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
     });
+    let invariant_contract = mln_0143_data_invariants_capability()
+        .mln_0143_data_invariants
+        .unwrap_or_else(|| unreachable!("native MLN invariant contract"));
     capability.d1_approved_mln_import = Some(cfctl_core::D1ApprovedMlnImportContractV1 {
         repository_id: "github.com/rogu3bear/mln-web".to_owned(),
         repository_head: "7cb0327c084ce956d728aa7d9df467cea8ed44fb".to_owned(),
+        pre_import_capability_version: invariant_contract.capability_version,
+        pre_import_validator_contract_hash: invariant_contract.validator_contract_hash,
+        pre_import_fixed_query_sha256: invariant_contract.fixed_query_sha256,
         account_id: account_id.to_owned(),
         database_id: database_id.to_owned(),
         import_path: capability.path.clone(),
@@ -2152,7 +2158,7 @@ fn mln_0143_data_invariants_capability() -> CapabilityV1 {
         post_table_definition_hash:
             "sha256:2fbdacd011abca8024507b99d179071b8b920271576e4cb3a2f06c4f3ffd2d7f".to_owned(),
         validator_contract_hash: String::new(),
-        capability_version: 3,
+        capability_version: 4,
         max_evidence_rows: 256,
         probe_rows: 257,
         max_bytes: 1024 * 1024,

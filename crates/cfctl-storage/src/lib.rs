@@ -1518,7 +1518,7 @@ fn validate_mln_0143_execution_binding(proof: &OperationalProofV1) -> Result<()>
     if binding.schema_version != 1
         || Uuid::parse_str(&binding.operation_id).is_err()
         || binding.capability_id != proof.capability_id
-        || binding.capability_version != 3
+        || binding.capability_version != 4
         || binding.catalog_hash != proof.catalog_hash
         || binding.manifest_evidence_hash != proof.evidence.content_hash
         || binding.request_hash != proof.input_hash

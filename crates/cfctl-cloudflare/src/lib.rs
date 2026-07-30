@@ -1003,7 +1003,7 @@ mod mln_0143_invariant_tests {
             post_table_definition_hash:
                 "sha256:2fbdacd011abca8024507b99d179071b8b920271576e4cb3a2f06c4f3ffd2d7f".to_owned(),
             validator_contract_hash: String::new(),
-            capability_version: 3,
+            capability_version: 4,
             max_evidence_rows: 256,
             probe_rows: 257,
             max_bytes: 1024 * 1024,
@@ -8417,7 +8417,7 @@ fn validate_mln_0143_data_invariants_contract(
         && contract
             .expected_validator_contract_hash()
             .is_ok_and(|hash| hash == contract.validator_contract_hash)
-        && contract.capability_version == 3
+        && contract.capability_version == 4
         && contract.max_evidence_rows == 256
         && contract.probe_rows == 257
         && (1..=1024 * 1024).contains(&contract.max_bytes)
@@ -8494,6 +8494,10 @@ fn validate_d1_restore_exact_bookmark_contract(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the closed repository, invariant authority, migration, target, and request identities remain visible as one fail-closed contract"
+)]
 fn validate_d1_approved_mln_import_contract(
     capability: &CapabilityV1,
     input: &CallInput,
@@ -8554,6 +8558,11 @@ fn validate_d1_approved_mln_import_contract(
         && keys == expected
         && contract.repository_id == "github.com/rogu3bear/mln-web"
         && contract.repository_head == "7cb0327c084ce956d728aa7d9df467cea8ed44fb"
+        && contract.pre_import_capability_version == 4
+        && contract.pre_import_validator_contract_hash
+            == "sha256:997bf74ac34c27b92581a7d3920939f3d33f0eaa0a2a10a658d53dd3fe6301f7"
+        && contract.pre_import_fixed_query_sha256
+            == "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d"
         && contract.migrations.len() == 2
         && contract.migrations[0].migration_id == "0142"
         && contract.migrations[0].basename == "0142_document_render_claim_generation.sql"
@@ -8698,6 +8707,11 @@ mod approved_mln_import_tests {
         D1ApprovedMlnImportContractV1 {
             repository_id: "github.com/rogu3bear/mln-web".to_owned(),
             repository_head: "7cb0327c084ce956d728aa7d9df467cea8ed44fb".to_owned(),
+            pre_import_capability_version: 4,
+            pre_import_validator_contract_hash:
+                "sha256:997bf74ac34c27b92581a7d3920939f3d33f0eaa0a2a10a658d53dd3fe6301f7".to_owned(),
+            pre_import_fixed_query_sha256:
+                "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d".to_owned(),
             account_id: "ca30e922fda7f5578e49873542e4aaca".to_owned(),
             database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
             import_path: "/accounts/{account_id}/d1/database/{database_id}/import".to_owned(),

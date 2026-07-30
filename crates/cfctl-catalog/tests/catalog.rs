@@ -10890,7 +10890,11 @@ fn native_control_overlay_adds_closed_pinned_mln_0143_invariant_read() {
         .expect("typed invariant contract");
     assert_eq!(contract.max_evidence_rows, 256);
     assert_eq!(contract.probe_rows, 257);
-    assert_eq!(contract.capability_version, 3);
+    assert_eq!(contract.capability_version, 4);
+    assert_eq!(
+        contract.validator_contract_hash,
+        "sha256:997bf74ac34c27b92581a7d3920939f3d33f0eaa0a2a10a658d53dd3fe6301f7"
+    );
     assert_eq!(
         contract
             .expected_validator_contract_hash()
@@ -10953,6 +10957,10 @@ fn native_control_overlay_adds_governed_full_d1_export_without_sql_or_restore() 
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the closed import catalog test keeps repository, invariant authority, target, and both migrations explicit"
+)]
 fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
     let mut snapshot = CatalogSnapshot {
         schema_version: 1,
@@ -10981,6 +10989,15 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
     assert_eq!(
         contract.repository_head,
         "7cb0327c084ce956d728aa7d9df467cea8ed44fb"
+    );
+    assert_eq!(contract.pre_import_capability_version, 4);
+    assert_eq!(
+        contract.pre_import_validator_contract_hash,
+        "sha256:997bf74ac34c27b92581a7d3920939f3d33f0eaa0a2a10a658d53dd3fe6301f7"
+    );
+    assert_eq!(
+        contract.pre_import_fixed_query_sha256,
+        "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d"
     );
     assert_eq!(contract.migrations.len(), 2);
     assert_eq!(

@@ -1869,55 +1869,6 @@ fn validate_approved_mln_import_prerequisites(
             "pre-0142 recovery anchor must be distinct from both import operations".to_owned(),
         ));
     }
-    let invariant_evidence_hash = body
-        .get("pre_import_invariant_evidence_hash")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CliError::Input("0143 requires pre_import_invariant_evidence_hash".to_owned())
-        })?;
-    store
-        .read_evidence_value(invariant_evidence_hash)
-        .map_err(|error| {
-            CliError::Input(format!(
-                "pre_import_invariant_evidence_hash does not resolve to immutable evidence: {error}"
-            ))
-        })?;
-    let invariant_operation = body
-        .get("pre_import_invariant_operation_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CliError::Input("0143 requires pre_import_invariant_operation_id".to_owned())
-        })?;
-    let invariant_hash = body
-        .get("pre_import_invariant_evidence_hash")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CliError::Input("0143 requires pre_import_invariant_evidence_hash".to_owned())
-        })?;
-    let exact_invariant_count = store
-        .list_operational_proofs()?
-        .into_iter()
-        .filter(|proof| {
-            proof.capability_id == "mln-0143-data-invariants"
-                && proof.evidence.content_hash == invariant_hash
-                && proof.mln_0143_governed_execution().is_some_and(|binding| {
-                    binding.operation_id == invariant_operation
-                        && binding.phase == "pre_import"
-                        && binding.target_scope_hash
-                            == hash_value(&json!({
-                                "account_id":contract.account_id,
-                                "database_id":contract.database_id,
-                            }))
-                            .unwrap_or_default()
-                })
-        })
-        .count();
-    if exact_invariant_count != 1 {
-        return Err(CliError::Input(
-            "0143 requires exactly one accepted current pre_import governed invariant proof"
-                .to_owned(),
-        ));
-    }
     let anchor_operation = body
         .get("post_0142_anchor_operation_id")
         .and_then(Value::as_str)
@@ -1981,7 +1932,48 @@ fn validate_approved_mln_import_prerequisites(
         after: Some(closed_at),
         before: cutoff,
     };
-    validate_exact_d1_recovery_anchor(store, &anchor_expectation)?;
+    let anchor_completed_at = validate_exact_d1_recovery_anchor(store, &anchor_expectation)?;
+    let invariant_operation = body
+        .get("pre_import_invariant_operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .ok_or_else(|| {
+            CliError::Input(
+                "0143 requires a canonical pre_import_invariant_operation_id".to_owned(),
+            )
+        })?;
+    let invariant_evidence_hash = required_body_string(body, "pre_import_invariant_evidence_hash")?;
+    store
+        .read_evidence_value(invariant_evidence_hash)
+        .map_err(|error| {
+            CliError::Input(format!(
+                "pre_import_invariant_evidence_hash does not resolve to immutable evidence: {error}"
+            ))
+        })?;
+    let invariant_request_hash = hash_value(&serde_json::to_value(CallInput {
+        selectors: input.selectors.clone(),
+        query: json!({}),
+        body: Some(json!({"migration_id":"0143","phase":"pre_import"})),
+        ..CallInput::default()
+    })?)?;
+    validate_exact_mln_0143_pre_import(
+        store,
+        &Mln0143PreImportExpectation {
+            operation_id: invariant_operation,
+            evidence_hash: invariant_evidence_hash,
+            catalog_hash: context.catalog_hash,
+            request_hash: &invariant_request_hash,
+            target_scope_hash: &expected_target_hash,
+            account_id: &contract.account_id,
+            profile_id: context.profile_id,
+            credential_generation_id: context.credential_generation_id,
+            capability_version: contract.pre_import_capability_version,
+            validator_contract_hash: &contract.pre_import_validator_contract_hash,
+            fixed_query_sha256: &contract.pre_import_fixed_query_sha256,
+            after: anchor_completed_at,
+            before: context.before,
+        },
+    )?;
     Ok(())
 }
 
@@ -2007,6 +1999,23 @@ struct D1RecoveryAnchorExpectation<'a> {
     profile_id: &'a str,
     credential_generation_id: Option<&'a str>,
     after: Option<chrono::DateTime<Utc>>,
+    before: chrono::DateTime<Utc>,
+}
+
+#[derive(Clone, Copy)]
+struct Mln0143PreImportExpectation<'a> {
+    operation_id: &'a str,
+    evidence_hash: &'a str,
+    catalog_hash: &'a str,
+    request_hash: &'a str,
+    target_scope_hash: &'a str,
+    account_id: &'a str,
+    profile_id: &'a str,
+    credential_generation_id: Option<&'a str>,
+    capability_version: u8,
+    validator_contract_hash: &'a str,
+    fixed_query_sha256: &'a str,
+    after: chrono::DateTime<Utc>,
     before: chrono::DateTime<Utc>,
 }
 
@@ -2046,15 +2055,88 @@ fn d1_recovery_anchor_matches(
 fn validate_exact_d1_recovery_anchor(
     store: &StateStore,
     expected: &D1RecoveryAnchorExpectation<'_>,
-) -> Result<()> {
+) -> Result<chrono::DateTime<Utc>> {
     let matches = store
         .list_operational_proofs()?
         .into_iter()
         .filter(|proof| d1_recovery_anchor_matches(proof, expected))
-        .count();
-    if matches != 1 {
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
         return Err(CliError::Input(
             "approved MLN import requires exactly one completed governed D1 full-export anchor bound to the exact operation, evidence, output, bookmark, catalog, input, target, profile, credential generation, and chronology"
+                .to_owned(),
+        ));
+    }
+    matches[0]
+        .d1_full_export_governed_execution()
+        .map(|binding| binding.completed_at)
+        .ok_or_else(|| CliError::Input("governed D1 export lost its execution binding".to_owned()))
+}
+
+fn mln_0143_pre_import_authority_matches(
+    proof: &OperationalProofV1,
+    expected: &Mln0143PreImportExpectation<'_>,
+) -> bool {
+    proof.mln_0143_governed_execution().is_some_and(|binding| {
+        let expected_profile_identity = hash_value(&json!({
+            "profile_id":expected.profile_id,
+            "credential_generation_id":expected.credential_generation_id,
+        }))
+        .ok();
+        proof.capability_id == "mln-0143-data-invariants"
+            && proof.outcome == OperationalProofOutcomeV1::Succeeded
+            && proof.evidence.class == EvidenceClass::LiveRead
+            && proof.catalog_hash == expected.catalog_hash
+            && binding.catalog_hash == expected.catalog_hash
+            && proof.input_hash == expected.request_hash
+            && binding.request_hash == expected.request_hash
+            && proof.account_id.as_deref() == Some(expected.account_id)
+            && proof.profile_id.as_deref() == Some(expected.profile_id)
+            && proof.credential_generation_id.as_deref() == expected.credential_generation_id
+            && Some(binding.credential_generation_id.as_str()) == expected.credential_generation_id
+            && Some(binding.profile_identity_hash.as_str()) == expected_profile_identity.as_deref()
+            && binding.capability_id == "mln-0143-data-invariants"
+            && binding.capability_version == expected.capability_version
+            && binding.validator_contract_hash == expected.validator_contract_hash
+            && binding.fixed_query_sha256 == expected.fixed_query_sha256
+            && binding.target_scope_hash == expected.target_scope_hash
+            && binding.phase == "pre_import"
+            && binding.completion_status == "completed"
+            && binding.cross_operation_lineage_hash.is_none()
+            && binding.completed_at == proof.observed_at
+            && binding.completed_at > expected.after
+            && binding.completed_at < expected.before
+    })
+}
+
+fn mln_0143_pre_import_matches(
+    proof: &OperationalProofV1,
+    expected: &Mln0143PreImportExpectation<'_>,
+) -> bool {
+    mln_0143_pre_import_authority_matches(proof, expected)
+        && proof.evidence.content_hash == expected.evidence_hash
+        && proof.mln_0143_governed_execution().is_some_and(|binding| {
+            binding.operation_id == expected.operation_id
+                && binding.manifest_evidence_hash == expected.evidence_hash
+        })
+}
+
+fn validate_exact_mln_0143_pre_import(
+    store: &StateStore,
+    expected: &Mln0143PreImportExpectation<'_>,
+) -> Result<()> {
+    let proofs = store.list_operational_proofs()?;
+    let current_authority = proofs
+        .iter()
+        .filter(|proof| mln_0143_pre_import_authority_matches(proof, expected))
+        .count();
+    let selected = proofs
+        .iter()
+        .filter(|proof| mln_0143_pre_import_matches(proof, expected))
+        .count();
+    if current_authority != 1 || selected != 1 {
+        return Err(CliError::Input(
+            "0143 requires exactly one selected completed pre_import proof bound to the current catalog, closed request, target, profile, credential generation, validator/query authority, and post-export-to-plan chronology; this ordered evidence does not prove absence of out-of-band provider writes"
                 .to_owned(),
         ));
     }
@@ -4736,7 +4818,7 @@ fn mln_0143_parent_manifests(
     let Some(contract) = capability.mln_0143_data_invariants.as_ref() else {
         return Ok(Vec::new());
     };
-    if contract.capability_version != 3
+    if contract.capability_version != 4
         || !contract
             .expected_validator_contract_hash()
             .is_ok_and(|hash| hash == contract.validator_contract_hash)
@@ -18787,10 +18869,11 @@ mod tests {
     use super::{
         CallInput, CliError, D1RecoveryAnchorExpectation, DNS_RECORD_DETAIL_PATH,
         DNS_RECORD_DETAIL_READ_CAPABILITY_ID, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
-        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, SECURITY_IP_RULE_COLLECTION_PATH,
-        SECURITY_IP_RULE_CREATE_ID, SECURITY_IP_RULE_STATE_CAPABILITY_ID,
-        SECURITY_LIST_MEMBER_COLLECTION_PATH, SECURITY_LIST_MEMBER_CREATE_ID,
-        SECURITY_LIST_MEMBER_REMOVE_ID, SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
+        Mln0143PreImportExpectation, OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority,
+        SECURITY_IP_RULE_COLLECTION_PATH, SECURITY_IP_RULE_CREATE_ID,
+        SECURITY_IP_RULE_STATE_CAPABILITY_ID, SECURITY_LIST_MEMBER_COLLECTION_PATH,
+        SECURITY_LIST_MEMBER_CREATE_ID, SECURITY_LIST_MEMBER_REMOVE_ID,
+        SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
         SECURITY_WAF_RULE_STATE_CAPABILITY_ID, TokenPolicyBinding, admit_standing_plan,
         apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
@@ -18808,7 +18891,8 @@ mod tests {
         guide_document, guide_stage_commands, http_client, is_live_plan_precondition_hash,
         is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
         list_security_action_state_receipt, mln_0142_terminal_import_state,
-        mln_0143_parent_manifests, non_readback_verification_basis,
+        mln_0143_parent_manifests, mln_0143_pre_import_authority_matches,
+        mln_0143_pre_import_matches, non_readback_verification_basis,
         normalize_reviewed_mln_repository_id, operational_proof_coverage,
         permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
         persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
@@ -18860,13 +18944,13 @@ mod tests {
         AsyncCollectionMutationContractV1, CapabilityV1, CostV1,
         CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
         CreatedResourceContractV1, D1FullExportGovernedExecutionBindingV1, EffectClass,
-        EntitlementProbeV1, EvidenceClass, EvidenceV1, OperationalProofOutcomeV1,
-        OperationalProofScopeV1, OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanPinsV2,
-        PlanStatus, PlanV1, PlanV2, QuerySerializationV1, ResultEnvelopeV2, RiskClass,
-        SECRET_FIELD_NAMES, SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
-        SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
-        StandingAuthorityV1, TransactionStageV1, VerificationState, WorkflowContractV1,
-        WorkflowStepV1, hash_value,
+        EntitlementProbeV1, EvidenceClass, EvidenceV1, Mln0143GovernedExecutionBindingV1,
+        OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, OutputFormatV1,
+        PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1, PlanV2, QuerySerializationV1,
+        ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1,
+        SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
+        SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
+        TransactionStageV1, VerificationState, WorkflowContractV1, WorkflowStepV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -19134,6 +19218,157 @@ mod tests {
         assert!(
             !d1_recovery_anchor_matches(&build(stale), &exact),
             "a pre-0142 export cannot serve as the post-0142 anchor"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the adversarial fixture keeps every pre-import authority and chronology dimension visible"
+    )]
+    fn mln_0143_pre_import_requires_one_current_authority_proof_after_recovery_anchor() {
+        let after = Utc::now();
+        let completed_at = after + ChronoDuration::seconds(10);
+        let before = completed_at + ChronoDuration::seconds(10);
+        let evidence = EvidenceV1::new(
+            EvidenceClass::LiveRead,
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "/tmp/pre-import-evidence.json",
+        );
+        let binding = Mln0143GovernedExecutionBindingV1 {
+            schema_version: 1,
+            operation_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            capability_id: "mln-0143-data-invariants".to_owned(),
+            capability_version: 4,
+            validator_contract_hash:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            fixed_query_sha256:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            catalog_hash: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .to_owned(),
+            target_scope_hash:
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            phase: "pre_import".to_owned(),
+            manifest_evidence_hash: evidence.content_hash.clone(),
+            request_hash: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                .to_owned(),
+            profile_identity_hash: hash_value(&json!({
+                "profile_id":"profile-a",
+                "credential_generation_id":"22222222-2222-4222-8222-222222222222",
+            }))
+            .expect("profile identity"),
+            credential_generation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            completion_status: "completed".to_owned(),
+            completed_at,
+            cross_operation_lineage_hash: None,
+        };
+        let build = |binding: Mln0143GovernedExecutionBindingV1| {
+            let mut proof = OperationalProofV1::new(
+                binding.completed_at,
+                "mln-0143-data-invariants",
+                &binding.catalog_hash,
+                &binding.request_hash,
+                OperationalProofScopeV1::new(
+                    Some("profile-a"),
+                    Some("account-a"),
+                    Some("22222222-2222-4222-8222-222222222222"),
+                ),
+                OperationalProofOutcomeV1::Succeeded,
+                evidence.clone(),
+            );
+            proof
+                .bind_mln_0143_governed_execution(binding)
+                .expect("valid pre-import binding");
+            proof
+        };
+        let proof = build(binding.clone());
+        let exact = Mln0143PreImportExpectation {
+            operation_id: &binding.operation_id,
+            evidence_hash: &binding.manifest_evidence_hash,
+            catalog_hash: &binding.catalog_hash,
+            request_hash: &binding.request_hash,
+            target_scope_hash: &binding.target_scope_hash,
+            account_id: "account-a",
+            profile_id: "profile-a",
+            credential_generation_id: Some(&binding.credential_generation_id),
+            capability_version: binding.capability_version,
+            validator_contract_hash: &binding.validator_contract_hash,
+            fixed_query_sha256: &binding.fixed_query_sha256,
+            after,
+            before,
+        };
+        assert!(mln_0143_pre_import_matches(&proof, &exact));
+        assert_eq!(
+            [proof.clone(), proof.clone()]
+                .iter()
+                .filter(|candidate| mln_0143_pre_import_authority_matches(candidate, &exact))
+                .count(),
+            2,
+            "duplicate or intervening current-authority proofs must invalidate admission"
+        );
+        for drifted in [
+            Mln0143PreImportExpectation {
+                operation_id: "33333333-3333-4333-8333-333333333333",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                evidence_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                catalog_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                request_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                target_scope_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                profile_id: "other-profile",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                credential_generation_id: Some("33333333-3333-4333-8333-333333333333"),
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                capability_version: 3,
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                validator_contract_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                fixed_query_sha256: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                after: completed_at,
+                ..exact
+            },
+            Mln0143PreImportExpectation {
+                before: completed_at,
+                ..exact
+            },
+        ] {
+            assert!(!mln_0143_pre_import_matches(&proof, &drifted));
+        }
+        let mut stale = binding.clone();
+        stale.completed_at = after - ChronoDuration::seconds(1);
+        assert!(
+            !mln_0143_pre_import_matches(&build(stale), &exact),
+            "a proof before 0142 closure or the recovery anchor must fail"
+        );
+        let mut after_plan = binding.clone();
+        after_plan.completed_at = before + ChronoDuration::seconds(1);
+        assert!(
+            !mln_0143_pre_import_matches(&build(after_plan), &exact),
+            "a proof after the immutable plan cutoff must fail"
         );
     }
 
