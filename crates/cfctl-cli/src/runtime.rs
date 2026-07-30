@@ -13230,6 +13230,94 @@ struct DurableProviderCompleteBoundary {
     checkpoint: Value,
 }
 
+fn trusted_native_capability(capability_id: &str) -> Result<CapabilityV1> {
+    let mut trusted_catalog = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "native://control".to_owned(),
+        source_hash: "sha256:native-control".to_owned(),
+        schema_hash: String::new(),
+        capabilities: BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut trusted_catalog)?;
+    trusted_catalog
+        .capabilities
+        .remove(capability_id)
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "trusted native capability declaration `{capability_id}` is missing"
+            ))
+        })
+}
+
+fn validate_trusted_root_import_plan(plan_v2: &PlanV2) -> Result<()> {
+    plan_v2.validate()?;
+    let plan = &plan_v2.plan;
+    let trusted = trusted_native_capability("d1-import-approved-mln-migration")?;
+    if plan.capability != trusted
+        || plan_v2.pins.catalog_hash != plan.catalog_hash
+        || plan.precondition_hashes.get("catalog") != Some(&plan.catalog_hash)
+    {
+        return Err(CliError::Input(
+            "approved MLN import does not match the trusted native catalog declaration".to_owned(),
+        ));
+    }
+    let contract = trusted
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("trusted import contract is missing".to_owned()))?;
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let migration_id = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("trusted import migration id is missing".to_owned()))?;
+    let migration = contract
+        .migrations
+        .iter()
+        .find(|migration| migration.migration_id == migration_id)
+        .ok_or_else(|| CliError::Input("trusted import migration is not catalogued".to_owned()))?;
+    let stage = plan
+        .targets
+        .pointer("/adapter/approved_mln_import")
+        .ok_or_else(|| CliError::Input("trusted import managed stage is missing".to_owned()))?;
+    let source = stage
+        .get("source_authority")
+        .ok_or_else(|| CliError::Input("trusted import source authority is missing".to_owned()))?;
+    let target = json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    });
+    let source_hash = hash_value(source)?;
+    if plan.account_id != contract.account_id
+        || stage.get("migration_id").and_then(Value::as_str) != Some(migration_id)
+        || stage.get("catalog_basename").and_then(Value::as_str)
+            != Some(migration.basename.as_str())
+        || stage.get("bytes").and_then(Value::as_u64) != Some(migration.bytes)
+        || stage.get("sha256").and_then(Value::as_str)
+            != Some(format!("sha256:{}", migration.sha256).as_str())
+        || stage.get("md5").and_then(Value::as_str) != Some(migration.md5.as_str())
+        || stage.get("target") != Some(&target)
+        || stage.get("source_authority_hash").and_then(Value::as_str) != Some(source_hash.as_str())
+        || source.get("repository_id").and_then(Value::as_str)
+            != Some(contract.repository_id.as_str())
+        || source.get("head").and_then(Value::as_str) != Some(contract.repository_head.as_str())
+        || source
+            .get("repository_relative_path")
+            .and_then(Value::as_str)
+            != Some(migration.repository_relative_path.as_str())
+        || source.get("git_blob_oid").and_then(Value::as_str)
+            != Some(migration.git_blob_oid.as_str())
+    {
+        return Err(CliError::Input(
+            "approved MLN import source authority or managed stage drifted from the trusted migration"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "canonical child admission joins journal, response, evidence, and terminal outcome"
@@ -13389,6 +13477,7 @@ fn exact_durable_provider_complete_boundary(
         ));
     };
     let plan = &plan_v2.plan;
+    validate_trusted_root_import_plan(&plan_v2)?;
     if plan.operation_id != operation_id
         || plan.profile_id.is_empty()
         || plan.catalog_hash.is_empty()
@@ -13608,23 +13697,10 @@ fn exact_linear_poll_child_provider_complete(
     store: &StateStore,
     root: &PlanV1,
 ) -> Result<DurableProviderCompleteBoundary> {
-    let mut trusted_catalog = CatalogSnapshot {
-        schema_version: 1,
-        generated_at: Utc::now(),
-        source_url: "native://control".to_owned(),
-        source_hash: "sha256:native-control".to_owned(),
-        schema_hash: String::new(),
-        capabilities: BTreeMap::new(),
-    };
-    ingest_native_control_capabilities(&mut trusted_catalog)?;
-    let canonical_capability = trusted_catalog
-        .capabilities
-        .remove("d1-resume-approved-mln-import-poll")
-        .ok_or_else(|| {
-            CliError::Input("trusted poll continuation declaration is missing".to_owned())
-        })?;
+    let canonical_capability = trusted_native_capability("d1-resume-approved-mln-import-poll")?;
     let canonical_contract_hash = hash_value(&serde_json::to_value(&canonical_capability)?)?;
     let root_v2 = store.load_plan_v2(&root.operation_id)?;
+    validate_trusted_root_import_plan(&root_v2)?;
     if root_v2.plan != *root {
         return Err(CliError::Input(
             "root import projection does not match its canonical PlanV2".to_owned(),
@@ -15571,6 +15647,7 @@ fn validate_and_derive_resume_poll_authority(
         ));
     }
     let exhaustion = if parent.capability.id == contract.root_capability_id {
+        validate_trusted_root_import_plan(&parent_v2)?;
         let (exhaustion_evidence, exhaustion_checkpoint, accepted_ingest_evidence) =
             exact_durable_poll_exhaustion(store, parent)?;
         let accepted_bookmark = exhaustion_checkpoint
@@ -22290,6 +22367,236 @@ mod tests {
     #[test]
     #[expect(
         clippy::too_many_lines,
+        reason = "the matrix coordinates root source authority, stage, checkpoints, child lineage, and evidence"
+    )]
+    fn poll_child_resolver_rejects_recomputed_valid_root_source_authority_grafts() {
+        let positive = build_poll_child_lineage(1);
+        let positive_root = positive
+            .store
+            .load_plan_v2(&positive.root_plan.operation_id)
+            .expect("canonical positive root");
+        super::validate_trusted_root_import_plan(&positive_root).expect("trusted positive root");
+        super::exact_linear_poll_child_provider_complete(&positive.store, &positive.root_plan)
+            .expect("positive root-to-child completion");
+
+        for graft in [
+            "repository_head",
+            "repository_id",
+            "migration_path_blob",
+            "migration_digest",
+            "migration_bytes",
+        ] {
+            let fixture = build_poll_child_lineage(1);
+            let mut root = fixture.root_plan.clone();
+            let contract = root
+                .capability
+                .d1_approved_mln_import
+                .as_mut()
+                .expect("root import contract");
+            let migration = contract
+                .migrations
+                .iter_mut()
+                .find(|migration| migration.migration_id == "0143")
+                .expect("0143 migration");
+            let stage = root
+                .targets
+                .pointer_mut("/adapter/approved_mln_import")
+                .expect("root stage");
+            match graft {
+                "repository_head" => {
+                    contract.repository_head =
+                        "1111111111111111111111111111111111111111".to_owned();
+                    stage["source_authority"]["head"] = json!(contract.repository_head);
+                }
+                "repository_id" => {
+                    contract.repository_id = "grafted/mln-web".to_owned();
+                    stage["source_authority"]["repository_id"] = json!(contract.repository_id);
+                }
+                "migration_path_blob" => {
+                    migration.repository_relative_path =
+                        "grafted/0143_advisor_final_equity_instrument.sql".to_owned();
+                    migration.git_blob_oid = "2222222222222222222222222222222222222222".to_owned();
+                    stage["source_authority"]["repository_relative_path"] =
+                        json!(migration.repository_relative_path);
+                    stage["source_authority"]["git_blob_oid"] = json!(migration.git_blob_oid);
+                }
+                "migration_digest" => {
+                    migration.sha256 = "33".repeat(32);
+                    migration.md5 = "44".repeat(16);
+                    stage["sha256"] = json!(format!("sha256:{}", migration.sha256));
+                    stage["md5"] = json!(migration.md5);
+                }
+                "migration_bytes" => {
+                    migration.bytes = migration.bytes.saturating_add(1);
+                    stage["bytes"] = json!(migration.bytes);
+                }
+                _ => unreachable!("closed root graft matrix"),
+            }
+            stage["source_authority_hash"] =
+                json!(hash_value(&stage["source_authority"]).expect("grafted authority hash"));
+            let stage = stage.clone();
+            root.refresh_hash().expect("grafted root hash");
+            let root_pins = fixture
+                .store
+                .load_plan_v2(&root.operation_id)
+                .expect("canonical root")
+                .pins;
+            persist_poll_test_plan_v2(&fixture.store, &root, root_pins);
+
+            let root_checkpoint_dir = fixture
+                .store
+                .paths()
+                .data_dir
+                .join("d1-import-checkpoints")
+                .join(&root.operation_id);
+            let root_checkpoints = fixture
+                .store
+                .read_d1_import_checkpoints(&root.operation_id)
+                .expect("root checkpoints");
+            for entry in fs::read_dir(&root_checkpoint_dir).expect("root checkpoint directory") {
+                fs::remove_file(entry.expect("root checkpoint entry").path())
+                    .expect("remove root checkpoint");
+            }
+            let mut accepted_hash = None;
+            let mut exhaustion_hash = None;
+            for (_, mut checkpoint) in root_checkpoints {
+                if checkpoint.get("step").and_then(Value::as_str)
+                    == Some("poll_in_progress_exhausted")
+                {
+                    checkpoint["receipt"]["source_sha256"] = stage["sha256"].clone();
+                }
+                let step = checkpoint
+                    .get("step")
+                    .and_then(Value::as_str)
+                    .expect("root checkpoint step")
+                    .to_owned();
+                let hash = persist_poll_lineage_checkpoint(
+                    &fixture.store,
+                    &root.operation_id,
+                    &checkpoint,
+                );
+                if step == "ingest_response" {
+                    accepted_hash = Some(hash.clone());
+                }
+                if step == "poll_in_progress_exhausted" {
+                    exhaustion_hash = Some(hash);
+                }
+            }
+            let accepted_hash = accepted_hash.expect("accepted evidence hash");
+            let exhaustion_hash = exhaustion_hash.expect("exhaustion evidence hash");
+
+            let mut child = fixture.children[0].clone();
+            let authority = child
+                .targets
+                .pointer_mut("/adapter/approved_mln_import_poll_resume")
+                .expect("child authority");
+            authority["root_plan_hash"] = json!(root.content_hash);
+            authority["parent_plan_hash"] = json!(root.content_hash);
+            authority["parent_exhaustion_evidence_hash"] = json!(exhaustion_hash);
+            authority["accepted_ingest_evidence_hash"] = json!(accepted_hash);
+            authority["root_input"] = root.input.clone();
+            authority["root_stage"] = stage.clone();
+            let mut input: CallInput =
+                serde_json::from_value(child.input.clone()).expect("child input");
+            let body = input
+                .body
+                .as_mut()
+                .and_then(Value::as_object_mut)
+                .expect("child input body");
+            body.insert("parent_plan_hash".to_owned(), json!(root.content_hash));
+            body.insert(
+                "exhaustion_evidence_hash".to_owned(),
+                json!(exhaustion_hash),
+            );
+            body.insert(
+                "accepted_ingest_evidence_hash".to_owned(),
+                json!(accepted_hash),
+            );
+            child.input = serde_json::to_value(input).expect("rebound child input");
+
+            let checkpoint_dir = fixture
+                .store
+                .paths()
+                .data_dir
+                .join("d1-import-checkpoints")
+                .join(&child.operation_id);
+            let child_checkpoints = fixture
+                .store
+                .read_d1_import_checkpoints(&child.operation_id)
+                .expect("child checkpoints");
+            for entry in fs::read_dir(&checkpoint_dir).expect("child checkpoint directory") {
+                fs::remove_file(entry.expect("child checkpoint entry").path())
+                    .expect("remove child checkpoint");
+            }
+            let child_input_hash = hash_value(&child.input).expect("child input hash");
+            let mut completion = None;
+            for (_, mut checkpoint) in child_checkpoints {
+                checkpoint["receipt"]["plan_input_hash"] = json!(child_input_hash);
+                if checkpoint.get("step").and_then(Value::as_str) == Some("provider_complete") {
+                    checkpoint["receipt"]["source_sha256"] = stage["sha256"].clone();
+                    checkpoint["receipt"]["source_md5"] = stage["md5"].clone();
+                    checkpoint["receipt"]["source_bytes"] = stage["bytes"].clone();
+                    checkpoint["receipt"]["source_authority_hash"] =
+                        stage["source_authority_hash"].clone();
+                    checkpoint["receipt"]["stage_identity_hash"] =
+                        json!(hash_value(&stage).expect("grafted stage hash"));
+                    checkpoint["receipt"]["root_plan_hash"] = json!(root.content_hash);
+                    checkpoint["receipt"]["parent_exhaustion_evidence_hash"] =
+                        json!(exhaustion_hash);
+                    completion = Some(checkpoint.clone());
+                }
+                persist_poll_lineage_checkpoint(&fixture.store, &child.operation_id, &checkpoint);
+            }
+            let completion = completion.expect("rebound completion");
+            let mut apply_response = completed_poll_child_apply_response(&fixture);
+            apply_response["result"]["_cfctl"] = completion["receipt"].clone();
+            apply_response["result"]["at_bookmark"] = completion["receipt"]["at_bookmark"].clone();
+            apply_response["result"]["result"]["final_bookmark"] =
+                completion["receipt"]["final_bookmark"].clone();
+            let apply = fixture
+                .store
+                .write_evidence(EvidenceClass::Apply, &apply_response)
+                .expect("rebound completion evidence");
+            let mut response_artifact = child
+                .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                .expect("child response artifact")
+                .clone();
+            response_artifact["apply_evidence_hash"] = json!(apply.content_hash);
+            rebuild_poll_child_terminal_lifecycle(
+                &mut child,
+                PlanStatus::Running,
+                response_artifact,
+            );
+            let child_pins = fixture
+                .store
+                .load_plan_v2(&child.operation_id)
+                .expect("canonical child")
+                .pins;
+            persist_poll_test_plan_v2(&fixture.store, &child, child_pins);
+
+            let grafted_root = fixture
+                .store
+                .load_plan_v2(&root.operation_id)
+                .expect("grafted root PlanV2");
+            assert!(
+                super::validate_trusted_root_import_plan(&grafted_root).is_err(),
+                "{graft} must fail direct trusted-root admission"
+            );
+            assert!(
+                super::exact_durable_provider_complete_boundary(&fixture.store, &root.operation_id)
+                    .is_err(),
+                "{graft} must fail direct completion resolution"
+            );
+            assert!(
+                super::exact_linear_poll_child_provider_complete(&fixture.store, &root).is_err(),
+                "{graft} must fail root-to-child completion resolution"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
         reason = "the adversarial anchor fixture keeps every joined authority dimension visible"
     )]
     fn mln_import_anchor_requires_the_exact_governed_export_join() {
@@ -23334,15 +23641,15 @@ mod tests {
             capabilities: BTreeMap::new(),
         };
         ingest_native_control_capabilities(&mut catalog).expect("native overlay");
-        let mut root_capability = catalog
+        let root_capability = catalog
             .capabilities
             .remove("d1-import-approved-mln-migration")
             .expect("root import capability");
-        root_capability
+        let root_poll_bound = root_capability
             .d1_approved_mln_import
-            .as_mut()
+            .as_ref()
             .expect("root contract")
-            .max_poll_attempts = 1;
+            .max_poll_attempts;
         let child_capability = catalog
             .capabilities
             .remove("d1-resume-approved-mln-import-poll")
@@ -23378,6 +23685,9 @@ mod tests {
             ..CallInput::default()
         })
         .expect("root input");
+        root_plan
+            .precondition_hashes
+            .insert("catalog".to_owned(), root_plan.catalog_hash.clone());
         let source_authority = json!({
             "schema_version":1,
             "repository_id":root_contract.repository_id,
@@ -23440,24 +23750,26 @@ mod tests {
         });
         let accepted_hash =
             persist_poll_lineage_checkpoint(&store, &root_plan.operation_id, &accepted);
-        let root_poll = json!({
-            "schema_version":1,
-            "operation_id":root_plan.operation_id,
-            "step":"poll_response_1",
-            "performed":true,
-            "rectification_required":false,
-            "receipt":{
-                "http_status":200,"success":true,"response_action":"poll",
-                "provider":"cloudflare","effect":"d1_import_response",
-                "migration_id":"0143","target":target,"plan_input_hash":root_input_hash,
-                "result":{"type":"import","status":"active","success":true,
-                    "at_bookmark":"accepted","result":{"final_bookmark":null},
-                    "provider_error_present":false},
-                "errors":[],"provider_errors_present":false,"no_replay":false,
-                "etag_present":false,"etag_sha256":null,"cf_ray":null
-            }
-        });
-        persist_poll_lineage_checkpoint(&store, &root_plan.operation_id, &root_poll);
+        for attempt in 1..=root_poll_bound {
+            let root_poll = json!({
+                "schema_version":1,
+                "operation_id":root_plan.operation_id,
+                "step":format!("poll_response_{attempt}"),
+                "performed":true,
+                "rectification_required":false,
+                "receipt":{
+                    "http_status":200,"success":true,"response_action":"poll",
+                    "provider":"cloudflare","effect":"d1_import_response",
+                    "migration_id":"0143","target":target,"plan_input_hash":root_input_hash,
+                    "result":{"type":"import","status":"active","success":true,
+                        "at_bookmark":"accepted","result":{"final_bookmark":null},
+                        "provider_error_present":false},
+                    "errors":[],"provider_errors_present":false,"no_replay":false,
+                    "etag_present":false,"etag_sha256":null,"cf_ray":null
+                }
+            });
+            persist_poll_lineage_checkpoint(&store, &root_plan.operation_id, &root_poll);
+        }
         let root_exhaustion = json!({
             "schema_version":1,
             "operation_id":root_plan.operation_id,
@@ -23468,7 +23780,7 @@ mod tests {
                 "provider":"cloudflare","effect":"d1_import_poll_in_progress_exhausted",
                 "migration_id":"0143","target":target,"plan_input_hash":root_input_hash,
                 "source_sha256":root_stage["sha256"],"at_bookmark":"accepted",
-                "attempt_count":1,"attempt_bound":1,
+                "attempt_count":root_poll_bound,"attempt_bound":root_poll_bound,
                 "outcome":"poll_in_progress_exhausted","receipt_available":true,"no_replay":true
             }
         });
