@@ -198,13 +198,28 @@ async fn d1_restore_prechecks_posts_once_and_postchecks_exact_returned_bookmark(
         "current-7"
     );
     assert_eq!(
-        response.result["_cfctl"]["post_restore_bookmark"],
-        "restored-8"
-    );
-    assert_eq!(
         response.result["_cfctl"]["source_operation_id"],
         "source-op"
     );
+    assert_eq!(response.result["_cfctl"]["verified"], false);
+    let verification = Executor::new(reqwest::Client::new(), &format!("http://{address}"))
+        .expect("executor")
+        .verify_plan_with_input(
+            &plan,
+            &response,
+            &input,
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+        )
+        .await
+        .expect("verification");
+    assert!(verification.passed);
+    assert_eq!(
+        verification.readback.result["_cfctl"]["post_restore_bookmark"],
+        "restored-8"
+    );
+    assert_eq!(verification.readback.result["_cfctl"]["verified"], true);
     let requests = server.await.expect("server");
     assert_eq!(requests.len(), 3);
     assert!(requests[0].starts_with("GET "));
@@ -213,6 +228,72 @@ async fn d1_restore_prechecks_posts_once_and_postchecks_exact_returned_bookmark(
     assert!(requests[1].contains(r#"{"bookmark":"target-1"}"#));
     assert!(!requests[1].contains("source_operation_id"));
     assert!(!requests[1].contains("expected_current_bookmark"));
+}
+
+#[tokio::test]
+async fn d1_restore_preserves_success_response_when_post_read_fails() {
+    let (address, server) = json_response_sequence_server(vec![
+        r#"{"success":true,"result":{"bookmark":"current-7"},"errors":[]}"#,
+        r#"{"success":true,"result":{"bookmark":"restored-8","message":"Database restored","previous_bookmark":"current-7"},"errors":[]}"#,
+    ])
+    .await;
+    let capability = d1_restore_exact_bookmark_capability();
+    let input = CallInput {
+        selectors: json!({
+            "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "database_id":"11111111-2222-3333-4444-555555555555"
+        }),
+        body: Some(json!({
+            "target_bookmark":"target-1",
+            "expected_current_bookmark":"current-7",
+            "source_operation_id":"source-op",
+            "source_evidence_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        })),
+        ..CallInput::default()
+    };
+    let mut plan = PlanV1::draft(
+        "profile",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:catalog",
+        capability,
+        json!({}),
+    )
+    .expect("draft plan");
+    plan.input = serde_json::to_value(&input).expect("plan input");
+    plan.refresh_hash().expect("refresh plan");
+    plan.approve(true, None).expect("approve plan");
+    plan.mark_consumed().expect("consume plan");
+    let executor =
+        Executor::new(reqwest::Client::new(), &format!("http://{address}")).expect("executor");
+    let response = executor
+        .execute_consumed_plan_with_input(
+            &mut plan,
+            "sha256:catalog",
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+            &input,
+        )
+        .await
+        .expect("successful POST response");
+    assert_eq!(server.await.expect("server").len(), 2);
+    let error = executor
+        .verify_plan_with_input(
+            &plan,
+            &response,
+            &input,
+            &AuthCredential::Bearer {
+                token: "token".to_owned(),
+            },
+        )
+        .await
+        .expect_err("post-read must fail");
+    assert!(matches!(error, CloudflareError::Http(_)));
+    assert!(response.success);
+    assert_eq!(response.result["bookmark"], "restored-8");
+    assert_eq!(response.result["previous_bookmark"], "current-7");
+    assert_eq!(response.result["_cfctl"]["performed"], true);
+    assert_eq!(response.result["_cfctl"]["verified"], false);
 }
 
 #[tokio::test]

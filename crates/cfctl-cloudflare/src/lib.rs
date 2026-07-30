@@ -1611,36 +1611,24 @@ impl Executor {
             plan.status = PlanStatus::Failed;
             return Ok(restore);
         }
-        let returned_bookmark = required_d1_bookmark(&restore, "restore")?.to_owned();
+        let returned_bookmark = restore
+            .result
+            .get("bookmark")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
         let previous_bookmark = restore
             .result
             .get("previous_bookmark")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                CloudflareError::MissingVerificationTarget(
-                    "D1 restore response omitted required previous_bookmark".to_owned(),
-                )
-            })?
-            .to_owned();
+            .map(str::to_owned);
         let message = restore
             .result
             .get("message")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                CloudflareError::MissingVerificationTarget(
-                    "D1 restore response omitted required message".to_owned(),
-                )
-            })?
-            .to_owned();
-        let post = self.send(&bookmark_request, credential).await?;
-        let post_bookmark = required_d1_bookmark(&post, "post-restore")?;
-        if post_bookmark != returned_bookmark {
-            return Err(CloudflareError::MissingVerificationTarget(format!(
-                "D1 post-restore bookmark `{post_bookmark}` did not equal returned restore bookmark `{returned_bookmark}`"
-            )));
-        }
+            .map(str::to_owned);
         let mut response = restore;
         response.result["_cfctl"] = serde_json::json!({
             "target_bookmark":target_bookmark,
@@ -1648,14 +1636,13 @@ impl Executor {
             "pre_restore_bookmark":pre_bookmark,
             "returned_bookmark":returned_bookmark,
             "previous_bookmark":previous_bookmark,
-            "post_restore_bookmark":post_bookmark,
             "source_operation_id":source_operation_id,
             "source_evidence_hash":source_evidence_hash,
             "request_digest":request_digest,
             "provider_message":message,
             "post_retry_count":contract.post_retry_count,
             "performed":true,
-            "verified":true,
+            "verified":false,
         });
         plan.status = PlanStatus::Running;
         Ok(response)
@@ -1689,35 +1676,9 @@ impl Executor {
         let strategy = plan.capability.verification.strategy.as_str();
         validate_verification_preconditions(&plan.capability, input)?;
         if strategy == "d1_current_bookmark_equals_restore_result_bookmark" {
-            let returned = apply_response
-                .result
-                .get("bookmark")
-                .and_then(Value::as_str);
-            let post = apply_response
-                .result
-                .pointer("/_cfctl/post_restore_bookmark")
-                .and_then(Value::as_str);
-            let passed = apply_response.success
-                && returned.is_some()
-                && returned == post
-                && apply_response
-                    .result
-                    .get("previous_bookmark")
-                    .and_then(Value::as_str)
-                    .is_some_and(|bookmark| !bookmark.is_empty());
-            return Ok(OperationVerificationV1 {
-                strategy: strategy.to_owned(),
-                passed,
-                basis: if passed {
-                    "the exact post-restore current bookmark equals Cloudflare's returned restore bookmark"
-                        .to_owned()
-                } else {
-                    "the exact post-restore bookmark receipt did not match the returned restore bookmark"
-                        .to_owned()
-                },
-                readback: apply_response.clone(),
-                correlated_resource_id: None,
-            });
+            return self
+                .verify_d1_restore_exact_bookmark(plan, apply_response, input, credential)
+                .await;
         }
         if strategy.starts_with("api_token_details_") {
             return self
@@ -1782,6 +1743,92 @@ impl Executor {
         Err(CloudflareError::UnsupportedVerificationStrategy(
             strategy.to_owned(),
         ))
+    }
+
+    async fn verify_d1_restore_exact_bookmark(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let contract = plan
+            .capability
+            .d1_restore_exact_bookmark
+            .as_ref()
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "D1 exact-bookmark restore verification contract is missing".to_owned(),
+                )
+            })?;
+        let returned_bookmark = required_d1_bookmark(apply_response, "restore")?;
+        let previous_bookmark = apply_response
+            .result
+            .get("previous_bookmark")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "D1 restore response omitted required previous_bookmark".to_owned(),
+                )
+            })?;
+        apply_response
+            .result
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "D1 restore response omitted required message".to_owned(),
+                )
+            })?;
+        let mut bookmark_capability = CapabilityV1::new(
+            "d1-current-time-travel-bookmark",
+            "Read current D1 time-travel bookmark",
+            "GET",
+            &contract.bookmark_path,
+        );
+        "D1".clone_into(&mut bookmark_capability.product);
+        "account".clone_into(&mut bookmark_capability.account_scope);
+        bookmark_capability.permissions = vec!["D1 Read".to_owned()];
+        bookmark_capability.selectors = plan.capability.selectors.clone();
+        bookmark_capability.response_contract = plan.capability.response_contract.clone();
+        let request = self.builder.build(
+            &bookmark_capability,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: serde_json::json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+        )?;
+        let mut readback = self.send(&request, credential).await?;
+        let post_bookmark = required_d1_bookmark(&readback, "post-restore")?.to_owned();
+        let passed = post_bookmark == returned_bookmark;
+        let mut receipt = apply_response
+            .result
+            .get("_cfctl")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        receipt["post_restore_bookmark"] = Value::String(post_bookmark.clone());
+        receipt["previous_bookmark"] = Value::String(previous_bookmark.to_owned());
+        receipt["performed"] = Value::Bool(true);
+        receipt["verified"] = Value::Bool(passed);
+        readback.result["_cfctl"] = receipt;
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis: if passed {
+                "the exact post-restore current bookmark equals Cloudflare's returned restore bookmark"
+                    .to_owned()
+            } else {
+                format!(
+                    "D1 post-restore bookmark `{post_bookmark}` did not equal returned restore bookmark `{returned_bookmark}`"
+                )
+            },
+            readback,
+            correlated_resource_id: None,
+        })
     }
 
     #[expect(
