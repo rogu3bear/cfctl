@@ -13567,6 +13567,194 @@ fn known_import_provider_failure_envelope(
     }
 }
 
+fn exact_durable_upload_response_failure(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<(EvidenceV1, Value)> {
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
+    let migration_id = plan
+        .input
+        .pointer("/body/migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("approved MLN import migration id is missing".to_owned()))?;
+    let target = json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    });
+    let input_hash = hash_value(&plan.input)?;
+    let failures = store
+        .read_d1_import_checkpoints(&plan.operation_id)?
+        .into_iter()
+        .filter(|(_, checkpoint)| {
+            let status = checkpoint
+                .pointer("/receipt/http_status")
+                .and_then(Value::as_u64);
+            let success = checkpoint
+                .pointer("/receipt/success")
+                .and_then(Value::as_bool);
+            let etag_present = checkpoint
+                .pointer("/receipt/etag_present")
+                .and_then(Value::as_bool);
+            let etag_matches = checkpoint
+                .pointer("/receipt/etag_matches")
+                .and_then(Value::as_bool);
+            let rejected = status.is_some_and(|value| !(200..300).contains(&value))
+                && success == Some(false)
+                && etag_present == Some(false)
+                && etag_matches == Some(false);
+            let integrity_rejected = status.is_some_and(|value| (200..300).contains(&value))
+                && success == Some(true)
+                && etag_present.is_some()
+                && etag_matches == Some(false);
+            checkpoint.get("schema_version").and_then(Value::as_u64) == Some(1)
+                && checkpoint.get("operation_id").and_then(Value::as_str)
+                    == Some(plan.operation_id.as_str())
+                && checkpoint.get("step").and_then(Value::as_str) == Some("upload_response")
+                && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
+                && checkpoint
+                    .get("rectification_required")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint
+                    .pointer("/receipt/provider")
+                    .and_then(Value::as_str)
+                    == Some("cloudflare")
+                && checkpoint
+                    .pointer("/receipt/effect")
+                    .and_then(Value::as_str)
+                    == Some("d1_import_upload_response")
+                && checkpoint
+                    .pointer("/receipt/migration_id")
+                    .and_then(Value::as_str)
+                    == Some(migration_id)
+                && checkpoint.pointer("/receipt/target") == Some(&target)
+                && checkpoint
+                    .pointer("/receipt/plan_input_hash")
+                    .and_then(Value::as_str)
+                    == Some(input_hash.as_str())
+                && checkpoint
+                    .pointer("/receipt/no_replay")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && checkpoint.pointer("/receipt/etag").is_none()
+                && (rejected || integrity_rejected)
+        })
+        .collect::<Vec<_>>();
+    if failures.len() != 1 {
+        return Err(CliError::Input(
+            "known upload response requires exactly one operation-bound durable redacted checkpoint"
+                .to_owned(),
+        ));
+    }
+    let (hash, checkpoint) = &failures[0];
+    if store.read_evidence_value(hash)? != *checkpoint {
+        return Err(CliError::Input(
+            "known upload-response evidence does not match its immutable checkpoint".to_owned(),
+        ));
+    }
+    Ok((
+        EvidenceV1::new(
+            EvidenceClass::Apply,
+            hash,
+            &store
+                .paths()
+                .data_dir
+                .join("evidence")
+                .join(format!("{}.json", hash.trim_start_matches("sha256:")))
+                .display()
+                .to_string(),
+        ),
+        checkpoint.clone(),
+    ))
+}
+
+fn known_import_upload_response_failure_envelope(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    secrets: &dyn SecretStore,
+) -> ResultEnvelopeV2 {
+    plan.status = PlanStatus::RectificationRequired;
+    match exact_durable_upload_response_failure(store, plan) {
+        Ok((evidence, checkpoint)) => {
+            let integrity_rejected = checkpoint
+                .pointer("/receipt/success")
+                .and_then(Value::as_bool)
+                == Some(true);
+            let outcome = if integrity_rejected {
+                "upload_integrity_rejected"
+            } else {
+                "upload_rejected"
+            };
+            let artifact = json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":outcome,
+                "receipt_available":true,
+                "upload_response_evidence_hash":evidence.content_hash,
+            });
+            let mut local_failures = Vec::new();
+            if let Err(error) = persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::BoundaryResponsePersisted,
+                artifact,
+            ) {
+                local_failures.push(format!("upload-response receipt binding failed: {error}"));
+            }
+            if let Err(error) = persist_secret_lifecycle(store, plan, false, None, secrets) {
+                local_failures.push(format!(
+                    "upload-response secret lifecycle persistence failed: {error}"
+                ));
+            }
+            let detail = if local_failures.is_empty() {
+                "Cloudflare returned a known D1 import upload rejection".to_owned()
+            } else {
+                format!(
+                    "Cloudflare returned a known D1 import upload rejection; {}",
+                    local_failures.join("; ")
+                )
+            };
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":outcome,
+                    "receipt_available":true,
+                    "http_status":checkpoint.pointer("/receipt/http_status"),
+                    "etag_present":checkpoint.pointer("/receipt/etag_present"),
+                    "etag_matches":checkpoint.pointer("/receipt/etag_matches"),
+                }),
+                Some(evidence),
+                None,
+                &CliError::Input(detail),
+                true,
+                "the exact redacted Cloudflare upload response is durable; ingest was not attempted and the import must not be replayed",
+            )
+        }
+        Err(error) => {
+            let _ = store.save_plan(plan);
+            post_boundary_failure_envelope(
+                plan,
+                json!({
+                    "success":false,
+                    "outcome":"upload_rejected_receipt_invalid",
+                    "receipt_available":false,
+                }),
+                None,
+                None,
+                &error,
+                true,
+                "Cloudflare returned an upload response, but its exact durable redacted checkpoint could not be uniquely resolved; do not replay",
+            )
+        }
+    }
+}
+
 fn approved_mln_import_execution_error_envelope(
     store: &StateStore,
     plan: &mut PlanV1,
@@ -13575,6 +13763,12 @@ fn approved_mln_import_execution_error_envelope(
 ) -> ResultEnvelopeV2 {
     if matches!(error, CloudflareError::D1ImportProviderFailure) {
         return known_import_provider_failure_envelope(store, plan, secrets);
+    }
+    if matches!(
+        error,
+        CloudflareError::D1ImportUploadResponseIntegrityFailure
+    ) {
+        return known_import_upload_response_failure_envelope(store, plan, secrets);
     }
     if !matches!(
         plan.status,
@@ -13615,7 +13809,9 @@ fn persist_d1_import_checkpoint(
         || checkpoint.receipt.get("effect").and_then(Value::as_str)
             == Some("d1_import_ingest_accepted")
         || checkpoint.receipt.get("effect").and_then(Value::as_str)
-            == Some("d1_import_transport_uncertain");
+            == Some("d1_import_transport_uncertain")
+        || checkpoint.receipt.get("effect").and_then(Value::as_str)
+            == Some("d1_import_upload_response");
     if durable_apply {
         let evidence = store
             .write_evidence(EvidenceClass::Apply, &value)
@@ -21361,6 +21557,185 @@ mod tests {
                 .expect("durable uncertainty evidence"),
             uncertainty_value
         );
+        let timeout_envelope = approved_mln_import_execution_error_envelope(
+            &uncertainty_store,
+            &mut uncertainty_plan.clone(),
+            CloudflareError::InvalidRequestBody(
+                "D1 import upload transport failed; presigned URL redacted; do not replay"
+                    .to_owned(),
+            ),
+            &MemorySecretStore::default(),
+        );
+        assert_eq!(timeout_envelope.result["receipt_available"], false);
+        assert!(
+            timeout_envelope
+                .verification
+                .basis
+                .as_deref()
+                .is_none_or(|basis| !basis.contains("upload response is durable"))
+        );
+
+        for (name, status, success, etag_present, expected_outcome) in [
+            (
+                "missing etag",
+                200,
+                true,
+                false,
+                "upload_integrity_rejected",
+            ),
+            (
+                "mismatched etag",
+                200,
+                true,
+                true,
+                "upload_integrity_rejected",
+            ),
+            ("provider rejection", 403, false, false, "upload_rejected"),
+        ] {
+            let upload_root = tempfile::tempdir().expect("upload response root");
+            let upload_store =
+                StateStore::open(RuntimePaths::from_root(upload_root.path())).expect(name);
+            let mut upload_plan = build_plan();
+            let upload_checkpoint = D1ImportCheckpointV1 {
+                schema_version: 1,
+                operation_id: upload_plan.operation_id.clone(),
+                step: "upload_response".to_owned(),
+                performed: true,
+                rectification_required: true,
+                receipt: json!({
+                    "provider":"cloudflare",
+                    "effect":"d1_import_upload_response",
+                    "migration_id":"0143",
+                    "target":{
+                        "account_id":contract.account_id,
+                        "database_id":contract.database_id,
+                    },
+                    "plan_input_hash":hash_value(&upload_plan.input).expect("input hash"),
+                    "http_status":status,
+                    "success":success,
+                    "etag_present":etag_present,
+                    "etag_matches":false,
+                    "no_replay":true,
+                }),
+            };
+            persist_d1_import_checkpoint(
+                &upload_store,
+                &upload_plan.operation_id,
+                &upload_checkpoint,
+            )
+            .expect("durable upload response");
+            let envelope = approved_mln_import_execution_error_envelope(
+                &upload_store,
+                &mut upload_plan,
+                CloudflareError::D1ImportUploadResponseIntegrityFailure,
+                &MemorySecretStore::default(),
+            );
+            assert!(envelope.performed, "{name}");
+            assert_eq!(envelope.result["outcome"], expected_outcome, "{name}");
+            assert_eq!(envelope.result["receipt_available"], true, "{name}");
+            assert_eq!(envelope.result["http_status"], status, "{name}");
+            assert_eq!(envelope.result["etag_present"], etag_present, "{name}");
+            assert_eq!(envelope.result["etag_matches"], false, "{name}");
+            assert_ne!(upload_plan.status, PlanStatus::Running, "{name}");
+            assert!(
+                !envelope.result.to_string().contains("etag_sha256"),
+                "{name}"
+            );
+        }
+
+        let missing_evidence_root = tempfile::tempdir().expect("missing evidence root");
+        let missing_evidence_store =
+            StateStore::open(RuntimePaths::from_root(missing_evidence_root.path()))
+                .expect("missing evidence store");
+        let mut missing_evidence_plan = build_plan();
+        let missing_evidence_checkpoint = json!({
+            "schema_version":1,
+            "operation_id":missing_evidence_plan.operation_id,
+            "step":"upload_response",
+            "performed":true,
+            "rectification_required":true,
+            "receipt":{
+                "provider":"cloudflare",
+                "effect":"d1_import_upload_response",
+                "migration_id":"0143",
+                "target":{
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                },
+                "plan_input_hash":hash_value(&missing_evidence_plan.input).expect("input hash"),
+                "http_status":200,
+                "success":true,
+                "etag_present":false,
+                "etag_matches":false,
+                "no_replay":true,
+            }
+        });
+        missing_evidence_store
+            .record_d1_import_checkpoint(
+                &missing_evidence_plan.operation_id,
+                &missing_evidence_checkpoint,
+            )
+            .expect("checkpoint without evidence");
+        let invalid_receipt = approved_mln_import_execution_error_envelope(
+            &missing_evidence_store,
+            &mut missing_evidence_plan,
+            CloudflareError::D1ImportUploadResponseIntegrityFailure,
+            &MemorySecretStore::default(),
+        );
+        assert_eq!(
+            invalid_receipt.result["outcome"],
+            "upload_rejected_receipt_invalid"
+        );
+        assert_eq!(invalid_receipt.result["receipt_available"], false);
+
+        let duplicate_root = tempfile::tempdir().expect("duplicate response root");
+        let duplicate_store = StateStore::open(RuntimePaths::from_root(duplicate_root.path()))
+            .expect("duplicate response store");
+        let mut duplicate_plan = build_plan();
+        let duplicate_checkpoint = |status: u16, success: bool| D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: duplicate_plan.operation_id.clone(),
+            step: "upload_response".to_owned(),
+            performed: true,
+            rectification_required: true,
+            receipt: json!({
+                "provider":"cloudflare",
+                "effect":"d1_import_upload_response",
+                "migration_id":"0143",
+                "target":{
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                },
+                "plan_input_hash":hash_value(&duplicate_plan.input).expect("input hash"),
+                "http_status":status,
+                "success":success,
+                "etag_present":false,
+                "etag_matches":false,
+                "no_replay":true,
+            }),
+        };
+        for checkpoint in [
+            duplicate_checkpoint(200, true),
+            duplicate_checkpoint(403, false),
+        ] {
+            persist_d1_import_checkpoint(
+                &duplicate_store,
+                &duplicate_plan.operation_id,
+                &checkpoint,
+            )
+            .expect("duplicate durable response");
+        }
+        let duplicate_receipt = approved_mln_import_execution_error_envelope(
+            &duplicate_store,
+            &mut duplicate_plan,
+            CloudflareError::D1ImportUploadResponseIntegrityFailure,
+            &MemorySecretStore::default(),
+        );
+        assert_eq!(
+            duplicate_receipt.result["outcome"],
+            "upload_rejected_receipt_invalid"
+        );
+        assert_eq!(duplicate_receipt.result["receipt_available"], false);
 
         let root = tempfile::tempdir().expect("known failure root");
         let store =

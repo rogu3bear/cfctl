@@ -106,6 +106,8 @@ pub enum CloudflareError {
     ApprovedPlanRequired(String),
     #[error("D1 import provider reported terminal failure after the mutation boundary")]
     D1ImportProviderFailure,
+    #[error("D1 import upload response failed its integrity contract")]
+    D1ImportUploadResponseIntegrityFailure,
     #[error("plan or capability `{capability_id}` is not an exact consumed event batch contract")]
     InvalidEventBatchPlan { capability_id: String },
     #[error("Cloudflare API base URL cannot accept path segments")]
@@ -2563,28 +2565,44 @@ impl Executor {
             ));
         };
         let upload_status = upload_status.as_u16();
+        let upload_target = serde_json::json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        });
+        let upload_binding = serde_json::json!({
+            "provider":"cloudflare",
+            "effect":"d1_import_upload_response",
+            "migration_id":migration.migration_id,
+            "target":upload_target,
+            "plan_input_hash":hash_value(&plan.input)?,
+            "no_replay":true,
+        });
         let upload_etag = if (200..300).contains(&upload_status) {
-            match validated_d1_import_upload_etag(&upload_headers, &migration.md5) {
-                Ok(etag) => Some(etag),
-                Err(error) => {
-                    let receipt = D1ImportCheckpointV1 {
-                        schema_version: 1,
-                        operation_id: plan.operation_id.clone(),
-                        step: "upload_response".to_owned(),
-                        performed: true,
-                        rectification_required: true,
-                        receipt: serde_json::json!({
-                            "http_status":upload_status,
-                            "success":true,
-                            "etag_present":upload_headers.contains_key(reqwest::header::ETAG),
-                            "etag_matches":false,
-                            "no_replay":true,
-                        }),
-                    };
-                    persist(&receipt).map_err(CloudflareError::InvalidRequestBody)?;
-                    plan.status = PlanStatus::RectificationRequired;
-                    return Err(error);
-                }
+            if let Ok(etag) = validated_d1_import_upload_etag(&upload_headers, &migration.md5) {
+                Some(etag)
+            } else {
+                let receipt = D1ImportCheckpointV1 {
+                    schema_version: 1,
+                    operation_id: plan.operation_id.clone(),
+                    step: "upload_response".to_owned(),
+                    performed: true,
+                    rectification_required: true,
+                    receipt: serde_json::json!({
+                        "provider":upload_binding["provider"],
+                        "effect":upload_binding["effect"],
+                        "migration_id":upload_binding["migration_id"],
+                        "target":upload_binding["target"],
+                        "plan_input_hash":upload_binding["plan_input_hash"],
+                        "http_status":upload_status,
+                        "success":true,
+                        "etag_present":upload_headers.contains_key(reqwest::header::ETAG),
+                        "etag_matches":false,
+                        "no_replay":upload_binding["no_replay"],
+                    }),
+                };
+                persist(&receipt).map_err(CloudflareError::InvalidRequestBody)?;
+                plan.status = PlanStatus::RectificationRequired;
+                return Err(CloudflareError::D1ImportUploadResponseIntegrityFailure);
             }
         } else {
             None
@@ -2596,19 +2614,23 @@ impl Executor {
             performed: true,
             rectification_required: !(200..300).contains(&upload_status),
             receipt: serde_json::json!({
+                "provider":upload_binding["provider"],
+                "effect":upload_binding["effect"],
+                "migration_id":upload_binding["migration_id"],
+                "target":upload_binding["target"],
+                "plan_input_hash":upload_binding["plan_input_hash"],
                 "http_status":upload_status,
                 "success":(200..300).contains(&upload_status),
                 "etag_present":upload_etag.is_some(),
                 "etag_matches":upload_etag.is_some(),
                 "etag_sha256":upload_etag.as_ref().map(|etag| format!("sha256:{}",hex::encode(Sha256::digest(etag.as_bytes())))),
+                "no_replay":upload_binding["no_replay"],
             }),
         };
         persist(&upload_receipt).map_err(CloudflareError::InvalidRequestBody)?;
         if !(200..300).contains(&upload_status) {
             plan.status = PlanStatus::RectificationRequired;
-            return Err(CloudflareError::InvalidRequestBody(format!(
-                "D1 import upload returned HTTP {upload_status}; do not replay"
-            )));
+            return Err(CloudflareError::D1ImportUploadResponseIntegrityFailure);
         }
         let ingest = match send_provider(serde_json::json!({
             "action":"ingest",
