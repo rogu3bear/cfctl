@@ -2508,6 +2508,11 @@ impl Executor {
             plan.status = PlanStatus::Failed;
             return Ok(init);
         }
+        if let Err(error) = accepted_d1_import_init_response(&init) {
+            persist_import_response(&mut persist, plan, "init_response", &init, None)?;
+            plan.status = PlanStatus::RectificationRequired;
+            return Err(error);
+        }
         let upload_url_raw = init.result.get("upload_url").and_then(Value::as_str);
         let filename_raw = init.result.get("filename").and_then(Value::as_str);
         persist_import_response(
@@ -2622,16 +2627,12 @@ impl Executor {
             plan.status = PlanStatus::RectificationRequired;
             return Ok(ingest);
         }
-        let Some(at_bookmark) = ingest
-            .result
-            .get("at_bookmark")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-        else {
-            plan.status = PlanStatus::RectificationRequired;
-            return Err(CloudflareError::InvalidRequestBody(
-                "D1 import ingest omitted at_bookmark; do not replay".to_owned(),
-            ));
+        let at_bookmark = match accepted_d1_import_ingest_response(&ingest) {
+            Ok(bookmark) => bookmark,
+            Err(error) => {
+                plan.status = PlanStatus::RectificationRequired;
+                return Err(error);
+            }
         };
         let at_bookmark = at_bookmark.to_owned();
         for attempt in 1..=contract.max_poll_attempts {
@@ -8806,6 +8807,68 @@ enum D1ImportPollOutcome<'a> {
     ProviderError,
 }
 
+fn d1_import_action_provider_error(response: &CloudflareResponseV1) -> bool {
+    response.success
+        && response.result.get("type").and_then(Value::as_str) == Some("import")
+        && response.result.get("status").and_then(Value::as_str) == Some("error")
+        && response.result.get("success").and_then(Value::as_bool) == Some(false)
+}
+
+fn accepted_d1_import_init_response(response: &CloudflareResponseV1) -> Result<()> {
+    if d1_import_action_provider_error(response) {
+        return Err(CloudflareError::D1ImportProviderFailure);
+    }
+    let nested = [
+        response.result.get("type"),
+        response.result.get("status"),
+        response.result.get("success"),
+    ];
+    if nested.iter().all(std::option::Option::is_none) {
+        return Ok(());
+    }
+    let valid = response.result.get("type").and_then(Value::as_str) == Some("import")
+        && matches!(
+            response.result.get("status").and_then(Value::as_str),
+            Some("active" | "pending")
+        )
+        && response.result.get("success").and_then(Value::as_bool) == Some(true);
+    if valid {
+        Ok(())
+    } else {
+        Err(CloudflareError::InvalidRequestBody(
+            "D1 import init returned an unsupported nested state; do not replay".to_owned(),
+        ))
+    }
+}
+
+fn accepted_d1_import_ingest_response(response: &CloudflareResponseV1) -> Result<&str> {
+    if d1_import_action_provider_error(response) {
+        return Err(CloudflareError::D1ImportProviderFailure);
+    }
+    let valid = response.success
+        && response.result.get("type").and_then(Value::as_str) == Some("import")
+        && matches!(
+            response.result.get("status").and_then(Value::as_str),
+            Some("active" | "pending")
+        )
+        && response.result.get("success").and_then(Value::as_bool) == Some(true);
+    if !valid {
+        return Err(CloudflareError::InvalidRequestBody(
+            "D1 import ingest returned an unsupported nested state; do not replay".to_owned(),
+        ));
+    }
+    response
+        .result
+        .get("at_bookmark")
+        .and_then(Value::as_str)
+        .filter(|bookmark| !bookmark.is_empty())
+        .ok_or_else(|| {
+            CloudflareError::InvalidRequestBody(
+                "D1 import ingest omitted at_bookmark; do not replay".to_owned(),
+            )
+        })
+}
+
 fn validate_d1_import_poll_response<'a>(
     response: &'a CloudflareResponseV1,
     expected_at_bookmark: &str,
@@ -8872,16 +8935,25 @@ fn persist_import_response<F>(
 where
     F: FnMut(&D1ImportCheckpointV1) -> std::result::Result<(), String>,
 {
-    let result = replacement_result.unwrap_or_else(|| response.result.clone());
+    let mut result = replacement_result.unwrap_or_else(|| response.result.clone());
     let terminal_provider_failure = result.get("status").and_then(Value::as_str) == Some("error")
         && result.get("success").and_then(Value::as_bool) == Some(false);
+    let provider_error_present = if let Some(object) = result.as_object_mut() {
+        let provider_error_present = object.remove("error").is_some();
+        if provider_error_present {
+            object.insert("provider_error_present".to_owned(), Value::Bool(true));
+        }
+        provider_error_present
+    } else {
+        false
+    };
     let result = if terminal_provider_failure {
         serde_json::json!({
             "type":result.get("type"),
             "status":"error",
             "success":false,
             "at_bookmark":result.get("at_bookmark"),
-            "provider_error_present":result.get("error").is_some(),
+            "provider_error_present":provider_error_present,
         })
     } else {
         result
@@ -8896,7 +8968,8 @@ where
             "http_status":response.status,
             "success":response.success,
             "result":result,
-            "errors":if terminal_provider_failure { Vec::new() } else { response.errors.clone() },
+            "errors":[],
+            "provider_errors_present":!response.errors.is_empty(),
             "etag":response.etag,
             "cf_ray":response.cf_ray,
         }),
@@ -8927,7 +9000,8 @@ where
 #[allow(clippy::expect_used)]
 mod approved_mln_import_tests {
     use super::{
-        CloudflareError, D1ImportPollOutcome, accepted_d1_import_poll_outcome, parse_response,
+        CloudflareError, D1ImportPollOutcome, accepted_d1_import_ingest_response,
+        accepted_d1_import_init_response, accepted_d1_import_poll_outcome, parse_response,
         validate_d1_import_poll_response, validate_d1_import_upload_url,
         validated_d1_import_upload_etag,
     };
@@ -9080,6 +9154,69 @@ mod approved_mln_import_tests {
             );
             assert_eq!(ingest_requests, 1);
         }
+    }
+
+    #[test]
+    fn approved_import_validates_init_and_ingest_before_upload_or_poll() {
+        let response =
+            |result| parse_response(200, &json!({"success":true,"result":result}), None, None);
+        let nested_error = response(json!({
+            "type":"import",
+            "status":"error",
+            "success":false,
+            "at_bookmark":"before",
+            "error":"provider rejected import",
+        }));
+        assert!(matches!(
+            accepted_d1_import_init_response(&nested_error),
+            Err(CloudflareError::D1ImportProviderFailure)
+        ));
+        assert!(matches!(
+            accepted_d1_import_ingest_response(&nested_error),
+            Err(CloudflareError::D1ImportProviderFailure)
+        ));
+
+        let mut poll_requests = 0_u8;
+        for malformed in [
+            json!({"type":"import","status":"unknown","success":true,"at_bookmark":"before"}),
+            json!({"type":"export","status":"active","success":true,"at_bookmark":"before"}),
+            json!({"type":"import","status":"active","success":false,"at_bookmark":"before"}),
+            json!({"type":"import","status":"active","success":true,"at_bookmark":""}),
+        ] {
+            let ingest = response(malformed);
+            assert!(accepted_d1_import_ingest_response(&ingest).is_err());
+        }
+        assert_eq!(poll_requests, 0);
+
+        let accepted = response(json!({
+            "type":"import",
+            "status":"active",
+            "success":true,
+            "at_bookmark":"before",
+        }));
+        let bookmark =
+            accepted_d1_import_ingest_response(&accepted).expect("accepted ingest response");
+        poll_requests += 1;
+        assert_eq!(bookmark, "before");
+        assert_eq!(poll_requests, 1);
+
+        assert!(
+            accepted_d1_import_init_response(&response(json!({
+                "filename":"upload.sql",
+                "upload_url":"https://redacted.invalid"
+            })))
+            .is_ok()
+        );
+        assert!(
+            accepted_d1_import_init_response(&response(json!({
+                "type":"import",
+                "status":"unexpected",
+                "success":true,
+                "filename":"upload.sql",
+                "upload_url":"https://redacted.invalid"
+            })))
+            .is_err()
+        );
     }
 
     #[test]

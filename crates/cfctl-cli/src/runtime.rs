@@ -13208,7 +13208,11 @@ fn exact_durable_provider_failure_boundary(
                 && checkpoint
                     .get("step")
                     .and_then(Value::as_str)
-                    .is_some_and(|step| step.starts_with("poll_response_"))
+                    .is_some_and(|step| {
+                        step == "init_response"
+                            || step == "ingest_response"
+                            || step.starts_with("poll_response_")
+                    })
                 && checkpoint.get("performed").and_then(Value::as_bool) == Some(true)
                 && checkpoint
                     .get("rectification_required")
@@ -13414,7 +13418,9 @@ async fn execute_approved_mln_import_plan(
                         );
                     }
                 }
-                if checkpoint.step.starts_with("poll_response_")
+                if (checkpoint.step == "init_response"
+                    || checkpoint.step == "ingest_response"
+                    || checkpoint.step.starts_with("poll_response_"))
                     && checkpoint
                         .receipt
                         .pointer("/result/status")
@@ -20868,7 +20874,7 @@ mod tests {
             json!({
                 "schema_version":1,
                 "operation_id":plan.operation_id,
-                "step":"poll_response_1",
+                "step":"ingest_response",
                 "performed":true,
                 "rectification_required":true,
                 "receipt":{
