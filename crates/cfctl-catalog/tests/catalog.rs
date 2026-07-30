@@ -10890,10 +10890,14 @@ fn native_control_overlay_adds_closed_pinned_mln_0143_invariant_read() {
         .expect("typed invariant contract");
     assert_eq!(contract.max_evidence_rows, 256);
     assert_eq!(contract.probe_rows, 257);
-    assert_eq!(contract.capability_version, 4);
+    assert_eq!(contract.capability_version, 5);
+    assert_eq!(
+        contract.prior_0142_trigger_definition_hash,
+        "sha256:7e68876f488b0117133c09de1cb0bbbd7a5a73ee705dd2888f480a2bdd1531e1"
+    );
     assert_eq!(
         contract.validator_contract_hash,
-        "sha256:997bf74ac34c27b92581a7d3920939f3d33f0eaa0a2a10a658d53dd3fe6301f7"
+        "sha256:e2c3ef831cbd18c58823a9577148dfd01c25df99f951d3f822cb99cf7561f992"
     );
     assert_eq!(
         contract
@@ -10903,7 +10907,7 @@ fn native_control_overlay_adds_closed_pinned_mln_0143_invariant_read() {
     );
     assert_eq!(
         contract.fixed_query_sha256,
-        "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d"
+        "sha256:5437f47c76377bf228f4b0113784294c880e42a9ef59b5f24a94cb7147e5383c"
     );
     assert_eq!(
         contract.migration_sha256,
@@ -10990,14 +10994,14 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
         contract.repository_head,
         "7cb0327c084ce956d728aa7d9df467cea8ed44fb"
     );
-    assert_eq!(contract.pre_import_capability_version, 4);
+    assert_eq!(contract.pre_import_capability_version, 5);
     assert_eq!(
         contract.pre_import_validator_contract_hash,
-        "sha256:997bf74ac34c27b92581a7d3920939f3d33f0eaa0a2a10a658d53dd3fe6301f7"
+        "sha256:e2c3ef831cbd18c58823a9577148dfd01c25df99f951d3f822cb99cf7561f992"
     );
     assert_eq!(
         contract.pre_import_fixed_query_sha256,
-        "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d"
+        "sha256:5437f47c76377bf228f4b0113784294c880e42a9ef59b5f24a94cb7147e5383c"
     );
     assert_eq!(contract.migrations.len(), 2);
     assert_eq!(

@@ -472,6 +472,22 @@ fn d1_schema_introspection_caller_sql(body: &Value) -> bool {
         .is_some_and(|body| body.contains_key("sql"))
 }
 
+const MLN_0142_TERMINAL_TRIGGER_SQL: &str = r"CREATE TRIGGER document_render_jobs_terminal_generation_guard
+BEFORE UPDATE OF state ON document_render_jobs
+FOR EACH ROW
+WHEN NEW.state IN ('ready', 'failed')
+ AND (
+   OLD.state <> 'rendering'
+   OR OLD.attempts < 1
+   OR OLD.claimed_by IS NULL
+   OR trim(OLD.claimed_by) = ''
+   OR NEW.attempts <> OLD.attempts
+   OR NEW.claimed_by IS NOT OLD.claimed_by
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'document_render_terminal_generation_stale');
+END";
+
 // Reviewed from MLN migrations 0110 and 0143. These are the exact table
 // definitions SQLite records, excluding only comments and formatting.
 const MLN_0143_PRE_TABLE_SQL: &str = r"CREATE TABLE equity_issuance_evidence_links (
@@ -572,6 +588,7 @@ SELECT evidence_rows,evidence_received,evidence_window_total,
  (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_equity_instrument_evidence_contract') AS trigger_contract_sql,
  (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_equity_instrument_evidence_immutable') AS trigger_immutable_sql,
  (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg_advisor_grant_final_instrument_required') AS trigger_final_required_sql,
+ (SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='document_render_jobs_terminal_generation_guard') AS prior_0142_trigger_sql,
  (SELECT COUNT(*) FROM pragma_foreign_key_check) AS foreign_key_violations,
  (SELECT COUNT(*) FROM (SELECT 1 FROM equity_issuance_evidence_links WHERE document_hash IS NOT NULL GROUP BY org_id,issuance_event_id,evidence_kind,document_hash HAVING COUNT(*)>1)) AS duplicate_hash_groups,
  (SELECT COUNT(*) FROM equity_issuance_evidence_links WHERE evidence_kind NOT IN (
@@ -859,24 +876,7 @@ fn render_d1_schema_introspection_body(body: &Value) -> Result<Value> {
         ),
         "mln_0142_trigger_definition" => (
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = 'document_render_jobs_terminal_generation_guard' AND sql = ?1) AS present",
-            vec![Value::String(
-                r"CREATE TRIGGER document_render_jobs_terminal_generation_guard
-BEFORE UPDATE OF state ON document_render_jobs
-FOR EACH ROW
-WHEN NEW.state IN ('ready', 'failed')
- AND (
-   OLD.state <> 'rendering'
-   OR OLD.attempts < 1
-   OR OLD.claimed_by IS NULL
-   OR trim(OLD.claimed_by) = ''
-   OR NEW.attempts <> OLD.attempts
-   OR NEW.claimed_by IS NOT OLD.claimed_by
- )
-BEGIN
-  SELECT RAISE(ABORT, 'document_render_terminal_generation_stale');
-END"
-                .to_owned(),
-            )],
+            vec![Value::String(MLN_0142_TERMINAL_TRIGGER_SQL.to_owned())],
         ),
         _ => unreachable!("assertion variants were closed above"),
     };
@@ -982,9 +982,10 @@ mod d1_schema_introspection_tests {
 #[allow(clippy::expect_used)]
 mod mln_0143_invariant_tests {
     use super::{
-        CloudflareResponseV1, MLN_0143_POST_TABLE_SQL, MLN_0143_PRE_TABLE_SQL,
-        Mln0143DataInvariantsContractV1, OutputFormatV1, PreparedRequest, Url, normalized_sql_hash,
-        reviewed_table_sql_hash, sanitize_mln_0143_data_invariants_response,
+        CloudflareResponseV1, MLN_0142_TERMINAL_TRIGGER_SQL, MLN_0143_POST_TABLE_SQL,
+        MLN_0143_PRE_TABLE_SQL, Mln0143DataInvariantsContractV1, OutputFormatV1, PreparedRequest,
+        Url, normalized_sql_hash, reviewed_table_sql_hash,
+        sanitize_mln_0143_data_invariants_response,
     };
     use reqwest::header::HeaderMap;
     use serde_json::{Value, json};
@@ -995,15 +996,17 @@ mod mln_0143_invariant_tests {
             database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
             migration_sha256: "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
                 .to_owned(),
+            prior_0142_trigger_definition_hash:
+                "sha256:7e68876f488b0117133c09de1cb0bbbd7a5a73ee705dd2888f480a2bdd1531e1".to_owned(),
             trigger_definition_hashes: Vec::new(),
             fixed_query_sha256:
-                "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d".to_owned(),
+                "sha256:5437f47c76377bf228f4b0113784294c880e42a9ef59b5f24a94cb7147e5383c".to_owned(),
             pre_table_definition_hash:
                 "sha256:8aa5012ace3d946354e0baba7e645646ac97373b42e7c3d61e79b67a5f689fea".to_owned(),
             post_table_definition_hash:
                 "sha256:2fbdacd011abca8024507b99d179071b8b920271576e4cb3a2f06c4f3ffd2d7f".to_owned(),
             validator_contract_hash: String::new(),
-            capability_version: 4,
+            capability_version: 5,
             max_evidence_rows: 256,
             probe_rows: 257,
             max_bytes: 1024 * 1024,
@@ -1088,6 +1091,7 @@ mod mln_0143_invariant_tests {
                     "trigger_contract_sql":null,
                     "trigger_immutable_sql":null,
                     "trigger_final_required_sql":null,
+                    "prior_0142_trigger_sql":MLN_0142_TERMINAL_TRIGGER_SQL,
                     "foreign_key_violations":0,
                     "duplicate_hash_groups":0,
                     "invalid_evidence_kinds":0,
@@ -1280,6 +1284,28 @@ mod mln_0143_invariant_tests {
         let mut response = pre_response(0);
         response.result[0]["results"][0]["invalid_advanced_events"] = json!(1);
         assert!(sanitize_mln_0143_data_invariants_response(&mut response, &request).is_err());
+    }
+
+    #[test]
+    fn post_restore_requires_the_exact_0142_terminal_generation_trigger() {
+        let request = prepared("post_restore");
+        let mut exact = pre_response(0);
+        sanitize_mln_0143_data_invariants_response(&mut exact, &request)
+            .expect("post-0142 restore preserves the exact 0142 trigger");
+
+        for replacement in [
+            Value::Null,
+            Value::String(
+                "CREATE TRIGGER document_render_jobs_terminal_generation_guard BEFORE UPDATE ON document_render_jobs BEGIN SELECT 1; END"
+                    .to_owned(),
+            ),
+        ] {
+            let mut drifted = pre_response(0);
+            drifted.result[0]["results"][0]["prior_0142_trigger_sql"] = replacement;
+            assert!(
+                sanitize_mln_0143_data_invariants_response(&mut drifted, &request).is_err()
+            );
+        }
     }
 
     #[test]
@@ -5475,6 +5501,12 @@ fn sanitize_mln_0143_data_invariants_response(
         "trigger_immutable_sql",
         "trigger_final_required_sql",
     ];
+    let prior_0142_trigger_hash = normalized_sql_hash(text("prior_0142_trigger_sql")?);
+    if prior_0142_trigger_hash != contract.prior_0142_trigger_definition_hash
+        || prior_0142_trigger_hash != normalized_sql_hash(MLN_0142_TERMINAL_TRIGGER_SQL)
+    {
+        return Err(invariant_response_error(response.status));
+    }
     if number("invalid_advanced_events")? != 0 {
         return Err(invariant_response_error(response.status));
     }
@@ -5521,6 +5553,7 @@ fn sanitize_mln_0143_data_invariants_response(
         "packet_count":packet_total,
         "packet_non_target_hash":hash_value(&Value::Array(non_target_packet_rows.clone()))?,
         "packet_non_target_count":non_target_packet_rows.len(),
+        "prior_0142_trigger_definition_hash":prior_0142_trigger_hash,
         "trigger_definition_hashes":trigger_hashes,
         "assertions":{
             "old_table_absent":true,
@@ -5531,6 +5564,7 @@ fn sanitize_mln_0143_data_invariants_response(
             "duplicate_hash_groups_zero":true,
             "invalid_evidence_kinds_zero":true,
             "invalid_advanced_events_zero":true,
+            "prior_0142_terminal_trigger_present":true,
         },
         "query":{
             "sha256":contract.fixed_query_sha256,
@@ -8389,6 +8423,8 @@ fn validate_mln_0143_data_invariants_contract(
         && database == Some(contract.database_id.as_str())
         && contract.migration_sha256
             == "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
+        && contract.prior_0142_trigger_definition_hash
+            == "sha256:7e68876f488b0117133c09de1cb0bbbd7a5a73ee705dd2888f480a2bdd1531e1"
         && contract.trigger_definition_hashes
             == [
                 "sha256:d858df9c22c19df241e5045eca9635c4fb786000428707a821090daeacc69072",
@@ -8396,7 +8432,7 @@ fn validate_mln_0143_data_invariants_contract(
                 "sha256:3ca04f9fc717104d2ee0da719e2c473a756d3345f4e222d52c4d0f76237a184b",
             ]
         && contract.fixed_query_sha256
-            == "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d"
+            == "sha256:5437f47c76377bf228f4b0113784294c880e42a9ef59b5f24a94cb7147e5383c"
         && hash_value(&Value::String(MLN_0143_QUERY.to_owned()))
             .is_ok_and(|hash| hash == contract.fixed_query_sha256)
         && contract.pre_table_definition_hash
@@ -8406,7 +8442,7 @@ fn validate_mln_0143_data_invariants_contract(
         && contract
             .expected_validator_contract_hash()
             .is_ok_and(|hash| hash == contract.validator_contract_hash)
-        && contract.capability_version == 4
+        && contract.capability_version == 5
         && contract.max_evidence_rows == 256
         && contract.probe_rows == 257
         && (1..=1024 * 1024).contains(&contract.max_bytes)
@@ -8547,11 +8583,11 @@ fn validate_d1_approved_mln_import_contract(
         && keys == expected
         && contract.repository_id == "github.com/rogu3bear/mln-web"
         && contract.repository_head == "7cb0327c084ce956d728aa7d9df467cea8ed44fb"
-        && contract.pre_import_capability_version == 4
+        && contract.pre_import_capability_version == 5
         && contract.pre_import_validator_contract_hash
-            == "sha256:997bf74ac34c27b92581a7d3920939f3d33f0eaa0a2a10a658d53dd3fe6301f7"
+            == "sha256:e2c3ef831cbd18c58823a9577148dfd01c25df99f951d3f822cb99cf7561f992"
         && contract.pre_import_fixed_query_sha256
-            == "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d"
+            == "sha256:5437f47c76377bf228f4b0113784294c880e42a9ef59b5f24a94cb7147e5383c"
         && contract.migrations.len() == 2
         && contract.migrations[0].migration_id == "0142"
         && contract.migrations[0].basename == "0142_document_render_claim_generation.sql"
@@ -8797,11 +8833,11 @@ mod approved_mln_import_tests {
         D1ApprovedMlnImportContractV1 {
             repository_id: "github.com/rogu3bear/mln-web".to_owned(),
             repository_head: "7cb0327c084ce956d728aa7d9df467cea8ed44fb".to_owned(),
-            pre_import_capability_version: 4,
+            pre_import_capability_version: 5,
             pre_import_validator_contract_hash:
-                "sha256:997bf74ac34c27b92581a7d3920939f3d33f0eaa0a2a10a658d53dd3fe6301f7".to_owned(),
+                "sha256:e2c3ef831cbd18c58823a9577148dfd01c25df99f951d3f822cb99cf7561f992".to_owned(),
             pre_import_fixed_query_sha256:
-                "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d".to_owned(),
+                "sha256:5437f47c76377bf228f4b0113784294c880e42a9ef59b5f24a94cb7147e5383c".to_owned(),
             account_id: "ca30e922fda7f5578e49873542e4aaca".to_owned(),
             database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
             import_path: "/accounts/{account_id}/d1/database/{database_id}/import".to_owned(),

@@ -4818,7 +4818,7 @@ fn mln_0143_parent_manifests(
     let Some(contract) = capability.mln_0143_data_invariants.as_ref() else {
         return Ok(Vec::new());
     };
-    if contract.capability_version != 4
+    if contract.capability_version != 5
         || !contract
             .expected_validator_contract_hash()
             .is_ok_and(|hash| hash == contract.validator_contract_hash)
@@ -4901,6 +4901,7 @@ fn mln_0143_parent_manifests(
                 "duplicate_hash_groups_zero",
                 "invalid_evidence_kinds_zero",
                 "invalid_advanced_events_zero",
+                "prior_0142_terminal_trigger_present",
             ];
             let expected_trigger_hashes = if *expected_phase == "pre_import" {
                 json!([])
@@ -4936,6 +4937,10 @@ fn mln_0143_parent_manifests(
                     .get("packet_non_target_count")
                     .and_then(Value::as_u64)
                     .is_some()
+                && manifest
+                    .get("prior_0142_trigger_definition_hash")
+                    .and_then(Value::as_str)
+                    == Some(contract.prior_0142_trigger_definition_hash.as_str())
                 && assertions.is_some_and(|assertions| {
                     assertions.len() == exact_assertions.len()
                         && exact_assertions.iter().all(|field| {
@@ -4986,6 +4991,30 @@ fn mln_0143_parent_manifests(
         .collect()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Mln0143RestoreAnchorJoin {
+    input_source_operation_id: String,
+    receipt_source_operation_id: String,
+    input_source_evidence_hash: String,
+    receipt_source_evidence_hash: String,
+    input_target_bookmark_hash: String,
+    requested_bookmark_hash: String,
+    observed_bookmark_hash: String,
+    account_id: String,
+    profile_id: String,
+    catalog_hash: String,
+    credential_generation_id: String,
+    anchor_completed_at: chrono::DateTime<Utc>,
+    restore_created_at: chrono::DateTime<Utc>,
+}
+
+fn mln_0143_restore_anchor_matches(
+    observed: &Mln0143RestoreAnchorJoin,
+    expected: &Mln0143RestoreAnchorJoin,
+) -> bool {
+    observed == expected && observed.anchor_completed_at < observed.restore_created_at
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "cross-operation import and restore joins are one fail-closed lineage gate"
@@ -5016,9 +5045,19 @@ fn validate_mln_cross_operation_lineage(
     let import_plan_hash = field("import_plan_hash")?;
     let import_plan = store.load_plan(import_operation_id)?;
     let import_input: CallInput = serde_json::from_value(import_plan.input.clone())?;
+    let StoredPlanRecord::Current(import_plan_v2) =
+        store.load_stored_plan_record(import_operation_id)?
+    else {
+        return Err(CliError::Input(
+            "MLN lineage import operation is not a current immutable PlanV2".to_owned(),
+        ));
+    };
     let exact_plan = import_plan.capability.id == "d1-import-approved-mln-migration"
+        && import_plan.status == PlanStatus::Verified
+        && import_plan.transaction_stage == TransactionStageV1::Closed
         && import_plan.account_id == contract.account_id
         && import_plan.content_hash == import_plan_hash
+        && import_plan_v2.plan.content_hash == import_plan.content_hash
         && import_input.selectors == input.selectors
         && import_input
             .body
@@ -5068,7 +5107,65 @@ fn validate_mln_cross_operation_lineage(
     let restore_operation_id = field("restore_operation_id")?;
     let restore_evidence_hash = field("restore_evidence_hash")?;
     let restore_plan = store.load_plan(restore_operation_id)?;
+    let StoredPlanRecord::Current(restore_plan_v2) =
+        store.load_stored_plan_record(restore_operation_id)?
+    else {
+        return Err(CliError::Input(
+            "post_restore operation is not a current immutable PlanV2".to_owned(),
+        ));
+    };
     let restore_input: CallInput = serde_json::from_value(restore_plan.input.clone())?;
+    let import_body = import_input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input("0143 import lost its closed prerequisite body".to_owned())
+        })?;
+    let import_field = |name: &str| {
+        import_body
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| CliError::Input(format!("0143 import omitted `{name}`")))
+    };
+    let anchor_operation_id = import_field("post_0142_anchor_operation_id")?;
+    let anchor_evidence_hash = import_field("post_0142_anchor_evidence_hash")?;
+    let anchor_bookmark_hash = import_field("post_0142_anchor_bookmark_hash")?;
+    let prior_0142_operation_id = import_field("prior_0142_operation_id")?;
+    let prior_0142_plan = store.load_plan(prior_0142_operation_id)?;
+    let prior_0142_closed_at = prior_0142_plan
+        .transaction_journal
+        .iter()
+        .find(|checkpoint| checkpoint.stage == TransactionStageV1::Closed)
+        .map(|checkpoint| checkpoint.recorded_at)
+        .ok_or_else(|| CliError::Input("0142 import lost its Closed checkpoint".to_owned()))?;
+    let target_scope_hash = hash_value(&json!({
+        "account_id":contract.account_id,
+        "database_id":contract.database_id,
+    }))?;
+    let anchor_request_hash = hash_value(&serde_json::to_value(CallInput {
+        selectors: input.selectors.clone(),
+        query: json!({}),
+        ..CallInput::default()
+    })?)?;
+    let anchor_completed_at = validate_exact_d1_recovery_anchor(
+        store,
+        &D1RecoveryAnchorExpectation {
+            operation_id: anchor_operation_id,
+            evidence_hash: anchor_evidence_hash,
+            output_sha256: None,
+            bookmark_hash: anchor_bookmark_hash,
+            catalog_hash: &import_plan.catalog_hash,
+            request_hash: &anchor_request_hash,
+            target_scope_hash: &target_scope_hash,
+            account_id: &contract.account_id,
+            profile_id: &import_plan.profile_id,
+            credential_generation_id: Some(import_plan_v2.pins.credential_generation_id.as_str()),
+            after: Some(prior_0142_closed_at),
+            before: import_plan.created_at,
+        },
+    )?;
     let restore_evidence = store.read_evidence_value(restore_evidence_hash)?;
     let receipt = restore_evidence
         .pointer("/result/_cfctl")
@@ -5087,6 +5184,51 @@ fn validate_mln_cross_operation_lineage(
         .ok_or_else(|| CliError::Input("restore requested bookmark is missing".to_owned()))?;
     let observed_hash = hash_bookmark(receipt.get("returned_bookmark").and_then(Value::as_str))?
         .ok_or_else(|| CliError::Input("restore observed bookmark is missing".to_owned()))?;
+    let receipt_source_operation_id = receipt.get("source_operation_id").and_then(Value::as_str);
+    let receipt_source_evidence_hash = receipt.get("source_evidence_hash").and_then(Value::as_str);
+    let restore_body = restore_input.body.as_ref();
+    let observed_anchor_join = Mln0143RestoreAnchorJoin {
+        input_source_operation_id: restore_body
+            .and_then(|body| body.get("source_operation_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        receipt_source_operation_id: receipt_source_operation_id.unwrap_or_default().to_owned(),
+        input_source_evidence_hash: restore_body
+            .and_then(|body| body.get("source_evidence_hash"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        receipt_source_evidence_hash: receipt_source_evidence_hash.unwrap_or_default().to_owned(),
+        input_target_bookmark_hash: restore_body
+            .and_then(|body| body.get("target_bookmark"))
+            .and_then(Value::as_str)
+            .and_then(|bookmark| hash_value(&Value::String(bookmark.to_owned())).ok())
+            .unwrap_or_default(),
+        requested_bookmark_hash: requested_hash.clone(),
+        observed_bookmark_hash: observed_hash.clone(),
+        account_id: restore_plan.account_id.clone(),
+        profile_id: restore_plan.profile_id.clone(),
+        catalog_hash: restore_plan.catalog_hash.clone(),
+        credential_generation_id: restore_plan_v2.pins.credential_generation_id.clone(),
+        anchor_completed_at,
+        restore_created_at: restore_plan.created_at,
+    };
+    let expected_anchor_join = Mln0143RestoreAnchorJoin {
+        input_source_operation_id: anchor_operation_id.to_owned(),
+        receipt_source_operation_id: anchor_operation_id.to_owned(),
+        input_source_evidence_hash: anchor_evidence_hash.to_owned(),
+        receipt_source_evidence_hash: anchor_evidence_hash.to_owned(),
+        input_target_bookmark_hash: anchor_bookmark_hash.to_owned(),
+        requested_bookmark_hash: anchor_bookmark_hash.to_owned(),
+        observed_bookmark_hash: anchor_bookmark_hash.to_owned(),
+        account_id: import_plan.account_id.clone(),
+        profile_id: import_plan.profile_id.clone(),
+        catalog_hash: import_plan.catalog_hash.clone(),
+        credential_generation_id: import_plan_v2.pins.credential_generation_id.clone(),
+        anchor_completed_at,
+        restore_created_at: restore_plan.created_at,
+    };
     let boundary_evidence_matches = restore_plan
         .transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
         .and_then(|artifact| artifact.get("apply_evidence_hash"))
@@ -5094,14 +5236,14 @@ fn validate_mln_cross_operation_lineage(
         == Some(restore_evidence_hash);
     let exact_restore = restore_plan.capability.id == "d1-restore-exact-bookmark"
         && restore_plan.status == PlanStatus::Verified
+        && restore_plan.transaction_stage == TransactionStageV1::Closed
         && restore_plan.account_id == contract.account_id
+        && restore_plan.profile_id == import_plan.profile_id
+        && restore_plan.catalog_hash == import_plan.catalog_hash
+        && restore_plan_v2.plan.content_hash == restore_plan.content_hash
+        && restore_plan_v2.pins.catalog_hash == import_plan_v2.pins.catalog_hash
+        && mln_0143_restore_anchor_matches(&observed_anchor_join, &expected_anchor_join)
         && restore_input.selectors == input.selectors
-        && restore_input
-            .body
-            .as_ref()
-            .and_then(|body| body.get("source_operation_id"))
-            .and_then(Value::as_str)
-            == Some(import_operation_id)
         && boundary_evidence_matches
         && previous_hash == field("restore_previous_bookmark_hash")?
         && requested_hash == field("restore_requested_bookmark_hash")?
@@ -18869,11 +19011,11 @@ mod tests {
     use super::{
         CallInput, CliError, D1RecoveryAnchorExpectation, DNS_RECORD_DETAIL_PATH,
         DNS_RECORD_DETAIL_READ_CAPABILITY_ID, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
-        Mln0143PreImportExpectation, OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority,
-        SECURITY_IP_RULE_COLLECTION_PATH, SECURITY_IP_RULE_CREATE_ID,
-        SECURITY_IP_RULE_STATE_CAPABILITY_ID, SECURITY_LIST_MEMBER_COLLECTION_PATH,
-        SECURITY_LIST_MEMBER_CREATE_ID, SECURITY_LIST_MEMBER_REMOVE_ID,
-        SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
+        Mln0143PreImportExpectation, Mln0143RestoreAnchorJoin,
+        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, SECURITY_IP_RULE_COLLECTION_PATH,
+        SECURITY_IP_RULE_CREATE_ID, SECURITY_IP_RULE_STATE_CAPABILITY_ID,
+        SECURITY_LIST_MEMBER_COLLECTION_PATH, SECURITY_LIST_MEMBER_CREATE_ID,
+        SECURITY_LIST_MEMBER_REMOVE_ID, SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
         SECURITY_WAF_RULE_STATE_CAPABILITY_ID, TokenPolicyBinding, admit_standing_plan,
         apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
@@ -18892,12 +19034,12 @@ mod tests {
         is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
         list_security_action_state_receipt, mln_0142_terminal_import_state,
         mln_0143_parent_manifests, mln_0143_pre_import_authority_matches,
-        mln_0143_pre_import_matches, non_readback_verification_basis,
-        normalize_reviewed_mln_repository_id, operational_proof_coverage,
-        permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
-        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
-        plan_state_next_step, plan_status_label, preflight_call_input,
-        preflight_standing_authority, prepare_r2_temporary_credentials_input,
+        mln_0143_pre_import_matches, mln_0143_restore_anchor_matches,
+        non_readback_verification_basis, normalize_reviewed_mln_repository_id,
+        operational_proof_coverage, permission_inventory_call, permission_inventory_envelope,
+        persist_prepared_plan, persist_secret_lifecycle,
+        persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
+        preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
         read_import_secret, read_r2_log_retrieval_credentials, read_secret_file,
         reconcile_standing_lineage_from_plan, rectify_plan, redact_response_for_capability,
@@ -19077,6 +19219,95 @@ mod tests {
     }
 
     #[test]
+    fn mln_0143_restore_anchor_join_rejects_every_authority_substitution() {
+        let anchor_completed_at = Utc::now() - chrono::Duration::minutes(2);
+        let restore_created_at = Utc::now() - chrono::Duration::minutes(1);
+        let exact = Mln0143RestoreAnchorJoin {
+            input_source_operation_id: "post-0142-anchor".to_owned(),
+            receipt_source_operation_id: "post-0142-anchor".to_owned(),
+            input_source_evidence_hash: "sha256:anchor-evidence".to_owned(),
+            receipt_source_evidence_hash: "sha256:anchor-evidence".to_owned(),
+            input_target_bookmark_hash: "sha256:post-0142-bookmark".to_owned(),
+            requested_bookmark_hash: "sha256:post-0142-bookmark".to_owned(),
+            observed_bookmark_hash: "sha256:post-0142-bookmark".to_owned(),
+            account_id: "account".to_owned(),
+            profile_id: "profile".to_owned(),
+            catalog_hash: "sha256:catalog".to_owned(),
+            credential_generation_id: "credential-generation".to_owned(),
+            anchor_completed_at,
+            restore_created_at,
+        };
+        assert!(mln_0143_restore_anchor_matches(&exact, &exact));
+        for (label, drifted) in [
+            ("input operation", {
+                let mut value = exact.clone();
+                value.input_source_operation_id = "pre-0142-anchor".to_owned();
+                value
+            }),
+            ("receipt operation", {
+                let mut value = exact.clone();
+                value.receipt_source_operation_id = "grafted-operation".to_owned();
+                value
+            }),
+            ("input evidence", {
+                let mut value = exact.clone();
+                value.input_source_evidence_hash = "sha256:substitute".to_owned();
+                value
+            }),
+            ("receipt evidence", {
+                let mut value = exact.clone();
+                value.receipt_source_evidence_hash = "sha256:substitute".to_owned();
+                value
+            }),
+            ("target bookmark", {
+                let mut value = exact.clone();
+                value.input_target_bookmark_hash = "sha256:pre-0142".to_owned();
+                value
+            }),
+            ("requested bookmark", {
+                let mut value = exact.clone();
+                value.requested_bookmark_hash = "sha256:pre-0142".to_owned();
+                value
+            }),
+            ("observed bookmark", {
+                let mut value = exact.clone();
+                value.observed_bookmark_hash = "sha256:pre-0142".to_owned();
+                value
+            }),
+            ("account", {
+                let mut value = exact.clone();
+                value.account_id = "other-account".to_owned();
+                value
+            }),
+            ("profile", {
+                let mut value = exact.clone();
+                value.profile_id = "other-profile".to_owned();
+                value
+            }),
+            ("catalog", {
+                let mut value = exact.clone();
+                value.catalog_hash = "sha256:other-catalog".to_owned();
+                value
+            }),
+            ("credential", {
+                let mut value = exact.clone();
+                value.credential_generation_id = "other-generation".to_owned();
+                value
+            }),
+            ("chronology", {
+                let mut value = exact.clone();
+                value.anchor_completed_at = restore_created_at;
+                value
+            }),
+        ] {
+            assert!(
+                !mln_0143_restore_anchor_matches(&drifted, &exact),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "the adversarial anchor fixture keeps every joined authority dimension visible"
@@ -19239,7 +19470,7 @@ mod tests {
             schema_version: 1,
             operation_id: "11111111-1111-4111-8111-111111111111".to_owned(),
             capability_id: "mln-0143-data-invariants".to_owned(),
-            capability_version: 4,
+            capability_version: 5,
             validator_contract_hash:
                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             fixed_query_sha256:
@@ -19685,6 +19916,7 @@ mod tests {
                 "packet_count":3,
                 "packet_non_target_hash":format!("sha256:{}", "e".repeat(64)),
                 "packet_non_target_count":2,
+                "prior_0142_trigger_definition_hash":contract.prior_0142_trigger_definition_hash,
                 "trigger_definition_hashes":if phase == "pre_import" {
                     json!([])
                 } else {
@@ -19698,7 +19930,8 @@ mod tests {
                     "foreign_key_check_empty":true,
                     "duplicate_hash_groups_zero":true,
                     "invalid_evidence_kinds_zero":true,
-                    "invalid_advanced_events_zero":true
+                    "invalid_advanced_events_zero":true,
+                    "prior_0142_terminal_trigger_present":true
                 },
                 "query":{
                     "sha256":contract.fixed_query_sha256,

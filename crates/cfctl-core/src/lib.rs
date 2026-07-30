@@ -951,6 +951,7 @@ pub struct Mln0143DataInvariantsContractV1 {
     pub account_id: String,
     pub database_id: String,
     pub migration_sha256: String,
+    pub prior_0142_trigger_definition_hash: String,
     pub trigger_definition_hashes: Vec<String>,
     pub fixed_query_sha256: String,
     pub pre_table_definition_hash: String,
@@ -969,6 +970,7 @@ impl Mln0143DataInvariantsContractV1 {
             "capability_id":"mln-0143-data-invariants",
             "capability_version":self.capability_version,
             "migration_sha256":self.migration_sha256,
+            "prior_0142_trigger_definition_hash":self.prior_0142_trigger_definition_hash,
             "target_scope":{"account_id":self.account_id,"database_id":self.database_id},
             "fixed_query_sha256":self.fixed_query_sha256,
             "phase_table_definition_hashes":{
@@ -997,8 +999,8 @@ impl Mln0143DataInvariantsContractV1 {
                 "max_timeout_seconds":self.max_timeout_seconds,
             },
             "manifest_contract":{
-                "required":["schema_version","capability_id","capability_version","validator_contract_hash","migration_id","migration_sha256","phase","target_scope_hash","complete","projection","semantic_schema_hash","packet_hash","packet_count","packet_non_target_hash","packet_non_target_count","trigger_definition_hashes","assertions","query","lineage"],
-                "assertions":["old_table_absent","unique_hash_index_present","event_index_exact_non_unique_shape","document_index_exact_non_unique_shape","foreign_key_check_empty","duplicate_hash_groups_zero","invalid_evidence_kinds_zero","invalid_advanced_events_zero"],
+                "required":["schema_version","capability_id","capability_version","validator_contract_hash","migration_id","migration_sha256","phase","target_scope_hash","complete","projection","semantic_schema_hash","packet_hash","packet_count","packet_non_target_hash","packet_non_target_count","prior_0142_trigger_definition_hash","trigger_definition_hashes","assertions","query","lineage"],
+                "assertions":["old_table_absent","unique_hash_index_present","event_index_exact_non_unique_shape","document_index_exact_non_unique_shape","foreign_key_check_empty","duplicate_hash_groups_zero","invalid_evidence_kinds_zero","invalid_advanced_events_zero","prior_0142_terminal_trigger_present"],
                 "query":["sha256","row_limit","probe_rows","byte_limit","timeout_seconds","received_rows","provider_rows_read","provider_duration","bounds_saturated"],
             },
             "governed_execution_provenance":{
@@ -1021,6 +1023,8 @@ impl Mln0143DataInvariantsContractV1 {
                     "restore_operation_id","restore_evidence_hash","restore_previous_bookmark_hash",
                     "restore_requested_bookmark_hash","restore_observed_bookmark_hash"
                 ],
+                "post_restore_anchor":"restore input and receipt source operation/evidence plus requested and observed bookmark must equal the import plan's distinct post-0142 governed recovery anchor under the same target, profile, credential generation, catalog, and chronology",
+                "post_restore_0142_preservation":"the closed invariant query requires the exact 0142 terminal-generation trigger definition after restore",
                 "cardinality":"exactly_one",
                 "state_order":["provider_complete","post_import_proved","verified"],
             },

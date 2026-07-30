@@ -387,7 +387,7 @@ fn mln_0143_operational_proof_requires_exact_completed_runtime_binding() {
         schema_version: 1,
         operation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
         capability_id: "mln-0143-data-invariants".to_owned(),
-        capability_version: 4,
+        capability_version: 5,
         validator_contract_hash: sha256('c'),
         fixed_query_sha256: sha256('d'),
         catalog_hash: sha256('a'),

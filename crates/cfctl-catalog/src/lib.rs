@@ -1863,7 +1863,7 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
         "/accounts/{account_id}/d1/database/{database_id}/import",
     );
     capability.description = Some(
-        "Stage and import exactly MLNavigator migration 0142 or 0143. The reviewed source is one exact clean Git repository revision, relative path, and blob; local origin configuration establishes snapshot identity, not hosted ownership. For 0143, the shared admission and consumption gate requires verified 0142 closure, then the governed recovery export, then exactly one current-authority pre_import proof, all before the immutable plan cutoff. This is evidence chronology, not a claim that out-of-band provider writes were absent. The plan binds those reviewed source bytes, the recovery anchor with its verified file and provider bookmark, and phase authority; provider completion remains unverified until the governed post-import proof is attached."
+        "Stage and import exactly MLNavigator migration 0142 or 0143. The reviewed source is one exact clean Git repository revision, relative path, and blob; local origin configuration establishes snapshot identity, not hosted ownership. For 0143, the shared admission and consumption gate requires verified 0142 closure, then the governed recovery export, then exactly one current-authority pre_import proof, all before the immutable plan cutoff. This is evidence chronology, not a claim that out-of-band provider writes were absent. A 0143 post-restore proof must restore the exact post-0142 recovery anchor and re-prove the exact 0142 terminal-generation trigger. A 0142 rollback is a different boundary: it must target the pre-0142 anchor and separately prove that the 0142 trigger is absent; it cannot use the 0143 post-restore contract. The plan binds reviewed source bytes, the phase-specific recovery anchor with its provider bookmark, and proof authority; provider completion remains unverified until the governed post-import proof is attached."
             .to_owned(),
     );
     "D1".clone_into(&mut capability.product);
@@ -1901,7 +1901,7 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
     capability.rollback.strategy =
         Some("no_automatic_rollback_use_separately_approved_bookmark_restore".to_owned());
     capability.rollback.warning = Some(
-        "There is no automatic rollback. Recovery requires a new explicitly approved exact-bookmark restore after quiescence and impact review."
+        "There is no automatic rollback. Recovery requires a new explicitly approved exact-bookmark restore after quiescence and impact review. Restore 0143 only to its post-0142 anchor and prove the 0142 terminal trigger remains exact; restore 0142 only to its pre-0142 anchor and prove that trigger is absent."
             .to_owned(),
     );
     capability.selectors = [("account_id", account_id), ("database_id", database_id)]
@@ -2146,19 +2146,21 @@ fn mln_0143_data_invariants_capability() -> CapabilityV1 {
         database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
         migration_sha256: "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
             .to_owned(),
+        prior_0142_trigger_definition_hash:
+            "sha256:7e68876f488b0117133c09de1cb0bbbd7a5a73ee705dd2888f480a2bdd1531e1".to_owned(),
         trigger_definition_hashes: vec![
             "sha256:d858df9c22c19df241e5045eca9635c4fb786000428707a821090daeacc69072".to_owned(),
             "sha256:e9205a4863c717c901ec3ac87089555a9af7eac14d5f38fbf40bff775ad8497c".to_owned(),
             "sha256:3ca04f9fc717104d2ee0da719e2c473a756d3345f4e222d52c4d0f76237a184b".to_owned(),
         ],
         fixed_query_sha256:
-            "sha256:25f81a01063e72e59da8b216a08673ec70b887a016ccba5d1a4fd12fd2cfc28d".to_owned(),
+            "sha256:5437f47c76377bf228f4b0113784294c880e42a9ef59b5f24a94cb7147e5383c".to_owned(),
         pre_table_definition_hash:
             "sha256:8aa5012ace3d946354e0baba7e645646ac97373b42e7c3d61e79b67a5f689fea".to_owned(),
         post_table_definition_hash:
             "sha256:2fbdacd011abca8024507b99d179071b8b920271576e4cb3a2f06c4f3ffd2d7f".to_owned(),
         validator_contract_hash: String::new(),
-        capability_version: 4,
+        capability_version: 5,
         max_evidence_rows: 256,
         probe_rows: 257,
         max_bytes: 1024 * 1024,
