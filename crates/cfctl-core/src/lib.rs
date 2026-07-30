@@ -5979,6 +5979,25 @@ pub struct OperationalProofV1 {
     mln_0143_execution: Option<Mln0143GovernedExecutionBindingV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mln_0142_execution: Option<Mln0142GovernedExecutionBindingV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    d1_full_export_execution: Option<D1FullExportGovernedExecutionBindingV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct D1FullExportGovernedExecutionBindingV1 {
+    pub schema_version: u8,
+    pub operation_id: String,
+    pub capability_id: String,
+    pub catalog_hash: String,
+    pub target_scope_hash: String,
+    pub output_file_sha256: String,
+    pub at_bookmark_hash: String,
+    pub manifest_evidence_hash: String,
+    pub request_hash: String,
+    pub profile_id: String,
+    pub credential_generation_id: String,
+    pub completion_status: String,
+    pub completed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6048,7 +6067,39 @@ impl OperationalProofV1 {
             evidence,
             mln_0143_execution: None,
             mln_0142_execution: None,
+            d1_full_export_execution: None,
         }
+    }
+
+    pub fn bind_d1_full_export_governed_execution(
+        &mut self,
+        binding: D1FullExportGovernedExecutionBindingV1,
+    ) -> Result<()> {
+        if self.d1_full_export_execution.is_some()
+            || self.capability_id != "d1-full-export"
+            || self.outcome != OperationalProofOutcomeV1::Succeeded
+            || self.evidence.content_hash != binding.manifest_evidence_hash
+            || self.catalog_hash != binding.catalog_hash
+            || self.input_hash != binding.request_hash
+            || self.profile_id.as_deref() != Some(binding.profile_id.as_str())
+            || self.credential_generation_id.as_deref()
+                != Some(binding.credential_generation_id.as_str())
+            || binding.schema_version != 1
+            || binding.completion_status != "completed"
+        {
+            return Err(CoreError::InvalidOperationalProofBinding(
+                "D1 full-export binding does not match its completed operational proof".to_owned(),
+            ));
+        }
+        self.d1_full_export_execution = Some(binding);
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn d1_full_export_governed_execution(
+        &self,
+    ) -> Option<&D1FullExportGovernedExecutionBindingV1> {
+        self.d1_full_export_execution.as_ref()
     }
 
     pub fn bind_mln_0143_governed_execution(

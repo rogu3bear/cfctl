@@ -1246,7 +1246,18 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     }
     let mut prepared = call_input(&capability, &arguments)?;
     if is_d1_approved_mln_import {
-        validate_approved_mln_import_prerequisites(store, &capability, &prepared.input)?;
+        let profiles = ProfilesConfig::load(store)?;
+        let profile = profiles.selected(arguments.profile.as_deref())?;
+        validate_approved_mln_import_prerequisites(
+            store,
+            &capability,
+            &prepared.input,
+            ImportPrerequisiteContext {
+                profile_id: &profile.id,
+                credential_generation_id: profile.credential_generation_id.as_deref(),
+                before: Utc::now(),
+            },
+        )?;
     }
     if capability.mln_0142_post_import_schema.is_some() {
         validate_mln_0142_post_import_schema_input(store, &capability, &prepared.input)?;
@@ -1533,6 +1544,7 @@ fn validate_approved_mln_import_prerequisites(
     store: &StateStore,
     capability: &CapabilityV1,
     input: &CallInput,
+    context: ImportPrerequisiteContext<'_>,
 ) -> Result<()> {
     let contract = capability
         .d1_approved_mln_import
@@ -1664,7 +1676,7 @@ fn validate_approved_mln_import_prerequisites(
         "account_id":contract.account_id,
         "database_id":contract.database_id,
     }))?;
-    let proof_matches = store
+    let schema_proofs = store
         .list_operational_proofs()?
         .into_iter()
         .filter(|proof| {
@@ -1682,11 +1694,11 @@ fn validate_approved_mln_import_prerequisites(
                     && binding.completion_status == "completed"
             })
         })
-        .count();
+        .collect::<Vec<_>>();
     if !prior_exact
         || !verification_artifact_matches
         || !verification_receipt_matches
-        || proof_matches != 1
+        || schema_proofs.len() != 1
         || matching_boundaries.len() != 1
     {
         return Err(CliError::Input(
@@ -1694,20 +1706,19 @@ fn validate_approved_mln_import_prerequisites(
                 .to_owned(),
         ));
     }
-    for field in [
-        "post_0142_anchor_evidence_hash",
-        "pre_import_invariant_evidence_hash",
-    ] {
-        let hash = body
-            .get(field)
-            .and_then(Value::as_str)
-            .ok_or_else(|| CliError::Input(format!("0143 requires {field}")))?;
-        store.read_evidence_value(hash).map_err(|error| {
+    let invariant_evidence_hash = body
+        .get("pre_import_invariant_evidence_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("0143 requires pre_import_invariant_evidence_hash".to_owned())
+        })?;
+    store
+        .read_evidence_value(invariant_evidence_hash)
+        .map_err(|error| {
             CliError::Input(format!(
-                "{field} does not resolve to immutable evidence: {error}"
+                "pre_import_invariant_evidence_hash does not resolve to immutable evidence: {error}"
             ))
         })?;
-    }
     let invariant_operation = body
         .get("pre_import_invariant_operation_id")
         .and_then(Value::as_str)
@@ -1757,7 +1768,105 @@ fn validate_approved_mln_import_prerequisites(
                 .to_owned(),
         ));
     }
+    let anchor_evidence_hash = body
+        .get("post_0142_anchor_evidence_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("0143 requires post_0142_anchor_evidence_hash".to_owned())
+        })?;
+    let anchor_bookmark_hash = body
+        .get("post_0142_anchor_bookmark_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("0143 requires post_0142_anchor_bookmark_hash".to_owned())
+        })?;
+    store.read_evidence_value(anchor_evidence_hash)?;
+    let closed_at = prior_plan
+        .transaction_journal
+        .iter()
+        .find(|checkpoint| checkpoint.stage == TransactionStageV1::Closed)
+        .map(|checkpoint| checkpoint.recorded_at)
+        .ok_or_else(|| {
+            CliError::Input("verified 0142 omitted its terminal checkpoint".to_owned())
+        })?;
+    let cutoff = context.before;
+    let expected_profile = context.profile_id;
+    let current_generation = context.credential_generation_id;
+    let prior_generation = schema_proofs[0]
+        .mln_0142_governed_execution()
+        .map(|binding| binding.credential_generation_id.as_str())
+        .ok_or_else(|| CliError::Input("verified 0142 schema proof lost its binding".to_owned()))?;
+    let anchor_expectation = Post0142AnchorExpectation {
+        operation_id: anchor_operation,
+        evidence_hash: anchor_evidence_hash,
+        bookmark_hash: anchor_bookmark_hash,
+        target_scope_hash: &expected_target_hash,
+        account_id: &contract.account_id,
+        profile_id: expected_profile,
+        credential_generation_id: prior_generation,
+        current_credential_generation_id: current_generation,
+        after: closed_at,
+        before: cutoff,
+    };
+    let anchor_matches = store
+        .list_operational_proofs()?
+        .into_iter()
+        .filter(|proof| post_0142_anchor_matches(proof, &anchor_expectation))
+        .count();
+    if anchor_matches != 1 {
+        return Err(CliError::Input(
+            "0143 requires exactly one completed governed D1 full-export anchor after verified 0142, bound to the exact evidence, target, profile, credential generation, and captured bookmark"
+                .to_owned(),
+        ));
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ImportPrerequisiteContext<'a> {
+    profile_id: &'a str,
+    credential_generation_id: Option<&'a str>,
+    before: chrono::DateTime<Utc>,
+}
+
+#[derive(Clone, Copy)]
+struct Post0142AnchorExpectation<'a> {
+    operation_id: &'a str,
+    evidence_hash: &'a str,
+    bookmark_hash: &'a str,
+    target_scope_hash: &'a str,
+    account_id: &'a str,
+    profile_id: &'a str,
+    credential_generation_id: &'a str,
+    current_credential_generation_id: Option<&'a str>,
+    after: chrono::DateTime<Utc>,
+    before: chrono::DateTime<Utc>,
+}
+
+fn post_0142_anchor_matches(
+    proof: &OperationalProofV1,
+    expected: &Post0142AnchorExpectation<'_>,
+) -> bool {
+    proof
+        .d1_full_export_governed_execution()
+        .is_some_and(|binding| {
+            binding.operation_id == expected.operation_id
+                && proof.capability_id == "d1-full-export"
+                && proof.evidence.content_hash == expected.evidence_hash
+                && binding.manifest_evidence_hash == expected.evidence_hash
+                && binding.at_bookmark_hash == expected.bookmark_hash
+                && binding.target_scope_hash == expected.target_scope_hash
+                && proof.account_id.as_deref() == Some(expected.account_id)
+                && proof.profile_id.as_deref() == Some(expected.profile_id)
+                && binding.profile_id == expected.profile_id
+                && binding.credential_generation_id == expected.credential_generation_id
+                && expected
+                    .current_credential_generation_id
+                    .is_none_or(|value| value == expected.credential_generation_id)
+                && binding.completion_status == "completed"
+                && binding.completed_at > expected.after
+                && binding.completed_at < expected.before
+        })
 }
 
 fn mln_0142_terminal_import_state(plan: &PlanV1) -> bool {
@@ -10135,6 +10244,19 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     preflight_secret_sink(&plan)?;
     let profiles = ProfilesConfig::load(store)?;
     let profile = profiles.selected(Some(&plan.profile_id))?;
+    if plan.capability.d1_approved_mln_import.is_some() {
+        let execution_input: CallInput = serde_json::from_value(plan.input.clone())?;
+        validate_approved_mln_import_prerequisites(
+            store,
+            &plan.capability,
+            &execution_input,
+            ImportPrerequisiteContext {
+                profile_id: &plan.profile_id,
+                credential_generation_id: profile.credential_generation_id.as_deref(),
+                before: plan.created_at,
+            },
+        )?;
+    }
     validate_plan_v2_runtime_pins(store, &plan, profile)?;
     if is_r2_temporary_credentials_operation_identity(&plan.capability)
         && profile.kind != ProfileKind::ApiToken
@@ -18378,10 +18500,11 @@ mod tests {
     use super::{
         CallInput, CliError, DNS_RECORD_DETAIL_PATH, DNS_RECORD_DETAIL_READ_CAPABILITY_ID,
         DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
-        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, SECURITY_IP_RULE_COLLECTION_PATH,
-        SECURITY_IP_RULE_CREATE_ID, SECURITY_IP_RULE_STATE_CAPABILITY_ID,
-        SECURITY_LIST_MEMBER_COLLECTION_PATH, SECURITY_LIST_MEMBER_CREATE_ID,
-        SECURITY_LIST_MEMBER_REMOVE_ID, SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
+        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, Post0142AnchorExpectation,
+        SECURITY_IP_RULE_COLLECTION_PATH, SECURITY_IP_RULE_CREATE_ID,
+        SECURITY_IP_RULE_STATE_CAPABILITY_ID, SECURITY_LIST_MEMBER_COLLECTION_PATH,
+        SECURITY_LIST_MEMBER_CREATE_ID, SECURITY_LIST_MEMBER_REMOVE_ID,
+        SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
         SECURITY_WAF_RULE_STATE_CAPABILITY_ID, TokenPolicyBinding, admit_standing_plan,
         apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
@@ -18402,7 +18525,7 @@ mod tests {
         mln_0143_parent_manifests, non_readback_verification_basis, operational_proof_coverage,
         permission_inventory_call, permission_inventory_envelope, persist_prepared_plan,
         persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage,
-        plan_state_next_step, plan_status_label, preflight_call_input,
+        plan_state_next_step, plan_status_label, post_0142_anchor_matches, preflight_call_input,
         preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
         read_import_secret, read_r2_log_retrieval_credentials, read_secret_file,
@@ -18447,13 +18570,14 @@ mod tests {
         AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
         AsyncCollectionMutationContractV1, CapabilityV1, CostV1,
         CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
-        CreatedResourceContractV1, EffectClass, EntitlementProbeV1, EvidenceClass, EvidenceV1,
-        OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, OutputFormatV1,
-        PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1, PlanV2, QuerySerializationV1,
-        ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1,
-        SecurityActionContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1,
-        SelectorContractV1, SelectorV1, StandingAuthorityStatus, StandingAuthorityV1,
-        TransactionStageV1, VerificationState, WorkflowContractV1, WorkflowStepV1, hash_value,
+        CreatedResourceContractV1, D1FullExportGovernedExecutionBindingV1, EffectClass,
+        EntitlementProbeV1, EvidenceClass, EvidenceV1, OperationalProofOutcomeV1,
+        OperationalProofScopeV1, OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanPinsV2,
+        PlanStatus, PlanV1, PlanV2, QuerySerializationV1, ResultEnvelopeV2, RiskClass,
+        SECRET_FIELD_NAMES, SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
+        SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
+        StandingAuthorityV1, TransactionStageV1, VerificationState, WorkflowContractV1,
+        WorkflowStepV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -18575,6 +18699,184 @@ mod tests {
             mln_0142_terminal_import_state(&plan),
             "only Verified plus Closed is admissible"
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the adversarial anchor fixture keeps every joined authority dimension visible"
+    )]
+    fn mln_0143_anchor_requires_the_exact_governed_post_0142_export_join() {
+        let after = Utc::now();
+        let completed_at = after + ChronoDuration::seconds(10);
+        let before = completed_at + ChronoDuration::seconds(10);
+        let evidence = EvidenceV1::new(
+            EvidenceClass::LiveRead,
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "/tmp/export-evidence.json",
+        );
+        let binding = D1FullExportGovernedExecutionBindingV1 {
+            schema_version: 1,
+            operation_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            capability_id: "d1-full-export".to_owned(),
+            catalog_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            target_scope_hash:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            output_file_sha256:
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+            at_bookmark_hash:
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            manifest_evidence_hash: evidence.content_hash.clone(),
+            request_hash: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                .to_owned(),
+            profile_id: "profile-a".to_owned(),
+            credential_generation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            completion_status: "completed".to_owned(),
+            completed_at,
+        };
+        let build = |binding: D1FullExportGovernedExecutionBindingV1| {
+            let mut proof = OperationalProofV1::new(
+                binding.completed_at,
+                "d1-full-export",
+                &binding.catalog_hash,
+                &binding.request_hash,
+                OperationalProofScopeV1::new(
+                    Some("profile-a"),
+                    Some("account-a"),
+                    Some("22222222-2222-4222-8222-222222222222"),
+                ),
+                OperationalProofOutcomeV1::Succeeded,
+                evidence.clone(),
+            );
+            proof
+                .bind_d1_full_export_governed_execution(binding)
+                .expect("valid export binding");
+            proof
+        };
+        let proof = build(binding.clone());
+        let exact = Post0142AnchorExpectation {
+            operation_id: &binding.operation_id,
+            evidence_hash: &binding.manifest_evidence_hash,
+            bookmark_hash: &binding.at_bookmark_hash,
+            target_scope_hash: &binding.target_scope_hash,
+            account_id: "account-a",
+            profile_id: "profile-a",
+            credential_generation_id: &binding.credential_generation_id,
+            current_credential_generation_id: Some(&binding.credential_generation_id),
+            after,
+            before,
+        };
+        assert!(post_0142_anchor_matches(&proof, &exact));
+        assert_eq!(
+            [proof.clone(), proof.clone()]
+                .iter()
+                .filter(|candidate| post_0142_anchor_matches(candidate, &exact))
+                .count(),
+            2,
+            "the admission cardinality gate must reject duplicate matching proof rows"
+        );
+        for drifted in [
+            Post0142AnchorExpectation {
+                operation_id: "33333333-3333-4333-8333-333333333333",
+                ..exact
+            },
+            Post0142AnchorExpectation {
+                evidence_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Post0142AnchorExpectation {
+                bookmark_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Post0142AnchorExpectation {
+                target_scope_hash: "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                ..exact
+            },
+            Post0142AnchorExpectation {
+                profile_id: "other-profile",
+                ..exact
+            },
+            Post0142AnchorExpectation {
+                current_credential_generation_id: Some("33333333-3333-4333-8333-333333333333"),
+                ..exact
+            },
+            Post0142AnchorExpectation {
+                after: completed_at,
+                ..exact
+            },
+            Post0142AnchorExpectation {
+                before: completed_at,
+                ..exact
+            },
+        ] {
+            assert!(!post_0142_anchor_matches(&proof, &drifted));
+        }
+        let mut stale = binding.clone();
+        stale.completed_at = after - ChronoDuration::seconds(1);
+        assert!(
+            !post_0142_anchor_matches(&build(stale), &exact),
+            "a pre-0142 export cannot serve as the post-0142 anchor"
+        );
+    }
+
+    #[test]
+    fn d1_full_export_runtime_records_the_exact_bookmark_anchor_receipt() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let capability = catalog.get("d1-full-export").expect("D1 export");
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"ca30e922fda7f5578e49873542e4aaca",
+                "database_id":"15dc8c91-cba5-4ba8-9e5b-a06cf7e6bf15",
+            }),
+            ..CallInput::default()
+        };
+        let result = json!({
+            "output_file":{
+                "sha256":format!("sha256:{}", "a".repeat(64)),
+                "complete":true,
+                "hash_matches":true,
+            },
+            "provider":{"at_bookmark":"bookmark-after-0142"},
+        });
+        let evidence = store
+            .write_evidence(EvidenceClass::LiveRead, &result)
+            .expect("evidence");
+        let mut envelope =
+            ResultEnvelopeV2::success("call", result).with_evidence(evidence.clone());
+        envelope.performed = true;
+        envelope.profile_id = Some("profile-a".to_owned());
+        envelope.account_id = Some("ca30e922fda7f5578e49873542e4aaca".to_owned());
+        record_operational_proof(
+            &store,
+            &catalog,
+            capability,
+            &input,
+            Some("22222222-2222-4222-8222-222222222222"),
+            &envelope,
+        )
+        .expect("governed export proof");
+        let proofs = store.list_operational_proofs().expect("proofs");
+        assert_eq!(proofs.len(), 1);
+        let binding = proofs[0]
+            .d1_full_export_governed_execution()
+            .expect("bound export");
+        assert_eq!(binding.manifest_evidence_hash, evidence.content_hash);
+        assert_eq!(
+            binding.at_bookmark_hash,
+            hash_value(&json!("bookmark-after-0142")).expect("bookmark hash")
+        );
+        assert_eq!(binding.completion_status, "completed");
     }
 
     #[test]

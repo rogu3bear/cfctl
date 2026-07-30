@@ -8517,8 +8517,11 @@ fn validate_d1_approved_mln_import_contract(
     let required_0143 = [
         "prior_0142_operation_id",
         "prior_0142_boundary_evidence_hash",
+        "prior_0142_schema_proof_operation_id",
+        "prior_0142_verification_evidence_hash",
         "post_0142_anchor_operation_id",
         "post_0142_anchor_evidence_hash",
+        "post_0142_anchor_bookmark_hash",
         "pre_import_invariant_operation_id",
         "pre_import_invariant_evidence_hash",
     ];

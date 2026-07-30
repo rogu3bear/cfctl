@@ -1938,6 +1938,7 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
             "prior_0142_verification_evidence_hash":hash,
             "post_0142_anchor_operation_id":operation,
             "post_0142_anchor_evidence_hash":hash,
+            "post_0142_anchor_bookmark_hash":hash,
             "pre_import_invariant_operation_id":operation,
             "pre_import_invariant_evidence_hash":hash
         },
@@ -1947,6 +1948,7 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
                  {"required":["prior_0142_operation_id"]},{"required":["prior_0142_boundary_evidence_hash"]},
                  {"required":["prior_0142_schema_proof_operation_id"]},{"required":["prior_0142_verification_evidence_hash"]},
                  {"required":["post_0142_anchor_operation_id"]},{"required":["post_0142_anchor_evidence_hash"]},
+                 {"required":["post_0142_anchor_bookmark_hash"]},
                  {"required":["pre_import_invariant_operation_id"]},{"required":["pre_import_invariant_evidence_hash"]}
              ]}}},
             {"if":{"properties":{"migration_id":{"const":"0143"}}},
@@ -1954,6 +1956,7 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
                  "prior_0142_operation_id","prior_0142_boundary_evidence_hash",
                  "prior_0142_schema_proof_operation_id","prior_0142_verification_evidence_hash",
                  "post_0142_anchor_operation_id","post_0142_anchor_evidence_hash",
+                 "post_0142_anchor_bookmark_hash",
                  "pre_import_invariant_operation_id","pre_import_invariant_evidence_hash"
              ]}}
         ]

@@ -11012,6 +11012,14 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
     let encoded = serde_json::to_string(capability).expect("capability JSON");
     assert!(!encoded.contains("\"sql\""));
     assert!(!encoded.contains("\"protocol\""));
+    assert!(
+        capability
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.pointer("/properties/post_0142_anchor_bookmark_hash"))
+            .is_some(),
+        "0143 must name the exact bookmark captured by its governed post-0142 export"
+    );
 }
 
 #[test]

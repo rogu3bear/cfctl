@@ -10,10 +10,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use cfctl_catalog::CatalogSnapshot;
 use cfctl_cloudflare::CallInput;
 use cfctl_core::{
-    AdapterStatus, CapabilityV1, EvidenceClass, Mln0142GovernedExecutionBindingV1,
-    Mln0143GovernedExecutionBindingV1, OperationalProofFreshnessV1, OperationalProofOutcomeV1,
-    OperationalProofScopeV1, OperationalProofV1, PlanStatus, PlanV1, ResultEnvelopeV2,
-    TransactionStageV1, VerificationState, hash_value,
+    AdapterStatus, CapabilityV1, D1FullExportGovernedExecutionBindingV1, EvidenceClass,
+    Mln0142GovernedExecutionBindingV1, Mln0143GovernedExecutionBindingV1,
+    OperationalProofFreshnessV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
+    OperationalProofV1, PlanStatus, PlanV1, ResultEnvelopeV2, TransactionStageV1,
+    VerificationState, hash_value,
 };
 use cfctl_storage::{OperationalProofPageV1, StateStore};
 use chrono::{DateTime, Utc};
@@ -217,6 +218,78 @@ pub(crate) fn record_operational_proof(
         },
         evidence,
     );
+    if capability.d1_full_export.is_some() {
+        let account_id = input
+            .selectors
+            .get("account_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("D1 full export omitted its account selector".to_owned())
+            })?;
+        let database_id = input
+            .selectors
+            .get("database_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("D1 full export omitted its database selector".to_owned())
+            })?;
+        let output_sha256 = envelope
+            .result
+            .pointer("/output_file/sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input("D1 full export omitted the verified output hash".to_owned())
+            })?;
+        let at_bookmark = envelope
+            .result
+            .pointer("/provider/at_bookmark")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Input("D1 full export omitted its captured provider bookmark".to_owned())
+            })?;
+        if !envelope.ok
+            || envelope
+                .result
+                .pointer("/output_file/complete")
+                .and_then(Value::as_bool)
+                != Some(true)
+            || envelope
+                .result
+                .pointer("/output_file/hash_matches")
+                .and_then(Value::as_bool)
+                != Some(true)
+            || envelope.account_id.as_deref() != Some(account_id)
+        {
+            return Err(CliError::Input(
+                "D1 full export is not a completed same-file verified snapshot".to_owned(),
+            ));
+        }
+        let profile_id = envelope.profile_id.as_deref().ok_or_else(|| {
+            CliError::Input("D1 full export proof requires a profile identity".to_owned())
+        })?;
+        let credential_generation_id = credential_generation_id.ok_or_else(|| {
+            CliError::Input("D1 full export proof requires a credential generation".to_owned())
+        })?;
+        proof.bind_d1_full_export_governed_execution(D1FullExportGovernedExecutionBindingV1 {
+            schema_version: 1,
+            operation_id: Uuid::new_v4().to_string(),
+            capability_id: capability.id.clone(),
+            catalog_hash: catalog.schema_hash.clone(),
+            target_scope_hash: hash_value(&json!({
+                "account_id": account_id,
+                "database_id": database_id,
+            }))?,
+            output_file_sha256: output_sha256.to_owned(),
+            at_bookmark_hash: hash_value(&Value::String(at_bookmark.to_owned()))?,
+            manifest_evidence_hash: proof.evidence.content_hash.clone(),
+            request_hash: input_hash.clone(),
+            profile_id: profile_id.to_owned(),
+            credential_generation_id: credential_generation_id.to_owned(),
+            completion_status: "completed".to_owned(),
+            completed_at: envelope.generated_at,
+        })?;
+    }
     if let Some(contract) = capability.mln_0143_data_invariants.as_ref() {
         let manifest = envelope.result.get("result").unwrap_or(&envelope.result);
         let phase = input

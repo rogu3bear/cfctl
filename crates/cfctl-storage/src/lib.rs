@@ -1367,8 +1367,52 @@ fn validate_operational_proof(
         ));
     }
     validate_sha256_identity("evidence", &proof.evidence.content_hash)?;
+    validate_d1_full_export_execution_binding(proof)?;
     validate_mln_0142_execution_binding(proof)?;
     validate_mln_0143_execution_binding(proof)?;
+    Ok(())
+}
+
+fn validate_d1_full_export_execution_binding(proof: &OperationalProofV1) -> Result<()> {
+    let binding = proof.d1_full_export_governed_execution();
+    if proof.capability_id == "d1-full-export" && binding.is_none() {
+        return Err(StorageError::InvalidOperationalProof(
+            "D1 full-export operational proof requires governed-execution provenance".to_owned(),
+        ));
+    }
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    for (label, value) in [
+        ("binding catalog", binding.catalog_hash.as_str()),
+        ("target scope", binding.target_scope_hash.as_str()),
+        ("output file", binding.output_file_sha256.as_str()),
+        ("captured bookmark", binding.at_bookmark_hash.as_str()),
+        ("manifest evidence", binding.manifest_evidence_hash.as_str()),
+        ("request", binding.request_hash.as_str()),
+    ] {
+        validate_sha256_identity(label, value)?;
+    }
+    if binding.schema_version != 1
+        || binding.capability_id != "d1-full-export"
+        || proof.capability_id != binding.capability_id
+        || proof.catalog_hash != binding.catalog_hash
+        || proof.input_hash != binding.request_hash
+        || proof.evidence.content_hash != binding.manifest_evidence_hash
+        || proof.profile_id.as_deref() != Some(binding.profile_id.as_str())
+        || proof.credential_generation_id.as_deref()
+            != Some(binding.credential_generation_id.as_str())
+        || Uuid::parse_str(&binding.operation_id).is_err()
+        || Uuid::parse_str(&binding.credential_generation_id).is_err()
+        || binding.profile_id.trim().is_empty()
+        || binding.completion_status != "completed"
+        || proof.outcome != cfctl_core::OperationalProofOutcomeV1::Succeeded
+        || proof.observed_at != binding.completed_at
+    {
+        return Err(StorageError::InvalidOperationalProof(
+            "D1 full-export binding drifted from its immutable completed proof".to_owned(),
+        ));
+    }
     Ok(())
 }
 

@@ -2,10 +2,10 @@
 
 use cfctl_core::{
     AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1, CapabilityV1,
-    EvidenceClass, Mln0142GovernedExecutionBindingV1, Mln0143GovernedExecutionBindingV1,
-    OperationalProofOutcomeV1, OperationalProofScopeV1, OperationalProofV1, PlanStatus, PlanV1,
-    PolicyDisposition, StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1,
-    hash_value,
+    D1FullExportGovernedExecutionBindingV1, EvidenceClass, Mln0142GovernedExecutionBindingV1,
+    Mln0143GovernedExecutionBindingV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
+    OperationalProofV1, PlanStatus, PlanV1, PolicyDisposition, StandingAuthorityStatus,
+    StandingAuthorityV1, TransactionStageV1, hash_value,
 };
 use cfctl_storage::{RuntimePaths, StateStore, StorageError, StoredPlanRecord};
 use chrono::{Duration, Utc};
@@ -550,6 +550,87 @@ fn mln_0142_operational_proof_rejects_synthetic_or_drifted_authority() {
         "mln-0142-post-import-schema",
         &sha256('a'),
         &sha256('1'),
+        OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+        OperationalProofOutcomeV1::Succeeded,
+        evidence,
+    );
+    assert!(matches!(
+        store.record_operational_proof(&synthetic),
+        Err(StorageError::InvalidOperationalProof(_))
+    ));
+}
+
+#[test]
+fn d1_full_export_proof_requires_exact_completed_snapshot_binding() {
+    let root = tempfile::tempdir().expect("temporary storage root");
+    let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("storage opens");
+    let observed_at = Utc::now();
+    let evidence = store
+        .write_evidence(
+            EvidenceClass::LiveRead,
+            &json!({"provider":{"at_bookmark":"bookmark-42"}}),
+        )
+        .expect("evidence writes");
+    let valid = D1FullExportGovernedExecutionBindingV1 {
+        schema_version: 1,
+        operation_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+        capability_id: "d1-full-export".to_owned(),
+        catalog_hash: sha256('a'),
+        target_scope_hash: sha256('b'),
+        output_file_sha256: sha256('c'),
+        at_bookmark_hash: sha256('d'),
+        manifest_evidence_hash: evidence.content_hash.clone(),
+        request_hash: sha256('e'),
+        profile_id: "profile-a".to_owned(),
+        credential_generation_id: GENERATION_A.to_owned(),
+        completion_status: "completed".to_owned(),
+        completed_at: observed_at,
+    };
+    let build = |binding: D1FullExportGovernedExecutionBindingV1| {
+        let mut proof = OperationalProofV1::new(
+            observed_at,
+            "d1-full-export",
+            &sha256('a'),
+            &sha256('e'),
+            OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
+            OperationalProofOutcomeV1::Succeeded,
+            evidence.clone(),
+        );
+        proof
+            .bind_d1_full_export_governed_execution(binding)
+            .map(|()| proof)
+    };
+    store
+        .record_operational_proof(&build(valid.clone()).expect("valid binding"))
+        .expect("valid proof indexes");
+    for mutate in [
+        |binding: &mut D1FullExportGovernedExecutionBindingV1| {
+            binding.at_bookmark_hash = "not-a-hash".to_owned();
+        },
+        |binding: &mut D1FullExportGovernedExecutionBindingV1| {
+            binding.target_scope_hash = "not-a-hash".to_owned();
+        },
+        |binding: &mut D1FullExportGovernedExecutionBindingV1| {
+            binding.profile_id = "other".to_owned();
+        },
+        |binding: &mut D1FullExportGovernedExecutionBindingV1| {
+            binding.completion_status = "started".to_owned();
+        },
+    ] {
+        let mut binding = valid.clone();
+        mutate(&mut binding);
+        if let Ok(proof) = build(binding) {
+            assert!(matches!(
+                store.record_operational_proof(&proof),
+                Err(StorageError::InvalidOperationalProof(_))
+            ));
+        }
+    }
+    let synthetic = OperationalProofV1::new(
+        observed_at,
+        "d1-full-export",
+        &sha256('a'),
+        &sha256('e'),
         OperationalProofScopeV1::new(Some("profile-a"), Some("account-a"), Some(GENERATION_A)),
         OperationalProofOutcomeV1::Succeeded,
         evidence,
