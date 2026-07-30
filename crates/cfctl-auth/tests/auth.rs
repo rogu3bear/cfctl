@@ -100,6 +100,22 @@ fn immutable_api_token_slots_switch_profiles_without_overwriting_the_old_generat
         Some("fresh-token")
     );
     store
+        .delete_profile("publisher")
+        .expect("retire legacy profile-keyed credential");
+    assert_eq!(
+        store
+            .load_profile_credential(&profile)
+            .expect("active immutable slot survives legacy cleanup")
+            .bearer_token(),
+        Some("fresh-token")
+    );
+    assert_eq!(
+        store
+            .locate_api_token("publisher")
+            .expect("legacy credential location"),
+        None
+    );
+    store
         .delete_api_token_slot(slot_id)
         .expect("delete retired slot");
     assert!(

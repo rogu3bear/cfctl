@@ -20007,6 +20007,14 @@ async fn key_renew_analytics_profile(
         let renew_at =
             managed.expires_at - ChronoDuration::hours(i64::from(arguments.renew_before_hours));
         if Utc::now() < renew_at {
+            let secrets = platform_secrets(store);
+            let retired_legacy_credential =
+                if secrets.locate_api_token(&arguments.profile)?.is_some() {
+                    secrets.delete_profile(&arguments.profile)?;
+                    true
+                } else {
+                    false
+                };
             let mut envelope = ResultEnvelopeV2::success(
                 "keys renew-analytics-profile",
                 json!({
@@ -20015,6 +20023,7 @@ async fn key_renew_analytics_profile(
                     "active_token_id":managed.token_id,
                     "expires_at":managed.expires_at,
                     "renew_at":renew_at,
+                    "retired_legacy_profile_credential":retired_legacy_credential,
                     "observable_failure_signal":"nonzero process exit with ResultEnvelopeV2 error",
                     "message":"Managed analytics child is healthy and outside its renewal window."
                 }),
