@@ -2673,6 +2673,14 @@ impl Executor {
             };
             match poll_outcome {
                 D1ImportPollOutcome::Complete(final_bookmark) => {
+                    let staged_identity = plan
+                        .targets
+                        .pointer("/adapter/approved_mln_import")
+                        .ok_or_else(|| {
+                            CloudflareError::InvalidRequestBody(
+                                "approved MLN import stage identity is missing".to_owned(),
+                            )
+                        })?;
                     let boundary = D1ImportCheckpointV1 {
                         schema_version: 1,
                         operation_id: plan.operation_id.clone(),
@@ -2680,10 +2688,16 @@ impl Executor {
                         performed: true,
                         rectification_required: false,
                         receipt: serde_json::json!({
+                            "provider":"cloudflare",
+                            "effect":"d1_import_provider_complete",
+                            "response_action":"poll",
+                            "no_replay":true,
                             "migration_id":migration_id,
                             "source_sha256":format!("sha256:{}",migration.sha256),
                             "source_md5":migration.md5,
                             "source_bytes":migration.bytes,
+                            "source_authority_hash":staged_identity.get("source_authority_hash"),
+                            "stage_identity_hash":hash_value(staged_identity)?,
                             "target":{"account_id":contract.account_id,"database_id":contract.database_id},
                             "plan_input_hash":hash_value(&plan.input)?,
                             "prerequisites":input.body,
