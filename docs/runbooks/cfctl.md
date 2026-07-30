@@ -94,6 +94,16 @@ carries a `next_step`. `2` is a clap usage error: the rejected arguments print
 as raw clap output, and an envelope appears only under `--json`, with error
 code `CFCTL_USAGE`.
 
+An hourly analytics publisher should run `keys renew-analytics-profile` before
+its read. Exit `0` means the managed child is outside its renewal window or a
+complete rotation passed staged and active reads plus old-child revocation.
+Exit `1` is the observable failure signal: do not suppress it. In particular,
+`CFCTL_ANALYTICS_ROTATION_OLD_REVOKE_PENDING` persists across later hourly
+checks until the one-time bootstrap revoke operation is approved, run, and
+verified. The same persistent signal guards any later lineage-bound revoke
+that did not reach verified closure; the scheduler cannot silently return to
+healthy or mint another child while two children may remain active.
+
 ## Authentication
 
 Day-to-day auth is a scoped API token imported out-of-band. Pipe it through

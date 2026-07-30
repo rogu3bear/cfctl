@@ -19,9 +19,9 @@ use cfctl_agent::{
     inspect_agent, install_agent_skill,
 };
 use cfctl_auth::{
-    AuthCredential, OAuthClientConfig, PkceSession, PlatformSecretStore, ProfileKind,
-    ProfileMetadata, SecretBackend, SecretStore, exchange_authorization_code, refresh_oauth_tokens,
-    revoke_oauth_token,
+    AuthCredential, ManagedApiTokenV1, OAuthClientConfig, PkceSession, PlatformSecretStore,
+    ProfileKind, ProfileMetadata, SecretBackend, SecretStore, exchange_authorization_code,
+    refresh_oauth_tokens, revoke_oauth_token,
 };
 use cfctl_catalog::{
     CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1, attach_official_product_knowledge,
@@ -47,7 +47,7 @@ use cfctl_planner::{ImpactContext, PolicyEngine};
 use cfctl_registry::{InventoryProviderV1, OperationIndexRecordV1, Registry};
 use cfctl_storage::{RuntimePaths, StateStore, StoredPlanRecord};
 use cfctl_workspace::{RegisteredRoot, WorkspaceGraph};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
 use futures_util::{StreamExt, stream};
 use md5::Md5;
 use serde::Deserialize;
@@ -69,11 +69,11 @@ use crate::{
     Cli, CloudflarePolicyCommand, Command, DocsCommand, EventBridgeCommand, EventHistoryArgs,
     EventReconcileArgs, EventsCommand, GuideArgs, GuideTopicArg, ImportApiTokenArgs,
     ImportGlobalKeyArgs, KeyMutationArgs, KeyPermissionArgs, KeyPolicyApproveArgs,
-    KeyPolicyCommand, KeyPolicyCreateArgs, KeyPolicySelector, KeyRevokeArgs, KeyRotateArgs,
-    KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector, PlansCommand, PolicyCommand,
-    ProfileSelector, RegistryCommand, RegistryDeclarationsCommand, RegistryOwnershipCommand,
-    RegistryScopeArgs, RegistryScopeKindArg, RegistryScopesCommand, ResolveArgs, SearchArgs,
-    WorkspaceCommand,
+    KeyPolicyCommand, KeyPolicyCreateArgs, KeyPolicySelector, KeyRenewAnalyticsProfileArgs,
+    KeyRevokeArgs, KeyRotateArgs, KeysCommand, MigrateCommand, PlanApproveArgs, PlanSelector,
+    PlansCommand, PolicyCommand, ProfileSelector, RegistryCommand, RegistryDeclarationsCommand,
+    RegistryOwnershipCommand, RegistryScopeArgs, RegistryScopeKindArg, RegistryScopesCommand,
+    ResolveArgs, SearchArgs, WorkspaceCommand,
     build_identity::{build_identity_is_healthy, current_build_info, inspect_path_build},
     profiles::{PendingLogin, ProfilesConfig, ensure_supported_profile},
 };
@@ -805,7 +805,7 @@ fn auth_status(
         .get(&selector.profile)
         .ok_or_else(|| CliError::Input(format!("profile `{}` does not exist", selector.profile)))?;
     ensure_supported_profile(profile)?;
-    let credential_available = secrets.load_credential(&profile.id, profile.kind).is_ok();
+    let credential_available = secrets.load_profile_credential(profile).is_ok();
     Ok(ResultEnvelopeV2::success(
         "auth status",
         json!({"profile": profile, "credential_available": credential_available, "selected": profiles.current_profile.as_deref() == Some(&profile.id)}),
@@ -19116,6 +19116,9 @@ async fn keys_command(store: &StateStore, command: KeysCommand) -> Result<Result
             .await
         }
         KeysCommand::Rotate(arguments) => Box::pin(key_rotate(store, &arguments)).await,
+        KeysCommand::RenewAnalyticsProfile(arguments) => {
+            Box::pin(key_renew_analytics_profile(store, &arguments)).await
+        }
         KeysCommand::Revoke(arguments) => {
             preflight_standing_authority(store, arguments.under_policy.as_deref())?;
             let plan = Box::pin(key_revoke(store, &arguments)).await?;
@@ -19197,7 +19200,7 @@ async fn key_policy_create(
     let inventory = Box::pin(key_permissions(
         store,
         &KeyPermissionArgs {
-            profile: None,
+            profile: arguments.profile.clone(),
             account: arguments.account.clone(),
             user: false,
         },
@@ -19651,6 +19654,689 @@ async fn key_rotate(store: &StateStore, arguments: &KeyRotateArgs) -> Result<Res
         json!({"value_out": arguments.value_out}),
     ))
     .await
+}
+
+async fn analytics_rotation_reads(
+    store: &StateStore,
+    profile: &str,
+    account: &str,
+    zone: &str,
+    hostname: &str,
+) -> Result<Vec<ResultEnvelopeV2>> {
+    let today = Utc::now().date_naive();
+    let month_start = today.with_day(1).ok_or_else(|| {
+        CliError::Input("could not derive the current UTC month boundary".to_owned())
+    })?;
+    let limit = i64::from(today.day());
+    let calls = [
+        CallArgs {
+            capability_id: "graphql-analytics-account-rum-dataset-settings".to_owned(),
+            selectors: vec![("account_id".to_owned(), account.to_owned())],
+            query: Vec::new(),
+            body_json: Some("{}".to_owned()),
+            body_stdin: false,
+            profile: Some(profile.to_owned()),
+            account: Some(account.to_owned()),
+            if_match: None,
+            if_none_match: None,
+            value_out: None,
+            credential_in: None,
+            out: None,
+            source_file: None,
+        },
+        CallArgs {
+            capability_id: "graphql-analytics-zone-dataset-settings".to_owned(),
+            selectors: vec![("zone_id".to_owned(), zone.to_owned())],
+            query: Vec::new(),
+            body_json: Some("{}".to_owned()),
+            body_stdin: false,
+            profile: Some(profile.to_owned()),
+            account: Some(account.to_owned()),
+            if_match: None,
+            if_none_match: None,
+            value_out: None,
+            credential_in: None,
+            out: None,
+            source_file: None,
+        },
+        CallArgs {
+            capability_id: "graphql-analytics-account-rum-pageload-visits".to_owned(),
+            selectors: vec![("account_id".to_owned(), account.to_owned())],
+            query: Vec::new(),
+            body_json: Some(
+                json!({
+                    "dataset":"rumPageloadEventsAdaptiveGroups",
+                    "hostname":hostname,
+                    "start":month_start.format("%Y-%m-%d").to_string(),
+                    "end":today.format("%Y-%m-%d").to_string(),
+                    "limit":limit,
+                })
+                .to_string(),
+            ),
+            body_stdin: false,
+            profile: Some(profile.to_owned()),
+            account: Some(account.to_owned()),
+            if_match: None,
+            if_none_match: None,
+            value_out: None,
+            credential_in: None,
+            out: None,
+            source_file: None,
+        },
+    ];
+    let mut envelopes = Vec::with_capacity(calls.len());
+    for call in calls {
+        let envelope = Box::pin(call_command(store, call)).await?;
+        let succeeded = envelope.ok && envelope.performed;
+        envelopes.push(envelope);
+        if !succeeded {
+            break;
+        }
+    }
+    Ok(envelopes)
+}
+
+fn analytics_reads_passed(envelopes: &[ResultEnvelopeV2]) -> bool {
+    envelopes.len() == 3
+        && envelopes
+            .iter()
+            .all(|envelope| envelope.ok && envelope.performed)
+}
+
+fn remove_staged_rotation_profile(
+    store: &StateStore,
+    secrets: &dyn SecretStore,
+    staging_profile_id: &str,
+    slot_id: &str,
+) -> Result<()> {
+    let mut profiles = ProfilesConfig::load(store)?;
+    profiles.profiles.remove(staging_profile_id);
+    profiles.save(store)?;
+    secrets.delete_api_token_slot(slot_id)?;
+    Ok(())
+}
+
+async fn revoke_rotation_child(
+    store: &StateStore,
+    account: &str,
+    token_id: &str,
+    authority_id: &str,
+) -> Result<ResultEnvelopeV2> {
+    preflight_standing_authority(store, Some(authority_id))?;
+    let plan = Box::pin(key_revoke(
+        store,
+        &KeyRevokeArgs {
+            user: false,
+            id: token_id.to_owned(),
+            account: Some(account.to_owned()),
+            under_policy: Some(authority_id.to_owned()),
+        },
+    ))
+    .await?;
+    Box::pin(finish_standing_run(store, plan, Some(authority_id))).await
+}
+
+fn rotation_failure(
+    code: &str,
+    message: impl Into<String>,
+    next_step: impl Into<String>,
+    evidence: Vec<EvidenceV1>,
+    result: Value,
+) -> ResultEnvelopeV2 {
+    let mut envelope = ResultEnvelopeV2::success("keys renew-analytics-profile", result);
+    envelope.ok = false;
+    envelope.performed = true;
+    envelope.verification.state = VerificationState::Failed;
+    envelope.error = Some(ErrorV1 {
+        code: code.to_owned(),
+        message: message.into(),
+        next_step: Some(next_step.into()),
+    });
+    envelope.evidence = evidence;
+    envelope
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the governed rotation keeps mint, staged reads, atomic activation, post-activation reads, rollback, and lineage-bound revocation in one fail-closed owner"
+)]
+async fn key_renew_analytics_profile(
+    store: &StateStore,
+    arguments: &KeyRenewAnalyticsProfileArgs,
+) -> Result<ResultEnvelopeV2> {
+    validate_zone_id(&arguments.zone)?;
+    if arguments.permissions.is_empty() {
+        return Err(CliError::Input(
+            "analytics profile renewal requires explicit permission groups".to_owned(),
+        ));
+    }
+    if arguments.ttl_hours == 0 || arguments.renew_before_hours >= arguments.ttl_hours {
+        return Err(CliError::Input(
+            "`--ttl-hours` must be positive and greater than `--renew-before-hours`".to_owned(),
+        ));
+    }
+    if arguments.profile == arguments.minter_profile {
+        return Err(CliError::Input(
+            "the publisher and minter profiles must be distinct".to_owned(),
+        ));
+    }
+    let authority = store.load_authority(&arguments.under_policy)?;
+    authority.ensure_operational()?;
+    if authority.account_id != arguments.account
+        || authority.zone_id.as_deref() != Some(arguments.zone.as_str())
+    {
+        return Err(CliError::Input(
+            "standing authority account or zone does not match the requested publisher rotation"
+                .to_owned(),
+        ));
+    }
+    let profiles = ProfilesConfig::load(store)?;
+    let mut old_profile = profiles
+        .profiles
+        .get(&arguments.profile)
+        .cloned()
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "publisher profile `{}` does not exist",
+                arguments.profile
+            ))
+        })?;
+    if old_profile.kind != ProfileKind::ApiToken
+        || old_profile.account_id.as_deref() != Some(arguments.account.as_str())
+    {
+        return Err(CliError::Input(
+            "publisher profile must be an API token pinned to the requested account".to_owned(),
+        ));
+    }
+    let minter = profiles
+        .profiles
+        .get(&arguments.minter_profile)
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "minter profile `{}` does not exist",
+                arguments.minter_profile
+            ))
+        })?;
+    if minter.kind != ProfileKind::ApiToken
+        || minter.account_id.as_deref() != Some(arguments.account.as_str())
+    {
+        return Err(CliError::Input(
+            "minter profile must be an API token pinned to the requested account".to_owned(),
+        ));
+    }
+    if let Some(managed) = old_profile.managed_api_token.as_ref()
+        && let (Some(pending_token_id), Some(pending_operation_id)) = (
+            managed.pending_revoke_token_id.as_deref(),
+            managed.pending_revoke_operation_id.as_deref(),
+        )
+    {
+        let pending_plan = load_validated_plan(store, pending_operation_id)?;
+        let pending_matches = pending_plan.capability.id == "account-api-tokens-delete-token"
+            && pending_plan.account_id == arguments.account
+            && pending_plan
+                .input
+                .pointer("/selectors/token_id")
+                .and_then(Value::as_str)
+                == Some(pending_token_id);
+        if !pending_matches || pending_plan.status != PlanStatus::Verified {
+            let mut pending = rotation_failure(
+                "CFCTL_ANALYTICS_ROTATION_OLD_REVOKE_PENDING",
+                "a prior analytics rotation still has an unverified old-child revocation",
+                format!(
+                    "Approve and run operation `{pending_operation_id}`; the hourly renewal check stays failed until its exact not-found verification is durable."
+                ),
+                Vec::new(),
+                json!({
+                    "profile":arguments.profile,
+                    "state":"active_old_revoke_pending",
+                    "active_token_id":managed.token_id,
+                    "old_token_id":pending_token_id,
+                    "revoke_operation_id":pending_operation_id,
+                    "observable_failure_signal":"nonzero process exit with CFCTL_ANALYTICS_ROTATION_OLD_REVOKE_PENDING",
+                }),
+            );
+            pending.operation_id = Some(pending_operation_id.to_owned());
+            pending.profile_id = Some(arguments.profile.clone());
+            pending.account_id = Some(arguments.account.clone());
+            return Ok(pending);
+        }
+        let retired_slot = managed.pending_revoke_slot_id.clone();
+        let mut reconciled_profile = old_profile.clone();
+        let reconciled_managed = reconciled_profile
+            .managed_api_token
+            .as_mut()
+            .ok_or_else(|| CliError::Input("managed profile binding disappeared".to_owned()))?;
+        reconciled_managed.pending_revoke_token_id = None;
+        reconciled_managed.pending_revoke_operation_id = None;
+        reconciled_managed.pending_revoke_slot_id = None;
+        let mut reconciled_profiles = profiles.clone();
+        reconciled_profiles
+            .profiles
+            .insert(arguments.profile.clone(), reconciled_profile.clone());
+        reconciled_profiles.save(store)?;
+        let secrets = platform_secrets(store);
+        if let Some(slot_id) = retired_slot.as_deref() {
+            secrets.delete_api_token_slot(slot_id)?;
+        } else {
+            secrets.delete_profile(&arguments.profile)?;
+        }
+        old_profile = reconciled_profile;
+    }
+    let old_token_id = match (
+        old_profile.managed_api_token.as_ref(),
+        arguments.current_token_id.as_deref(),
+    ) {
+        (Some(managed), Some(provided)) if managed.token_id != provided => {
+            return Err(CliError::Input(
+                "`--current-token-id` conflicts with the profile's managed child identity"
+                    .to_owned(),
+            ));
+        }
+        (Some(managed), _) => managed.token_id.clone(),
+        (None, Some(provided)) if !provided.trim().is_empty() => provided.to_owned(),
+        (None, _) => {
+            return Err(CliError::Input(
+                "the first managed renewal requires `--current-token-id`; later runs use the profile's durable managed-child identity"
+                    .to_owned(),
+            ));
+        }
+    };
+    if !arguments.force
+        && let Some(managed) = old_profile.managed_api_token.as_ref()
+    {
+        let renew_at =
+            managed.expires_at - ChronoDuration::hours(i64::from(arguments.renew_before_hours));
+        if Utc::now() < renew_at {
+            let mut envelope = ResultEnvelopeV2::success(
+                "keys renew-analytics-profile",
+                json!({
+                    "profile":arguments.profile,
+                    "state":"healthy_not_due",
+                    "active_token_id":managed.token_id,
+                    "expires_at":managed.expires_at,
+                    "renew_at":renew_at,
+                    "observable_failure_signal":"nonzero process exit with ResultEnvelopeV2 error",
+                    "message":"Managed analytics child is healthy and outside its renewal window."
+                }),
+            );
+            envelope.profile_id = Some(arguments.profile.clone());
+            envelope.account_id = Some(arguments.account.clone());
+            return Ok(envelope);
+        }
+    }
+
+    preflight_standing_authority(store, Some(&arguments.under_policy))?;
+    let rotation_id = Uuid::new_v4();
+    let child_name = format!(
+        "{}{}-{}",
+        arguments.name_prefix,
+        Utc::now().format("%Y%m%d%H%M%S"),
+        &rotation_id.simple().to_string()[..8]
+    );
+    if !child_name.starts_with(&authority.name_prefix) {
+        return Err(CliError::Input(
+            "generated child name is outside the standing authority prefix".to_owned(),
+        ));
+    }
+    let staging_root = store.paths().data_dir.join("credential-rotation-staging");
+    fs::create_dir_all(&staging_root).map_err(|source| cli_io(&staging_root, source))?;
+    #[cfg(unix)]
+    fs::set_permissions(&staging_root, fs::Permissions::from_mode(0o700))
+        .map_err(|source| cli_io(&staging_root, source))?;
+    let sink_path = staging_root.join(format!("{rotation_id}.token"));
+    let mint_plan = Box::pin(key_mint(
+        store,
+        &KeyMutationArgs {
+            profile: Some(arguments.minter_profile.clone()),
+            user: false,
+            name: child_name,
+            permissions: arguments.permissions.clone(),
+            account: Some(arguments.account.clone()),
+            zone: Some(arguments.zone.clone()),
+            ttl_hours: Some(arguments.ttl_hours),
+            value_out: Some(sink_path.clone()),
+            under_policy: Some(arguments.under_policy.clone()),
+        },
+    ))
+    .await?;
+    let mint = Box::pin(finish_standing_run(
+        store,
+        mint_plan,
+        Some(&arguments.under_policy),
+    ))
+    .await?;
+    if !mint.ok || !mint.performed {
+        return Ok(rotation_failure(
+            "CFCTL_ANALYTICS_ROTATION_MINT_FAILED",
+            "the standing-authority mint did not complete",
+            "Inspect the mint operation receipt; do not retry if the boundary may have been crossed without lineage reconciliation.",
+            mint.evidence,
+            json!({"profile":arguments.profile,"state":"mint_failed"}),
+        ));
+    }
+    let new_token_id = mint
+        .result
+        .pointer("/result/id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "successful child mint omitted its non-secret token identity; do not replay"
+                    .to_owned(),
+            )
+        })?
+        .to_owned();
+    let token = read_private_secret_file(&sink_path, "internal rotation sink")?;
+    fs::remove_file(&sink_path).map_err(|source| cli_io(&sink_path, source))?;
+    let expires_at = mint
+        .result
+        .pointer("/result/expires_on")
+        .and_then(Value::as_str)
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map_or_else(
+            || Utc::now() + ChronoDuration::hours(i64::from(arguments.ttl_hours)),
+            |value| value.with_timezone(&Utc),
+        );
+
+    let secrets = platform_secrets(store);
+    let slot_id = Uuid::new_v4().to_string();
+    secrets.store_api_token_slot(&slot_id, token.trim())?;
+    let staging_profile_id = format!("__cfctl_rotation_{rotation_id}");
+    let mut staging_profile = ProfileMetadata::new(
+        &staging_profile_id,
+        ProfileKind::ApiToken,
+        Some(&arguments.account),
+    );
+    staging_profile.api_token_slot_id = Some(slot_id.clone());
+    let mut staged_profiles = ProfilesConfig::load(store)?;
+    staged_profiles
+        .profiles
+        .insert(staging_profile_id.clone(), staging_profile.clone());
+    if let Err(error) = staged_profiles.save(store) {
+        let _ = secrets.delete_api_token_slot(&slot_id);
+        return Err(error);
+    }
+
+    let staged_reads = Box::pin(analytics_rotation_reads(
+        store,
+        &staging_profile_id,
+        &arguments.account,
+        &arguments.zone,
+        &arguments.hostname,
+    ))
+    .await?;
+    if !analytics_reads_passed(&staged_reads) {
+        let mut evidence = mint.evidence;
+        evidence.extend(
+            staged_reads
+                .into_iter()
+                .flat_map(|envelope| envelope.evidence),
+        );
+        let cleanup = Box::pin(revoke_rotation_child(
+            store,
+            &arguments.account,
+            &new_token_id,
+            &arguments.under_policy,
+        ))
+        .await?;
+        evidence.extend(cleanup.evidence);
+        remove_staged_rotation_profile(store, &secrets, &staging_profile_id, &slot_id)?;
+        return Ok(rotation_failure(
+            "CFCTL_ANALYTICS_ROTATION_STAGED_READ_FAILED",
+            "the fresh child failed its staged settings or hostname-bound RUM read",
+            "The prior publisher profile remains active. Inspect the redacted live-read and cleanup receipts before the next scheduled attempt.",
+            evidence,
+            json!({
+                "profile":arguments.profile,
+                "state":"staged_read_failed",
+                "new_child_revoked":cleanup.ok,
+            }),
+        ));
+    }
+
+    let mut activation_profiles = ProfilesConfig::load(store)?;
+    let current = activation_profiles
+        .profiles
+        .get(&arguments.profile)
+        .ok_or_else(|| {
+            CliError::Input("publisher profile disappeared during rotation".to_owned())
+        })?;
+    if current.credential_generation_id != old_profile.credential_generation_id
+        || current.api_token_slot_id != old_profile.api_token_slot_id
+    {
+        let _ = revoke_rotation_child(
+            store,
+            &arguments.account,
+            &new_token_id,
+            &arguments.under_policy,
+        )
+        .await;
+        remove_staged_rotation_profile(store, &secrets, &staging_profile_id, &slot_id)?;
+        return Err(CliError::Input(
+            "publisher credential generation changed during rotation; the fresh child was not activated"
+                .to_owned(),
+        ));
+    }
+    let mut activated_profile = old_profile.clone();
+    activated_profile.credential_generation_id = staging_profile.credential_generation_id.clone();
+    activated_profile.api_token_slot_id = Some(slot_id.clone());
+    activated_profile.managed_api_token = Some(ManagedApiTokenV1 {
+        schema_version: 1,
+        token_id: new_token_id.clone(),
+        expires_at,
+        standing_authority_id: arguments.under_policy.clone(),
+        pending_revoke_token_id: None,
+        pending_revoke_operation_id: None,
+        pending_revoke_slot_id: None,
+    });
+    activation_profiles.profiles.remove(&staging_profile_id);
+    activation_profiles
+        .profiles
+        .insert(arguments.profile.clone(), activated_profile.clone());
+    activation_profiles.save(store)?;
+    let activation_evidence = store.write_evidence(
+        EvidenceClass::PostChangeVerification,
+        &json!({
+            "profile":arguments.profile,
+            "account_id":arguments.account,
+            "zone_id":arguments.zone,
+            "old_credential_generation_id":old_profile.credential_generation_id,
+            "new_credential_generation_id":activated_profile.credential_generation_id,
+            "new_token_id":new_token_id,
+            "expires_at":expires_at,
+            "activation":"atomic_profile_metadata_switch",
+            "secret_material_recorded":false,
+        }),
+    )?;
+
+    let active_reads = Box::pin(analytics_rotation_reads(
+        store,
+        &arguments.profile,
+        &arguments.account,
+        &arguments.zone,
+        &arguments.hostname,
+    ))
+    .await?;
+    if !analytics_reads_passed(&active_reads) {
+        let mut rollback_profiles = ProfilesConfig::load(store)?;
+        rollback_profiles
+            .profiles
+            .insert(arguments.profile.clone(), old_profile.clone());
+        rollback_profiles.save(store)?;
+        let cleanup = Box::pin(revoke_rotation_child(
+            store,
+            &arguments.account,
+            &new_token_id,
+            &arguments.under_policy,
+        ))
+        .await?;
+        secrets.delete_api_token_slot(&slot_id)?;
+        let mut evidence = mint.evidence;
+        evidence.push(activation_evidence);
+        evidence.extend(
+            active_reads
+                .into_iter()
+                .flat_map(|envelope| envelope.evidence),
+        );
+        evidence.extend(cleanup.evidence);
+        return Ok(rotation_failure(
+            "CFCTL_ANALYTICS_ROTATION_ACTIVE_READ_FAILED",
+            "the atomically activated profile failed its live read and was rolled back",
+            "The prior profile generation is active again. Inspect the redacted read, rollback, and fresh-child revocation receipts.",
+            evidence,
+            json!({
+                "profile":arguments.profile,
+                "state":"rolled_back",
+                "new_child_revoked":cleanup.ok,
+            }),
+        ));
+    }
+
+    let refreshed_authority = store.load_authority(&arguments.under_policy)?;
+    let old_is_lineage_bound = refreshed_authority
+        .minted_token_ids
+        .iter()
+        .any(|token_id| token_id == &old_token_id);
+    let mut evidence = mint.evidence;
+    evidence.push(activation_evidence);
+    evidence.extend(
+        staged_reads
+            .into_iter()
+            .chain(active_reads)
+            .flat_map(|envelope| envelope.evidence),
+    );
+    if !old_is_lineage_bound {
+        let revoke_plan = Box::pin(key_revoke(
+            store,
+            &KeyRevokeArgs {
+                user: false,
+                id: old_token_id.clone(),
+                account: Some(arguments.account.clone()),
+                under_policy: None,
+            },
+        ))
+        .await?;
+        evidence.extend(revoke_plan.evidence.clone());
+        let revoke_operation_id = revoke_plan.operation_id.clone().ok_or_else(|| {
+            CliError::Input("bootstrap revoke plan omitted its operation ID".to_owned())
+        })?;
+        let mut pending_profiles = ProfilesConfig::load(store)?;
+        let pending_profile = pending_profiles
+            .profiles
+            .get_mut(&arguments.profile)
+            .ok_or_else(|| CliError::Input("activated publisher profile disappeared".to_owned()))?;
+        let managed = pending_profile.managed_api_token.as_mut().ok_or_else(|| {
+            CliError::Input("activated publisher profile lost its managed binding".to_owned())
+        })?;
+        managed.pending_revoke_token_id = Some(old_token_id.clone());
+        managed.pending_revoke_operation_id = Some(revoke_operation_id.clone());
+        managed
+            .pending_revoke_slot_id
+            .clone_from(&old_profile.api_token_slot_id);
+        pending_profiles.save(store)?;
+        let mut pending = rotation_failure(
+            "CFCTL_ANALYTICS_ROTATION_BOOTSTRAP_REVOKE_APPROVAL_REQUIRED",
+            "the fresh child is active and verified, but the pre-existing child is outside standing-authority lineage",
+            format!(
+                "Approve and run operation `{}` once. Future renewals revoke their lineage-bound prior child automatically.",
+                revoke_plan.operation_id.as_deref().unwrap_or("missing")
+            ),
+            evidence,
+            json!({
+                "profile":arguments.profile,
+                "state":"active_old_revoke_pending",
+                "active_token_id":new_token_id,
+                "expires_at":expires_at,
+                "old_token_id":old_token_id,
+                "revoke_operation_id":revoke_operation_id.clone(),
+                "observable_failure_signal":"nonzero process exit with CFCTL_ANALYTICS_ROTATION_BOOTSTRAP_REVOKE_APPROVAL_REQUIRED",
+            }),
+        );
+        pending.operation_id = Some(revoke_operation_id);
+        pending.profile_id = Some(arguments.profile.clone());
+        pending.account_id = Some(arguments.account.clone());
+        return Ok(pending);
+    }
+
+    let revoke = Box::pin(revoke_rotation_child(
+        store,
+        &arguments.account,
+        &old_token_id,
+        &arguments.under_policy,
+    ))
+    .await?;
+    evidence.extend(revoke.evidence);
+    if !revoke.ok || revoke.verification.state != VerificationState::Passed {
+        let revoke_operation_id = revoke.operation_id.clone().ok_or_else(|| {
+            CliError::Input(
+                "failed old-child revocation omitted its operation ID; the active profile remains cut over but requires manual overlap reconciliation"
+                    .to_owned(),
+            )
+        })?;
+        let mut pending_profiles = ProfilesConfig::load(store)?;
+        let pending_profile = pending_profiles
+            .profiles
+            .get_mut(&arguments.profile)
+            .ok_or_else(|| CliError::Input("activated publisher profile disappeared".to_owned()))?;
+        let managed = pending_profile.managed_api_token.as_mut().ok_or_else(|| {
+            CliError::Input("activated publisher profile lost its managed binding".to_owned())
+        })?;
+        managed.pending_revoke_token_id = Some(old_token_id.clone());
+        managed.pending_revoke_operation_id = Some(revoke_operation_id.clone());
+        managed
+            .pending_revoke_slot_id
+            .clone_from(&old_profile.api_token_slot_id);
+        pending_profiles.save(store)?;
+        return Ok(rotation_failure(
+            "CFCTL_ANALYTICS_ROTATION_OLD_REVOKE_FAILED",
+            "the fresh child is active and verified, but old-child revocation was not proven",
+            format!(
+                "Reconcile operation `{revoke_operation_id}` to Verified. Every later hourly check stays failed and refuses another mint until this overlap is closed."
+            ),
+            evidence,
+            json!({
+                "profile":arguments.profile,
+                "state":"active_old_revoke_failed",
+                "active_token_id":new_token_id,
+                "old_token_id":old_token_id,
+                "revoke_operation_id":revoke_operation_id,
+                "observable_failure_signal":"nonzero process exit with CFCTL_ANALYTICS_ROTATION_OLD_REVOKE_PENDING",
+            }),
+        ));
+    }
+    if let Some(old_slot_id) = old_profile.api_token_slot_id.as_deref() {
+        secrets.delete_api_token_slot(old_slot_id)?;
+    } else {
+        secrets.delete_profile(&arguments.profile)?;
+    }
+    let mut envelope = ResultEnvelopeV2::success(
+        "keys renew-analytics-profile",
+        json!({
+            "profile":arguments.profile,
+            "state":"rotated",
+            "active_token_id":new_token_id,
+            "revoked_token_id":old_token_id,
+            "expires_at":expires_at,
+            "renew_at":expires_at - ChronoDuration::hours(i64::from(arguments.renew_before_hours)),
+            "verification_capabilities":[
+                "graphql-analytics-account-rum-dataset-settings",
+                "graphql-analytics-zone-dataset-settings",
+                "graphql-analytics-account-rum-pageload-visits",
+            ],
+            "observable_failure_signal":"nonzero process exit with ResultEnvelopeV2 error",
+            "message":"Fresh analytics child was staged, verified, atomically activated, re-verified through the publisher profile, and the lineage-bound prior child was revoked."
+        }),
+    );
+    envelope.performed = true;
+    envelope.profile_id = Some(arguments.profile.clone());
+    envelope.account_id = Some(arguments.account.clone());
+    envelope.verification.state = VerificationState::Passed;
+    envelope.verification.basis = Some(
+        "staged and active account RUM settings, zone settings, and exact-host RUM reads passed before lineage-bound old-child revocation"
+            .to_owned(),
+    );
+    envelope.evidence = evidence;
+    Ok(envelope)
 }
 
 async fn key_revoke(store: &StateStore, arguments: &KeyRevokeArgs) -> Result<ResultEnvelopeV2> {
@@ -21151,7 +21837,7 @@ async fn fresh_credential(
     secrets: &dyn SecretStore,
 ) -> Result<AuthCredential> {
     if profile.kind != ProfileKind::OAuth {
-        return Ok(secrets.load_credential(&profile.id, profile.kind)?);
+        return Ok(secrets.load_profile_credential(profile)?);
     }
     let tokens = secrets.load_oauth_tokens(&profile.id)?;
     if !tokens.needs_refresh() {

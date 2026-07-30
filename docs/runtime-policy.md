@@ -141,6 +141,39 @@ External sends, spend, and everything else in the list above remain
 per-operation approval forever; standing authority covers only the
 token-lifecycle capabilities named in the approved grant.
 
+### Managed analytics profile rotation
+
+`cfctl keys renew-analytics-profile` is the closed consumer-credential bridge
+for an unattended analytics publisher. It requires a distinct minter profile,
+an approved account-and-zone standing authority, exact child permissions, a
+finite TTL, one hostname, and an existing publisher profile. The command does
+not accept or print token material.
+
+A mint first writes its one-time value to a private internal sink. cfctl then
+stores it in a UUID-addressed immutable secret slot and creates a temporary
+profile projection. Account RUM settings, zone dataset settings, and the
+hostname-filtered RUM query must all succeed through that projection. Only then
+does one atomic `profiles.json` replacement point the publisher profile at the
+new slot and credential generation. The same reads run again through the
+publisher profile before any old-child revocation.
+
+Until activation, the old profile and child remain untouched. A failed
+post-activation read atomically restores the exact prior profile projection
+before the fresh child is revoked. Old-child revocation is unattended only
+when the standing authority's durable lineage contains that ID. A bootstrap
+child outside lineage produces a normal revoke plan and a persistent nonzero
+failure state until the exact approved plan reaches verified not-found
+closure. A failed lineage-bound revoke persists the same old-child overlap and
+operation reference, so later hourly checks refuse another mint and remain
+nonzero until that exact operation is reconciled to `Verified`. Successful
+later rotations use two standing run reservations: mint and old-child revoke.
+
+Profile metadata contains only opaque slot, token identity, expiry, authority,
+and pending-revocation references. Secret slots remain in the platform
+credential store or its private mode-0600 fallback. Slot activation is
+old-or-new atomic; no token value enters stdout, arguments, profiles, plans,
+evidence, or repository files.
+
 ## Secrets
 
 Credential material is written to the platform keyring first — Keychain on

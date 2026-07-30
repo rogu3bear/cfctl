@@ -65,6 +65,50 @@ fn api_token_profiles_store_bearer_credentials_outside_profile_metadata() {
 }
 
 #[test]
+fn immutable_api_token_slots_switch_profiles_without_overwriting_the_old_generation() {
+    let store = MemorySecretStore::default();
+    store
+        .store_api_token("publisher", "legacy-token")
+        .expect("store legacy token");
+    let mut profile = ProfileMetadata::new("publisher", ProfileKind::ApiToken, Some("account-a"));
+    assert_eq!(
+        store
+            .load_profile_credential(&profile)
+            .expect("legacy profile credential")
+            .bearer_token(),
+        Some("legacy-token")
+    );
+
+    let slot_id = "11111111-1111-4111-8111-111111111111";
+    store
+        .store_api_token_slot(slot_id, "fresh-token")
+        .expect("stage immutable slot");
+    assert_eq!(
+        store
+            .load_profile_credential(&profile)
+            .expect("unswitched profile still uses legacy credential")
+            .bearer_token(),
+        Some("legacy-token")
+    );
+
+    profile.api_token_slot_id = Some(slot_id.to_owned());
+    assert_eq!(
+        store
+            .load_profile_credential(&profile)
+            .expect("switched profile uses staged slot")
+            .bearer_token(),
+        Some("fresh-token")
+    );
+    store
+        .delete_api_token_slot(slot_id)
+        .expect("delete retired slot");
+    assert!(
+        store.load_profile_credential(&profile).is_err(),
+        "a removed active slot fails closed instead of falling back to stale profile material"
+    );
+}
+
+#[test]
 fn global_key_profiles_require_an_email_and_are_explicitly_emergency_only() {
     let store = MemorySecretStore::default();
     store

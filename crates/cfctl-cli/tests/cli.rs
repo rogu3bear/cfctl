@@ -715,6 +715,8 @@ fn standing_policy_verbs_parse_and_under_policy_rides_mint_and_revoke() {
         "keys",
         "policy",
         "create",
+        "--profile",
+        "minter",
         "--account",
         "account-id",
         "--name-prefix",
@@ -737,6 +739,7 @@ fn standing_policy_verbs_parse_and_under_policy_rides_mint_and_revoke() {
         panic!("create command");
     };
     assert_eq!(create.account, "account-id");
+    assert_eq!(create.profile.as_deref(), Some("minter"));
     assert_eq!(create.name_prefix, "cf-rotation-");
     assert_eq!(create.max_child_ttl_hours, 24);
     assert_eq!(create.max_runs_per_day, 4);
@@ -781,6 +784,94 @@ fn standing_policy_verbs_parse_and_under_policy_rides_mint_and_revoke() {
         panic!("mint command");
     };
     assert_eq!(mint.under_policy.as_deref(), Some("authority-1"));
+}
+
+#[test]
+fn governed_analytics_profile_renewal_parses_explicit_authority_and_truth_scope() {
+    let parsed = Cli::try_parse_from([
+        "cfctl",
+        "keys",
+        "renew-analytics-profile",
+        "--profile",
+        "jkca-public-activity-read",
+        "--minter-profile",
+        "minter",
+        "--account",
+        "account-id",
+        "--zone",
+        "11111111111111111111111111111111",
+        "--hostname",
+        "jkca.me",
+        "--permission",
+        "Account Analytics Read",
+        "--permission",
+        "Analytics Read",
+        "--under-policy",
+        "authority-1",
+        "--current-token-id",
+        "old-token-id",
+        "--force",
+    ])
+    .expect("analytics renewal parses");
+    let Some(Command::Keys(arguments)) = parsed.command else {
+        panic!("keys command");
+    };
+    let KeysCommand::RenewAnalyticsProfile(arguments) = arguments.command else {
+        panic!("renew analytics profile command");
+    };
+    assert_eq!(arguments.profile, "jkca-public-activity-read");
+    assert_eq!(arguments.minter_profile, "minter");
+    assert_eq!(arguments.hostname, "jkca.me");
+    assert_eq!(
+        arguments.permissions,
+        ["Account Analytics Read", "Analytics Read"]
+    );
+    assert_eq!(arguments.ttl_hours, 168);
+    assert_eq!(arguments.renew_before_hours, 24);
+    assert_eq!(arguments.under_policy, "authority-1");
+    assert!(arguments.force);
+}
+
+#[test]
+fn analytics_profile_renewal_fails_before_network_when_authority_is_missing() {
+    let runtime = tempfile::tempdir().expect("runtime root");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
+        .env("CFCTL_HOME", runtime.path())
+        .args([
+            "keys",
+            "renew-analytics-profile",
+            "--profile",
+            "jkca-public-activity-read",
+            "--minter-profile",
+            "minter",
+            "--account",
+            "account-id",
+            "--zone",
+            "11111111111111111111111111111111",
+            "--hostname",
+            "jkca.me",
+            "--permission",
+            "Account Analytics Read",
+            "--permission",
+            "Analytics Read",
+            "--under-policy",
+            "00000000-0000-4000-8000-000000000001",
+            "--current-token-id",
+            "old-token-id",
+            "--force",
+            "--json",
+        ])
+        .output()
+        .expect("isolated renewal runs");
+    assert_eq!(output.status.code(), Some(1));
+    let envelope = health_envelope(&output, "missing renewal authority");
+    assert_eq!(envelope["ok"], false);
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("standing authority")),
+        "{envelope}"
+    );
 }
 
 #[test]

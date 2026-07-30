@@ -135,6 +135,7 @@ pub const PUBLIC_V2_COMMAND_TREE: &[CommandNodeV1] = &[
                     CommandNodeV1::leaf("revoke"),
                 ],
             },
+            CommandNodeV1::leaf("renew-analytics-profile"),
             CommandNodeV1::leaf("revoke"),
             CommandNodeV1::leaf("rotate"),
         ],

@@ -159,6 +159,9 @@ pub enum KeysCommand {
     Permissions(KeyPermissionArgs),
     Mint(KeyMutationArgs),
     Rotate(KeyRotateArgs),
+    /// Renew a managed analytics child and atomically switch one profile only
+    /// after the staged child passes governed live reads.
+    RenewAnalyticsProfile(KeyRenewAnalyticsProfileArgs),
     Revoke(KeyRevokeArgs),
     Policy(KeyPolicyArgs),
 }
@@ -183,6 +186,8 @@ pub enum KeyPolicyCommand {
 
 #[derive(Debug, Args)]
 pub struct KeyPolicyCreateArgs {
+    #[arg(long, help = "Explicit profile used for the live permission inventory")]
+    pub profile: Option<String>,
     #[arg(long, help = "Pin the single account this authority may operate on")]
     pub account: String,
     #[arg(
@@ -303,6 +308,50 @@ pub struct KeyRotateArgs {
     pub account: String,
     #[arg(long)]
     pub value_out: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct KeyRenewAnalyticsProfileArgs {
+    #[arg(long, help = "Existing publisher profile to renew in place")]
+    pub profile: String,
+    #[arg(
+        long,
+        help = "Profile authorized to mint and revoke account API tokens"
+    )]
+    pub minter_profile: String,
+    #[arg(long)]
+    pub account: String,
+    #[arg(long, value_name = "ZONE_ID")]
+    pub zone: String,
+    #[arg(long, help = "Exact Web Analytics requestHost to verify")]
+    pub hostname: String,
+    #[arg(
+        long = "permission",
+        help = "Permission group (id or exact name) for the child; repeatable"
+    )]
+    pub permissions: Vec<String>,
+    #[arg(long, default_value_t = 168)]
+    pub ttl_hours: u32,
+    #[arg(long, default_value_t = 24)]
+    pub renew_before_hours: u32,
+    #[arg(
+        long,
+        default_value = "jkca-public-activity-",
+        help = "Standing-authority-bound prefix for generated child names"
+    )]
+    pub name_prefix: String,
+    #[arg(long, value_name = "AUTHORITY_ID")]
+    pub under_policy: String,
+    #[arg(
+        long,
+        help = "Bootstrap-only active child ID when the profile predates managed rotation metadata"
+    )]
+    pub current_token_id: Option<String>,
+    #[arg(
+        long,
+        help = "Renew even when the managed child is outside the renewal window"
+    )]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]

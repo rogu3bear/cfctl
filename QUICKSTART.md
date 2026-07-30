@@ -145,6 +145,58 @@ cfctl keys policy revoke <authority-id> --json
 ```
 <!-- END CFCTL GENERATED: standing-authority-guide -->
 
+## Unattended analytics-profile renewal
+
+Create and separately approve one account-and-zone-bounded authority using the
+minter profile. The child allowlist must contain exactly `Account Analytics
+Read` and zone `Analytics Read`; two standing runs per completed renewal cover
+one mint and one lineage-bound old-child revoke.
+
+```bash
+cfctl keys policy create \
+  --profile minter \
+  --account <account-id> \
+  --zone <zone-id> \
+  --name-prefix jkca-public-activity- \
+  --permission "Account Analytics Read" \
+  --permission "Analytics Read" \
+  --max-child-ttl-hours 168 \
+  --max-runs-per-day 4 \
+  --expires-days 365 \
+  --json
+
+cfctl keys policy approve <authority-id> --yes --json
+
+cfctl keys renew-analytics-profile \
+  --profile jkca-public-activity-read \
+  --minter-profile minter \
+  --account <account-id> \
+  --zone <zone-id> \
+  --hostname jkca.me \
+  --permission "Account Analytics Read" \
+  --permission "Analytics Read" \
+  --ttl-hours 168 \
+  --renew-before-hours 24 \
+  --name-prefix jkca-public-activity- \
+  --under-policy <authority-id> \
+  --json
+```
+
+The first run for a pre-existing profile also needs
+`--current-token-id <active-child-id> --force`. That child predates the new
+authority, so cfctl activates and verifies the fresh child but returns exit 1
+with a one-time revoke operation ID. Approve and run that exact operation.
+Until its not-found verification is durable, every hourly renewal check keeps
+returning a nonzero `CFCTL_ANALYTICS_ROTATION_OLD_REVOKE_PENDING` signal.
+Later renewals are fully unattended because both children are lineage-bound.
+
+The fresh secret exists only in cfctl's private sink and immutable credential
+slot. The publisher profile switches slots through one atomic metadata write.
+Before that switch and again afterward, cfctl requires successful account RUM
+settings, zone analytics settings, and exact-hostname RUM reads. Any failure
+preserves or restores the prior profile, revokes the fresh child when safely
+lineage-bound, emits redacted evidence, and exits nonzero.
+
 ## Install agent discovery
 
 ```bash

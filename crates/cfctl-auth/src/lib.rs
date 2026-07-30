@@ -180,7 +180,29 @@ pub struct ProfileMetadata {
     /// persisting any secret-derived verifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_generation_id: Option<String>,
+    /// Immutable secret slot selected by this profile. Legacy profiles omit
+    /// this field and continue to use their profile-keyed credential. A
+    /// rotation stages a complete slot before one atomic metadata switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token_slot_id: Option<String>,
+    /// Non-secret Cloudflare identity and expiry for a cfctl-managed child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_api_token: Option<ManagedApiTokenV1>,
     pub emergency_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedApiTokenV1 {
+    pub schema_version: u8,
+    pub token_id: String,
+    pub expires_at: DateTime<Utc>,
+    pub standing_authority_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_revoke_token_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_revoke_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_revoke_slot_id: Option<String>,
 }
 
 impl ProfileMetadata {
@@ -196,6 +218,8 @@ impl ProfileMetadata {
             oauth_scope_inventory_hash: None,
             credential_generation_id: (kind != ProfileKind::LegacyWranglerSession)
                 .then(|| Uuid::new_v4().to_string()),
+            api_token_slot_id: None,
+            managed_api_token: None,
             emergency_only: kind == ProfileKind::GlobalKey,
         }
     }
@@ -360,6 +384,26 @@ pub trait SecretStore: Send + Sync {
 
     fn store_api_token(&self, profile_id: &str, token: &str) -> Result<()> {
         self.put(&api_token_key(profile_id), token)
+    }
+
+    fn store_api_token_slot(&self, slot_id: &str, token: &str) -> Result<()> {
+        self.put(&api_token_slot_key(slot_id)?, token)
+    }
+
+    fn delete_api_token_slot(&self, slot_id: &str) -> Result<()> {
+        self.delete(&api_token_slot_key(slot_id)?)
+    }
+
+    fn load_profile_credential(&self, profile: &ProfileMetadata) -> Result<AuthCredential> {
+        if profile.kind == ProfileKind::ApiToken
+            && let Some(slot_id) = profile.api_token_slot_id.as_deref()
+        {
+            return self
+                .get(&api_token_slot_key(slot_id)?)?
+                .map(|token| AuthCredential::Bearer { token })
+                .ok_or_else(|| AuthError::MissingCredential(profile.id.clone()));
+        }
+        self.load_credential(&profile.id, profile.kind)
     }
 
     fn store_global_key(&self, profile_id: &str, email: &str, key: &str) -> Result<()> {
@@ -979,6 +1023,12 @@ fn oauth_key(profile_id: &str) -> String {
 
 fn api_token_key(profile_id: &str) -> String {
     format!("profile/{profile_id}/api-token")
+}
+
+fn api_token_slot_key(slot_id: &str) -> Result<String> {
+    Uuid::parse_str(slot_id)
+        .map_err(|_| AuthError::SecretStore("API-token slot identity must be a UUID".to_owned()))?;
+    Ok(format!("api-token-slot/{slot_id}"))
 }
 
 fn global_key(profile_id: &str) -> String {
