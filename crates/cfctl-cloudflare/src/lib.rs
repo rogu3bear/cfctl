@@ -95,6 +95,13 @@ pub enum CloudflareError {
     #[error("Cloudflare returned HTTP {status} without the pinned JSON success envelope")]
     InvalidResponseEnvelope { status: u16 },
     #[error(
+        "MLN 0143 invariant read returned an untrusted provider response classification `{classification}` at HTTP {status}"
+    )]
+    Mln0143ResponseClassification {
+        status: u16,
+        classification: &'static str,
+    },
+    #[error(
         "Cloudflare returned successful HTTP {status}, which is not in the pinned response statuses: {expected}"
     )]
     UnexpectedSuccessStatus { status: u16, expected: String },
@@ -1093,11 +1100,22 @@ mod mln_0143_invariant_tests {
     use super::{
         CloudflareResponseV1, MLN_0142_TERMINAL_TRIGGER_SQL, MLN_0143_POST_TABLE_SQL,
         MLN_0143_PRE_TABLE_SQL, Mln0143DataInvariantsContractV1, OutputFormatV1, PreparedRequest,
-        Url, normalized_sql_hash, reviewed_table_sql_hash,
+        Url, mln_0143_request_schema, normalized_sql_hash, reviewed_table_sql_hash,
         sanitize_mln_0143_data_invariants_response,
     };
     use reqwest::header::HeaderMap;
     use serde_json::{Value, json};
+
+    #[test]
+    fn request_schema_closes_each_phase_without_rejecting_phase_fields_at_root() {
+        let schema = mln_0143_request_schema();
+        assert!(schema.get("additionalProperties").is_none());
+        assert_eq!(schema["oneOf"][0]["additionalProperties"], false);
+        assert_eq!(
+            schema["oneOf"][0]["required"],
+            json!(["migration_id", "phase"])
+        );
+    }
 
     fn prepared(phase: &str) -> PreparedRequest {
         let mut contract = Mln0143DataInvariantsContractV1 {
@@ -1270,7 +1288,15 @@ mod mln_0143_invariant_tests {
             .as_object_mut()
             .expect("meta")
             .remove("rows_read");
-        assert!(sanitize_mln_0143_data_invariants_response(&mut response, &request).is_err());
+        let error = sanitize_mln_0143_data_invariants_response(&mut response, &request)
+            .expect_err("ambiguous provider metadata must fail closed");
+        assert!(matches!(
+            error,
+            super::CloudflareError::Mln0143ResponseClassification {
+                status: 200,
+                classification: "invariant_contract_violation"
+            }
+        ));
     }
 
     #[test]
@@ -1293,6 +1319,13 @@ mod mln_0143_invariant_tests {
         assert!(!observable.contains(private_hash));
         assert!(provider_error.errors.is_empty());
         assert!(provider_error.result.is_null());
+        assert!(matches!(
+            error,
+            super::CloudflareError::Mln0143ResponseClassification {
+                status: 200,
+                classification: "provider_declared_failure"
+            }
+        ));
 
         let mut unsuccessful = pre_response(0);
         unsuccessful.success = false;
@@ -1300,7 +1333,10 @@ mod mln_0143_invariant_tests {
             .expect_err("success=false must fail closed");
         assert!(matches!(
             error,
-            super::CloudflareError::InvalidResponseEnvelope { status: 200 }
+            super::CloudflareError::Mln0143ResponseClassification {
+                status: 200,
+                classification: "provider_declared_failure"
+            }
         ));
         assert!(unsuccessful.errors.is_empty());
         assert!(unsuccessful.result.is_null());
@@ -5231,6 +5267,10 @@ fn required_d1_bookmark<'a>(response: &'a CloudflareResponseV1, phase: &str) -> 
     clippy::too_many_arguments,
     reason = "response parsing receives the immutable request contract plus exact upstream metadata without hidden shared state"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "response modes and bounded native-query sanitization must remain visible at one provider boundary"
+)]
 async fn parse_success_response(
     response: reqwest::Response,
     request: &PreparedRequest,
@@ -5268,8 +5308,23 @@ async fn parse_success_response(
                 }
                 return Err(CloudflareError::InvalidResponseEnvelope { status });
             }
-            let body = parse_json_bytes(&bytes, status)?;
+            let body: Value = serde_json::from_slice(&bytes).map_err(|_| {
+                if request.mln_0143_data_invariants.is_some() {
+                    CloudflareError::Mln0143ResponseClassification {
+                        status,
+                        classification: "invalid_json_response",
+                    }
+                } else {
+                    CloudflareError::InvalidResponseEnvelope { status }
+                }
+            })?;
             if body.get("success").and_then(Value::as_bool).is_none() {
+                if request.mln_0143_data_invariants.is_some() {
+                    return Err(CloudflareError::Mln0143ResponseClassification {
+                        status,
+                        classification: "missing_success_boolean",
+                    });
+                }
                 return Err(CloudflareError::InvalidResponseEnvelope { status });
             }
             let parsed = parse_response(status, &body, etag, cf_ray);
@@ -5524,7 +5579,10 @@ fn reviewed_table_sql_hash(value: &str) -> Option<String> {
 }
 
 fn invariant_response_error(status: u16) -> CloudflareError {
-    CloudflareError::InvalidResponseEnvelope { status }
+    CloudflareError::Mln0143ResponseClassification {
+        status,
+        classification: "invariant_contract_violation",
+    }
 }
 
 #[expect(
@@ -5539,7 +5597,10 @@ fn sanitize_mln_0143_data_invariants_response(
         response.result = Value::Null;
         response.errors.clear();
         response.result_info = None;
-        return Err(invariant_response_error(response.status));
+        return Err(CloudflareError::Mln0143ResponseClassification {
+            status: response.status,
+            classification: "provider_declared_failure",
+        });
     }
     let contract = request
         .mln_0143_data_invariants
@@ -9754,7 +9815,6 @@ fn mln_0143_request_schema() -> Value {
     });
     serde_json::json!({
         "type":"object",
-        "additionalProperties":false,
         "x-cfctl-body-required":true,
         "oneOf":[
             {

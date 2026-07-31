@@ -1,7 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::{fs, process::Command as ProcessCommand};
+use std::{fs, path::Path, process::Command as ProcessCommand};
 
+use cfctl_auth::{FileSecretStore, SecretStore};
 use cfctl_cli::{
     Cli, Command, InvocationMode, KeysCommand,
     build_identity::{build_identity_is_healthy, current_build_info},
@@ -22,6 +23,22 @@ fn health_envelope(output: &std::process::Output, context: &str) -> serde_json::
             String::from_utf8_lossy(bytes)
         )
     })
+}
+
+fn seed_test_fallback_secret(runtime: &Path) {
+    FileSecretStore::new(runtime.join("data").join("auth").join("secrets"))
+        .put("__test__/keyring-probe-guard", "test-only")
+        .expect("seed test-only fallback secret");
+}
+
+fn assert_platform_keyring_probe_skipped(envelope: &serde_json::Value) {
+    let health = &envelope["result"]["platform_secret_store"];
+    assert_eq!(health["active_backend"], "fallback_file");
+    assert_eq!(health["fallback_secret_count"], 1);
+    assert_eq!(
+        health["keyring"],
+        "unavailable: not probed while governed fallback credentials are active; this avoids interactive platform prompts"
+    );
 }
 
 #[test]
@@ -942,6 +959,7 @@ fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
     let workspace = tempfile::tempdir().expect("workspace root");
     let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cfctl"));
     let binary_dir = binary.parent().expect("binary directory");
+    seed_test_fallback_secret(runtime.path());
 
     let doctor = ProcessCommand::new(binary)
         .env("CFCTL_HOME", runtime.path())
@@ -953,6 +971,7 @@ fn isolated_doctor_and_registered_workspace_emit_v2_envelopes() {
     let identity_healthy = build_identity_is_healthy(&current_build_info());
     assert_eq!(doctor.status.success(), identity_healthy);
     let doctor = health_envelope(&doctor, "doctor");
+    assert_platform_keyring_probe_skipped(&doctor);
     assert_eq!(doctor["schema_version"], 2);
     assert_eq!(doctor["ok"], identity_healthy);
     assert_eq!(doctor["performed"], false);
@@ -1342,6 +1361,7 @@ fn isolated_agents_doctor_accepts_the_exact_running_path_build() {
     let runtime = tempfile::tempdir().expect("runtime root");
     let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cfctl"));
     let binary_dir = binary.parent().expect("binary directory");
+    seed_test_fallback_secret(runtime.path());
     let output = ProcessCommand::new(binary)
         .env("CFCTL_HOME", runtime.path())
         .env("HOME", runtime.path())
@@ -1353,6 +1373,7 @@ fn isolated_agents_doctor_accepts_the_exact_running_path_build() {
     let identity_healthy = build_identity_is_healthy(&current_build_info());
     assert_eq!(output.status.success(), identity_healthy);
     let envelope = health_envelope(&output, "agents doctor");
+    assert_platform_keyring_probe_skipped(&envelope);
     assert_eq!(envelope["command"], "agents doctor");
     assert_eq!(
         envelope["result"]["build_identity_healthy"],
@@ -1421,6 +1442,7 @@ fn legacy_wrangler_profile_can_be_inspected_and_removed_without_revival() {
     write_legacy_wrangler_profile(runtime.path());
     let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cfctl"));
     let binary_dir = binary.parent().expect("binary directory");
+    seed_test_fallback_secret(runtime.path());
 
     let profiles = ProcessCommand::new(env!("CARGO_BIN_EXE_cfctl"))
         .env("CFCTL_HOME", runtime.path())
@@ -1449,6 +1471,7 @@ fn legacy_wrangler_profile_can_be_inspected_and_removed_without_revival() {
     let identity_healthy = build_identity_is_healthy(&current_build_info());
     assert_eq!(doctor.status.success(), identity_healthy);
     let doctor = health_envelope(&doctor, "legacy profile doctor");
+    assert_platform_keyring_probe_skipped(&doctor);
     assert_eq!(
         doctor["result"]["unsupported_legacy_profiles"][0]["profile"],
         "legacy"

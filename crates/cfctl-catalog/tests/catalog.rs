@@ -12226,7 +12226,11 @@ fn native_control_overlay_adds_closed_pinned_mln_0143_invariant_read() {
         json!({"type":"string","enum":["7c282983-2e48-4ea4-9f0d-09b0d718fe65"]})
     );
     let schema = capability.request_schema.as_ref().expect("closed schema");
-    assert_eq!(schema["additionalProperties"], false);
+    assert!(schema.get("additionalProperties").is_none());
+    assert_eq!(
+        schema["oneOf"][0]["additionalProperties"], false,
+        "each phase owns its closed object boundary; a root closure would reject every phase field"
+    );
     assert_eq!(schema["oneOf"].as_array().expect("phase variants").len(), 3);
     let encoded = serde_json::to_string(schema).expect("schema JSON");
     for forbidden in ["\"sql\"", "\"table\"", "\"query\"", "\"output\""] {

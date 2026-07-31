@@ -5,6 +5,7 @@ use std::{fs, path::Path, process::Command};
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 
+use cfctl_auth::{FileSecretStore, SecretStore};
 use cfctl_cli::{
     build_identity::{
         PathBuildProbeV1, PathBuildStateV1, build_identity_is_healthy, classify_path_build,
@@ -40,6 +41,22 @@ fn git(repository: &Path, arguments: &[&str]) {
         .status()
         .expect("run git");
     assert!(status.success(), "git {arguments:?}");
+}
+
+fn seed_test_fallback_secret(runtime: &Path) {
+    FileSecretStore::new(runtime.join("data").join("auth").join("secrets"))
+        .put("__test__/keyring-probe-guard", "test-only")
+        .expect("seed test-only fallback secret");
+}
+
+fn assert_platform_keyring_probe_skipped(envelope: &serde_json::Value) {
+    let health = &envelope["result"]["platform_secret_store"];
+    assert_eq!(health["active_backend"], "fallback_file");
+    assert_eq!(health["fallback_secret_count"], 1);
+    assert_eq!(
+        health["keyring"],
+        "unavailable: not probed while governed fallback credentials are active; this avoids interactive platform prompts"
+    );
 }
 
 #[test]
@@ -193,8 +210,10 @@ fn doctor_never_executes_a_different_path_cfctl() {
         ("agents-doctor", &["agents", "doctor", "--json"][..]),
     ] {
         let marker = root.path().join(format!("{command}.marker"));
+        let runtime = root.path().join(command);
+        seed_test_fallback_secret(&runtime);
         let output = Command::new(env!("CARGO_BIN_EXE_cfctl"))
-            .env("CFCTL_HOME", root.path().join(command))
+            .env("CFCTL_HOME", &runtime)
             .env("CFCTL_TEST_MARKER", &marker)
             .env("PATH", &fake_bin)
             .args(arguments)
@@ -208,6 +227,7 @@ fn doctor_never_executes_a_different_path_cfctl() {
 
         let envelope: serde_json::Value =
             serde_json::from_slice(&output.stderr).expect("doctor JSON envelope");
+        assert_platform_keyring_probe_skipped(&envelope);
         assert_eq!(envelope["result"]["path_build"]["state"], "uninspectable");
         assert_eq!(envelope["result"]["path_build"]["healthy"], false);
         assert!(
@@ -226,10 +246,12 @@ fn doctor_accepts_a_path_symlink_to_the_running_cfctl() {
     let linked_bin = root.path().join("linked-bin");
     fs::create_dir(&linked_bin).expect("create linked bin");
     symlink(env!("CARGO_BIN_EXE_cfctl"), linked_bin.join("cfctl")).expect("link running cfctl");
+    let runtime = root.path().join("current");
+    seed_test_fallback_secret(&runtime);
 
     let output = Command::new(env!("CARGO_BIN_EXE_cfctl"))
-        .env("CFCTL_HOME", root.path().join("current"))
-        .env("HOME", root.path().join("current"))
+        .env("CFCTL_HOME", &runtime)
+        .env("HOME", &runtime)
         .env("PATH", &linked_bin)
         .args(["doctor", "--json"])
         .output()
@@ -242,6 +264,7 @@ fn doctor_accepts_a_path_symlink_to_the_running_cfctl() {
         &output.stderr
     };
     let envelope: serde_json::Value = serde_json::from_slice(bytes).expect("doctor JSON envelope");
+    assert_platform_keyring_probe_skipped(&envelope);
 
     assert_eq!(envelope["result"]["path_build"]["state"], "current");
     assert_eq!(envelope["result"]["path_build"]["healthy"], true);
