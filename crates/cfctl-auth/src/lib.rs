@@ -1866,15 +1866,8 @@ mod tests {
         let profile = ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a"));
         store
             .fallback
-            .put(&api_token_key(&profile.id), "old-token")
-            .expect("seed selected raw fallback");
-        store
-            .fallback
-            .put(
-                fallback_journal_key(&api_token_key(&profile.id)).as_str(),
-                "fresh-token",
-            )
-            .expect("seed selected fallback journal");
+            .put(&api_token_key(&profile.id), "opaque-token")
+            .expect("seed selected fallback");
 
         assert_eq!(
             store
@@ -1999,8 +1992,15 @@ mod tests {
         let profile = ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a"));
         store
             .fallback
-            .put(&api_token_key(&profile.id), "opaque-token")
-            .expect("seed selected fallback");
+            .put(&api_token_key(&profile.id), "old-token")
+            .expect("seed selected raw fallback");
+        store
+            .fallback
+            .put(
+                fallback_journal_key(&api_token_key(&profile.id)).as_str(),
+                "fresh-token",
+            )
+            .expect("seed selected fallback journal");
 
         store
             .delete_profile(&profile.id)
