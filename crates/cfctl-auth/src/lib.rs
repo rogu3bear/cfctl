@@ -1040,8 +1040,8 @@ fn authoritative_fallback_get(fallback: &dyn SecretStore, key: &str) -> Result<O
 }
 
 fn delete_authoritative_fallback_key(fallback: &dyn SecretStore, key: &str) -> Result<()> {
-    fallback.delete(fallback_journal_key(key).as_str())?;
-    fallback.delete(key)
+    fallback.delete(key)?;
+    fallback.delete(fallback_journal_key(key).as_str())
 }
 
 fn credential_unavailable(
@@ -1687,6 +1687,37 @@ mod tests {
         inner: MemorySecretStore,
     }
 
+    #[derive(Default)]
+    struct JournalDeleteOnceRejectingSecretStore {
+        inner: MemorySecretStore,
+        journal_delete_attempts: AtomicUsize,
+    }
+
+    impl SecretStore for JournalDeleteOnceRejectingSecretStore {
+        fn put(&self, key: &str, value: &str) -> Result<()> {
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.inner.get(key)
+        }
+
+        fn delete(&self, key: &str) -> Result<()> {
+            if key.starts_with(FALLBACK_JOURNAL_KEY_PREFIX)
+                && self.journal_delete_attempts.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                return Err(AuthError::SecretStore(
+                    "one-time fallback journal delete rejection".to_owned(),
+                ));
+            }
+            self.inner.delete(key)
+        }
+
+        fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
+            self.inner.locate(key)
+        }
+    }
+
     impl SecretStore for JournalDeleteAfterCommitRejectingSecretStore {
         fn put(&self, key: &str, value: &str) -> Result<()> {
             self.inner.put(key, value)
@@ -2016,6 +2047,81 @@ mod tests {
                 .expect("read deleted fallback"),
             None,
             "logout must remove both the authoritative journal and legacy raw fallback"
+        );
+    }
+
+    #[test]
+    fn authoritative_fallback_delete_preserves_journal_when_raw_delete_fails() {
+        let fallback = LegacyDeleteRejectingSecretStore::default();
+        let journal_key = fallback_journal_key("k");
+        fallback.put("k", "stale").expect("seed stale raw fallback");
+        fallback
+            .put(journal_key.as_str(), "fresh")
+            .expect("seed authoritative journal");
+
+        let error = delete_authoritative_fallback_key(&fallback, "k")
+            .expect_err("raw fallback delete failure must surface");
+
+        assert!(
+            error
+                .to_string()
+                .contains("legacy fallback delete rejected")
+        );
+        assert_eq!(fallback.delete_attempts(), vec!["k"]);
+        assert_eq!(
+            authoritative_fallback_get(&fallback, "k").expect("authoritative fallback"),
+            Some("fresh".to_owned()),
+            "the journal must remain authoritative while stale raw cleanup is incomplete"
+        );
+    }
+
+    #[test]
+    fn authoritative_fallback_delete_interruption_keeps_journal_authoritative() {
+        let fallback = DeleteAfterCommitRejectingSecretStore::default();
+        let journal_key = fallback_journal_key("k");
+        fallback.put("k", "stale").expect("seed stale raw fallback");
+        fallback
+            .put(journal_key.as_str(), "fresh")
+            .expect("seed authoritative journal");
+
+        let error = delete_authoritative_fallback_key(&fallback, "k")
+            .expect_err("crossed raw deletion must stop before journal deletion");
+
+        assert!(
+            error
+                .to_string()
+                .contains("crossed before reporting failure")
+        );
+        assert_eq!(fallback.get("k").expect("raw fallback"), None);
+        assert_eq!(
+            authoritative_fallback_get(&fallback, "k").expect("authoritative fallback"),
+            Some("fresh".to_owned()),
+            "the journal must remain authoritative across interruption"
+        );
+    }
+
+    #[test]
+    fn authoritative_fallback_journal_delete_failure_is_retryable() {
+        let fallback = JournalDeleteOnceRejectingSecretStore::default();
+        let journal_key = fallback_journal_key("k");
+        fallback.put("k", "stale").expect("seed stale raw fallback");
+        fallback
+            .put(journal_key.as_str(), "fresh")
+            .expect("seed authoritative journal");
+
+        let error = delete_authoritative_fallback_key(&fallback, "k")
+            .expect_err("first journal deletion must fail");
+
+        assert!(error.to_string().contains("one-time"));
+        assert_eq!(fallback.get("k").expect("raw fallback"), None);
+        assert_eq!(
+            authoritative_fallback_get(&fallback, "k").expect("authoritative fallback"),
+            Some("fresh".to_owned())
+        );
+        delete_authoritative_fallback_key(&fallback, "k").expect("retry journal deletion");
+        assert_eq!(
+            authoritative_fallback_get(&fallback, "k").expect("deleted state"),
+            None
         );
     }
 
