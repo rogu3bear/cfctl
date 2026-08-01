@@ -362,6 +362,14 @@ fn auth_guidance(error: &cfctl_auth::AuthError) -> Option<(&'static str, String)
     use cfctl_auth::AuthError as E;
     const CODE: &str = "CFCTL_AUTH";
     let step = match error {
+        E::CredentialUnavailable { profile_id, .. } => {
+            return Some((
+                "CFCTL_CREDENTIAL_UNAVAILABLE",
+                format!(
+                    "Re-import the credential for the selected profile `{profile_id}`. If the only valid copy is intentionally in Keychain, run `cfctl auth repair-keychain-access {profile_id}` and review its warning before continuing."
+                ),
+            ));
+        }
         E::MissingCredential(_) => {
             "The profile has no stored credential. Re-import it: `printf '%s' \"$TOKEN\" | cfctl auth import-api-token --account <account-id> --stdin`."
                 .to_owned()
@@ -820,11 +828,29 @@ fn repair_keychain_access(
     secrets: &dyn SecretStore,
     selector: &ProfileSelector,
 ) -> Result<ResultEnvelopeV2> {
+    let mut warnings = std::io::stderr().lock();
+    repair_keychain_access_with_warning(profiles, secrets, selector, &mut warnings)
+}
+
+const KEYCHAIN_REPAIR_WARNING: &str = "warning: this explicit repair may open macOS Keychain for the selected profile; cancel the system prompt to stop without changing the credential\n";
+
+fn repair_keychain_access_with_warning(
+    profiles: &ProfilesConfig,
+    secrets: &dyn SecretStore,
+    selector: &ProfileSelector,
+    warnings: &mut dyn Write,
+) -> Result<ResultEnvelopeV2> {
     let profile = profiles
         .profiles
         .get(&selector.profile)
         .ok_or_else(|| CliError::Input(format!("profile `{}` does not exist", selector.profile)))?;
     ensure_supported_profile(profile)?;
+    warnings
+        .write_all(KEYCHAIN_REPAIR_WARNING.as_bytes())
+        .map_err(|source| CliError::Io {
+            path: "stderr".to_owned(),
+            source,
+        })?;
     secrets.repair_profile_credential_access(profile)?;
     let backend = secrets.locate_profile_credential(profile)?;
     Ok(ResultEnvelopeV2::success(
@@ -24181,12 +24207,13 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 mod tests {
     use super::{
         CallInput, CliError, D1RecoveryAnchorExpectation, DNS_RECORD_DETAIL_PATH,
-        DNS_RECORD_DETAIL_READ_CAPABILITY_ID, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
-        Mln0143PreImportExpectation, Mln0143RestoreAnchorJoin,
-        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, SECURITY_IP_RULE_COLLECTION_PATH,
-        SECURITY_IP_RULE_CREATE_ID, SECURITY_IP_RULE_STATE_CAPABILITY_ID,
-        SECURITY_LIST_MEMBER_COLLECTION_PATH, SECURITY_LIST_MEMBER_CREATE_ID,
-        SECURITY_LIST_MEMBER_REMOVE_ID, SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
+        DNS_RECORD_DETAIL_READ_CAPABILITY_ID, DNS_RECORD_STATE_PRECONDITION,
+        KEYCHAIN_REPAIR_WARNING, LivePlanPreconditions, Mln0143PreImportExpectation,
+        Mln0143RestoreAnchorJoin, OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority,
+        SECURITY_IP_RULE_COLLECTION_PATH, SECURITY_IP_RULE_CREATE_ID,
+        SECURITY_IP_RULE_STATE_CAPABILITY_ID, SECURITY_LIST_MEMBER_COLLECTION_PATH,
+        SECURITY_LIST_MEMBER_CREATE_ID, SECURITY_LIST_MEMBER_REMOVE_ID,
+        SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
         SECURITY_WAF_RULE_STATE_CAPABILITY_ID, TokenPolicyBinding, admit_standing_plan,
         apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
@@ -24218,8 +24245,8 @@ mod tests {
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
         read_import_secret, read_r2_log_retrieval_credentials, read_secret_file,
         reconcile_standing_lineage_from_plan, rectify_plan, redact_response_for_capability,
-        redact_secret_payload, redact_secret_result, request_body_contains_secret,
-        required_cloudflare_tunnel_configuration_state_precondition,
+        redact_secret_payload, redact_secret_result, repair_keychain_access_with_warning,
+        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -24251,9 +24278,13 @@ mod tests {
     use crate::telemetry_product::record_operational_proof;
     use crate::{
         CallArgs, CapabilitySelector, CatalogCommand, KeyMutationArgs, KeyPermissionArgs,
-        KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs, PlanSelector, SearchArgs,
+        KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs, PlanSelector, ProfileSelector,
+        SearchArgs,
     };
-    use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
+    use cfctl_auth::{
+        AuthError, CredentialUnavailableReason, MemorySecretStore, ProfileKind, ProfileMetadata,
+        SecretStore,
+    };
     use cfctl_catalog::{CatalogSnapshot, ingest_native_control_capabilities};
     use cfctl_cloudflare::{
         CloudflareApiErrorV1, CloudflareError, CloudflareResponseV1, D1ImportCheckpointV1,
@@ -35055,6 +35086,50 @@ mod tests {
         )
         .expect_err("empty account rejected");
         assert!(unpinned.to_string().contains("--account"));
+    }
+
+    #[test]
+    fn credential_unavailable_has_stable_noninteractive_guidance() {
+        let error = CliError::Auth(AuthError::CredentialUnavailable {
+            profile_id: "audit".to_owned(),
+            reason: CredentialUnavailableReason::MissingSelectedFallback,
+        });
+
+        assert_eq!(error.code(), "CFCTL_CREDENTIAL_UNAVAILABLE");
+        let next_step = error.next_step().expect("credential recovery guidance");
+        assert!(
+            next_step.contains("selected profile `audit`"),
+            "{next_step}"
+        );
+        assert!(
+            next_step.contains("cfctl auth repair-keychain-access audit"),
+            "{next_step}"
+        );
+    }
+
+    #[test]
+    fn explicit_keychain_repair_warns_before_access() {
+        let secrets = MemorySecretStore::default();
+        secrets
+            .store_api_token("audit", "opaque-token")
+            .expect("seed credential");
+        let mut profiles = ProfilesConfig::default();
+        profiles.profiles.insert(
+            "audit".to_owned(),
+            ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a")),
+        );
+        let selector = ProfileSelector {
+            profile: "audit".to_owned(),
+        };
+        let mut warnings = Vec::new();
+
+        let envelope =
+            repair_keychain_access_with_warning(&profiles, &secrets, &selector, &mut warnings)
+                .expect("explicit repair");
+
+        assert!(envelope.ok);
+        assert_eq!(warnings, KEYCHAIN_REPAIR_WARNING.as_bytes());
+        assert!(!String::from_utf8_lossy(&warnings).contains("opaque-token"));
     }
 
     #[test]

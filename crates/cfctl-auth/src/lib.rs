@@ -11,7 +11,7 @@ use std::{
     fmt, fs,
     io::Write as _,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use chrono::{DateTime, Duration, Utc};
@@ -44,10 +44,37 @@ pub enum AuthError {
     SecretStore(String),
     #[error("profile `{0}` has no stored credential")]
     MissingCredential(String),
+    #[error("credential unavailable for profile `{profile_id}`: {reason}")]
+    CredentialUnavailable {
+        profile_id: String,
+        reason: CredentialUnavailableReason,
+    },
     #[error(
         "legacy Wrangler session profile `{0}` is no longer supported; run `cfctl auth logout {0}` to remove its metadata, then `cfctl auth login --profile {0}`"
     )]
     UnsupportedLegacyWranglerSession(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialUnavailableReason {
+    MissingSelectedFallback,
+    Invalid,
+    Malformed,
+    Expired,
+    Revoked,
+}
+
+impl fmt::Display for CredentialUnavailableReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::MissingSelectedFallback => "the selected profile has no fallback credential",
+            Self::Invalid => "the selected fallback credential is invalid",
+            Self::Malformed => "the selected fallback credential is malformed",
+            Self::Expired => "the selected fallback credential is expired",
+            Self::Revoked => "the selected fallback credential is marked for revocation",
+        };
+        formatter.write_str(message)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, AuthError>;
@@ -848,17 +875,35 @@ impl SecretStore for FileSecretStore {
 /// and sidecar. A process crash at any completed boundary therefore exposes
 /// one complete old or new value without guessing which legacy copy is newer.
 /// `cfctl doctor` reports which backend is active.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PlatformSecretStore {
-    keyring: KeyringSecretStore,
+    keyring: Arc<dyn SecretStore>,
     fallback: FileSecretStore,
+}
+
+impl fmt::Debug for PlatformSecretStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlatformSecretStore")
+            .field("keyring", &"[platform secret store]")
+            .field("fallback", &self.fallback)
+            .finish()
+    }
 }
 
 impl PlatformSecretStore {
     #[must_use]
     pub fn new(fallback_root: PathBuf) -> Self {
         Self {
-            keyring: KeyringSecretStore,
+            keyring: Arc::new(KeyringSecretStore),
+            fallback: FileSecretStore::new(fallback_root),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_keyring(fallback_root: PathBuf, keyring: Arc<dyn SecretStore>) -> Self {
+        Self {
+            keyring,
             fallback: FileSecretStore::new(fallback_root),
         }
     }
@@ -908,19 +953,135 @@ impl SecretStore for PlatformSecretStore {
         if self.fallback_secret_count()? > 0 {
             return self.fallback.put(fallback_journal_key(key).as_str(), value);
         }
-        chained_put(&self.keyring, &self.fallback, key, value)
+        chained_put(self.keyring.as_ref(), &self.fallback, key, value)
     }
 
     fn get(&self, key: &str) -> Result<Option<String>> {
-        chained_get(&self.keyring, &self.fallback, key)
+        if self.fallback_secret_count()? > 0 {
+            return authoritative_fallback_get(&self.fallback, key);
+        }
+        self.keyring.get(key)
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        chained_delete(&self.keyring, &self.fallback, key)
+        chained_delete(self.keyring.as_ref(), &self.fallback, key)
     }
 
     fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
-        chained_locate(&self.keyring, &self.fallback, key)
+        if self.fallback_secret_count()? > 0 {
+            return authoritative_fallback_get(&self.fallback, key)
+                .map(|value| value.map(|_| SecretBackend::FallbackFile));
+        }
+        self.keyring.locate(key)
+    }
+
+    fn load_profile_credential(&self, profile: &ProfileMetadata) -> Result<AuthCredential> {
+        let key = profile_credential_key(profile)?;
+        let encoded = self
+            .get(&key)?
+            .ok_or_else(|| AuthError::CredentialUnavailable {
+                profile_id: profile.id.clone(),
+                reason: CredentialUnavailableReason::MissingSelectedFallback,
+            })?;
+        decode_selected_credential(profile, encoded)
+    }
+
+    fn repair_profile_credential_access(&self, profile: &ProfileMetadata) -> Result<()> {
+        let key = profile_credential_key(profile)?;
+        let value = chained_get(self.keyring.as_ref(), &self.fallback, &key)?.ok_or_else(|| {
+            AuthError::CredentialUnavailable {
+                profile_id: profile.id.clone(),
+                reason: CredentialUnavailableReason::MissingSelectedFallback,
+            }
+        })?;
+        decode_selected_credential(profile, value.clone())?;
+        self.put(&key, &value)
+    }
+}
+
+fn authoritative_fallback_get(fallback: &dyn SecretStore, key: &str) -> Result<Option<String>> {
+    if let Some(journal) = fallback.get(fallback_journal_key(key).as_str())? {
+        return Ok(Some(journal));
+    }
+    fallback.get(key)
+}
+
+fn credential_unavailable(
+    profile: &ProfileMetadata,
+    reason: CredentialUnavailableReason,
+) -> AuthError {
+    AuthError::CredentialUnavailable {
+        profile_id: profile.id.clone(),
+        reason,
+    }
+}
+
+fn decode_selected_credential(
+    profile: &ProfileMetadata,
+    encoded: String,
+) -> Result<AuthCredential> {
+    if let Some(managed) = profile.managed_api_token.as_ref() {
+        if managed.expires_at <= Utc::now() {
+            return Err(credential_unavailable(
+                profile,
+                CredentialUnavailableReason::Expired,
+            ));
+        }
+        if managed.pending_revoke_token_id.as_deref() == Some(managed.token_id.as_str()) {
+            return Err(credential_unavailable(
+                profile,
+                CredentialUnavailableReason::Revoked,
+            ));
+        }
+    }
+    match profile.kind {
+        ProfileKind::OAuth => {
+            let tokens = OAuthTokenSet::from_json(&encoded).map_err(|_| {
+                credential_unavailable(profile, CredentialUnavailableReason::Malformed)
+            })?;
+            if tokens.access_token().trim().is_empty() {
+                return Err(credential_unavailable(
+                    profile,
+                    CredentialUnavailableReason::Invalid,
+                ));
+            }
+            if tokens.needs_refresh() && tokens.refresh_token().is_none() {
+                return Err(credential_unavailable(
+                    profile,
+                    CredentialUnavailableReason::Expired,
+                ));
+            }
+            Ok(AuthCredential::Bearer {
+                token: tokens.access_token,
+            })
+        }
+        ProfileKind::ApiToken => {
+            if encoded.trim().is_empty() {
+                return Err(credential_unavailable(
+                    profile,
+                    CredentialUnavailableReason::Invalid,
+                ));
+            }
+            Ok(AuthCredential::Bearer { token: encoded })
+        }
+        ProfileKind::LegacyWranglerSession => Err(AuthError::UnsupportedLegacyWranglerSession(
+            profile.id.clone(),
+        )),
+        ProfileKind::GlobalKey => {
+            let record: GlobalKeyRecord = serde_json::from_str(&encoded).map_err(|_| {
+                credential_unavailable(profile, CredentialUnavailableReason::Malformed)
+            })?;
+            if record.email.trim().is_empty() || record.key.trim().is_empty() {
+                return Err(credential_unavailable(
+                    profile,
+                    CredentialUnavailableReason::Invalid,
+                ));
+            }
+            Ok(AuthCredential::GlobalKey {
+                email: record.email,
+                key: record.key,
+            })
+        }
     }
 }
 
@@ -1075,6 +1236,7 @@ fn chained_delete(primary: &dyn SecretStore, fallback: &dyn SecretStore, key: &s
     journal_result
 }
 
+#[cfg(test)]
 fn chained_locate(
     primary: &dyn SecretStore,
     fallback: &dyn SecretStore,
@@ -1291,6 +1453,43 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct CountingSecretStore {
+        inner: MemorySecretStore,
+        reads: AtomicUsize,
+    }
+
+    impl CountingSecretStore {
+        fn seed(&self, key: &str, value: &str) {
+            self.inner.put(key, value).expect("seed counting store");
+        }
+
+        fn access_count(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl SecretStore for CountingSecretStore {
+        fn put(&self, key: &str, value: &str) -> Result<()> {
+            self.inner.put(key, value)
+        }
+
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key)
+        }
+
+        fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key)
+        }
+
+        fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.locate(key)
+        }
+    }
 
     struct RejectingSecretStore;
 
@@ -1612,6 +1811,259 @@ mod tests {
             .keyring_probe()
             .expect_err("active fallback skips keyring");
         assert!(probe.contains("avoids interactive platform prompts"));
+    }
+
+    #[test]
+    fn ordinary_read_uses_selected_raw_fallback_without_keyring_access() {
+        let runtime = tempfile::tempdir().expect("fallback root");
+        let keyring = Arc::new(CountingSecretStore::default());
+        let store =
+            PlatformSecretStore::with_keyring(runtime.path().to_path_buf(), keyring.clone());
+        let profile = ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a"));
+        store
+            .fallback
+            .put(&api_token_key(&profile.id), "opaque-token")
+            .expect("seed selected fallback");
+
+        assert_eq!(
+            store
+                .load_profile_credential(&profile)
+                .expect("selected fallback credential")
+                .bearer_token(),
+            Some("opaque-token")
+        );
+        assert_eq!(
+            store
+                .locate_profile_credential(&profile)
+                .expect("selected fallback location"),
+            Some(SecretBackend::FallbackFile)
+        );
+        assert_eq!(
+            keyring.access_count(),
+            0,
+            "ordinary reads must not query Keychain"
+        );
+    }
+
+    #[test]
+    fn ordinary_read_with_missing_selected_fallback_does_not_query_keyring() {
+        let runtime = tempfile::tempdir().expect("fallback root");
+        let keyring = Arc::new(CountingSecretStore::default());
+        let store =
+            PlatformSecretStore::with_keyring(runtime.path().to_path_buf(), keyring.clone());
+        let profile = ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a"));
+        store
+            .fallback
+            .put("pending/migration", "opaque-state")
+            .expect("activate fallback authority");
+
+        let error = store
+            .load_profile_credential(&profile)
+            .expect_err("missing selected fallback must fail closed");
+        assert!(matches!(
+            error,
+            AuthError::CredentialUnavailable {
+                reason: CredentialUnavailableReason::MissingSelectedFallback,
+                ..
+            }
+        ));
+        assert_eq!(
+            keyring.access_count(),
+            0,
+            "missing fallback must not query Keychain"
+        );
+    }
+
+    #[test]
+    fn ordinary_read_with_malformed_selected_fallback_does_not_query_keyring() {
+        let runtime = tempfile::tempdir().expect("fallback root");
+        let keyring = Arc::new(CountingSecretStore::default());
+        let store =
+            PlatformSecretStore::with_keyring(runtime.path().to_path_buf(), keyring.clone());
+        let profile = ProfileMetadata::new("audit", ProfileKind::OAuth, Some("account-a"));
+        store
+            .fallback
+            .put(&oauth_key(&profile.id), "not-json")
+            .expect("seed malformed fallback");
+
+        let error = store
+            .load_profile_credential(&profile)
+            .expect_err("malformed selected fallback must fail closed");
+        assert!(matches!(
+            error,
+            AuthError::CredentialUnavailable {
+                reason: CredentialUnavailableReason::Malformed,
+                ..
+            }
+        ));
+        assert_eq!(
+            keyring.access_count(),
+            0,
+            "malformed fallback must not query Keychain"
+        );
+    }
+
+    #[test]
+    fn ordinary_read_with_invalid_selected_fallback_does_not_query_keyring() {
+        let runtime = tempfile::tempdir().expect("fallback root");
+        let keyring = Arc::new(CountingSecretStore::default());
+        let store =
+            PlatformSecretStore::with_keyring(runtime.path().to_path_buf(), keyring.clone());
+        let profile = ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a"));
+        store
+            .fallback
+            .put(&api_token_key(&profile.id), "   ")
+            .expect("seed invalid fallback");
+
+        let error = store
+            .load_profile_credential(&profile)
+            .expect_err("empty selected fallback must fail closed");
+        assert!(matches!(
+            error,
+            AuthError::CredentialUnavailable {
+                reason: CredentialUnavailableReason::Invalid,
+                ..
+            }
+        ));
+        assert_eq!(
+            keyring.access_count(),
+            0,
+            "invalid fallback must not query Keychain"
+        );
+    }
+
+    #[test]
+    fn ordinary_read_with_expired_managed_fallback_does_not_query_keyring() {
+        let runtime = tempfile::tempdir().expect("fallback root");
+        let keyring = Arc::new(CountingSecretStore::default());
+        let store =
+            PlatformSecretStore::with_keyring(runtime.path().to_path_buf(), keyring.clone());
+        let mut profile = ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a"));
+        profile.managed_api_token = Some(ManagedApiTokenV1 {
+            schema_version: 1,
+            token_id: "token-id".to_owned(),
+            expires_at: Utc::now() - Duration::minutes(1),
+            standing_authority_id: "authority-id".to_owned(),
+            pending_revoke_token_id: None,
+            pending_revoke_operation_id: None,
+            pending_revoke_slot_id: None,
+        });
+        store
+            .fallback
+            .put(&api_token_key(&profile.id), "opaque-token")
+            .expect("seed expired fallback");
+
+        let error = store
+            .load_profile_credential(&profile)
+            .expect_err("expired selected fallback must fail closed");
+        assert!(matches!(
+            error,
+            AuthError::CredentialUnavailable {
+                reason: CredentialUnavailableReason::Expired,
+                ..
+            }
+        ));
+        assert_eq!(
+            keyring.access_count(),
+            0,
+            "expired fallback must not query Keychain"
+        );
+    }
+
+    #[test]
+    fn ordinary_read_with_revoked_managed_fallback_does_not_query_keyring() {
+        let runtime = tempfile::tempdir().expect("fallback root");
+        let keyring = Arc::new(CountingSecretStore::default());
+        let store =
+            PlatformSecretStore::with_keyring(runtime.path().to_path_buf(), keyring.clone());
+        let mut profile = ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a"));
+        profile.managed_api_token = Some(ManagedApiTokenV1 {
+            schema_version: 1,
+            token_id: "token-id".to_owned(),
+            expires_at: Utc::now() + Duration::hours(1),
+            standing_authority_id: "authority-id".to_owned(),
+            pending_revoke_token_id: Some("token-id".to_owned()),
+            pending_revoke_operation_id: Some(Uuid::new_v4().to_string()),
+            pending_revoke_slot_id: None,
+        });
+        store
+            .fallback
+            .put(&api_token_key(&profile.id), "opaque-token")
+            .expect("seed revoked fallback");
+
+        let error = store
+            .load_profile_credential(&profile)
+            .expect_err("revoked selected fallback must fail closed");
+        assert!(matches!(
+            error,
+            AuthError::CredentialUnavailable {
+                reason: CredentialUnavailableReason::Revoked,
+                ..
+            }
+        ));
+        assert_eq!(
+            keyring.access_count(),
+            0,
+            "revoked fallback must not query Keychain"
+        );
+    }
+
+    #[test]
+    fn ordinary_read_does_not_search_keyring_when_fallback_belongs_to_another_profile() {
+        let runtime = tempfile::tempdir().expect("fallback root");
+        let keyring = Arc::new(CountingSecretStore::default());
+        let store =
+            PlatformSecretStore::with_keyring(runtime.path().to_path_buf(), keyring.clone());
+        let profile = ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a"));
+        store
+            .fallback
+            .put(&api_token_key("other-profile"), "other-token")
+            .expect("seed other profile fallback");
+
+        let error = store
+            .load_profile_credential(&profile)
+            .expect_err("other profile fallback must not be searched");
+        assert!(matches!(
+            error,
+            AuthError::CredentialUnavailable {
+                reason: CredentialUnavailableReason::MissingSelectedFallback,
+                ..
+            }
+        ));
+        assert_eq!(
+            store
+                .locate_profile_credential(&profile)
+                .expect("wrong-profile lookup remains local"),
+            None
+        );
+        assert_eq!(
+            keyring.access_count(),
+            0,
+            "wrong-profile fallback must not query Keychain"
+        );
+    }
+
+    #[test]
+    fn explicit_repair_is_allowed_to_read_keyring() {
+        let runtime = tempfile::tempdir().expect("fallback root");
+        let keyring = Arc::new(CountingSecretStore::default());
+        let store =
+            PlatformSecretStore::with_keyring(runtime.path().to_path_buf(), keyring.clone());
+        let profile = ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a"));
+        let key = api_token_key(&profile.id);
+        keyring.seed(&key, "opaque-token");
+        store
+            .fallback
+            .put(&key, "opaque-token")
+            .expect("seed selected fallback");
+
+        store
+            .repair_profile_credential_access(&profile)
+            .expect("explicit repair may inspect Keychain");
+        assert!(
+            keyring.access_count() > 0,
+            "explicit repair should exercise Keychain access"
+        );
     }
 
     #[test]
