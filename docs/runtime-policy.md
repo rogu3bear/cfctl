@@ -185,14 +185,15 @@ scheduler failure instead of an indefinite hang. No token value enters stdout,
 arguments, profiles, plans, evidence, or repository files.
 
 Once the governed fallback contains state, it is the deterministic authority
-for ordinary credential reads, locations, and fresh writes. The selected
-profile's current journal takes precedence over its legacy raw fallback. A
-valid selected-profile fallback is used directly without consulting Keychain;
+for ordinary credential reads, locations, fresh writes, and logout deletion.
+The selected profile's current journal takes precedence over its legacy raw
+fallback. A valid selected-profile fallback is used directly without consulting Keychain;
 a missing, invalid, malformed, expired, revoked, or wrong-profile fallback
 fails with `CFCTL_CREDENTIAL_UNAVAILABLE` without searching Keychain or another
 profile. Keychain health probes are also skipped. This prevents unattended
 jobs from reopening an interactive password dialog while preserving profile
-isolation and journal precedence.
+isolation and journal precedence. Logout removes the selected profile's raw
+fallback and journal entries without probing Keychain.
 
 Only an explicit migration or `cfctl auth repair-keychain-access <profile>`
 may inspect Keychain while fallback authority is active. The repair command

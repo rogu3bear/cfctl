@@ -430,6 +430,16 @@ pub trait SecretStore: Send + Sync {
         OAuthTokenSet::from_json(&encoded)
     }
 
+    fn load_profile_oauth_tokens(&self, profile: &ProfileMetadata) -> Result<OAuthTokenSet> {
+        let encoded = self.get(&oauth_key(&profile.id))?.ok_or_else(|| {
+            credential_unavailable(
+                profile,
+                CredentialUnavailableReason::MissingSelectedFallback,
+            )
+        })?;
+        decode_selected_oauth_tokens(profile, &encoded)
+    }
+
     fn store_api_token(&self, profile_id: &str, token: &str) -> Result<()> {
         self.put(&api_token_key(profile_id), token)
     }
@@ -964,6 +974,9 @@ impl SecretStore for PlatformSecretStore {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
+        if self.fallback_secret_count()? > 0 {
+            return delete_authoritative_fallback_key(&self.fallback, key);
+        }
         chained_delete(self.keyring.as_ref(), &self.fallback, key)
     }
 
@@ -976,6 +989,12 @@ impl SecretStore for PlatformSecretStore {
     }
 
     fn load_profile_credential(&self, profile: &ProfileMetadata) -> Result<AuthCredential> {
+        if profile.kind == ProfileKind::OAuth {
+            let tokens = self.load_profile_oauth_tokens(profile)?;
+            return Ok(AuthCredential::Bearer {
+                token: tokens.access_token,
+            });
+        }
         let key = profile_credential_key(profile)?;
         let encoded = self
             .get(&key)?
@@ -984,6 +1003,20 @@ impl SecretStore for PlatformSecretStore {
                 reason: CredentialUnavailableReason::MissingSelectedFallback,
             })?;
         decode_selected_credential(profile, encoded)
+    }
+
+    fn delete_profile(&self, profile_id: &str) -> Result<()> {
+        if self.fallback_secret_count()? > 0 {
+            for key in [
+                oauth_key(profile_id),
+                api_token_key(profile_id),
+                global_key(profile_id),
+            ] {
+                delete_authoritative_fallback_key(&self.fallback, &key)?;
+            }
+            return Ok(());
+        }
+        self.keyring.delete_profile(profile_id)
     }
 
     fn repair_profile_credential_access(&self, profile: &ProfileMetadata) -> Result<()> {
@@ -1004,6 +1037,11 @@ fn authoritative_fallback_get(fallback: &dyn SecretStore, key: &str) -> Result<O
         return Ok(Some(journal));
     }
     fallback.get(key)
+}
+
+fn delete_authoritative_fallback_key(fallback: &dyn SecretStore, key: &str) -> Result<()> {
+    fallback.delete(fallback_journal_key(key).as_str())?;
+    fallback.delete(key)
 }
 
 fn credential_unavailable(
@@ -1036,21 +1074,7 @@ fn decode_selected_credential(
     }
     match profile.kind {
         ProfileKind::OAuth => {
-            let tokens = OAuthTokenSet::from_json(&encoded).map_err(|_| {
-                credential_unavailable(profile, CredentialUnavailableReason::Malformed)
-            })?;
-            if tokens.access_token().trim().is_empty() {
-                return Err(credential_unavailable(
-                    profile,
-                    CredentialUnavailableReason::Invalid,
-                ));
-            }
-            if tokens.needs_refresh() && tokens.refresh_token().is_none() {
-                return Err(credential_unavailable(
-                    profile,
-                    CredentialUnavailableReason::Expired,
-                ));
-            }
+            let tokens = decode_selected_oauth_tokens(profile, &encoded)?;
             Ok(AuthCredential::Bearer {
                 token: tokens.access_token,
             })
@@ -1083,6 +1107,24 @@ fn decode_selected_credential(
             })
         }
     }
+}
+
+fn decode_selected_oauth_tokens(profile: &ProfileMetadata, encoded: &str) -> Result<OAuthTokenSet> {
+    let tokens = OAuthTokenSet::from_json(encoded)
+        .map_err(|_| credential_unavailable(profile, CredentialUnavailableReason::Malformed))?;
+    if tokens.access_token().trim().is_empty() {
+        return Err(credential_unavailable(
+            profile,
+            CredentialUnavailableReason::Invalid,
+        ));
+    }
+    if tokens.needs_refresh() && tokens.refresh_token().is_none() {
+        return Err(credential_unavailable(
+            profile,
+            CredentialUnavailableReason::Expired,
+        ));
+    }
+    Ok(tokens)
 }
 
 fn chained_put(
@@ -1458,7 +1500,7 @@ mod tests {
     #[derive(Default)]
     struct CountingSecretStore {
         inner: MemorySecretStore,
-        reads: AtomicUsize,
+        accesses: AtomicUsize,
     }
 
     impl CountingSecretStore {
@@ -1467,26 +1509,28 @@ mod tests {
         }
 
         fn access_count(&self) -> usize {
-            self.reads.load(Ordering::SeqCst)
+            self.accesses.load(Ordering::SeqCst)
         }
     }
 
     impl SecretStore for CountingSecretStore {
         fn put(&self, key: &str, value: &str) -> Result<()> {
+            self.accesses.fetch_add(1, Ordering::SeqCst);
             self.inner.put(key, value)
         }
 
         fn get(&self, key: &str) -> Result<Option<String>> {
-            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.accesses.fetch_add(1, Ordering::SeqCst);
             self.inner.get(key)
         }
 
         fn delete(&self, key: &str) -> Result<()> {
+            self.accesses.fetch_add(1, Ordering::SeqCst);
             self.inner.delete(key)
         }
 
         fn locate(&self, key: &str) -> Result<Option<SecretBackend>> {
-            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.accesses.fetch_add(1, Ordering::SeqCst);
             self.inner.locate(key)
         }
     }
@@ -1822,8 +1866,15 @@ mod tests {
         let profile = ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a"));
         store
             .fallback
-            .put(&api_token_key(&profile.id), "opaque-token")
-            .expect("seed selected fallback");
+            .put(&api_token_key(&profile.id), "old-token")
+            .expect("seed selected raw fallback");
+        store
+            .fallback
+            .put(
+                fallback_journal_key(&api_token_key(&profile.id)).as_str(),
+                "fresh-token",
+            )
+            .expect("seed selected fallback journal");
 
         assert_eq!(
             store
@@ -1900,6 +1951,71 @@ mod tests {
             keyring.access_count(),
             0,
             "malformed fallback must not query Keychain"
+        );
+    }
+
+    #[test]
+    fn selected_oauth_token_validation_preserves_refresh_without_keyring_access() {
+        let cases = [
+            (
+                r#"{"access_token":"fresh-token","refresh_token":null,"token_type":"bearer","expires_in":null,"expires_at":null,"scope":null}"#,
+                false,
+                None,
+            ),
+            (
+                r#"{"access_token":"expired-token","refresh_token":"refresh-token","token_type":"bearer","expires_in":null,"expires_at":"2000-01-01T00:00:00Z","scope":null}"#,
+                true,
+                Some("refresh-token"),
+            ),
+        ];
+
+        for (encoded, needs_refresh, refresh_token) in cases {
+            let runtime = tempfile::tempdir().expect("fallback root");
+            let keyring = Arc::new(CountingSecretStore::default());
+            let store =
+                PlatformSecretStore::with_keyring(runtime.path().to_path_buf(), keyring.clone());
+            let profile = ProfileMetadata::new("audit", ProfileKind::OAuth, Some("account-a"));
+            store
+                .fallback
+                .put(&oauth_key(&profile.id), encoded)
+                .expect("seed selected OAuth fallback");
+
+            let tokens = store
+                .load_profile_oauth_tokens(&profile)
+                .expect("selected OAuth tokens");
+
+            assert_eq!(tokens.needs_refresh(), needs_refresh);
+            assert_eq!(tokens.refresh_token(), refresh_token);
+            assert_eq!(keyring.access_count(), 0);
+        }
+    }
+
+    #[test]
+    fn active_fallback_logout_delete_does_not_access_keyring() {
+        let runtime = tempfile::tempdir().expect("fallback root");
+        let keyring = Arc::new(CountingSecretStore::default());
+        let store =
+            PlatformSecretStore::with_keyring(runtime.path().to_path_buf(), keyring.clone());
+        let profile = ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a"));
+        store
+            .fallback
+            .put(&api_token_key(&profile.id), "opaque-token")
+            .expect("seed selected fallback");
+
+        store
+            .delete_profile(&profile.id)
+            .expect("logout credential deletion");
+
+        assert_eq!(
+            keyring.access_count(),
+            0,
+            "active-fallback logout must not access Keychain"
+        );
+        assert_eq!(
+            authoritative_fallback_get(&store.fallback, &api_token_key(&profile.id))
+                .expect("read deleted fallback"),
+            None,
+            "logout must remove both the authoritative journal and legacy raw fallback"
         );
     }
 
