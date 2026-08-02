@@ -362,6 +362,14 @@ fn auth_guidance(error: &cfctl_auth::AuthError) -> Option<(&'static str, String)
     use cfctl_auth::AuthError as E;
     const CODE: &str = "CFCTL_AUTH";
     let step = match error {
+        E::CredentialUnavailable { profile_id, .. } => {
+            return Some((
+                "CFCTL_CREDENTIAL_UNAVAILABLE",
+                format!(
+                    "Re-import the credential for the selected profile `{profile_id}`. If the only valid copy is intentionally in Keychain, run `cfctl auth repair-keychain-access {profile_id}` and review its warning before continuing."
+                ),
+            ));
+        }
         E::MissingCredential(_) => {
             "The profile has no stored credential. Re-import it: `printf '%s' \"$TOKEN\" | cfctl auth import-api-token --account <account-id> --stdin`."
                 .to_owned()
@@ -820,11 +828,29 @@ fn repair_keychain_access(
     secrets: &dyn SecretStore,
     selector: &ProfileSelector,
 ) -> Result<ResultEnvelopeV2> {
+    let mut warnings = std::io::stderr().lock();
+    repair_keychain_access_with_warning(profiles, secrets, selector, &mut warnings)
+}
+
+const KEYCHAIN_REPAIR_WARNING: &str = "warning: this explicit repair may open macOS Keychain for the selected profile; cancel the system prompt to stop without changing the credential\n";
+
+fn repair_keychain_access_with_warning(
+    profiles: &ProfilesConfig,
+    secrets: &dyn SecretStore,
+    selector: &ProfileSelector,
+    warnings: &mut dyn Write,
+) -> Result<ResultEnvelopeV2> {
     let profile = profiles
         .profiles
         .get(&selector.profile)
         .ok_or_else(|| CliError::Input(format!("profile `{}` does not exist", selector.profile)))?;
     ensure_supported_profile(profile)?;
+    warnings
+        .write_all(KEYCHAIN_REPAIR_WARNING.as_bytes())
+        .map_err(|source| CliError::Io {
+            path: "stderr".to_owned(),
+            source,
+        })?;
     secrets.repair_profile_credential_access(profile)?;
     let backend = secrets.locate_profile_credential(profile)?;
     Ok(ResultEnvelopeV2::success(
@@ -869,7 +895,7 @@ async fn logout_profile(
     if let Some(profile) = profiles.profiles.get(&selector.profile)
         && profile.kind == ProfileKind::OAuth
     {
-        let tokens = secrets.load_oauth_tokens(&profile.id)?;
+        let tokens = secrets.load_profile_oauth_tokens(profile)?;
         let client_id = profile
             .oauth_client_id
             .as_deref()
@@ -21998,7 +22024,7 @@ async fn fresh_credential(
     if profile.kind != ProfileKind::OAuth {
         return Ok(secrets.load_profile_credential(profile)?);
     }
-    let tokens = secrets.load_oauth_tokens(&profile.id)?;
+    let tokens = secrets.load_profile_oauth_tokens(profile)?;
     if !tokens.needs_refresh() {
         return Ok(AuthCredential::Bearer {
             token: tokens.access_token().to_owned(),
@@ -24181,12 +24207,13 @@ fn cli_io(path: &Path, source: std::io::Error) -> CliError {
 mod tests {
     use super::{
         CallInput, CliError, D1RecoveryAnchorExpectation, DNS_RECORD_DETAIL_PATH,
-        DNS_RECORD_DETAIL_READ_CAPABILITY_ID, DNS_RECORD_STATE_PRECONDITION, LivePlanPreconditions,
-        Mln0143PreImportExpectation, Mln0143RestoreAnchorJoin,
-        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, SECURITY_IP_RULE_COLLECTION_PATH,
-        SECURITY_IP_RULE_CREATE_ID, SECURITY_IP_RULE_STATE_CAPABILITY_ID,
-        SECURITY_LIST_MEMBER_COLLECTION_PATH, SECURITY_LIST_MEMBER_CREATE_ID,
-        SECURITY_LIST_MEMBER_REMOVE_ID, SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
+        DNS_RECORD_DETAIL_READ_CAPABILITY_ID, DNS_RECORD_STATE_PRECONDITION,
+        KEYCHAIN_REPAIR_WARNING, LivePlanPreconditions, Mln0143PreImportExpectation,
+        Mln0143RestoreAnchorJoin, OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority,
+        SECURITY_IP_RULE_COLLECTION_PATH, SECURITY_IP_RULE_CREATE_ID,
+        SECURITY_IP_RULE_STATE_CAPABILITY_ID, SECURITY_LIST_MEMBER_COLLECTION_PATH,
+        SECURITY_LIST_MEMBER_CREATE_ID, SECURITY_LIST_MEMBER_REMOVE_ID,
+        SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
         SECURITY_WAF_RULE_STATE_CAPABILITY_ID, TokenPolicyBinding, admit_standing_plan,
         apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
@@ -24204,8 +24231,8 @@ mod tests {
         exact_durable_poll_exhaustion, exact_durable_provider_complete_boundary,
         exact_durable_provider_failure_boundary, exact_in_progress_poll_receipt,
         execute_native_workflow, execute_read, find_secret_value, force_ipv4_from,
-        governed_cli_environment_contract, governed_cli_workspace_env, guide_document,
-        guide_stage_commands, http_client, is_live_plan_precondition_hash,
+        fresh_credential, governed_cli_environment_contract, governed_cli_workspace_env,
+        guide_document, guide_stage_commands, http_client, is_live_plan_precondition_hash,
         is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
         list_security_action_state_receipt, mln_0142_terminal_import_state,
         mln_0143_parent_manifests, mln_0143_pre_import_authority_matches,
@@ -24218,8 +24245,8 @@ mod tests {
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
         read_import_secret, read_r2_log_retrieval_credentials, read_secret_file,
         reconcile_standing_lineage_from_plan, rectify_plan, redact_response_for_capability,
-        redact_secret_payload, redact_secret_result, request_body_contains_secret,
-        required_cloudflare_tunnel_configuration_state_precondition,
+        redact_secret_payload, redact_secret_result, repair_keychain_access_with_warning,
+        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -24251,9 +24278,13 @@ mod tests {
     use crate::telemetry_product::record_operational_proof;
     use crate::{
         CallArgs, CapabilitySelector, CatalogCommand, KeyMutationArgs, KeyPermissionArgs,
-        KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs, PlanSelector, SearchArgs,
+        KeyPolicyApproveArgs, KeyPolicySelector, PlanApproveArgs, PlanSelector, ProfileSelector,
+        SearchArgs,
     };
-    use cfctl_auth::{AuthError, MemorySecretStore, ProfileKind, ProfileMetadata, SecretStore};
+    use cfctl_auth::{
+        AuthError, CredentialUnavailableReason, MemorySecretStore, ProfileKind, ProfileMetadata,
+        SecretStore,
+    };
     use cfctl_catalog::{CatalogSnapshot, ingest_native_control_capabilities};
     use cfctl_cloudflare::{
         CloudflareApiErrorV1, CloudflareError, CloudflareResponseV1, D1ImportCheckpointV1,
@@ -24282,7 +24313,10 @@ mod tests {
     use std::{
         collections::BTreeMap,
         fs,
-        sync::{Arc, Barrier},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        },
         thread,
     };
     use uuid::Uuid;
@@ -30343,6 +30377,48 @@ mod tests {
     struct DeleteFailingSecretStore;
     struct PutFailingSecretStore;
 
+    struct ProductionOAuthRouteStore {
+        encoded: Option<String>,
+        legacy_loads: AtomicUsize,
+    }
+
+    impl ProductionOAuthRouteStore {
+        fn new(encoded: Option<&str>) -> Self {
+            Self {
+                encoded: encoded.map(str::to_owned),
+                legacy_loads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl SecretStore for ProductionOAuthRouteStore {
+        fn put(&self, _key: &str, _value: &str) -> cfctl_auth::Result<()> {
+            Ok(())
+        }
+
+        fn get(&self, _key: &str) -> cfctl_auth::Result<Option<String>> {
+            Ok(self.encoded.clone())
+        }
+
+        fn delete(&self, _key: &str) -> cfctl_auth::Result<()> {
+            Ok(())
+        }
+
+        fn locate(&self, _key: &str) -> cfctl_auth::Result<Option<cfctl_auth::SecretBackend>> {
+            Ok(None)
+        }
+
+        fn load_oauth_tokens(
+            &self,
+            _profile_id: &str,
+        ) -> cfctl_auth::Result<cfctl_auth::OAuthTokenSet> {
+            self.legacy_loads.fetch_add(1, Ordering::SeqCst);
+            Err(AuthError::SecretStore(
+                "legacy OAuth loader must not be used".to_owned(),
+            ))
+        }
+    }
+
     #[test]
     fn d1_state_hash_is_validated_by_the_live_precondition_lane() {
         assert!(is_live_plan_precondition_hash("d1_read_replication_state"));
@@ -35055,6 +35131,110 @@ mod tests {
         )
         .expect_err("empty account rejected");
         assert!(unpinned.to_string().contains("--account"));
+    }
+
+    #[test]
+    fn credential_unavailable_has_stable_noninteractive_guidance() {
+        let error = CliError::Auth(AuthError::CredentialUnavailable {
+            profile_id: "audit".to_owned(),
+            reason: CredentialUnavailableReason::MissingSelectedFallback,
+        });
+
+        assert_eq!(error.code(), "CFCTL_CREDENTIAL_UNAVAILABLE");
+        let next_step = error.next_step().expect("credential recovery guidance");
+        assert!(
+            next_step.contains("selected profile `audit`"),
+            "{next_step}"
+        );
+        assert!(
+            next_step.contains("cfctl auth repair-keychain-access audit"),
+            "{next_step}"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_oauth_reads_use_selected_profile_validation_without_legacy_lookup() {
+        let cases = [
+            (
+                "missing",
+                None,
+                CredentialUnavailableReason::MissingSelectedFallback,
+            ),
+            (
+                "malformed",
+                Some("not-json"),
+                CredentialUnavailableReason::Malformed,
+            ),
+            (
+                "empty",
+                Some(
+                    r#"{"access_token":" ","refresh_token":null,"token_type":"bearer","expires_in":null,"expires_at":null,"scope":null}"#,
+                ),
+                CredentialUnavailableReason::Invalid,
+            ),
+            (
+                "expired-without-refresh",
+                Some(
+                    r#"{"access_token":"expired-token","refresh_token":null,"token_type":"bearer","expires_in":null,"expires_at":"2000-01-01T00:00:00Z","scope":null}"#,
+                ),
+                CredentialUnavailableReason::Expired,
+            ),
+        ];
+
+        for (name, encoded, expected_reason) in cases {
+            let store = ProductionOAuthRouteStore::new(encoded);
+            let profile = ProfileMetadata::new("audit", ProfileKind::OAuth, Some("account-a"));
+
+            let error = fresh_credential(&profile, &store).await.expect_err(name);
+
+            assert!(
+                matches!(
+                    error,
+                    CliError::Auth(AuthError::CredentialUnavailable {
+                        reason,
+                        ..
+                    }) if reason == expected_reason
+                ),
+                "{name}: {error}"
+            );
+            assert_eq!(error.code(), "CFCTL_CREDENTIAL_UNAVAILABLE", "{name}");
+            assert!(
+                error
+                    .next_step()
+                    .is_some_and(|step| step.contains("selected profile `audit`")),
+                "{name}: expected noninteractive selected-profile guidance"
+            );
+            assert_eq!(
+                store.legacy_loads.load(Ordering::SeqCst),
+                0,
+                "{name}: production OAuth read must not use the legacy loader"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_keychain_repair_warns_before_access() {
+        let secrets = MemorySecretStore::default();
+        secrets
+            .store_api_token("audit", "opaque-token")
+            .expect("seed credential");
+        let mut profiles = ProfilesConfig::default();
+        profiles.profiles.insert(
+            "audit".to_owned(),
+            ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a")),
+        );
+        let selector = ProfileSelector {
+            profile: "audit".to_owned(),
+        };
+        let mut warnings = Vec::new();
+
+        let envelope =
+            repair_keychain_access_with_warning(&profiles, &secrets, &selector, &mut warnings)
+                .expect("explicit repair");
+
+        assert!(envelope.ok);
+        assert_eq!(warnings, KEYCHAIN_REPAIR_WARNING.as_bytes());
+        assert!(!String::from_utf8_lossy(&warnings).contains("opaque-token"));
     }
 
     #[test]

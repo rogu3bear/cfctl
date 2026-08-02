@@ -184,18 +184,30 @@ created before this contract. An interactive access prompt becomes a nonzero
 scheduler failure instead of an indefinite hang. No token value enters stdout,
 arguments, profiles, plans, evidence, or repository files.
 
-Once the governed fallback contains an active credential, it remains the
-selected write backend for fresh slots and Keychain health probes are skipped.
-This prevents unattended jobs from reopening an interactive password dialog.
-An explicit credential repair or re-import is required to migrate back to the
-platform keyring.
+Once the governed fallback contains state, it is the deterministic authority
+for ordinary credential reads, locations, fresh writes, and logout deletion.
+The selected profile's current journal takes precedence over its legacy raw
+fallback. A valid selected-profile fallback is used directly without consulting Keychain;
+a missing, invalid, malformed, expired, revoked, or wrong-profile fallback
+fails with `CFCTL_CREDENTIAL_UNAVAILABLE` without searching Keychain or another
+profile. Keychain health probes are also skipped. This prevents unattended
+jobs from reopening an interactive password dialog while preserving profile
+isolation and journal precedence. Logout removes the selected profile's raw
+fallback and journal entries without probing Keychain.
+
+Only an explicit migration or `cfctl auth repair-keychain-access <profile>`
+may inspect Keychain while fallback authority is active. The repair command
+warns on stderr before that access. Re-import remains the noninteractive path
+for replacing invalid or unavailable credential material.
 
 ## Secrets
 
-Credential material is written to the platform keyring first — Keychain on
-macOS or Secret Service on Linux — and fails down to a governed mode-0600 file
-store under cfctl's data directory (`auth/secrets`, a mode-0700 directory) when
-the keyring is unavailable; reads reject any group- or world-readable secret
+When no fallback authority exists, credential material is written to the
+platform keyring first — Keychain on macOS or Secret Service on Linux — and
+fails down to a governed mode-0600 file store under cfctl's data directory
+(`auth/secrets`, a mode-0700 directory) when the keyring is unavailable. Once
+fallback authority exists, fresh writes stay there and ordinary reads never
+probe the platform keyring. Reads reject any group- or world-readable secret
 file, and `cfctl doctor` names the active backend. Secret request fields enter
 through stdin and become opaque references.
 Secret results require `--value-out`, which must not exist and is created mode
