@@ -1021,14 +1021,15 @@ impl SecretStore for PlatformSecretStore {
 
     fn repair_profile_credential_access(&self, profile: &ProfileMetadata) -> Result<()> {
         let key = profile_credential_key(profile)?;
-        let value = chained_get(self.keyring.as_ref(), &self.fallback, &key)?.ok_or_else(|| {
-            AuthError::CredentialUnavailable {
+        let value = self
+            .keyring
+            .get(&key)?
+            .ok_or_else(|| AuthError::CredentialUnavailable {
                 profile_id: profile.id.clone(),
                 reason: CredentialUnavailableReason::MissingSelectedFallback,
-            }
-        })?;
+            })?;
         decode_selected_credential(profile, value.clone())?;
-        self.put(&key, &value)
+        self.keyring.put(&key, &value)
     }
 }
 
@@ -1252,6 +1253,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn chained_get(
     primary: &dyn SecretStore,
     fallback: &dyn SecretStore,
@@ -1291,12 +1293,14 @@ fn chained_locate(
     }
 }
 
+#[cfg(test)]
 enum ResolvedChainedCredential {
     Fallback(String),
     Primary(String),
     Missing,
 }
 
+#[cfg(test)]
 fn resolve_chained_credential(
     primary: &dyn SecretStore,
     fallback: &dyn SecretStore,
@@ -1501,6 +1505,8 @@ mod tests {
     struct CountingSecretStore {
         inner: MemorySecretStore,
         accesses: AtomicUsize,
+        reads: AtomicUsize,
+        writes: AtomicUsize,
     }
 
     impl CountingSecretStore {
@@ -1511,16 +1517,26 @@ mod tests {
         fn access_count(&self) -> usize {
             self.accesses.load(Ordering::SeqCst)
         }
+
+        fn read_count(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+
+        fn write_count(&self) -> usize {
+            self.writes.load(Ordering::SeqCst)
+        }
     }
 
     impl SecretStore for CountingSecretStore {
         fn put(&self, key: &str, value: &str) -> Result<()> {
             self.accesses.fetch_add(1, Ordering::SeqCst);
+            self.writes.fetch_add(1, Ordering::SeqCst);
             self.inner.put(key, value)
         }
 
         fn get(&self, key: &str) -> Result<Option<String>> {
             self.accesses.fetch_add(1, Ordering::SeqCst);
+            self.reads.fetch_add(1, Ordering::SeqCst);
             self.inner.get(key)
         }
 
@@ -2285,6 +2301,57 @@ mod tests {
         assert!(
             keyring.access_count() > 0,
             "explicit repair should exercise Keychain access"
+        );
+    }
+
+    #[test]
+    fn explicit_repair_with_journal_only_fallback_reads_and_rewrites_keyring() {
+        let runtime = tempfile::tempdir().expect("fallback root");
+        let keyring = Arc::new(CountingSecretStore::default());
+        let store =
+            PlatformSecretStore::with_keyring(runtime.path().to_path_buf(), keyring.clone());
+        let profile = ProfileMetadata::new("audit", ProfileKind::ApiToken, Some("account-a"));
+        let key = api_token_key(&profile.id);
+        let journal_key = fallback_journal_key(&key);
+        keyring.seed(&key, "opaque-token");
+        store
+            .fallback
+            .put(&journal_key, "opaque-token")
+            .expect("seed journal-only selected fallback");
+        assert_eq!(
+            store.fallback.get(&key).expect("raw fallback lookup"),
+            None,
+            "the regression must begin with journal-only fallback authority"
+        );
+
+        store
+            .repair_profile_credential_access(&profile)
+            .expect("explicit repair must reach Keychain");
+
+        assert_eq!(keyring.read_count(), 1, "repair must read Keychain once");
+        assert_eq!(
+            keyring.write_count(),
+            1,
+            "repair must rewrite the selected Keychain item once"
+        );
+        assert_eq!(
+            authoritative_fallback_get(&store.fallback, &key)
+                .expect("authoritative fallback lookup"),
+            Some("opaque-token".to_owned()),
+            "repair must preserve journal-backed fallback authority"
+        );
+
+        let accesses_after_repair = keyring.access_count();
+        assert!(matches!(
+            store
+                .load_profile_credential(&profile)
+                .expect("ordinary read remains fallback-first"),
+            AuthCredential::Bearer { token } if token == "opaque-token"
+        ));
+        assert_eq!(
+            keyring.access_count(),
+            accesses_after_repair,
+            "ordinary reads after repair must not touch Keychain"
         );
     }
 
