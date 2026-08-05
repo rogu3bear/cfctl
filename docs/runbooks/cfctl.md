@@ -466,6 +466,29 @@ draft or approved plan; consumed/running plans are deliberately non-replayable.
 Use `plans rectify` to inspect compensation and verification steps after an
 uncertain or unsupported result.
 
+WebSockets use a dedicated zone-setting read/write pair rather than the
+unbounded generic zone-setting mutation:
+
+```bash
+cfctl call zone-settings-get-websockets-setting \
+  --selector zone_id=<zone-id> --json
+
+cfctl call zone-settings-configure-websockets \
+  --selector zone_id=<zone-id> \
+  --body-json '{"value":"on"}' --json
+cfctl plans show <operation-id> --json
+cfctl plans approve <operation-id> --yes --json
+cfctl plans run <operation-id> --json
+cfctl plans status <operation-id> --json
+```
+
+Use `"off"` to disable it. The mutation accepts no other value or body field,
+targets the literal `/zones/{zone_id}/settings/websockets` path, and captures
+the exact prior value for drift detection and a separately reviewed restoration
+plan. Cloudflare documents WebSockets as available on all plans. The generic
+`zone-settings-edit-single-setting` capability remains blocked; do not route
+around the dedicated contract.
+
 The DNS record lifecycle is governed end to end — create, update, patch, and
 delete — with deletion verified by a not-found readback of the exact record.
 

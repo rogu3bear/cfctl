@@ -9402,6 +9402,286 @@ fn warp_connector_configuration_rejects_permission_schema_and_read_drift() {
     assert!(!capability.cost.known);
 }
 
+fn websocket_zone_setting_schemas() -> serde_json::Value {
+    json!({
+        "zones_identifier": {"type": "string", "maxLength": 32},
+        "zones_setting_name": {"type": "string"},
+        "zones_api_response_common": {
+            "type": "object",
+            "required": ["success"],
+            "properties": {"success": {"type": "boolean"}}
+        },
+        "zones_base": {
+            "type": "object",
+            "required": ["id", "value"],
+            "properties": {
+                "editable": {"type": "boolean", "readOnly": true},
+                "id": {"type": "string"},
+                "modified_on": {"type": "string"},
+                "value": {}
+            }
+        },
+        "zones_websockets_value": {
+            "type": "string",
+            "enum": ["off", "on"],
+            "default": "off"
+        },
+        "zones_websockets": {
+            "allOf": [
+                {"$ref": "#/components/schemas/zones_base"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"enum": ["websockets"]},
+                        "value": {"$ref": "#/components/schemas/zones_websockets_value"}
+                    }
+                }
+            ]
+        },
+        "zones_other_setting": {
+            "type": "object",
+            "properties": {
+                "id": {"enum": ["other"]},
+                "value": {"type": "object"}
+            }
+        },
+        "zones_setting": {
+            "type": "object",
+            "oneOf": [
+                {"$ref": "#/components/schemas/zones_websockets"},
+                {"$ref": "#/components/schemas/zones_other_setting"}
+            ]
+        },
+        "zones_setting_value": {
+            "oneOf": [
+                {"$ref": "#/components/schemas/zones_websockets_value"}
+            ]
+        },
+        "zones_zone_settings_single_request": {
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean"}}
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "value": {"$ref": "#/components/schemas/zones_setting_value"}
+                    }
+                }
+            ]
+        }
+    })
+}
+
+fn websocket_zone_setting_fixture() -> serde_json::Value {
+    let parameters = json!([
+        {
+            "in": "path",
+            "name": "zone_id",
+            "required": true,
+            "schema": {"$ref": "#/components/schemas/zones_identifier"}
+        },
+        {
+            "in": "path",
+            "name": "setting_id",
+            "required": true,
+            "schema": {"$ref": "#/components/schemas/zones_setting_name"}
+        }
+    ]);
+    let response = json!({
+        "description": "Cloudflare API envelope",
+        "content": {"application/json": {"schema": {
+            "allOf": [
+                {"$ref": "#/components/schemas/zones_api_response_common"},
+                {
+                    "type": "object",
+                    "required": ["result"],
+                    "properties": {
+                        "result": {"$ref": "#/components/schemas/zones_setting"}
+                    }
+                }
+            ]
+        }}}
+    });
+    json!({
+        "openapi": "3.0.3",
+        "info": {"title": "Cloudflare API", "version": "4.0.0"},
+        "servers": [{"url": "https://api.cloudflare.com/client/v4"}],
+        "components": {"schemas": websocket_zone_setting_schemas()},
+        "paths": {
+            "/zones/{zone_id}/settings/{setting_id}": {
+                "parameters": parameters,
+                "get": {
+                    "operationId": "zone-settings-get-single-setting",
+                    "summary": "Get a zone setting",
+                    "tags": ["Zone Settings"],
+                    "x-api-token-group": ["Zone Settings Write", "Zone Settings Read"],
+                    "x-cfPlanAvailability": {
+                        "free": false,
+                        "pro": false,
+                        "business": true,
+                        "enterprise": true
+                    },
+                    "responses": {"200": response.clone()}
+                },
+                "patch": {
+                    "operationId": "zone-settings-edit-single-setting",
+                    "summary": "Edit a zone setting",
+                    "tags": ["Zone Settings"],
+                    "x-api-token-group": ["Zone Settings Write"],
+                    "x-cfPlanAvailability": {
+                        "free": false,
+                        "pro": false,
+                        "business": true,
+                        "enterprise": true
+                    },
+                    "requestBody": {
+                        "required": true,
+                        "content": {"application/json": {"schema": {
+                            "$ref": "#/components/schemas/zones_zone_settings_single_request"
+                        }}}
+                    },
+                    "responses": {"200": response}
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn websocket_zone_setting_derives_governed_read_and_write() {
+    let snapshot =
+        normalize_openapi(&websocket_zone_setting_fixture()).expect("WebSockets zone setting");
+
+    let read = snapshot
+        .get("zone-settings-get-websockets-setting")
+        .expect("dedicated WebSockets read");
+    assert_eq!(read.method, "GET");
+    assert_eq!(read.path, "/zones/{zone_id}/settings/websockets");
+    assert_eq!(read.adapter_status, AdapterStatus::DynamicApi);
+    assert!(!read.mutating);
+    assert_eq!(read.selectors.len(), 1);
+    assert_eq!(read.selectors[0].name, "zone_id");
+
+    let update = snapshot
+        .get("zone-settings-configure-websockets")
+        .expect("dedicated WebSockets update");
+    assert_eq!(update.method, "PATCH");
+    assert_eq!(update.path, "/zones/{zone_id}/settings/websockets");
+    assert_eq!(update.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(update.risk, RiskClass::CrossConfig);
+    assert_eq!(update.effect, EffectClass::ReversibleWrite);
+    assert_eq!(update.permissions, ["Zone Settings Write"]);
+    assert_eq!(update.selectors.len(), 1);
+    assert_eq!(update.selectors[0].name, "zone_id");
+    let request = update.request_schema.as_ref().expect("request schema");
+    assert_eq!(
+        request,
+        &json!({
+            "additionalProperties": false,
+            "properties": {
+                "value": {"enum": ["on", "off"], "type": "string"}
+            },
+            "required": ["value"],
+            "type": "object",
+            "x-cfctl-body-required": true
+        })
+    );
+    assert!(update.cost.known);
+    assert_eq!(update.cost.maximum, Some(0.0));
+    assert_eq!(update.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(update.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(update.entitlement.available, Some(true));
+    for plan in ["free", "pro", "business", "enterprise"] {
+        assert_eq!(update.entitlement.plans.get(plan), Some(&true));
+    }
+    assert!(!update.entitlement.requires_live_resolution);
+    assert_eq!(
+        update
+            .same_path_read
+            .as_ref()
+            .expect("same-path read")
+            .read_capability_id,
+        "zone-settings-get-websockets-setting"
+    );
+    assert_eq!(
+        update
+            .same_path_read
+            .as_ref()
+            .expect("same-path read")
+            .verified_response_fields,
+        ["value"]
+    );
+    assert!(update.rollback.supported);
+    assert_eq!(
+        update.rollback.strategy.as_deref(),
+        Some("restore_same_path_prior_snapshot")
+    );
+    assert!(update.mutation_contract_gaps().is_empty());
+
+    let generic_update = snapshot
+        .get("zone-settings-edit-single-setting")
+        .expect("generic zone-setting update");
+    assert_eq!(generic_update.adapter_status, AdapterStatus::Blocked);
+
+    let ranked = snapshot.search_scored("support websockets");
+    assert_eq!(
+        ranked.first().map(|(capability, _)| capability.id.as_str()),
+        Some("zone-settings-configure-websockets")
+    );
+    assert!(
+        ranked.len() == 1 || ranked[0].1.saturating_mul(5) >= ranked[1].1.saturating_mul(6),
+        "resolver should have a decisive WebSockets mutation winner: {ranked:?}"
+    );
+}
+
+#[test]
+fn websocket_zone_setting_derivation_fails_closed_on_source_drift() {
+    for (label, document) in [
+        {
+            let mut document = websocket_zone_setting_fixture();
+            document["paths"]["/zones/{zone_id}/settings/{setting_id}"]["patch"]["x-api-token-group"] =
+                json!(["Zone Settings Read"]);
+            ("permission", document)
+        },
+        {
+            let mut document = websocket_zone_setting_fixture();
+            document["components"]["schemas"]["zones_websockets_value"]["enum"] =
+                json!(["off", "on", "auto"]);
+            ("value schema", document)
+        },
+        {
+            let mut document = websocket_zone_setting_fixture();
+            document["paths"]["/zones/{zone_id}/settings/{setting_id}"]["patch"]["requestBody"]["content"]
+                ["application/json"]["schema"]["$ref"] =
+                json!("#/components/schemas/zones_unbounded_request");
+            ("request schema", document)
+        },
+        {
+            let mut document = websocket_zone_setting_fixture();
+            document["components"]["schemas"]["zones_base"]["properties"]
+                .as_object_mut()
+                .expect("zone base properties")
+                .remove("editable");
+            ("response", document)
+        },
+    ] {
+        let snapshot = normalize_openapi(&document).expect("drifted zone setting catalog");
+        assert!(
+            snapshot
+                .get("zone-settings-get-websockets-setting")
+                .is_none(),
+            "{label} drift must suppress the dedicated read"
+        );
+        assert!(
+            snapshot.get("zone-settings-configure-websockets").is_none(),
+            "{label} drift must suppress the dedicated mutation"
+        );
+    }
+}
+
 fn web_analytics_rum_fixture() -> serde_json::Value {
     let response = json!({
         "description": "Cloudflare API envelope",

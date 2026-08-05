@@ -7040,6 +7040,7 @@ fn apply_post_normalization_contracts(
     finalize_workers_kv_namespace_contracts(document, capabilities);
     finalize_r2_temporary_credentials_contract(document, capabilities);
     finalize_zone_cache_purge_contracts(document, capabilities);
+    finalize_websocket_zone_setting_contract(document, capabilities);
     finalize_oauth_client_secret_rotation_contract(document, capabilities);
     finalize_global_warp_override_rollback_contract(capabilities);
     finalize_d1_read_replication_rollback_contract(capabilities);
@@ -14366,6 +14367,349 @@ fn finalize_warp_connector_configuration_rollback_contract(
             .to_owned(),
     );
     refresh_dynamic_mutation_contract(capability);
+}
+
+const GENERIC_ZONE_SETTING_READ_CAPABILITY_ID: &str = "zone-settings-get-single-setting";
+const GENERIC_ZONE_SETTING_MUTATION_CAPABILITY_ID: &str = "zone-settings-edit-single-setting";
+const GENERIC_ZONE_SETTING_PATH: &str = "/zones/{zone_id}/settings/{setting_id}";
+const WEBSOCKET_ZONE_SETTING_READ_CAPABILITY_ID: &str = "zone-settings-get-websockets-setting";
+const WEBSOCKET_ZONE_SETTING_MUTATION_CAPABILITY_ID: &str = "zone-settings-configure-websockets";
+const WEBSOCKET_ZONE_SETTING_PATH: &str = "/zones/{zone_id}/settings/websockets";
+const WEBSOCKET_DOCS_URL: &str = "https://developers.cloudflare.com/network/websockets/";
+
+fn websocket_zone_setting_response_supported(capability: &CapabilityV1) -> bool {
+    capability
+        .response_contract
+        .as_ref()
+        .is_some_and(|response| {
+            response.success_statuses == ["200"]
+                && response.success_media_types == ["application/json"]
+                && response.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+        })
+}
+
+fn generic_zone_setting_selector_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.selectors.len() == 2
+        && ["setting_id", "zone_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+}
+
+fn generic_zone_setting_read_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == GENERIC_ZONE_SETTING_READ_CAPABILITY_ID
+        && capability.method == "GET"
+        && capability.path == GENERIC_ZONE_SETTING_PATH
+        && capability.product == "Zone Settings"
+        && capability.account_scope == "zone"
+        && !capability.mutating
+        && capability.request_schema.is_none()
+        && capability.permissions == ["Zone Settings Write", "Zone Settings Read"]
+        && generic_zone_setting_selector_contract_supported(capability)
+        && websocket_zone_setting_response_supported(capability)
+}
+
+fn generic_zone_setting_mutation_contract_supported(capability: &CapabilityV1) -> bool {
+    capability.id == GENERIC_ZONE_SETTING_MUTATION_CAPABILITY_ID
+        && capability.method == "PATCH"
+        && capability.path == GENERIC_ZONE_SETTING_PATH
+        && capability.product == "Zone Settings"
+        && capability.account_scope == "zone"
+        && capability.mutating
+        && capability.request_schema.is_some()
+        && capability.permissions == ["Zone Settings Write"]
+        && generic_zone_setting_selector_contract_supported(capability)
+        && websocket_zone_setting_response_supported(capability)
+}
+
+fn schema_union_contains_reference(
+    document: &Value,
+    schema_pointer: &str,
+    reference: &str,
+) -> bool {
+    document
+        .pointer(schema_pointer)
+        .and_then(|schema| schema.get("oneOf"))
+        .and_then(Value::as_array)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| member.get("$ref").and_then(Value::as_str) == Some(reference))
+        })
+}
+
+fn exact_string_array(value: Option<&Value>, expected: &[&str]) -> bool {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return false;
+    };
+    values.len() == expected.len()
+        && values
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<BTreeSet<_>>>()
+            == Some(expected.iter().copied().collect())
+}
+
+fn websocket_value_schema_supported(document: &Value) -> bool {
+    let Some(schema) = document.pointer("/components/schemas/zones_websockets_value") else {
+        return false;
+    };
+    if schema.get("type").and_then(Value::as_str) != Some("string")
+        || schema.get("default").and_then(Value::as_str) != Some("off")
+    {
+        return false;
+    }
+    exact_string_array(schema.get("enum"), &["off", "on"])
+}
+
+fn websocket_setting_schema_supported(document: &Value) -> bool {
+    let Some(base) = document.pointer("/components/schemas/zones_base") else {
+        return false;
+    };
+    let base_supported = exact_string_array(base.get("required"), &["id", "value"])
+        && base
+            .pointer("/properties/editable/type")
+            .and_then(Value::as_str)
+            == Some("boolean")
+        && base.pointer("/properties/id/type").and_then(Value::as_str) == Some("string")
+        && base.pointer("/properties/value").is_some();
+    if !base_supported {
+        return false;
+    }
+    let Some(schema) = document.pointer("/components/schemas/zones_websockets") else {
+        return false;
+    };
+    let Some(members) = schema.get("allOf").and_then(Value::as_array) else {
+        return false;
+    };
+    let websocket_uses_base = members.len() == 2
+        && members.iter().any(|member| {
+            member.get("$ref").and_then(Value::as_str) == Some("#/components/schemas/zones_base")
+        });
+    let websocket_fields_supported = members.iter().any(|member| {
+        member.pointer("/properties/id/enum") == Some(&serde_json::json!(["websockets"]))
+            && member
+                .pointer("/properties/value/$ref")
+                .and_then(Value::as_str)
+                == Some("#/components/schemas/zones_websockets_value")
+    });
+    websocket_uses_base
+        && websocket_fields_supported
+        && schema_union_contains_reference(
+            document,
+            "/components/schemas/zones_setting",
+            "#/components/schemas/zones_websockets",
+        )
+        && schema_union_contains_reference(
+            document,
+            "/components/schemas/zones_setting_value",
+            "#/components/schemas/zones_websockets_value",
+        )
+        && websocket_value_schema_supported(document)
+}
+
+fn schema_contains_result_reference(schema: &Value, reference: &str, depth: usize) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    schema
+        .pointer("/properties/result/$ref")
+        .and_then(Value::as_str)
+        == Some(reference)
+        || schema
+            .get("allOf")
+            .and_then(Value::as_array)
+            .is_some_and(|members| {
+                members
+                    .iter()
+                    .any(|member| schema_contains_result_reference(member, reference, depth + 1))
+            })
+}
+
+fn operation_returns_zone_setting(operation: &Value) -> bool {
+    operation
+        .get("responses")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(status, _)| status.starts_with('2'))
+        .filter_map(|(_, response)| response.pointer("/content/application~1json/schema"))
+        .any(|schema| {
+            schema_contains_result_reference(schema, "#/components/schemas/zones_setting", 0)
+        })
+}
+
+fn websocket_source_operations_supported(document: &Value) -> bool {
+    let Some(path_item) = document
+        .get("paths")
+        .and_then(Value::as_object)
+        .and_then(|paths| paths.get(GENERIC_ZONE_SETTING_PATH))
+    else {
+        return false;
+    };
+    let (Some(read), Some(update)) = (path_item.get("get"), path_item.get("patch")) else {
+        return false;
+    };
+    update
+        .pointer("/requestBody/required")
+        .and_then(Value::as_bool)
+        == Some(true)
+        && update
+            .pointer("/requestBody/content/application~1json/schema/$ref")
+            .and_then(Value::as_str)
+            == Some("#/components/schemas/zones_zone_settings_single_request")
+        && operation_returns_zone_setting(read)
+        && operation_returns_zone_setting(update)
+        && websocket_setting_schema_supported(document)
+}
+
+fn websocket_all_plan_entitlement() -> EntitlementV1 {
+    EntitlementV1 {
+        available: Some(true),
+        plans: BTreeMap::from([
+            ("business".to_owned(), true),
+            ("enterprise".to_owned(), true),
+            ("free".to_owned(), true),
+            ("pro".to_owned(), true),
+        ]),
+        blocker: None,
+        source: Some(WEBSOCKET_DOCS_URL.to_owned()),
+        requires_live_resolution: false,
+        observed_plan: None,
+        probe: None,
+    }
+}
+
+fn derived_websocket_zone_setting_read(mut capability: CapabilityV1) -> CapabilityV1 {
+    WEBSOCKET_ZONE_SETTING_READ_CAPABILITY_ID.clone_into(&mut capability.id);
+    "Get WebSockets status".clone_into(&mut capability.title);
+    capability.description = Some(
+        "Reads the zone's WebSockets on/off setting through the exact WebSockets setting path."
+            .to_owned(),
+    );
+    "Network".clone_into(&mut capability.product);
+    WEBSOCKET_ZONE_SETTING_PATH.clone_into(&mut capability.path);
+    capability
+        .selectors
+        .retain(|selector| selector.name == "zone_id" && selector.location == "path");
+    capability.aliases = vec![
+        "get websocket status".to_owned(),
+        "show websockets setting".to_owned(),
+        "read websocket configuration".to_owned(),
+    ];
+    capability.entitlement = websocket_all_plan_entitlement();
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    capability.blocked_reason = None;
+    capability
+}
+
+fn derived_websocket_zone_setting_update(mut capability: CapabilityV1) -> Option<CapabilityV1> {
+    WEBSOCKET_ZONE_SETTING_MUTATION_CAPABILITY_ID.clone_into(&mut capability.id);
+    "Configure WebSockets support".clone_into(&mut capability.title);
+    capability.description = Some(
+        "Enables or disables proxied WebSockets for one zone through the exact WebSockets setting path."
+            .to_owned(),
+    );
+    "Network".clone_into(&mut capability.product);
+    WEBSOCKET_ZONE_SETTING_PATH.clone_into(&mut capability.path);
+    capability
+        .selectors
+        .retain(|selector| selector.name == "zone_id" && selector.location == "path");
+    capability.aliases = vec![
+        "support websockets".to_owned(),
+        "enable websockets".to_owned(),
+        "disable websockets".to_owned(),
+        "turn websocket on off".to_owned(),
+    ];
+    capability.request_schema = Some(serde_json::json!({
+        "additionalProperties": false,
+        "properties": {
+            "value": {"enum": ["on", "off"], "type": "string"}
+        },
+        "required": ["value"],
+        "type": "object",
+        "x-cfctl-body-required": true
+    }));
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.entitlement = websocket_all_plan_entitlement();
+    capability.cost = CostV1::default();
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.basis = Some(
+        "changing the setting has no direct operation charge; the initial WebSocket request and downstream traffic remain subject to the zone's usage and plan terms"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        official_reference("Cloudflare WebSockets", WEBSOCKET_DOCS_URL),
+        official_reference(
+            "Edit zone setting",
+            "https://developers.cloudflare.com/api/resources/zones/subresources/settings/methods/edit/",
+        ),
+    ];
+    capability.verification.required = true;
+    "same_path_result_contains_planned_fields_after_update"
+        .clone_into(&mut capability.verification.strategy);
+    capability.same_path_read = Some(SamePathReadContractV1 {
+        path: WEBSOCKET_ZONE_SETTING_PATH.to_owned(),
+        read_capability_id: WEBSOCKET_ZONE_SETTING_READ_CAPABILITY_ID.to_owned(),
+        verified_response_fields: vec!["value".to_owned()],
+    });
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("restore_same_path_prior_snapshot".to_owned());
+    capability.rollback.warning = Some(
+        "cfctl captures and rechecks the exact prior WebSockets value before applying; rollback is a separately reviewed restoration plan"
+            .to_owned(),
+    );
+    capability.adapter_status = AdapterStatus::DynamicApi;
+    capability.blocked_reason = None;
+    refresh_dynamic_mutation_contract(&mut capability);
+    (capability.adapter_status == AdapterStatus::DynamicApi).then_some(capability)
+}
+
+/// Derive a literal `WebSockets` surface only while the generic official zone
+/// setting path proves the exact `WebSockets` schema, permissions, and readback.
+/// The generic mutation remains blocked so callers cannot select an arbitrary
+/// setting id or smuggle another setting's request shape through this contract.
+fn finalize_websocket_zone_setting_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    if capabilities.contains_key(WEBSOCKET_ZONE_SETTING_READ_CAPABILITY_ID)
+        || capabilities.contains_key(WEBSOCKET_ZONE_SETTING_MUTATION_CAPABILITY_ID)
+        || !websocket_source_operations_supported(document)
+    {
+        return;
+    }
+    let Some(source_read) = capabilities
+        .get(GENERIC_ZONE_SETTING_READ_CAPABILITY_ID)
+        .filter(|capability| generic_zone_setting_read_contract_supported(capability))
+        .cloned()
+    else {
+        return;
+    };
+    let Some(source_update) = capabilities
+        .get(GENERIC_ZONE_SETTING_MUTATION_CAPABILITY_ID)
+        .filter(|capability| generic_zone_setting_mutation_contract_supported(capability))
+        .cloned()
+    else {
+        return;
+    };
+
+    let read = derived_websocket_zone_setting_read(source_read);
+    let Some(update) = derived_websocket_zone_setting_update(source_update) else {
+        return;
+    };
+
+    capabilities.insert(WEBSOCKET_ZONE_SETTING_READ_CAPABILITY_ID.to_owned(), read);
+    capabilities.insert(
+        WEBSOCKET_ZONE_SETTING_MUTATION_CAPABILITY_ID.to_owned(),
+        update,
+    );
 }
 
 const WEB_ANALYTICS_RUM_MUTATION_CAPABILITY_ID: &str = "web-analytics-toggle-rum";

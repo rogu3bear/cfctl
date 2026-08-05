@@ -52,6 +52,9 @@ Product APIs:
 - Security Events semantics and sampled-log limits: https://developers.cloudflare.com/waf/analytics/security-events/
 - Analytics Engine SQL API: https://developers.cloudflare.com/analytics/analytics-engine/sql-api/
 - Web Analytics API: https://developers.cloudflare.com/api/resources/rum/
+- WebSockets: https://developers.cloudflare.com/network/websockets/
+- Get one zone setting: https://developers.cloudflare.com/api/resources/zones/subresources/settings/methods/get/
+- Edit one zone setting: https://developers.cloudflare.com/api/resources/zones/subresources/settings/methods/edit/
 - Workers observability: https://developers.cloudflare.com/workers/observability/
 - Workers Tail API: https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/tail/
 - Log Explorer: https://developers.cloudflare.com/log-explorer/

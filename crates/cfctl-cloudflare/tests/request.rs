@@ -1579,6 +1579,72 @@ fn unchecked_request_validates_required_body_shape_from_pinned_schema() {
 }
 
 #[test]
+fn websocket_zone_setting_request_is_plan_gated_and_exactly_bounded() {
+    let mut capability = CapabilityV1::new(
+        "zone-settings-configure-websockets",
+        "Configure WebSockets support",
+        "PATCH",
+        "/zones/{zone_id}/settings/websockets",
+    );
+    capability.selectors = vec![SelectorV1 {
+        name: "zone_id".to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }];
+    capability.request_schema = Some(json!({
+        "additionalProperties": false,
+        "properties": {
+            "value": {"enum": ["on", "off"], "type": "string"}
+        },
+        "required": ["value"],
+        "type": "object",
+        "x-cfctl-body-required": true
+    }));
+    let builder = RequestBuilder::new("https://api.cloudflare.com/client/v4").expect("builder");
+    let input = CallInput {
+        selectors: json!({"zone_id": "zone-1"}),
+        body: Some(json!({"value": "on"})),
+        ..CallInput::default()
+    };
+
+    assert!(matches!(
+        builder.build(&capability, &input),
+        Err(CloudflareError::ApprovedPlanRequired(id))
+            if id == "zone-settings-configure-websockets"
+    ));
+    let request = builder
+        .build_unchecked(&capability, &input)
+        .expect("approved-plan transport request");
+    assert_eq!(request.method, "PATCH");
+    assert_eq!(
+        request.url.as_str(),
+        "https://api.cloudflare.com/client/v4/zones/zone-1/settings/websockets"
+    );
+    assert_eq!(request.body, Some(json!({"value": "on"})));
+
+    for body in [
+        json!({"value": "auto"}),
+        json!({"value": "on", "setting_id": "other"}),
+    ] {
+        assert!(
+            builder
+                .build_unchecked(
+                    &capability,
+                    &CallInput {
+                        selectors: json!({"zone_id": "zone-1"}),
+                        body: Some(body),
+                        ..CallInput::default()
+                    }
+                )
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn unchecked_request_closes_an_explicitly_empty_property_contract() {
     let mut capability = CapabilityV1::new("server-state", "Server state", "POST", "/state");
     capability.request_schema = Some(json!({
