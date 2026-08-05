@@ -3,7 +3,8 @@
 use cfctl_catalog::{
     CatalogChangeKind, CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1,
     attach_official_product_knowledge, ingest_cli_help, ingest_native_control_capabilities,
-    ingest_telemetry_capabilities, markdown_link, markdown_links, normalize_openapi,
+    ingest_telemetry_capabilities, ingest_wrangler_pages_deploy_help, markdown_link,
+    markdown_links, normalize_openapi,
 };
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryKindV1, BillingModelV1, CapabilityV1, CostExposureV1,
@@ -74,6 +75,85 @@ fn cloudflare_envelope_responses() -> Value {
             }}}
         }
     })
+}
+
+fn cloudflare_named_result_responses() -> Value {
+    json!({
+        "200": {
+            "description": "Cloudflare API envelope with a named resource",
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["success", "result"],
+                "properties": {
+                    "success": {"type": "boolean"},
+                    "result": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {"name": {"type": "string"}}
+                    }
+                }
+            }}}
+        }
+    })
+}
+
+fn pages_domain_fixture() -> Value {
+    let mut document = fixture();
+    let account = json!({
+        "in": "path",
+        "name": "account_id",
+        "required": true,
+        "schema": {"maxLength": 32, "type": "string"}
+    });
+    let project = json!({
+        "in": "path",
+        "name": "project_name",
+        "required": true,
+        "schema": {"type": "string"}
+    });
+    let domain = json!({
+        "in": "path",
+        "name": "domain_name",
+        "required": true,
+        "schema": {"type": "string"}
+    });
+    document["paths"]["/accounts/{account_id}/pages/projects/{project_name}/domains"] = json!({
+        "post": {
+            "operationId": "pages-domains-add-domain",
+            "summary": "Add domain",
+            "tags": ["Pages Domains"],
+            "parameters": [account.clone(), project.clone()],
+            "requestBody": {
+                "required": true,
+                "content": {"application/json": {"schema": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {"name": {"type": "string"}}
+                }}}
+            },
+            "responses": cloudflare_named_result_responses(),
+            "x-api-token-group": ["Pages Write"]
+        }
+    });
+    document["paths"]["/accounts/{account_id}/pages/projects/{project_name}/domains/{domain_name}"] = json!({
+        "get": {
+            "operationId": "pages-domains-get-domain",
+            "summary": "Get domain",
+            "tags": ["Pages Domains"],
+            "parameters": [account.clone(), project.clone(), domain.clone()],
+            "responses": cloudflare_named_result_responses(),
+            "x-api-token-group": ["Pages Read", "Pages Write"]
+        },
+        "delete": {
+            "operationId": "pages-domains-delete-domain",
+            "summary": "Delete domain",
+            "tags": ["Pages Domains"],
+            "parameters": [account, project, domain],
+            "responses": cloudflare_envelope_responses(),
+            "x-api-token-group": ["Pages Write"]
+        }
+    });
+    document
 }
 
 /// The response shape Cloudflare's `OpenAPI` actually declares for the DNS
@@ -2069,6 +2149,81 @@ fn official_cli_help_becomes_delegated_capabilities() {
             .expect("tail capability")
             .mutating
     );
+}
+
+#[test]
+fn exact_wrangler_pages_deploy_help_becomes_a_governed_upload() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    ingest_wrangler_pages_deploy_help(
+        &mut snapshot,
+        "4.83.0",
+        "wrangler pages deploy [directory]\nOPTIONS\n  --project-name\n  --branch\n  --commit-hash\n  --commit-message\n",
+    );
+
+    let deploy = snapshot
+        .get("wrangler.pages-deploy")
+        .expect("Pages deploy capability");
+    assert_eq!(deploy.path, "wrangler pages deploy");
+    assert_eq!(deploy.adapter_status, AdapterStatus::DelegatedCli);
+    assert_eq!(deploy.risk, RiskClass::CrossConfig);
+    assert_eq!(deploy.effect, EffectClass::ReversibleWrite);
+    assert_eq!(deploy.cost.maximum, Some(0.0));
+    assert_eq!(
+        deploy.verification.strategy,
+        "wrangler_pages_production_deployment_reports_commit_hash"
+    );
+    assert!(deploy.verification_contract_supported());
+    assert!(deploy.mutation_contract_gaps().is_empty());
+    for name in ["argument", "project_name", "branch", "commit_hash"] {
+        assert!(deploy.selectors.iter().any(|selector| {
+            selector.name == name && selector.location == "query" && selector.required
+        }));
+    }
+
+    let mut unsupported = normalize_openapi(&fixture()).expect("catalog");
+    ingest_wrangler_pages_deploy_help(
+        &mut unsupported,
+        "4.83.0",
+        "wrangler pages deploy [directory]\nOPTIONS\n  --project-name\n",
+    );
+    assert!(unsupported.get("wrangler.pages-deploy").is_none());
+}
+
+#[test]
+fn pages_domain_create_binds_exact_readback_and_reviewed_delete_compensation() {
+    let snapshot = normalize_openapi(&pages_domain_fixture()).expect("Pages domain catalog");
+    let create = snapshot
+        .get("pages-domains-add-domain")
+        .expect("Pages domain create");
+
+    assert_eq!(create.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(create.risk, RiskClass::CrossConfig);
+    assert_eq!(create.effect, EffectClass::ReversibleWrite);
+    assert_eq!(create.cost.maximum, Some(0.0));
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    let target = create
+        .created_resource
+        .as_ref()
+        .expect("created domain contract");
+    assert_eq!(
+        target.detail_path,
+        "/accounts/{account_id}/pages/projects/{project_name}/domains/{domain_name}"
+    );
+    assert_eq!(target.identity_selector, "domain_name");
+    assert_eq!(target.response_result_identity_pointer, "/name");
+    assert_eq!(target.read_capability_id, "pages-domains-get-domain");
+    assert_eq!(target.delete_capability_id, "pages-domains-delete-domain");
+    assert_eq!(target.verified_response_fields, ["name"]);
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    assert!(create.verification_contract_supported());
+    assert!(create.rollback_contract_supported());
+    assert!(create.mutation_contract_gaps().is_empty());
 }
 
 #[test]

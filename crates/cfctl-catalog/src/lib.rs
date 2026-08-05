@@ -1529,6 +1529,104 @@ pub fn ingest_cli_help(snapshot: &mut CatalogSnapshot, program: &str, version: &
     }
 }
 
+/// Add the exact Wrangler Pages upload command only when the installed
+/// Wrangler help proves that command and every selector cfctl relies on are
+/// present. The top-level Wrangler help exposes only the aggregate `pages`
+/// command, which is not specific enough to govern a deployment.
+pub fn ingest_wrangler_pages_deploy_help(
+    snapshot: &mut CatalogSnapshot,
+    version: &str,
+    help: &str,
+) {
+    if ![
+        "wrangler pages deploy [directory]",
+        "--project-name",
+        "--branch",
+        "--commit-hash",
+        "--commit-message",
+    ]
+    .iter()
+    .all(|marker| help.contains(marker))
+    {
+        return;
+    }
+
+    let mut capability = CapabilityV1::new(
+        "wrangler.pages-deploy",
+        "Deploy a directory to Cloudflare Pages",
+        "POST",
+        "wrangler pages deploy",
+    );
+    capability.source = format!("wrangler {version} pages deploy help");
+    "CLI".clone_into(&mut capability.method);
+    "Cloudflare Pages".clone_into(&mut capability.product);
+    capability.adapter_status = AdapterStatus::DelegatedCli;
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost.known = true;
+    capability.cost.incremental = false;
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.basis = Some(
+        "uploading a Pages deployment has no direct per-deployment charge; the deployed site can create plan-specific Functions and bandwidth usage"
+            .to_owned(),
+    );
+    capability.cost.references = vec![KnowledgeReferenceV1 {
+        title: "Cloudflare Pages Functions pricing".to_owned(),
+        url: "https://developers.cloudflare.com/pages/functions/pricing/".to_owned(),
+        source: "official Cloudflare docs".to_owned(),
+    }];
+    capability.verification.required = true;
+    "wrangler_pages_production_deployment_reports_commit_hash"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.warning = Some(
+        "automatic rollback is not implemented; restoration requires a separate reviewed Pages deployment plan for a known prior artifact and commit"
+            .to_owned(),
+    );
+    capability.selectors = [
+        (
+            "argument",
+            true,
+            "Absolute or workspace-relative directory containing the built Pages artifact",
+        ),
+        (
+            "project_name",
+            true,
+            "Existing Cloudflare Pages project name",
+        ),
+        (
+            "branch",
+            true,
+            "Production branch recorded on the deployment",
+        ),
+        (
+            "commit_hash",
+            true,
+            "Exact source commit recorded on and verified against the deployment",
+        ),
+        (
+            "commit_message",
+            false,
+            "Optional source commit message recorded on the deployment",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, required, description)| SelectorV1 {
+        name: name.to_owned(),
+        location: "query".to_owned(),
+        required,
+        value_type: "string".to_owned(),
+        description: Some(description.to_owned()),
+        contract: None,
+    })
+    .collect();
+    snapshot
+        .capabilities
+        .insert(capability.id.clone(), capability);
+}
+
 fn classify_delegated_cli_capability(capability: &mut CapabilityV1) {
     if capability.id != "wrangler.deploy" {
         return;
@@ -6870,6 +6968,7 @@ fn apply_post_normalization_contracts(
     classify_access_service_token_refresh_contract(document, capabilities);
     classify_created_resource_contracts(document, capabilities);
     classify_created_collection_resource_contracts(document, capabilities);
+    finalize_pages_domain_create_contract(document, capabilities);
     classify_global_warp_override_contract(document, capabilities);
     classify_same_path_object_mutation_contracts(document, capabilities);
     finalize_r2_bucket_create_contract(document, capabilities);
@@ -6893,6 +6992,104 @@ fn apply_post_normalization_contracts(
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
+}
+
+const PAGES_DOMAIN_CREATE_CAPABILITY_ID: &str = "pages-domains-add-domain";
+const PAGES_DOMAIN_READ_CAPABILITY_ID: &str = "pages-domains-get-domain";
+const PAGES_DOMAIN_DELETE_CAPABILITY_ID: &str = "pages-domains-delete-domain";
+const PAGES_DOMAIN_COLLECTION_PATH: &str =
+    "/accounts/{account_id}/pages/projects/{project_name}/domains";
+const PAGES_DOMAIN_DETAIL_PATH: &str =
+    "/accounts/{account_id}/pages/projects/{project_name}/domains/{domain_name}";
+
+fn finalize_pages_domain_create_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let companions_supported = capabilities
+        .get(PAGES_DOMAIN_READ_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.method == "GET"
+                && capability.path == PAGES_DOMAIN_DETAIL_PATH
+                && capability.product == "Pages Domains"
+                && capability
+                    .selectors
+                    .iter()
+                    .all(|selector| selector.location == "path")
+        })
+        && capabilities
+            .get(PAGES_DOMAIN_DELETE_CAPABILITY_ID)
+            .is_some_and(|capability| {
+                capability.method == "DELETE"
+                    && capability.path == PAGES_DOMAIN_DETAIL_PATH
+                    && capability.product == "Pages Domains"
+            });
+    let create_operation = document
+        .pointer("/paths/~1accounts~1{account_id}~1pages~1projects~1{project_name}~1domains/post");
+    let read_operation = document.pointer(
+        "/paths/~1accounts~1{account_id}~1pages~1projects~1{project_name}~1domains~1{domain_name}/get",
+    );
+    let response_supported = create_operation.is_some_and(|operation| {
+        success_response_declares_result_string_field(document, operation, "name")
+    }) && read_operation.is_some_and(|operation| {
+        success_response_declares_result_string_field(document, operation, "name")
+    });
+
+    let Some(capability) = capabilities.get_mut(PAGES_DOMAIN_CREATE_CAPABILITY_ID) else {
+        return;
+    };
+    let create_supported = capability.method == "POST"
+        && capability.path == PAGES_DOMAIN_COLLECTION_PATH
+        && capability.product == "Pages Domains"
+        && capability.permissions == ["Pages Write"]
+        && capability.request_schema.as_ref()
+            == Some(&serde_json::json!({
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "type": "object",
+                "x-cfctl-body-required": true
+            }));
+    if !create_supported || !companions_supported || !response_supported {
+        capability.created_resource = None;
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(format!(
+            "Pages domain create, exact readback, delete, or response contract drifted (create={create_supported}, companions={companions_supported}, response={response_supported})"
+        ));
+        return;
+    }
+
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost = CostV1::default();
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.basis = Some(
+        "attaching a custom domain has no direct operation charge; ordinary Pages Functions and bandwidth usage remains plan-specific"
+            .to_owned(),
+    );
+    capability.cost.references = vec![official_reference(
+        "Cloudflare Pages Functions pricing",
+        "https://developers.cloudflare.com/pages/functions/pricing/",
+    )];
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: PAGES_DOMAIN_DETAIL_PATH.to_owned(),
+        identity_selector: "domain_name".to_owned(),
+        response_result_identity_pointer: "/name".to_owned(),
+        read_capability_id: PAGES_DOMAIN_READ_CAPABILITY_ID.to_owned(),
+        delete_capability_id: PAGES_DOMAIN_DELETE_CAPABILITY_ID.to_owned(),
+        verified_response_fields: vec!["name".to_owned()],
+    });
+    capability.verification.required = true;
+    "created_resource_contains_planned_fields_by_returned_id"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    capability.rollback.warning = Some(
+        "compensation creates a separate exact-domain delete plan that must be reviewed and explicitly approved"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
 }
 
 fn classify_same_path_object_mutation_contracts(

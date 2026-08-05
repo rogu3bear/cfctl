@@ -549,6 +549,33 @@ working directory. `cfctl doctor --json` projects this boundary under
 `result.delegated_cli_environment` so deploy wrappers can fail closed when an
 older cfctl build does not preserve it.
 
+For a Cloudflare Pages direct upload, use the exact
+`wrangler.pages-deploy` capability rather than the aggregate
+`wrangler.pages` command. Bind the built directory, existing project,
+production branch, and exact source commit in the plan:
+
+```bash
+cfctl call wrangler.pages-deploy \
+  --query argument=/absolute/path/to/site \
+  --query project_name=example-web \
+  --query branch=main \
+  --query commit_hash=<full-source-sha> \
+  --query commit_message='<reviewed message>' \
+  --json
+```
+
+The governed subprocess receives only the selected account and cfctl's
+Wrangler cache plus the selected credential. Verification lists production
+deployments and requires the exact project, branch, commit hash, and a
+successful deployment stage. Automatic rollback is not implemented; restoring
+a prior artifact is a separate reviewed deployment plan.
+
+Custom-domain attachment is the separate `pages-domains-add-domain` dynamic
+API capability. Its verifier reads the returned domain by exact name; its
+compensation path is a new, independently reviewed delete plan. A created
+domain resource is not proof that DNS and TLS have converged, so release proof
+must still include live hostname readback.
+
 Mint an account token only through the dedicated key workflow. The generic
 `account-api-tokens-update-token` and `user-api-tokens-update-token`
 capabilities stay blocked by design, not by a schema gap: their request

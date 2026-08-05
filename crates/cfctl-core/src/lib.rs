@@ -2205,6 +2205,22 @@ impl CapabilityV1 {
                             && selector.value_type == "string"
                     })
             }
+            "wrangler_pages_production_deployment_reports_commit_hash" => {
+                self.id == "wrangler.pages-deploy"
+                    && self.method == "CLI"
+                    && self.path == "wrangler pages deploy"
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && ["argument", "project_name", "branch", "commit_hash"]
+                        .iter()
+                        .all(|name| {
+                            self.selectors.iter().any(|selector| {
+                                selector.name == *name
+                                    && selector.location == "query"
+                                    && selector.required
+                                    && selector.value_type == "string"
+                            })
+                        })
+            }
             // The Email Routing enable/disable toggles have no same-path
             // readback of a resource, so verification asserts the toggle's own
             // `result.enabled` boolean in the settings object the action

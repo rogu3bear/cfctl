@@ -27,7 +27,7 @@ use cfctl_catalog::{
     CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1, attach_official_product_knowledge,
     fetch_official, fetch_official_text_feeds, ingest_cli_help, ingest_governed_ui_capabilities,
     ingest_native_control_capabilities, ingest_telemetry_capabilities,
-    refresh_dynamic_mutation_contract,
+    ingest_wrangler_pages_deploy_help, refresh_dynamic_mutation_contract,
 };
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, D1ImportCheckpointV1, Executor,
@@ -1124,6 +1124,19 @@ async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2> {
                 String::from_utf8_lossy(&version.stdout).trim(),
                 &String::from_utf8_lossy(&help.stdout),
             );
+            if program == "wrangler" {
+                let pages_deploy_help = std::process::Command::new(program)
+                    .args(["pages", "deploy", "--help"])
+                    .output()
+                    .map_err(|source| cli_io(Path::new(program), source))?;
+                if pages_deploy_help.status.success() {
+                    ingest_wrangler_pages_deploy_help(
+                        &mut catalog,
+                        String::from_utf8_lossy(&version.stdout).trim(),
+                        &String::from_utf8_lossy(&pages_deploy_help.stdout),
+                    );
+                }
+            }
         }
     }
     ingest_governed_ui_capabilities(&mut catalog);
@@ -5830,6 +5843,56 @@ async fn verify_delegated_cli_plan(
     credential: &AuthCredential,
 ) -> Value {
     if plan.capability.verification.strategy
+        == "wrangler_pages_production_deployment_reports_commit_hash"
+    {
+        let Some(project_name) = input
+            .query
+            .get("project_name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return json!({
+                "passed": false,
+                "basis": "the Pages deployment plan omitted its required project_name selector",
+            });
+        };
+        let Some(branch) = input
+            .query
+            .get("branch")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return json!({
+                "passed": false,
+                "basis": "the Pages deployment plan omitted its required branch selector",
+                "project_name": project_name,
+            });
+        };
+        let Some(commit_hash) = input
+            .query
+            .get("commit_hash")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return json!({
+                "passed": false,
+                "basis": "the Pages deployment plan omitted its required commit_hash selector",
+                "project_name": project_name,
+                "branch": branch,
+            });
+        };
+        return verify_wrangler_pages_production_deployment(
+            project_name,
+            branch,
+            commit_hash,
+            credential,
+            &plan.account_id,
+            &store.paths().cache_dir,
+        )
+        .await;
+    }
+
+    if plan.capability.verification.strategy
         != "wrangler_deployment_status_reports_promoted_version"
     {
         return json!({
@@ -5867,6 +5930,158 @@ async fn verify_delegated_cli_plan(
         &store.paths().cache_dir,
     )
     .await
+}
+
+async fn verify_wrangler_pages_production_deployment(
+    project_name: &str,
+    branch: &str,
+    commit_hash: &str,
+    credential: &AuthCredential,
+    account_id: &str,
+    cache_dir: &Path,
+) -> Value {
+    let mut command = ProcessCommand::new("wrangler");
+    command
+        .args([
+            "pages",
+            "deployment",
+            "list",
+            "--project-name",
+            project_name,
+            "--environment",
+            "production",
+            "--json",
+        ])
+        .env_clear()
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .env("HOME", env::var_os("HOME").unwrap_or_default())
+        .env("NO_COLOR", "1")
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in governed_cli_workspace_env("wrangler", Some(account_id), cache_dir) {
+        command.env(name, value);
+    }
+    match credential {
+        AuthCredential::Bearer { token } => {
+            command.env("CLOUDFLARE_API_TOKEN", token);
+        }
+        AuthCredential::GlobalKey { email, key } => {
+            command
+                .env("CLOUDFLARE_EMAIL", email)
+                .env("CLOUDFLARE_API_KEY", key);
+        }
+    }
+    let output = match tokio::time::timeout(Duration::from_mins(2), command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler Pages deployment verification could not start: {error}"),
+                "project_name": project_name,
+                "branch": branch,
+                "commit_hash": commit_hash,
+            });
+        }
+        Err(_) => {
+            return json!({
+                "passed": false,
+                "basis": "Wrangler Pages deployment verification timed out",
+                "project_name": project_name,
+                "branch": branch,
+                "commit_hash": commit_hash,
+            });
+        }
+    };
+    let stdout = redact_subprocess_text(&String::from_utf8_lossy(&output.stdout), credential);
+    let stderr = redact_subprocess_text(&String::from_utf8_lossy(&output.stderr), credential);
+    if !output.status.success() {
+        return json!({
+            "passed": false,
+            "basis": "Wrangler Pages deployment verification returned a failing exit status",
+            "project_name": project_name,
+            "branch": branch,
+            "commit_hash": commit_hash,
+            "exit_status": output.status.code(),
+            "stdout": stdout,
+            "stderr": stderr,
+        });
+    }
+    let deployments = match serde_json::from_str::<Value>(stdout.trim()) {
+        Ok(deployments) => deployments,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler Pages deployment output was not JSON: {error}"),
+                "project_name": project_name,
+                "branch": branch,
+                "commit_hash": commit_hash,
+                "stdout": stdout,
+                "stderr": stderr,
+            });
+        }
+    };
+    let passed =
+        wrangler_pages_deployment_has_commit(&deployments, project_name, branch, commit_hash);
+    json!({
+        "passed": passed,
+        "basis": if passed {
+            format!("Wrangler Pages production deployment for {project_name} reports successful commit {commit_hash} on branch {branch}")
+        } else {
+            format!("Wrangler Pages production deployments for {project_name} do not report successful commit {commit_hash} on branch {branch}")
+        },
+        "project_name": project_name,
+        "branch": branch,
+        "commit_hash": commit_hash,
+        "readback": deployments,
+        "stderr": stderr,
+    })
+}
+
+fn wrangler_pages_deployment_has_commit(
+    value: &Value,
+    expected_project_name: &str,
+    expected_branch: &str,
+    expected_commit_hash: &str,
+) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(|item| {
+            wrangler_pages_deployment_has_commit(
+                item,
+                expected_project_name,
+                expected_branch,
+                expected_commit_hash,
+            )
+        }),
+        Value::Object(fields) => {
+            let matches = fields.get("project_name").and_then(Value::as_str)
+                == Some(expected_project_name)
+                && fields.get("environment").and_then(Value::as_str) == Some("production")
+                && value
+                    .pointer("/deployment_trigger/metadata/branch")
+                    .and_then(Value::as_str)
+                    == Some(expected_branch)
+                && value
+                    .pointer("/deployment_trigger/metadata/commit_hash")
+                    .and_then(Value::as_str)
+                    == Some(expected_commit_hash)
+                && value
+                    .pointer("/latest_stage/status")
+                    .and_then(Value::as_str)
+                    == Some("success");
+            matches
+                || fields.values().any(|nested| {
+                    wrangler_pages_deployment_has_commit(
+                        nested,
+                        expected_project_name,
+                        expected_branch,
+                        expected_commit_hash,
+                    )
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Wrangler discovers dotenv credentials relative to its process working
@@ -24272,7 +24487,8 @@ mod tests {
         validate_worker_script_secret_semantics, validate_zone_account_receipt_precondition,
         validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
         workspace_operational_proof_posture, workspace_resource_keys, wrangler_config_directory,
-        wrangler_deploy_version_id, wrangler_status_has_promoted_version, zone_target,
+        wrangler_deploy_version_id, wrangler_pages_deployment_has_commit,
+        wrangler_status_has_promoted_version, zone_target,
     };
     use crate::profiles::ProfilesConfig;
     use crate::telemetry_product::record_operational_proof;
@@ -29918,6 +30134,52 @@ mod tests {
         assert!(!wrangler_status_has_promoted_version(
             &promoted,
             "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        ));
+    }
+
+    #[test]
+    fn wrangler_pages_readback_binds_project_branch_commit_and_success() {
+        let deployment = json!([{
+            "project_name": "mlxread-web",
+            "environment": "production",
+            "deployment_trigger": {"metadata": {
+                "branch": "main",
+                "commit_hash": "6372fdc5448afc5d0db90bd9f4dd57eaeb409a7b"
+            }},
+            "latest_stage": {"status": "success"}
+        }]);
+        assert!(wrangler_pages_deployment_has_commit(
+            &deployment,
+            "mlxread-web",
+            "main",
+            "6372fdc5448afc5d0db90bd9f4dd57eaeb409a7b"
+        ));
+        assert!(!wrangler_pages_deployment_has_commit(
+            &deployment,
+            "other-project",
+            "main",
+            "6372fdc5448afc5d0db90bd9f4dd57eaeb409a7b"
+        ));
+        assert!(!wrangler_pages_deployment_has_commit(
+            &deployment,
+            "mlxread-web",
+            "preview",
+            "6372fdc5448afc5d0db90bd9f4dd57eaeb409a7b"
+        ));
+        let failed = json!([{
+            "project_name": "mlxread-web",
+            "environment": "production",
+            "deployment_trigger": {"metadata": {
+                "branch": "main",
+                "commit_hash": "6372fdc5448afc5d0db90bd9f4dd57eaeb409a7b"
+            }},
+            "latest_stage": {"status": "failure"}
+        }]);
+        assert!(!wrangler_pages_deployment_has_commit(
+            &failed,
+            "mlxread-web",
+            "main",
+            "6372fdc5448afc5d0db90bd9f4dd57eaeb409a7b"
         ));
     }
 
