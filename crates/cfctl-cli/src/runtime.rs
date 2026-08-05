@@ -19714,6 +19714,103 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
     reason = "rectification is one no-replay verified-state transition"
 )]
 fn rectify_approved_mln_import(store: &StateStore, plan: &mut PlanV1) -> Result<ResultEnvelopeV2> {
+    if plan.status == PlanStatus::RectificationRequired
+        && plan.transaction_stage == TransactionStageV1::SecretSinkPersisted
+    {
+        let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
+        if checkpoints.len() != 1
+            || checkpoints[0].1.get("step").and_then(Value::as_str) != Some("init_response")
+        {
+            return Err(CliError::Input(
+                "init-only rectification requires exactly one durable init response and no upload, ingest, poll, or provider-complete checkpoint"
+                    .to_owned(),
+            ));
+        }
+        let (init_evidence, checkpoint) = exact_durable_init_response_failure(store, plan)?;
+        let valid_abandoned_session = checkpoint
+            .pointer("/receipt/success")
+            .and_then(Value::as_bool)
+            == Some(true)
+            && checkpoint
+                .pointer("/receipt/result/success")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && checkpoint
+                .pointer("/receipt/result/upload_url_present")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && checkpoint
+                .pointer("/receipt/result/filename_present")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && checkpoint
+                .pointer("/receipt/provider_errors_present")
+                .and_then(Value::as_bool)
+                == Some(false)
+            && checkpoint
+                .pointer("/receipt/result/provider_error_present")
+                .and_then(Value::as_bool)
+                == Some(false)
+            && checkpoint
+                .pointer("/receipt/errors")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            && checkpoint
+                .pointer("/receipt/result/type")
+                .is_some_and(Value::is_null)
+            && checkpoint
+                .pointer("/receipt/result/status")
+                .is_some_and(Value::is_null);
+        if !valid_abandoned_session {
+            return Err(CliError::Input(
+                "init-only rectification requires one successful redacted upload-session receipt; provider rejection or uncertainty remains unresolved"
+                    .to_owned(),
+            ));
+        }
+        persist_transaction_stage(
+            store,
+            plan,
+            TransactionStageV1::VerificationAttemptPersisted,
+        )?;
+        plan.status = PlanStatus::Rectified;
+        let completion = json!({
+            "schema_version":1,
+            "state":"rectified",
+            "operation_id":plan.operation_id,
+            "init_response_evidence_hash":init_evidence.content_hash,
+            "upload_performed":false,
+            "database_write_performed":false,
+            "disposition":"abandoned_unuploaded_provider_init_session",
+        });
+        let verification_evidence =
+            store.write_evidence(EvidenceClass::PostChangeVerification, &completion)?;
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            TransactionStageV1::VerificationResponsePersisted,
+            json!({
+                "state":"passed",
+                "evidence_hash":verification_evidence.content_hash,
+                "init_response_evidence_hash":init_evidence.content_hash,
+            }),
+        )?;
+        persist_transaction_stage(store, plan, TransactionStageV1::Closed)?;
+        let mut envelope = ResultEnvelopeV2::success("plans rectify", completion)
+            .with_evidence(verification_evidence);
+        envelope.evidence.push(init_evidence);
+        envelope.performed = false;
+        envelope.operation_id = Some(plan.operation_id.clone());
+        envelope.capability_id = Some(plan.capability.id.clone());
+        envelope.profile_id = Some(plan.profile_id.clone());
+        envelope.account_id = Some(plan.account_id.clone());
+        envelope.policy_decision = Some(plan.policy.clone());
+        envelope.verification.state = VerificationState::Passed;
+        envelope.verification.basis = Some(
+            "the operation has exactly one durable successful init-session receipt and no upload, ingest, poll, or provider-complete checkpoint; rectification abandoned that unuploaded session without replay or provider mutation"
+                .to_owned(),
+        );
+        return Ok(envelope);
+    }
     if plan.status != PlanStatus::Running
         || plan.transaction_stage != TransactionStageV1::SecretSinkPersisted
     {
@@ -24932,9 +25029,10 @@ mod tests {
         preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
         read_import_secret, read_r2_log_retrieval_credentials, read_secret_file,
-        reconcile_standing_lineage_from_plan, rectify_plan, redact_response_for_capability,
-        redact_secret_payload, redact_secret_result, repair_keychain_access_with_warning,
-        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
+        reconcile_standing_lineage_from_plan, rectify_approved_mln_import, rectify_plan,
+        redact_response_for_capability, redact_secret_payload, redact_secret_result,
+        repair_keychain_access_with_warning, request_body_contains_secret,
+        required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -29189,6 +29287,10 @@ mod tests {
         assert_eq!(init_envelope.result["outcome"], "invalid_provider_response");
         assert_eq!(init_envelope.result["receipt_available"], true);
         assert_ne!(init_plan.status, PlanStatus::Running);
+        assert!(
+            rectify_approved_mln_import(&init_store, &mut init_plan).is_err(),
+            "provider-error init receipts must remain unrectified"
+        );
         for forbidden in ["X-Amz-Signature", "SECRET", "upload_url\":"] {
             assert!(!init_envelope.result.to_string().contains(forbidden));
             assert!(
@@ -29200,6 +29302,80 @@ mod tests {
                     .contains(forbidden)
             );
         }
+
+        let abandoned_root = tempfile::tempdir().expect("abandoned init root");
+        let abandoned_store = StateStore::open(RuntimePaths::from_root(abandoned_root.path()))
+            .expect("abandoned init store");
+        let mut abandoned_plan = build_plan();
+        let abandoned_checkpoint = D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: abandoned_plan.operation_id.clone(),
+            step: "init_response".to_owned(),
+            performed: true,
+            rectification_required: true,
+            receipt: json!({
+                "http_status":200,
+                "success":true,
+                "response_action":"init",
+                "provider":"cloudflare",
+                "effect":"d1_import_response",
+                "migration_id":"0143",
+                "target":{
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                },
+                "plan_input_hash":hash_value(&abandoned_plan.input).expect("input hash"),
+                "result":{
+                    "type":null,
+                    "status":null,
+                    "success":true,
+                    "at_bookmark":null,
+                    "upload_url_present":true,
+                    "upload_url_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "filename_present":true,
+                    "filename_sha256":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "provider_error_present":false,
+                },
+                "errors":[],
+                "provider_errors_present":false,
+                "no_replay":true,
+                "etag_present":false,
+                "etag_sha256":null,
+                "cf_ray":"safe-ray",
+            }),
+        };
+        persist_d1_import_checkpoint(
+            &abandoned_store,
+            &abandoned_plan.operation_id,
+            &abandoned_checkpoint,
+        )
+        .expect("durable abandoned init response");
+        let abandoned_failure = approved_mln_import_execution_error_envelope(
+            &abandoned_store,
+            &mut abandoned_plan,
+            CloudflareError::D1ImportInitResponseFailure,
+            &MemorySecretStore::default(),
+        );
+        assert_eq!(abandoned_failure.result["receipt_available"], true);
+        assert_eq!(
+            abandoned_plan.transaction_stage,
+            TransactionStageV1::SecretSinkPersisted
+        );
+        let rectified = rectify_approved_mln_import(&abandoned_store, &mut abandoned_plan)
+            .expect("rectify abandoned unuploaded session");
+        assert!(rectified.ok);
+        assert!(!rectified.performed);
+        assert_eq!(rectified.result["upload_performed"], false);
+        assert_eq!(rectified.result["database_write_performed"], false);
+        assert_eq!(abandoned_plan.status, PlanStatus::Rectified);
+        assert_eq!(abandoned_plan.transaction_stage, TransactionStageV1::Closed);
+        assert_eq!(
+            abandoned_store
+                .read_d1_import_checkpoints(&abandoned_plan.operation_id)
+                .expect("unchanged abandoned checkpoint set")
+                .len(),
+            1
+        );
 
         for (action, step, error) in [
             (

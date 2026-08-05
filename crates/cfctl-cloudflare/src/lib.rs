@@ -10644,7 +10644,11 @@ fn accepted_d1_import_init_response(response: &CloudflareResponseV1) -> Result<(
         response.result.get("status"),
         response.result.get("success"),
     ];
-    if nested.iter().all(std::option::Option::is_none) {
+    if nested.iter().all(std::option::Option::is_none)
+        || (nested[0].is_none()
+            && nested[1].is_none()
+            && response.result.get("success").and_then(Value::as_bool) == Some(true))
+    {
         return Ok(());
     }
     let valid = response.result.get("type").and_then(Value::as_str) == Some("import")
@@ -11158,6 +11162,14 @@ mod approved_mln_import_tests {
 
         assert!(
             accepted_d1_import_init_response(&response(json!({
+                "filename":"upload.sql",
+                "upload_url":"https://redacted.invalid"
+            })))
+            .is_ok()
+        );
+        assert!(
+            accepted_d1_import_init_response(&response(json!({
+                "success":true,
                 "filename":"upload.sql",
                 "upload_url":"https://redacted.invalid"
             })))
