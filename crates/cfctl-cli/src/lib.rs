@@ -466,7 +466,7 @@ pub struct CallArgs {
     #[arg(
         long,
         value_name = "REVIEWED_MIGRATION_SQL",
-        help = "Plan-creation-only source for the closed approved MLNavigator D1 import"
+        help = "Plan-creation-only source for a closed approved D1 migration import"
     )]
     pub source_file: Option<PathBuf>,
 }

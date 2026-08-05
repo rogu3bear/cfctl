@@ -1971,6 +1971,14 @@ impl CapabilityV1 {
                     && (self.d1_approved_mln_import.is_some()
                         ^ self.d1_approved_mln_import_poll_resume.is_some())
             }
+            "osint_research_migration_schema_marker_is_present" => {
+                self.id == "d1-import-approved-osint-research-migration"
+                    && self.method == "POST"
+                    && self.risk == RiskClass::Irreversible
+                    && self.effect == EffectClass::DataWrite
+                    && self.d1_approved_mln_import.is_some()
+                    && self.d1_approved_mln_import_poll_resume.is_none()
+            }
             "d1_current_bookmark_equals_restore_result_bookmark" => {
                 self.id == "d1-restore-exact-bookmark"
                     && self.method == "POST"
@@ -3002,7 +3010,9 @@ impl CapabilityV1 {
 fn approved_mln_import_recovery_contract_supported(capability: &CapabilityV1) -> bool {
     matches!(
         capability.id.as_str(),
-        "d1-import-approved-mln-migration" | "d1-resume-approved-mln-import-poll"
+        "d1-import-approved-mln-migration"
+            | "d1-import-approved-osint-research-migration"
+            | "d1-resume-approved-mln-import-poll"
     ) && capability.method == "POST"
         && capability.risk == RiskClass::Irreversible
         && capability.effect == EffectClass::DataWrite

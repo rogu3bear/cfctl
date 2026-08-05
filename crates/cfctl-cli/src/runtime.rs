@@ -1777,6 +1777,12 @@ fn normalize_reviewed_mln_repository_id(remote: &str) -> Option<String> {
         | "https://github.com/rogu3bear/mln-web"
         | "git@github.com:rogu3bear/mln-web.git"
         | "git@github.com:rogu3bear/mln-web" => Some("github.com/rogu3bear/mln-web".to_owned()),
+        "https://github.com/rogu3bear/osint-research-center.git"
+        | "https://github.com/rogu3bear/osint-research-center"
+        | "git@github.com:rogu3bear/osint-research-center.git"
+        | "git@github.com:rogu3bear/osint-research-center" => {
+            Some("github.com/rogu3bear/osint-research-center".to_owned())
+        }
         _ => None,
     }
 }
@@ -1785,6 +1791,62 @@ fn required_body_string<'a>(body: &'a Map<String, Value>, field: &str) -> Result
     body.get(field)
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input(format!("approved MLN import requires {field}")))
+}
+
+fn validate_osint_research_recovery_bookmark(
+    store: &StateStore,
+    input: &CallInput,
+    body: &Map<String, Value>,
+    contract: &cfctl_core::D1ApprovedMlnImportContractV1,
+    context: ImportPrerequisiteContext<'_>,
+) -> Result<()> {
+    let evidence_hash = required_body_string(body, "pre_recovery_anchor_evidence_hash")?;
+    let bookmark_hash = required_body_string(body, "pre_recovery_anchor_bookmark_hash")?;
+    let expected_input_hash = hash_value(&serde_json::to_value(CallInput {
+        selectors: input.selectors.clone(),
+        query: json!({}),
+        ..CallInput::default()
+    })?)?;
+    let matches = store
+        .list_operational_proofs()?
+        .into_iter()
+        .filter(|proof| {
+            proof.capability_id == "d1-time-travel-get-bookmark"
+                && proof.catalog_hash == context.catalog_hash
+                && proof.input_hash == expected_input_hash
+                && proof.profile_id.as_deref() == Some(context.profile_id)
+                && proof.account_id.as_deref() == Some(contract.account_id.as_str())
+                && proof.credential_generation_id.as_deref() == context.credential_generation_id
+                && proof.outcome == OperationalProofOutcomeV1::Succeeded
+                && proof.evidence.content_hash == evidence_hash
+                && proof.observed_at < context.before
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(CliError::Input(
+            "OSINT Research import requires exactly one governed current D1 time-travel bookmark read bound to the catalog, request, target, profile, credential generation, evidence, and pre-plan chronology"
+                .to_owned(),
+        ));
+    }
+    let evidence = store.read_evidence_value(evidence_hash)?;
+    let bookmark = evidence
+        .pointer("/result/bookmark")
+        .and_then(Value::as_str)
+        .filter(|bookmark| !bookmark.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "OSINT Research recovery bookmark evidence omitted the exact bookmark".to_owned(),
+            )
+        })?;
+    if evidence.get("status").and_then(Value::as_u64) != Some(200)
+        || evidence.get("success").and_then(Value::as_bool) != Some(true)
+        || hash_value(&Value::String(bookmark.to_owned()))? != bookmark_hash
+    {
+        return Err(CliError::Input(
+            "OSINT Research recovery bookmark evidence or bookmark hash drifted".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[expect(
@@ -1810,6 +1872,10 @@ fn validate_approved_mln_import_prerequisites(
         .get("migration_id")
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("migration_id is missing".to_owned()))?;
+    if capability.id == "d1-import-approved-osint-research-migration" {
+        validate_osint_research_recovery_bookmark(store, input, body, contract, context)?;
+        return Ok(());
+    }
     let pre_operation = body
         .get("pre_recovery_anchor_operation_id")
         .and_then(Value::as_str)
@@ -18145,6 +18211,47 @@ async fn execute_approved_mln_import_plan(
             &error,
             true,
             "the import boundary was crossed but exact durable provider completion was not proven",
+        ));
+    }
+    if plan.capability.id == "d1-import-approved-osint-research-migration" {
+        let verification = match verify_api_plan(
+            store,
+            executor,
+            plan,
+            &response,
+            execution_input,
+            credential,
+        )
+        .await
+        {
+            Ok(verification) => verification,
+            Err(error) => {
+                return Ok(post_boundary_failure_envelope(
+                    plan,
+                    response_value,
+                    Some(apply_evidence),
+                    lineage_evidence,
+                    &error,
+                    true,
+                    "the OSINT Research import completed, but its schema-marker verification could not be persisted",
+                ));
+            }
+        };
+        let finalization: Result<()> =
+            if matches!(plan.status, PlanStatus::Verified | PlanStatus::Failed) {
+                persist_transaction_stage(store, plan, TransactionStageV1::Closed)
+            } else {
+                store.save_plan(plan).map_err(CliError::from)
+            };
+        let finalization_error = finalization.err();
+        return Ok(api_plan_result_envelope(
+            plan,
+            response_value,
+            apply_evidence,
+            lineage_evidence,
+            verification,
+            true,
+            finalization_error.as_ref(),
         ));
     }
     if matches!(

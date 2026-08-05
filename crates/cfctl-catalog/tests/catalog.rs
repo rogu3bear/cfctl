@@ -12895,9 +12895,7 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
         );
     }
     for required in [
-        "pre_recovery_anchor_operation_id",
         "pre_recovery_anchor_evidence_hash",
-        "pre_recovery_anchor_output_sha256",
         "pre_recovery_anchor_bookmark_hash",
     ] {
         assert!(encoded.contains(required), "missing governed `{required}`");
@@ -12910,6 +12908,68 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
             .is_some(),
         "0143 must name the exact bookmark captured by its governed post-0142 export"
     );
+}
+
+#[test]
+fn native_control_overlay_adds_six_closed_osint_research_imports() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .get("d1-import-approved-osint-research-migration")
+        .expect("approved OSINT Research import");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Irreversible);
+    assert_eq!(capability.effect, EffectClass::DataWrite);
+    assert!(capability.mutating);
+    assert_eq!(capability.permissions, ["D1 Write"]);
+    assert_eq!(
+        capability.verification.strategy,
+        "osint_research_migration_schema_marker_is_present"
+    );
+    assert!(capability.verification_contract_supported());
+    assert!(capability.rollback.supported);
+    let contract = capability
+        .d1_approved_mln_import
+        .as_ref()
+        .expect("typed import contract");
+    assert_eq!(contract.account_id, "ca30e922fda7f5578e49873542e4aaca");
+    assert_eq!(contract.database_id, "1c1ce476-73ab-4dd6-a2e2-de0c155ade61");
+    assert_eq!(
+        contract.repository_id,
+        "github.com/rogu3bear/osint-research-center"
+    );
+    assert_eq!(
+        contract.repository_head,
+        "a737e4f88653e93ce16965482681964b5820605b"
+    );
+    assert_eq!(
+        contract
+            .migrations
+            .iter()
+            .map(|migration| migration.migration_id.as_str())
+            .collect::<Vec<_>>(),
+        ["0028", "0029", "0030", "0031", "0032", "0033"]
+    );
+    let encoded = serde_json::to_string(capability).expect("capability JSON");
+    for forbidden in ["\"sql\"", "\"action\"", "\"etag\"", "\"filename\""] {
+        assert!(
+            !encoded.contains(forbidden),
+            "caller/provider control leaked into the closed import: {forbidden}"
+        );
+    }
+    for required in [
+        "pre_recovery_anchor_evidence_hash",
+        "pre_recovery_anchor_bookmark_hash",
+    ] {
+        assert!(encoded.contains(required), "missing governed `{required}`");
+    }
 }
 
 #[test]
