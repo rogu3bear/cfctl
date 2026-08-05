@@ -5706,14 +5706,18 @@ async fn execute_delegated_plan(
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
-    let receipt = run_delegated_cli(
-        &plan.capability,
-        input,
-        credential,
-        Some(&plan.account_id),
-        &store.paths().cache_dir,
-    )
-    .await?;
+    let receipt = if plan.capability.id == "cloudflared.tunnel" {
+        run_quick_tunnel(store, plan, input).await?
+    } else {
+        run_delegated_cli(
+            &plan.capability,
+            input,
+            credential,
+            Some(&plan.account_id),
+            &store.paths().cache_dir,
+        )
+        .await?
+    };
     let success = receipt
         .get("success")
         .and_then(Value::as_bool)
@@ -5842,6 +5846,9 @@ async fn verify_delegated_cli_plan(
     receipt: &Value,
     credential: &AuthCredential,
 ) -> Value {
+    if plan.capability.verification.strategy == "trycloudflare_https_url_reaches_reviewed_origin" {
+        return verify_quick_tunnel_plan(input, receipt).await;
+    }
     if plan.capability.verification.strategy
         == "wrangler_pages_production_deployment_reports_commit_hash"
     {
@@ -6374,6 +6381,365 @@ async fn run_delegated_cli(
             AuthCredential::GlobalKey { .. } => ["CLOUDFLARE_EMAIL", "CLOUDFLARE_API_KEY"].as_slice(),
         },
     }))
+}
+
+async fn run_quick_tunnel(store: &StateStore, plan: &PlanV1, input: &CallInput) -> Result<Value> {
+    let (origin, health_path) = quick_tunnel_request(input)?;
+    let runtime_dir = store
+        .paths()
+        .data_dir
+        .join("quick-tunnels")
+        .join(&plan.operation_id);
+    fs::create_dir_all(&runtime_dir).map_err(|source| CliError::Io {
+        path: runtime_dir.display().to_string(),
+        source,
+    })?;
+    let log_path = runtime_dir.join("cloudflared.log");
+    let mut child = spawn_quick_tunnel_process(&origin, &runtime_dir, &log_path)?;
+    let Some(pid) = child.id() else {
+        return Err(CliError::Input(
+            "cloudflared started without an observable process id".to_owned(),
+        ));
+    };
+    let started_at = Utc::now().to_rfc3339();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+    loop {
+        let log_text = fs::read_to_string(&log_path).unwrap_or_default();
+        if let Some(public_url) = trycloudflare_public_url(&log_text) {
+            return Ok(json!({
+                "adapter": "delegated_cli",
+                "command": "cloudflared tunnel --url [reviewed-loopback-origin]",
+                "success": true,
+                "exit_status": Value::Null,
+                "origin_url": origin,
+                "health_path": health_path,
+                "public_url": public_url,
+                "pid": pid,
+                "started_at": started_at,
+                "log_path": log_path,
+                "credential_environment": [],
+            }));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(json!({
+                    "adapter": "delegated_cli",
+                    "command": "cloudflared tunnel --url [reviewed-loopback-origin]",
+                    "success": false,
+                    "exit_status": status.code(),
+                    "origin_url": origin,
+                    "health_path": health_path,
+                    "pid": pid,
+                    "started_at": started_at,
+                    "log_path": log_path,
+                    "stderr": log_text,
+                    "credential_environment": [],
+                }));
+            }
+            Ok(None) => {}
+            Err(source) => {
+                terminate_quick_tunnel(&mut child).await;
+                return Err(CliError::Io {
+                    path: format!("cloudflared process {pid}"),
+                    source,
+                });
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            terminate_quick_tunnel(&mut child).await;
+            return Ok(json!({
+                "adapter": "delegated_cli",
+                "command": "cloudflared tunnel --url [reviewed-loopback-origin]",
+                "success": false,
+                "exit_status": Value::Null,
+                "origin_url": origin,
+                "health_path": health_path,
+                "pid": pid,
+                "started_at": started_at,
+                "log_path": log_path,
+                "stderr": log_text,
+                "failure": "cloudflared did not report a TryCloudflare URL within 30 seconds",
+                "credential_environment": [],
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn quick_tunnel_request(input: &CallInput) -> Result<(String, Option<String>)> {
+    let origin = input
+        .query
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("quick tunnel requires query control `url`".to_owned()))
+        .and_then(validated_quick_tunnel_origin)?;
+    let health_path = input
+        .query
+        .get("health_path")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    quick_tunnel_verification_url(
+        "https://contract-check.trycloudflare.com",
+        health_path.as_deref(),
+    )?;
+    Ok((origin, health_path))
+}
+
+fn spawn_quick_tunnel_process(
+    origin: &str,
+    runtime_dir: &Path,
+    log_path: &Path,
+) -> Result<tokio::process::Child> {
+    let log = secure_create_new(log_path)?;
+    let stderr = log.try_clone().map_err(|source| CliError::Io {
+        path: log_path.display().to_string(),
+        source,
+    })?;
+    let mut command = ProcessCommand::new("cloudflared");
+    command
+        .args(["tunnel", "--url", origin])
+        .env_clear()
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .env("HOME", runtime_dir)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr));
+    command.spawn().map_err(|source| CliError::Io {
+        path: "cloudflared".to_owned(),
+        source,
+    })
+}
+
+async fn terminate_quick_tunnel(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+fn secure_create_new(path: &Path) -> Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+fn validated_quick_tunnel_origin(raw: &str) -> Result<String> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|error| CliError::Input(format!("invalid quick tunnel origin URL: {error}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(CliError::Input(
+            "quick tunnel origin must use http or https".to_owned(),
+        ));
+    }
+    if !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
+        return Err(CliError::Input(
+            "quick tunnel origin must resolve to explicit loopback".to_owned(),
+        ));
+    }
+    if parsed.port().is_none() {
+        return Err(CliError::Input(
+            "quick tunnel origin must include an explicit port".to_owned(),
+        ));
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(CliError::Input(
+            "quick tunnel origin must not contain credentials, a path, query, or fragment"
+                .to_owned(),
+        ));
+    }
+    Ok(parsed.to_string())
+}
+
+fn trycloudflare_public_url(log: &str) -> Option<String> {
+    log.split_whitespace().find_map(|token| {
+        let candidate = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '|' | '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';'
+            )
+        });
+        let parsed = url::Url::parse(candidate).ok()?;
+        let host = parsed.host_str()?;
+        (parsed.scheme() == "https"
+            && host.ends_with(".trycloudflare.com")
+            && parsed.port().is_none()
+            && parsed.username().is_empty()
+            && parsed.password().is_none())
+        .then(|| candidate.trim_end_matches('/').to_owned())
+    })
+}
+
+fn quick_tunnel_verification_url(public_url: &str, health_path: Option<&str>) -> Result<String> {
+    let mut parsed = url::Url::parse(public_url)
+        .map_err(|error| CliError::Input(format!("invalid TryCloudflare URL: {error}")))?;
+    if parsed.scheme() != "https"
+        || !parsed
+            .host_str()
+            .is_some_and(|host| host.ends_with(".trycloudflare.com"))
+        || parsed.port().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(CliError::Input(
+            "verification URL must be an HTTPS trycloudflare.com subdomain".to_owned(),
+        ));
+    }
+    let path = health_path.unwrap_or("/");
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains('?')
+        || path.contains('#')
+        || path.contains("://")
+    {
+        return Err(CliError::Input(
+            "quick tunnel health_path must be one relative absolute-path reference".to_owned(),
+        ));
+    }
+    parsed.set_path(path);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Ok(parsed.to_string())
+}
+
+async fn verify_quick_tunnel_plan(input: &CallInput, receipt: &Value) -> Value {
+    let context = match quick_tunnel_verification_context(input, receipt) {
+        Ok(context) => context,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": error.to_string(),
+            });
+        }
+    };
+    let (origin, public_url, public_health, local_health, pid) = context;
+    if !quick_tunnel_process_is_alive(pid) {
+        return json!({
+            "passed": false,
+            "basis": "cloudflared process exited before public verification",
+            "public_url": public_url,
+            "pid": pid,
+        });
+    }
+    let client = match http_client() {
+        Ok(client) => client,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": format!("could not construct tunnel verifier: {error}"),
+                "public_url": public_url,
+                "pid": pid,
+            });
+        }
+    };
+    let (local_status, local_body) = match fetch_quick_tunnel_response(&client, &local_health).await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": format!("reviewed local origin verification failed: {error}"),
+                "public_url": public_url,
+                "pid": pid,
+            });
+        }
+    };
+    let (public_status, public_body) =
+        match fetch_quick_tunnel_response(&client, &public_health).await {
+            Ok(response) => response,
+            Err(error) => {
+                return json!({
+                    "passed": false,
+                    "basis": format!("TryCloudflare HTTPS verification failed: {error}"),
+                    "public_url": public_url,
+                    "pid": pid,
+                });
+            }
+        };
+    let bodies_match = local_body == public_body;
+    let passed = (200..300).contains(&local_status)
+        && local_status == public_status
+        && bodies_match
+        && quick_tunnel_process_is_alive(pid);
+    json!({
+        "passed": passed,
+        "basis": if passed {
+            "the recorded cloudflared process is alive and the public HTTPS verification response matches the reviewed loopback origin"
+        } else {
+            "public TryCloudflare response did not match the reviewed loopback origin"
+        },
+        "public_url": public_url,
+        "verification_url": public_health,
+        "origin_url": origin,
+        "origin_verification_url": local_health,
+        "pid": pid,
+        "local_status": local_status,
+        "public_status": public_status,
+        "response_body_match": bodies_match,
+    })
+}
+
+fn quick_tunnel_verification_context(
+    input: &CallInput,
+    receipt: &Value,
+) -> Result<(String, String, String, String, u64)> {
+    let public_url = receipt
+        .get("public_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("cloudflared did not report a public URL".to_owned()))?
+        .to_owned();
+    let pid = receipt
+        .get("pid")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CliError::Input("cloudflared did not report a process id".to_owned()))?;
+    let (origin, health_path) = quick_tunnel_request(input)?;
+    if receipt.get("origin_url").and_then(Value::as_str) != Some(origin.as_str()) {
+        return Err(CliError::Input(
+            "cloudflared receipt origin does not match the reviewed plan origin".to_owned(),
+        ));
+    }
+    let public_health = quick_tunnel_verification_url(&public_url, health_path.as_deref())?;
+    let local_health = url::Url::parse(&origin)
+        .and_then(|base| base.join(health_path.as_deref().unwrap_or("/")))
+        .map_err(|error| {
+            CliError::Input(format!(
+                "could not build reviewed local verification URL: {error}"
+            ))
+        })?
+        .to_string();
+    Ok((origin, public_url, public_health, local_health, pid))
+}
+
+async fn fetch_quick_tunnel_response(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(u16, Vec<u8>)> {
+    let response = client.get(url).send().await?;
+    let status = response.status().as_u16();
+    let body = response.bytes().await?.to_vec();
+    Ok((status, body))
+}
+
+fn quick_tunnel_process_is_alive(pid: u64) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    StdCommand::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Environment that must survive cfctl's fail-closed `env_clear()` boundary
@@ -38812,6 +39178,68 @@ mod tests {
         assert!(envelope.performed);
         assert_eq!(envelope.capability_id.as_deref(), Some("delegated.read"));
         assert_eq!(envelope.evidence[0].class, EvidenceClass::LiveRead);
+    }
+
+    #[test]
+    fn quick_tunnel_origin_is_loopback_and_port_bound() {
+        assert_eq!(
+            super::validated_quick_tunnel_origin("http://127.0.0.1:3300").expect("loopback origin"),
+            "http://127.0.0.1:3300/"
+        );
+        assert_eq!(
+            super::validated_quick_tunnel_origin("http://localhost:3300")
+                .expect("localhost origin"),
+            "http://localhost:3300/"
+        );
+        assert!(super::validated_quick_tunnel_origin("https://example.com").is_err());
+        assert!(super::validated_quick_tunnel_origin("http://127.0.0.1").is_err());
+        assert!(super::validated_quick_tunnel_origin("file:///tmp/socket").is_err());
+    }
+
+    #[test]
+    fn quick_tunnel_public_url_is_extracted_only_from_trycloudflare_https() {
+        let log = concat!(
+            "INF Requesting new quick Tunnel on trycloudflare.com...\n",
+            "INF +------------------------------------------------------------+\n",
+            "INF |  https://quiet-river-123.trycloudflare.com                 |\n",
+        );
+        assert_eq!(
+            super::trycloudflare_public_url(log).as_deref(),
+            Some("https://quiet-river-123.trycloudflare.com")
+        );
+        assert!(super::trycloudflare_public_url("https://example.com").is_none());
+        assert!(super::trycloudflare_public_url("http://quiet-river.trycloudflare.com").is_none());
+    }
+
+    #[test]
+    fn quick_tunnel_health_url_accepts_only_a_relative_path() {
+        assert_eq!(
+            super::quick_tunnel_verification_url(
+                "https://quiet-river.trycloudflare.com",
+                Some("/healthz")
+            )
+            .expect("health URL"),
+            "https://quiet-river.trycloudflare.com/healthz"
+        );
+        assert_eq!(
+            super::quick_tunnel_verification_url("https://quiet-river.trycloudflare.com", None)
+                .expect("default URL"),
+            "https://quiet-river.trycloudflare.com/"
+        );
+        assert!(
+            super::quick_tunnel_verification_url(
+                "https://quiet-river.trycloudflare.com",
+                Some("https://example.com")
+            )
+            .is_err()
+        );
+        assert!(
+            super::quick_tunnel_verification_url(
+                "https://quiet-river.trycloudflare.com",
+                Some("//example.com")
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -2227,6 +2227,56 @@ fn pages_domain_create_binds_exact_readback_and_reviewed_delete_compensation() {
 }
 
 #[test]
+fn cloudflared_quick_tunnel_has_a_closed_publication_contract() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    ingest_cli_help(
+        &mut snapshot,
+        "cloudflared",
+        "2026.7.3",
+        "COMMANDS:\n  tunnel  Use Cloudflare Tunnel to expose private services\n",
+    );
+    let tunnel = snapshot
+        .get("cloudflared.tunnel")
+        .expect("quick tunnel capability");
+
+    assert_eq!(tunnel.adapter_status, AdapterStatus::DelegatedCli);
+    assert!(tunnel.mutating);
+    assert_eq!(tunnel.risk, RiskClass::ExternalCommunication);
+    assert_eq!(tunnel.effect, EffectClass::ExternalCommunication);
+    assert!(tunnel.cost.known);
+    assert!(!tunnel.cost.incremental);
+    assert_eq!(tunnel.cost.maximum, Some(0.0));
+    assert_eq!(tunnel.entitlement.available, Some(true));
+    assert_eq!(
+        tunnel.verification.strategy,
+        "trycloudflare_https_url_reaches_reviewed_origin"
+    );
+    assert!(tunnel.verification_contract_supported());
+    assert!(tunnel.mutation_contract_gaps().is_empty());
+    assert!(tunnel.selectors.iter().any(|selector| {
+        selector.name == "url" && selector.location == "query" && selector.required
+    }));
+    assert!(tunnel.selectors.iter().any(|selector| {
+        selector.name == "health_path" && selector.location == "query" && !selector.required
+    }));
+    assert!(
+        tunnel
+            .cost
+            .references
+            .iter()
+            .any(|reference| reference.url.contains("/trycloudflare/"))
+    );
+    assert!(!tunnel.rollback.supported);
+    assert!(
+        tunnel
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("recorded cloudflared process"))
+    );
+}
+
+#[test]
 fn sqlite_index_is_rebuildable_from_the_authoritative_snapshot() {
     let snapshot = normalize_openapi(&fixture()).expect("catalog");
     let root = tempfile::tempdir().expect("temp catalog");

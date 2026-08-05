@@ -2221,6 +2221,26 @@ impl CapabilityV1 {
                             })
                         })
             }
+            "trycloudflare_https_url_reaches_reviewed_origin" => {
+                self.id == "cloudflared.tunnel"
+                    && self.method == "CLI"
+                    && self.path == "cloudflared tunnel"
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && self.risk == RiskClass::ExternalCommunication
+                    && self.effect == EffectClass::ExternalCommunication
+                    && self.selectors.iter().any(|selector| {
+                        selector.name == "url"
+                            && selector.location == "query"
+                            && selector.required
+                            && selector.value_type == "string"
+                    })
+                    && self.selectors.iter().any(|selector| {
+                        selector.name == "health_path"
+                            && selector.location == "query"
+                            && !selector.required
+                            && selector.value_type == "string"
+                    })
+            }
             // The Email Routing enable/disable toggles have no same-path
             // readback of a resource, so verification asserts the toggle's own
             // `result.enabled` boolean in the settings object the action

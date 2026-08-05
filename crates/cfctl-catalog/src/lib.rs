@@ -1628,10 +1628,14 @@ pub fn ingest_wrangler_pages_deploy_help(
 }
 
 fn classify_delegated_cli_capability(capability: &mut CapabilityV1) {
-    if capability.id != "wrangler.deploy" {
-        return;
+    match capability.id.as_str() {
+        "wrangler.deploy" => classify_wrangler_deploy_capability(capability),
+        "cloudflared.tunnel" => classify_cloudflared_quick_tunnel_capability(capability),
+        _ => {}
     }
+}
 
+fn classify_wrangler_deploy_capability(capability: &mut CapabilityV1) {
     capability.risk = RiskClass::CrossConfig;
     capability.effect = EffectClass::ReversibleWrite;
     capability.cost.known = true;
@@ -1671,6 +1675,66 @@ fn classify_delegated_cli_capability(capability: &mut CapabilityV1) {
             required: false,
             value_type: "string".to_owned(),
             description: Some("One deploy-time Worker variable in KEY:VALUE form".to_owned()),
+            contract: None,
+        },
+    ];
+}
+
+fn classify_cloudflared_quick_tunnel_capability(capability: &mut CapabilityV1) {
+    "Start a temporary TryCloudflare Quick Tunnel to a loopback web server"
+        .clone_into(&mut capability.title);
+    capability.description = Some(
+        "Publishes one reviewed loopback HTTP origin at a random trycloudflare.com URL for development and testing only"
+            .to_owned(),
+    );
+    capability.risk = RiskClass::ExternalCommunication;
+    capability.effect = EffectClass::ExternalCommunication;
+    capability.maturity = Maturity::Experimental;
+    capability.entitlement.available = Some(true);
+    capability.entitlement.source = Some(
+        "Cloudflare documents TryCloudflare Quick Tunnels as free and available without adding a site to Cloudflare DNS"
+            .to_owned(),
+    );
+    capability.cost.known = true;
+    capability.cost.incremental = false;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.exposure = CostExposureV1::None;
+    capability.cost.basis =
+        Some("Cloudflare documents TryCloudflare Quick Tunnels as free".to_owned());
+    capability.cost.references = vec![KnowledgeReferenceV1 {
+        title: "Cloudflare Quick Tunnels".to_owned(),
+        url: "https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/".to_owned(),
+        source: "official Cloudflare docs".to_owned(),
+    }];
+    capability.verification.required = true;
+    "trycloudflare_https_url_reaches_reviewed_origin"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = false;
+    capability.rollback.warning = Some(
+        "stopping the recorded cloudflared process removes the temporary public URL; automatic process termination is not yet implemented and shutdown must be separately confirmed"
+            .to_owned(),
+    );
+    capability.selectors = vec![
+        SelectorV1 {
+            name: "url".to_owned(),
+            location: "query".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some(
+                "Loopback HTTP origin with an explicit port, for example http://127.0.0.1:3300"
+                    .to_owned(),
+            ),
+            contract: None,
+        },
+        SelectorV1 {
+            name: "health_path".to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            value_type: "string".to_owned(),
+            description: Some(
+                "Relative public path used for post-start HTTP verification; defaults to /"
+                    .to_owned(),
+            ),
             contract: None,
         },
     ];
