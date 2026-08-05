@@ -3,8 +3,8 @@
 use cfctl_catalog::{
     CatalogChangeKind, CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1,
     attach_official_product_knowledge, ingest_cli_help, ingest_native_control_capabilities,
-    ingest_telemetry_capabilities, ingest_wrangler_pages_deploy_help, markdown_link,
-    markdown_links, normalize_openapi,
+    ingest_telemetry_capabilities, ingest_wrangler_pages_deploy_help,
+    ingest_wrangler_worker_versions_help, markdown_link, markdown_links, normalize_openapi,
 };
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryKindV1, BillingModelV1, CapabilityV1, CostExposureV1,
@@ -2187,6 +2187,63 @@ fn exact_wrangler_pages_deploy_help_becomes_a_governed_upload() {
         "wrangler pages deploy [directory]\nOPTIONS\n  --project-name\n",
     );
     assert!(unsupported.get("wrangler.pages-deploy").is_none());
+}
+
+#[test]
+fn exact_wrangler_worker_versions_help_governs_upload_and_promotion_separately() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    ingest_wrangler_worker_versions_help(
+        &mut snapshot,
+        "4.107.0",
+        "wrangler versions upload [path]\nOPTIONS\n  --config\n  --message\n  --name\n",
+        "wrangler versions deploy [version-specs..]\nOPTIONS\n  --config\n  --message\n  --yes\n  --name\n",
+    );
+
+    let upload = snapshot
+        .get("wrangler.versions-upload")
+        .expect("versions upload capability");
+    assert_eq!(upload.path, "wrangler versions upload");
+    assert_eq!(upload.adapter_status, AdapterStatus::DelegatedCli);
+    assert_eq!(upload.effect, EffectClass::ReversibleWrite);
+    assert_eq!(upload.cost.maximum, Some(0.0));
+    assert_eq!(
+        upload.verification.strategy,
+        "wrangler_worker_version_reports_expected_message"
+    );
+    assert!(upload.verification_contract_supported());
+    assert!(upload.mutation_contract_gaps().is_empty());
+    for name in ["config", "message"] {
+        assert!(upload.selectors.iter().any(|selector| {
+            selector.name == name && selector.location == "query" && selector.required
+        }));
+    }
+
+    let deploy = snapshot
+        .get("wrangler.versions-deploy")
+        .expect("versions deploy capability");
+    assert_eq!(deploy.path, "wrangler versions deploy --yes");
+    assert_eq!(deploy.adapter_status, AdapterStatus::DelegatedCli);
+    assert_eq!(
+        deploy.verification.strategy,
+        "wrangler_worker_versions_deployment_reports_expected_traffic"
+    );
+    assert!(deploy.verification_contract_supported());
+    assert!(deploy.mutation_contract_gaps().is_empty());
+    for name in ["argument", "config", "message"] {
+        assert!(deploy.selectors.iter().any(|selector| {
+            selector.name == name && selector.location == "query" && selector.required
+        }));
+    }
+
+    let mut unsupported = normalize_openapi(&fixture()).expect("catalog");
+    ingest_wrangler_worker_versions_help(
+        &mut unsupported,
+        "4.107.0",
+        "wrangler versions upload [path]\nOPTIONS\n  --config\n",
+        "wrangler versions deploy [version-specs..]\nOPTIONS\n  --config\n  --message\n",
+    );
+    assert!(unsupported.get("wrangler.versions-upload").is_none());
+    assert!(unsupported.get("wrangler.versions-deploy").is_none());
 }
 
 #[test]

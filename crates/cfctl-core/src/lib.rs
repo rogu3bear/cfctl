@@ -2221,6 +2221,34 @@ impl CapabilityV1 {
                             })
                         })
             }
+            "wrangler_worker_version_reports_expected_message" => {
+                self.id == "wrangler.versions-upload"
+                    && self.method == "CLI"
+                    && self.path == "wrangler versions upload"
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && ["config", "message"].iter().all(|name| {
+                        self.selectors.iter().any(|selector| {
+                            selector.name == *name
+                                && selector.location == "query"
+                                && selector.required
+                                && selector.value_type == "string"
+                        })
+                    })
+            }
+            "wrangler_worker_versions_deployment_reports_expected_traffic" => {
+                self.id == "wrangler.versions-deploy"
+                    && self.method == "CLI"
+                    && self.path == "wrangler versions deploy --yes"
+                    && self.adapter_status == AdapterStatus::DelegatedCli
+                    && ["argument", "config", "message"].iter().all(|name| {
+                        self.selectors.iter().any(|selector| {
+                            selector.name == *name
+                                && selector.location == "query"
+                                && selector.required
+                                && selector.value_type == "string"
+                        })
+                    })
+            }
             "trycloudflare_https_url_reaches_reviewed_origin" => {
                 self.id == "cloudflared.tunnel"
                     && self.method == "CLI"

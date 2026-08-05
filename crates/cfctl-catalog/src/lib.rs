@@ -1627,6 +1627,165 @@ pub fn ingest_wrangler_pages_deploy_help(
         .insert(capability.id.clone(), capability);
 }
 
+/// Add the two exact Worker Versions mutation commands only when the installed
+/// Wrangler help proves the command shapes and every control cfctl relies on.
+/// Keeping upload and traffic promotion separate lets operators review the
+/// inert artifact before granting a second authority to serve it.
+pub fn ingest_wrangler_worker_versions_help(
+    snapshot: &mut CatalogSnapshot,
+    version: &str,
+    upload_help: &str,
+    deploy_help: &str,
+) {
+    ingest_wrangler_versions_upload_help(snapshot, version, upload_help);
+    ingest_wrangler_versions_deploy_help(snapshot, version, deploy_help);
+}
+
+fn ingest_wrangler_versions_upload_help(
+    snapshot: &mut CatalogSnapshot,
+    version: &str,
+    upload_help: &str,
+) {
+    if ["wrangler versions upload [path]", "--config", "--message"]
+        .iter()
+        .all(|marker| upload_help.contains(marker))
+    {
+        let mut capability = CapabilityV1::new(
+            "wrangler.versions-upload",
+            "Upload an inert Cloudflare Worker version",
+            "POST",
+            "wrangler versions upload",
+        );
+        capability.source = format!("wrangler {version} versions upload help");
+        "CLI".clone_into(&mut capability.method);
+        "Cloudflare Workers".clone_into(&mut capability.product);
+        classify_wrangler_worker_versions_capability(&mut capability);
+        "wrangler_worker_version_reports_expected_message"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.warning = Some(
+            "the uploaded version is inert until separately promoted; automatic deletion of an uploaded version is not implemented"
+                .to_owned(),
+        );
+        capability.selectors = [
+            (
+                "config",
+                true,
+                "Absolute path to the reviewed Wrangler configuration",
+            ),
+            (
+                "message",
+                true,
+                "Reviewed source identity recorded on and verified against the uploaded version",
+            ),
+            (
+                "argument",
+                false,
+                "Optional Worker entry path resolved from the reviewed config directory",
+            ),
+            ("name", false, "Optional Worker name override"),
+        ]
+        .into_iter()
+        .map(|(name, required, description)| SelectorV1 {
+            name: name.to_owned(),
+            location: "query".to_owned(),
+            required,
+            value_type: "string".to_owned(),
+            description: Some(description.to_owned()),
+            contract: None,
+        })
+        .collect();
+        snapshot
+            .capabilities
+            .insert(capability.id.clone(), capability);
+    }
+}
+
+fn ingest_wrangler_versions_deploy_help(
+    snapshot: &mut CatalogSnapshot,
+    version: &str,
+    deploy_help: &str,
+) {
+    if [
+        "wrangler versions deploy [version-specs..]",
+        "--config",
+        "--message",
+        "--yes",
+    ]
+    .iter()
+    .all(|marker| deploy_help.contains(marker))
+    {
+        let mut capability = CapabilityV1::new(
+            "wrangler.versions-deploy",
+            "Promote one Cloudflare Worker version to all production traffic",
+            "POST",
+            "wrangler versions deploy --yes",
+        );
+        capability.source = format!("wrangler {version} versions deploy help");
+        "CLI".clone_into(&mut capability.method);
+        "Cloudflare Workers".clone_into(&mut capability.product);
+        classify_wrangler_worker_versions_capability(&mut capability);
+        "wrangler_worker_versions_deployment_reports_expected_traffic"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.warning = Some(
+            "rollback requires a separate reviewed versions-deploy plan that targets a known prior version at 100 percent"
+                .to_owned(),
+        );
+        capability.selectors = [
+            (
+                "argument",
+                true,
+                "Exactly one reviewed Worker version in UUID@100 form",
+            ),
+            (
+                "config",
+                true,
+                "Absolute path to the reviewed Wrangler configuration",
+            ),
+            (
+                "message",
+                true,
+                "Reviewed deployment reason recorded by Wrangler",
+            ),
+            ("name", false, "Optional Worker name override"),
+        ]
+        .into_iter()
+        .map(|(name, required, description)| SelectorV1 {
+            name: name.to_owned(),
+            location: "query".to_owned(),
+            required,
+            value_type: "string".to_owned(),
+            description: Some(description.to_owned()),
+            contract: None,
+        })
+        .collect();
+        snapshot
+            .capabilities
+            .insert(capability.id.clone(), capability);
+    }
+}
+
+fn classify_wrangler_worker_versions_capability(capability: &mut CapabilityV1) {
+    capability.adapter_status = AdapterStatus::DelegatedCli;
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost.known = true;
+    capability.cost.incremental = false;
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.basis = Some(
+        "creating or promoting a Worker version has no direct per-operation charge; a promoted Worker can create plan-specific downstream usage"
+            .to_owned(),
+    );
+    capability.cost.references = vec![KnowledgeReferenceV1 {
+        title: "Cloudflare Workers pricing".to_owned(),
+        url: "https://developers.cloudflare.com/workers/platform/pricing/".to_owned(),
+        source: "official Cloudflare docs".to_owned(),
+    }];
+    capability.verification.required = true;
+    capability.rollback.supported = false;
+}
+
 fn classify_delegated_cli_capability(capability: &mut CapabilityV1) {
     match capability.id.as_str() {
         "wrangler.deploy" => classify_wrangler_deploy_capability(capability),
