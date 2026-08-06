@@ -2649,12 +2649,22 @@ impl Executor {
                 return Err(error);
             }
         };
-        let Ok(init_fields) = classify_d1_import_init_response(&init, contract) else {
-            plan.status = PlanStatus::RectificationRequired;
-            persist_import_response(&mut persist, plan, "init_response", &init, None)?;
-            return Err(CloudflareError::D1ImportInitResponseFailure);
+        let init_fields = match classify_d1_import_init_response(&init, contract) {
+            Ok(fields) => fields,
+            Err(rejection) => {
+                plan.status = PlanStatus::RectificationRequired;
+                persist_import_response(
+                    &mut persist,
+                    plan,
+                    "init_response",
+                    &init,
+                    None,
+                    Some(rejection.receipt_label()),
+                )?;
+                return Err(CloudflareError::D1ImportInitResponseFailure);
+            }
         };
-        persist_import_response(&mut persist, plan, "init_response", &init, None)?;
+        persist_import_response(&mut persist, plan, "init_response", &init, None, None)?;
         let upload_url = init_fields.upload_url;
         let filename = init_fields.filename;
         let Ok((upload_status, upload_headers)) = bounded_d1_import_upload(
@@ -2757,10 +2767,10 @@ impl Executor {
         };
         let Ok(at_bookmark) = classify_d1_import_ingest_response(&ingest) else {
             plan.status = PlanStatus::RectificationRequired;
-            persist_import_response(&mut persist, plan, "ingest_response", &ingest, None)?;
+            persist_import_response(&mut persist, plan, "ingest_response", &ingest, None, None)?;
             return Err(CloudflareError::D1ImportIngestResponseFailure);
         };
-        persist_import_response(&mut persist, plan, "ingest_response", &ingest, None)?;
+        persist_import_response(&mut persist, plan, "ingest_response", &ingest, None, None)?;
         for attempt in 1..=contract.max_poll_attempts {
             let poll = match send_provider(serde_json::json!({
                 "action":"poll",
@@ -2787,6 +2797,7 @@ impl Executor {
                     &format!("poll_response_{attempt}"),
                     &poll,
                     None,
+                    None,
                 )?;
                 return Err(CloudflareError::D1ImportPollResponseFailure);
             };
@@ -2795,6 +2806,7 @@ impl Executor {
                 plan,
                 &format!("poll_response_{attempt}"),
                 &poll,
+                None,
                 None,
             )?;
             match poll_outcome {
@@ -2935,6 +2947,7 @@ impl Executor {
                 plan,
                 &format!("poll_response_{attempt}"),
                 &poll,
+                None,
                 None,
             )?;
             let Ok(outcome) = outcome else {
@@ -10763,15 +10776,45 @@ fn import_provider_capability(import: &CapabilityV1) -> CapabilityV1 {
     provider
 }
 
+#[cfg(test)]
 fn validate_d1_import_upload_url(
     raw: &str,
     contract: &D1ApprovedMlnImportContractV1,
 ) -> Result<Url> {
+    classify_d1_import_upload_url(raw, contract).map_err(|rejection| {
+        CloudflareError::InvalidRequestBody(rejection.provider_message().to_owned())
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum D1ImportUploadUrlRejection {
+    AuthorityOrShape,
+    Signature,
+}
+
+#[cfg(test)]
+impl D1ImportUploadUrlRejection {
+    const fn provider_message(self) -> &'static str {
+        match self {
+            Self::AuthorityOrShape => {
+                "D1 import upload URL is not an exact account-owned R2 presigned HTTPS PUT URL"
+            }
+            Self::Signature => {
+                "D1 import upload URL has an unsupported presigned signature contract"
+            }
+        }
+    }
+}
+
+fn classify_d1_import_upload_url(
+    raw: &str,
+    contract: &D1ApprovedMlnImportContractV1,
+) -> std::result::Result<Url, D1ImportUploadUrlRejection> {
     let raw_authority = raw
         .split_once("://")
         .map(|(_, remainder)| remainder.split(['/', '?', '#']).next().unwrap_or_default())
         .unwrap_or_default();
-    let url = Url::parse(raw)?;
+    let url = Url::parse(raw).map_err(|_| D1ImportUploadUrlRejection::AuthorityOrShape)?;
     let host = url.host_str().unwrap_or_default();
     let expected_host = format!("{}{}", contract.account_id, contract.upload_url_suffix);
     let required_query_keys = [
@@ -10801,10 +10844,7 @@ fn validate_d1_import_upload_url(
             matching.len() != 1 || matching[0].1.is_empty()
         })
     {
-        return Err(CloudflareError::InvalidRequestBody(
-            "D1 import upload URL is not an exact account-owned R2 presigned HTTPS PUT URL"
-                .to_owned(),
-        ));
+        return Err(D1ImportUploadUrlRejection::AuthorityOrShape);
     }
     let query_value = |name: &str| {
         query_pairs
@@ -10819,9 +10859,7 @@ fn validate_d1_import_upload_url(
         || signature.len() != 64
         || !signature.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        return Err(CloudflareError::InvalidRequestBody(
-            "D1 import upload URL has an unsupported presigned signature contract".to_owned(),
-        ));
+        return Err(D1ImportUploadUrlRejection::Signature);
     }
     Ok(url)
 }
@@ -10959,17 +10997,44 @@ fn accepted_d1_import_init_response(response: &CloudflareResponseV1) -> Result<(
     }
 }
 
+#[derive(Debug)]
 struct AcceptedD1ImportInit {
     filename: String,
     upload_url: Url,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum D1ImportInitRejection {
+    TopLevel,
+    NestedState,
+    Filename,
+    UploadUrlMissingOrNonString,
+    UploadUrlAuthorityOrShape,
+    UploadUrlSignature,
+}
+
+impl D1ImportInitRejection {
+    const fn receipt_label(self) -> &'static str {
+        match self {
+            Self::TopLevel => "top_level_rejected",
+            Self::NestedState => "nested_state_rejected",
+            Self::Filename => "filename_rejected",
+            Self::UploadUrlMissingOrNonString => "upload_url_missing_or_non_string",
+            Self::UploadUrlAuthorityOrShape => "upload_url_authority_or_shape_rejected",
+            Self::UploadUrlSignature => "upload_url_signature_rejected",
+        }
+    }
+}
+
 fn classify_d1_import_init_response(
     response: &CloudflareResponseV1,
     contract: &D1ApprovedMlnImportContractV1,
-) -> std::result::Result<AcceptedD1ImportInit, ()> {
-    if !response.success || accepted_d1_import_init_response(response).is_err() {
-        return Err(());
+) -> std::result::Result<AcceptedD1ImportInit, D1ImportInitRejection> {
+    if !response.success {
+        return Err(D1ImportInitRejection::TopLevel);
+    }
+    if accepted_d1_import_init_response(response).is_err() {
+        return Err(D1ImportInitRejection::NestedState);
     }
     let filename = response
         .result
@@ -10984,14 +11049,21 @@ fn classify_d1_import_init_response(
                 && !value.starts_with('.')
                 && !value.ends_with('.')
         })
-        .ok_or(())?
+        .ok_or(D1ImportInitRejection::Filename)?
         .to_owned();
     let upload_url_raw = response
         .result
         .get("upload_url")
         .and_then(Value::as_str)
-        .ok_or(())?;
-    let upload_url = validate_d1_import_upload_url(upload_url_raw, contract).map_err(|_| ())?;
+        .ok_or(D1ImportInitRejection::UploadUrlMissingOrNonString)?;
+    let upload_url = classify_d1_import_upload_url(upload_url_raw, contract).map_err(
+        |rejection| match rejection {
+            D1ImportUploadUrlRejection::AuthorityOrShape => {
+                D1ImportInitRejection::UploadUrlAuthorityOrShape
+            }
+            D1ImportUploadUrlRejection::Signature => D1ImportInitRejection::UploadUrlSignature,
+        },
+    )?;
     Ok(AcceptedD1ImportInit {
         filename,
         upload_url,
@@ -11109,6 +11181,7 @@ fn persist_import_response<F>(
     step: &str,
     response: &CloudflareResponseV1,
     replacement_result: Option<Value>,
+    init_classification_failure: Option<&str>,
 ) -> Result<()>
 where
     F: FnMut(&D1ImportCheckpointV1) -> std::result::Result<(), String>,
@@ -11137,6 +11210,7 @@ where
             "filename_present":filename.is_some(),
             "filename_sha256":filename.map(|value| format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))),
             "provider_error_present":response.result.get("error").is_some(),
+            "cfctl_classification_failure":init_classification_failure,
         })
     } else {
         let source = replacement_result.as_ref().unwrap_or(&response.result);
@@ -11248,11 +11322,12 @@ where
 #[allow(clippy::expect_used)]
 mod approved_mln_import_tests {
     use super::{
-        CloudflareError, D1ImportPollOutcome, accepted_d1_import_ingest_response,
-        accepted_d1_import_init_response, accepted_d1_import_poll_outcome,
-        bounded_d1_import_upload, classify_d1_import_ingest_response,
-        classify_d1_import_init_response, classify_d1_import_poll_response, parse_response,
-        persist_import_response, persist_import_uncertainty, validate_d1_import_poll_response,
+        CloudflareError, D1ImportInitRejection, D1ImportPollOutcome,
+        accepted_d1_import_ingest_response, accepted_d1_import_init_response,
+        accepted_d1_import_poll_outcome, bounded_d1_import_upload,
+        classify_d1_import_ingest_response, classify_d1_import_init_response,
+        classify_d1_import_poll_response, parse_response, persist_import_response,
+        persist_import_uncertainty, validate_d1_import_poll_response,
         validate_d1_import_upload_url, validated_d1_import_upload_etag,
     };
     use cfctl_core::{CapabilityV1, D1ApprovedMlnImportContractV1, PlanStatus, PlanV1};
@@ -11512,6 +11587,51 @@ mod approved_mln_import_tests {
         assert_eq!(accepted.filename, "upload.sql");
         assert_eq!(accepted.upload_url.scheme(), "https");
 
+        let signature_rejected_url = valid_url.replace("AWS4-HMAC-SHA256", "unsupported");
+        for (result, expected) in [
+            (
+                json!({"filename":"upload.sql"}),
+                D1ImportInitRejection::UploadUrlMissingOrNonString,
+            ),
+            (
+                json!({"filename":"upload.sql","upload_url":7}),
+                D1ImportInitRejection::UploadUrlMissingOrNonString,
+            ),
+            (
+                json!({"filename":"upload.sql","upload_url":"https://example.com/object"}),
+                D1ImportInitRejection::UploadUrlAuthorityOrShape,
+            ),
+            (
+                json!({"filename":"upload.sql","upload_url":signature_rejected_url}),
+                D1ImportInitRejection::UploadUrlSignature,
+            ),
+            (
+                json!({"upload_url":valid_url}),
+                D1ImportInitRejection::Filename,
+            ),
+            (
+                json!({"type":"import","status":"unsupported","success":true,"filename":"upload.sql","upload_url":valid_url}),
+                D1ImportInitRejection::NestedState,
+            ),
+        ] {
+            assert_eq!(
+                classify_d1_import_init_response(&response(true, result), &contract)
+                    .expect_err("rejected init shape"),
+                expected
+            );
+        }
+        assert_eq!(
+            classify_d1_import_init_response(
+                &response(
+                    false,
+                    json!({"filename":"upload.sql","upload_url":valid_url})
+                ),
+                &contract
+            )
+            .expect_err("rejected top-level response"),
+            D1ImportInitRejection::TopLevel
+        );
+
         let invalid_results = [
             json!({"filename":"upload.sql"}),
             json!({"filename":"upload.sql","upload_url":7}),
@@ -11663,6 +11783,7 @@ mod approved_mln_import_tests {
             "init_response",
             &malformed_init,
             None,
+            Some("nested_state_rejected"),
         )
         .expect("redacted init receipt");
         let checkpoint = &checkpoints[0];
@@ -11672,6 +11793,10 @@ mod approved_mln_import_tests {
         assert_eq!(checkpoint["receipt"]["no_replay"], true);
         assert_eq!(checkpoint["receipt"]["result"]["upload_url_present"], true);
         assert_eq!(checkpoint["receipt"]["result"]["filename_present"], true);
+        assert_eq!(
+            checkpoint["receipt"]["result"]["cfctl_classification_failure"],
+            "nested_state_rejected"
+        );
         let durable = checkpoint.to_string();
         for forbidden in [
             "X-Amz-Signature",
@@ -11710,6 +11835,7 @@ mod approved_mln_import_tests {
                 &plan,
                 step,
                 &response,
+                None,
                 None,
             )
             .expect("projected action receipt");
