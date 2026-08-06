@@ -56,6 +56,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::process::Command as ProcessCommand;
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -11436,7 +11437,11 @@ fn persist_prepared_plan(
         .insert("request_input".to_owned(), hash_value(&plan.input)?);
     bind_live_plan_preconditions(&mut plan, &live_preconditions)?;
     plan.precondition_hashes
-        .extend(workspace_precondition_hashes(store)?);
+        .extend(workspace_precondition_hashes_for_scope(
+            store,
+            &impact.affected_repositories,
+            &impact.local_artifact_paths,
+        )?);
     plan.affected_repositories = impact.affected_repositories;
     plan.affected_resources = impact.affected_resources;
     plan.local_diffs = impact.local_diffs;
@@ -12187,6 +12192,7 @@ struct PlannedImpact {
     affected_repositories: Vec<String>,
     affected_resources: Vec<String>,
     local_diffs: Vec<Value>,
+    local_artifact_paths: Vec<PathBuf>,
 }
 
 fn plan_impact(
@@ -12222,25 +12228,102 @@ fn plan_impact(
     affected_resources.sort();
     affected_resources.dedup();
     let workspace_impact = graph.impact_for(&workspace_resource_keys);
-    let local_diffs = workspace_impact
+    let local_artifact_paths = plan_local_artifact_paths(capability, input)?;
+    let mut affected_repositories = workspace_impact.affected_repositories.clone();
+    for artifact in &local_artifact_paths {
+        let repository = repository_owning_path(&graph, artifact).ok_or_else(|| {
+            CliError::Input(format!(
+                "local deployment artifact `{}` is not owned by a registered repository",
+                artifact.display()
+            ))
+        })?;
+        affected_repositories.push(repository.path.display().to_string());
+    }
+    affected_repositories.sort();
+    affected_repositories.dedup();
+    affected_resources.extend(
+        local_artifact_paths
+            .iter()
+            .map(|path| format!("source_artifact:{}", path.display())),
+    );
+    affected_resources.sort();
+    affected_resources.dedup();
+    let mut local_diffs = workspace_impact
         .local_diffs
         .iter()
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    for repository_id in &affected_repositories {
+        let Some(repository) = graph.repository(repository_id) else {
+            continue;
+        };
+        for config in &repository.configs {
+            let diff = json!({
+                "repository": repository.path,
+                "path": config.path,
+                "kind": config.kind,
+                "content_hash": config.content_hash,
+                "head_content_hash": config.head_content_hash,
+                "worktree_diff_hash": config.worktree_diff_hash,
+                "dirty": config.dirty,
+            });
+            if !local_diffs.contains(&diff) {
+                local_diffs.push(diff);
+            }
+        }
+    }
+    local_diffs.sort_by_key(|value| value["path"].as_str().unwrap_or_default().to_owned());
     let policy = ImpactContext {
-        affected_repositories: workspace_impact.affected_repositories.len(),
+        affected_repositories: affected_repositories.len(),
         affected_resources: affected_resources.len(),
-        dependent_configurations: workspace_impact.local_diffs.len(),
+        dependent_configurations: local_diffs.len(),
         has_unmanaged_dependencies: workspace_impact.has_unmanaged_dependencies,
-        has_dirty_overlap: workspace_impact.has_dirty_overlap,
+        has_dirty_overlap: affected_repositories.iter().any(|repository_id| {
+            graph
+                .repository(repository_id)
+                .is_some_and(|repository| repository.git.dirty)
+        }),
         selector_ambiguous: missing_required,
     };
     Ok(PlannedImpact {
         policy,
-        affected_repositories: workspace_impact.affected_repositories,
+        affected_repositories,
         affected_resources,
         local_diffs,
+        local_artifact_paths,
     })
+}
+
+fn plan_local_artifact_paths(capability: &CapabilityV1, input: &CallInput) -> Result<Vec<PathBuf>> {
+    if capability.id != "wrangler.pages-deploy" {
+        return Ok(Vec::new());
+    }
+    let raw = input
+        .query
+        .get("argument")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("Pages deployment requires an artifact directory".to_owned())
+        })?;
+    let path = fs::canonicalize(raw).map_err(|source| cli_io(Path::new(raw), source))?;
+    if !path.is_dir() {
+        return Err(CliError::Input(format!(
+            "Pages deployment artifact `{}` is not a directory",
+            path.display()
+        )));
+    }
+    Ok(vec![path])
+}
+
+fn repository_owning_path<'a>(
+    graph: &'a WorkspaceGraph,
+    path: &Path,
+) -> Option<&'a cfctl_workspace::RepositoryNode> {
+    graph
+        .repositories
+        .iter()
+        .filter(|repository| path.starts_with(&repository.path))
+        .max_by_key(|repository| repository.path.components().count())
 }
 
 fn workspace_resource_keys(capability: &CapabilityV1, input: &CallInput) -> Vec<String> {
@@ -22730,16 +22813,61 @@ fn discover_registered(store: &StateStore) -> Result<WorkspaceGraph> {
     Ok(WorkspaceGraph::discover(&roots)?)
 }
 
-fn workspace_precondition_hashes(store: &StateStore) -> Result<BTreeMap<String, String>> {
+fn workspace_precondition_hashes_for_scope(
+    store: &StateStore,
+    affected_repositories: &[String],
+    local_artifact_paths: &[PathBuf],
+) -> Result<BTreeMap<String, String>> {
     let graph = discover_registered(store)?;
+    let repository_ids = affected_repositories
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let repositories = graph
+        .repositories
+        .iter()
+        .filter(|repository| repository_ids.contains(&repository.path.display().to_string()))
+        .collect::<Vec<_>>();
+    if repositories.len() != repository_ids.len() {
+        return Err(CliError::Input(
+            "an affected repository is no longer present in the registered workspace graph"
+                .to_owned(),
+        ));
+    }
+    let resources = graph
+        .resources
+        .iter()
+        .filter(|resource| {
+            graph.links.get(&resource.key).is_some_and(|linked| {
+                linked
+                    .iter()
+                    .any(|repository| repository_ids.contains(repository))
+            })
+        })
+        .collect::<Vec<_>>();
+    let links = graph
+        .links
+        .iter()
+        .filter_map(|(resource, linked)| {
+            let scoped = linked
+                .iter()
+                .filter(|repository| repository_ids.contains(*repository))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            (!scoped.is_empty()).then_some((resource.clone(), scoped))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut hashes = BTreeMap::new();
     hashes.insert(
         "workspace_graph".to_owned(),
-        hash_value(&serde_json::to_value(&graph)?)?,
+        hash_value(&json!({
+            "repositories": repositories,
+            "resources": resources,
+            "links": links,
+        }))?,
     );
-    for path in graph
-        .repositories
-        .iter()
+    for path in repositories
+        .into_iter()
         .flat_map(|repository| &repository.cloudflare_configs)
     {
         let content = fs::read_to_string(path).map_err(|source| cli_io(path, source))?;
@@ -22748,11 +22876,68 @@ fn workspace_precondition_hashes(store: &StateStore) -> Result<BTreeMap<String, 
             hash_value(&Value::String(content))?,
         );
     }
+    for path in local_artifact_paths {
+        hashes.insert(
+            format!("source_artifact:{}", path.display()),
+            hash_directory_artifact(path)?,
+        );
+    }
     Ok(hashes)
 }
 
+fn hash_directory_artifact(root: &Path) -> Result<String> {
+    let canonical = fs::canonicalize(root).map_err(|source| cli_io(root, source))?;
+    if !canonical.is_dir() {
+        return Err(CliError::Input(format!(
+            "deployment artifact `{}` is not a directory",
+            canonical.display()
+        )));
+    }
+    let mut manifest = Vec::new();
+    for entry in WalkDir::new(&canonical).follow_links(false) {
+        let entry = entry.map_err(|source| {
+            CliError::Input(format!(
+                "failed to inspect deployment artifact `{}`: {source}",
+                canonical.display()
+            ))
+        })?;
+        if entry.path() == canonical || entry.file_type().is_dir() {
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            return Err(CliError::Input(format!(
+                "deployment artifact contains unsupported non-file entry `{}`",
+                entry.path().display()
+            )));
+        }
+        let relative = entry.path().strip_prefix(&canonical).map_err(|_| {
+            CliError::Input(format!(
+                "deployment artifact entry `{}` escaped its root",
+                entry.path().display()
+            ))
+        })?;
+        let bytes = fs::read(entry.path()).map_err(|source| cli_io(entry.path(), source))?;
+        manifest.push(json!({
+            "path": relative.to_string_lossy(),
+            "sha256": hex::encode(Sha256::digest(&bytes)),
+        }));
+    }
+    manifest.sort_by_key(|entry| entry["path"].as_str().unwrap_or_default().to_owned());
+    Ok(hash_value(&Value::Array(manifest))?)
+}
+
 fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> {
-    let current = workspace_precondition_hashes(store)?;
+    let local_artifact_paths = plan
+        .precondition_hashes
+        .keys()
+        .filter_map(|name| name.strip_prefix("source_artifact:"))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let current = workspace_precondition_hashes_for_scope(
+        store,
+        &plan.affected_repositories,
+        &local_artifact_paths,
+    )?;
     for (name, expected) in &plan.precondition_hashes {
         if is_live_plan_precondition_hash(name) {
             continue;
@@ -24852,9 +25037,9 @@ mod tests {
         validate_standing_authority_permission_inventory, validate_token_policy_body,
         validate_worker_script_secret_semantics, validate_zone_account_receipt_precondition,
         validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
-        workspace_operational_proof_posture, workspace_resource_keys, wrangler_config_directory,
-        wrangler_deploy_version_id, wrangler_pages_deployment_has_commit,
-        wrangler_status_has_promoted_version, zone_target,
+        workspace_operational_proof_posture, workspace_precondition_hashes_for_scope,
+        workspace_resource_keys, wrangler_config_directory, wrangler_deploy_version_id,
+        wrangler_pages_deployment_has_commit, wrangler_status_has_promoted_version, zone_target,
     };
     use crate::profiles::ProfilesConfig;
     use crate::telemetry_product::record_operational_proof;
@@ -24895,6 +25080,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         fs,
+        process::Command as StdCommand,
         sync::{
             Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
@@ -30642,6 +30828,85 @@ mod tests {
             PathBuf::from(".")
         );
         assert!(wrangler_config_directory("/").is_err());
+    }
+
+    #[test]
+    fn workspace_plan_pins_ignore_unrelated_repositories_but_bind_the_selected_artifact() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let windowdrop = root.path().join("windowdrop");
+        let unrelated = root.path().join("unrelated");
+        for repository in [&windowdrop, &unrelated] {
+            fs::create_dir_all(repository.join("serve")).expect("repository directories");
+            StdCommand::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(repository)
+                .status()
+                .expect("git init");
+        }
+        fs::write(windowdrop.join("serve/index.html"), "windowdrop-v1")
+            .expect("WindowDrop artifact");
+        fs::write(
+            unrelated.join("wrangler.toml"),
+            "name = \"unrelated\"\nmain = \"src/index.js\"\n",
+        )
+        .expect("unrelated config");
+        for repository in [&windowdrop, &unrelated] {
+            StdCommand::new("git")
+                .args(["add", "."])
+                .current_dir(repository)
+                .status()
+                .expect("git add");
+            StdCommand::new("git")
+                .args([
+                    "-c",
+                    "user.name=cfctl test",
+                    "-c",
+                    "user.email=cfctl-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ])
+                .current_dir(repository)
+                .status()
+                .expect("git commit");
+        }
+        store
+            .register_workspace(&windowdrop, None)
+            .expect("register WindowDrop");
+        store
+            .register_workspace(&unrelated, None)
+            .expect("register unrelated repository");
+
+        let repositories = vec![
+            fs::canonicalize(&windowdrop)
+                .expect("canonical WindowDrop")
+                .display()
+                .to_string(),
+        ];
+        let artifacts = vec![windowdrop.join("serve")];
+        let before = workspace_precondition_hashes_for_scope(&store, &repositories, &artifacts)
+            .expect("initial scoped pins");
+
+        fs::write(
+            unrelated.join("wrangler.toml"),
+            "name = \"unrelated-changed\"\nmain = \"src/index.js\"\n",
+        )
+        .expect("mutate unrelated config");
+        fs::write(unrelated.join("untracked.txt"), "unrelated dirt")
+            .expect("mutate unrelated Git state");
+        let after_unrelated_change =
+            workspace_precondition_hashes_for_scope(&store, &repositories, &artifacts)
+                .expect("pins after unrelated change");
+        assert_eq!(before, after_unrelated_change);
+
+        fs::write(windowdrop.join("serve/index.html"), "windowdrop-v2")
+            .expect("mutate selected artifact");
+        let after_artifact_change =
+            workspace_precondition_hashes_for_scope(&store, &repositories, &artifacts)
+                .expect("pins after artifact change");
+        assert_ne!(before, after_artifact_change);
     }
 
     #[test]
