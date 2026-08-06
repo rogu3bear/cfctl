@@ -382,6 +382,37 @@ database unavailable while producing a large export, so capture the snapshot
 in the migration window. The receipt proves only the local pre-migration
 snapshot; importing or applying it is a separate protected workflow.
 
+OSINT Research Center migrations 0028 through 0034 use the narrower
+`d1-import-approved-osint-research-migration` adapter. It pins account
+`ca30e922fda7f5578e49873542e4aaca`, database
+`1c1ce476-73ab-4dd6-a2e2-de0c155ade61`, repository
+`github.com/rogu3bear/osint-research-center`, release HEAD, and every migration
+path/blob/SHA-256/MD5/size. The caller selects only one migration ID, supplies
+the corresponding reviewed absolute `--source-file`, and binds a current
+governed `d1-time-travel-get-bookmark` evidence hash plus the SHA-256 of its
+exact bookmark string. This bookmark lane is required because Cloudflare full
+export rejects databases containing FTS5 virtual tables; it still provides the
+exact rollback target consumed by `d1-restore-exact-bookmark`.
+
+```bash
+printf '%s' \
+  '{"migration_id":"0028","pre_recovery_anchor_evidence_hash":"sha256:<live-read-evidence>","pre_recovery_anchor_bookmark_hash":"sha256:<bookmark-string-hash>"}' |
+  cfctl call d1-import-approved-osint-research-migration \
+    --profile osint-research-d1 \
+    --account ca30e922fda7f5578e49873542e4aaca \
+    --selector account_id=ca30e922fda7f5578e49873542e4aaca \
+    --selector database_id=1c1ce476-73ab-4dd6-a2e2-de0c155ade61 \
+    --source-file /absolute/reviewed/repository/migrations/d1/0028_founder_people_handoff.sql \
+    --body-stdin --json
+```
+
+Create, review, approve, run, and verify one plan at a time in numeric order.
+The import state machine never replays init, upload, ingest, or an uncertain
+poll. After provider completion, cfctl runs one compiler-owned marker query for
+the selected migration and closes only when that read returns exactly
+`present = 1`. Caller SQL, import protocol controls, alternate repositories,
+dirty source trees, and retargeted accounts or databases fail closed.
+
 Approved MLNavigator imports use `d1-import-approved-mln-migration`. If its
 bounded provider polling ends while the import is still active, do not rerun
 that consumed plan: init, upload, and ingest are one-shot boundaries. Create a
@@ -571,6 +602,34 @@ Worker's `node_modules`. Other delegated CLI capabilities keep their existing
 working directory. `cfctl doctor --json` projects this boundary under
 `result.delegated_cli_environment` so deploy wrappers can fail closed when an
 older cfctl build does not preserve it.
+
+For Worker code-only publication, keep artifact creation and production
+traffic promotion as two independently reviewed plans. The upload verifier
+reads the returned Worker version and requires both its exact ID and reviewed
+message; it does not change production traffic:
+
+```bash
+cfctl call wrangler.versions-upload \
+  --query config=/absolute/path/to/wrangler.toml \
+  --query message='release <full-source-sha>' \
+  --json
+```
+
+After reviewing that verified version ID, create a second plan that targets
+exactly one version at all traffic. Other percentages, multiple targets, and
+relative config paths fail closed:
+
+```bash
+cfctl call wrangler.versions-deploy \
+  --query argument=<worker-version-uuid>@100 \
+  --query config=/absolute/path/to/wrangler.toml \
+  --query message='promote release <full-source-sha>' \
+  --json
+```
+
+Promotion verification reads Wrangler's production deployment status and
+requires the planned version at 100 percent. Rolling back remains a separate
+reviewed `wrangler.versions-deploy` plan targeting a known prior version.
 
 For a Cloudflare Pages direct upload, use the exact
 `wrangler.pages-deploy` capability rather than the aggregate

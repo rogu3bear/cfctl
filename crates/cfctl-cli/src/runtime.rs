@@ -27,7 +27,8 @@ use cfctl_catalog::{
     CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1, attach_official_product_knowledge,
     fetch_official, fetch_official_text_feeds, ingest_cli_help, ingest_governed_ui_capabilities,
     ingest_native_control_capabilities, ingest_telemetry_capabilities,
-    ingest_wrangler_pages_deploy_help, refresh_dynamic_mutation_contract,
+    ingest_wrangler_pages_deploy_help, ingest_wrangler_worker_versions_help,
+    refresh_dynamic_mutation_contract,
 };
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, D1ImportCheckpointV1, Executor,
@@ -1137,6 +1138,22 @@ async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2> {
                         &String::from_utf8_lossy(&pages_deploy_help.stdout),
                     );
                 }
+                let versions_upload_help = std::process::Command::new(program)
+                    .args(["versions", "upload", "--help"])
+                    .output()
+                    .map_err(|source| cli_io(Path::new(program), source))?;
+                let versions_deploy_help = std::process::Command::new(program)
+                    .args(["versions", "deploy", "--help"])
+                    .output()
+                    .map_err(|source| cli_io(Path::new(program), source))?;
+                if versions_upload_help.status.success() && versions_deploy_help.status.success() {
+                    ingest_wrangler_worker_versions_help(
+                        &mut catalog,
+                        String::from_utf8_lossy(&version.stdout).trim(),
+                        &String::from_utf8_lossy(&versions_upload_help.stdout),
+                        &String::from_utf8_lossy(&versions_deploy_help.stdout),
+                    );
+                }
             }
         }
     }
@@ -1778,6 +1795,12 @@ fn normalize_reviewed_mln_repository_id(remote: &str) -> Option<String> {
         | "https://github.com/rogu3bear/mln-web"
         | "git@github.com:rogu3bear/mln-web.git"
         | "git@github.com:rogu3bear/mln-web" => Some("github.com/rogu3bear/mln-web".to_owned()),
+        "https://github.com/rogu3bear/osint-research-center.git"
+        | "https://github.com/rogu3bear/osint-research-center"
+        | "git@github.com:rogu3bear/osint-research-center.git"
+        | "git@github.com:rogu3bear/osint-research-center" => {
+            Some("github.com/rogu3bear/osint-research-center".to_owned())
+        }
         _ => None,
     }
 }
@@ -1786,6 +1809,62 @@ fn required_body_string<'a>(body: &'a Map<String, Value>, field: &str) -> Result
     body.get(field)
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input(format!("approved MLN import requires {field}")))
+}
+
+fn validate_osint_research_recovery_bookmark(
+    store: &StateStore,
+    input: &CallInput,
+    body: &Map<String, Value>,
+    contract: &cfctl_core::D1ApprovedMlnImportContractV1,
+    context: ImportPrerequisiteContext<'_>,
+) -> Result<()> {
+    let evidence_hash = required_body_string(body, "pre_recovery_anchor_evidence_hash")?;
+    let bookmark_hash = required_body_string(body, "pre_recovery_anchor_bookmark_hash")?;
+    let expected_input_hash = hash_value(&serde_json::to_value(CallInput {
+        selectors: input.selectors.clone(),
+        query: json!({}),
+        ..CallInput::default()
+    })?)?;
+    let matches = store
+        .list_operational_proofs()?
+        .into_iter()
+        .filter(|proof| {
+            proof.capability_id == "d1-time-travel-get-bookmark"
+                && proof.catalog_hash == context.catalog_hash
+                && proof.input_hash == expected_input_hash
+                && proof.profile_id.as_deref() == Some(context.profile_id)
+                && proof.account_id.as_deref() == Some(contract.account_id.as_str())
+                && proof.credential_generation_id.as_deref() == context.credential_generation_id
+                && proof.outcome == OperationalProofOutcomeV1::Succeeded
+                && proof.evidence.content_hash == evidence_hash
+                && proof.observed_at < context.before
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(CliError::Input(
+            "OSINT Research import requires exactly one governed current D1 time-travel bookmark read bound to the catalog, request, target, profile, credential generation, evidence, and pre-plan chronology"
+                .to_owned(),
+        ));
+    }
+    let evidence = store.read_evidence_value(evidence_hash)?;
+    let bookmark = evidence
+        .pointer("/result/bookmark")
+        .and_then(Value::as_str)
+        .filter(|bookmark| !bookmark.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "OSINT Research recovery bookmark evidence omitted the exact bookmark".to_owned(),
+            )
+        })?;
+    if evidence.get("status").and_then(Value::as_u64) != Some(200)
+        || evidence.get("success").and_then(Value::as_bool) != Some(true)
+        || hash_value(&Value::String(bookmark.to_owned()))? != bookmark_hash
+    {
+        return Err(CliError::Input(
+            "OSINT Research recovery bookmark evidence or bookmark hash drifted".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[expect(
@@ -1811,6 +1890,10 @@ fn validate_approved_mln_import_prerequisites(
         .get("migration_id")
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("migration_id is missing".to_owned()))?;
+    if capability.id == "d1-import-approved-osint-research-migration" {
+        validate_osint_research_recovery_bookmark(store, input, body, contract, context)?;
+        return Ok(());
+    }
     let pre_operation = body
         .get("pre_recovery_anchor_operation_id")
         .and_then(Value::as_str)
@@ -5900,6 +5983,17 @@ async fn verify_delegated_cli_plan(
         .await;
     }
 
+    if plan.capability.verification.strategy == "wrangler_worker_version_reports_expected_message" {
+        return verify_wrangler_worker_version_upload_plan(store, plan, input, receipt, credential)
+            .await;
+    }
+
+    if plan.capability.verification.strategy
+        == "wrangler_worker_versions_deployment_reports_expected_traffic"
+    {
+        return verify_wrangler_worker_versions_deploy_plan(store, plan, input, credential).await;
+    }
+
     if plan.capability.verification.strategy
         != "wrangler_deployment_status_reports_promoted_version"
     {
@@ -5930,6 +6024,78 @@ async fn verify_delegated_cli_plan(
         });
     };
 
+    verify_wrangler_deployment_status(
+        config,
+        &version_id,
+        credential,
+        &plan.account_id,
+        &store.paths().cache_dir,
+    )
+    .await
+}
+
+async fn verify_wrangler_worker_version_upload_plan(
+    store: &StateStore,
+    plan: &PlanV1,
+    input: &CallInput,
+    receipt: &Value,
+    credential: &AuthCredential,
+) -> Value {
+    let Some(version_id) = wrangler_worker_version_id(receipt) else {
+        return json!({
+            "passed": false,
+            "basis": "Wrangler reported upload success without a parseable Worker Version ID",
+        });
+    };
+    let Some(config) = input.query.get("config").and_then(Value::as_str) else {
+        return json!({
+            "passed": false,
+            "basis": "the version upload plan omitted its required Wrangler config selector",
+            "version_id": version_id,
+        });
+    };
+    let Some(message) = input.query.get("message").and_then(Value::as_str) else {
+        return json!({
+            "passed": false,
+            "basis": "the version upload plan omitted its required message selector",
+            "version_id": version_id,
+        });
+    };
+    verify_wrangler_worker_version(
+        config,
+        &version_id,
+        message,
+        credential,
+        &plan.account_id,
+        &store.paths().cache_dir,
+    )
+    .await
+}
+
+async fn verify_wrangler_worker_versions_deploy_plan(
+    store: &StateStore,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Value {
+    let Some(version_id) = input
+        .query
+        .get("argument")
+        .and_then(Value::as_str)
+        .and_then(wrangler_versions_deploy_version_id)
+    else {
+        return json!({
+            "passed": false,
+            "basis": "the versions deployment plan did not contain exactly one UUID@100 traffic target",
+        });
+    };
+    let Some(config) = input.query.get("config").and_then(Value::as_str) else {
+        return json!({
+            "passed": false,
+            "basis": "the versions deployment plan omitted its required Wrangler config selector",
+            "version_id": version_id,
+        });
+    };
     verify_wrangler_deployment_status(
         config,
         &version_id,
@@ -6205,6 +6371,104 @@ async fn verify_wrangler_deployment_status(
     })
 }
 
+async fn verify_wrangler_worker_version(
+    config: &str,
+    version_id: &str,
+    expected_message: &str,
+    credential: &AuthCredential,
+    account_id: &str,
+    cache_dir: &Path,
+) -> Value {
+    let working_directory = match wrangler_config_directory(config) {
+        Ok(directory) => directory,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler version verification could not resolve the reviewed config directory: {error}"),
+                "version_id": version_id,
+            });
+        }
+    };
+    let mut command = ProcessCommand::new("wrangler");
+    command
+        .args(["versions", "view", version_id, "--config", config, "--json"])
+        .current_dir(working_directory)
+        .env_clear()
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .env("HOME", env::var_os("HOME").unwrap_or_default())
+        .env("NO_COLOR", "1")
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in governed_cli_workspace_env("wrangler", Some(account_id), cache_dir) {
+        command.env(name, value);
+    }
+    match credential {
+        AuthCredential::Bearer { token } => {
+            command.env("CLOUDFLARE_API_TOKEN", token);
+        }
+        AuthCredential::GlobalKey { email, key } => {
+            command
+                .env("CLOUDFLARE_EMAIL", email)
+                .env("CLOUDFLARE_API_KEY", key);
+        }
+    }
+    let output = match tokio::time::timeout(Duration::from_mins(2), command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler version verification could not start: {error}"),
+                "version_id": version_id,
+            });
+        }
+        Err(_) => {
+            return json!({
+                "passed": false,
+                "basis": "Wrangler version verification timed out",
+                "version_id": version_id,
+            });
+        }
+    };
+    let stdout = redact_subprocess_text(&String::from_utf8_lossy(&output.stdout), credential);
+    let stderr = redact_subprocess_text(&String::from_utf8_lossy(&output.stderr), credential);
+    if !output.status.success() {
+        return json!({
+            "passed": false,
+            "basis": "Wrangler version verification returned a failing exit status",
+            "version_id": version_id,
+            "exit_status": output.status.code(),
+            "stdout": stdout,
+            "stderr": stderr,
+        });
+    }
+    let version = match serde_json::from_str::<Value>(stdout.trim()) {
+        Ok(version) => version,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler version output was not JSON: {error}"),
+                "version_id": version_id,
+                "stdout": stdout,
+                "stderr": stderr,
+            });
+        }
+    };
+    let passed = wrangler_version_readback_matches(&version, version_id, expected_message);
+    json!({
+        "passed": passed,
+        "basis": if passed {
+            format!("Wrangler reports uploaded version {version_id} with the reviewed message")
+        } else {
+            format!("Wrangler version readback did not bind {version_id} to the reviewed message")
+        },
+        "version_id": version_id,
+        "readback": version,
+        "stderr": stderr,
+    })
+}
+
 fn wrangler_deploy_version_id(receipt: &Value) -> Option<String> {
     receipt
         .get("stdout")
@@ -6219,6 +6483,38 @@ fn wrangler_deploy_version_id(receipt: &Value) -> Option<String> {
                     .all(|character| character.is_ascii_alphanumeric() || character == '-')
         })
         .map(str::to_owned)
+}
+
+fn wrangler_worker_version_id(receipt: &Value) -> Option<String> {
+    receipt
+        .get("stdout")
+        .and_then(Value::as_str)?
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Worker Version ID:"))
+        .map(str::trim)
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .map(str::to_owned)
+}
+
+fn wrangler_versions_deploy_version_id(spec: &str) -> Option<String> {
+    let (version_id, percentage) = spec.split_once('@')?;
+    if percentage == "100" && Uuid::parse_str(version_id).is_ok() {
+        Some(version_id.to_owned())
+    } else {
+        None
+    }
+}
+
+fn wrangler_version_readback_matches(
+    value: &Value,
+    expected_version_id: &str,
+    expected_message: &str,
+) -> bool {
+    value.get("id").and_then(Value::as_str) == Some(expected_version_id)
+        && value
+            .pointer("/annotations/workers~1message")
+            .and_then(Value::as_str)
+            == Some(expected_message)
 }
 
 fn wrangler_status_has_promoted_version(value: &Value, expected_version_id: &str) -> bool {
@@ -18230,6 +18526,47 @@ async fn execute_approved_mln_import_plan(
             "the import boundary was crossed but exact durable provider completion was not proven",
         ));
     }
+    if plan.capability.id == "d1-import-approved-osint-research-migration" {
+        let verification = match verify_api_plan(
+            store,
+            executor,
+            plan,
+            &response,
+            execution_input,
+            credential,
+        )
+        .await
+        {
+            Ok(verification) => verification,
+            Err(error) => {
+                return Ok(post_boundary_failure_envelope(
+                    plan,
+                    response_value,
+                    Some(apply_evidence),
+                    lineage_evidence,
+                    &error,
+                    true,
+                    "the OSINT Research import completed, but its schema-marker verification could not be persisted",
+                ));
+            }
+        };
+        let finalization: Result<()> =
+            if matches!(plan.status, PlanStatus::Verified | PlanStatus::Failed) {
+                persist_transaction_stage(store, plan, TransactionStageV1::Closed)
+            } else {
+                store.save_plan(plan).map_err(CliError::from)
+            };
+        let finalization_error = finalization.err();
+        return Ok(api_plan_result_envelope(
+            plan,
+            response_value,
+            apply_evidence,
+            lineage_evidence,
+            verification,
+            true,
+            finalization_error.as_ref(),
+        ));
+    }
     if matches!(
         plan.status,
         PlanStatus::RectificationRequired | PlanStatus::Failed
@@ -19690,6 +20027,103 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
     reason = "rectification is one no-replay verified-state transition"
 )]
 fn rectify_approved_mln_import(store: &StateStore, plan: &mut PlanV1) -> Result<ResultEnvelopeV2> {
+    if plan.status == PlanStatus::RectificationRequired
+        && plan.transaction_stage == TransactionStageV1::SecretSinkPersisted
+    {
+        let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
+        if checkpoints.len() != 1
+            || checkpoints[0].1.get("step").and_then(Value::as_str) != Some("init_response")
+        {
+            return Err(CliError::Input(
+                "init-only rectification requires exactly one durable init response and no upload, ingest, poll, or provider-complete checkpoint"
+                    .to_owned(),
+            ));
+        }
+        let (init_evidence, checkpoint) = exact_durable_init_response_failure(store, plan)?;
+        let valid_abandoned_session = checkpoint
+            .pointer("/receipt/success")
+            .and_then(Value::as_bool)
+            == Some(true)
+            && checkpoint
+                .pointer("/receipt/result/success")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && checkpoint
+                .pointer("/receipt/result/upload_url_present")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && checkpoint
+                .pointer("/receipt/result/filename_present")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && checkpoint
+                .pointer("/receipt/provider_errors_present")
+                .and_then(Value::as_bool)
+                == Some(false)
+            && checkpoint
+                .pointer("/receipt/result/provider_error_present")
+                .and_then(Value::as_bool)
+                == Some(false)
+            && checkpoint
+                .pointer("/receipt/errors")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            && checkpoint
+                .pointer("/receipt/result/type")
+                .is_some_and(Value::is_null)
+            && checkpoint
+                .pointer("/receipt/result/status")
+                .is_some_and(Value::is_null);
+        if !valid_abandoned_session {
+            return Err(CliError::Input(
+                "init-only rectification requires one successful redacted upload-session receipt; provider rejection or uncertainty remains unresolved"
+                    .to_owned(),
+            ));
+        }
+        persist_transaction_stage(
+            store,
+            plan,
+            TransactionStageV1::VerificationAttemptPersisted,
+        )?;
+        plan.status = PlanStatus::Rectified;
+        let completion = json!({
+            "schema_version":1,
+            "state":"rectified",
+            "operation_id":plan.operation_id,
+            "init_response_evidence_hash":init_evidence.content_hash,
+            "upload_performed":false,
+            "database_write_performed":false,
+            "disposition":"abandoned_unuploaded_provider_init_session",
+        });
+        let verification_evidence =
+            store.write_evidence(EvidenceClass::PostChangeVerification, &completion)?;
+        persist_transaction_stage_with_artifact(
+            store,
+            plan,
+            TransactionStageV1::VerificationResponsePersisted,
+            json!({
+                "state":"passed",
+                "evidence_hash":verification_evidence.content_hash,
+                "init_response_evidence_hash":init_evidence.content_hash,
+            }),
+        )?;
+        persist_transaction_stage(store, plan, TransactionStageV1::Closed)?;
+        let mut envelope = ResultEnvelopeV2::success("plans rectify", completion)
+            .with_evidence(verification_evidence);
+        envelope.evidence.push(init_evidence);
+        envelope.performed = false;
+        envelope.operation_id = Some(plan.operation_id.clone());
+        envelope.capability_id = Some(plan.capability.id.clone());
+        envelope.profile_id = Some(plan.profile_id.clone());
+        envelope.account_id = Some(plan.account_id.clone());
+        envelope.policy_decision = Some(plan.policy.clone());
+        envelope.verification.state = VerificationState::Passed;
+        envelope.verification.basis = Some(
+            "the operation has exactly one durable successful init-session receipt and no upload, ingest, poll, or provider-complete checkpoint; rectification abandoned that unuploaded session without replay or provider mutation"
+                .to_owned(),
+        );
+        return Ok(envelope);
+    }
     if plan.status != PlanStatus::Running
         || plan.transaction_stage != TransactionStageV1::SecretSinkPersisted
     {
@@ -23016,6 +23450,7 @@ struct PreparedCallInput {
 fn call_input(capability: &CapabilityV1, arguments: &CallArgs) -> Result<PreparedCallInput> {
     let selectors = object_from_pairs(&arguments.selectors);
     let query = query_object_from_pairs(capability, &arguments.query)?;
+    validate_wrangler_worker_versions_input(capability, &query)?;
     let body = if arguments.body_stdin {
         Some(serde_json::from_str(&read_stdin()?)?)
     } else {
@@ -23044,6 +23479,39 @@ fn call_input(capability: &CapabilityV1, arguments: &CallArgs) -> Result<Prepare
         },
         secret_body: contains_secret.then_some(body).flatten(),
     })
+}
+
+fn validate_wrangler_worker_versions_input(capability: &CapabilityV1, query: &Value) -> Result<()> {
+    if !matches!(
+        capability.id.as_str(),
+        "wrangler.versions-upload" | "wrangler.versions-deploy"
+    ) {
+        return Ok(());
+    }
+    let config = query.get("config").and_then(Value::as_str).ok_or_else(|| {
+        CliError::Input("Worker Versions plans require a config selector".to_owned())
+    })?;
+    if !Path::new(config).is_absolute() {
+        return Err(CliError::Input(
+            "Worker Versions plans require an absolute Wrangler config path".to_owned(),
+        ));
+    }
+    if capability.id == "wrangler.versions-deploy" {
+        let spec = query
+            .get("argument")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input(
+                    "Worker Versions deployment requires exactly one UUID@100 target".to_owned(),
+                )
+            })?;
+        if wrangler_versions_deploy_version_id(spec).is_none() {
+            return Err(CliError::Input(
+                "Worker Versions deployment target must be exactly one UUID@100 value".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn request_body_contains_secret(capability: &CapabilityV1, body: &Value) -> bool {
@@ -25010,9 +25478,10 @@ mod tests {
         preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
         read_import_secret, read_r2_log_retrieval_credentials, read_secret_file,
-        reconcile_standing_lineage_from_plan, rectify_plan, redact_response_for_capability,
-        redact_secret_payload, redact_secret_result, repair_keychain_access_with_warning,
-        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
+        reconcile_standing_lineage_from_plan, rectify_approved_mln_import, rectify_plan,
+        redact_response_for_capability, redact_secret_payload, redact_secret_result,
+        repair_keychain_access_with_warning, request_body_contains_secret,
+        required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -25035,11 +25504,14 @@ mod tests {
         validate_permission_group_resource_scope, validate_request_contract,
         validate_selected_permission_groups, validate_standing_authority_group_scopes,
         validate_standing_authority_permission_inventory, validate_token_policy_body,
-        validate_worker_script_secret_semantics, validate_zone_account_receipt_precondition,
-        validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
+        validate_worker_script_secret_semantics, validate_wrangler_worker_versions_input,
+        validate_zone_account_receipt_precondition, validate_zone_id,
+        validated_standing_lineage_token_id, verification_outcome,
         workspace_operational_proof_posture, workspace_precondition_hashes_for_scope,
         workspace_resource_keys, wrangler_config_directory, wrangler_deploy_version_id,
-        wrangler_pages_deployment_has_commit, wrangler_status_has_promoted_version, zone_target,
+        wrangler_pages_deployment_has_commit, wrangler_status_has_promoted_version,
+        wrangler_version_readback_matches, wrangler_versions_deploy_version_id,
+        wrangler_worker_version_id, zone_target,
     };
     use crate::profiles::ProfilesConfig;
     use crate::telemetry_product::record_operational_proof;
@@ -29268,6 +29740,10 @@ mod tests {
         assert_eq!(init_envelope.result["outcome"], "invalid_provider_response");
         assert_eq!(init_envelope.result["receipt_available"], true);
         assert_ne!(init_plan.status, PlanStatus::Running);
+        assert!(
+            rectify_approved_mln_import(&init_store, &mut init_plan).is_err(),
+            "provider-error init receipts must remain unrectified"
+        );
         for forbidden in ["X-Amz-Signature", "SECRET", "upload_url\":"] {
             assert!(!init_envelope.result.to_string().contains(forbidden));
             assert!(
@@ -29279,6 +29755,80 @@ mod tests {
                     .contains(forbidden)
             );
         }
+
+        let abandoned_root = tempfile::tempdir().expect("abandoned init root");
+        let abandoned_store = StateStore::open(RuntimePaths::from_root(abandoned_root.path()))
+            .expect("abandoned init store");
+        let mut abandoned_plan = build_plan();
+        let abandoned_checkpoint = D1ImportCheckpointV1 {
+            schema_version: 1,
+            operation_id: abandoned_plan.operation_id.clone(),
+            step: "init_response".to_owned(),
+            performed: true,
+            rectification_required: true,
+            receipt: json!({
+                "http_status":200,
+                "success":true,
+                "response_action":"init",
+                "provider":"cloudflare",
+                "effect":"d1_import_response",
+                "migration_id":"0143",
+                "target":{
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                },
+                "plan_input_hash":hash_value(&abandoned_plan.input).expect("input hash"),
+                "result":{
+                    "type":null,
+                    "status":null,
+                    "success":true,
+                    "at_bookmark":null,
+                    "upload_url_present":true,
+                    "upload_url_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "filename_present":true,
+                    "filename_sha256":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "provider_error_present":false,
+                },
+                "errors":[],
+                "provider_errors_present":false,
+                "no_replay":true,
+                "etag_present":false,
+                "etag_sha256":null,
+                "cf_ray":"safe-ray",
+            }),
+        };
+        persist_d1_import_checkpoint(
+            &abandoned_store,
+            &abandoned_plan.operation_id,
+            &abandoned_checkpoint,
+        )
+        .expect("durable abandoned init response");
+        let abandoned_failure = approved_mln_import_execution_error_envelope(
+            &abandoned_store,
+            &mut abandoned_plan,
+            CloudflareError::D1ImportInitResponseFailure,
+            &MemorySecretStore::default(),
+        );
+        assert_eq!(abandoned_failure.result["receipt_available"], true);
+        assert_eq!(
+            abandoned_plan.transaction_stage,
+            TransactionStageV1::SecretSinkPersisted
+        );
+        let rectified = rectify_approved_mln_import(&abandoned_store, &mut abandoned_plan)
+            .expect("rectify abandoned unuploaded session");
+        assert!(rectified.ok);
+        assert!(!rectified.performed);
+        assert_eq!(rectified.result["upload_performed"], false);
+        assert_eq!(rectified.result["database_write_performed"], false);
+        assert_eq!(abandoned_plan.status, PlanStatus::Rectified);
+        assert_eq!(abandoned_plan.transaction_stage, TransactionStageV1::Closed);
+        assert_eq!(
+            abandoned_store
+                .read_d1_import_checkpoints(&abandoned_plan.operation_id)
+                .expect("unchanged abandoned checkpoint set")
+                .len(),
+            1
+        );
 
         for (action, step, error) in [
             (
@@ -30687,6 +31237,84 @@ mod tests {
             &promoted,
             "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         ));
+    }
+
+    #[test]
+    fn wrangler_worker_versions_receipts_and_targets_are_exact() {
+        let version_id = "11111111-2222-3333-4444-555555555555";
+        let receipt = json!({
+            "stdout": format!("Uploaded leakbar\nWorker Version ID: {version_id}\n")
+        });
+        assert_eq!(
+            wrangler_worker_version_id(&receipt).as_deref(),
+            Some(version_id)
+        );
+        assert_eq!(
+            wrangler_versions_deploy_version_id(&format!("{version_id}@100")).as_deref(),
+            Some(version_id)
+        );
+        assert!(wrangler_versions_deploy_version_id(&format!("{version_id}@25")).is_none());
+        assert!(wrangler_versions_deploy_version_id("not-a-version@100").is_none());
+        assert!(wrangler_versions_deploy_version_id(&format!("{version_id}@100@100")).is_none());
+
+        let readback = json!({
+            "id": version_id,
+            "annotations": {"workers/message": "release 88ef60c"}
+        });
+        assert!(wrangler_version_readback_matches(
+            &readback,
+            version_id,
+            "release 88ef60c"
+        ));
+        assert!(!wrangler_version_readback_matches(
+            &readback,
+            version_id,
+            "release other"
+        ));
+    }
+
+    #[test]
+    fn wrangler_worker_versions_inputs_require_absolute_config_and_full_traffic() {
+        let mut upload = CapabilityV1::new(
+            "wrangler.versions-upload",
+            "upload",
+            "POST",
+            "wrangler versions upload",
+        );
+        upload.adapter_status = AdapterStatus::DelegatedCli;
+        validate_wrangler_worker_versions_input(
+            &upload,
+            &json!({"config": "/srv/leakbar/web/wrangler.toml"}),
+        )
+        .expect("absolute upload config");
+        assert!(
+            validate_wrangler_worker_versions_input(
+                &upload,
+                &json!({"config": "web/wrangler.toml"}),
+            )
+            .is_err()
+        );
+
+        let mut deploy = upload;
+        deploy.id = "wrangler.versions-deploy".to_owned();
+        validate_wrangler_worker_versions_input(
+            &deploy,
+            &json!({
+                "config": "/srv/leakbar/web/wrangler.toml",
+                "argument": "11111111-2222-3333-4444-555555555555@100"
+            }),
+        )
+        .expect("one exact full-traffic target");
+        assert!(
+            validate_wrangler_worker_versions_input(
+                &deploy,
+                &json!({
+                    "config": "/srv/leakbar/web/wrangler.toml",
+                    "argument": "11111111-2222-3333-4444-555555555555@50"
+                }),
+            )
+            .is_err()
+        );
     }
 
     #[test]

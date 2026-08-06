@@ -3,8 +3,8 @@
 use cfctl_catalog::{
     CatalogChangeKind, CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1,
     attach_official_product_knowledge, ingest_cli_help, ingest_native_control_capabilities,
-    ingest_telemetry_capabilities, ingest_wrangler_pages_deploy_help, markdown_link,
-    markdown_links, normalize_openapi,
+    ingest_telemetry_capabilities, ingest_wrangler_pages_deploy_help,
+    ingest_wrangler_worker_versions_help, markdown_link, markdown_links, normalize_openapi,
 };
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryKindV1, BillingModelV1, CapabilityV1, CostExposureV1,
@@ -2187,6 +2187,63 @@ fn exact_wrangler_pages_deploy_help_becomes_a_governed_upload() {
         "wrangler pages deploy [directory]\nOPTIONS\n  --project-name\n",
     );
     assert!(unsupported.get("wrangler.pages-deploy").is_none());
+}
+
+#[test]
+fn exact_wrangler_worker_versions_help_governs_upload_and_promotion_separately() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    ingest_wrangler_worker_versions_help(
+        &mut snapshot,
+        "4.107.0",
+        "wrangler versions upload [path]\nOPTIONS\n  --config\n  --message\n  --name\n",
+        "wrangler versions deploy [version-specs..]\nOPTIONS\n  --config\n  --message\n  --yes\n  --name\n",
+    );
+
+    let upload = snapshot
+        .get("wrangler.versions-upload")
+        .expect("versions upload capability");
+    assert_eq!(upload.path, "wrangler versions upload");
+    assert_eq!(upload.adapter_status, AdapterStatus::DelegatedCli);
+    assert_eq!(upload.effect, EffectClass::ReversibleWrite);
+    assert_eq!(upload.cost.maximum, Some(0.0));
+    assert_eq!(
+        upload.verification.strategy,
+        "wrangler_worker_version_reports_expected_message"
+    );
+    assert!(upload.verification_contract_supported());
+    assert!(upload.mutation_contract_gaps().is_empty());
+    for name in ["config", "message"] {
+        assert!(upload.selectors.iter().any(|selector| {
+            selector.name == name && selector.location == "query" && selector.required
+        }));
+    }
+
+    let deploy = snapshot
+        .get("wrangler.versions-deploy")
+        .expect("versions deploy capability");
+    assert_eq!(deploy.path, "wrangler versions deploy --yes");
+    assert_eq!(deploy.adapter_status, AdapterStatus::DelegatedCli);
+    assert_eq!(
+        deploy.verification.strategy,
+        "wrangler_worker_versions_deployment_reports_expected_traffic"
+    );
+    assert!(deploy.verification_contract_supported());
+    assert!(deploy.mutation_contract_gaps().is_empty());
+    for name in ["argument", "config", "message"] {
+        assert!(deploy.selectors.iter().any(|selector| {
+            selector.name == name && selector.location == "query" && selector.required
+        }));
+    }
+
+    let mut unsupported = normalize_openapi(&fixture()).expect("catalog");
+    ingest_wrangler_worker_versions_help(
+        &mut unsupported,
+        "4.107.0",
+        "wrangler versions upload [path]\nOPTIONS\n  --config\n",
+        "wrangler versions deploy [version-specs..]\nOPTIONS\n  --config\n  --message\n",
+    );
+    assert!(unsupported.get("wrangler.versions-upload").is_none());
+    assert!(unsupported.get("wrangler.versions-deploy").is_none());
 }
 
 #[test]
@@ -12895,9 +12952,7 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
         );
     }
     for required in [
-        "pre_recovery_anchor_operation_id",
         "pre_recovery_anchor_evidence_hash",
-        "pre_recovery_anchor_output_sha256",
         "pre_recovery_anchor_bookmark_hash",
     ] {
         assert!(encoded.contains(required), "missing governed `{required}`");
@@ -12910,6 +12965,68 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
             .is_some(),
         "0143 must name the exact bookmark captured by its governed post-0142 export"
     );
+}
+
+#[test]
+fn native_control_overlay_adds_seven_closed_osint_research_imports() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .get("d1-import-approved-osint-research-migration")
+        .expect("approved OSINT Research import");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Irreversible);
+    assert_eq!(capability.effect, EffectClass::DataWrite);
+    assert!(capability.mutating);
+    assert_eq!(capability.permissions, ["D1 Write"]);
+    assert_eq!(
+        capability.verification.strategy,
+        "osint_research_migration_schema_marker_is_present"
+    );
+    assert!(capability.verification_contract_supported());
+    assert!(capability.rollback.supported);
+    let contract = capability
+        .d1_approved_mln_import
+        .as_ref()
+        .expect("typed import contract");
+    assert_eq!(contract.account_id, "ca30e922fda7f5578e49873542e4aaca");
+    assert_eq!(contract.database_id, "1c1ce476-73ab-4dd6-a2e2-de0c155ade61");
+    assert_eq!(
+        contract.repository_id,
+        "github.com/rogu3bear/osint-research-center"
+    );
+    assert_eq!(
+        contract.repository_head,
+        "af3da8cd20d2f6acd0dd4948319d45dbe8561b53"
+    );
+    assert_eq!(
+        contract
+            .migrations
+            .iter()
+            .map(|migration| migration.migration_id.as_str())
+            .collect::<Vec<_>>(),
+        ["0028", "0029", "0030", "0031", "0032", "0033", "0034"]
+    );
+    let encoded = serde_json::to_string(capability).expect("capability JSON");
+    for forbidden in ["\"sql\"", "\"action\"", "\"etag\"", "\"filename\""] {
+        assert!(
+            !encoded.contains(forbidden),
+            "caller/provider control leaked into the closed import: {forbidden}"
+        );
+    }
+    for required in [
+        "pre_recovery_anchor_evidence_hash",
+        "pre_recovery_anchor_bookmark_hash",
+    ] {
+        assert!(encoded.contains(required), "missing governed `{required}`");
+    }
 }
 
 #[test]

@@ -1627,6 +1627,165 @@ pub fn ingest_wrangler_pages_deploy_help(
         .insert(capability.id.clone(), capability);
 }
 
+/// Add the two exact Worker Versions mutation commands only when the installed
+/// Wrangler help proves the command shapes and every control cfctl relies on.
+/// Keeping upload and traffic promotion separate lets operators review the
+/// inert artifact before granting a second authority to serve it.
+pub fn ingest_wrangler_worker_versions_help(
+    snapshot: &mut CatalogSnapshot,
+    version: &str,
+    upload_help: &str,
+    deploy_help: &str,
+) {
+    ingest_wrangler_versions_upload_help(snapshot, version, upload_help);
+    ingest_wrangler_versions_deploy_help(snapshot, version, deploy_help);
+}
+
+fn ingest_wrangler_versions_upload_help(
+    snapshot: &mut CatalogSnapshot,
+    version: &str,
+    upload_help: &str,
+) {
+    if ["wrangler versions upload [path]", "--config", "--message"]
+        .iter()
+        .all(|marker| upload_help.contains(marker))
+    {
+        let mut capability = CapabilityV1::new(
+            "wrangler.versions-upload",
+            "Upload an inert Cloudflare Worker version",
+            "POST",
+            "wrangler versions upload",
+        );
+        capability.source = format!("wrangler {version} versions upload help");
+        "CLI".clone_into(&mut capability.method);
+        "Cloudflare Workers".clone_into(&mut capability.product);
+        classify_wrangler_worker_versions_capability(&mut capability);
+        "wrangler_worker_version_reports_expected_message"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.warning = Some(
+            "the uploaded version is inert until separately promoted; automatic deletion of an uploaded version is not implemented"
+                .to_owned(),
+        );
+        capability.selectors = [
+            (
+                "config",
+                true,
+                "Absolute path to the reviewed Wrangler configuration",
+            ),
+            (
+                "message",
+                true,
+                "Reviewed source identity recorded on and verified against the uploaded version",
+            ),
+            (
+                "argument",
+                false,
+                "Optional Worker entry path resolved from the reviewed config directory",
+            ),
+            ("name", false, "Optional Worker name override"),
+        ]
+        .into_iter()
+        .map(|(name, required, description)| SelectorV1 {
+            name: name.to_owned(),
+            location: "query".to_owned(),
+            required,
+            value_type: "string".to_owned(),
+            description: Some(description.to_owned()),
+            contract: None,
+        })
+        .collect();
+        snapshot
+            .capabilities
+            .insert(capability.id.clone(), capability);
+    }
+}
+
+fn ingest_wrangler_versions_deploy_help(
+    snapshot: &mut CatalogSnapshot,
+    version: &str,
+    deploy_help: &str,
+) {
+    if [
+        "wrangler versions deploy [version-specs..]",
+        "--config",
+        "--message",
+        "--yes",
+    ]
+    .iter()
+    .all(|marker| deploy_help.contains(marker))
+    {
+        let mut capability = CapabilityV1::new(
+            "wrangler.versions-deploy",
+            "Promote one Cloudflare Worker version to all production traffic",
+            "POST",
+            "wrangler versions deploy --yes",
+        );
+        capability.source = format!("wrangler {version} versions deploy help");
+        "CLI".clone_into(&mut capability.method);
+        "Cloudflare Workers".clone_into(&mut capability.product);
+        classify_wrangler_worker_versions_capability(&mut capability);
+        "wrangler_worker_versions_deployment_reports_expected_traffic"
+            .clone_into(&mut capability.verification.strategy);
+        capability.rollback.warning = Some(
+            "rollback requires a separate reviewed versions-deploy plan that targets a known prior version at 100 percent"
+                .to_owned(),
+        );
+        capability.selectors = [
+            (
+                "argument",
+                true,
+                "Exactly one reviewed Worker version in UUID@100 form",
+            ),
+            (
+                "config",
+                true,
+                "Absolute path to the reviewed Wrangler configuration",
+            ),
+            (
+                "message",
+                true,
+                "Reviewed deployment reason recorded by Wrangler",
+            ),
+            ("name", false, "Optional Worker name override"),
+        ]
+        .into_iter()
+        .map(|(name, required, description)| SelectorV1 {
+            name: name.to_owned(),
+            location: "query".to_owned(),
+            required,
+            value_type: "string".to_owned(),
+            description: Some(description.to_owned()),
+            contract: None,
+        })
+        .collect();
+        snapshot
+            .capabilities
+            .insert(capability.id.clone(), capability);
+    }
+}
+
+fn classify_wrangler_worker_versions_capability(capability: &mut CapabilityV1) {
+    capability.adapter_status = AdapterStatus::DelegatedCli;
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost.known = true;
+    capability.cost.incremental = false;
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.basis = Some(
+        "creating or promoting a Worker version has no direct per-operation charge; a promoted Worker can create plan-specific downstream usage"
+            .to_owned(),
+    );
+    capability.cost.references = vec![KnowledgeReferenceV1 {
+        title: "Cloudflare Workers pricing".to_owned(),
+        url: "https://developers.cloudflare.com/workers/platform/pricing/".to_owned(),
+        source: "official Cloudflare docs".to_owned(),
+    }];
+    capability.verification.required = true;
+    capability.rollback.supported = false;
+}
+
 fn classify_delegated_cli_capability(capability: &mut CapabilityV1) {
     match capability.id.as_str() {
         "wrangler.deploy" => classify_wrangler_deploy_capability(capability),
@@ -1952,6 +2111,7 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
         d1_full_export_capability(),
         d1_restore_exact_bookmark_capability(),
         d1_import_approved_mln_migration_capability(),
+        d1_import_approved_osint_research_migration_capability(),
         d1_resume_approved_mln_import_poll_capability(),
     ]
     .into_boxed_slice()
@@ -2190,6 +2350,192 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
                 sha256: "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
                     .to_owned(),
                 md5: "bd50b7e05cc13c20f17eb8748472eb4b".to_owned(),
+            },
+        ],
+        max_response_bytes: 1024 * 1024,
+        max_poll_attempts: 120,
+        max_timeout_seconds: 30,
+        upload_url_suffix: ".r2.cloudflarestorage.com".to_owned(),
+        requires_create_new_mode_0600_stage: true,
+    });
+    capability
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the six-entry closed migration catalogue and recovery contract remain reviewable in one declaration"
+)]
+fn d1_import_approved_osint_research_migration_capability() -> CapabilityV1 {
+    let account_id = "ca30e922fda7f5578e49873542e4aaca";
+    let database_id = "1c1ce476-73ab-4dd6-a2e2-de0c155ade61";
+    let hash = serde_json::json!({
+        "type":"string","pattern":"^sha256:[0-9a-f]{64}$","minLength":71,"maxLength":71
+    });
+    let mut capability = CapabilityV1::new(
+        "d1-import-approved-osint-research-migration",
+        "Import one approved OSINT Research Center migration",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/import",
+    );
+    capability.description = Some(
+        "Stage and import exactly one reviewed OSINT Research Center migration from 0028 through 0034. The adapter pins the private repository, clean release HEAD, relative path, Git blob, source hashes, account, and database. Every plan requires one governed current time-travel bookmark read created before the plan, and execution closes only after a compiler-owned schema-marker readback proves that exact migration's durable effect. No caller SQL or provider protocol control is accepted."
+            .to_owned(),
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native closed OSINT Research Center migration import adapter"
+        .clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![
+        "apply OSINT Research migration".to_owned(),
+        "migrate OSINT Research Center D1".to_owned(),
+        "apply Research migrations 0028 through 0034".to_owned(),
+    ];
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.mutating = true;
+    capability.risk = RiskClass::Irreversible;
+    capability.effect = EffectClass::DataWrite;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: Some(0.0),
+        basis: Some(
+            "D1 import and schema readback have no incremental operation charge; ordinary D1 storage, rows-written, and rows-read accounting remains"
+                .to_owned(),
+        ),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![KnowledgeReferenceV1 {
+            title: "D1 pricing".to_owned(),
+            url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        }],
+    };
+    capability.entitlement.available = Some(true);
+    capability.verification.required = true;
+    "osint_research_migration_schema_marker_is_present"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("no_automatic_rollback_use_separately_approved_bookmark_restore".to_owned());
+    capability.rollback.warning = Some(
+        "There is no automatic rollback. Recovery requires a separately planned and approved exact-bookmark restore to the bound pre-migration time-travel bookmark after quiescence and impact review."
+            .to_owned(),
+    );
+    capability.selectors = [("account_id", account_id), ("database_id", database_id)]
+        .map(|(name, value)| SelectorV1 {
+            name: name.to_owned(),
+            location: "path".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some(format!("Pinned OSINT Research Center {name}.")),
+            contract: Some(SelectorContractV1 {
+                schema: serde_json::json!({"type":"string","enum":[value]}),
+                query: None,
+            }),
+        })
+        .to_vec();
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object","additionalProperties":false,"x-cfctl-body-required":true,
+        "required":[
+            "migration_id","pre_recovery_anchor_evidence_hash",
+            "pre_recovery_anchor_bookmark_hash"
+        ],
+        "properties":{
+            "migration_id":{"type":"string","enum":["0028","0029","0030","0031","0032","0033","0034"]},
+            "pre_recovery_anchor_evidence_hash":hash,
+            "pre_recovery_anchor_bookmark_hash":hash
+        }
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_approved_mln_import = Some(cfctl_core::D1ApprovedMlnImportContractV1 {
+        repository_id: "github.com/rogu3bear/osint-research-center".to_owned(),
+        repository_head: "af3da8cd20d2f6acd0dd4948319d45dbe8561b53".to_owned(),
+        pre_import_capability_version: 0,
+        pre_import_validator_contract_hash: String::new(),
+        pre_import_fixed_query_sha256: String::new(),
+        account_id: account_id.to_owned(),
+        database_id: database_id.to_owned(),
+        import_path: capability.path.clone(),
+        migrations: vec![
+            cfctl_core::D1ApprovedMlnMigrationV1 {
+                migration_id: "0028".to_owned(),
+                basename: "0028_founder_people_handoff.sql".to_owned(),
+                repository_relative_path: "migrations/d1/0028_founder_people_handoff.sql"
+                    .to_owned(),
+                git_blob_oid: "d463d2223051da863ac468e92914fbf88debd1fa".to_owned(),
+                bytes: 2_853,
+                sha256: "a2ac89e3db1efed7fcb4d07637e713f49c508164a127cdf1d2a81a60c86a2ae0"
+                    .to_owned(),
+                md5: "653f14485ff316a6573252abeff0e605".to_owned(),
+            },
+            cfctl_core::D1ApprovedMlnMigrationV1 {
+                migration_id: "0029".to_owned(),
+                basename: "0029_research_lifecycle_authority.sql".to_owned(),
+                repository_relative_path: "migrations/d1/0029_research_lifecycle_authority.sql"
+                    .to_owned(),
+                git_blob_oid: "7e42628430d1847e636a268a6dc6f2352f9574d8".to_owned(),
+                bytes: 7_057,
+                sha256: "597ed8cca3965ad83126f2853996f1ff3f1a77fadf3f080dcd3d330e53126e9b"
+                    .to_owned(),
+                md5: "79c69abe2e316c758918c1d77dd8e6ee".to_owned(),
+            },
+            cfctl_core::D1ApprovedMlnMigrationV1 {
+                migration_id: "0030".to_owned(),
+                basename: "0030_operator_live_proof.sql".to_owned(),
+                repository_relative_path: "migrations/d1/0030_operator_live_proof.sql".to_owned(),
+                git_blob_oid: "5f021f1d811bbf0baf7ab4f5388895a1ff58b7f0".to_owned(),
+                bytes: 1_961,
+                sha256: "333e78871eaa036ade54481b1d036d20dadfa33bec3cf1a707c849dd59f13b19"
+                    .to_owned(),
+                md5: "125f2558dc535debc05a20d215b06029".to_owned(),
+            },
+            cfctl_core::D1ApprovedMlnMigrationV1 {
+                migration_id: "0031".to_owned(),
+                basename: "0031_job_retry_authority.sql".to_owned(),
+                repository_relative_path: "migrations/d1/0031_job_retry_authority.sql".to_owned(),
+                git_blob_oid: "f5742a397eade5526a42f6719d67c6a91b93a166".to_owned(),
+                bytes: 448,
+                sha256: "285eb5451cec6c6dcd316f7237d58179f76e55565e43a0e12232d1d9ff240465"
+                    .to_owned(),
+                md5: "7a75624927e38519d8b451a87a7d8aeb".to_owned(),
+            },
+            cfctl_core::D1ApprovedMlnMigrationV1 {
+                migration_id: "0032".to_owned(),
+                basename: "0032_durable_action_receipts.sql".to_owned(),
+                repository_relative_path: "migrations/d1/0032_durable_action_receipts.sql"
+                    .to_owned(),
+                git_blob_oid: "161a19a300ce8596bde864136deaa1acf839ba3f".to_owned(),
+                bytes: 1_284,
+                sha256: "9727c9382f521d0e8a659a022a5440f6ef556c33a5efbfb71a78430ccc62b183"
+                    .to_owned(),
+                md5: "09ffafb383ba2cdbff7d769b5bba2819".to_owned(),
+            },
+            cfctl_core::D1ApprovedMlnMigrationV1 {
+                migration_id: "0033".to_owned(),
+                basename: "0033_deployment_authority.sql".to_owned(),
+                repository_relative_path: "migrations/d1/0033_deployment_authority.sql".to_owned(),
+                git_blob_oid: "bc91f79798399f92bb26421521d755ddac7c7ba4".to_owned(),
+                bytes: 2_170,
+                sha256: "183910767ab00b7a41bc2fb9f3f54f4db2978e779204a823509d20abf146bb9e"
+                    .to_owned(),
+                md5: "0c2da569b6e9dc9125667830174a6fbc".to_owned(),
+            },
+            cfctl_core::D1ApprovedMlnMigrationV1 {
+                migration_id: "0034".to_owned(),
+                basename: "0034_audit_hash_authority.sql".to_owned(),
+                repository_relative_path: "migrations/d1/0034_audit_hash_authority.sql".to_owned(),
+                git_blob_oid: "8015fac654607ac7f43f104236243e852fddc300".to_owned(),
+                bytes: 2_901,
+                sha256: "0240b298382402198043369f9afe3f8fdb353ecc16e22e669e644e5faeb58710"
+                    .to_owned(),
+                md5: "88bd54cd5a408fe3234513af4abd3d8d".to_owned(),
             },
         ],
         max_response_bytes: 1024 * 1024,

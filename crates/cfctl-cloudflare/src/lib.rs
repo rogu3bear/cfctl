@@ -3029,6 +3029,11 @@ impl Executor {
                 .verify_d1_restore_exact_bookmark(plan, apply_response, input, credential)
                 .await;
         }
+        if strategy == "osint_research_migration_schema_marker_is_present" {
+            return self
+                .verify_osint_research_migration(plan, apply_response, input, credential)
+                .await;
+        }
         if strategy.starts_with("api_token_details_") {
             return self
                 .verify_api_token(plan, apply_response, input, credential)
@@ -3175,6 +3180,63 @@ impl Executor {
                     "D1 post-restore bookmark `{post_bookmark}` did not equal returned restore bookmark `{returned_bookmark}`"
                 )
             },
+            readback,
+            correlated_resource_id: None,
+        })
+    }
+
+    async fn verify_osint_research_migration(
+        &self,
+        plan: &PlanV1,
+        apply_response: &CloudflareResponseV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<OperationVerificationV1> {
+        let migration_id = input
+            .body
+            .as_ref()
+            .and_then(|body| body.get("migration_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CloudflareError::MissingVerificationTarget(
+                    "OSINT Research migration id is missing from the exact plan".to_owned(),
+                )
+            })?;
+        let sql = osint_research_schema_marker_sql(migration_id)?;
+        let mut marker_capability = CapabilityV1::new(
+            "cfctl-private-osint-research-schema-marker",
+            "Read one OSINT Research migration schema marker",
+            "POST",
+            "/accounts/{account_id}/d1/database/{database_id}/query",
+        );
+        "D1".clone_into(&mut marker_capability.product);
+        "account".clone_into(&mut marker_capability.account_scope);
+        marker_capability.permissions = vec!["D1 Read".to_owned()];
+        marker_capability.selectors = plan.capability.selectors.clone();
+        marker_capability.response_contract = plan.capability.response_contract.clone();
+        let mut request = self.builder.build(
+            &marker_capability,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: serde_json::json!({}),
+                body: Some(serde_json::json!({"sql":sql,"params":[]})),
+                ..CallInput::default()
+            },
+        )?;
+        request.max_rows = 1;
+        request.max_bytes = 64 * 1024;
+        request.timeout_seconds = 10;
+        let readback = self.send(&request, credential).await?;
+        let marker_present = osint_research_schema_marker_present(&readback);
+        let passed =
+            apply_response.success && readback.status == 200 && readback.success && marker_present;
+        Ok(OperationVerificationV1 {
+            strategy: plan.capability.verification.strategy.clone(),
+            passed,
+            basis: format!(
+                "OSINT Research migration {migration_id} schema-marker proof (provider import success={}, readback HTTP {}, readback success={}, marker present={marker_present})",
+                apply_response.success, readback.status, readback.success
+            ),
             readback,
             correlated_resource_id: None,
         })
@@ -8884,6 +8946,93 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
     }
 }
 
+fn osint_research_schema_marker_sql(migration_id: &str) -> Result<&'static str> {
+    match migration_id {
+        "0028" => Ok(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'founder_people_proposal_deliveries') AS present",
+        ),
+        "0029" => Ok(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('claims') WHERE name = 'lifecycle_state') AS present",
+        ),
+        "0030" => Ok(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'operator_live_proofs') AS present",
+        ),
+        "0031" => Ok(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('jobs') WHERE name = 'retry_of_job_id') AS present",
+        ),
+        "0032" => Ok(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = 'trg_actor_actions_completed_requires_receipt_key') AS present",
+        ),
+        "0033" => Ok(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'deployment_records') AS present",
+        ),
+        "0034" => Ok(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('audit_events') WHERE name = 'hash_version') AS present",
+        ),
+        _ => Err(CloudflareError::MissingVerificationTarget(
+            "OSINT Research migration is absent from the closed schema-marker catalogue".to_owned(),
+        )),
+    }
+}
+
+fn osint_research_schema_marker_present(readback: &CloudflareResponseV1) -> bool {
+    readback.status == 200
+        && readback.success
+        && readback
+            .result
+            .pointer("/0/results/0/present")
+            .and_then(Value::as_i64)
+            == Some(1)
+}
+
+#[cfg(test)]
+mod osint_research_schema_marker_tests {
+    use super::{
+        CloudflareResponseV1, osint_research_schema_marker_present,
+        osint_research_schema_marker_sql,
+    };
+    use serde_json::{Value, json};
+
+    fn readback(status: u16, success: bool, present: Value) -> CloudflareResponseV1 {
+        CloudflareResponseV1 {
+            status,
+            success,
+            result: json!([{"results":[{"present":present}]}]),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        }
+    }
+
+    #[test]
+    fn every_closed_migration_has_one_compiler_owned_marker_query() {
+        for migration_id in ["0028", "0029", "0030", "0031", "0032", "0033", "0034"] {
+            let sql = osint_research_schema_marker_sql(migration_id).unwrap_or_default();
+            assert!(sql.starts_with("SELECT EXISTS("));
+            assert!(sql.ends_with(" AS present"));
+        }
+        assert!(osint_research_schema_marker_sql("0027").is_err());
+    }
+
+    #[test]
+    fn marker_requires_exact_successful_single_present_result() {
+        assert!(osint_research_schema_marker_present(&readback(
+            200,
+            true,
+            json!(1)
+        )));
+        for response in [
+            readback(500, true, json!(1)),
+            readback(200, false, json!(1)),
+            readback(200, true, json!(0)),
+            readback(200, true, json!(true)),
+        ] {
+            assert!(!osint_research_schema_marker_present(&response));
+        }
+    }
+}
+
 fn validate_async_list_mutation_target(capability: &CapabilityV1, input: &CallInput) -> Result<()> {
     let selectors = input.selectors.as_object().ok_or_else(|| {
         CloudflareError::MissingVerificationTarget(
@@ -9997,6 +10146,9 @@ fn validate_d1_approved_mln_import_contract(
     let Some(contract) = capability.d1_approved_mln_import.as_ref() else {
         return Ok(());
     };
+    if capability.id == "d1-import-approved-osint-research-migration" {
+        return validate_d1_approved_osint_research_import_contract(capability, input, contract);
+    }
     let body = input.body.as_ref().and_then(Value::as_object);
     let migration_id = body
         .and_then(|body| body.get("migration_id"))
@@ -10092,6 +10244,160 @@ fn validate_d1_approved_mln_import_contract(
     if !supported {
         return Err(CloudflareError::InvalidRequestBody(
             "approved MLN import identity, target, closed prerequisites, or bounds drifted"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the seven pinned source identities and runtime invariants remain visible in one fail-closed validator"
+)]
+fn validate_d1_approved_osint_research_import_contract(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    contract: &cfctl_core::D1ApprovedMlnImportContractV1,
+) -> Result<()> {
+    let body = input.body.as_ref().and_then(Value::as_object);
+    let migration_id = body
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str);
+    let keys = body
+        .map(|body| body.keys().map(String::as_str).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let expected_keys = [
+        "migration_id",
+        "pre_recovery_anchor_evidence_hash",
+        "pre_recovery_anchor_bookmark_hash",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let expected_migrations = [
+        (
+            "0028",
+            "0028_founder_people_handoff.sql",
+            "migrations/d1/0028_founder_people_handoff.sql",
+            "d463d2223051da863ac468e92914fbf88debd1fa",
+            2_853,
+            "a2ac89e3db1efed7fcb4d07637e713f49c508164a127cdf1d2a81a60c86a2ae0",
+            "653f14485ff316a6573252abeff0e605",
+        ),
+        (
+            "0029",
+            "0029_research_lifecycle_authority.sql",
+            "migrations/d1/0029_research_lifecycle_authority.sql",
+            "7e42628430d1847e636a268a6dc6f2352f9574d8",
+            7_057,
+            "597ed8cca3965ad83126f2853996f1ff3f1a77fadf3f080dcd3d330e53126e9b",
+            "79c69abe2e316c758918c1d77dd8e6ee",
+        ),
+        (
+            "0030",
+            "0030_operator_live_proof.sql",
+            "migrations/d1/0030_operator_live_proof.sql",
+            "5f021f1d811bbf0baf7ab4f5388895a1ff58b7f0",
+            1_961,
+            "333e78871eaa036ade54481b1d036d20dadfa33bec3cf1a707c849dd59f13b19",
+            "125f2558dc535debc05a20d215b06029",
+        ),
+        (
+            "0031",
+            "0031_job_retry_authority.sql",
+            "migrations/d1/0031_job_retry_authority.sql",
+            "f5742a397eade5526a42f6719d67c6a91b93a166",
+            448,
+            "285eb5451cec6c6dcd316f7237d58179f76e55565e43a0e12232d1d9ff240465",
+            "7a75624927e38519d8b451a87a7d8aeb",
+        ),
+        (
+            "0032",
+            "0032_durable_action_receipts.sql",
+            "migrations/d1/0032_durable_action_receipts.sql",
+            "161a19a300ce8596bde864136deaa1acf839ba3f",
+            1_284,
+            "9727c9382f521d0e8a659a022a5440f6ef556c33a5efbfb71a78430ccc62b183",
+            "09ffafb383ba2cdbff7d769b5bba2819",
+        ),
+        (
+            "0033",
+            "0033_deployment_authority.sql",
+            "migrations/d1/0033_deployment_authority.sql",
+            "bc91f79798399f92bb26421521d755ddac7c7ba4",
+            2_170,
+            "183910767ab00b7a41bc2fb9f3f54f4db2978e779204a823509d20abf146bb9e",
+            "0c2da569b6e9dc9125667830174a6fbc",
+        ),
+        (
+            "0034",
+            "0034_audit_hash_authority.sql",
+            "migrations/d1/0034_audit_hash_authority.sql",
+            "8015fac654607ac7f43f104236243e852fddc300",
+            2_901,
+            "0240b298382402198043369f9afe3f8fdb353ecc16e22e669e644e5faeb58710",
+            "88bd54cd5a408fe3234513af4abd3d8d",
+        ),
+    ];
+    let migration_catalog_matches = contract.migrations.len() == expected_migrations.len()
+        && contract.migrations.iter().zip(expected_migrations).all(
+            |(actual, (id, basename, path, blob, bytes, sha256, md5))| {
+                actual.migration_id == id
+                    && actual.basename == basename
+                    && actual.repository_relative_path == path
+                    && actual.git_blob_oid == blob
+                    && actual.bytes == bytes
+                    && actual.sha256 == sha256
+                    && actual.md5 == md5
+            },
+        );
+    let supported = capability.method == "POST"
+        && capability.path == "/accounts/{account_id}/d1/database/{database_id}/import"
+        && capability.path == contract.import_path
+        && capability.product == "D1"
+        && capability.account_scope == "account"
+        && capability.adapter_status == AdapterStatus::Native
+        && capability.mutating
+        && capability.risk == RiskClass::Irreversible
+        && capability.effect == cfctl_core::EffectClass::DataWrite
+        && capability.permissions == ["D1 Write"]
+        && capability.verification.strategy == "osint_research_migration_schema_marker_is_present"
+        && input.selectors.get("account_id").and_then(Value::as_str)
+            == Some(contract.account_id.as_str())
+        && input.selectors.get("database_id").and_then(Value::as_str)
+            == Some(contract.database_id.as_str())
+        && migration_id.is_some_and(|id| {
+            matches!(
+                id,
+                "0028" | "0029" | "0030" | "0031" | "0032" | "0033" | "0034"
+            )
+        })
+        && keys == expected_keys
+        && contract.repository_id == "github.com/rogu3bear/osint-research-center"
+        && contract.repository_head == "af3da8cd20d2f6acd0dd4948319d45dbe8561b53"
+        && contract.pre_import_capability_version == 0
+        && contract.pre_import_validator_contract_hash.is_empty()
+        && contract.pre_import_fixed_query_sha256.is_empty()
+        && contract.account_id == "ca30e922fda7f5578e49873542e4aaca"
+        && contract.database_id == "1c1ce476-73ab-4dd6-a2e2-de0c155ade61"
+        && migration_catalog_matches
+        && contract.requires_create_new_mode_0600_stage
+        && contract.upload_url_suffix == ".r2.cloudflarestorage.com"
+        && (1..=1024 * 1024).contains(&contract.max_response_bytes)
+        && (1..=120).contains(&contract.max_poll_attempts)
+        && (1..=30).contains(&contract.max_timeout_seconds)
+        && capability.analytics_query.is_none()
+        && capability.d1_schema_introspection.is_none()
+        && capability.mln_0143_data_invariants.is_none()
+        && capability.d1_full_export.is_none()
+        && capability.d1_restore_exact_bookmark.is_none()
+        && capability.r2_log_retrieval.is_none()
+        && input
+            .query
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+    if !supported {
+        return Err(CloudflareError::InvalidRequestBody(
+            "approved OSINT Research Center import identity, target, closed prerequisites, or bounds drifted"
                 .to_owned(),
         ));
     }
@@ -10353,7 +10659,11 @@ fn accepted_d1_import_init_response(response: &CloudflareResponseV1) -> Result<(
         response.result.get("status"),
         response.result.get("success"),
     ];
-    if nested.iter().all(std::option::Option::is_none) {
+    if nested.iter().all(std::option::Option::is_none)
+        || (nested[0].is_none()
+            && nested[1].is_none()
+            && response.result.get("success").and_then(Value::as_bool) == Some(true))
+    {
         return Ok(());
     }
     let valid = response.result.get("type").and_then(Value::as_str) == Some("import")
@@ -10867,6 +11177,14 @@ mod approved_mln_import_tests {
 
         assert!(
             accepted_d1_import_init_response(&response(json!({
+                "filename":"upload.sql",
+                "upload_url":"https://redacted.invalid"
+            })))
+            .is_ok()
+        );
+        assert!(
+            accepted_d1_import_init_response(&response(json!({
+                "success":true,
                 "filename":"upload.sql",
                 "upload_url":"https://redacted.invalid"
             })))
