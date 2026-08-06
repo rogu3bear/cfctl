@@ -13004,7 +13004,7 @@ fn native_control_overlay_adds_seven_closed_osint_research_imports() {
     );
     assert_eq!(
         contract.repository_head,
-        "9d4c991fba13cddfa03ea60fc9f97cd5c1774e1d"
+        "af3da8cd20d2f6acd0dd4948319d45dbe8561b53"
     );
     assert_eq!(
         contract

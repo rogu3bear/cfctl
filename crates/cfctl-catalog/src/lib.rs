@@ -2456,7 +2456,7 @@ fn d1_import_approved_osint_research_migration_capability() -> CapabilityV1 {
     });
     capability.d1_approved_mln_import = Some(cfctl_core::D1ApprovedMlnImportContractV1 {
         repository_id: "github.com/rogu3bear/osint-research-center".to_owned(),
-        repository_head: "9d4c991fba13cddfa03ea60fc9f97cd5c1774e1d".to_owned(),
+        repository_head: "af3da8cd20d2f6acd0dd4948319d45dbe8561b53".to_owned(),
         pre_import_capability_version: 0,
         pre_import_validator_contract_hash: String::new(),
         pre_import_fixed_query_sha256: String::new(),

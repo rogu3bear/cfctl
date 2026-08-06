@@ -10373,7 +10373,7 @@ fn validate_d1_approved_osint_research_import_contract(
         })
         && keys == expected_keys
         && contract.repository_id == "github.com/rogu3bear/osint-research-center"
-        && contract.repository_head == "9d4c991fba13cddfa03ea60fc9f97cd5c1774e1d"
+        && contract.repository_head == "af3da8cd20d2f6acd0dd4948319d45dbe8561b53"
         && contract.pre_import_capability_version == 0
         && contract.pre_import_validator_contract_hash.is_empty()
         && contract.pre_import_fixed_query_sha256.is_empty()
