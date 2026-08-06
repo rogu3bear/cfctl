@@ -13030,6 +13030,78 @@ fn native_control_overlay_adds_seven_closed_osint_research_imports() {
 }
 
 #[test]
+fn native_control_overlay_adds_one_closed_under_the_sun_farm_import() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: std::collections::BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let capability = snapshot
+        .get("d1-import-approved-under-the-sun-farm-migration")
+        .expect("approved Under the Sun Farm import");
+    assert_eq!(capability.adapter_status, AdapterStatus::Native);
+    assert_eq!(capability.risk, RiskClass::Irreversible);
+    assert_eq!(capability.effect, EffectClass::DataWrite);
+    assert!(capability.mutating);
+    assert_eq!(capability.permissions, ["D1 Write"]);
+    assert_eq!(capability.cost.maximum, Some(0.0));
+    assert_eq!(
+        capability.verification.strategy,
+        "under_the_sun_farm_owner_editorial_schema_is_present"
+    );
+    assert!(capability.verification_contract_supported());
+    assert!(capability.rollback.supported);
+    let contract = capability
+        .d1_approved_mln_import
+        .as_ref()
+        .expect("typed import contract");
+    assert_eq!(contract.account_id, "ca30e922fda7f5578e49873542e4aaca");
+    assert_eq!(contract.database_id, "2a220ff3-f718-430e-a45f-b0d186a46193");
+    assert_eq!(
+        contract.repository_id,
+        "github.com/rogu3bear/under-the-sun-farm"
+    );
+    assert_eq!(
+        contract.repository_head,
+        "a74727c9c4aa4b4a2c4165d5f6b231206e61c59c"
+    );
+    assert_eq!(contract.migrations.len(), 1);
+    let migration = &contract.migrations[0];
+    assert_eq!(migration.migration_id, "0001");
+    assert_eq!(
+        migration.repository_relative_path,
+        "migrations/0001_owner_editorial.sql"
+    );
+    assert_eq!(
+        migration.git_blob_oid,
+        "39a9649f6400a4bcc0952d8b5decf1826a05c4b9"
+    );
+    assert_eq!(migration.bytes, 2_172);
+    assert_eq!(
+        migration.sha256,
+        "ec46d7d650af305b47f00a71ff0f19df02767fcccbd8245d3173a5808bde8c1f"
+    );
+    assert_eq!(migration.md5, "ed8027ce4c8de209c9752eccdab46c64");
+    let encoded = serde_json::to_string(capability).expect("capability JSON");
+    for forbidden in ["\"sql\"", "\"action\"", "\"etag\"", "\"filename\""] {
+        assert!(
+            !encoded.contains(forbidden),
+            "caller/provider control leaked into the closed import: {forbidden}"
+        );
+    }
+    for required in [
+        "pre_recovery_anchor_evidence_hash",
+        "pre_recovery_anchor_bookmark_hash",
+    ] {
+        assert!(encoded.contains(required), "missing governed `{required}`");
+    }
+}
+
+#[test]
 fn native_control_overlay_adds_closed_poll_only_mln_import_continuation() {
     let mut snapshot = CatalogSnapshot {
         schema_version: 1,
