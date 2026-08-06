@@ -8966,6 +8966,9 @@ fn osint_research_schema_marker_sql(migration_id: &str) -> Result<&'static str> 
         "0033" => Ok(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'deployment_records') AS present",
         ),
+        "0034" => Ok(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('audit_events') WHERE name = 'hash_version') AS present",
+        ),
         _ => Err(CloudflareError::MissingVerificationTarget(
             "OSINT Research migration is absent from the closed schema-marker catalogue".to_owned(),
         )),
@@ -9004,13 +9007,12 @@ mod osint_research_schema_marker_tests {
 
     #[test]
     fn every_closed_migration_has_one_compiler_owned_marker_query() {
-        for migration_id in ["0028", "0029", "0030", "0031", "0032", "0033"] {
+        for migration_id in ["0028", "0029", "0030", "0031", "0032", "0033", "0034"] {
             let sql = osint_research_schema_marker_sql(migration_id).unwrap_or_default();
             assert!(sql.starts_with("SELECT EXISTS("));
             assert!(sql.ends_with(" AS present"));
         }
         assert!(osint_research_schema_marker_sql("0027").is_err());
-        assert!(osint_research_schema_marker_sql("0034").is_err());
     }
 
     #[test]
@@ -10250,7 +10252,7 @@ fn validate_d1_approved_mln_import_contract(
 
 #[expect(
     clippy::too_many_lines,
-    reason = "the six pinned source identities and runtime invariants remain visible in one fail-closed validator"
+    reason = "the seven pinned source identities and runtime invariants remain visible in one fail-closed validator"
 )]
 fn validate_d1_approved_osint_research_import_contract(
     capability: &CapabilityV1,
@@ -10326,6 +10328,15 @@ fn validate_d1_approved_osint_research_import_contract(
             "183910767ab00b7a41bc2fb9f3f54f4db2978e779204a823509d20abf146bb9e",
             "0c2da569b6e9dc9125667830174a6fbc",
         ),
+        (
+            "0034",
+            "0034_audit_hash_authority.sql",
+            "migrations/d1/0034_audit_hash_authority.sql",
+            "8015fac654607ac7f43f104236243e852fddc300",
+            2_901,
+            "0240b298382402198043369f9afe3f8fdb353ecc16e22e669e644e5faeb58710",
+            "88bd54cd5a408fe3234513af4abd3d8d",
+        ),
     ];
     let migration_catalog_matches = contract.migrations.len() == expected_migrations.len()
         && contract.migrations.iter().zip(expected_migrations).all(
@@ -10354,11 +10365,15 @@ fn validate_d1_approved_osint_research_import_contract(
             == Some(contract.account_id.as_str())
         && input.selectors.get("database_id").and_then(Value::as_str)
             == Some(contract.database_id.as_str())
-        && migration_id
-            .is_some_and(|id| matches!(id, "0028" | "0029" | "0030" | "0031" | "0032" | "0033"))
+        && migration_id.is_some_and(|id| {
+            matches!(
+                id,
+                "0028" | "0029" | "0030" | "0031" | "0032" | "0033" | "0034"
+            )
+        })
         && keys == expected_keys
         && contract.repository_id == "github.com/rogu3bear/osint-research-center"
-        && contract.repository_head == "a737e4f88653e93ce16965482681964b5820605b"
+        && contract.repository_head == "9d4c991fba13cddfa03ea60fc9f97cd5c1774e1d"
         && contract.pre_import_capability_version == 0
         && contract.pre_import_validator_contract_hash.is_empty()
         && contract.pre_import_fixed_query_sha256.is_empty()

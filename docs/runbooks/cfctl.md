@@ -382,7 +382,7 @@ database unavailable while producing a large export, so capture the snapshot
 in the migration window. The receipt proves only the local pre-migration
 snapshot; importing or applying it is a separate protected workflow.
 
-OSINT Research Center migrations 0028 through 0033 use the narrower
+OSINT Research Center migrations 0028 through 0034 use the narrower
 `d1-import-approved-osint-research-migration` adapter. It pins account
 `ca30e922fda7f5578e49873542e4aaca`, database
 `1c1ce476-73ab-4dd6-a2e2-de0c155ade61`, repository

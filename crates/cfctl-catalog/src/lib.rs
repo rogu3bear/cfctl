@@ -2378,7 +2378,7 @@ fn d1_import_approved_osint_research_migration_capability() -> CapabilityV1 {
         "/accounts/{account_id}/d1/database/{database_id}/import",
     );
     capability.description = Some(
-        "Stage and import exactly one reviewed OSINT Research Center migration from 0028 through 0033. The adapter pins the private repository, clean release HEAD, relative path, Git blob, source hashes, account, and database. Every plan requires one governed current time-travel bookmark read created before the plan, and execution closes only after a compiler-owned schema-marker readback proves that exact migration's durable effect. No caller SQL or provider protocol control is accepted."
+        "Stage and import exactly one reviewed OSINT Research Center migration from 0028 through 0034. The adapter pins the private repository, clean release HEAD, relative path, Git blob, source hashes, account, and database. Every plan requires one governed current time-travel bookmark read created before the plan, and execution closes only after a compiler-owned schema-marker readback proves that exact migration's durable effect. No caller SQL or provider protocol control is accepted."
             .to_owned(),
     );
     "D1".clone_into(&mut capability.product);
@@ -2388,7 +2388,7 @@ fn d1_import_approved_osint_research_migration_capability() -> CapabilityV1 {
     capability.aliases = vec![
         "apply OSINT Research migration".to_owned(),
         "migrate OSINT Research Center D1".to_owned(),
-        "apply Research migrations 0028 through 0033".to_owned(),
+        "apply Research migrations 0028 through 0034".to_owned(),
     ];
     capability.permissions = vec!["D1 Write".to_owned()];
     capability.mutating = true;
@@ -2444,7 +2444,7 @@ fn d1_import_approved_osint_research_migration_capability() -> CapabilityV1 {
             "pre_recovery_anchor_bookmark_hash"
         ],
         "properties":{
-            "migration_id":{"type":"string","enum":["0028","0029","0030","0031","0032","0033"]},
+            "migration_id":{"type":"string","enum":["0028","0029","0030","0031","0032","0033","0034"]},
             "pre_recovery_anchor_evidence_hash":hash,
             "pre_recovery_anchor_bookmark_hash":hash
         }
@@ -2456,7 +2456,7 @@ fn d1_import_approved_osint_research_migration_capability() -> CapabilityV1 {
     });
     capability.d1_approved_mln_import = Some(cfctl_core::D1ApprovedMlnImportContractV1 {
         repository_id: "github.com/rogu3bear/osint-research-center".to_owned(),
-        repository_head: "a737e4f88653e93ce16965482681964b5820605b".to_owned(),
+        repository_head: "9d4c991fba13cddfa03ea60fc9f97cd5c1774e1d".to_owned(),
         pre_import_capability_version: 0,
         pre_import_validator_contract_hash: String::new(),
         pre_import_fixed_query_sha256: String::new(),
@@ -2526,6 +2526,16 @@ fn d1_import_approved_osint_research_migration_capability() -> CapabilityV1 {
                 sha256: "183910767ab00b7a41bc2fb9f3f54f4db2978e779204a823509d20abf146bb9e"
                     .to_owned(),
                 md5: "0c2da569b6e9dc9125667830174a6fbc".to_owned(),
+            },
+            cfctl_core::D1ApprovedMlnMigrationV1 {
+                migration_id: "0034".to_owned(),
+                basename: "0034_audit_hash_authority.sql".to_owned(),
+                repository_relative_path: "migrations/d1/0034_audit_hash_authority.sql".to_owned(),
+                git_blob_oid: "8015fac654607ac7f43f104236243e852fddc300".to_owned(),
+                bytes: 2_901,
+                sha256: "0240b298382402198043369f9afe3f8fdb353ecc16e22e669e644e5faeb58710"
+                    .to_owned(),
+                md5: "88bd54cd5a408fe3234513af4abd3d8d".to_owned(),
             },
         ],
         max_response_bytes: 1024 * 1024,

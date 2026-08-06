@@ -12968,7 +12968,7 @@ fn native_control_overlay_adds_only_the_two_digest_pinned_mln_imports() {
 }
 
 #[test]
-fn native_control_overlay_adds_six_closed_osint_research_imports() {
+fn native_control_overlay_adds_seven_closed_osint_research_imports() {
     let mut snapshot = CatalogSnapshot {
         schema_version: 1,
         generated_at: Utc::now(),
@@ -13004,7 +13004,7 @@ fn native_control_overlay_adds_six_closed_osint_research_imports() {
     );
     assert_eq!(
         contract.repository_head,
-        "a737e4f88653e93ce16965482681964b5820605b"
+        "9d4c991fba13cddfa03ea60fc9f97cd5c1774e1d"
     );
     assert_eq!(
         contract
@@ -13012,7 +13012,7 @@ fn native_control_overlay_adds_six_closed_osint_research_imports() {
             .iter()
             .map(|migration| migration.migration_id.as_str())
             .collect::<Vec<_>>(),
-        ["0028", "0029", "0030", "0031", "0032", "0033"]
+        ["0028", "0029", "0030", "0031", "0032", "0033", "0034"]
     );
     let encoded = serde_json::to_string(capability).expect("capability JSON");
     for forbidden in ["\"sql\"", "\"action\"", "\"etag\"", "\"filename\""] {
