@@ -603,6 +603,34 @@ working directory. `cfctl doctor --json` projects this boundary under
 `result.delegated_cli_environment` so deploy wrappers can fail closed when an
 older cfctl build does not preserve it.
 
+For Worker code-only publication, keep artifact creation and production
+traffic promotion as two independently reviewed plans. The upload verifier
+reads the returned Worker version and requires both its exact ID and reviewed
+message; it does not change production traffic:
+
+```bash
+cfctl call wrangler.versions-upload \
+  --query config=/absolute/path/to/wrangler.toml \
+  --query message='release <full-source-sha>' \
+  --json
+```
+
+After reviewing that verified version ID, create a second plan that targets
+exactly one version at all traffic. Other percentages, multiple targets, and
+relative config paths fail closed:
+
+```bash
+cfctl call wrangler.versions-deploy \
+  --query argument=<worker-version-uuid>@100 \
+  --query config=/absolute/path/to/wrangler.toml \
+  --query message='promote release <full-source-sha>' \
+  --json
+```
+
+Promotion verification reads Wrangler's production deployment status and
+requires the planned version at 100 percent. Rolling back remains a separate
+reviewed `wrangler.versions-deploy` plan targeting a known prior version.
+
 For a Cloudflare Pages direct upload, use the exact
 `wrangler.pages-deploy` capability rather than the aggregate
 `wrangler.pages` command. Bind the built directory, existing project,

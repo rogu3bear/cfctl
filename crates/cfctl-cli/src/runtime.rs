@@ -27,7 +27,8 @@ use cfctl_catalog::{
     CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1, attach_official_product_knowledge,
     fetch_official, fetch_official_text_feeds, ingest_cli_help, ingest_governed_ui_capabilities,
     ingest_native_control_capabilities, ingest_telemetry_capabilities,
-    ingest_wrangler_pages_deploy_help, refresh_dynamic_mutation_contract,
+    ingest_wrangler_pages_deploy_help, ingest_wrangler_worker_versions_help,
+    refresh_dynamic_mutation_contract,
 };
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, D1ImportCheckpointV1, Executor,
@@ -1134,6 +1135,22 @@ async fn sync_catalog(store: &StateStore) -> Result<ResultEnvelopeV2> {
                         &mut catalog,
                         String::from_utf8_lossy(&version.stdout).trim(),
                         &String::from_utf8_lossy(&pages_deploy_help.stdout),
+                    );
+                }
+                let versions_upload_help = std::process::Command::new(program)
+                    .args(["versions", "upload", "--help"])
+                    .output()
+                    .map_err(|source| cli_io(Path::new(program), source))?;
+                let versions_deploy_help = std::process::Command::new(program)
+                    .args(["versions", "deploy", "--help"])
+                    .output()
+                    .map_err(|source| cli_io(Path::new(program), source))?;
+                if versions_upload_help.status.success() && versions_deploy_help.status.success() {
+                    ingest_wrangler_worker_versions_help(
+                        &mut catalog,
+                        String::from_utf8_lossy(&version.stdout).trim(),
+                        &String::from_utf8_lossy(&versions_upload_help.stdout),
+                        &String::from_utf8_lossy(&versions_deploy_help.stdout),
                     );
                 }
             }
@@ -5965,6 +5982,17 @@ async fn verify_delegated_cli_plan(
         .await;
     }
 
+    if plan.capability.verification.strategy == "wrangler_worker_version_reports_expected_message" {
+        return verify_wrangler_worker_version_upload_plan(store, plan, input, receipt, credential)
+            .await;
+    }
+
+    if plan.capability.verification.strategy
+        == "wrangler_worker_versions_deployment_reports_expected_traffic"
+    {
+        return verify_wrangler_worker_versions_deploy_plan(store, plan, input, credential).await;
+    }
+
     if plan.capability.verification.strategy
         != "wrangler_deployment_status_reports_promoted_version"
     {
@@ -5995,6 +6023,78 @@ async fn verify_delegated_cli_plan(
         });
     };
 
+    verify_wrangler_deployment_status(
+        config,
+        &version_id,
+        credential,
+        &plan.account_id,
+        &store.paths().cache_dir,
+    )
+    .await
+}
+
+async fn verify_wrangler_worker_version_upload_plan(
+    store: &StateStore,
+    plan: &PlanV1,
+    input: &CallInput,
+    receipt: &Value,
+    credential: &AuthCredential,
+) -> Value {
+    let Some(version_id) = wrangler_worker_version_id(receipt) else {
+        return json!({
+            "passed": false,
+            "basis": "Wrangler reported upload success without a parseable Worker Version ID",
+        });
+    };
+    let Some(config) = input.query.get("config").and_then(Value::as_str) else {
+        return json!({
+            "passed": false,
+            "basis": "the version upload plan omitted its required Wrangler config selector",
+            "version_id": version_id,
+        });
+    };
+    let Some(message) = input.query.get("message").and_then(Value::as_str) else {
+        return json!({
+            "passed": false,
+            "basis": "the version upload plan omitted its required message selector",
+            "version_id": version_id,
+        });
+    };
+    verify_wrangler_worker_version(
+        config,
+        &version_id,
+        message,
+        credential,
+        &plan.account_id,
+        &store.paths().cache_dir,
+    )
+    .await
+}
+
+async fn verify_wrangler_worker_versions_deploy_plan(
+    store: &StateStore,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Value {
+    let Some(version_id) = input
+        .query
+        .get("argument")
+        .and_then(Value::as_str)
+        .and_then(wrangler_versions_deploy_version_id)
+    else {
+        return json!({
+            "passed": false,
+            "basis": "the versions deployment plan did not contain exactly one UUID@100 traffic target",
+        });
+    };
+    let Some(config) = input.query.get("config").and_then(Value::as_str) else {
+        return json!({
+            "passed": false,
+            "basis": "the versions deployment plan omitted its required Wrangler config selector",
+            "version_id": version_id,
+        });
+    };
     verify_wrangler_deployment_status(
         config,
         &version_id,
@@ -6270,6 +6370,104 @@ async fn verify_wrangler_deployment_status(
     })
 }
 
+async fn verify_wrangler_worker_version(
+    config: &str,
+    version_id: &str,
+    expected_message: &str,
+    credential: &AuthCredential,
+    account_id: &str,
+    cache_dir: &Path,
+) -> Value {
+    let working_directory = match wrangler_config_directory(config) {
+        Ok(directory) => directory,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler version verification could not resolve the reviewed config directory: {error}"),
+                "version_id": version_id,
+            });
+        }
+    };
+    let mut command = ProcessCommand::new("wrangler");
+    command
+        .args(["versions", "view", version_id, "--config", config, "--json"])
+        .current_dir(working_directory)
+        .env_clear()
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .env("HOME", env::var_os("HOME").unwrap_or_default())
+        .env("NO_COLOR", "1")
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in governed_cli_workspace_env("wrangler", Some(account_id), cache_dir) {
+        command.env(name, value);
+    }
+    match credential {
+        AuthCredential::Bearer { token } => {
+            command.env("CLOUDFLARE_API_TOKEN", token);
+        }
+        AuthCredential::GlobalKey { email, key } => {
+            command
+                .env("CLOUDFLARE_EMAIL", email)
+                .env("CLOUDFLARE_API_KEY", key);
+        }
+    }
+    let output = match tokio::time::timeout(Duration::from_mins(2), command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler version verification could not start: {error}"),
+                "version_id": version_id,
+            });
+        }
+        Err(_) => {
+            return json!({
+                "passed": false,
+                "basis": "Wrangler version verification timed out",
+                "version_id": version_id,
+            });
+        }
+    };
+    let stdout = redact_subprocess_text(&String::from_utf8_lossy(&output.stdout), credential);
+    let stderr = redact_subprocess_text(&String::from_utf8_lossy(&output.stderr), credential);
+    if !output.status.success() {
+        return json!({
+            "passed": false,
+            "basis": "Wrangler version verification returned a failing exit status",
+            "version_id": version_id,
+            "exit_status": output.status.code(),
+            "stdout": stdout,
+            "stderr": stderr,
+        });
+    }
+    let version = match serde_json::from_str::<Value>(stdout.trim()) {
+        Ok(version) => version,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler version output was not JSON: {error}"),
+                "version_id": version_id,
+                "stdout": stdout,
+                "stderr": stderr,
+            });
+        }
+    };
+    let passed = wrangler_version_readback_matches(&version, version_id, expected_message);
+    json!({
+        "passed": passed,
+        "basis": if passed {
+            format!("Wrangler reports uploaded version {version_id} with the reviewed message")
+        } else {
+            format!("Wrangler version readback did not bind {version_id} to the reviewed message")
+        },
+        "version_id": version_id,
+        "readback": version,
+        "stderr": stderr,
+    })
+}
+
 fn wrangler_deploy_version_id(receipt: &Value) -> Option<String> {
     receipt
         .get("stdout")
@@ -6284,6 +6482,38 @@ fn wrangler_deploy_version_id(receipt: &Value) -> Option<String> {
                     .all(|character| character.is_ascii_alphanumeric() || character == '-')
         })
         .map(str::to_owned)
+}
+
+fn wrangler_worker_version_id(receipt: &Value) -> Option<String> {
+    receipt
+        .get("stdout")
+        .and_then(Value::as_str)?
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Worker Version ID:"))
+        .map(str::trim)
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .map(str::to_owned)
+}
+
+fn wrangler_versions_deploy_version_id(spec: &str) -> Option<String> {
+    let (version_id, percentage) = spec.split_once('@')?;
+    if percentage == "100" && Uuid::parse_str(version_id).is_ok() {
+        Some(version_id.to_owned())
+    } else {
+        None
+    }
+}
+
+fn wrangler_version_readback_matches(
+    value: &Value,
+    expected_version_id: &str,
+    expected_message: &str,
+) -> bool {
+    value.get("id").and_then(Value::as_str) == Some(expected_version_id)
+        && value
+            .pointer("/annotations/workers~1message")
+            .and_then(Value::as_str)
+            == Some(expected_message)
 }
 
 fn wrangler_status_has_promoted_version(value: &Value, expected_version_id: &str) -> bool {
@@ -23035,6 +23265,7 @@ struct PreparedCallInput {
 fn call_input(capability: &CapabilityV1, arguments: &CallArgs) -> Result<PreparedCallInput> {
     let selectors = object_from_pairs(&arguments.selectors);
     let query = query_object_from_pairs(capability, &arguments.query)?;
+    validate_wrangler_worker_versions_input(capability, &query)?;
     let body = if arguments.body_stdin {
         Some(serde_json::from_str(&read_stdin()?)?)
     } else {
@@ -23063,6 +23294,39 @@ fn call_input(capability: &CapabilityV1, arguments: &CallArgs) -> Result<Prepare
         },
         secret_body: contains_secret.then_some(body).flatten(),
     })
+}
+
+fn validate_wrangler_worker_versions_input(capability: &CapabilityV1, query: &Value) -> Result<()> {
+    if !matches!(
+        capability.id.as_str(),
+        "wrangler.versions-upload" | "wrangler.versions-deploy"
+    ) {
+        return Ok(());
+    }
+    let config = query.get("config").and_then(Value::as_str).ok_or_else(|| {
+        CliError::Input("Worker Versions plans require a config selector".to_owned())
+    })?;
+    if !Path::new(config).is_absolute() {
+        return Err(CliError::Input(
+            "Worker Versions plans require an absolute Wrangler config path".to_owned(),
+        ));
+    }
+    if capability.id == "wrangler.versions-deploy" {
+        let spec = query
+            .get("argument")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Input(
+                    "Worker Versions deployment requires exactly one UUID@100 target".to_owned(),
+                )
+            })?;
+        if wrangler_versions_deploy_version_id(spec).is_none() {
+            return Err(CliError::Input(
+                "Worker Versions deployment target must be exactly one UUID@100 value".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn request_body_contains_secret(capability: &CapabilityV1, body: &Value) -> bool {
@@ -25055,11 +25319,13 @@ mod tests {
         validate_permission_group_resource_scope, validate_request_contract,
         validate_selected_permission_groups, validate_standing_authority_group_scopes,
         validate_standing_authority_permission_inventory, validate_token_policy_body,
-        validate_worker_script_secret_semantics, validate_zone_account_receipt_precondition,
-        validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
+        validate_worker_script_secret_semantics, validate_wrangler_worker_versions_input,
+        validate_zone_account_receipt_precondition, validate_zone_id,
+        validated_standing_lineage_token_id, verification_outcome,
         workspace_operational_proof_posture, workspace_resource_keys, wrangler_config_directory,
         wrangler_deploy_version_id, wrangler_pages_deployment_has_commit,
-        wrangler_status_has_promoted_version, zone_target,
+        wrangler_status_has_promoted_version, wrangler_version_readback_matches,
+        wrangler_versions_deploy_version_id, wrangler_worker_version_id, zone_target,
     };
     use crate::profiles::ProfilesConfig;
     use crate::telemetry_product::record_operational_proof;
@@ -30784,6 +31050,84 @@ mod tests {
             &promoted,
             "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         ));
+    }
+
+    #[test]
+    fn wrangler_worker_versions_receipts_and_targets_are_exact() {
+        let version_id = "11111111-2222-3333-4444-555555555555";
+        let receipt = json!({
+            "stdout": format!("Uploaded leakbar\nWorker Version ID: {version_id}\n")
+        });
+        assert_eq!(
+            wrangler_worker_version_id(&receipt).as_deref(),
+            Some(version_id)
+        );
+        assert_eq!(
+            wrangler_versions_deploy_version_id(&format!("{version_id}@100")).as_deref(),
+            Some(version_id)
+        );
+        assert!(wrangler_versions_deploy_version_id(&format!("{version_id}@25")).is_none());
+        assert!(wrangler_versions_deploy_version_id("not-a-version@100").is_none());
+        assert!(wrangler_versions_deploy_version_id(&format!("{version_id}@100@100")).is_none());
+
+        let readback = json!({
+            "id": version_id,
+            "annotations": {"workers/message": "release 88ef60c"}
+        });
+        assert!(wrangler_version_readback_matches(
+            &readback,
+            version_id,
+            "release 88ef60c"
+        ));
+        assert!(!wrangler_version_readback_matches(
+            &readback,
+            version_id,
+            "release other"
+        ));
+    }
+
+    #[test]
+    fn wrangler_worker_versions_inputs_require_absolute_config_and_full_traffic() {
+        let mut upload = CapabilityV1::new(
+            "wrangler.versions-upload",
+            "upload",
+            "POST",
+            "wrangler versions upload",
+        );
+        upload.adapter_status = AdapterStatus::DelegatedCli;
+        validate_wrangler_worker_versions_input(
+            &upload,
+            &json!({"config": "/srv/leakbar/web/wrangler.toml"}),
+        )
+        .expect("absolute upload config");
+        assert!(
+            validate_wrangler_worker_versions_input(
+                &upload,
+                &json!({"config": "web/wrangler.toml"}),
+            )
+            .is_err()
+        );
+
+        let mut deploy = upload;
+        deploy.id = "wrangler.versions-deploy".to_owned();
+        validate_wrangler_worker_versions_input(
+            &deploy,
+            &json!({
+                "config": "/srv/leakbar/web/wrangler.toml",
+                "argument": "11111111-2222-3333-4444-555555555555@100"
+            }),
+        )
+        .expect("one exact full-traffic target");
+        assert!(
+            validate_wrangler_worker_versions_input(
+                &deploy,
+                &json!({
+                    "config": "/srv/leakbar/web/wrangler.toml",
+                    "argument": "11111111-2222-3333-4444-555555555555@50"
+                }),
+            )
+            .is_err()
+        );
     }
 
     #[test]
