@@ -24,7 +24,7 @@ use uuid::Uuid;
 pub const CLOUDFLARE_AUTHORIZATION_ENDPOINT: &str = "https://dash.cloudflare.com/oauth2/auth";
 pub const CLOUDFLARE_TOKEN_ENDPOINT: &str = "https://dash.cloudflare.com/oauth2/token";
 pub const CLOUDFLARE_REVOKE_ENDPOINT: &str = "https://dash.cloudflare.com/oauth2/revoke";
-pub const CFCTL_CALLBACK_URL: &str = "https://cfctl.io/oauth/callback";
+pub const CFCTL_CALLBACK_URL: &str = "https://cfctl.com/oauth/callback";
 
 #[derive(Debug, Error)]
 pub enum AuthError {

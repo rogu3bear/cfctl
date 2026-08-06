@@ -33,6 +33,21 @@
 | Hydration mismatch | Console/error proof fails release; SSR content remains the diagnostic baseline. |
 | Worker exception | No credentials, environment details, or stack traces in the public response. |
 
+## OAuth callback bridge
+
+| Case | Expected behavior |
+|---|---|
+| Missing, empty, duplicated, or oversized `state` or `code` | Reject locally; never construct a success payload. |
+| OAuth `error` or `error_description` is attacker-controlled | Render bounded inert text without reflecting arbitrary detail or markup. |
+| Query contains control characters, whitespace, or a fake `STATE CODE` delimiter | Reject before display or copy. |
+| Stylesheet, icon, telemetry, or error reporter loads before query removal | Release fails; callback must not propagate its URL as a referrer or third-party request. |
+| Clipboard permission is denied or the API is unavailable | Keep the bounded payload selectable, explain manual copy, and do not claim success. |
+| User navigates back, restores bfcache, backgrounds the tab, or waits past expiry | Clear the payload and require a fresh login attempt where safe reuse cannot be proven. |
+| Callback response is cached | Release fails; route requires `Cache-Control: no-store` and no service-worker persistence. |
+| JavaScript is disabled | Do not render query values; explain how to retry with script enabled or cancel safely. |
+| Callback is embedded by another origin | Framing is denied; no UI redress path may expose or copy the value. |
+| Worker/request logs include the query string | Treat as sensitive exposure and block launch until logs are disabled, redacted, or proven not to retain it. |
+
 ## Product claims
 
 | Case | Expected behavior |

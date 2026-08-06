@@ -268,7 +268,7 @@ async fn oauth_exchange_refresh_and_revoke_use_public_client_flows() {
         authorization_endpoint: format!("{endpoint}/auth"),
         token_endpoint: format!("{endpoint}/token"),
         revoke_endpoint: format!("{endpoint}/revoke"),
-        redirect_uri: "https://cfctl.io/oauth/callback".to_owned(),
+        redirect_uri: "https://cfctl.com/oauth/callback".to_owned(),
     };
     let client = reqwest::Client::new();
     let exchanged = exchange_authorization_code(&client, &config, "code-one", "verifier-one")

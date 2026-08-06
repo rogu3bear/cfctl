@@ -1,6 +1,6 @@
 # cfctl website product packet
 
-Status: evidence-bound planning for the `cfctl.io` product site.
+Status: evidence-bound planning for the `cfctl.com` product site.
 
 These documents separate observed repository and market evidence from hypotheses. They do not claim user research, production deployment, or outcome data that does not exist. `HORIZON.md` is the sole design authority once a direction is selected.
 

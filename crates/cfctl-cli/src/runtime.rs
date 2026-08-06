@@ -22410,7 +22410,7 @@ fn doctor_command(store: &StateStore) -> Result<ResultEnvelopeV2> {
             "standing_authorities": standing_authorities_health(store)?,
             "instruction_drift": instruction_drift,
             "agents": agents,
-            "public_oauth": "unconfigured until cfctl.io ownership, site publication, domain verification, and permanent promotion are explicitly completed; use `cfctl auth import-api-token --account <id> --stdin` for the scoped day-to-day lane",
+            "public_oauth": "unconfigured until cfctl.com ownership, site publication, domain verification, and permanent promotion are explicitly completed; use `cfctl auth import-api-token --account <id> --stdin` for the scoped day-to-day lane",
         }),
         healthy,
         "CFCTL_RUNTIME_DRIFT",
