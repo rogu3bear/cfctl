@@ -10686,6 +10686,16 @@ struct AcceptedD1ImportInit {
     upload_url: Url,
 }
 
+fn d1_import_filename_is_safe(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+}
+
 fn classify_d1_import_init_response(
     response: &CloudflareResponseV1,
     contract: &D1ApprovedMlnImportContractV1,
@@ -10697,15 +10707,7 @@ fn classify_d1_import_init_response(
         .result
         .get("filename")
         .and_then(Value::as_str)
-        .filter(|value| {
-            !value.is_empty()
-                && value.len() <= 512
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-                && !value.starts_with('.')
-                && !value.ends_with('.')
-        })
+        .filter(|value| d1_import_filename_is_safe(value))
         .ok_or(())?
         .to_owned();
     let upload_url_raw = response
@@ -10825,6 +10827,33 @@ fn classify_d1_import_poll_response<'a>(
     accepted_d1_import_poll_outcome(response, expected_at_bookmark).map_err(|_| ())
 }
 
+fn projected_d1_import_init_result(plan: &PlanV1, response: &CloudflareResponseV1) -> Value {
+    let upload_url = response.result.get("upload_url").and_then(Value::as_str);
+    let filename = response.result.get("filename").and_then(Value::as_str);
+    let parsed_upload_url = upload_url.and_then(|value| Url::parse(value).ok());
+    let upload_url_host = parsed_upload_url.as_ref().and_then(Url::host_str);
+    let expected_upload_url_host = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .map(|contract| format!("{}{}", contract.account_id, contract.upload_url_suffix));
+    serde_json::json!({
+        "type":response.result.get("type"),
+        "status":response.result.get("status"),
+        "success":response.result.get("success"),
+        "at_bookmark":response.result.get("at_bookmark"),
+        "upload_url_present":upload_url.is_some(),
+        "upload_url_sha256":upload_url.map(|value| format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))),
+        "upload_url_host":upload_url_host,
+        "upload_url_host_is_exact_account_endpoint":upload_url_host.zip(expected_upload_url_host.as_deref()).is_some_and(|(actual, expected)| actual == expected),
+        "upload_url_host_is_cloudflare_r2":upload_url_host.is_some_and(|host| host.ends_with(".r2.cloudflarestorage.com")),
+        "filename_present":filename.is_some(),
+        "filename_sha256":filename.map(|value| format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))),
+        "filename_shape_valid":filename.is_some_and(d1_import_filename_is_safe),
+        "provider_error_present":response.result.get("error").is_some(),
+    })
+}
+
 fn persist_import_response<F>(
     persist: &mut F,
     plan: &PlanV1,
@@ -10847,19 +10876,7 @@ where
     let target = import_target(plan);
     let migration_id = import_lineage_value(plan, "migration_id");
     let mut result = if response_action == "init" {
-        let upload_url = response.result.get("upload_url").and_then(Value::as_str);
-        let filename = response.result.get("filename").and_then(Value::as_str);
-        serde_json::json!({
-            "type":response.result.get("type"),
-            "status":response.result.get("status"),
-            "success":response.result.get("success"),
-            "at_bookmark":response.result.get("at_bookmark"),
-            "upload_url_present":upload_url.is_some(),
-            "upload_url_sha256":upload_url.map(|value| format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))),
-            "filename_present":filename.is_some(),
-            "filename_sha256":filename.map(|value| format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))),
-            "provider_error_present":response.result.get("error").is_some(),
-        })
+        projected_d1_import_init_result(plan, response)
     } else {
         let source = replacement_result.as_ref().unwrap_or(&response.result);
         serde_json::json!({
@@ -11394,11 +11411,26 @@ mod approved_mln_import_tests {
         assert_eq!(checkpoint["receipt"]["no_replay"], true);
         assert_eq!(checkpoint["receipt"]["result"]["upload_url_present"], true);
         assert_eq!(checkpoint["receipt"]["result"]["filename_present"], true);
+        assert_eq!(
+            checkpoint["receipt"]["result"]["filename_shape_valid"],
+            true
+        );
+        assert_eq!(
+            checkpoint["receipt"]["result"]["upload_url_host"],
+            "upload.invalid"
+        );
+        assert_eq!(
+            checkpoint["receipt"]["result"]["upload_url_host_is_exact_account_endpoint"],
+            false
+        );
+        assert_eq!(
+            checkpoint["receipt"]["result"]["upload_url_host_is_cloudflare_r2"],
+            false
+        );
         let durable = checkpoint.to_string();
         for forbidden in [
             "X-Amz-Signature",
             "SECRET",
-            "upload.invalid",
             "credential",
             "SECRET.sql",
             "SECRET-etag",
