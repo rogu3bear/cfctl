@@ -1979,6 +1979,14 @@ impl CapabilityV1 {
                     && self.d1_approved_mln_import.is_some()
                     && self.d1_approved_mln_import_poll_resume.is_none()
             }
+            "under_the_sun_farm_owner_editorial_schema_is_present" => {
+                self.id == "d1-import-approved-under-the-sun-farm-migration"
+                    && self.method == "POST"
+                    && self.risk == RiskClass::Irreversible
+                    && self.effect == EffectClass::DataWrite
+                    && self.d1_approved_mln_import.is_some()
+                    && self.d1_approved_mln_import_poll_resume.is_none()
+            }
             "d1_current_bookmark_equals_restore_result_bookmark" => {
                 self.id == "d1-restore-exact-bookmark"
                     && self.method == "POST"
@@ -3040,6 +3048,7 @@ fn approved_mln_import_recovery_contract_supported(capability: &CapabilityV1) ->
         capability.id.as_str(),
         "d1-import-approved-mln-migration"
             | "d1-import-approved-osint-research-migration"
+            | "d1-import-approved-under-the-sun-farm-migration"
             | "d1-resume-approved-mln-import-poll"
     ) && capability.method == "POST"
         && capability.risk == RiskClass::Irreversible
