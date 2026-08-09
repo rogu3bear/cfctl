@@ -1803,12 +1803,6 @@ fn normalize_reviewed_mln_repository_id(remote: &str) -> Option<String> {
         | "git@github.com:rogu3bear/osint-research-center" => {
             Some("github.com/rogu3bear/osint-research-center".to_owned())
         }
-        "https://github.com/rogu3bear/under-the-sun-farm.git"
-        | "https://github.com/rogu3bear/under-the-sun-farm"
-        | "git@github.com:rogu3bear/under-the-sun-farm.git"
-        | "git@github.com:rogu3bear/under-the-sun-farm" => {
-            Some("github.com/rogu3bear/under-the-sun-farm".to_owned())
-        }
         _ => None,
     }
 }
@@ -1903,17 +1897,15 @@ fn validate_approved_mln_import_prerequisites(
         .get("migration_id")
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("migration_id is missing".to_owned()))?;
-    if matches!(
-        capability.id.as_str(),
-        "d1-import-approved-osint-research-migration"
-            | "d1-import-approved-under-the-sun-farm-migration"
-    ) {
-        let subject = if capability.id == "d1-import-approved-osint-research-migration" {
-            "OSINT Research"
-        } else {
-            "Under the Sun Farm"
-        };
-        validate_closed_import_recovery_bookmark(store, input, body, contract, context, subject)?;
+    if capability.id == "d1-import-approved-osint-research-migration" {
+        validate_closed_import_recovery_bookmark(
+            store,
+            input,
+            body,
+            contract,
+            context,
+            "OSINT Research",
+        )?;
         return Ok(());
     }
     let pre_operation = body
@@ -18548,16 +18540,8 @@ async fn execute_approved_mln_import_plan(
             "the import boundary was crossed but exact durable provider completion was not proven",
         ));
     }
-    if matches!(
-        plan.capability.id.as_str(),
-        "d1-import-approved-osint-research-migration"
-            | "d1-import-approved-under-the-sun-farm-migration"
-    ) {
-        let subject = if plan.capability.id == "d1-import-approved-osint-research-migration" {
-            "OSINT Research"
-        } else {
-            "Under the Sun Farm"
-        };
+    if plan.capability.id == "d1-import-approved-osint-research-migration" {
+        let subject = "OSINT Research";
         let verification = match verify_api_plan(
             store,
             executor,
@@ -26752,14 +26736,14 @@ mod tests {
             };
             ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
             let capability = catalog
-                .get("d1-import-approved-under-the-sun-farm-migration")
-                .expect("farm migration capability");
+                .get("d1-import-approved-osint-research-migration")
+                .expect("OSINT Research migration capability");
             let contract = capability
                 .d1_approved_mln_import
                 .as_ref()
-                .expect("farm migration contract");
+                .expect("OSINT Research migration contract");
             let before = Utc::now();
-            let bookmark = "farm-pre-migration-bookmark";
+            let bookmark = "osint-pre-migration-bookmark";
             let evidence = store
                 .write_evidence(
                     EvidenceClass::LiveRead,
@@ -26777,7 +26761,7 @@ mod tests {
                 }),
                 query: json!({}),
                 body: Some(json!({
-                    "migration_id":"0001",
+                    "migration_id":"0028",
                     "pre_recovery_anchor_evidence_hash":evidence.content_hash,
                     "pre_recovery_anchor_bookmark_hash":hash_value(&json!(bookmark))
                         .expect("bookmark hash"),
@@ -26799,7 +26783,7 @@ mod tests {
                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 &proof_input_hash,
                 OperationalProofScopeV1::new(
-                    Some("farm-profile"),
+                    Some("osint-profile"),
                     Some(contract.account_id.as_str()),
                     Some("22222222-2222-4222-8222-222222222222"),
                 ),
@@ -26819,13 +26803,13 @@ mod tests {
                     .expect("closed body"),
                 contract,
                 ImportPrerequisiteContext {
-                    profile_id: "farm-profile",
+                    profile_id: "osint-profile",
                     credential_generation_id: Some("22222222-2222-4222-8222-222222222222"),
                     catalog_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     import_operation_id: None,
                     before,
                 },
-                "Under the Sun Farm",
+                "OSINT Research",
             )
         };
 
@@ -26989,17 +26973,6 @@ mod tests {
             assert_eq!(
                 normalize_reviewed_mln_repository_id(remote).as_deref(),
                 Some("github.com/rogu3bear/mln-web")
-            );
-        }
-        for remote in [
-            "https://github.com/rogu3bear/under-the-sun-farm.git",
-            "https://github.com/rogu3bear/under-the-sun-farm",
-            "git@github.com:rogu3bear/under-the-sun-farm.git",
-            "git@github.com:rogu3bear/under-the-sun-farm",
-        ] {
-            assert_eq!(
-                normalize_reviewed_mln_repository_id(remote).as_deref(),
-                Some("github.com/rogu3bear/under-the-sun-farm")
             );
         }
         for remote in [
