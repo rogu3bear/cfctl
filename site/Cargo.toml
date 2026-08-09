@@ -1,0 +1,94 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "cfctl-site"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "SSR-first cfctl product website for Cloudflare Workers."
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+axum = { version = "0.8", default-features = false, optional = true }
+base64 = "0.22"
+console_error_panic_hook = { version = "0.1", optional = true }
+getrandom = { version = "0.4", features = ["wasm_js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+js-sys = { version = "0.3", optional = true }
+leptos = { version = "0.8" }
+leptos_axum = { version = "0.8.8", default-features = false, features = ["wasm"], optional = true }
+leptos_meta = "0.8"
+leptos_router = "0.8"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+tower-service = "0.3"
+wasm-bindgen = { version = "0.2.121", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+  "Clipboard",
+  "Document",
+  "Event",
+  "EventTarget",
+  "History",
+  "Location",
+  "Navigator",
+  "UrlSearchParams",
+  "VisibilityState",
+  "Window",
+] }
+worker = { version = "0.7.5", features = ["http", "axum"], optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+any_spawner = { version = "0.3", features = ["tokio"], optional = true }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"], optional = true }
+tower-http = { version = "0.6", features = ["fs"], optional = true }
+
+[features]
+local-preview = [
+  "axum/http1",
+  "axum/tokio",
+  "dep:any_spawner",
+  "dep:tokio",
+  "dep:tower-http",
+]
+hydrate = [
+  "dep:console_error_panic_hook",
+  "dep:js-sys",
+  "dep:wasm-bindgen",
+  "dep:wasm-bindgen-futures",
+  "dep:web-sys",
+  "leptos/hydrate",
+  "leptos/islands",
+]
+ssr = [
+  "dep:axum",
+  "dep:leptos_axum",
+  "dep:worker",
+  "leptos/islands",
+  "leptos/ssr",
+  "leptos_meta/ssr",
+  "leptos_router/ssr",
+]
+
+[package.metadata.leptos]
+output-name = "cfctl-site"
+site-root = "target/site"
+site-pkg-dir = "pkg"
+style-file = "style/main.css"
+assets-dir = "assets"
+site-addr = "127.0.0.1:57591"
+reload-port = 57592
+browserquery = "defaults"
+bin-features = ["ssr"]
+bin-default-features = false
+lib-features = ["hydrate"]
+lib-default-features = false

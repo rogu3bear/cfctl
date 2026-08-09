@@ -25,6 +25,12 @@
 12. As a narrow-screen user, I want code samples and lifecycle content to reflow without horizontal page overflow.
 13. As a motion-sensitive user, I want the story to remain understandable with reduced motion.
 
+## Epic E — complete optional OAuth safely
+
+14. As an OAuth user, I want the callback bridge to hand one bounded state/code response to my waiting CLI without transmitting it to analytics or unrelated services.
+15. As an OAuth user whose clipboard is unavailable, I want a safe manual-copy path and an honest failure state.
+16. As a security reviewer, I want callback values removed from browser-visible history, cleared after a short lifetime, excluded from caches and telemetry, and validated again by the CLI's pending-state and PKCE checks.
+
 ## Story quality notes
 
 These stories reflect repository semantics and a proto-persona, not observed interview statements. Validate priority and wording in first-use sessions.

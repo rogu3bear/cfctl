@@ -56,11 +56,13 @@ lanes separate so a reviewer can see the risky change alone.
 
 ## Development setup
 
-Rust 1.97 is pinned by the repository. The local proof lane needs `cargo-deny`
-and Gitleaks, and — because `cargo xtask verify` cross-builds the Linux ship
-target — `zig` with `cargo-zigbuild` and the `x86_64-unknown-linux-musl` Rust
-target. `verify` fails closed when the cross toolchain is absent rather than
-skipping the Linux build. Install them, then orient through the public CLI:
+Rust 1.97 is pinned by the repository. The local proof lane needs `cargo-deny`,
+Gitleaks, Bun 1.3.14, cargo-leptos 0.3.5, worker-build 0.7.5, and the
+`wasm32-unknown-unknown` target. Because `cargo xtask verify` also cross-builds
+the Linux ship target, it needs `zig`, `cargo-zigbuild`, and the
+`x86_64-unknown-linux-musl` Rust target. `verify` fails closed when either the
+site or cross-build toolchain is absent rather than skipping that proof.
+Install them, then orient through the public CLI:
 
 ```bash
 ./bootstrap.sh
@@ -84,11 +86,14 @@ create a repository `.env` with Cloudflare credentials.
 
 ### Hosted and pre-push gates
 
-GitHub runs a read-only hosted Rust proof for every pull request and `main`
-push: formatting, workspace Clippy, workspace tests, and the Cloudflare
-request-contract test. It does not replace the complete local lane: Bun bridge
-proof, dependency policy, full-history secret scanning, source/governance
-contracts, and the Linux musl cross-build remain in `cargo xtask verify`.
+GitHub runs two read-only hosted proofs for every pull request and `main` push.
+The Rust job runs formatting, workspace Clippy, workspace tests, and the
+Cloudflare request-contract test. The website job pins its Bun and Rust build
+tools, runs site formatting/Clippy/tests, and builds the complete edge artifact
+twice to reject nondeterminism. Hosted proof still does not replace the complete
+local lane: Bun bridge proof, dependency policy, full-history secret scanning,
+source/governance contracts, and the Linux musl cross-build remain in
+`cargo xtask verify`.
 
 `.githooks/pre-push` runs that complete local proof and refuses the push when
 it fails. This repository has previously shipped a red `main` when the local

@@ -6,7 +6,10 @@ Status: repository mainline notes, not a public version announcement or deployme
 
 `cfctl` now keeps using its governed fallback credential store once that store is active. Ordinary commands no longer reopen macOS Keychain merely to discover that the fallback remains authoritative. Operators still have an explicit repair path when they intentionally want to test or restore Keychain.
 
-The installed build now reports its exact source revision in `cfctl doctor`, making stale-binary diagnosis easier. The repaired build was locally installed and verified with both credential status and an authenticated D1 database-list read. Secret values were not printed or copied into repository files.
+The source tree makes the installed revision visible through `cfctl doctor`,
+which provides the build-identity check required before any later live work.
+This draft does not claim that the accumulator branch is installed or that an
+authenticated provider read has run from it.
 
 ## New governed capabilities
 
@@ -20,6 +23,19 @@ Each write remains plan-first. Landing code on `main` does not mean an account m
 
 The security guide now agrees with runtime policy: the fallback store is sticky after activation, and Keychain repair is an explicit operator action rather than a routine credential probe.
 
+## Upcoming website preview
+
+The former static site template has been replaced locally by a standalone
+Leptos 0.8 application for Cloudflare Workers and Workers Assets. Its Control
+Ledger design explains the ordered read/plan/admit/execute/verify boundary,
+adds a bounded first-read guide, preserves direct privacy and terms routes, and
+hardens the OAuth callback as a browser-only, query-erasing, one-copy bridge.
+
+The v1 website has no user accounts, forms, database, object storage,
+analytics, runtime secrets, or third-party scripts. Content is useful SSR HTML;
+only command copy and the callback bridge hydrate. This section is preview
+notes for an uncommitted, undeployed tree—not a public launch claim.
+
 ## Operator impact
 
 - If you already use fallback credentials, ordinary `auth status` and governed calls should no longer trigger repeated Keychain password prompts.
@@ -28,4 +44,7 @@ The security guide now agrees with runtime policy: the fallback store is sticky 
 
 ## Evidence and limits
 
-The combined repository proof passed formatting, Clippy with warnings denied, all tests, dependency policy, secret scanning, and a clean build before `main` was pushed. The installed keyring repair was then verified by an authenticated live read. These notes do not claim that the new website exists, that Cloudflare infrastructure was mutated, or that a public release was published.
+The website exists only as source and local build artifacts until the current
+accumulator candidate passes its complete proof lane. No Cloudflare deployment
+plan has been created, no provider mutation has run, no live edge readback
+exists, and no public release is claimed.

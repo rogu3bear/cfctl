@@ -22,15 +22,23 @@ Audit date: 2026-08-05. “Loads” means the named `SKILL.md` and its required 
 | Market research → market sizing | Web primary-source research; no special local agent required | Load; current primary sources collected; sizing produced | Right-sized market evidence; did not force the generic 50-page report. |
 | `improve-website` + `create-website` | Strategy routing | Both load | Existing site makes improve the lead; create contributes rebuild architecture. |
 | SSOT | `authority_mapper`, `drift_reconciler`, then scoped `worker` are available | All three stages executed | Proved an existing SSOT and repaired only the stale consumer/install. |
-| Leptos Design Studio | Needs Creative Production and Product Design stages; available visual agents can audit but are not silent substitutes | Scanner loads; required creative plugins unavailable | HORIZON drafted; stop for owner decision before implementation. |
-| Leptos opportunity radar | Code/radar reasoning; design-system/spatial agents useful for verification | Loads; current scan sees no Leptos app | Run after implementation to find evidence-backed improvements. |
-| Layout spacing repair | `spatial_analyst` is a direct fit | Loads; no rendered drift yet | Conditional post-render, not a design generator. |
-| Component consolidation | `design_system_analyst` is a direct fit | Loads; no component duplication yet | Conditional after components exist. |
+| Leptos Design Studio | Needs Creative Production and Product Design stages; available visual agents can audit when the owner explicitly authorizes substitutes | Scanner and validator pass; required creative plugins unavailable; owner selected Control Ledger through five bounded substitutes | Used through implemented HORIZON; the substitute limitation stays explicit. |
+| Leptos opportunity radar | Code/radar reasoning; design-system/spatial agents useful for verification | Loads; post-implementation audit produced | Found delivery closure and callback-state proof—not another framework primitive—as the leading opportunity. |
+| Layout spacing repair | `spatial_analyst` is a direct fit | Loads; rendered narrow/wide ownership audit found no proven spacing defect | Applied as a proof lens; no speculative repair or wrapper added. |
+| Component consolidation | `design_system_analyst` is a direct fit | Loads; peer audit found actions and copy buttons are intentional semantic variants with shared token geometry | Applied as a proof lens; no universal control component invented. |
 | WebGPU/Three.js TSL | Three/WebGPU specialists are available | Loads | Technically possible, strategically unjustified for v1. |
-| Define security policy | Security reviewer/tool fit | Loads; existing policy inspected | Requires exact proposed diff and explicit approval before writing. |
-| Security threat model | Security specialist fit | Loads | Requires scope check-in before final model. |
-| Deploy + cf-deploy | Governed plan/apply/readback through the CLI | Load; exact install and live read proved | Prepare is authorized; apply waits for exact operation approval. |
+| Define security policy | Security reviewer/tool fit | Loads; exact `site/SECURITY.md` scope was owner-approved and written | Policy now matches implemented callback controls; staging/commit remains a separate authorization gate. |
+| Security threat model | Security specialist fit | Loads; owner confirmed exposure/data/deployment assumptions | Grounded `site-threat-model.md` produced with eight abuse paths and stable threat IDs. |
+| Deploy + cf-deploy | Governed plan/apply/readback through the CLI | Load; the Workers Assets source contract is present, but account and provider state are intentionally unbound | A `workers.dev` preview is the first live target. Planning waits for a committed release tree, a fresh account/service read, and exact operation approval. |
 
 ## Available-agent conclusion
 
-The agent set is strongest for authority mapping, drift reconciliation, implementation, and post-render design verification. It does not contain a native replacement for the Design Studio's named Creative Production/Product Design stages or the missing PM auditor package assets. Those gaps should remain explicit rather than being masked by a generic agent.
+The agent set is strongest for authority mapping, drift reconciliation,
+implementation, security review, and post-render design verification. The
+grounding, semantics, design-system, spatial, and Leptos-architecture agents
+were legitimate bounded substitutes only because the owner explicitly
+authorized them; they did not silently become the missing Creative Production
+or Product Design packages. The PM auditor wrapper packaging gap also remains a
+plugin-owner issue. This separation proves that the named artifact skills work
+where their inputs exist without inflating unavailable orchestration into a
+pass.

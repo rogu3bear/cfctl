@@ -1,20 +1,21 @@
 # HORIZON — cfctl product website
 
 Created: 2026-08-05
-Stage: draft
+Stage: implemented
 
-Decision status: owner and required creative-stage decision pending.
+Decision status: owner selected Control Ledger and explicitly authorized the
+available design substitutes on 2026-08-05.
 
 This is the sole design authority for the scoped surface. No `NORTH_STAR.md` exists in this repository; product semantics are grounded in the cited README and runtime policy. Existing UI is functional evidence, not a style source.
 
 ## 1. Frame
 
-- Surface and routes: `/`, `/start`, `/security`, `/privacy`, `/terms`, and not-found.
+- Surface and routes: `/`, `/start`, `/security`, `/privacy`, `/terms`, `/oauth/callback/`, and not-found.
 - Primary user: the accountable Cloudflare operator who delegates selectively to agents.
 - Primary job and success state: understand the governance model, install the intended build, and complete one verified read.
 - Design ambition: make careful infrastructure operation feel faster, clearer, and more tangible than direct API improvisation.
 - Scope: public product/activation website and its edge runtime.
-- Non-goals: product dashboard, authentication UI, D1 lab, contact database, full documentation mirror, WebGPU scene.
+- Non-goals: product dashboard, general authentication UI, D1 lab, contact database, full documentation mirror, WebGPU scene. The existing OAuth callback bridge remains in scope because the CLI pins it as its redirect URI.
 
 ## 2. Semantic Product Contract
 
@@ -35,20 +36,32 @@ No `NORTH_STAR.md#absent` authority exists. No layout, color, typography, compon
 
 ### Observed
 
-- `site/index.html` is one dark static landing page with three feature sections and a source link.
-- `site/style.css` is the only existing style authority.
-- There is no Leptos manifest, component, route, hydration, or server-function surface in this worktree.
-- The external `/Users/star/dev/leptos-cf` template proves cargo-leptos SSR/hydration, Router, hashed assets, and Workers Assets delivery.
+- The former static `site/index.html`, `site/privacy.html`, `site/terms.html`, and
+  `site/style.css` template paths were replaced by a standalone Leptos 0.8
+  crate, one router tree, and the selected Control Ledger system.
+- The implementation renders all primary content with SSR and hydrates only
+  `CommandBlock` and the isolated OAuth callback bridge.
+- The cargo-leptos edge build produces a Rust Worker shim plus content-hashed
+  JS, WASM, and CSS served through Workers Assets. No D1, KV, R2, account,
+  form, analytics, or third-party-script surface was introduced.
+- Local route, browser, responsive, callback, and interaction proof passed on
+  2026-08-05. That local proof does not bind an account, Worker service,
+  preview hostname, custom domain, or current provider state. Those values must
+  be re-read and pinned in a separate deployment plan; deployment and
+  post-change live readback remain distinct evidence.
 
 ### Inferred
 
 - Current content establishes positioning but does not carry a visitor through verified activation.
 - cargo-leptos SSR plus Workers Assets is the coherent v1 runtime; Pages would imply a different static/CSR architecture.
 
-### Proposed
+### Implemented
 
-- Replace the static page with a minimal standalone Leptos crate under `site/`.
-- Use useful SSR HTML, modest hydration for copy/status affordances, and no persistence.
+- The standalone `site/` crate now owns the route tree, Worker adapter,
+  content-hashed asset pipeline, selected visual system, and zero-persistence
+  security boundary.
+- Useful SSR HTML is present before WASM; hydration is limited to copy/status
+  affordances and browser-only callback validation.
 
 ### Content and capability inventory
 
@@ -59,6 +72,7 @@ No `NORTH_STAR.md#absent` authority exists. No layout, color, typography, compon
 | Eight-stage lifecycle | Authority comprehension | `README.md:77-86` | Wide, narrow, reduced motion | Add as primary visual story |
 | Security/local custody | Trust evaluation | `docs/runtime-policy.md` | Fallback and explicit repair | Expand |
 | Privacy and terms | Legal/trust | Existing routes | Direct navigation, no JS | Preserve semantics, redesign |
+| OAuth callback bridge | Complete optional PKCE login without a localhost listener | `site/oauth/callback/index.html`, `crates/cfctl-auth/src/lib.rs:27` | Valid/missing/duplicate/oversized query values, denied clipboard, no JS, expiry, back/forward cache | Preserve behavior; harden as an isolated sensitive route |
 | Starter field guide, D1 lab, contact form | Template demonstration only | External template | Not applicable | Remove |
 
 ### Current-design diagnosis
@@ -83,6 +97,7 @@ The current page has strong headline scale but weak task order: no install verif
 | `/security` | Evaluate custody/authority | Credential, approval, evidence, reporting | Policy links | Fallback/repair distinction | Both |
 | `/privacy` | Understand data handling | Current policy content | Links | No JS | Both |
 | `/terms` | Understand terms | Current terms content | Links | No JS | Both |
+| `/oauth/callback/` | Return one PKCE authorization response to the waiting CLI | State/code or bounded error; paste instructions | Copy then clear | Missing/mismatched-looking/duplicate/oversized input, denied clipboard, no JS, expiry | Both |
 | 404 | Recover | Clear miss and route links | Navigate | Direct deep link | Both |
 
 ## 7. Hierarchy Contract
@@ -108,17 +123,31 @@ DOM, reading, and focus order remain identical; CSS must not visually reorder me
 
 ## 9. Creative Production Territory
 
-Status: blocked. The required Creative Production plugin/stage is not installed. Available design-review agents are not silently substituted.
+Status: owner-selected through an explicitly authorized substitute process. The
+required Creative Production plugin/stage was unavailable; the owner authorized
+grounding, semantic, design-system, spatial, and Leptos-architecture reviewers
+as substitutes rather than treating their output as an implicit replacement.
 
-- Provisional territory for owner discussion: **Control Ledger** — warm paper/ink contrast, precise orange boundary marks, content-addressed receipt motifs, and visible state transitions.
-- No generated artifact or asset is authoritative yet.
+- Selected territory: **Control Ledger** — warm paper/ink contrast, precise
+  orange boundary marks, content-addressed receipt motifs, and visible state
+  transitions.
+- Substitute review evidence: the 2026-08-05 Grounding Scout, Semantics
+  Guardian, Design System, Spatial Hierarchy, and Leptos Architecture returns,
+  synthesized into Sections 7–17 of this HORIZON.
+- Preserve: ordered authority, evidence-class distinctions, selectable exact
+  commands, and calm accountability.
+- Avoid: dashboard chrome, generic cards, terminal theater, remote fonts/icons,
+  and motion that resembles a real execution.
 
 ## 10. Product Design Options
 
-Status: not generated. The required Product Design plugin/stage is unavailable.
+Status: three structural directions compared in text under the explicitly
+authorized substitute process. Direction A is owner-selected.
 
-### Direction A — Control Ledger (provisional recommendation)
+### Direction A — Control Ledger (selected)
 
+- Exact substitute Product Design artifact:
+  `/Users/star/.codex/visualizations/2026/08/05/019fd392-3386-79f2-b79a-1d377fc86ff4/control-ledger-review.html`
 - Hierarchy thesis: executable proof and the authority ledger share the first viewport.
 - Layout grammar: editorial split hero, ruled lifecycle ledger, compact verification receipts.
 - Interaction model: copyable commands and progressive state explanation; no simulated product dashboard.
@@ -145,11 +174,44 @@ These text territories are not substitutes for the missing exact Product Design 
 
 ## 11. Selected Direction
 
-Status: not selected. Owner must choose an exact direction or authorize an explicit substitute process.
+Status: selected by the owner on 2026-08-05.
+
+- Exact selected Product Design result:
+  `/Users/star/.codex/visualizations/2026/08/05/019fd392-3386-79f2-b79a-1d377fc86ff4/control-ledger-review.html`
+  for **Direction A — Control Ledger**, as specified by Sections 7–10.
+- Coverage targets: every row in Section 6 uses the same warm editorial ledger
+  system; the OAuth callback uses a deliberately isolated, query-blind shell.
+- Selected creative territory: warm paper, near-black ink, mineral-gray rules,
+  restrained Cloudflare orange at authority boundaries, and cool blue-gray for
+  read/evidence metadata.
+- Why it wins: it makes the product's actual differentiator—where authority
+  crosses and what evidence proves—more legible than a feature grid or cloud
+  topology metaphor.
+- Why alternatives lose: Edge Observatory risks generic cloud spectacle and
+  motion ambiguity; Operator Manual is clear but does not make the governed
+  lifecycle ownable.
+- User feedback incorporated: use available design substitutes, select Control
+  Ledger, and use Workers Assets. Canonical-domain authority remains a later
+  source change gated by live domain and OAuth readback.
+- Known risks: ledger motifs can feel bureaucratic; orange can become generic
+  brand wash; illustrative states can be mistaken for live execution. Counter
+  with generous rhythm, orange only at named boundaries, and explicit evidence
+  labels.
 
 ## 12. Visualize Full-Design Review
 
-Status: not run. After selection, review all coverage rows as an inspectable preview with wide and narrow captures.
+Status: specified for an inspectable, route-switching full-page preview.
+
+- Review form: interactive full-page mockup with route/state switching.
+- Visualization path: thread-owned `control-ledger-review.html`; it is review
+  evidence only and never production source.
+- Coverage: home, start, security, privacy/terms treatment, OAuth callback
+  isolation, not-found recovery, wide-to-narrow movement, copy failure, and
+  invalid/expired callback states.
+- Decisions: lifecycle is the dominant spatial object; commands remain
+  selectable SSR content; trust regions are ruled notes rather than cards;
+  callback values never appear in the review fixture.
+- Limits: no runtime, browser, accessibility, or Leptos proof is implied.
 
 ## 13. Shared Design System
 
@@ -169,22 +231,25 @@ Status: not run. After selection, review all coverage rows as an inspectable pre
 | Command blocks | Full command text | Copy feedback | `CommandBlock` | Compile-time exact commands | Copy unavailable/denied |
 | Lifecycle | Full ordered list | Optional focus/highlight | `LifecycleLedger` | README semantics | Reduced motion/no JS |
 | Trust receipts | Full evidence text | None | `EvidenceReceipt` | Compile-time content | Not applicable |
+| OAuth callback | Shell and privacy instructions only; never server-render query values | Parse, validate, display, copy, clear | `OAuthCallback` isolated route | URL query from Cloudflare OAuth | Missing/invalid/duplicate/oversized, denied clipboard, expired display, no JS |
 
 - Canonical route-tree change: replace static files with one Leptos Router tree.
 - SSR route generation/server mount: Workers request adapter from the template, without D1.
 - Feature/bundle boundary: `ssr` and `hydrate`; minimal client islands.
 - Navigation/access/capability inventory: public routes only, no authentication or role gate.
-- No-JS behavior: all primary content and ordinary links work; copy feedback degrades to selectable text.
+- No-JS behavior: all primary content and ordinary links work; ordinary copy feedback degrades to selectable text. The OAuth bridge explains that script is required and does not server-render callback values.
 
 ## 15. Idea Server
 
-- Dev-only route: `/__ideas/cfctl-site`
-- Feature/config gate: development-only `ideas` feature or remove before production.
-- Full Design Coverage rows implemented: all routes and shared regions after selection.
-- Fixture source and mutation policy: compile-time copy only; no Cloudflare mutation.
-- Run command: to be set after crate extraction.
-- Readback URL: local loopback only.
-- Promotion/removal plan: selected components move to canonical routes; dev route removed before launch.
+- Dev-only route considered during selection: `/__ideas/cfctl-site`.
+- Promotion decision: the selected result was implemented directly in canonical
+  routes, so no idea-server route or feature ships in production.
+- Local review surface: `cargo build --no-default-features --features
+  ssr,local-preview` and `target/debug/cfctl-site` on loopback.
+- Fixture and mutation policy: compile-time public copy only; no Cloudflare
+  mutation and no sensitive callback fixture in SSR.
+- Full Design Coverage rows implemented: all routes and shared regions in
+  Section 6, including isolated callback and not-found recovery.
 
 ## 16. Responsive and Inclusive Behavior
 
@@ -197,20 +262,34 @@ Status: not run. After selection, review all coverage rows as an inspectable pre
 
 ## 17. Comparison and Proof Plan
 
-- Focused source/architecture ratchets for route inventory, template residue, and CLI commands.
-- SSR HTML assertions for every route and critical heading/command.
-- SSR and hydrate feature builds via cargo-leptos.
-- Release-shaped asset hash and Worker shim verification.
-- Browser deep-link, hydration, console/page-error, and copy-state checks.
-- Wide/narrow screenshots compared to the selected authority.
-- Keyboard, focus, contrast, zoom, reduced motion, and no-JS checks.
-- Evidence limits: screenshots do not prove semantics or accessibility APIs by themselves.
+- Source/architecture ratchets pass for route inventory, callback bounds,
+  template residue, zero storage, and immutable asset references.
+- SSR route proof returns 200 for every intended route and 404 for an unknown
+  path; ordinary route content is meaningful before hydration.
+- SSR, hydrate, Worker-WASM, and local-preview builds pass against the installed
+  Leptos 0.8 lockfile.
+- Browser proof shows the `CommandBlock` island changes its status to `Copied.`;
+  the OAuth callback removes its query, displays only validated inert text,
+  clears after copy, and rejects duplicate state values.
+- The implemented Leptos routes were compared with the selected Product Design
+  Control Ledger artifact: editorial split, ruled lifecycle, receipt language,
+  warm paper/ink tokens, and narrow ordered movement are present without a
+  production Idea Server.
+- Wide and 320-class narrow review preserve DOM order and avoid page-wide
+  horizontal overflow; semantic landmarks, headings, navigation, buttons, and
+  status regions remain present. Keyboard/focus rules, reduced-motion, forced
+  colors, and 200% reflow contracts are source-verified, with live assistive
+  technology validation still a launch follow-up.
+- Evidence limits: local browser and source proof do not prove live Cloudflare
+  headers, asset identity, domain binding, real-user comprehension, or outcome
+  lift. Those require exact deployment and live readback.
 
 ## 18. Non-goals and Reversibility
 
-- Non-goals: authenticated product UI, account data, forms, D1, WebGPU, third-party analytics.
+- Non-goals: authenticated product UI beyond the callback bridge, account data, forms, D1, WebGPU, third-party analytics.
 - Feature flag or isolation boundary: standalone `site/` Cargo workspace and Workers config.
-- Files/components to remove if rejected: new Leptos crate; current privacy/terms content remains recoverable from Git.
+- Files/components to remove if rejected: the standalone Leptos crate; the
+  superseded static privacy/terms files remain recoverable from Git history.
 - Old shared primitives: none.
 - Data or migration impact: none.
 
@@ -222,3 +301,6 @@ Status: not run. After selection, review all coverage rows as an inspectable pre
 | 2026-08-05 | Recommend Workers Assets for cargo-leptos SSR | Platform and Leptos primary docs | Pages is not the canonical v1 target unless owner overrides |
 | 2026-08-05 | Reject WebGPU for v1 | No validated job; bundle/accessibility cost | Use semantic HTML/CSS for the lifecycle |
 | 2026-08-05 | Stop before visual implementation | Required creative/product-design stages unavailable | Owner decision required |
+| 2026-08-05 | Select Control Ledger through explicitly authorized substitutes | Owner response plus five bounded substitute reviews | Lock lifecycle-led editorial design and proceed to Leptos implementation |
+| 2026-08-05 | Use Workers Assets without embedding a production route | The site needs SSR plus immutable assets, while provider and domain state can drift independently of source | Publish to the exact account-bound preview selected by a later governed plan; review custom-domain attachment separately after preview readback |
+| 2026-08-05 | Implement the selected result in canonical Leptos routes | Green edge build plus local route, hydration, callback, and responsive browser proof | Remove superseded static paths; keep deployment/live proof open |

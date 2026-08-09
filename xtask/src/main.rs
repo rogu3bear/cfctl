@@ -207,12 +207,55 @@ fn verify() -> Result<(), TaskError> {
             "--locked",
         ],
     )?;
+    verify_site()?;
     verify_event_ingress_bridge()?;
     verify_security_contract()?;
     verify_source_contract()?;
     verify_cross_target()?;
     report_pre_push_registration();
     Ok(())
+}
+
+fn verify_site() -> Result<(), TaskError> {
+    let root = repository_root()?.join("site");
+
+    let mut fmt = Command::new("cargo");
+    fmt.args(["fmt", "--", "--check"]).current_dir(&root);
+    run_command(&mut fmt, "cargo fmt -- --check (site)")?;
+
+    let mut clippy = Command::new("cargo");
+    clippy
+        .args([
+            "clippy",
+            "--all-targets",
+            "--features",
+            "ssr",
+            "--locked",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .current_dir(&root);
+    run_command(
+        &mut clippy,
+        "cargo clippy --all-targets --features ssr --locked -- -D warnings (site)",
+    )?;
+
+    let mut test = Command::new("cargo");
+    test.args(["test", "--all-targets", "--features", "ssr", "--locked"])
+        .current_dir(&root);
+    run_command(
+        &mut test,
+        "cargo test --all-targets --features ssr --locked (site)",
+    )?;
+
+    let mut edge = Command::new("bash");
+    edge.arg("./scripts/verify-reproducible-edge.sh")
+        .current_dir(&root);
+    run_command(
+        &mut edge,
+        "bash ./scripts/verify-reproducible-edge.sh (site)",
+    )
 }
 
 fn verify_event_ingress_bridge() -> Result<(), TaskError> {
