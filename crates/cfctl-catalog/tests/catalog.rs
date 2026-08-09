@@ -156,6 +156,130 @@ fn pages_domain_fixture() -> Value {
     document
 }
 
+fn pages_project_result_schema() -> Value {
+    json!({
+        "type":"object",
+        "required":["name","production_branch","build_config","source"],
+        "properties":{
+            "name":{"type":"string"},
+            "production_branch":{"type":"string"},
+            "build_config":{"type":"object","properties":{
+                "build_command":{"type":"string"},
+                "destination_dir":{"type":"string"},
+                "root_dir":{"type":"string"}
+            }},
+            "source":{"type":"object","properties":{
+                "type":{"type":"string"},
+                "config":{"type":"object"}
+            }}
+        }
+    })
+}
+
+fn pages_project_source_config_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "deployments_enabled":{"type":"boolean"},
+            "owner":{"type":"string"},
+            "owner_id":{"type":"string"},
+            "path_excludes":{"type":"array","items":{"type":"string"}},
+            "path_includes":{"type":"array","items":{"type":"string"}},
+            "pr_comments_enabled":{"type":"boolean"},
+            "preview_branch_excludes":{"type":"array","items":{"type":"string"}},
+            "preview_branch_includes":{"type":"array","items":{"type":"string"}},
+            "preview_deployment_setting":{"type":"string","enum":["all","none","custom"]},
+            "production_branch":{"type":"string"},
+            "production_deployments_enabled":{"type":"boolean"},
+            "repo_id":{"type":"string"},
+            "repo_name":{"type":"string"}
+        }
+    })
+}
+
+fn pages_project_request_schema() -> Value {
+    json!({
+        "type":"object",
+        "required":["name","production_branch"],
+        "properties":{
+            "name":{"type":"string"},
+            "production_branch":{"type":"string"},
+            "build_config":{"type":"object","properties":{
+                "build_caching":{"type":"boolean"},
+                "build_command":{"type":"string"},
+                "destination_dir":{"type":"string"},
+                "root_dir":{"type":"string"},
+                "web_analytics_tag":{"type":"string"}
+            }},
+            "deployment_configs":{"type":"object"},
+            "source":{
+                "type":"object",
+                "required":["type","config"],
+                "properties":{
+                    "type":{"type":"string","enum":["github","gitlab"]},
+                    "config":pages_project_source_config_schema()
+                }
+            }
+        }
+    })
+}
+
+fn pages_project_create_fixture() -> Value {
+    let mut document = fixture();
+    let account = json!({
+        "in": "path",
+        "name": "account_id",
+        "required": true,
+        "schema": {"maxLength": 32, "type": "string"}
+    });
+    let project = json!({
+        "in": "path",
+        "name": "project_name",
+        "required": true,
+        "schema": {"type": "string"}
+    });
+    let project_response = json!({
+        "200":{"description":"ok","content":{"application/json":{"schema":{
+            "type":"object",
+            "required":["success","result"],
+            "properties":{
+                "success":{"type":"boolean"},
+                "result":pages_project_result_schema()
+            }
+        }}}}
+    });
+    document["paths"]["/accounts/{account_id}/pages/projects"] = json!({
+        "post":{
+            "operationId":"pages-project-create-project",
+            "summary":"Create project",
+            "tags":["Pages Project"],
+            "x-api-token-group":["Pages Write"],
+            "parameters":[account.clone()],
+            "requestBody":{"required":true,"content":{"application/json":{"schema":pages_project_request_schema()}}},
+            "responses":project_response.clone()
+        }
+    });
+    document["paths"]["/accounts/{account_id}/pages/projects/{project_name}"] = json!({
+        "get":{
+            "operationId":"pages-project-get-project",
+            "summary":"Get project",
+            "tags":["Pages Project"],
+            "x-api-token-group":["Pages Read","Pages Write"],
+            "parameters":[account.clone(),project.clone()],
+            "responses":project_response
+        },
+        "delete":{
+            "operationId":"pages-project-delete-project",
+            "summary":"Delete project",
+            "tags":["Pages Project"],
+            "x-api-token-group":["Pages Write"],
+            "parameters":[account,project],
+            "responses":cloudflare_envelope_responses()
+        }
+    });
+    document
+}
+
 /// The response shape Cloudflare's `OpenAPI` actually declares for the DNS
 /// record delete: a bare `result` object with no top-level `success` boolean.
 /// The live API returns the full envelope (observed 2026-07-19); the schema
@@ -2029,6 +2153,59 @@ fn selector_contract_preserves_bounded_query_schema_and_serialization() {
 }
 
 #[test]
+fn pages_deployment_uuid_selector_corrects_only_pages_deployment_paths() {
+    let mut document = fixture();
+    let bounded_deployment = json!({
+        "in": "path",
+        "name": "deployment_id",
+        "required": true,
+        "schema": {"type": "string", "maxLength": 32}
+    });
+    let operation = |operation_id: &str, tag: &str| {
+        json!({
+            "get": {
+                "operationId": operation_id,
+                "summary": "Read deployment logs",
+                "tags": [tag],
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string","maxLength":32}},
+                    {"in":"path","name":"project_name","required":true,"schema":{"type":"string"}},
+                    bounded_deployment.clone()
+                ],
+                "responses": cloudflare_envelope_responses()
+            }
+        })
+    };
+    document["paths"]["/accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}/history/logs"] =
+        operation("pages-deployment-get-deployment-logs", "Pages Deployment");
+    document["paths"]["/accounts/{account_id}/unrelated/{deployment_id}"] =
+        operation("unrelated-get-deployment", "Unrelated");
+
+    let snapshot = normalize_openapi(&document).expect("Pages deployment selector catalog");
+    let selector_schema = |capability_id: &str| {
+        snapshot
+            .get(capability_id)
+            .expect("capability")
+            .selectors
+            .iter()
+            .find(|selector| selector.name == "deployment_id")
+            .and_then(|selector| selector.contract.as_ref())
+            .map(|contract| contract.schema.clone())
+            .expect("deployment selector schema")
+    };
+
+    let pages = selector_schema("pages-deployment-get-deployment-logs");
+    assert_eq!(pages["minLength"], 36);
+    assert_eq!(pages["maxLength"], 36);
+    assert!(
+        pages["pattern"]
+            .as_str()
+            .is_some_and(|value| value.contains('-'))
+    );
+    assert_eq!(selector_schema("unrelated-get-deployment")["maxLength"], 32);
+}
+
+#[test]
 fn selector_contract_resolves_local_parameter_references_and_operation_overrides() {
     let mut document = fixture();
     document["components"]["parameters"] = json!({
@@ -2281,6 +2458,144 @@ fn pages_domain_create_binds_exact_readback_and_reviewed_delete_compensation() {
     assert!(create.verification_contract_supported());
     assert!(create.rollback_contract_supported());
     assert!(create.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn pages_project_create_is_bounded_to_git_integrated_static_pages() {
+    let snapshot = normalize_openapi(&pages_project_create_fixture()).expect("Pages catalog");
+    let create = snapshot
+        .get("pages-project-create-project")
+        .expect("Pages project create");
+
+    assert_eq!(create.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(create.risk, RiskClass::CrossConfig);
+    assert_eq!(create.effect, EffectClass::ReversibleWrite);
+    assert_eq!(create.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(create.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(create.cost.maximum, Some(0.0));
+    assert!(create.cost.basis.as_deref().is_some_and(|basis| {
+        basis.contains("no direct API-operation charge")
+            && basis.contains("Git integration starts and continues builds/deployments")
+            && basis.contains("Pages Functions")
+            && basis.contains("plan-specific downstream exposure")
+    }));
+
+    let schema = create
+        .request_schema
+        .as_ref()
+        .expect("closed request schema");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["required"],
+        json!(["name", "production_branch", "build_config", "source"])
+    );
+    assert!(schema["properties"].get("deployment_configs").is_none());
+    assert_eq!(
+        schema["properties"]["production_branch"]["enum"],
+        json!(["main"])
+    );
+    assert!(
+        schema["properties"]["build_config"]["properties"]
+            .get("web_analytics_tag")
+            .is_none()
+    );
+    assert_eq!(
+        schema["properties"]["source"]["properties"]["type"]["enum"],
+        json!(["github"])
+    );
+    let source_config = &schema["properties"]["source"]["properties"]["config"]["properties"];
+    assert_eq!(source_config["production_branch"]["enum"], json!(["main"]));
+    assert_eq!(
+        source_config["preview_deployment_setting"]["enum"],
+        json!(["all"])
+    );
+    assert_eq!(source_config["deployments_enabled"]["enum"], json!([true]));
+    assert_eq!(
+        source_config["production_deployments_enabled"]["enum"],
+        json!([true])
+    );
+    for excluded in [
+        "path_excludes",
+        "path_includes",
+        "preview_branch_excludes",
+        "preview_branch_includes",
+    ] {
+        assert!(source_config.get(excluded).is_none());
+    }
+    assert_eq!(
+        schema["properties"]["source"]["properties"]["config"]["additionalProperties"],
+        false
+    );
+
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    let target = create
+        .created_resource
+        .as_ref()
+        .expect("created Pages project contract");
+    assert_eq!(
+        target.detail_path,
+        "/accounts/{account_id}/pages/projects/{project_name}"
+    );
+    assert_eq!(target.identity_selector, "project_name");
+    assert_eq!(target.response_result_identity_pointer, "/name");
+    assert_eq!(target.read_capability_id, "pages-project-get-project");
+    assert_eq!(target.delete_capability_id, "pages-project-delete-project");
+    assert_eq!(
+        target.verified_response_fields,
+        ["build_config", "name", "production_branch", "source"]
+    );
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    assert!(create.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("separate exact-project deletion plan")
+            && warning.contains("does not delete the connected Git repository")
+    }));
+    assert!(create.verification_contract_supported());
+    assert!(create.rollback_contract_supported());
+    assert!(create.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn pages_project_create_fails_closed_when_git_or_readback_contracts_drift() {
+    let mut missing_github = pages_project_create_fixture();
+    missing_github["paths"]["/accounts/{account_id}/pages/projects"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["source"]["properties"]["type"]["enum"] =
+        json!(["gitlab"]);
+    let snapshot = normalize_openapi(&missing_github).expect("drifted catalog");
+    let create = snapshot
+        .get("pages-project-create-project")
+        .expect("blocked Pages create");
+    assert_eq!(create.adapter_status, AdapterStatus::Blocked);
+    assert!(
+        create
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("create=false"))
+    );
+
+    let mut missing_source_readback = pages_project_create_fixture();
+    missing_source_readback["paths"]
+        ["/accounts/{account_id}/pages/projects/{project_name}"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("result properties")
+        .remove("source");
+    let snapshot = normalize_openapi(&missing_source_readback).expect("drifted catalog");
+    let create = snapshot
+        .get("pages-project-create-project")
+        .expect("blocked Pages create");
+    assert_eq!(create.adapter_status, AdapterStatus::Blocked);
+    assert!(
+        create
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("response=false"))
+    );
 }
 
 #[test]

@@ -411,6 +411,7 @@ dependencies = [
  "hex",
  "libc",
  "md-5",
+ "processkit",
  "reqwest",
  "serde",
  "serde_json",
@@ -1848,6 +1849,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "processkit"
+version = "2.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2391c479e77063c255aa4549f33bdcc12c0aab3300db786bc46ed893979dc4fa"
+dependencies = [
+ "async-trait",
+ "encoding_rs",
+ "libc",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2614,6 +2631,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
  "tokio",
 ]
 

@@ -47,7 +47,7 @@ use cfctl_core::{
 use cfctl_planner::{ImpactContext, PolicyEngine};
 use cfctl_registry::{InventoryProviderV1, OperationIndexRecordV1, Registry};
 use cfctl_storage::{RuntimePaths, StateStore, StoredPlanRecord};
-use cfctl_workspace::{RegisteredRoot, WorkspaceGraph};
+use cfctl_workspace::{RegisteredRoot, RepositoryNode, WorkspaceGraph};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
 use futures_util::{StreamExt, stream};
 use md5::Md5;
@@ -84,6 +84,14 @@ const API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
 const WRANGLER_ACCOUNT_ENV: &str = "CLOUDFLARE_ACCOUNT_ID";
 const WRANGLER_CACHE_ENV: &str = "WRANGLER_CACHE_DIR";
 const WRANGLER_CACHE_SUBDIRECTORY: &str = "wrangler";
+const PAGES_PROJECT_CREATE_CAPABILITY_ID: &str = "pages-project-create-project";
+const PAGES_PROJECT_READ_CAPABILITY_ID: &str = "pages-project-get-project";
+const PAGES_PROJECT_DETAIL_PATH: &str = "/accounts/{account_id}/pages/projects/{project_name}";
+const PAGES_PROJECT_ABSENCE_PRECONDITION: &str = "pages_project_absence";
+const PAGES_SOURCE_REMOTE_PRECONDITION: &str = "pages_source_remote";
+const PAGES_PROJECT_NOT_FOUND_ERROR_CODE: i64 = 8_000_007;
+const PAGES_GIT_CONFIG_TIMEOUT: Duration = Duration::from_secs(5);
+const PAGES_GIT_REMOTE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -10606,6 +10614,113 @@ fn apply_zone_account_response(
     }))
 }
 
+fn should_bind_pages_project_absence(capability: &CapabilityV1) -> bool {
+    capability.id == PAGES_PROJECT_CREATE_CAPABILITY_ID
+        && capability.method == "POST"
+        && capability.path == "/accounts/{account_id}/pages/projects"
+}
+
+fn pages_project_name(input: &CallInput) -> Result<&str> {
+    input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages project creation requires a non-empty project `name` in the request body"
+                    .to_owned(),
+            )
+        })
+}
+
+fn apply_pages_project_absence_response(
+    account_id: &str,
+    project_name: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    let exact_not_found = response.status == 404
+        && !response.success
+        && response.result.is_null()
+        && response.errors.len() == 1
+        && response.errors[0].code == Some(PAGES_PROJECT_NOT_FOUND_ERROR_CODE);
+    if exact_not_found {
+        return Ok(json!({
+            "schema_version": 1,
+            "source_capability_id": PAGES_PROJECT_READ_CAPABILITY_ID,
+            "source_path": PAGES_PROJECT_DETAIL_PATH,
+            "target_capability_id": PAGES_PROJECT_CREATE_CAPABILITY_ID,
+            "target_path": "/accounts/{account_id}/pages/projects",
+            "target_scope": "account",
+            "account_id": account_id,
+            "project_name": project_name,
+            "http_status": response.status,
+            "absent": true,
+        }));
+    }
+    if response.success && (200..300).contains(&response.status) {
+        return Err(CliError::Input(format!(
+            "Cloudflare Pages project `{project_name}` already exists in the selected account; the creation boundary was not crossed"
+        )));
+    }
+    Err(CliError::Input(format!(
+        "Cloudflare Pages project read returned HTTP {} and cannot prove exact target absence; the creation boundary was not crossed",
+        response.status
+    )))
+}
+
+async fn read_live_pages_project_absence(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !should_bind_pages_project_absence(capability) {
+        return Err(CliError::Input(
+            "Pages project absence read was requested for a different capability".to_owned(),
+        ));
+    }
+    let source_capability = catalog
+        .get(PAGES_PROJECT_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(PAGES_PROJECT_READ_CAPABILITY_ID))?;
+    if source_capability.method != "GET"
+        || source_capability.path != PAGES_PROJECT_DETAIL_PATH
+        || source_capability.mutating
+        || !matches!(
+            source_capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+    {
+        return Err(CliError::Input(
+            "Pages project absence source capability drifted from the governed exact-project read"
+                .to_owned(),
+        ));
+    }
+    let project_name = pages_project_name(input)?;
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source_capability,
+            &CallInput {
+                selectors: json!({
+                    "account_id": account_id,
+                    "project_name": project_name,
+                }),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt = apply_pages_project_absence_response(account_id, project_name, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
+
 async fn read_live_zone_account(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -10649,7 +10764,8 @@ async fn read_live_zone_account(
 }
 
 fn plan_requires_live_credential(capability: &CapabilityV1, adapter_targets: &Value) -> bool {
-    should_resolve_entitlement_probe(capability)
+    should_bind_pages_project_absence(capability)
+        || should_resolve_entitlement_probe(capability)
         || should_resolve_zone_entitlement(capability)
         || should_bind_zone_account(capability)
         || should_bind_global_warp_override_state(capability)
@@ -10819,6 +10935,25 @@ async fn create_plan(
         adapter_targets,
         live_preconditions,
     )
+}
+
+async fn prepare_pages_project_absence_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !should_bind_pages_project_absence(capability) {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input("Pages project absence precondition credential was not resolved".to_owned())
+    })?;
+    read_live_pages_project_absence(store, catalog, capability, input, account_id, credential)
+        .await
+        .map(Some)
 }
 
 async fn prepare_global_warp_override_state_precondition(
@@ -11376,6 +11511,10 @@ async fn prepare_live_plan_preconditions(
     Ok(LivePlanPreconditions {
         entitlement: None,
         zone_account: None,
+        pages_project_absence: prepare_pages_project_absence_precondition(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await?,
         r2_parent_token: None,
         global_warp_override_state: prepare_global_warp_override_state_precondition(
             store, catalog, capability, input, account_id, credential,
@@ -11452,6 +11591,7 @@ struct PlanAuthority<'a> {
 struct LivePlanPreconditions {
     entitlement: Option<(Value, EvidenceV1)>,
     zone_account: Option<(Value, EvidenceV1)>,
+    pages_project_absence: Option<(Value, EvidenceV1)>,
     r2_parent_token: Option<(Value, EvidenceV1)>,
     global_warp_override_state: Option<(Value, EvidenceV1)>,
     d1_read_replication_state: Option<(Value, EvidenceV1)>,
@@ -11477,6 +11617,9 @@ fn plan_targets(
         "account_id": account_id,
         "adapter": adapter_targets,
     });
+    if let Some((receipt, _)) = &live_preconditions.pages_project_absence {
+        targets["live_preconditions"][PAGES_PROJECT_ABSENCE_PRECONDITION] = receipt.clone();
+    }
     if let Some((receipt, _)) = &live_preconditions.global_warp_override_state {
         targets["live_preconditions"]["global_warp_override_state"] = receipt.clone();
     }
@@ -11525,6 +11668,10 @@ fn bind_live_plan_preconditions(
     for (name, precondition) in [
         ("entitlement", &live_preconditions.entitlement),
         ("zone_account", &live_preconditions.zone_account),
+        (
+            PAGES_PROJECT_ABSENCE_PRECONDITION,
+            &live_preconditions.pages_project_absence,
+        ),
         (
             "global_warp_override_state",
             &live_preconditions.global_warp_override_state,
@@ -11686,6 +11833,19 @@ fn planned_cloudflare_diff(
     diff
 }
 
+fn prepare_pages_source_remote_precondition(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> Result<Option<Value>> {
+    if !should_bind_pages_project_absence(capability) {
+        return Ok(None);
+    }
+    let graph = discover_registered(store)?;
+    let repository = registered_pages_source_repository(&graph, input)?;
+    pages_source_remote_snapshot(repository, input).map(Some)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "PlanV1 compatibility, PlanV2 pins, durable persistence, and the returned preview must be constructed from one immutable preparation context"
@@ -11725,7 +11885,11 @@ fn persist_prepared_plan(
             &policy.reasons.join("; "),
         ));
     }
-    let targets = plan_targets(&input, account_id, &adapter_targets, &live_preconditions);
+    let pages_source_remote = prepare_pages_source_remote_precondition(store, &capability, &input)?;
+    let mut targets = plan_targets(&input, account_id, &adapter_targets, &live_preconditions);
+    if let Some(snapshot) = &pages_source_remote {
+        targets["source_preconditions"][PAGES_SOURCE_REMOTE_PRECONDITION] = snapshot.clone();
+    }
     let mut plan = PlanV1::draft(
         &profile.id,
         account_id,
@@ -11746,6 +11910,12 @@ fn persist_prepared_plan(
     plan.precondition_hashes
         .insert("request_input".to_owned(), hash_value(&plan.input)?);
     bind_live_plan_preconditions(&mut plan, &live_preconditions)?;
+    if let Some(snapshot) = &pages_source_remote {
+        plan.precondition_hashes.insert(
+            PAGES_SOURCE_REMOTE_PRECONDITION.to_owned(),
+            hash_value(snapshot)?,
+        );
+    }
     plan.precondition_hashes
         .extend(workspace_precondition_hashes_for_scope(
             store,
@@ -12505,6 +12675,365 @@ struct PlannedImpact {
     local_artifact_paths: Vec<PathBuf>,
 }
 
+fn pages_github_source(input: &CallInput) -> Result<(&str, &str, &str)> {
+    let body = input.body.as_ref().ok_or_else(|| {
+        CliError::Input("Pages Git integration requires a request body".to_owned())
+    })?;
+    if body.pointer("/source/type").and_then(Value::as_str) != Some("github") {
+        return Err(CliError::Input(
+            "Pages project creation requires an exact GitHub source input".to_owned(),
+        ));
+    }
+    let required = |pointer: &str, label: &str| {
+        body.pointer(pointer)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| CliError::Input(format!("Pages Git source requires `{label}`")))
+    };
+    let owner = required("/source/config/owner", "source.config.owner")?;
+    let repository = required("/source/config/repo_name", "source.config.repo_name")?;
+    let branch = required("/production_branch", "production_branch")?;
+    if body
+        .pointer("/source/config/production_branch")
+        .and_then(Value::as_str)
+        != Some(branch)
+    {
+        return Err(CliError::Input(
+            "Pages source and project production branches must match exactly".to_owned(),
+        ));
+    }
+    if !github_path_segment_is_safe(owner)
+        || !github_path_segment_is_safe(repository)
+        || !git_branch_name_is_safe(branch)
+    {
+        return Err(CliError::Input(
+            "Pages Git source repository or branch identity is malformed".to_owned(),
+        ));
+    }
+    Ok((owner, repository, branch))
+}
+
+fn github_path_segment_is_safe(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn git_branch_name_is_safe(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+        && !value.ends_with('/')
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !value.bytes().any(|byte| {
+            byte <= b' '
+                || byte == 0x7f
+                || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+}
+
+fn github_remote_identity(remote: &str) -> Option<(String, String)> {
+    let path = if let Some(path) = remote.strip_prefix("git@github.com:") {
+        path.to_owned()
+    } else {
+        let parsed = url::Url::parse(remote).ok()?;
+        let valid_https = parsed.scheme() == "https" && parsed.username().is_empty();
+        let valid_ssh = parsed.scheme() == "ssh" && parsed.username() == "git";
+        if (!valid_https && !valid_ssh)
+            || parsed.password().is_some()
+            || parsed.port().is_some()
+            || parsed.host_str() != Some("github.com")
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return None;
+        }
+        parsed.path().trim_start_matches('/').to_owned()
+    };
+    let path = path.strip_suffix(".git").unwrap_or(&path);
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let repository = segments.next()?;
+    if segments.next().is_some()
+        || !github_path_segment_is_safe(owner)
+        || !github_path_segment_is_safe(repository)
+    {
+        return None;
+    }
+    Some((owner.to_ascii_lowercase(), repository.to_ascii_lowercase()))
+}
+
+#[derive(Debug)]
+struct BoundedPagesGitOutput {
+    success: bool,
+    code: Option<i32>,
+    stdout: String,
+}
+
+fn run_bounded_pages_git_program(
+    program: &Path,
+    repository_root: Option<&Path>,
+    arguments: &[&str],
+    timeout: Duration,
+) -> Result<BoundedPagesGitOutput> {
+    let program = program.to_path_buf();
+    let repository_root = repository_root.map(Path::to_path_buf);
+    let arguments = arguments
+        .iter()
+        .map(OsString::from)
+        .collect::<Vec<OsString>>();
+    let path = env::var_os("PATH").unwrap_or_default();
+    let inherited_environment = [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "SSH_AUTH_SOCK",
+    ]
+    .into_iter()
+    .filter_map(|name| env::var_os(name).map(|value| (name, value)))
+    .collect::<Vec<_>>();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| {
+                CliError::Input("Pages source Git proof runtime was unavailable".to_owned())
+            })?;
+        runtime.block_on(async move {
+            let mut command = processkit::Command::new(&program);
+            if let Some(repository_root) = repository_root {
+                command = command.arg("-C").arg(repository_root);
+            } else {
+                command = command.current_dir(env::temp_dir());
+            }
+            command = command
+                .args(arguments)
+                .env_clear()
+                .env("PATH", path)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_ASKPASS", "")
+                .env("SSH_ASKPASS", "")
+                .env("SSH_ASKPASS_REQUIRE", "never")
+                .env("GCM_INTERACTIVE", "Never")
+                .stdin(processkit::Stdin::empty())
+                .stderr(processkit::StdioMode::Null)
+                .output_buffer(processkit::OutputBufferPolicy::bounded(8_192).with_max_bytes(8_192))
+                .timeout(timeout);
+            for (name, value) in inherited_environment {
+                command = command.env(name, value);
+            }
+            let output = command.output_bytes().await.map_err(|_| {
+                CliError::Input("Pages source Git proof could not start or complete".to_owned())
+            })?;
+            if output.timed_out() {
+                return Err(CliError::SubprocessTimeout(
+                    "Pages source Git proof".to_owned(),
+                ));
+            }
+            if output.truncated() || output.stdout().len() > 8_192 {
+                return Err(CliError::Input(
+                    "Pages source Git proof output exceeded its fixed bound".to_owned(),
+                ));
+            }
+            let stdout = String::from_utf8(output.stdout().clone()).map_err(|_| {
+                CliError::Input("Pages source Git proof output was not UTF-8".to_owned())
+            })?;
+            Ok(BoundedPagesGitOutput {
+                success: output.is_success(),
+                code: output.code(),
+                stdout,
+            })
+        })
+    })
+    .join()
+    .map_err(|_| CliError::Input("Pages source Git proof runtime failed".to_owned()))?
+}
+
+fn pages_git_output(
+    repository_root: Option<&Path>,
+    arguments: &[&str],
+    timeout: Duration,
+    allow_no_match: bool,
+) -> Result<String> {
+    let output =
+        run_bounded_pages_git_program(Path::new("git"), repository_root, arguments, timeout)?;
+    if output.success {
+        return Ok(output.stdout);
+    }
+    if allow_no_match && output.code == Some(1) && output.stdout.is_empty() {
+        return Ok(String::new());
+    }
+    Err(CliError::Input(
+        "Pages source Git proof failed without exposing subprocess output".to_owned(),
+    ))
+}
+
+fn configured_origin(repository_root: &Path) -> Result<Option<String>> {
+    let output = pages_git_output(
+        Some(repository_root),
+        &["config", "--get-all", "remote.origin.url"],
+        PAGES_GIT_CONFIG_TIMEOUT,
+        true,
+    )?;
+    if output.is_empty() {
+        return Ok(None);
+    }
+    let rows = output.lines().collect::<Vec<_>>();
+    if rows.len() != 1 || rows[0].is_empty() || rows[0].trim() != rows[0] {
+        return Err(CliError::Input(
+            "Pages source repository must have exactly one raw effective origin URL".to_owned(),
+        ));
+    }
+    Ok(Some(rows[0].to_owned()))
+}
+
+fn matching_git_url_rewrite(config: &str, candidates: &[&str]) -> Result<bool> {
+    for row in config.lines().filter(|row| !row.is_empty()) {
+        let Some(separator) = row.find(char::is_whitespace) else {
+            return Err(CliError::Input(
+                "Pages source Git URL rewrite configuration was malformed".to_owned(),
+            ));
+        };
+        let (key, value) = row.split_at(separator);
+        let value = value.trim();
+        if !key.starts_with("url.") || !key.ends_with(".insteadof") || value.is_empty() {
+            return Err(CliError::Input(
+                "Pages source Git URL rewrite configuration was malformed".to_owned(),
+            ));
+        }
+        if candidates
+            .iter()
+            .any(|candidate| candidate.starts_with(value))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn registered_pages_source_repository<'a>(
+    graph: &'a WorkspaceGraph,
+    input: &CallInput,
+) -> Result<&'a RepositoryNode> {
+    let (owner, repository, _) = pages_github_source(input)?;
+    let expected = (owner.to_ascii_lowercase(), repository.to_ascii_lowercase());
+    let mut matches = Vec::new();
+    for candidate in &graph.repositories {
+        let Ok(Some(origin)) = configured_origin(&candidate.path) else {
+            continue;
+        };
+        if github_remote_identity(&origin).as_ref() == Some(&expected) {
+            matches.push(candidate);
+        }
+    }
+    if matches.len() != 1 {
+        return Err(CliError::Input(format!(
+            "Pages Git source must match exactly one registered repository; found {}",
+            matches.len()
+        )));
+    }
+    Ok(matches[0])
+}
+
+fn parse_pages_remote_head(output: &str, branch: &str) -> Result<String> {
+    let expected_ref = format!("refs/heads/{branch}");
+    let rows = output.lines().collect::<Vec<_>>();
+    let Some(row) = rows.first() else {
+        return Err(CliError::Input(
+            "Pages source branch did not resolve to one exact remote commit".to_owned(),
+        ));
+    };
+    let Some((commit, remote_ref)) = row.split_once('\t') else {
+        return Err(CliError::Input(
+            "Pages source branch returned a malformed remote identity".to_owned(),
+        ));
+    };
+    if rows.len() != 1 || remote_ref != expected_ref || !is_canonical_git_sha1(commit) {
+        return Err(CliError::Input(
+            "Pages source branch did not resolve to one exact remote commit".to_owned(),
+        ));
+    }
+    Ok(commit.to_owned())
+}
+
+fn is_canonical_git_sha1(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn pages_source_remote_receipt(input: &CallInput, remote_commit: &str) -> Result<Value> {
+    let (owner, repository, branch) = pages_github_source(input)?;
+    if !is_canonical_git_sha1(remote_commit) {
+        return Err(CliError::Input(
+            "Pages source branch returned a malformed remote commit".to_owned(),
+        ));
+    }
+    Ok(json!({
+        "schema_version": 1,
+        "provider": "github",
+        "owner": owner.to_ascii_lowercase(),
+        "repository": repository.to_ascii_lowercase(),
+        "branch": branch,
+        "remote_ref": format!("refs/heads/{branch}"),
+        "remote_commit": remote_commit,
+    }))
+}
+
+fn pages_source_remote_snapshot(repository: &RepositoryNode, input: &CallInput) -> Result<Value> {
+    let (owner, repository_name, branch) = pages_github_source(input)?;
+    let expected = (
+        owner.to_ascii_lowercase(),
+        repository_name.to_ascii_lowercase(),
+    );
+    let origin = configured_origin(&repository.path)?.ok_or_else(|| {
+        CliError::Input("Pages source repository has no raw local origin URL".to_owned())
+    })?;
+    if github_remote_identity(&origin).as_ref() != Some(&expected) {
+        return Err(CliError::Input(
+            "Pages source repository origin drifted from the reviewed GitHub identity".to_owned(),
+        ));
+    }
+    let canonical_remote = format!("https://github.com/{owner}/{repository_name}.git");
+    let rewrites = pages_git_output(
+        Some(&repository.path),
+        &["config", "--get-regexp", "^url\\..*\\.insteadof$"],
+        PAGES_GIT_CONFIG_TIMEOUT,
+        true,
+    )?;
+    if matching_git_url_rewrite(&rewrites, &[&origin, &canonical_remote])? {
+        return Err(CliError::Input(
+            "Pages source Git identity is subject to a configured URL substitution".to_owned(),
+        ));
+    }
+    let remote_ref = format!("refs/heads/{branch}");
+    let output = pages_git_output(
+        None,
+        &[
+            "-c",
+            "credential.helper=",
+            "ls-remote",
+            "--exit-code",
+            "--refs",
+            &canonical_remote,
+            &remote_ref,
+        ],
+        PAGES_GIT_REMOTE_TIMEOUT,
+        false,
+    )?;
+    let remote_commit = parse_pages_remote_head(&output, branch)?;
+    pages_source_remote_receipt(input, &remote_commit)
+}
+
 fn plan_impact(
     store: &StateStore,
     capability: &CapabilityV1,
@@ -12540,6 +13069,10 @@ fn plan_impact(
     let workspace_impact = graph.impact_for(&workspace_resource_keys);
     let local_artifact_paths = plan_local_artifact_paths(capability, input)?;
     let mut affected_repositories = workspace_impact.affected_repositories.clone();
+    if should_bind_pages_project_absence(capability) {
+        let source_repository = registered_pages_source_repository(&graph, input)?;
+        affected_repositories.push(source_repository.path.display().to_string());
+    }
     for artifact in &local_artifact_paths {
         let repository = repository_owning_path(&graph, artifact).ok_or_else(|| {
             CliError::Input(format!(
@@ -12642,6 +13175,12 @@ fn workspace_resource_keys(capability: &CapabilityV1, input: &CallInput) -> Vec<
     collect_workspace_resource_keys(capability, &input.query, None, &mut resources);
     if let Some(body) = &input.body {
         collect_workspace_resource_keys(capability, body, None, &mut resources);
+        if should_bind_pages_project_absence(capability)
+            && let Some(name) = body.get("name").and_then(Value::as_str)
+            && !name.is_empty()
+        {
+            resources.push(format!("pages_project:{name}"));
+        }
     }
     resources.sort();
     resources.dedup();
@@ -13530,6 +14069,7 @@ fn recover_standing_lineage(store: &StateStore, authority_id: &str) -> Result<Ve
 struct LivePreconditionEvidence {
     zone_account: Option<EvidenceV1>,
     entitlement: Option<EvidenceV1>,
+    pages_project_absence: Option<EvidenceV1>,
     permission_inventory: Option<EvidenceV1>,
     global_warp_override_state: Option<EvidenceV1>,
     d1_read_replication_state: Option<EvidenceV1>,
@@ -13559,6 +14099,10 @@ async fn validate_live_plan_precondition_evidence(
         )
         .await?,
         entitlement: validate_live_entitlement_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        pages_project_absence: validate_live_pages_project_absence_precondition(
             store, catalog, plan, input, credential,
         )
         .await?,
@@ -13694,6 +14238,7 @@ fn prepend_live_precondition_evidence(
     evidence: LivePreconditionEvidence,
 ) {
     for item in [
+        evidence.pages_project_absence,
         evidence.r2_parent_token,
         evidence.oauth_client_secret_state,
         evidence.dns_record_state,
@@ -13834,6 +14379,95 @@ fn required_r2_parent_token_precondition(plan: &PlanV1) -> Result<Option<&str>> 
         ));
     }
     Ok(Some(expected_hash))
+}
+
+fn validate_pages_project_absence_receipt(plan: &PlanV1, receipt: &Value) -> Result<()> {
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let project_name = pages_project_name(&input)?;
+    let exact = receipt.as_object().is_some_and(|object| object.len() == 10)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("source_capability_id").and_then(Value::as_str)
+            == Some(PAGES_PROJECT_READ_CAPABILITY_ID)
+        && receipt.get("source_path").and_then(Value::as_str) == Some(PAGES_PROJECT_DETAIL_PATH)
+        && receipt.get("target_capability_id").and_then(Value::as_str)
+            == Some(PAGES_PROJECT_CREATE_CAPABILITY_ID)
+        && receipt.get("target_path").and_then(Value::as_str)
+            == Some("/accounts/{account_id}/pages/projects")
+        && receipt.get("target_scope").and_then(Value::as_str) == Some("account")
+        && receipt.get("account_id").and_then(Value::as_str) == Some(plan.account_id.as_str())
+        && receipt.get("project_name").and_then(Value::as_str) == Some(project_name)
+        && receipt.get("http_status").and_then(Value::as_u64) == Some(404)
+        && receipt.get("absent").and_then(Value::as_bool) == Some(true);
+    if !exact {
+        return Err(CliError::Input(
+            "Pages project absence receipt has an invalid source, target, account, or absence shape; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn required_pages_project_absence_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    if !should_bind_pages_project_absence(&plan.capability) {
+        return Ok(None);
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(PAGES_PROJECT_ABSENCE_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages project creation plan predates the live exact-target absence contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer(&format!(
+            "/live_preconditions/{PAGES_PROJECT_ABSENCE_PRECONDITION}"
+        ))
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages project creation plan omitted its hash-bound target-absence receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    validate_pages_project_absence_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "Pages project target-absence receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+async fn validate_live_pages_project_absence_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_pages_project_absence_precondition(plan)? else {
+        return Ok(None);
+    };
+    let (receipt, evidence) = read_live_pages_project_absence(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live Pages project target state drifted after planning; the creation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
 }
 
 async fn validate_live_global_warp_override_state_precondition(
@@ -23377,6 +24011,80 @@ fn hash_directory_artifact(root: &Path) -> Result<String> {
     Ok(hash_value(&Value::Array(manifest))?)
 }
 
+fn validate_pages_source_remote_receipt(plan: &PlanV1, receipt: &Value) -> Result<()> {
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let (owner, repository, branch) = pages_github_source(&input)?;
+    let owner = owner.to_ascii_lowercase();
+    let repository = repository.to_ascii_lowercase();
+    let remote_ref = format!("refs/heads/{branch}");
+    let commit = receipt.get("remote_commit").and_then(Value::as_str);
+    let exact = receipt.as_object().is_some_and(|object| object.len() == 7)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("provider").and_then(Value::as_str) == Some("github")
+        && receipt.get("owner").and_then(Value::as_str) == Some(owner.as_str())
+        && receipt.get("repository").and_then(Value::as_str) == Some(repository.as_str())
+        && receipt.get("branch").and_then(Value::as_str) == Some(branch)
+        && receipt.get("remote_ref").and_then(Value::as_str) == Some(remote_ref.as_str())
+        && commit.is_some_and(|commit| {
+            commit.len() == 40
+                && commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    if !exact {
+        return Err(CliError::Input(
+            "Pages source remote receipt has an invalid repository, branch, or commit shape; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn current_pages_source_remote_precondition(
+    store: &StateStore,
+    plan: &PlanV1,
+) -> Result<Option<String>> {
+    if !should_bind_pages_project_absence(&plan.capability) {
+        return Ok(None);
+    }
+    let expected = plan
+        .precondition_hashes
+        .get(PAGES_SOURCE_REMOTE_PRECONDITION)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages project creation plan predates the exact source-remote contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer(&format!(
+            "/source_preconditions/{PAGES_SOURCE_REMOTE_PRECONDITION}"
+        ))
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages project creation plan omitted its source-remote receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    validate_pages_source_remote_receipt(plan, receipt)?;
+    if &hash_value(receipt)? != expected {
+        return Err(CliError::Input(
+            "Pages source-remote receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let current = prepare_pages_source_remote_precondition(store, &plan.capability, &input)?
+        .ok_or_else(|| {
+            CliError::Input(
+                "Pages source-remote precondition could not be recomputed; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    Ok(Some(hash_value(&current)?))
+}
+
 fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> {
     let local_artifact_paths = plan
         .precondition_hashes
@@ -23384,11 +24092,14 @@ fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> 
         .filter_map(|name| name.strip_prefix("source_artifact:"))
         .map(PathBuf::from)
         .collect::<Vec<_>>();
-    let current = workspace_precondition_hashes_for_scope(
+    let mut current = workspace_precondition_hashes_for_scope(
         store,
         &plan.affected_repositories,
         &local_artifact_paths,
     )?;
+    if let Some(source_remote) = current_pages_source_remote_precondition(store, plan)? {
+        current.insert(PAGES_SOURCE_REMOTE_PRECONDITION.to_owned(), source_remote);
+    }
     for (name, expected) in &plan.precondition_hashes {
         if is_live_plan_precondition_hash(name) {
             continue;
@@ -23409,6 +24120,7 @@ fn is_live_plan_precondition_hash(name: &str) -> bool {
             | "request_input"
             | "entitlement"
             | "zone_account"
+            | PAGES_PROJECT_ABSENCE_PRECONDITION
             | "global_warp_override_state"
             | D1_READ_REPLICATION_PRECONDITION
             | D1_EMPTY_DATABASE_PRECONDITION
@@ -25461,7 +26173,9 @@ mod tests {
         DNS_RECORD_DETAIL_READ_CAPABILITY_ID, DNS_RECORD_STATE_PRECONDITION,
         ImportPrerequisiteContext, KEYCHAIN_REPAIR_WARNING, LivePlanPreconditions,
         Mln0143PreImportExpectation, Mln0143RestoreAnchorJoin,
-        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, SECURITY_IP_RULE_COLLECTION_PATH,
+        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PAGES_PROJECT_ABSENCE_PRECONDITION,
+        PAGES_PROJECT_CREATE_CAPABILITY_ID, PAGES_PROJECT_DETAIL_PATH,
+        PAGES_PROJECT_READ_CAPABILITY_ID, PlanAuthority, SECURITY_IP_RULE_COLLECTION_PATH,
         SECURITY_IP_RULE_CREATE_ID, SECURITY_IP_RULE_STATE_CAPABILITY_ID,
         SECURITY_LIST_MEMBER_COLLECTION_PATH, SECURITY_LIST_MEMBER_CREATE_ID,
         SECURITY_LIST_MEMBER_REMOVE_ID, SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
@@ -25471,28 +26185,30 @@ mod tests {
         apply_dns_record_state_response, apply_entitlement_probe_response,
         apply_global_warp_override_state_response, apply_kv_empty_namespace_state_response,
         apply_oauth_client_secret_state_response, apply_operational_proof_index_result,
-        apply_r2_parent_token_response, apply_warp_connector_configuration_state_response,
-        apply_web_analytics_rum_state_response, apply_zone_account_response,
-        apply_zone_entitlement_response, approve_plan,
+        apply_pages_project_absence_response, apply_r2_parent_token_response,
+        apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
+        apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
         approved_mln_import_execution_error_envelope, bind_required_empty_compensation_body,
         blocked_capability_envelope, boundary_response_artifact, build_mint_policy_body,
-        call_command, cancel_plan, capability_call_argv, compensation_request,
+        call_command, cancel_plan, capability_call_argv, compensation_request, configured_origin,
         credential_generation_for_read, d1_recovery_anchor_matches, delegated_read_envelope,
         entitlement_probe_selectors, exact_accepted_ingest_bookmarks,
         exact_durable_poll_exhaustion, exact_durable_provider_complete_boundary,
         exact_durable_provider_failure_boundary, exact_in_progress_poll_receipt,
         execute_native_workflow, execute_read, find_secret_value, force_ipv4_from,
-        fresh_credential, governed_cli_environment_contract, governed_cli_workspace_env,
-        guide_document, guide_stage_commands, http_client, is_live_plan_precondition_hash,
-        is_secret_output_capability, key_policy_approve, key_policy_list, key_policy_revoke,
-        list_security_action_state_receipt, mln_0142_terminal_import_state,
-        mln_0143_parent_manifests, mln_0143_pre_import_authority_matches,
-        mln_0143_pre_import_matches, mln_0143_restore_anchor_matches,
-        non_readback_verification_basis, normalize_reviewed_mln_repository_id,
-        operational_proof_coverage, permission_inventory_call, permission_inventory_envelope,
-        persist_d1_import_checkpoint, persist_prepared_plan, persist_secret_lifecycle,
-        persist_secret_lifecycle_and_reconcile_lineage, plan_state_next_step, plan_status_label,
-        preflight_call_input, preflight_standing_authority, prepare_r2_temporary_credentials_input,
+        fresh_credential, github_remote_identity, governed_cli_environment_contract,
+        governed_cli_workspace_env, guide_document, guide_stage_commands, http_client,
+        is_live_plan_precondition_hash, is_secret_output_capability, key_policy_approve,
+        key_policy_list, key_policy_revoke, list_security_action_state_receipt,
+        matching_git_url_rewrite, mln_0142_terminal_import_state, mln_0143_parent_manifests,
+        mln_0143_pre_import_authority_matches, mln_0143_pre_import_matches,
+        mln_0143_restore_anchor_matches, non_readback_verification_basis,
+        normalize_reviewed_mln_repository_id, operational_proof_coverage,
+        pages_source_remote_receipt, parse_pages_remote_head, permission_inventory_call,
+        permission_inventory_envelope, persist_d1_import_checkpoint, persist_prepared_plan,
+        persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage, plan_impact,
+        plan_state_next_step, plan_status_label, preflight_call_input,
+        preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
         read_import_secret, read_r2_log_retrieval_credentials, read_secret_file,
         reconcile_standing_lineage_from_plan, rectify_approved_mln_import, rectify_plan,
@@ -25506,18 +26222,20 @@ mod tests {
         required_warp_connector_configuration_state_precondition,
         required_web_analytics_rum_state_precondition, required_zone_account_precondition,
         resolve_kv_empty_namespace_delete_cost, resolve_mint_token_bindings,
-        resolve_mint_token_scope, secret_sink_format,
+        resolve_mint_token_scope, run_bounded_pages_git_program, secret_sink_format,
         should_bind_cloudflare_tunnel_configuration_state, should_bind_d1_read_replication_state,
         should_bind_dns_record_state, should_bind_global_warp_override_state,
         should_bind_kv_empty_namespace_state, should_bind_oauth_client_secret_state,
-        should_bind_warp_connector_configuration_state, should_bind_web_analytics_rum_state,
-        should_bind_zone_account, should_redact_secret_response, should_resolve_entitlement_probe,
+        should_bind_pages_project_absence, should_bind_warp_connector_configuration_state,
+        should_bind_web_analytics_rum_state, should_bind_zone_account,
+        should_redact_secret_response, should_resolve_entitlement_probe,
         should_resolve_zone_entitlement, sink_secret_result, stage_approved_mln_migration,
         store_imported_api_token, validate_api_token_creation_contract,
         validate_approved_mln_repository_authority, validate_closed_import_recovery_bookmark,
         validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
         validate_managed_mln_stage_authority, validate_mln_0143_lineage_result,
+        validate_pages_project_absence_receipt, validate_pages_source_remote_receipt,
         validate_permission_group_resource_scope, validate_request_contract,
         validate_selected_permission_groups, validate_standing_authority_group_scopes,
         validate_standing_authority_permission_inventory, validate_token_policy_body,
@@ -25565,7 +26283,7 @@ mod tests {
     use md5::Md5;
     use serde_json::{Value, json};
     use sha2::{Digest as _, Sha256};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::{
         collections::BTreeMap,
         fs,
@@ -25575,11 +26293,626 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
         thread,
+        time::Duration,
     };
     use uuid::Uuid;
 
     fn guide_json(capability: &CapabilityV1) -> Value {
         serde_json::to_value(guide_document(capability)).expect("typed capability guide JSON")
+    }
+
+    fn pages_source_test_input() -> CallInput {
+        CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            body: Some(json!({
+                "name":"site-project",
+                "production_branch":"main",
+                "source": {
+                    "type":"github",
+                    "config": {
+                        "owner":"example-owner",
+                        "repo_name":"site-source",
+                        "production_branch":"main"
+                    }
+                }
+            })),
+            ..CallInput::default()
+        }
+    }
+
+    fn pages_create_test_capability() -> CapabilityV1 {
+        CapabilityV1::new(
+            PAGES_PROJECT_CREATE_CAPABILITY_ID,
+            "Create Pages project",
+            "POST",
+            "/accounts/{account_id}/pages/projects",
+        )
+    }
+
+    #[test]
+    fn pages_project_creation_requires_an_exact_live_absence_receipt() {
+        let capability = pages_create_test_capability();
+        assert!(should_bind_pages_project_absence(&capability));
+        let mut drifted_capability = capability.clone();
+        drifted_capability.method = "PUT".to_owned();
+        assert!(!should_bind_pages_project_absence(&drifted_capability));
+        assert!(
+            workspace_resource_keys(&drifted_capability, &pages_source_test_input()).is_empty()
+        );
+        let absent = CloudflareResponseV1 {
+            status: 404,
+            success: false,
+            result: Value::Null,
+            errors: vec![CloudflareApiErrorV1 {
+                code: Some(8_000_007),
+                message: "Project not found".to_owned(),
+            }],
+            result_info: None,
+            etag: None,
+            cf_ray: Some("ray-a".to_owned()),
+        };
+        let receipt = apply_pages_project_absence_response("account-a", "site-project", &absent)
+            .expect("the exact Pages not-found response proves target absence");
+        assert_eq!(receipt["project_name"], "site-project");
+        assert_eq!(receipt["http_status"], 404);
+        assert_eq!(receipt["absent"], true);
+
+        let exists = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({"name":"site-project"}),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        assert!(
+            apply_pages_project_absence_response("account-a", "site-project", &exists)
+                .expect_err("an existing project blocks creation")
+                .to_string()
+                .contains("already exists")
+        );
+
+        for ambiguous in [
+            CloudflareResponseV1 {
+                status: 403,
+                success: false,
+                result: Value::Null,
+                errors: Vec::new(),
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+            CloudflareResponseV1 {
+                status: 404,
+                success: false,
+                result: Value::Null,
+                errors: vec![CloudflareApiErrorV1 {
+                    code: Some(10_000),
+                    message: "Unknown route".to_owned(),
+                }],
+                result_info: None,
+                etag: None,
+                cf_ray: None,
+            },
+        ] {
+            assert!(
+                apply_pages_project_absence_response("account-a", "site-project", &ambiguous)
+                    .expect_err("non-exact read failure cannot prove target absence")
+                    .to_string()
+                    .contains("cannot prove")
+            );
+        }
+        assert!(is_live_plan_precondition_hash(
+            PAGES_PROJECT_ABSENCE_PRECONDITION
+        ));
+    }
+
+    #[test]
+    fn pages_absence_receipt_binds_the_selected_account_and_target() {
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-a",
+            pages_create_test_capability(),
+            json!({}),
+        )
+        .expect("Pages plan");
+        plan.input = serde_json::to_value(pages_source_test_input()).expect("Pages input");
+        let receipt = json!({
+            "schema_version": 1,
+            "source_capability_id": PAGES_PROJECT_READ_CAPABILITY_ID,
+            "source_path": PAGES_PROJECT_DETAIL_PATH,
+            "target_capability_id": PAGES_PROJECT_CREATE_CAPABILITY_ID,
+            "target_path": "/accounts/{account_id}/pages/projects",
+            "target_scope": "account",
+            "account_id": "account-a",
+            "project_name": "site-project",
+            "http_status": 404,
+            "absent": true,
+        });
+        validate_pages_project_absence_receipt(&plan, &receipt)
+            .expect("exact Pages absence receipt");
+
+        plan.account_id = "account-b".to_owned();
+        assert!(validate_pages_project_absence_receipt(&plan, &receipt).is_err());
+        plan.account_id = "account-a".to_owned();
+        plan.input["body"]["name"] = json!("different-project");
+        assert!(validate_pages_project_absence_receipt(&plan, &receipt).is_err());
+    }
+
+    #[test]
+    fn pages_remote_head_requires_one_exact_lowercase_sha_and_ref() {
+        let commit = "a".repeat(40);
+        let exact = format!("{commit}\trefs/heads/main\n");
+        assert_eq!(
+            parse_pages_remote_head(&exact, "main").expect("exact remote row"),
+            commit
+        );
+        for malformed in [
+            format!("{} refs/heads/main\n", "a".repeat(40)),
+            format!("{}\trefs/heads/main\n", "a".repeat(39)),
+            format!("{}\trefs/heads/main\n", "A".repeat(40)),
+            format!("{}\trefs/heads/other\n", "a".repeat(40)),
+            format!(
+                "{}\trefs/heads/main\n{}\trefs/heads/main\n",
+                "a".repeat(40),
+                "b".repeat(40)
+            ),
+        ] {
+            assert!(parse_pages_remote_head(&malformed, "main").is_err());
+        }
+    }
+
+    #[test]
+    fn pages_github_identity_and_matching_url_rewrites_fail_closed() {
+        for remote in [
+            "https://github.com/Example-Owner/site-source.git",
+            "ssh://git@github.com/Example-Owner/site-source.git",
+            "git@github.com:Example-Owner/site-source.git",
+        ] {
+            assert_eq!(
+                github_remote_identity(remote),
+                Some(("example-owner".to_owned(), "site-source".to_owned()))
+            );
+        }
+        for rejected in [
+            "https://git@github.com/example-owner/site-source.git",
+            "https://github.com:444/example-owner/site-source.git",
+            "https://github.com/example-owner/site-source/extra.git",
+            "https://gitlab.com/example-owner/site-source.git",
+        ] {
+            assert_eq!(github_remote_identity(rejected), None);
+        }
+
+        let canonical = "https://github.com/example-owner/site-source.git";
+        let scp = "git@github.com:example-owner/site-source.git";
+        assert!(
+            matching_git_url_rewrite(
+                "url.file:///tmp/mirror/.insteadof https://github.com/\n",
+                &[canonical, scp],
+            )
+            .expect("well-formed rewrite")
+        );
+        assert!(
+            matching_git_url_rewrite(
+                "url.ssh://mirror/.insteadof git@github.com:\n",
+                &[canonical, scp],
+            )
+            .expect("well-formed scp rewrite")
+        );
+        assert!(
+            !matching_git_url_rewrite(
+                "url.file:///tmp/mirror/.insteadof https://example.invalid/\n",
+                &[canonical, scp],
+            )
+            .expect("unrelated rewrite")
+        );
+        assert!(matching_git_url_rewrite("malformed-row\n", &[canonical]).is_err());
+    }
+
+    #[test]
+    fn pages_source_requires_exactly_one_raw_effective_origin() {
+        let root = tempfile::tempdir().expect("repository root");
+        init_pages_scope_repository(root.path(), "name = \"site-project\"\n");
+        assert!(
+            StdCommand::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/example-owner/site-source.git",
+                ])
+                .current_dir(root.path())
+                .status()
+                .expect("source origin")
+                .success()
+        );
+        assert_eq!(
+            configured_origin(root.path()).expect("one raw origin"),
+            Some("https://github.com/example-owner/site-source.git".to_owned())
+        );
+        assert!(
+            StdCommand::new("git")
+                .args([
+                    "config",
+                    "--add",
+                    "remote.origin.url",
+                    "https://github.com/example-owner/different-source.git",
+                ])
+                .current_dir(root.path())
+                .status()
+                .expect("second source origin")
+                .success()
+        );
+        assert!(configured_origin(root.path()).is_err());
+
+        let linked_root = tempfile::tempdir().expect("linked-worktree root");
+        let common = linked_root.path().join("common");
+        let linked = linked_root.path().join("linked");
+        init_pages_scope_repository(&common, "name = \"site-project\"\n");
+        assert!(
+            StdCommand::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/example-owner/site-source.git",
+                ])
+                .current_dir(&common)
+                .status()
+                .expect("common source origin")
+                .success()
+        );
+        assert!(
+            StdCommand::new("git")
+                .args(["config", "extensions.worktreeConfig", "true"])
+                .current_dir(&common)
+                .status()
+                .expect("enable worktree config")
+                .success()
+        );
+        assert!(
+            StdCommand::new("git")
+                .args(["worktree", "add", "--quiet", "--detach"])
+                .arg(&linked)
+                .current_dir(&common)
+                .status()
+                .expect("linked worktree")
+                .success()
+        );
+        assert!(
+            StdCommand::new("git")
+                .args([
+                    "config",
+                    "--worktree",
+                    "remote.origin.url",
+                    "https://github.com/example-owner/substituted-source.git",
+                ])
+                .current_dir(&linked)
+                .status()
+                .expect("worktree source override")
+                .success()
+        );
+        assert!(configured_origin(&linked).is_err());
+    }
+
+    #[test]
+    fn pages_source_receipt_is_categorical_and_remote_drift_changes_its_hash() {
+        let input = pages_source_test_input();
+        let first =
+            pages_source_remote_receipt(&input, &"a".repeat(40)).expect("first source receipt");
+        let second =
+            pages_source_remote_receipt(&input, &"b".repeat(40)).expect("drifted source receipt");
+        assert_eq!(first.as_object().expect("object").len(), 7);
+        assert_eq!(first["provider"], "github");
+        assert_eq!(first["repository"], "site-source");
+        assert!(first.get("remote_url").is_none());
+        assert_ne!(
+            hash_value(&first).expect("first hash"),
+            hash_value(&second).expect("second hash")
+        );
+
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-a",
+            pages_create_test_capability(),
+            json!({}),
+        )
+        .expect("Pages plan");
+        plan.input = serde_json::to_value(input).expect("Pages input");
+        validate_pages_source_remote_receipt(&plan, &first).expect("exact source receipt");
+        let mut drifted_identity = first;
+        drifted_identity["repository"] = json!("different-source");
+        assert!(validate_pages_source_remote_receipt(&plan, &drifted_identity).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pages_git_proof_is_prompt_free_bounded_and_terminates_its_process_group() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn executable_script(root: &Path, name: &str, source: &str) -> PathBuf {
+            let path = root.join(name);
+            fs::write(&path, source).expect("script source");
+            let mut permissions = fs::metadata(&path).expect("script metadata").permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&path, permissions).expect("script permissions");
+            path
+        }
+
+        let root = tempfile::tempdir().expect("script root");
+        let prompt_probe = executable_script(
+            root.path(),
+            "prompt-probe.sh",
+            "#!/bin/sh\n[ \"$GIT_TERMINAL_PROMPT\" = 0 ] || exit 9\n[ -z \"$GIT_ASKPASS\" ] || exit 10\n[ -z \"$SSH_ASKPASS\" ] || exit 11\n[ \"$SSH_ASKPASS_REQUIRE\" = never ] || exit 12\n[ \"$GCM_INTERACTIVE\" = Never ] || exit 13\nif IFS= read -r value; then exit 14; fi\nprintf prompt-free\n",
+        );
+        let prompt_output =
+            run_bounded_pages_git_program(&prompt_probe, None, &[], Duration::from_secs(5))
+                .expect("prompt-free subprocess");
+        assert!(prompt_output.success);
+        assert_eq!(prompt_output.stdout, "prompt-free");
+
+        let askpass_marker = root.path().join("askpass-ran");
+        let _askpass_probe = executable_script(
+            root.path(),
+            "cfctl-askpass-is-disabled",
+            "#!/bin/sh\nprintf invoked > \"$CFCTL_ASKPASS_MARKER\"\n",
+        );
+        let credential_probe = executable_script(
+            root.path(),
+            "credential-probe.sh",
+            "#!/bin/sh\nPATH=\"$1:$PATH\" CFCTL_ASKPASS_MARKER=\"$2\" git -c credential.helper= -c core.askPass=cfctl-askpass-is-disabled credential fill <<'EOF'\nprotocol=https\nhost=example.invalid\nusername=test\n\nEOF\n",
+        );
+        let credential_output = run_bounded_pages_git_program(
+            &credential_probe,
+            None,
+            &[
+                root.path().to_str().expect("UTF-8 sentinel path"),
+                askpass_marker.to_str().expect("UTF-8 marker path"),
+            ],
+            Duration::from_secs(5),
+        )
+        .expect("credential probe");
+        assert!(!credential_output.success);
+        assert!(!askpass_marker.exists(), "PATH askpass sentinel executed");
+
+        let secret_failure = executable_script(
+            root.path(),
+            "secret-failure.sh",
+            "#!/bin/sh\nprintf super-secret-provider-body >&2\nexit 7\n",
+        );
+        let failed =
+            run_bounded_pages_git_program(&secret_failure, None, &[], Duration::from_secs(5))
+                .expect("bounded failure receipt");
+        assert!(!failed.success);
+        assert_eq!(failed.code, Some(7));
+        assert!(failed.stdout.is_empty());
+
+        let output_flood = executable_script(
+            root.path(),
+            "output-flood.sh",
+            "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 8193 ]; do printf x; i=$((i + 1)); done\n",
+        );
+        let error = run_bounded_pages_git_program(&output_flood, None, &[], Duration::from_secs(5))
+            .expect_err("oversized output must fail closed");
+        assert!(matches!(error, CliError::Input(message) if message.contains("fixed bound")));
+
+        let pid_file = root.path().join("pids");
+        let timeout_probe = executable_script(
+            root.path(),
+            "timeout-probe.sh",
+            "#!/bin/sh\nsleep 30 &\nprintf '%s %s\\n' \"$$\" \"$!\" > \"$1\"\nwait\n",
+        );
+        let pid_file_argument = pid_file.to_str().expect("UTF-8 pid path");
+        let error = run_bounded_pages_git_program(
+            &timeout_probe,
+            None,
+            &[pid_file_argument],
+            Duration::from_secs(1),
+        )
+        .expect_err("timeout must fail closed");
+        assert!(matches!(error, CliError::SubprocessTimeout(_)));
+
+        let pids = fs::read_to_string(&pid_file).expect("recorded process IDs");
+        for pid in pids.split_whitespace() {
+            let mut alive = true;
+            for _ in 0..100 {
+                alive = StdCommand::new("kill")
+                    .args(["-0", pid])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .expect("process probe")
+                    .success();
+                if !alive {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!alive, "timed-out Pages Git process {pid} survived");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pages_git_proof_windows_job_contains_an_immediate_descendant() {
+        let root = tempfile::tempdir().expect("Windows process-tree root");
+        let pid_file = root.path().join("descendant-pid");
+        let started = std::time::Instant::now();
+        let error = run_bounded_pages_git_program(
+            Path::new("powershell.exe"),
+            None,
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$child = Start-Process powershell.exe -NoNewWindow -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru; Set-Content -NoNewline -LiteralPath $args[0] -Value $child.Id; $child.WaitForExit()",
+                pid_file.to_str().expect("UTF-8 descendant PID path"),
+            ],
+            Duration::from_secs(1),
+        )
+        .expect_err("descendant-held pipe must time out");
+        assert!(matches!(error, CliError::SubprocessTimeout(_)));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "Windows Pages Git timeout exceeded its fixed teardown bound"
+        );
+        let pid = fs::read_to_string(&pid_file).expect("recorded descendant PID");
+        let mut alive = true;
+        for _ in 0..100 {
+            alive = StdCommand::new("powershell.exe")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &format!(
+                        "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                    ),
+                ])
+                .status()
+                .expect("descendant process probe")
+                .success();
+            if !alive {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!alive, "timed-out Pages Git descendant {pid} survived");
+    }
+
+    fn init_pages_scope_repository(path: &Path, wrangler: &str) {
+        fs::create_dir_all(path).expect("repository root");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .current_dir(path)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        fs::write(path.join("wrangler.toml"), wrangler).expect("wrangler fixture");
+        fs::write(path.join("README.md"), "fixture\n").expect("source fixture");
+        assert!(
+            StdCommand::new("git")
+                .args(["add", "."])
+                .current_dir(path)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            StdCommand::new("git")
+                .args([
+                    "-c",
+                    "user.name=cfctl test",
+                    "-c",
+                    "user.email=cfctl-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ])
+                .current_dir(path)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+    }
+
+    #[test]
+    fn pages_plan_scope_adds_the_exact_source_without_broadening_generic_preconditions() {
+        let state = tempfile::tempdir().expect("state root");
+        let repositories = tempfile::tempdir().expect("repository root");
+        let store = StateStore::open(RuntimePaths::from_root(state.path())).expect("state store");
+        let source = repositories.path().join("site-source");
+        let unrelated = repositories.path().join("unrelated");
+        init_pages_scope_repository(
+            &source,
+            "name = \"site-project\"\npages_build_output_dir = \"dist\"\n",
+        );
+        init_pages_scope_repository(
+            &unrelated,
+            "name = \"unrelated-worker\"\nmain = \"src/index.js\"\n",
+        );
+        assert!(
+            StdCommand::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/example-owner/site-source.git",
+                ])
+                .current_dir(&source)
+                .status()
+                .expect("source origin")
+                .success()
+        );
+        assert!(
+            StdCommand::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/example-owner/unrelated-source.git",
+                ])
+                .current_dir(&unrelated)
+                .status()
+                .expect("unrelated origin")
+                .success()
+        );
+        assert!(
+            StdCommand::new("git")
+                .args([
+                    "config",
+                    "--add",
+                    "remote.origin.url",
+                    "https://github.com/example-owner/ambiguous-unrelated-source.git",
+                ])
+                .current_dir(&unrelated)
+                .status()
+                .expect("ambiguous unrelated origin")
+                .success()
+        );
+        store
+            .register_workspace(&source, Some("account-a".to_owned()))
+            .expect("register source");
+        store
+            .register_workspace(&unrelated, Some("account-a".to_owned()))
+            .expect("register unrelated");
+        let source = source.canonicalize().expect("canonical source");
+        let unrelated = unrelated.canonicalize().expect("canonical unrelated");
+
+        let input = pages_source_test_input();
+        let impact = plan_impact(&store, &pages_create_test_capability(), &input, "account-a")
+            .expect("Pages impact");
+        assert_eq!(
+            impact.affected_repositories,
+            vec![source.display().to_string()]
+        );
+        assert!(
+            impact
+                .affected_resources
+                .contains(&"pages_project:site-project".to_owned())
+        );
+
+        let before =
+            workspace_precondition_hashes_for_scope(&store, &impact.affected_repositories, &[])
+                .expect("scoped generic preconditions");
+        fs::write(unrelated.join("README.md"), "unrelated drift\n").expect("unrelated drift");
+        let after_unrelated =
+            workspace_precondition_hashes_for_scope(&store, &impact.affected_repositories, &[])
+                .expect("unrelated repository remains outside scope");
+        assert_eq!(before, after_unrelated);
+
+        fs::write(source.join("README.md"), "source drift\n").expect("source drift");
+        let after_source =
+            workspace_precondition_hashes_for_scope(&store, &impact.affected_repositories, &[])
+                .expect("source repository remains bound");
+        assert_ne!(before, after_source);
     }
 
     #[test]
@@ -31921,6 +33254,7 @@ mod tests {
         let no_preconditions = || LivePlanPreconditions {
             entitlement: None,
             zone_account: None,
+            pages_project_absence: None,
             r2_parent_token: None,
             global_warp_override_state: None,
             d1_read_replication_state: None,
@@ -32973,8 +34307,6 @@ mod tests {
                 "account_id":"account-a",
                 "oauth_client_id":"oauth-client-a"
             }),
-            query: json!({}),
-            body: None,
             ..CallInput::default()
         };
         let response = CloudflareResponseV1 {
@@ -33015,6 +34347,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                pages_project_absence: None,
                 r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
@@ -33975,6 +35308,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                pages_project_absence: None,
                 r2_parent_token: None,
                 global_warp_override_state: Some((receipt.clone(), receipt_evidence)),
                 d1_read_replication_state: None,
@@ -34064,6 +35398,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                pages_project_absence: None,
                 r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: Some((receipt.clone(), receipt_evidence)),
@@ -34158,6 +35493,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                pages_project_absence: None,
                 r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
@@ -34248,6 +35584,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                pages_project_absence: None,
                 r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
@@ -34332,6 +35669,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                pages_project_absence: None,
                 r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,
@@ -34432,6 +35770,7 @@ mod tests {
             LivePlanPreconditions {
                 entitlement: None,
                 zone_account: None,
+                pages_project_absence: None,
                 r2_parent_token: None,
                 global_warp_override_state: None,
                 d1_read_replication_state: None,

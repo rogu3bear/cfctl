@@ -7368,6 +7368,7 @@ fn apply_post_normalization_contracts(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
 ) {
+    finalize_pages_deployment_id_selector_contracts(capabilities);
     finalize_worker_script_secret_contracts(document, capabilities);
     classify_exact_resource_contracts(document, capabilities);
     finalize_singleton_resource_delete_contracts(document, capabilities);
@@ -7377,6 +7378,7 @@ fn apply_post_normalization_contracts(
     classify_access_service_token_refresh_contract(document, capabilities);
     classify_created_resource_contracts(document, capabilities);
     classify_created_collection_resource_contracts(document, capabilities);
+    finalize_pages_project_create_contract(document, capabilities);
     finalize_pages_domain_create_contract(document, capabilities);
     classify_global_warp_override_contract(document, capabilities);
     classify_same_path_object_mutation_contracts(document, capabilities);
@@ -7402,6 +7404,284 @@ fn apply_post_normalization_contracts(
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
+}
+
+const PAGES_DEPLOYMENT_DETAIL_PATH_PREFIX: &str =
+    "/accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}";
+
+/// Cloudflare Pages deployment identifiers are UUIDs. The generated `OpenAPI`
+/// currently reuses the 32-character account identifier bound for this path
+/// selector, which rejects the API's canonical 36-character deployment IDs
+/// before a governed read can reach the provider. Keep this correction scoped
+/// to Pages deployment-resource paths and preserve every other selector bound.
+fn finalize_pages_deployment_id_selector_contracts(
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    for capability in capabilities.values_mut().filter(|capability| {
+        capability
+            .path
+            .starts_with(PAGES_DEPLOYMENT_DETAIL_PATH_PREFIX)
+    }) {
+        let Some(selector) = capability.selectors.iter_mut().find(|selector| {
+            selector.name == "deployment_id"
+                && selector.location == "path"
+                && selector.value_type == "string"
+        }) else {
+            continue;
+        };
+        selector.contract = Some(SelectorContractV1 {
+            schema: serde_json::json!({
+                "type": "string",
+                "minLength": 36,
+                "maxLength": 36,
+                "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+            }),
+            query: None,
+        });
+    }
+}
+
+const PAGES_PROJECT_CREATE_CAPABILITY_ID: &str = "pages-project-create-project";
+const PAGES_PROJECT_READ_CAPABILITY_ID: &str = "pages-project-get-project";
+const PAGES_PROJECT_DELETE_CAPABILITY_ID: &str = "pages-project-delete-project";
+const PAGES_PROJECT_COLLECTION_PATH: &str = "/accounts/{account_id}/pages/projects";
+const PAGES_PROJECT_DETAIL_PATH: &str = "/accounts/{account_id}/pages/projects/{project_name}";
+
+fn finalize_pages_project_create_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let companions_supported = capabilities
+        .get(PAGES_PROJECT_READ_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.method == "GET"
+                && capability.path == PAGES_PROJECT_DETAIL_PATH
+                && capability.product == "Pages Project"
+                && capability
+                    .selectors
+                    .iter()
+                    .all(|selector| selector.location == "path")
+        })
+        && capabilities
+            .get(PAGES_PROJECT_DELETE_CAPABILITY_ID)
+            .is_some_and(|capability| {
+                capability.method == "DELETE"
+                    && capability.path == PAGES_PROJECT_DETAIL_PATH
+                    && capability.product == "Pages Project"
+                    && capability.permissions == ["Pages Write"]
+            });
+    let create_operation =
+        document.pointer("/paths/~1accounts~1{account_id}~1pages~1projects/post");
+    let read_operation =
+        document.pointer("/paths/~1accounts~1{account_id}~1pages~1projects~1{project_name}/get");
+    let response_fields = ["build_config", "name", "production_branch", "source"];
+    let response_supported = create_operation.is_some_and(|operation| {
+        success_response_declares_result_string_field(document, operation, "name")
+            && success_response_declares_result_fields(document, operation, &response_fields)
+    }) && read_operation.is_some_and(|operation| {
+        success_response_declares_result_string_field(document, operation, "name")
+            && success_response_declares_result_fields(document, operation, &response_fields)
+    });
+
+    let Some(capability) = capabilities.get_mut(PAGES_PROJECT_CREATE_CAPABILITY_ID) else {
+        return;
+    };
+    let create_supported = capability.method == "POST"
+        && capability.path == PAGES_PROJECT_COLLECTION_PATH
+        && capability.product == "Pages Project"
+        && capability.permissions == ["Pages Write"]
+        && pages_project_upstream_request_supported(capability.request_schema.as_ref());
+    if !create_supported || !companions_supported || !response_supported {
+        capability.created_resource = None;
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(format!(
+            "Pages Git-integrated project create, exact readback, delete, or response contract drifted (create={create_supported}, companions={companions_supported}, response={response_supported})"
+        ));
+        return;
+    }
+
+    capability.request_schema = Some(pages_git_project_create_request_schema());
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost = CostV1::default();
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.basis = Some(
+        "creating one Git-integrated Pages project has no direct API-operation charge; the closed request contract excludes deployment configuration and resource bindings, but Git integration starts and continues builds/deployments, and any Pages Functions present in repository output plus build quotas remain plan-specific downstream exposure"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        official_reference(
+            "Cloudflare Pages pricing",
+            "https://developers.cloudflare.com/pages/functions/pricing/",
+        ),
+        official_reference(
+            "Cloudflare Pages Git integration",
+            "https://developers.cloudflare.com/pages/configuration/git-integration/",
+        ),
+    ];
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: PAGES_PROJECT_DETAIL_PATH.to_owned(),
+        identity_selector: "project_name".to_owned(),
+        response_result_identity_pointer: "/name".to_owned(),
+        read_capability_id: PAGES_PROJECT_READ_CAPABILITY_ID.to_owned(),
+        delete_capability_id: PAGES_PROJECT_DELETE_CAPABILITY_ID.to_owned(),
+        verified_response_fields: response_fields.map(str::to_owned).to_vec(),
+    });
+    capability.verification.required = true;
+    "created_resource_contains_planned_fields_by_returned_id"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    capability.rollback.warning = Some(
+        "compensation creates a separate exact-project deletion plan that must be reviewed and explicitly approved; deletion removes the Pages project and deployments but does not delete the connected Git repository"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
+
+fn pages_project_upstream_request_supported(schema: Option<&Value>) -> bool {
+    let Some(schema) = schema else {
+        return false;
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    let has_string = |object: &serde_json::Map<String, Value>, field: &str| {
+        object
+            .get(field)
+            .and_then(|field| field.get("type"))
+            .and_then(Value::as_str)
+            == Some("string")
+    };
+    let Some(build) = properties
+        .get("build_config")
+        .and_then(|value| value.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(source) = properties
+        .get("source")
+        .and_then(|value| value.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(source_config) = source
+        .get("config")
+        .and_then(|value| value.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let source_types = source
+        .get("type")
+        .and_then(|value| value.get("enum"))
+        .and_then(Value::as_array);
+    let required = schema.get("required").and_then(Value::as_array);
+    let source_required = properties
+        .get("source")
+        .and_then(|value| value.get("required"))
+        .and_then(Value::as_array);
+    schema.get("type").and_then(Value::as_str) == Some("object")
+        && required.is_some_and(|required| {
+            ["name", "production_branch"]
+                .iter()
+                .all(|field| required.contains(&Value::String((*field).to_owned())))
+        })
+        && has_string(properties, "name")
+        && has_string(properties, "production_branch")
+        && ["build_command", "destination_dir", "root_dir"]
+            .iter()
+            .all(|field| has_string(build, field))
+        && source_types.is_some_and(|types| types.contains(&Value::String("github".to_owned())))
+        && source_required.is_some_and(|required| {
+            ["type", "config"]
+                .iter()
+                .all(|field| required.contains(&Value::String((*field).to_owned())))
+        })
+        && [
+            "owner",
+            "owner_id",
+            "production_branch",
+            "repo_id",
+            "repo_name",
+        ]
+        .iter()
+        .all(|field| has_string(source_config, field))
+        && [
+            "deployments_enabled",
+            "pr_comments_enabled",
+            "production_deployments_enabled",
+        ]
+        .iter()
+        .all(|field| {
+            source_config
+                .get(*field)
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+                == Some("boolean")
+        })
+        && source_config
+            .get("preview_deployment_setting")
+            .and_then(|value| value.get("enum"))
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                ["all", "none", "custom"]
+                    .iter()
+                    .all(|value| values.contains(&Value::String((*value).to_owned())))
+            })
+}
+
+fn pages_git_project_create_request_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "x-cfctl-body-required":true,
+        "required":["name","production_branch","build_config","source"],
+        "properties":{
+            "name":{"type":"string","minLength":1},
+            "production_branch":{"type":"string","enum":["main"]},
+            "build_config":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["build_command","destination_dir"],
+                "properties":{
+                    "build_command":{"type":"string","minLength":1},
+                    "destination_dir":{"type":"string","minLength":1},
+                    "root_dir":{"type":"string"}
+                }
+            },
+            "source":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["type","config"],
+                "properties":{
+                    "type":{"type":"string","enum":["github"]},
+                    "config":{
+                        "type":"object",
+                        "additionalProperties":false,
+                        "required":[
+                            "deployments_enabled","owner","owner_id","preview_deployment_setting",
+                            "production_branch","production_deployments_enabled","repo_id","repo_name"
+                        ],
+                        "properties":{
+                            "deployments_enabled":{"type":"boolean","enum":[true]},
+                            "owner":{"type":"string","minLength":1},
+                            "owner_id":{"type":"string","minLength":1},
+                            "preview_deployment_setting":{"type":"string","enum":["all"]},
+                            "production_branch":{"type":"string","enum":["main"]},
+                            "production_deployments_enabled":{"type":"boolean","enum":[true]},
+                            "repo_id":{"type":"string","minLength":1},
+                            "repo_name":{"type":"string","minLength":1}
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 
 const PAGES_DOMAIN_CREATE_CAPABILITY_ID: &str = "pages-domains-add-domain";
