@@ -334,8 +334,11 @@ catalog is managed under `CFCTL_HOME`.
 
 ## Development
 
-Rust 1.97 is pinned. The local proof lane is `cargo xtask verify`, which also
-needs `cargo-deny` and Gitleaks. Remote CI is intentionally absent. See
+Rust 1.97 is pinned. Every pull request and `main` push runs the read-only
+hosted Rust proof (formatting, workspace Clippy, workspace tests, and the
+Cloudflare request-contract test). The stronger local proof lane remains
+`cargo xtask verify`; it additionally needs Bun, `cargo-deny`, Gitleaks, Zig,
+`cargo-zigbuild`, and the Linux musl target. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the pre-push gate, and the
 assembly, signing, and publishing lanes.
 

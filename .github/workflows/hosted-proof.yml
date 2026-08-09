@@ -1,0 +1,50 @@
+name: Hosted proof
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-proof-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-proof:
+    name: Rust proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libdbus-1-dev pkg-config
+
+      - name: Verify exact checkout identity
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint every Rust target
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test every Rust target
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Recheck the Cloudflare request contract
+        run: cargo test -p cfctl-cloudflare --test request --locked

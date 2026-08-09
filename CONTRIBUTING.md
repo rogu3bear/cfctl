@@ -76,11 +76,18 @@ Authentication is optional for offline development. Use `cfctl auth login` or
 an explicitly scoped token profile when live-read proof is required; never
 create a repository `.env` with Cloudflare credentials.
 
-### Pre-push gate
+### Hosted and pre-push gates
 
-Remote CI is intentionally absent, so nothing catches a gate that was never
-run — this repository has shipped a red `main` that way. `.githooks/pre-push`
-runs `cargo xtask verify` and refuses the push when it fails.
+GitHub runs a read-only hosted Rust proof for every pull request and `main`
+push: formatting, workspace Clippy, workspace tests, and the Cloudflare
+request-contract test. It does not replace the complete local lane: Bun bridge
+proof, dependency policy, full-history secret scanning, source/governance
+contracts, and the Linux musl cross-build remain in `cargo xtask verify`.
+
+`.githooks/pre-push` runs that complete local proof and refuses the push when
+it fails. This repository has previously shipped a red `main` when the local
+gate was not run; hosted Rust proof now supplies an independent baseline while
+the pre-push gate preserves the broader release-target contract.
 
 The hook is tracked, but it does not run merely because you cloned the
 repository. It executes only where an agentOS-style delegate pins its digest in
@@ -160,7 +167,8 @@ releases are unsigned by operator decision**, with integrity from `SHA256SUMS`,
 reproducible double-builds, SPDX SBOMs, and commit-bound provenance. Because
 the rendered Linux installer verifies a Cosign identity and has no
 checksum-only fallback, it is deliberately not shipped with unsigned releases.
-GitHub-hosted Rust builds are intentionally absent.
+The hosted Rust proof never assembles, signs, uploads, or publishes release
+artifacts.
 
 An account-backed disposable token smoke test
 (`tests/account-backed-smoke.sh`) is kept out of the local proof lane because
