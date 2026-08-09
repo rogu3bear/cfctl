@@ -12,6 +12,12 @@ documentation, and evidence model agree.
 - Search the catalog before adding behavior. New writes remain blocked until
   risk, effect, cost, permission, entitlement, verification, and rollback or
   explicit irreversibility are known.
+- Classify capability authority separately from its adapter. Reusable
+  Cloudflare behavior is `provider_generic`; cfctl's own public identity is
+  `cfctl_product`. Do not compile a customer or application repository,
+  account, database, migration, or deployment policy into either class. New
+  `legacy_embedded` entries are prohibited; workspace-owned behavior must wait
+  for the typed operation-pack loader and remain in its owning repository.
 - Reads are not plans, plans are not applies, and apply artifacts are not
   post-change verification. Keep those evidence classes distinct.
 - All mutations use the one-use `PlanV1` lifecycle. Never weaken approval,

@@ -818,6 +818,28 @@ pub enum AdapterStatus {
     Blocked,
 }
 
+/// Identifies whose authority makes a catalog capability executable.
+///
+/// This is deliberately independent of [`AdapterStatus`]: a native adapter can
+/// still be generic provider machinery, cfctl's own product behavior, or
+/// legacy application logic that must eventually move back to its workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityAuthorityScopeV1 {
+    /// Portable Cloudflare behavior whose contract is not owned by one
+    /// application repository, account, database, or deployment.
+    ProviderGeneric,
+    /// Behavior owned by cfctl itself, including its public site and release
+    /// identity. This must not be used to disguise another product's policy.
+    CfctlProduct,
+    /// An application-owned operation supplied by a typed, hash-bound
+    /// workspace declaration rather than compiled into cfctl.
+    WorkspaceOwned,
+    /// A frozen pre-operation-pack exception. New entries are rejected unless
+    /// the catalog's exact migration allowlist is deliberately changed.
+    LegacyEmbedded,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskClass {
@@ -1622,6 +1644,11 @@ pub struct CapabilityV1 {
     pub id: String,
     pub title: String,
     pub description: Option<String>,
+    /// `None` exists only so v1 catalog snapshots remain hash-readable. Every
+    /// newly constructed capability sets this field, and v2 snapshots reject
+    /// an absent value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_scope: Option<CapabilityAuthorityScopeV1>,
     pub product: String,
     pub source: String,
     pub method: String,
@@ -1724,6 +1751,7 @@ impl CapabilityV1 {
             id: id.to_owned(),
             title: title.to_owned(),
             description: None,
+            authority_scope: Some(CapabilityAuthorityScopeV1::ProviderGeneric),
             product: "Cloudflare API".to_owned(),
             source: "cloudflare-api-schemas".to_owned(),
             method: normalized_method,

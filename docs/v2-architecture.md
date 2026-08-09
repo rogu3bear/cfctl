@@ -52,6 +52,26 @@ inferred from model output. Generated API writes are executable only when
 their operation contract is complete; reads remain dynamically executable, and
 incomplete writes stay searchable with every missing contract field explained.
 
+Adapter selection is separate from authority ownership. Catalog schema v2
+classifies every newly built capability as `provider_generic`, `cfctl_product`,
+`workspace_owned`, or `legacy_embedded`. Generic provider contracts must remain
+portable across application repositories. cfctl-product contracts may describe
+cfctl's own site, OAuth identity, and release surface, but cannot absorb another
+product's source or deployment policy. Workspace-owned operations belong in a
+future typed, hash-bound operation pack loaded from an explicitly registered
+root; inserting one directly into the provider catalog fails closed.
+
+Five pre-operation-pack D1 contracts are acknowledged as frozen
+`legacy_embedded` migration debt: two MLNavigator schema proofs, its approved
+import and poll continuation, and the approved OSINT Research Center import.
+The catalog validates their exact ids and contract shapes, reports the authority
+classes in `catalog coverage`, and rejects a new legacy id without an explicit
+allowlist change. This classification does not publish either application
+repository and does not grant new execution authority. The migration sequence
+is consumer-first: define and validate the workspace operation-pack format,
+adopt it in each owning repository, prove plan and receipt compatibility, then
+remove the compiled projection and its frozen exception.
+
 Most of the catalog is therefore inventory, not capability: the large majority
 of mutating operations are unexecutable because their contracts are
 incomplete, and only a governed core carries complete risk, effect, cost,

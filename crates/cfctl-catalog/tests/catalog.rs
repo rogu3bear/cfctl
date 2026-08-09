@@ -1,16 +1,18 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use cfctl_catalog::{
-    CatalogChangeKind, CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1,
-    attach_official_product_knowledge, ingest_cli_help, ingest_native_control_capabilities,
-    ingest_telemetry_capabilities, ingest_wrangler_pages_deploy_help,
-    ingest_wrangler_worker_versions_help, markdown_link, markdown_links, normalize_openapi,
+    CatalogChangeKind, CatalogIndex, CatalogSnapshot, LEGACY_EMBEDDED_CAPABILITY_IDS,
+    OfficialTextFeedsV1, attach_official_product_knowledge, ingest_cli_help,
+    ingest_native_control_capabilities, ingest_telemetry_capabilities,
+    ingest_wrangler_pages_deploy_help, ingest_wrangler_worker_versions_help, markdown_link,
+    markdown_links, normalize_openapi,
 };
 use cfctl_core::{
-    AdapterStatus, AnalyticsQueryKindV1, BillingModelV1, CapabilityV1, CostExposureV1,
-    CreatedResourceContractV1, DeletedResourceContractV1, EffectClass, KnowledgeReferenceV1,
-    PaginationModeV1, ResponseBodyModeV1, ResponseContractV1, RiskClass, SamePathReadContractV1,
-    SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorV1, TimestampFormatV1, hash_value,
+    AdapterStatus, AnalyticsQueryKindV1, BillingModelV1, CapabilityAuthorityScopeV1, CapabilityV1,
+    CostExposureV1, CreatedResourceContractV1, DeletedResourceContractV1, EffectClass,
+    KnowledgeReferenceV1, PaginationModeV1, ResponseBodyModeV1, ResponseContractV1, RiskClass,
+    SamePathReadContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorV1,
+    TimestampFormatV1, hash_value,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -2661,6 +2663,106 @@ fn sqlite_index_is_rebuildable_from_the_authoritative_snapshot() {
         index.schema_hash().expect("schema hash"),
         snapshot.schema_hash
     );
+}
+
+#[test]
+fn catalog_v2_classifies_generic_and_frozen_legacy_authority() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    assert_eq!(snapshot.schema_version, 2);
+    assert!(snapshot.capabilities.values().all(|capability| {
+        capability.authority_scope == Some(CapabilityAuthorityScopeV1::ProviderGeneric)
+    }));
+
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let legacy_ids = snapshot
+        .capabilities
+        .values()
+        .filter(|capability| {
+            capability.authority_scope == Some(CapabilityAuthorityScopeV1::LegacyEmbedded)
+        })
+        .map(|capability| capability.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(legacy_ids, LEGACY_EMBEDDED_CAPABILITY_IDS);
+    assert_eq!(
+        snapshot.coverage().authority_scopes["legacy_embedded"],
+        LEGACY_EMBEDDED_CAPABILITY_IDS.len()
+    );
+    snapshot
+        .validate_authority_contracts()
+        .expect("exact legacy allowlist is valid");
+}
+
+#[test]
+fn catalog_v2_rejects_legacy_authority_disguised_as_generic() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    snapshot
+        .capabilities
+        .get_mut("d1-import-approved-osint-research-migration")
+        .expect("legacy capability")
+        .authority_scope = Some(CapabilityAuthorityScopeV1::ProviderGeneric);
+
+    let error = snapshot
+        .refresh_hash()
+        .expect_err("embedded workspace authority must fail closed")
+        .to_string();
+    assert!(error.contains("embeds application authority"), "{error}");
+}
+
+#[test]
+fn catalog_v2_rejects_new_legacy_and_compiled_workspace_owned_entries() {
+    for (id, scope, expected) in [
+        (
+            "new-embedded-app-operation",
+            CapabilityAuthorityScopeV1::LegacyEmbedded,
+            "not one of the frozen exact legacy contracts",
+        ),
+        (
+            "workspace-owned-operation",
+            CapabilityAuthorityScopeV1::WorkspaceOwned,
+            "require a separate typed declaration loader",
+        ),
+    ] {
+        let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+        let mut capability = CapabilityV1::new(id, "App operation", "GET", "/app");
+        capability.authority_scope = Some(scope);
+        snapshot.capabilities.insert(id.to_owned(), capability);
+
+        let error = snapshot
+            .refresh_hash()
+            .expect_err("provider catalog must reject authority expansion")
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn schema_v1_catalog_without_authority_metadata_remains_hash_readable() {
+    let snapshot = normalize_openapi(&fixture()).expect("catalog");
+    let mut stored = serde_json::to_value(snapshot).expect("serialize catalog");
+    stored["schema_version"] = json!(1);
+    for capability in stored["capabilities"]
+        .as_object_mut()
+        .expect("capabilities object")
+        .values_mut()
+    {
+        capability
+            .as_object_mut()
+            .expect("capability object")
+            .remove("authority_scope");
+    }
+    stored["schema_hash"] = json!(hash_value(&stored["capabilities"]).expect("legacy hash"));
+
+    let loaded: CatalogSnapshot = serde_json::from_value(stored).expect("v1 catalog decodes");
+    assert!(
+        loaded
+            .capabilities
+            .values()
+            .all(|capability| capability.authority_scope.is_none())
+    );
+    loaded
+        .validate_hash()
+        .expect("v1 hash remains valid until catalog sync replaces it");
 }
 
 #[test]

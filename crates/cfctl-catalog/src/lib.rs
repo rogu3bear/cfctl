@@ -8,8 +8,8 @@ use std::{
 
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
-    AsyncCollectionMutationContractV1, BillingModelV1, CapabilityV1, CostExposureV1, CostV1,
-    CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
+    AsyncCollectionMutationContractV1, BillingModelV1, CapabilityAuthorityScopeV1, CapabilityV1,
+    CostExposureV1, CostV1, CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
     CreatedResourceContractV1, D1FullExportContractV1, D1SchemaIntrospectionContractV1,
     DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass, EntitlementProbeV1,
     EntitlementV1, EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1,
@@ -31,6 +31,51 @@ pub const OFFICIAL_OPENAPI_URL: &str =
     "https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json";
 pub const OFFICIAL_DOCS_INDEX_URL: &str = "https://developers.cloudflare.com/llms.txt";
 pub const OFFICIAL_CHANGELOG_URL: &str = "https://developers.cloudflare.com/changelog/";
+
+/// Frozen migration debt from before workspace-owned operation packs existed.
+/// Adding an id here is a public architecture decision, not the normal path for
+/// extending cfctl. Keep this sorted for the fail-closed binary search below.
+pub const LEGACY_EMBEDDED_CAPABILITY_IDS: [&str; 5] = [
+    "d1-import-approved-mln-migration",
+    "d1-import-approved-osint-research-migration",
+    "d1-resume-approved-mln-import-poll",
+    "mln-0142-post-import-schema",
+    "mln-0143-data-invariants",
+];
+
+fn legacy_embedded_contract_matches(capability: &CapabilityV1) -> bool {
+    match capability.id.as_str() {
+        "d1-import-approved-mln-migration" => capability
+            .d1_approved_mln_import
+            .as_ref()
+            .is_some_and(|contract| contract.repository_id == "github.com/rogu3bear/mln-web"),
+        "d1-import-approved-osint-research-migration" => capability
+            .d1_approved_mln_import
+            .as_ref()
+            .is_some_and(|contract| {
+                contract.repository_id == "github.com/rogu3bear/osint-research-center"
+            }),
+        "d1-resume-approved-mln-import-poll" => capability
+            .d1_approved_mln_import_poll_resume
+            .as_ref()
+            .is_some_and(|contract| {
+                contract.root_capability_id == "d1-import-approved-mln-migration"
+            }),
+        "mln-0142-post-import-schema" => capability.mln_0142_post_import_schema.is_some(),
+        "mln-0143-data-invariants" => capability.mln_0143_data_invariants.is_some(),
+        _ => false,
+    }
+}
+
+const fn authority_scope_name(scope: Option<CapabilityAuthorityScopeV1>) -> &'static str {
+    match scope {
+        Some(CapabilityAuthorityScopeV1::ProviderGeneric) => "provider_generic",
+        Some(CapabilityAuthorityScopeV1::CfctlProduct) => "cfctl_product",
+        Some(CapabilityAuthorityScopeV1::WorkspaceOwned) => "workspace_owned",
+        Some(CapabilityAuthorityScopeV1::LegacyEmbedded) => "legacy_embedded",
+        None => "unclassified",
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum CatalogError {
@@ -56,6 +101,8 @@ pub enum CatalogError {
     ResponseReferenceDepth(String),
     #[error("catalog content hash mismatch: recorded {recorded}, actual {actual}")]
     ContentHashMismatch { recorded: String, actual: String },
+    #[error("catalog capability authority contract is invalid: {0}")]
+    InvalidAuthorityContract(String),
     #[error(transparent)]
     Core(#[from] cfctl_core::CoreError),
     #[error(transparent)]
@@ -86,17 +133,75 @@ pub struct CatalogSnapshot {
 
 impl CatalogSnapshot {
     pub fn refresh_hash(&mut self) -> Result<()> {
+        self.validate_authority_contracts()?;
         self.schema_hash = hash_value(&serde_json::to_value(&self.capabilities)?)?;
         Ok(())
     }
 
     pub fn validate_hash(&self) -> Result<()> {
+        self.validate_authority_contracts()?;
         let actual = hash_value(&serde_json::to_value(&self.capabilities)?)?;
         if self.schema_hash != actual {
             return Err(CatalogError::ContentHashMismatch {
                 recorded: self.schema_hash.clone(),
                 actual,
             });
+        }
+        Ok(())
+    }
+
+    /// Enforces the ownership boundary introduced with catalog schema v2.
+    ///
+    /// Schema v1 remains hash-readable so an installed pre-v2 catalog can be
+    /// preserved during sync. It does not acquire authority metadata by
+    /// inference. Every newly normalized v2 snapshot must classify every
+    /// capability, and its frozen embedded-workspace set cannot grow through a
+    /// generic constructor or a plausible-looking label.
+    pub fn validate_authority_contracts(&self) -> Result<()> {
+        if self.schema_version < 2 {
+            return Ok(());
+        }
+        for capability in self.capabilities.values() {
+            let scope = capability.authority_scope.ok_or_else(|| {
+                CatalogError::InvalidAuthorityContract(format!(
+                    "`{}` is unclassified in a v2 snapshot",
+                    capability.id
+                ))
+            })?;
+            let legacy_contract_matches = legacy_embedded_contract_matches(capability);
+            let embeds_workspace_contract = capability.mln_0142_post_import_schema.is_some()
+                || capability.mln_0143_data_invariants.is_some()
+                || capability.d1_approved_mln_import.is_some()
+                || capability.d1_approved_mln_import_poll_resume.is_some();
+            match scope {
+                CapabilityAuthorityScopeV1::LegacyEmbedded if !legacy_contract_matches => {
+                    return Err(CatalogError::InvalidAuthorityContract(format!(
+                        "`{}` is not one of the frozen exact legacy contracts",
+                        capability.id
+                    )));
+                }
+                CapabilityAuthorityScopeV1::WorkspaceOwned => {
+                    return Err(CatalogError::InvalidAuthorityContract(format!(
+                        "`{}` is workspace-owned but was inserted into the provider catalog; workspace operations require a separate typed declaration loader",
+                        capability.id
+                    )));
+                }
+                CapabilityAuthorityScopeV1::ProviderGeneric
+                | CapabilityAuthorityScopeV1::CfctlProduct
+                    if embeds_workspace_contract
+                        || LEGACY_EMBEDDED_CAPABILITY_IDS
+                            .binary_search(&capability.id.as_str())
+                            .is_ok() =>
+                {
+                    return Err(CatalogError::InvalidAuthorityContract(format!(
+                        "`{}` embeds application authority but is classified as {scope:?}",
+                        capability.id
+                    )));
+                }
+                CapabilityAuthorityScopeV1::LegacyEmbedded
+                | CapabilityAuthorityScopeV1::ProviderGeneric
+                | CapabilityAuthorityScopeV1::CfctlProduct => {}
+            }
         }
         Ok(())
     }
@@ -168,6 +273,7 @@ impl CatalogSnapshot {
     #[must_use]
     pub fn coverage(&self) -> CatalogCoverageV1 {
         let mut adapter_statuses = BTreeMap::new();
+        let mut authority_scopes = BTreeMap::new();
         let mut sources = BTreeMap::new();
         let mut mutating = 0;
         let mut blocked = 0;
@@ -181,6 +287,9 @@ impl CatalogSnapshot {
         let mut blocked_adapters_without_contract_gaps = 0;
         let mut mutation_contract_gap_counts = BTreeMap::new();
         for capability in self.capabilities.values() {
+            *authority_scopes
+                .entry(authority_scope_name(capability.authority_scope).to_owned())
+                .or_insert(0) += 1;
             *adapter_statuses
                 .entry(adapter_status_name(capability.adapter_status).to_owned())
                 .or_insert(0) += 1;
@@ -244,6 +353,7 @@ impl CatalogSnapshot {
             blocked_adapters_without_contract_gaps,
             mutation_contract_gap_counts,
             adapter_statuses,
+            authority_scopes,
             sources,
             telemetry_targeted,
             telemetry_ledger,
@@ -284,6 +394,7 @@ pub struct CatalogCoverageV1 {
     pub blocked_adapters_without_contract_gaps: usize,
     pub mutation_contract_gap_counts: BTreeMap<String, usize>,
     pub adapter_statuses: BTreeMap<String, usize>,
+    pub authority_scopes: BTreeMap<String, usize>,
     pub sources: BTreeMap<String, usize>,
     pub telemetry_targeted: TelemetryCoverageSummaryV1,
     pub telemetry_ledger: Vec<TelemetryCoverageEntryV1>,
@@ -2056,7 +2167,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
 
     let source_hash = hash_value(document)?;
     let mut snapshot = CatalogSnapshot {
-        schema_version: 1,
+        schema_version: 2,
         generated_at: Utc::now(),
         source_url: OFFICIAL_OPENAPI_URL.to_owned(),
         source_hash,
@@ -2147,6 +2258,7 @@ fn mln_0142_post_import_schema_capability() -> CapabilityV1 {
         "sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b";
     let mut capability = d1_schema_introspection_capability();
     "mln-0142-post-import-schema".clone_into(&mut capability.id);
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::LegacyEmbedded);
     "Prove MLN 0142 post-import trigger authority".clone_into(&mut capability.title);
     capability.description = Some(
         "Run one exact compiler-owned equality assertion for the reviewed MLNavigator 0142 trigger and bind the result to its durable import boundary."
@@ -2212,6 +2324,7 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
         "POST",
         "/accounts/{account_id}/d1/database/{database_id}/import",
     );
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::LegacyEmbedded);
     capability.description = Some(
         "Stage and import exactly MLNavigator migration 0142 or 0143. The reviewed source is one exact clean Git repository revision, relative path, and blob; local origin configuration establishes snapshot identity, not hosted ownership. For 0143, the shared admission and consumption gate requires verified 0142 closure, then the governed recovery export, then exactly one current-authority pre_import proof, all before the immutable plan cutoff. This is evidence chronology, not a claim that out-of-band provider writes were absent. A 0143 post-restore proof must restore the exact post-0142 recovery anchor and re-prove the exact 0142 terminal-generation trigger. A 0142 rollback is a different boundary: it must target the pre-0142 anchor and separately prove that the 0142 trigger is absent; it cannot use the 0143 post-restore contract. The plan binds reviewed source bytes, the phase-specific recovery anchor with its provider bookmark, and proof authority; provider completion remains unverified until the governed post-import proof is attached."
             .to_owned(),
@@ -2377,6 +2490,7 @@ fn d1_import_approved_osint_research_migration_capability() -> CapabilityV1 {
         "POST",
         "/accounts/{account_id}/d1/database/{database_id}/import",
     );
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::LegacyEmbedded);
     capability.description = Some(
         "Stage and import exactly one reviewed OSINT Research Center migration from 0028 through 0034. The adapter pins the private repository, clean release HEAD, relative path, Git blob, source hashes, account, and database. Every plan requires one governed current time-travel bookmark read created before the plan, and execution closes only after a compiler-owned schema-marker readback proves that exact migration's durable effect. No caller SQL or provider protocol control is accepted."
             .to_owned(),
@@ -2561,6 +2675,7 @@ fn d1_resume_approved_mln_import_poll_capability() -> CapabilityV1 {
         "POST",
         "/accounts/{account_id}/d1/database/{database_id}/import",
     );
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::LegacyEmbedded);
     capability.description = Some(
         "Create a separately approved poll-only child of one exact durable MLNavigator import exhaustion. The runtime derives the root migration, source, target, credential, catalog, accepted bookmark, and provider request from immutable parent authority. It never replays init, upload, or ingest; each exhaustion admits at most one non-cancelled child."
             .to_owned(),
@@ -2656,6 +2771,7 @@ fn mln_0143_data_invariants_capability() -> CapabilityV1 {
         "POST",
         "/accounts/{account_id}/d1/database/{database_id}/query",
     );
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::LegacyEmbedded);
     capability.description = Some(
         "Run fixed compiler-owned reads for the bounded pre-import, post-import, or post-restore MLNavigator 0143 boundary. Raw evidence rows and identifiers are digested in volatile memory and never persisted."
             .to_owned(),
