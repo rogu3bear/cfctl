@@ -1697,7 +1697,7 @@ fn git_authority_output(repository_root: &Path, arguments: &[&str]) -> Result<St
     })?;
     if !output.status.success() {
         return Err(CliError::Input(format!(
-            "reviewed MLN repository authority command `git {}` failed closed",
+            "reviewed migration repository authority command `git {}` failed closed",
             arguments.join(" ")
         )));
     }
@@ -1716,7 +1716,7 @@ fn git_authority_bytes(repository_root: &Path, arguments: &[&str]) -> Result<Vec
     })?;
     if !output.status.success() {
         return Err(CliError::Input(format!(
-            "reviewed MLN repository authority command `git {}` failed closed",
+            "reviewed migration repository authority command `git {}` failed closed",
             arguments.join(" ")
         )));
     }
@@ -1743,7 +1743,8 @@ fn validate_approved_mln_repository_authority(
     })?;
     if canonical_root != root {
         return Err(CliError::Input(
-            "reviewed MLN repository root is missing, substituted, or non-canonical".to_owned(),
+            "reviewed migration repository root is missing, substituted, or non-canonical"
+                .to_owned(),
         ));
     }
     let top = git_authority_output(root, &["rev-parse", "--show-toplevel"])?;
@@ -1765,7 +1766,8 @@ fn validate_approved_mln_repository_authority(
             != Some(contract.repository_id.as_str())
     {
         return Err(CliError::Input(
-            "reviewed MLN repository identity, canonical worktree root, or HEAD drifted".to_owned(),
+            "reviewed migration repository identity, canonical worktree root, or HEAD drifted"
+                .to_owned(),
         ));
     }
     let relative = migration.repository_relative_path.as_str();
@@ -1777,13 +1779,13 @@ fn validate_approved_mln_repository_authority(
     let blob_bytes = git_authority_bytes(root, &["cat-file", "blob", &migration.git_blob_oid])?;
     if tracked != relative || blob != migration.git_blob_oid || !status.is_empty() {
         return Err(CliError::Input(
-            "reviewed MLN migration is untracked, dirty, or does not match the pinned HEAD blob"
+            "reviewed migration is untracked, dirty, or does not match the pinned HEAD blob"
                 .to_owned(),
         ));
     }
     if expected_bytes.is_some_and(|bytes| bytes != blob_bytes) {
         return Err(CliError::Input(
-            "reviewed MLN source bytes differ from the exact pinned Git blob".to_owned(),
+            "reviewed migration source bytes differ from the exact pinned Git blob".to_owned(),
         ));
     }
     Ok(canonical_common)
@@ -1801,6 +1803,12 @@ fn normalize_reviewed_mln_repository_id(remote: &str) -> Option<String> {
         | "git@github.com:rogu3bear/osint-research-center" => {
             Some("github.com/rogu3bear/osint-research-center".to_owned())
         }
+        "https://github.com/rogu3bear/under-the-sun-farm.git"
+        | "https://github.com/rogu3bear/under-the-sun-farm"
+        | "git@github.com:rogu3bear/under-the-sun-farm.git"
+        | "git@github.com:rogu3bear/under-the-sun-farm" => {
+            Some("github.com/rogu3bear/under-the-sun-farm".to_owned())
+        }
         _ => None,
     }
 }
@@ -1811,12 +1819,15 @@ fn required_body_string<'a>(body: &'a Map<String, Value>, field: &str) -> Result
         .ok_or_else(|| CliError::Input(format!("approved MLN import requires {field}")))
 }
 
-fn validate_osint_research_recovery_bookmark(
+const CLOSED_IMPORT_RECOVERY_BOOKMARK_MAX_AGE_MINUTES: i64 = 10;
+
+fn validate_closed_import_recovery_bookmark(
     store: &StateStore,
     input: &CallInput,
     body: &Map<String, Value>,
     contract: &cfctl_core::D1ApprovedMlnImportContractV1,
     context: ImportPrerequisiteContext<'_>,
+    subject: &str,
 ) -> Result<()> {
     let evidence_hash = required_body_string(body, "pre_recovery_anchor_evidence_hash")?;
     let bookmark_hash = required_body_string(body, "pre_recovery_anchor_bookmark_hash")?;
@@ -1825,6 +1836,8 @@ fn validate_osint_research_recovery_bookmark(
         query: json!({}),
         ..CallInput::default()
     })?)?;
+    let freshness_floor =
+        context.before - ChronoDuration::minutes(CLOSED_IMPORT_RECOVERY_BOOKMARK_MAX_AGE_MINUTES);
     let matches = store
         .list_operational_proofs()?
         .into_iter()
@@ -1837,14 +1850,14 @@ fn validate_osint_research_recovery_bookmark(
                 && proof.credential_generation_id.as_deref() == context.credential_generation_id
                 && proof.outcome == OperationalProofOutcomeV1::Succeeded
                 && proof.evidence.content_hash == evidence_hash
+                && proof.observed_at >= freshness_floor
                 && proof.observed_at < context.before
         })
         .collect::<Vec<_>>();
     if matches.len() != 1 {
-        return Err(CliError::Input(
-            "OSINT Research import requires exactly one governed current D1 time-travel bookmark read bound to the catalog, request, target, profile, credential generation, evidence, and pre-plan chronology"
-                .to_owned(),
-        ));
+        return Err(CliError::Input(format!(
+            "{subject} import requires exactly one governed D1 time-travel bookmark read from the 10 minutes before planning, bound to the catalog, request, target, profile, credential generation, and evidence"
+        )));
     }
     let evidence = store.read_evidence_value(evidence_hash)?;
     let bookmark = evidence
@@ -1852,17 +1865,17 @@ fn validate_osint_research_recovery_bookmark(
         .and_then(Value::as_str)
         .filter(|bookmark| !bookmark.is_empty())
         .ok_or_else(|| {
-            CliError::Input(
-                "OSINT Research recovery bookmark evidence omitted the exact bookmark".to_owned(),
-            )
+            CliError::Input(format!(
+                "{subject} recovery bookmark evidence omitted the exact bookmark"
+            ))
         })?;
     if evidence.get("status").and_then(Value::as_u64) != Some(200)
         || evidence.get("success").and_then(Value::as_bool) != Some(true)
         || hash_value(&Value::String(bookmark.to_owned()))? != bookmark_hash
     {
-        return Err(CliError::Input(
-            "OSINT Research recovery bookmark evidence or bookmark hash drifted".to_owned(),
-        ));
+        return Err(CliError::Input(format!(
+            "{subject} recovery bookmark evidence or bookmark hash drifted"
+        )));
     }
     Ok(())
 }
@@ -1890,8 +1903,17 @@ fn validate_approved_mln_import_prerequisites(
         .get("migration_id")
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("migration_id is missing".to_owned()))?;
-    if capability.id == "d1-import-approved-osint-research-migration" {
-        validate_osint_research_recovery_bookmark(store, input, body, contract, context)?;
+    if matches!(
+        capability.id.as_str(),
+        "d1-import-approved-osint-research-migration"
+            | "d1-import-approved-under-the-sun-farm-migration"
+    ) {
+        let subject = if capability.id == "d1-import-approved-osint-research-migration" {
+            "OSINT Research"
+        } else {
+            "Under the Sun Farm"
+        };
+        validate_closed_import_recovery_bookmark(store, input, body, contract, context, subject)?;
         return Ok(());
     }
     let pre_operation = body
@@ -18526,7 +18548,16 @@ async fn execute_approved_mln_import_plan(
             "the import boundary was crossed but exact durable provider completion was not proven",
         ));
     }
-    if plan.capability.id == "d1-import-approved-osint-research-migration" {
+    if matches!(
+        plan.capability.id.as_str(),
+        "d1-import-approved-osint-research-migration"
+            | "d1-import-approved-under-the-sun-farm-migration"
+    ) {
+        let subject = if plan.capability.id == "d1-import-approved-osint-research-migration" {
+            "OSINT Research"
+        } else {
+            "Under the Sun Farm"
+        };
         let verification = match verify_api_plan(
             store,
             executor,
@@ -18546,7 +18577,9 @@ async fn execute_approved_mln_import_plan(
                     lineage_evidence,
                     &error,
                     true,
-                    "the OSINT Research import completed, but its schema-marker verification could not be persisted",
+                    &format!(
+                        "the {subject} import completed, but its schema-marker verification could not be persisted"
+                    ),
                 ));
             }
         };
@@ -25442,12 +25475,12 @@ mod tests {
     use super::{
         CallInput, CliError, D1RecoveryAnchorExpectation, DNS_RECORD_DETAIL_PATH,
         DNS_RECORD_DETAIL_READ_CAPABILITY_ID, DNS_RECORD_STATE_PRECONDITION,
-        KEYCHAIN_REPAIR_WARNING, LivePlanPreconditions, Mln0143PreImportExpectation,
-        Mln0143RestoreAnchorJoin, OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority,
-        SECURITY_IP_RULE_COLLECTION_PATH, SECURITY_IP_RULE_CREATE_ID,
-        SECURITY_IP_RULE_STATE_CAPABILITY_ID, SECURITY_LIST_MEMBER_COLLECTION_PATH,
-        SECURITY_LIST_MEMBER_CREATE_ID, SECURITY_LIST_MEMBER_REMOVE_ID,
-        SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
+        ImportPrerequisiteContext, KEYCHAIN_REPAIR_WARNING, LivePlanPreconditions,
+        Mln0143PreImportExpectation, Mln0143RestoreAnchorJoin,
+        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PlanAuthority, SECURITY_IP_RULE_COLLECTION_PATH,
+        SECURITY_IP_RULE_CREATE_ID, SECURITY_IP_RULE_STATE_CAPABILITY_ID,
+        SECURITY_LIST_MEMBER_COLLECTION_PATH, SECURITY_LIST_MEMBER_CREATE_ID,
+        SECURITY_LIST_MEMBER_REMOVE_ID, SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
         SECURITY_WAF_RULE_STATE_CAPABILITY_ID, TokenPolicyBinding, admit_standing_plan,
         apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
@@ -25497,8 +25530,8 @@ mod tests {
         should_bind_zone_account, should_redact_secret_response, should_resolve_entitlement_probe,
         should_resolve_zone_entitlement, sink_secret_result, stage_approved_mln_migration,
         store_imported_api_token, validate_api_token_creation_contract,
-        validate_approved_mln_repository_authority, validate_current_permission_groups,
-        validate_entitlement_receipt_precondition,
+        validate_approved_mln_repository_authority, validate_closed_import_recovery_bookmark,
+        validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
         validate_managed_mln_stage_authority, validate_mln_0143_lineage_result,
         validate_permission_group_resource_scope, validate_request_contract,
@@ -26705,6 +26738,105 @@ mod tests {
     }
 
     #[test]
+    fn closed_import_recovery_bookmark_must_be_fresh_at_plan_time() {
+        let evaluate = |age: ChronoDuration| {
+            let root = tempfile::tempdir().expect("runtime root");
+            let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
+            let mut catalog = CatalogSnapshot {
+                schema_version: 1,
+                generated_at: Utc::now(),
+                source_url: "fixture".to_owned(),
+                source_hash: "fixture".to_owned(),
+                schema_hash: String::new(),
+                capabilities: BTreeMap::new(),
+            };
+            ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+            let capability = catalog
+                .get("d1-import-approved-under-the-sun-farm-migration")
+                .expect("farm migration capability");
+            let contract = capability
+                .d1_approved_mln_import
+                .as_ref()
+                .expect("farm migration contract");
+            let before = Utc::now();
+            let bookmark = "farm-pre-migration-bookmark";
+            let evidence = store
+                .write_evidence(
+                    EvidenceClass::LiveRead,
+                    &json!({
+                        "status":200,
+                        "success":true,
+                        "result":{"bookmark":bookmark},
+                    }),
+                )
+                .expect("bookmark evidence");
+            let input = CallInput {
+                selectors: json!({
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                }),
+                query: json!({}),
+                body: Some(json!({
+                    "migration_id":"0001",
+                    "pre_recovery_anchor_evidence_hash":evidence.content_hash,
+                    "pre_recovery_anchor_bookmark_hash":hash_value(&json!(bookmark))
+                        .expect("bookmark hash"),
+                })),
+                ..CallInput::default()
+            };
+            let proof_input_hash = hash_value(
+                &serde_json::to_value(CallInput {
+                    selectors: input.selectors.clone(),
+                    query: json!({}),
+                    ..CallInput::default()
+                })
+                .expect("proof input"),
+            )
+            .expect("proof input hash");
+            let proof = OperationalProofV1::new(
+                before - age,
+                "d1-time-travel-get-bookmark",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &proof_input_hash,
+                OperationalProofScopeV1::new(
+                    Some("farm-profile"),
+                    Some(contract.account_id.as_str()),
+                    Some("22222222-2222-4222-8222-222222222222"),
+                ),
+                OperationalProofOutcomeV1::Succeeded,
+                evidence,
+            );
+            store
+                .record_operational_proof(&proof)
+                .expect("bookmark proof");
+            validate_closed_import_recovery_bookmark(
+                &store,
+                &input,
+                input
+                    .body
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .expect("closed body"),
+                contract,
+                ImportPrerequisiteContext {
+                    profile_id: "farm-profile",
+                    credential_generation_id: Some("22222222-2222-4222-8222-222222222222"),
+                    catalog_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    import_operation_id: None,
+                    before,
+                },
+                "Under the Sun Farm",
+            )
+        };
+
+        assert!(evaluate(ChronoDuration::minutes(9)).is_ok());
+        assert!(matches!(
+            evaluate(ChronoDuration::minutes(11)),
+            Err(CliError::Input(reason)) if reason.contains("10 minutes before planning")
+        ));
+    }
+
+    #[test]
     fn d1_full_export_runtime_records_the_exact_bookmark_anchor_receipt() {
         let root = tempfile::tempdir().expect("runtime root");
         let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("store");
@@ -26857,6 +26989,17 @@ mod tests {
             assert_eq!(
                 normalize_reviewed_mln_repository_id(remote).as_deref(),
                 Some("github.com/rogu3bear/mln-web")
+            );
+        }
+        for remote in [
+            "https://github.com/rogu3bear/under-the-sun-farm.git",
+            "https://github.com/rogu3bear/under-the-sun-farm",
+            "git@github.com:rogu3bear/under-the-sun-farm.git",
+            "git@github.com:rogu3bear/under-the-sun-farm",
+        ] {
+            assert_eq!(
+                normalize_reviewed_mln_repository_id(remote).as_deref(),
+                Some("github.com/rogu3bear/under-the-sun-farm")
             );
         }
         for remote in [

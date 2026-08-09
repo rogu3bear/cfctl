@@ -2649,12 +2649,31 @@ impl Executor {
                 return Err(error);
             }
         };
-        let Ok(init_fields) = classify_d1_import_init_response(&init, contract) else {
-            plan.status = PlanStatus::RectificationRequired;
-            persist_import_response(&mut persist, plan, "init_response", &init, None)?;
-            return Err(CloudflareError::D1ImportInitResponseFailure);
+        let init_fields = match classify_d1_import_init_response(&init, contract) {
+            Ok(fields) => fields,
+            Err(rejection) => {
+                plan.status = PlanStatus::RectificationRequired;
+                persist_import_response(
+                    &mut persist,
+                    plan,
+                    "init_response",
+                    &init,
+                    None,
+                    Some(rejection.receipt_label()),
+                    false,
+                )?;
+                return Err(CloudflareError::D1ImportInitResponseFailure);
+            }
         };
-        persist_import_response(&mut persist, plan, "init_response", &init, None)?;
+        persist_import_response(
+            &mut persist,
+            plan,
+            "init_response",
+            &init,
+            None,
+            None,
+            false,
+        )?;
         let upload_url = init_fields.upload_url;
         let filename = init_fields.filename;
         let Ok((upload_status, upload_headers)) = bounded_d1_import_upload(
@@ -2757,10 +2776,26 @@ impl Executor {
         };
         let Ok(at_bookmark) = classify_d1_import_ingest_response(&ingest) else {
             plan.status = PlanStatus::RectificationRequired;
-            persist_import_response(&mut persist, plan, "ingest_response", &ingest, None)?;
+            persist_import_response(
+                &mut persist,
+                plan,
+                "ingest_response",
+                &ingest,
+                None,
+                None,
+                false,
+            )?;
             return Err(CloudflareError::D1ImportIngestResponseFailure);
         };
-        persist_import_response(&mut persist, plan, "ingest_response", &ingest, None)?;
+        persist_import_response(
+            &mut persist,
+            plan,
+            "ingest_response",
+            &ingest,
+            None,
+            None,
+            true,
+        )?;
         for attempt in 1..=contract.max_poll_attempts {
             let poll = match send_provider(serde_json::json!({
                 "action":"poll",
@@ -2787,6 +2822,8 @@ impl Executor {
                     &format!("poll_response_{attempt}"),
                     &poll,
                     None,
+                    None,
+                    false,
                 )?;
                 return Err(CloudflareError::D1ImportPollResponseFailure);
             };
@@ -2796,6 +2833,8 @@ impl Executor {
                 &format!("poll_response_{attempt}"),
                 &poll,
                 None,
+                None,
+                true,
             )?;
             match poll_outcome {
                 D1ImportPollOutcome::Complete(final_bookmark) => {
@@ -2927,6 +2966,7 @@ impl Executor {
                 }
             };
             let outcome = classify_d1_import_poll_response(&poll, at_bookmark);
+            let retain_validated_bookmarks = outcome.is_ok();
             if outcome.is_err() {
                 plan.status = PlanStatus::RectificationRequired;
             }
@@ -2936,6 +2976,8 @@ impl Executor {
                 &format!("poll_response_{attempt}"),
                 &poll,
                 None,
+                None,
+                retain_validated_bookmarks,
             )?;
             let Ok(outcome) = outcome else {
                 return Err(CloudflareError::D1ImportPollResponseFailure);
@@ -3029,9 +3071,13 @@ impl Executor {
                 .verify_d1_restore_exact_bookmark(plan, apply_response, input, credential)
                 .await;
         }
-        if strategy == "osint_research_migration_schema_marker_is_present" {
+        if matches!(
+            strategy,
+            "osint_research_migration_schema_marker_is_present"
+                | "under_the_sun_farm_owner_editorial_schema_is_present"
+        ) {
             return self
-                .verify_osint_research_migration(plan, apply_response, input, credential)
+                .verify_closed_schema_migration(plan, apply_response, input, credential)
                 .await;
         }
         if strategy.starts_with("api_token_details_") {
@@ -3185,7 +3231,7 @@ impl Executor {
         })
     }
 
-    async fn verify_osint_research_migration(
+    async fn verify_closed_schema_migration(
         &self,
         plan: &PlanV1,
         apply_response: &CloudflareResponseV1,
@@ -3202,10 +3248,24 @@ impl Executor {
                     "OSINT Research migration id is missing from the exact plan".to_owned(),
                 )
             })?;
-        let sql = osint_research_schema_marker_sql(migration_id)?;
+        let is_farm = plan.capability.id == "d1-import-approved-under-the-sun-farm-migration";
+        let sql = if is_farm {
+            under_the_sun_farm_schema_marker_sql(migration_id)?
+        } else {
+            osint_research_schema_marker_sql(migration_id)?
+        };
+        let subject = if is_farm {
+            "Under the Sun Farm"
+        } else {
+            "OSINT Research"
+        };
         let mut marker_capability = CapabilityV1::new(
-            "cfctl-private-osint-research-schema-marker",
-            "Read one OSINT Research migration schema marker",
+            if is_farm {
+                "cfctl-private-under-the-sun-farm-schema-marker"
+            } else {
+                "cfctl-private-osint-research-schema-marker"
+            },
+            &format!("Read one {subject} migration schema marker"),
             "POST",
             "/accounts/{account_id}/d1/database/{database_id}/query",
         );
@@ -3227,14 +3287,14 @@ impl Executor {
         request.max_bytes = 64 * 1024;
         request.timeout_seconds = 10;
         let readback = self.send(&request, credential).await?;
-        let marker_present = osint_research_schema_marker_present(&readback);
+        let marker_present = closed_schema_marker_present(&readback);
         let passed =
             apply_response.success && readback.status == 200 && readback.success && marker_present;
         Ok(OperationVerificationV1 {
             strategy: plan.capability.verification.strategy.clone(),
             passed,
             basis: format!(
-                "OSINT Research migration {migration_id} schema-marker proof (provider import success={}, readback HTTP {}, readback success={}, marker present={marker_present})",
+                "{subject} migration {migration_id} schema-marker proof (provider import success={}, readback HTTP {}, readback success={}, marker present={marker_present})",
                 apply_response.success, readback.status, readback.success
             ),
             readback,
@@ -8975,7 +9035,19 @@ fn osint_research_schema_marker_sql(migration_id: &str) -> Result<&'static str> 
     }
 }
 
-fn osint_research_schema_marker_present(readback: &CloudflareResponseV1) -> bool {
+fn under_the_sun_farm_schema_marker_sql(migration_id: &str) -> Result<&'static str> {
+    match migration_id {
+        "0001" => Ok(
+            "SELECT (EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'editorial_items') AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'action_intents') AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'inbound_events') AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'publication_receipts') AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = 'idx_editorial_lifecycle_updated') AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = 'idx_intents_item')) AS present",
+        ),
+        _ => Err(CloudflareError::MissingVerificationTarget(
+            "Under the Sun Farm migration is absent from the closed schema-marker catalogue"
+                .to_owned(),
+        )),
+    }
+}
+
+fn closed_schema_marker_present(readback: &CloudflareResponseV1) -> bool {
     readback.status == 200
         && readback.success
         && readback
@@ -8988,8 +9060,8 @@ fn osint_research_schema_marker_present(readback: &CloudflareResponseV1) -> bool
 #[cfg(test)]
 mod osint_research_schema_marker_tests {
     use super::{
-        CloudflareResponseV1, osint_research_schema_marker_present,
-        osint_research_schema_marker_sql,
+        CloudflareResponseV1, closed_schema_marker_present, osint_research_schema_marker_sql,
+        under_the_sun_farm_schema_marker_sql,
     };
     use serde_json::{Value, json};
 
@@ -9017,19 +9089,33 @@ mod osint_research_schema_marker_tests {
 
     #[test]
     fn marker_requires_exact_successful_single_present_result() {
-        assert!(osint_research_schema_marker_present(&readback(
-            200,
-            true,
-            json!(1)
-        )));
+        assert!(closed_schema_marker_present(&readback(200, true, json!(1))));
         for response in [
             readback(500, true, json!(1)),
             readback(200, false, json!(1)),
             readback(200, true, json!(0)),
             readback(200, true, json!(true)),
         ] {
-            assert!(!osint_research_schema_marker_present(&response));
+            assert!(!closed_schema_marker_present(&response));
         }
+    }
+
+    #[test]
+    fn farm_marker_is_compiler_owned_and_proves_every_migration_object() {
+        let sql = under_the_sun_farm_schema_marker_sql("0001").unwrap_or_default();
+        for object in [
+            "editorial_items",
+            "action_intents",
+            "inbound_events",
+            "publication_receipts",
+            "idx_editorial_lifecycle_updated",
+            "idx_intents_item",
+        ] {
+            assert!(sql.contains(object), "missing schema marker for {object}");
+        }
+        assert!(sql.starts_with("SELECT (EXISTS("));
+        assert!(sql.ends_with(") AS present"));
+        assert!(under_the_sun_farm_schema_marker_sql("0002").is_err());
     }
 }
 
@@ -10149,6 +10235,11 @@ fn validate_d1_approved_mln_import_contract(
     if capability.id == "d1-import-approved-osint-research-migration" {
         return validate_d1_approved_osint_research_import_contract(capability, input, contract);
     }
+    if capability.id == "d1-import-approved-under-the-sun-farm-migration" {
+        return validate_d1_approved_under_the_sun_farm_import_contract(
+            capability, input, contract,
+        );
+    }
     let body = input.body.as_ref().and_then(Value::as_object);
     let migration_id = body
         .and_then(|body| body.get("migration_id"))
@@ -10404,6 +10495,235 @@ fn validate_d1_approved_osint_research_import_contract(
     Ok(())
 }
 
+fn validate_d1_approved_under_the_sun_farm_import_contract(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    contract: &cfctl_core::D1ApprovedMlnImportContractV1,
+) -> Result<()> {
+    let body = input.body.as_ref().and_then(Value::as_object);
+    let migration_id = body
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str);
+    let keys = body
+        .map(|body| body.keys().map(String::as_str).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let expected_keys = [
+        "migration_id",
+        "pre_recovery_anchor_evidence_hash",
+        "pre_recovery_anchor_bookmark_hash",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let migration = contract.migrations.first();
+    let supported = capability.method == "POST"
+        && capability.path == "/accounts/{account_id}/d1/database/{database_id}/import"
+        && capability.path == contract.import_path
+        && capability.product == "D1"
+        && capability.account_scope == "account"
+        && capability.adapter_status == AdapterStatus::Native
+        && capability.mutating
+        && capability.risk == RiskClass::Irreversible
+        && capability.effect == cfctl_core::EffectClass::DataWrite
+        && capability.permissions == ["D1 Write"]
+        && capability.verification.strategy
+            == "under_the_sun_farm_owner_editorial_schema_is_present"
+        && input.selectors.get("account_id").and_then(Value::as_str)
+            == Some(contract.account_id.as_str())
+        && input.selectors.get("database_id").and_then(Value::as_str)
+            == Some(contract.database_id.as_str())
+        && migration_id == Some("0001")
+        && keys == expected_keys
+        && contract.repository_id == "github.com/rogu3bear/under-the-sun-farm"
+        && contract.repository_head == "a74727c9c4aa4b4a2c4165d5f6b231206e61c59c"
+        && contract.pre_import_capability_version == 0
+        && contract.pre_import_validator_contract_hash.is_empty()
+        && contract.pre_import_fixed_query_sha256.is_empty()
+        && contract.account_id == "ca30e922fda7f5578e49873542e4aaca"
+        && contract.database_id == "2a220ff3-f718-430e-a45f-b0d186a46193"
+        && contract.migrations.len() == 1
+        && migration.is_some_and(|migration| {
+            migration.migration_id == "0001"
+                && migration.basename == "0001_owner_editorial.sql"
+                && migration.repository_relative_path == "migrations/0001_owner_editorial.sql"
+                && migration.git_blob_oid == "39a9649f6400a4bcc0952d8b5decf1826a05c4b9"
+                && migration.bytes == 2_172
+                && migration.sha256
+                    == "ec46d7d650af305b47f00a71ff0f19df02767fcccbd8245d3173a5808bde8c1f"
+                && migration.md5 == "ed8027ce4c8de209c9752eccdab46c64"
+        })
+        && contract.requires_create_new_mode_0600_stage
+        && contract.upload_url_suffix == ".r2.cloudflarestorage.com"
+        && (1..=1024 * 1024).contains(&contract.max_response_bytes)
+        && (1..=120).contains(&contract.max_poll_attempts)
+        && (1..=30).contains(&contract.max_timeout_seconds)
+        && capability.analytics_query.is_none()
+        && capability.d1_schema_introspection.is_none()
+        && capability.mln_0143_data_invariants.is_none()
+        && capability.d1_full_export.is_none()
+        && capability.d1_restore_exact_bookmark.is_none()
+        && capability.r2_log_retrieval.is_none()
+        && input
+            .query
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+    if !supported {
+        return Err(CloudflareError::InvalidRequestBody(
+            "approved Under the Sun Farm import identity, target, closed prerequisites, or bounds drifted"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod under_the_sun_farm_import_contract_tests {
+    use super::{
+        CallInput, CloudflareError, validate_d1_approved_under_the_sun_farm_import_contract,
+    };
+    use cfctl_core::{
+        AdapterStatus, CapabilityV1, D1ApprovedMlnImportContractV1, D1ApprovedMlnMigrationV1,
+        EffectClass, RiskClass,
+    };
+    use serde_json::json;
+
+    fn capability() -> CapabilityV1 {
+        let mut capability = CapabilityV1::new(
+            "d1-import-approved-under-the-sun-farm-migration",
+            "Import the approved Under the Sun Farm owner-editorial migration",
+            "POST",
+            "/accounts/{account_id}/d1/database/{database_id}/import",
+        );
+        capability.product = "D1".to_owned();
+        capability.account_scope = "account".to_owned();
+        capability.adapter_status = AdapterStatus::Native;
+        capability.mutating = true;
+        capability.risk = RiskClass::Irreversible;
+        capability.effect = EffectClass::DataWrite;
+        capability.permissions = vec!["D1 Write".to_owned()];
+        capability.verification.required = true;
+        capability.verification.strategy =
+            "under_the_sun_farm_owner_editorial_schema_is_present".to_owned();
+        capability.d1_approved_mln_import = Some(D1ApprovedMlnImportContractV1 {
+            repository_id: "github.com/rogu3bear/under-the-sun-farm".to_owned(),
+            repository_head: "a74727c9c4aa4b4a2c4165d5f6b231206e61c59c".to_owned(),
+            pre_import_capability_version: 0,
+            pre_import_validator_contract_hash: String::new(),
+            pre_import_fixed_query_sha256: String::new(),
+            account_id: "ca30e922fda7f5578e49873542e4aaca".to_owned(),
+            database_id: "2a220ff3-f718-430e-a45f-b0d186a46193".to_owned(),
+            import_path: capability.path.clone(),
+            migrations: vec![D1ApprovedMlnMigrationV1 {
+                migration_id: "0001".to_owned(),
+                basename: "0001_owner_editorial.sql".to_owned(),
+                repository_relative_path: "migrations/0001_owner_editorial.sql".to_owned(),
+                git_blob_oid: "39a9649f6400a4bcc0952d8b5decf1826a05c4b9".to_owned(),
+                bytes: 2_172,
+                sha256: "ec46d7d650af305b47f00a71ff0f19df02767fcccbd8245d3173a5808bde8c1f"
+                    .to_owned(),
+                md5: "ed8027ce4c8de209c9752eccdab46c64".to_owned(),
+            }],
+            max_response_bytes: 1024 * 1024,
+            max_poll_attempts: 120,
+            max_timeout_seconds: 30,
+            upload_url_suffix: ".r2.cloudflarestorage.com".to_owned(),
+            requires_create_new_mode_0600_stage: true,
+        });
+        capability
+    }
+
+    fn input() -> CallInput {
+        let mut input = CallInput {
+            body: Some(json!({
+                "migration_id":"0001",
+                "pre_recovery_anchor_evidence_hash":format!("sha256:{}", "a".repeat(64)),
+                "pre_recovery_anchor_bookmark_hash":format!("sha256:{}", "b".repeat(64)),
+            })),
+            query: json!({}),
+            ..CallInput::default()
+        };
+        input.selectors = json!({
+            "account_id":"ca30e922fda7f5578e49873542e4aaca",
+            "database_id":"2a220ff3-f718-430e-a45f-b0d186a46193",
+        });
+        input
+    }
+
+    #[test]
+    fn exact_farm_import_contract_passes_and_every_material_drift_fails_closed() {
+        let capability = capability();
+        let contract = capability
+            .d1_approved_mln_import
+            .as_ref()
+            .expect("farm contract");
+        assert!(
+            validate_d1_approved_under_the_sun_farm_import_contract(
+                &capability,
+                &input(),
+                contract,
+            )
+            .is_ok()
+        );
+
+        let mut cases = Vec::new();
+        let mut wrong_target = input();
+        wrong_target
+            .selectors
+            .as_object_mut()
+            .expect("selector object")
+            .insert(
+                "database_id".to_owned(),
+                json!("00000000-0000-0000-0000-000000000000"),
+            );
+        cases.push((capability.clone(), wrong_target));
+
+        let mut wrong_permission = capability.clone();
+        wrong_permission.permissions = vec!["D1 Read".to_owned()];
+        cases.push((wrong_permission, input()));
+
+        let mut wrong_source = capability.clone();
+        wrong_source
+            .d1_approved_mln_import
+            .as_mut()
+            .expect("farm contract")
+            .repository_head = "0000000000000000000000000000000000000000".to_owned();
+        cases.push((wrong_source, input()));
+
+        let mut wrong_migration = capability.clone();
+        wrong_migration
+            .d1_approved_mln_import
+            .as_mut()
+            .expect("farm contract")
+            .migrations[0]
+            .sha256 = "00".repeat(32);
+        cases.push((wrong_migration, input()));
+
+        let mut open_body = input();
+        open_body
+            .body
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("object body")
+            .insert("sql".to_owned(), json!("DROP TABLE editorial_items"));
+        cases.push((capability, open_body));
+
+        for (capability, input) in cases {
+            let contract = capability
+                .d1_approved_mln_import
+                .as_ref()
+                .expect("farm contract");
+            assert!(matches!(
+                validate_d1_approved_under_the_sun_farm_import_contract(
+                    &capability,
+                    &input,
+                    contract,
+                ),
+                Err(CloudflareError::InvalidRequestBody(_))
+            ));
+        }
+    }
+}
+
 fn validate_d1_approved_mln_import_poll_resume_contract(
     capability: &CapabilityV1,
     input: &CallInput,
@@ -10485,15 +10805,45 @@ fn import_provider_capability(import: &CapabilityV1) -> CapabilityV1 {
     provider
 }
 
+#[cfg(test)]
 fn validate_d1_import_upload_url(
     raw: &str,
     contract: &D1ApprovedMlnImportContractV1,
 ) -> Result<Url> {
+    classify_d1_import_upload_url(raw, contract).map_err(|rejection| {
+        CloudflareError::InvalidRequestBody(rejection.provider_message().to_owned())
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum D1ImportUploadUrlRejection {
+    AuthorityOrShape,
+    Signature,
+}
+
+#[cfg(test)]
+impl D1ImportUploadUrlRejection {
+    const fn provider_message(self) -> &'static str {
+        match self {
+            Self::AuthorityOrShape => {
+                "D1 import upload URL is not an exact account-owned R2 presigned HTTPS PUT URL"
+            }
+            Self::Signature => {
+                "D1 import upload URL has an unsupported presigned signature contract"
+            }
+        }
+    }
+}
+
+fn classify_d1_import_upload_url(
+    raw: &str,
+    contract: &D1ApprovedMlnImportContractV1,
+) -> std::result::Result<Url, D1ImportUploadUrlRejection> {
     let raw_authority = raw
         .split_once("://")
         .map(|(_, remainder)| remainder.split(['/', '?', '#']).next().unwrap_or_default())
         .unwrap_or_default();
-    let url = Url::parse(raw)?;
+    let url = Url::parse(raw).map_err(|_| D1ImportUploadUrlRejection::AuthorityOrShape)?;
     let host = url.host_str().unwrap_or_default();
     let expected_host = format!("{}{}", contract.account_id, contract.upload_url_suffix);
     let required_query_keys = [
@@ -10523,10 +10873,7 @@ fn validate_d1_import_upload_url(
             matching.len() != 1 || matching[0].1.is_empty()
         })
     {
-        return Err(CloudflareError::InvalidRequestBody(
-            "D1 import upload URL is not an exact account-owned R2 presigned HTTPS PUT URL"
-                .to_owned(),
-        ));
+        return Err(D1ImportUploadUrlRejection::AuthorityOrShape);
     }
     let query_value = |name: &str| {
         query_pairs
@@ -10541,9 +10888,7 @@ fn validate_d1_import_upload_url(
         || signature.len() != 64
         || !signature.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        return Err(CloudflareError::InvalidRequestBody(
-            "D1 import upload URL has an unsupported presigned signature contract".to_owned(),
-        ));
+        return Err(D1ImportUploadUrlRejection::Signature);
     }
     Ok(url)
 }
@@ -10681,6 +11026,7 @@ fn accepted_d1_import_init_response(response: &CloudflareResponseV1) -> Result<(
     }
 }
 
+#[derive(Debug)]
 struct AcceptedD1ImportInit {
     filename: String,
     upload_url: Url,
@@ -10696,26 +11042,59 @@ fn d1_import_filename_is_safe(value: &str) -> bool {
         && !value.ends_with('.')
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum D1ImportInitRejection {
+    TopLevel,
+    NestedState,
+    Filename,
+    UploadUrlMissingOrNonString,
+    UploadUrlAuthorityOrShape,
+    UploadUrlSignature,
+}
+
+impl D1ImportInitRejection {
+    const fn receipt_label(self) -> &'static str {
+        match self {
+            Self::TopLevel => "top_level_rejected",
+            Self::NestedState => "nested_state_rejected",
+            Self::Filename => "filename_rejected",
+            Self::UploadUrlMissingOrNonString => "upload_url_missing_or_non_string",
+            Self::UploadUrlAuthorityOrShape => "upload_url_authority_or_shape_rejected",
+            Self::UploadUrlSignature => "upload_url_signature_rejected",
+        }
+    }
+}
+
 fn classify_d1_import_init_response(
     response: &CloudflareResponseV1,
     contract: &D1ApprovedMlnImportContractV1,
-) -> std::result::Result<AcceptedD1ImportInit, ()> {
-    if !response.success || accepted_d1_import_init_response(response).is_err() {
-        return Err(());
+) -> std::result::Result<AcceptedD1ImportInit, D1ImportInitRejection> {
+    if !response.success {
+        return Err(D1ImportInitRejection::TopLevel);
+    }
+    if accepted_d1_import_init_response(response).is_err() {
+        return Err(D1ImportInitRejection::NestedState);
     }
     let filename = response
         .result
         .get("filename")
         .and_then(Value::as_str)
         .filter(|value| d1_import_filename_is_safe(value))
-        .ok_or(())?
+        .ok_or(D1ImportInitRejection::Filename)?
         .to_owned();
     let upload_url_raw = response
         .result
         .get("upload_url")
         .and_then(Value::as_str)
-        .ok_or(())?;
-    let upload_url = validate_d1_import_upload_url(upload_url_raw, contract).map_err(|_| ())?;
+        .ok_or(D1ImportInitRejection::UploadUrlMissingOrNonString)?;
+    let upload_url = classify_d1_import_upload_url(upload_url_raw, contract).map_err(
+        |rejection| match rejection {
+            D1ImportUploadUrlRejection::AuthorityOrShape => {
+                D1ImportInitRejection::UploadUrlAuthorityOrShape
+            }
+            D1ImportUploadUrlRejection::Signature => D1ImportInitRejection::UploadUrlSignature,
+        },
+    )?;
     Ok(AcceptedD1ImportInit {
         filename,
         upload_url,
@@ -10827,7 +11206,32 @@ fn classify_d1_import_poll_response<'a>(
     accepted_d1_import_poll_outcome(response, expected_at_bookmark).map_err(|_| ())
 }
 
-fn projected_d1_import_init_result(plan: &PlanV1, response: &CloudflareResponseV1) -> Value {
+fn projected_d1_import_type(source: &Value) -> Option<&'static str> {
+    match source.get("type").and_then(Value::as_str) {
+        Some("import") => Some("import"),
+        _ => None,
+    }
+}
+
+fn projected_d1_import_status(source: &Value) -> Option<&'static str> {
+    match source.get("status").and_then(Value::as_str) {
+        Some("active") => Some("active"),
+        Some("pending") => Some("pending"),
+        Some("complete") => Some("complete"),
+        Some("error") => Some("error"),
+        _ => None,
+    }
+}
+
+fn sha256_string(value: &str) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))
+}
+
+fn projected_d1_import_init_result(
+    plan: &PlanV1,
+    response: &CloudflareResponseV1,
+    init_classification_failure: Option<&str>,
+) -> Value {
     let upload_url = response.result.get("upload_url").and_then(Value::as_str);
     let filename = response.result.get("filename").and_then(Value::as_str);
     let parsed_upload_url = upload_url.and_then(|value| Url::parse(value).ok());
@@ -10838,19 +11242,47 @@ fn projected_d1_import_init_result(plan: &PlanV1, response: &CloudflareResponseV
         .as_ref()
         .map(|contract| format!("{}{}", contract.account_id, contract.upload_url_suffix));
     serde_json::json!({
-        "type":response.result.get("type"),
-        "status":response.result.get("status"),
-        "success":response.result.get("success"),
-        "at_bookmark":response.result.get("at_bookmark"),
+        "type":projected_d1_import_type(&response.result),
+        "status":projected_d1_import_status(&response.result),
+        "success":response.result.get("success").and_then(Value::as_bool),
+        "at_bookmark_present":response.result.get("at_bookmark").is_some(),
+        "at_bookmark_is_string":response.result.get("at_bookmark").and_then(Value::as_str).is_some(),
         "upload_url_present":upload_url.is_some(),
-        "upload_url_sha256":upload_url.map(|value| format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))),
-        "upload_url_host":upload_url_host,
+        "upload_url_sha256":upload_url.map(sha256_string),
         "upload_url_host_is_exact_account_endpoint":upload_url_host.zip(expected_upload_url_host.as_deref()).is_some_and(|(actual, expected)| actual == expected),
         "upload_url_host_is_cloudflare_r2":upload_url_host.is_some_and(|host| host.ends_with(".r2.cloudflarestorage.com")),
         "filename_present":filename.is_some(),
-        "filename_sha256":filename.map(|value| format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))),
+        "filename_sha256":filename.map(sha256_string),
         "filename_shape_valid":filename.is_some_and(d1_import_filename_is_safe),
         "provider_error_present":response.result.get("error").is_some(),
+        "cfctl_classification_failure":init_classification_failure,
+    })
+}
+
+fn projected_d1_import_action_result(source: &Value, retain_validated_bookmarks: bool) -> Value {
+    let at_bookmark = source
+        .get("at_bookmark")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let final_bookmark = source
+        .pointer("/result/final_bookmark")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    serde_json::json!({
+        "type":projected_d1_import_type(source),
+        "status":projected_d1_import_status(source),
+        "success":source.get("success").and_then(Value::as_bool),
+        "at_bookmark":retain_validated_bookmarks.then_some(at_bookmark).flatten(),
+        "at_bookmark_present":source.get("at_bookmark").is_some(),
+        "at_bookmark_is_string":source.get("at_bookmark").and_then(Value::as_str).is_some(),
+        "at_bookmark_sha256":at_bookmark.map(sha256_string),
+        "result":{
+            "final_bookmark":retain_validated_bookmarks.then_some(final_bookmark).flatten(),
+            "final_bookmark_present":source.pointer("/result/final_bookmark").is_some(),
+            "final_bookmark_is_string":source.pointer("/result/final_bookmark").and_then(Value::as_str).is_some(),
+            "final_bookmark_sha256":final_bookmark.map(sha256_string),
+        },
+        "provider_error_present":source.get("error").is_some(),
     })
 }
 
@@ -10860,6 +11292,8 @@ fn persist_import_response<F>(
     step: &str,
     response: &CloudflareResponseV1,
     replacement_result: Option<Value>,
+    init_classification_failure: Option<&str>,
+    retain_validated_bookmarks: bool,
 ) -> Result<()>
 where
     F: FnMut(&D1ImportCheckpointV1) -> std::result::Result<(), String>,
@@ -10875,20 +11309,11 @@ where
     };
     let target = import_target(plan);
     let migration_id = import_lineage_value(plan, "migration_id");
-    let mut result = if response_action == "init" {
-        projected_d1_import_init_result(plan, response)
+    let result = if response_action == "init" {
+        projected_d1_import_init_result(plan, response, init_classification_failure)
     } else {
         let source = replacement_result.as_ref().unwrap_or(&response.result);
-        serde_json::json!({
-            "type":source.get("type"),
-            "status":source.get("status"),
-            "success":source.get("success"),
-            "at_bookmark":source.get("at_bookmark"),
-            "result":{
-                "final_bookmark":source.pointer("/result/final_bookmark"),
-            },
-            "provider_error_present":source.get("error").is_some(),
-        })
+        projected_d1_import_action_result(source, retain_validated_bookmarks)
     };
     let successful_nonterminal_ingest = step == "ingest_response"
         && response.success
@@ -10900,15 +11325,10 @@ where
         && result.get("success").and_then(Value::as_bool) == Some(true);
     let terminal_provider_failure = result.get("status").and_then(Value::as_str) == Some("error")
         && result.get("success").and_then(Value::as_bool) == Some(false);
-    let provider_error_present = if let Some(object) = result.as_object_mut() {
-        let provider_error_present = object.remove("error").is_some();
-        if provider_error_present {
-            object.insert("provider_error_present".to_owned(), Value::Bool(true));
-        }
-        provider_error_present
-    } else {
-        false
-    };
+    let provider_error_present = result
+        .get("provider_error_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let result = if terminal_provider_failure {
         serde_json::json!({
             "type":result.get("type"),
@@ -10987,11 +11407,12 @@ where
 #[allow(clippy::expect_used)]
 mod approved_mln_import_tests {
     use super::{
-        CloudflareError, D1ImportPollOutcome, accepted_d1_import_ingest_response,
-        accepted_d1_import_init_response, accepted_d1_import_poll_outcome,
-        bounded_d1_import_upload, classify_d1_import_ingest_response,
-        classify_d1_import_init_response, classify_d1_import_poll_response, parse_response,
-        persist_import_response, persist_import_uncertainty, validate_d1_import_poll_response,
+        CloudflareError, D1ImportInitRejection, D1ImportPollOutcome,
+        accepted_d1_import_ingest_response, accepted_d1_import_init_response,
+        accepted_d1_import_poll_outcome, bounded_d1_import_upload,
+        classify_d1_import_ingest_response, classify_d1_import_init_response,
+        classify_d1_import_poll_response, parse_response, persist_import_response,
+        persist_import_uncertainty, validate_d1_import_poll_response,
         validate_d1_import_upload_url, validated_d1_import_upload_etag,
     };
     use cfctl_core::{CapabilityV1, D1ApprovedMlnImportContractV1, PlanStatus, PlanV1};
@@ -11251,6 +11672,51 @@ mod approved_mln_import_tests {
         assert_eq!(accepted.filename, "upload.sql");
         assert_eq!(accepted.upload_url.scheme(), "https");
 
+        let signature_rejected_url = valid_url.replace("AWS4-HMAC-SHA256", "unsupported");
+        for (result, expected) in [
+            (
+                json!({"filename":"upload.sql"}),
+                D1ImportInitRejection::UploadUrlMissingOrNonString,
+            ),
+            (
+                json!({"filename":"upload.sql","upload_url":7}),
+                D1ImportInitRejection::UploadUrlMissingOrNonString,
+            ),
+            (
+                json!({"filename":"upload.sql","upload_url":"https://example.com/object"}),
+                D1ImportInitRejection::UploadUrlAuthorityOrShape,
+            ),
+            (
+                json!({"filename":"upload.sql","upload_url":signature_rejected_url}),
+                D1ImportInitRejection::UploadUrlSignature,
+            ),
+            (
+                json!({"upload_url":valid_url}),
+                D1ImportInitRejection::Filename,
+            ),
+            (
+                json!({"type":"import","status":"unsupported","success":true,"filename":"upload.sql","upload_url":valid_url}),
+                D1ImportInitRejection::NestedState,
+            ),
+        ] {
+            assert_eq!(
+                classify_d1_import_init_response(&response(true, result), &contract)
+                    .expect_err("rejected init shape"),
+                expected
+            );
+        }
+        assert_eq!(
+            classify_d1_import_init_response(
+                &response(
+                    false,
+                    json!({"filename":"upload.sql","upload_url":valid_url})
+                ),
+                &contract
+            )
+            .expect_err("rejected top-level response"),
+            D1ImportInitRejection::TopLevel
+        );
+
         let invalid_results = [
             json!({"filename":"upload.sql"}),
             json!({"filename":"upload.sql","upload_url":7}),
@@ -11378,9 +11844,10 @@ mod approved_mln_import_tests {
             &json!({
                 "success":true,
                 "result":{
-                    "type":"import",
-                    "status":"unsupported",
-                    "success":true,
+                    "type":{"credential":"INIT_TYPE_OBJECT_SECRET"},
+                    "status":["INIT_STATUS_ARRAY_SECRET"],
+                    "success":"INIT_SUCCESS_STRING_SECRET",
+                    "at_bookmark":{"credential":"INIT_BOOKMARK_OBJECT_SECRET"},
                     "upload_url":secret_url,
                     "filename":"SECRET.sql",
                     "nested":{"credential":"SECRET"},
@@ -11402,6 +11869,8 @@ mod approved_mln_import_tests {
             "init_response",
             &malformed_init,
             None,
+            Some("nested_state_rejected"),
+            false,
         )
         .expect("redacted init receipt");
         let checkpoint = &checkpoints[0];
@@ -11415,9 +11884,10 @@ mod approved_mln_import_tests {
             checkpoint["receipt"]["result"]["filename_shape_valid"],
             true
         );
-        assert_eq!(
-            checkpoint["receipt"]["result"]["upload_url_host"],
-            "upload.invalid"
+        assert!(
+            checkpoint["receipt"]["result"]
+                .get("upload_url_host")
+                .is_none()
         );
         assert_eq!(
             checkpoint["receipt"]["result"]["upload_url_host_is_exact_account_endpoint"],
@@ -11427,6 +11897,10 @@ mod approved_mln_import_tests {
             checkpoint["receipt"]["result"]["upload_url_host_is_cloudflare_r2"],
             false
         );
+        assert_eq!(
+            checkpoint["receipt"]["result"]["cfctl_classification_failure"],
+            "nested_state_rejected"
+        );
         let durable = checkpoint.to_string();
         for forbidden in [
             "X-Amz-Signature",
@@ -11434,43 +11908,61 @@ mod approved_mln_import_tests {
             "credential",
             "SECRET.sql",
             "SECRET-etag",
+            "upload.invalid",
         ] {
             assert!(!durable.contains(forbidden), "{forbidden}");
         }
 
+        let hostile_results = [
+            json!({
+                "type":{"credential":"TYPE_OBJECT_SECRET"},
+                "status":["STATUS_ARRAY_SECRET"],
+                "success":"SUCCESS_STRING_SECRET",
+                "at_bookmark":{"credential":"BOOKMARK_OBJECT_SECRET"},
+                "result":{"final_bookmark":["FINAL_ARRAY_SECRET"]},
+            }),
+            json!({
+                "type":["TYPE_ARRAY_SECRET"],
+                "status":{"credential":"STATUS_OBJECT_SECRET"},
+                "success":["SUCCESS_ARRAY_SECRET"],
+                "at_bookmark":"BOOKMARK_STRING_SECRET",
+                "result":{"final_bookmark":{"credential":"FINAL_OBJECT_SECRET"}},
+            }),
+            json!({
+                "type":"TYPE_STRING_SECRET",
+                "status":"STATUS_STRING_SECRET",
+                "success":{"credential":"SUCCESS_OBJECT_SECRET"},
+                "at_bookmark":["BOOKMARK_ARRAY_SECRET"],
+                "result":{"final_bookmark":"FINAL_STRING_SECRET"},
+            }),
+        ];
         for (step, action) in [("ingest_response", "ingest"), ("poll_response_1", "poll")] {
-            let response = parse_response(
-                200,
-                &json!({
-                    "success":true,
-                    "result":{
-                        "type":"import",
-                        "status":"unsupported",
-                        "success":true,
-                        "at_bookmark":"safe-bookmark",
-                        "upload_url":secret_url,
-                        "credential":"SECRET",
-                    }
-                }),
-                None,
-                None,
-            );
-            let mut projected = Vec::new();
-            persist_import_response(
-                &mut |checkpoint| {
-                    projected.push(serde_json::to_value(checkpoint).expect("checkpoint"));
-                    Ok(())
-                },
-                &plan,
-                step,
-                &response,
-                None,
-            )
-            .expect("projected action receipt");
-            assert_eq!(projected[0]["receipt"]["response_action"], action);
-            assert!(!projected[0].to_string().contains("SECRET"));
-            assert!(!projected[0].to_string().contains("upload_url"));
-            assert!(!projected[0].to_string().contains("credential"));
+            for hostile_result in &hostile_results {
+                let response = parse_response(
+                    200,
+                    &json!({"success":true,"result":hostile_result}),
+                    None,
+                    None,
+                );
+                let mut projected = Vec::new();
+                persist_import_response(
+                    &mut |checkpoint| {
+                        projected.push(serde_json::to_value(checkpoint).expect("checkpoint"));
+                        Ok(())
+                    },
+                    &plan,
+                    step,
+                    &response,
+                    None,
+                    None,
+                    false,
+                )
+                .expect("projected action receipt");
+                assert_eq!(projected[0]["receipt"]["response_action"], action);
+                let durable = projected[0].to_string();
+                assert!(!durable.contains("SECRET"), "{durable}");
+                assert!(!durable.contains("credential"), "{durable}");
+            }
         }
     }
 
