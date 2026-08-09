@@ -3071,11 +3071,7 @@ impl Executor {
                 .verify_d1_restore_exact_bookmark(plan, apply_response, input, credential)
                 .await;
         }
-        if matches!(
-            strategy,
-            "osint_research_migration_schema_marker_is_present"
-                | "under_the_sun_farm_owner_editorial_schema_is_present"
-        ) {
+        if strategy == "osint_research_migration_schema_marker_is_present" {
             return self
                 .verify_closed_schema_migration(plan, apply_response, input, credential)
                 .await;
@@ -3248,23 +3244,10 @@ impl Executor {
                     "OSINT Research migration id is missing from the exact plan".to_owned(),
                 )
             })?;
-        let is_farm = plan.capability.id == "d1-import-approved-under-the-sun-farm-migration";
-        let sql = if is_farm {
-            under_the_sun_farm_schema_marker_sql(migration_id)?
-        } else {
-            osint_research_schema_marker_sql(migration_id)?
-        };
-        let subject = if is_farm {
-            "Under the Sun Farm"
-        } else {
-            "OSINT Research"
-        };
+        let sql = osint_research_schema_marker_sql(migration_id)?;
+        let subject = "OSINT Research";
         let mut marker_capability = CapabilityV1::new(
-            if is_farm {
-                "cfctl-private-under-the-sun-farm-schema-marker"
-            } else {
-                "cfctl-private-osint-research-schema-marker"
-            },
+            "cfctl-private-osint-research-schema-marker",
             &format!("Read one {subject} migration schema marker"),
             "POST",
             "/accounts/{account_id}/d1/database/{database_id}/query",
@@ -9035,18 +9018,6 @@ fn osint_research_schema_marker_sql(migration_id: &str) -> Result<&'static str> 
     }
 }
 
-fn under_the_sun_farm_schema_marker_sql(migration_id: &str) -> Result<&'static str> {
-    match migration_id {
-        "0001" => Ok(
-            "SELECT (EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'editorial_items') AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'action_intents') AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'inbound_events') AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'publication_receipts') AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = 'idx_editorial_lifecycle_updated') AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = 'idx_intents_item')) AS present",
-        ),
-        _ => Err(CloudflareError::MissingVerificationTarget(
-            "Under the Sun Farm migration is absent from the closed schema-marker catalogue"
-                .to_owned(),
-        )),
-    }
-}
-
 fn closed_schema_marker_present(readback: &CloudflareResponseV1) -> bool {
     readback.status == 200
         && readback.success
@@ -9061,7 +9032,6 @@ fn closed_schema_marker_present(readback: &CloudflareResponseV1) -> bool {
 mod osint_research_schema_marker_tests {
     use super::{
         CloudflareResponseV1, closed_schema_marker_present, osint_research_schema_marker_sql,
-        under_the_sun_farm_schema_marker_sql,
     };
     use serde_json::{Value, json};
 
@@ -9098,24 +9068,6 @@ mod osint_research_schema_marker_tests {
         ] {
             assert!(!closed_schema_marker_present(&response));
         }
-    }
-
-    #[test]
-    fn farm_marker_is_compiler_owned_and_proves_every_migration_object() {
-        let sql = under_the_sun_farm_schema_marker_sql("0001").unwrap_or_default();
-        for object in [
-            "editorial_items",
-            "action_intents",
-            "inbound_events",
-            "publication_receipts",
-            "idx_editorial_lifecycle_updated",
-            "idx_intents_item",
-        ] {
-            assert!(sql.contains(object), "missing schema marker for {object}");
-        }
-        assert!(sql.starts_with("SELECT (EXISTS("));
-        assert!(sql.ends_with(") AS present"));
-        assert!(under_the_sun_farm_schema_marker_sql("0002").is_err());
     }
 }
 
@@ -10235,11 +10187,6 @@ fn validate_d1_approved_mln_import_contract(
     if capability.id == "d1-import-approved-osint-research-migration" {
         return validate_d1_approved_osint_research_import_contract(capability, input, contract);
     }
-    if capability.id == "d1-import-approved-under-the-sun-farm-migration" {
-        return validate_d1_approved_under_the_sun_farm_import_contract(
-            capability, input, contract,
-        );
-    }
     let body = input.body.as_ref().and_then(Value::as_object);
     let migration_id = body
         .and_then(|body| body.get("migration_id"))
@@ -10493,235 +10440,6 @@ fn validate_d1_approved_osint_research_import_contract(
         ));
     }
     Ok(())
-}
-
-fn validate_d1_approved_under_the_sun_farm_import_contract(
-    capability: &CapabilityV1,
-    input: &CallInput,
-    contract: &cfctl_core::D1ApprovedMlnImportContractV1,
-) -> Result<()> {
-    let body = input.body.as_ref().and_then(Value::as_object);
-    let migration_id = body
-        .and_then(|body| body.get("migration_id"))
-        .and_then(Value::as_str);
-    let keys = body
-        .map(|body| body.keys().map(String::as_str).collect::<BTreeSet<_>>())
-        .unwrap_or_default();
-    let expected_keys = [
-        "migration_id",
-        "pre_recovery_anchor_evidence_hash",
-        "pre_recovery_anchor_bookmark_hash",
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    let migration = contract.migrations.first();
-    let supported = capability.method == "POST"
-        && capability.path == "/accounts/{account_id}/d1/database/{database_id}/import"
-        && capability.path == contract.import_path
-        && capability.product == "D1"
-        && capability.account_scope == "account"
-        && capability.adapter_status == AdapterStatus::Native
-        && capability.mutating
-        && capability.risk == RiskClass::Irreversible
-        && capability.effect == cfctl_core::EffectClass::DataWrite
-        && capability.permissions == ["D1 Write"]
-        && capability.verification.strategy
-            == "under_the_sun_farm_owner_editorial_schema_is_present"
-        && input.selectors.get("account_id").and_then(Value::as_str)
-            == Some(contract.account_id.as_str())
-        && input.selectors.get("database_id").and_then(Value::as_str)
-            == Some(contract.database_id.as_str())
-        && migration_id == Some("0001")
-        && keys == expected_keys
-        && contract.repository_id == "github.com/rogu3bear/under-the-sun-farm"
-        && contract.repository_head == "a74727c9c4aa4b4a2c4165d5f6b231206e61c59c"
-        && contract.pre_import_capability_version == 0
-        && contract.pre_import_validator_contract_hash.is_empty()
-        && contract.pre_import_fixed_query_sha256.is_empty()
-        && contract.account_id == "ca30e922fda7f5578e49873542e4aaca"
-        && contract.database_id == "2a220ff3-f718-430e-a45f-b0d186a46193"
-        && contract.migrations.len() == 1
-        && migration.is_some_and(|migration| {
-            migration.migration_id == "0001"
-                && migration.basename == "0001_owner_editorial.sql"
-                && migration.repository_relative_path == "migrations/0001_owner_editorial.sql"
-                && migration.git_blob_oid == "39a9649f6400a4bcc0952d8b5decf1826a05c4b9"
-                && migration.bytes == 2_172
-                && migration.sha256
-                    == "ec46d7d650af305b47f00a71ff0f19df02767fcccbd8245d3173a5808bde8c1f"
-                && migration.md5 == "ed8027ce4c8de209c9752eccdab46c64"
-        })
-        && contract.requires_create_new_mode_0600_stage
-        && contract.upload_url_suffix == ".r2.cloudflarestorage.com"
-        && (1..=1024 * 1024).contains(&contract.max_response_bytes)
-        && (1..=120).contains(&contract.max_poll_attempts)
-        && (1..=30).contains(&contract.max_timeout_seconds)
-        && capability.analytics_query.is_none()
-        && capability.d1_schema_introspection.is_none()
-        && capability.mln_0143_data_invariants.is_none()
-        && capability.d1_full_export.is_none()
-        && capability.d1_restore_exact_bookmark.is_none()
-        && capability.r2_log_retrieval.is_none()
-        && input
-            .query
-            .as_object()
-            .is_some_and(serde_json::Map::is_empty);
-    if !supported {
-        return Err(CloudflareError::InvalidRequestBody(
-            "approved Under the Sun Farm import identity, target, closed prerequisites, or bounds drifted"
-                .to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-#[allow(clippy::expect_used)]
-mod under_the_sun_farm_import_contract_tests {
-    use super::{
-        CallInput, CloudflareError, validate_d1_approved_under_the_sun_farm_import_contract,
-    };
-    use cfctl_core::{
-        AdapterStatus, CapabilityV1, D1ApprovedMlnImportContractV1, D1ApprovedMlnMigrationV1,
-        EffectClass, RiskClass,
-    };
-    use serde_json::json;
-
-    fn capability() -> CapabilityV1 {
-        let mut capability = CapabilityV1::new(
-            "d1-import-approved-under-the-sun-farm-migration",
-            "Import the approved Under the Sun Farm owner-editorial migration",
-            "POST",
-            "/accounts/{account_id}/d1/database/{database_id}/import",
-        );
-        capability.product = "D1".to_owned();
-        capability.account_scope = "account".to_owned();
-        capability.adapter_status = AdapterStatus::Native;
-        capability.mutating = true;
-        capability.risk = RiskClass::Irreversible;
-        capability.effect = EffectClass::DataWrite;
-        capability.permissions = vec!["D1 Write".to_owned()];
-        capability.verification.required = true;
-        capability.verification.strategy =
-            "under_the_sun_farm_owner_editorial_schema_is_present".to_owned();
-        capability.d1_approved_mln_import = Some(D1ApprovedMlnImportContractV1 {
-            repository_id: "github.com/rogu3bear/under-the-sun-farm".to_owned(),
-            repository_head: "a74727c9c4aa4b4a2c4165d5f6b231206e61c59c".to_owned(),
-            pre_import_capability_version: 0,
-            pre_import_validator_contract_hash: String::new(),
-            pre_import_fixed_query_sha256: String::new(),
-            account_id: "ca30e922fda7f5578e49873542e4aaca".to_owned(),
-            database_id: "2a220ff3-f718-430e-a45f-b0d186a46193".to_owned(),
-            import_path: capability.path.clone(),
-            migrations: vec![D1ApprovedMlnMigrationV1 {
-                migration_id: "0001".to_owned(),
-                basename: "0001_owner_editorial.sql".to_owned(),
-                repository_relative_path: "migrations/0001_owner_editorial.sql".to_owned(),
-                git_blob_oid: "39a9649f6400a4bcc0952d8b5decf1826a05c4b9".to_owned(),
-                bytes: 2_172,
-                sha256: "ec46d7d650af305b47f00a71ff0f19df02767fcccbd8245d3173a5808bde8c1f"
-                    .to_owned(),
-                md5: "ed8027ce4c8de209c9752eccdab46c64".to_owned(),
-            }],
-            max_response_bytes: 1024 * 1024,
-            max_poll_attempts: 120,
-            max_timeout_seconds: 30,
-            upload_url_suffix: ".r2.cloudflarestorage.com".to_owned(),
-            requires_create_new_mode_0600_stage: true,
-        });
-        capability
-    }
-
-    fn input() -> CallInput {
-        let mut input = CallInput {
-            body: Some(json!({
-                "migration_id":"0001",
-                "pre_recovery_anchor_evidence_hash":format!("sha256:{}", "a".repeat(64)),
-                "pre_recovery_anchor_bookmark_hash":format!("sha256:{}", "b".repeat(64)),
-            })),
-            query: json!({}),
-            ..CallInput::default()
-        };
-        input.selectors = json!({
-            "account_id":"ca30e922fda7f5578e49873542e4aaca",
-            "database_id":"2a220ff3-f718-430e-a45f-b0d186a46193",
-        });
-        input
-    }
-
-    #[test]
-    fn exact_farm_import_contract_passes_and_every_material_drift_fails_closed() {
-        let capability = capability();
-        let contract = capability
-            .d1_approved_mln_import
-            .as_ref()
-            .expect("farm contract");
-        assert!(
-            validate_d1_approved_under_the_sun_farm_import_contract(
-                &capability,
-                &input(),
-                contract,
-            )
-            .is_ok()
-        );
-
-        let mut cases = Vec::new();
-        let mut wrong_target = input();
-        wrong_target
-            .selectors
-            .as_object_mut()
-            .expect("selector object")
-            .insert(
-                "database_id".to_owned(),
-                json!("00000000-0000-0000-0000-000000000000"),
-            );
-        cases.push((capability.clone(), wrong_target));
-
-        let mut wrong_permission = capability.clone();
-        wrong_permission.permissions = vec!["D1 Read".to_owned()];
-        cases.push((wrong_permission, input()));
-
-        let mut wrong_source = capability.clone();
-        wrong_source
-            .d1_approved_mln_import
-            .as_mut()
-            .expect("farm contract")
-            .repository_head = "0000000000000000000000000000000000000000".to_owned();
-        cases.push((wrong_source, input()));
-
-        let mut wrong_migration = capability.clone();
-        wrong_migration
-            .d1_approved_mln_import
-            .as_mut()
-            .expect("farm contract")
-            .migrations[0]
-            .sha256 = "00".repeat(32);
-        cases.push((wrong_migration, input()));
-
-        let mut open_body = input();
-        open_body
-            .body
-            .as_mut()
-            .and_then(serde_json::Value::as_object_mut)
-            .expect("object body")
-            .insert("sql".to_owned(), json!("DROP TABLE editorial_items"));
-        cases.push((capability, open_body));
-
-        for (capability, input) in cases {
-            let contract = capability
-                .d1_approved_mln_import
-                .as_ref()
-                .expect("farm contract");
-            assert!(matches!(
-                validate_d1_approved_under_the_sun_farm_import_contract(
-                    &capability,
-                    &input,
-                    contract,
-                ),
-                Err(CloudflareError::InvalidRequestBody(_))
-            ));
-        }
-    }
 }
 
 fn validate_d1_approved_mln_import_poll_resume_contract(

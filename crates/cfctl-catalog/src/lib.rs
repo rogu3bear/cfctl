@@ -2112,7 +2112,6 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
         d1_restore_exact_bookmark_capability(),
         d1_import_approved_mln_migration_capability(),
         d1_import_approved_osint_research_migration_capability(),
-        d1_import_approved_under_the_sun_farm_migration_capability(),
         d1_resume_approved_mln_import_poll_capability(),
     ]
     .into_boxed_slice()
@@ -2547,127 +2546,6 @@ fn d1_import_approved_osint_research_migration_capability() -> CapabilityV1 {
     });
     capability
 }
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "the closed source, target, recovery, cost, and verification identities remain visible as one reviewable contract"
-)]
-fn d1_import_approved_under_the_sun_farm_migration_capability() -> CapabilityV1 {
-    let account_id = "ca30e922fda7f5578e49873542e4aaca";
-    let database_id = "2a220ff3-f718-430e-a45f-b0d186a46193";
-    let hash = serde_json::json!({
-        "type":"string","pattern":"^sha256:[0-9a-f]{64}$","minLength":71,"maxLength":71
-    });
-    let mut capability = CapabilityV1::new(
-        "d1-import-approved-under-the-sun-farm-migration",
-        "Import the approved Under the Sun Farm owner-editorial migration",
-        "POST",
-        "/accounts/{account_id}/d1/database/{database_id}/import",
-    );
-    capability.description = Some(
-        "Stage and import exactly the reviewed Under the Sun Farm 0001 owner-editorial migration. The adapter pins the private repository, clean release HEAD, relative path, Git blob, source hashes, account, and database. Every plan requires exactly one governed time-travel bookmark read from the preceding 10 minutes, and execution closes only after a compiler-owned readback proves all four tables and both indexes. No caller SQL or provider protocol control is accepted."
-            .to_owned(),
-    );
-    "D1".clone_into(&mut capability.product);
-    "cfctl native closed Under the Sun Farm migration import adapter"
-        .clone_into(&mut capability.source);
-    "account".clone_into(&mut capability.account_scope);
-    capability.aliases = vec![
-        "apply Under the Sun Farm migration".to_owned(),
-        "migrate Under the Sun Farm D1".to_owned(),
-        "apply owner editorial migration 0001".to_owned(),
-    ];
-    capability.permissions = vec!["D1 Write".to_owned()];
-    capability.mutating = true;
-    capability.risk = RiskClass::Irreversible;
-    capability.effect = EffectClass::DataWrite;
-    capability.maturity = Maturity::GenerallyAvailable;
-    capability.adapter_status = AdapterStatus::Native;
-    capability.cost = CostV1 {
-        incremental: false,
-        currency: None,
-        maximum: Some(0.0),
-        basis: Some(
-            "D1 import and the bounded schema readback have no incremental operation charge; ordinary D1 storage, rows-written, and rows-read accounting remains"
-                .to_owned(),
-        ),
-        known: true,
-        billing_model: BillingModelV1::UsageBased,
-        exposure: CostExposureV1::DownstreamUsage,
-        references: vec![KnowledgeReferenceV1 {
-            title: "D1 pricing".to_owned(),
-            url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
-            source: "official Cloudflare docs".to_owned(),
-        }],
-    };
-    capability.entitlement.available = Some(true);
-    capability.verification.required = true;
-    "under_the_sun_farm_owner_editorial_schema_is_present"
-        .clone_into(&mut capability.verification.strategy);
-    capability.rollback.supported = true;
-    capability.rollback.strategy =
-        Some("no_automatic_rollback_use_separately_approved_bookmark_restore".to_owned());
-    capability.rollback.warning = Some(
-        "There is no automatic rollback. Recovery requires a separately planned and approved exact-bookmark restore to the bound pre-migration time-travel bookmark after quiescence and impact review."
-            .to_owned(),
-    );
-    capability.selectors = [("account_id", account_id), ("database_id", database_id)]
-        .map(|(name, value)| SelectorV1 {
-            name: name.to_owned(),
-            location: "path".to_owned(),
-            required: true,
-            value_type: "string".to_owned(),
-            description: Some(format!("Pinned Under the Sun Farm {name}.")),
-            contract: Some(SelectorContractV1 {
-                schema: serde_json::json!({"type":"string","enum":[value]}),
-                query: None,
-            }),
-        })
-        .to_vec();
-    capability.request_schema = Some(serde_json::json!({
-        "type":"object","additionalProperties":false,"x-cfctl-body-required":true,
-        "required":[
-            "migration_id","pre_recovery_anchor_evidence_hash",
-            "pre_recovery_anchor_bookmark_hash"
-        ],
-        "properties":{
-            "migration_id":{"type":"string","enum":["0001"]},
-            "pre_recovery_anchor_evidence_hash":hash,
-            "pre_recovery_anchor_bookmark_hash":hash
-        }
-    }));
-    capability.response_contract = Some(ResponseContractV1 {
-        success_statuses: vec!["200".to_owned()],
-        success_media_types: vec!["application/json".to_owned()],
-        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
-    });
-    capability.d1_approved_mln_import = Some(cfctl_core::D1ApprovedMlnImportContractV1 {
-        repository_id: "github.com/rogu3bear/under-the-sun-farm".to_owned(),
-        repository_head: "a74727c9c4aa4b4a2c4165d5f6b231206e61c59c".to_owned(),
-        pre_import_capability_version: 0,
-        pre_import_validator_contract_hash: String::new(),
-        pre_import_fixed_query_sha256: String::new(),
-        account_id: account_id.to_owned(),
-        database_id: database_id.to_owned(),
-        import_path: capability.path.clone(),
-        migrations: vec![cfctl_core::D1ApprovedMlnMigrationV1 {
-            migration_id: "0001".to_owned(),
-            basename: "0001_owner_editorial.sql".to_owned(),
-            repository_relative_path: "migrations/0001_owner_editorial.sql".to_owned(),
-            git_blob_oid: "39a9649f6400a4bcc0952d8b5decf1826a05c4b9".to_owned(),
-            bytes: 2_172,
-            sha256: "ec46d7d650af305b47f00a71ff0f19df02767fcccbd8245d3173a5808bde8c1f".to_owned(),
-            md5: "ed8027ce4c8de209c9752eccdab46c64".to_owned(),
-        }],
-        max_response_bytes: 1024 * 1024,
-        max_poll_attempts: 120,
-        max_timeout_seconds: 30,
-        upload_url_suffix: ".r2.cloudflarestorage.com".to_owned(),
-        requires_create_new_mode_0600_stage: true,
-    });
-    capability
-}
-
 fn d1_resume_approved_mln_import_poll_capability() -> CapabilityV1 {
     let account_id = "ca30e922fda7f5578e49873542e4aaca";
     let database_id = "7c282983-2e48-4ea4-9f0d-09b0d718fe65";
