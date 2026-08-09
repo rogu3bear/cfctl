@@ -7496,6 +7496,7 @@ fn apply_post_normalization_contracts(
     classify_created_collection_resource_contracts(document, capabilities);
     finalize_pages_project_create_contract(document, capabilities);
     finalize_pages_domain_create_contract(document, capabilities);
+    finalize_worker_custom_domain_attach_contract(document, capabilities);
     classify_global_warp_override_contract(document, capabilities);
     classify_same_path_object_mutation_contracts(document, capabilities);
     finalize_r2_bucket_create_contract(document, capabilities);
@@ -7893,6 +7894,186 @@ fn finalize_pages_domain_create_contract(
     capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
     capability.rollback.warning = Some(
         "compensation creates a separate exact-domain delete plan that must be reviewed and explicitly approved"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
+
+const WORKER_DOMAIN_ATTACH_CAPABILITY_ID: &str = "workers.domains.update";
+const WORKER_DOMAIN_READ_CAPABILITY_ID: &str = "workers.domains.get";
+const WORKER_DOMAIN_DELETE_CAPABILITY_ID: &str = "workers.domains.delete";
+const WORKER_DOMAIN_COLLECTION_PATH: &str = "/accounts/{account_id}/workers/domains";
+const WORKER_DOMAIN_DETAIL_PATH: &str = "/accounts/{account_id}/workers/domains/{domain_id}";
+
+fn worker_domain_path_selectors_supported(capability: &CapabilityV1, expected: &[&str]) -> bool {
+    capability.selectors.len() == expected.len()
+        && expected.iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+}
+
+fn worker_domain_upstream_request_supported(schema: Option<&Value>) -> bool {
+    schema
+        == Some(&serde_json::json!({
+            "allOf": [
+                {
+                    "properties": {
+                        "hostname": {"type": "string"},
+                        "service": {"type": "string"},
+                        "zone_id": {"type": "string"},
+                        "zone_name": {"type": "string"}
+                    },
+                    "required": ["zone_id", "zone_name", "hostname", "service"],
+                    "type": "object"
+                },
+                {
+                    "required": ["hostname", "service"],
+                    "type": "object"
+                }
+            ],
+            "x-cfctl-body-required": true
+        }))
+}
+
+fn worker_domain_attach_request_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "x-cfctl-body-required": true,
+        "required": ["hostname", "service", "zone_id"],
+        "properties": {
+            "hostname": {"type": "string", "minLength": 1, "maxLength": 253},
+            "service": {"type": "string", "minLength": 1},
+            "zone_id": {"type": "string", "minLength": 32, "maxLength": 32}
+        }
+    })
+}
+
+fn worker_domain_companions_supported(capabilities: &BTreeMap<String, CapabilityV1>) -> bool {
+    capabilities
+        .get(WORKER_DOMAIN_READ_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.method == "GET"
+                && capability.path == WORKER_DOMAIN_DETAIL_PATH
+                && capability.product == "Domains"
+                && capability.account_scope == "account"
+                && capability.permissions == ["Workers Scripts Write", "Workers Scripts Read"]
+                && worker_domain_path_selectors_supported(capability, &["account_id", "domain_id"])
+        })
+        && capabilities
+            .get(WORKER_DOMAIN_DELETE_CAPABILITY_ID)
+            .is_some_and(|capability| {
+                capability.method == "DELETE"
+                    && capability.path == WORKER_DOMAIN_DETAIL_PATH
+                    && capability.product == "Domains"
+                    && capability.account_scope == "account"
+                    && capability.permissions == ["Workers Scripts Write"]
+                    && capability.request_schema.is_none()
+                    && worker_domain_path_selectors_supported(
+                        capability,
+                        &["account_id", "domain_id"],
+                    )
+            })
+}
+
+fn worker_domain_responses_supported(document: &Value) -> bool {
+    let attach_operation =
+        document.pointer("/paths/~1accounts~1{account_id}~1workers~1domains/put");
+    let read_operation =
+        document.pointer("/paths/~1accounts~1{account_id}~1workers~1domains~1{domain_id}/get");
+    let response_fields = [
+        "cert_id",
+        "hostname",
+        "id",
+        "service",
+        "zone_id",
+        "zone_name",
+    ];
+    attach_operation.is_some_and(|operation| {
+        success_response_declares_result_string_field(document, operation, "id")
+            && success_response_declares_result_fields(document, operation, &response_fields)
+    }) && read_operation.is_some_and(|operation| {
+        success_response_declares_result_string_field(document, operation, "id")
+            && success_response_declares_result_fields(document, operation, &response_fields)
+    })
+}
+
+fn finalize_worker_custom_domain_attach_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let companions_supported = worker_domain_companions_supported(capabilities);
+    let response_supported = worker_domain_responses_supported(document);
+
+    let Some(capability) = capabilities.get_mut(WORKER_DOMAIN_ATTACH_CAPABILITY_ID) else {
+        return;
+    };
+    let attach_supported = capability.method == "PUT"
+        && capability.path == WORKER_DOMAIN_COLLECTION_PATH
+        && capability.product == "Domains"
+        && capability.account_scope == "account"
+        && capability.permissions == ["Workers Scripts Write"]
+        && worker_domain_path_selectors_supported(capability, &["account_id"])
+        && worker_domain_upstream_request_supported(capability.request_schema.as_ref());
+    if !attach_supported || !companions_supported || !response_supported {
+        capability.created_resource = None;
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(format!(
+            "Worker custom-domain attach, exact readback, detach, request, permission, or response contract drifted (attach={attach_supported}, companions={companions_supported}, response={response_supported})"
+        ));
+        return;
+    }
+
+    capability.request_schema = Some(worker_domain_attach_request_schema());
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.entitlement.available = Some(true);
+    capability.entitlement.source = Some(
+        "https://developers.cloudflare.com/workers/configuration/routing/custom-domains/"
+            .to_owned(),
+    );
+    capability.cost = CostV1::default();
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.basis = Some(
+        "attaching one exact hostname to a Worker has no direct attachment charge; traffic routed through the Worker retains plan-specific request and CPU usage exposure"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        official_reference(
+            "Cloudflare Workers custom domains",
+            "https://developers.cloudflare.com/workers/configuration/routing/custom-domains/",
+        ),
+        official_reference(
+            "Cloudflare Workers pricing",
+            "https://developers.cloudflare.com/workers/platform/pricing/",
+        ),
+    ];
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: WORKER_DOMAIN_DETAIL_PATH.to_owned(),
+        identity_selector: "domain_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: WORKER_DOMAIN_READ_CAPABILITY_ID.to_owned(),
+        delete_capability_id: WORKER_DOMAIN_DELETE_CAPABILITY_ID.to_owned(),
+        verified_response_fields: vec![
+            "hostname".to_owned(),
+            "service".to_owned(),
+            "zone_id".to_owned(),
+        ],
+    });
+    capability.verification.required = true;
+    "created_resource_contains_planned_fields_by_returned_id"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    capability.rollback.warning = Some(
+        "compensation creates a separate exact-domain detach plan that must be reviewed and explicitly approved; detaching does not remove an associated Advanced Certificate and cannot undo traffic already served"
             .to_owned(),
     );
     refresh_dynamic_mutation_contract(capability);

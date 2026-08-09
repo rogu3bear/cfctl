@@ -2150,7 +2150,8 @@ impl CapabilityV1 {
                     })
             }
             "created_resource_contains_planned_fields_by_returned_id" => {
-                self.method == "POST" && self.created_resource_contract_supported()
+                self.created_resource_creation_method_supported()
+                    && self.created_resource_contract_supported()
             }
             // An Access application body is a 13-way `anyOf` over app types
             // with no universally-required field, so the generic binder — which
@@ -2723,7 +2724,7 @@ impl CapabilityV1 {
     }
 
     fn delete_created_resource_rollback_supported(&self) -> bool {
-        self.method == "POST"
+        self.created_resource_creation_method_supported()
             && self.id != "d1-create-database"
             && (self.created_resource_contract_supported()
                 || self.created_collection_resource_contract_supported()
@@ -2733,6 +2734,13 @@ impl CapabilityV1 {
                     && self.created_resource_contract_supported_with_curated_fields(&[
                         "name", "type",
                     ])))
+    }
+
+    fn created_resource_creation_method_supported(&self) -> bool {
+        self.method == "POST"
+            || (self.id == "workers.domains.update"
+                && self.method == "PUT"
+                && self.path == "/accounts/{account_id}/workers/domains")
     }
 
     fn created_resource_contract_supported(&self) -> bool {

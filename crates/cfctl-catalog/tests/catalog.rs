@@ -158,6 +158,98 @@ fn pages_domain_fixture() -> Value {
     document
 }
 
+fn worker_domain_result_responses() -> Value {
+    json!({
+        "200": {
+            "description": "Cloudflare API envelope with a Worker domain",
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["success", "result"],
+                "properties": {
+                    "success": {"type": "boolean"},
+                    "result": {
+                        "type": "object",
+                        "required": ["cert_id", "hostname", "id", "service", "zone_id", "zone_name"],
+                        "properties": {
+                            "cert_id": {"type": "string"},
+                            "hostname": {"type": "string"},
+                            "id": {"type": "string"},
+                            "service": {"type": "string"},
+                            "zone_id": {"type": "string"},
+                            "zone_name": {"type": "string"}
+                        }
+                    }
+                }
+            }}}
+        }
+    })
+}
+
+fn worker_domain_fixture() -> Value {
+    let mut document = fixture();
+    let account = json!({
+        "in": "path",
+        "name": "account_id",
+        "required": true,
+        "description": "Identifier.",
+        "schema": {"maxLength": 32, "type": "string"}
+    });
+    let domain = json!({
+        "in": "path",
+        "name": "domain_id",
+        "required": true,
+        "description": "ID of the domain.",
+        "schema": {"type": "string"}
+    });
+    document["paths"]["/accounts/{account_id}/workers/domains"] = json!({
+        "put": {
+            "operationId": "workers.domains.update",
+            "summary": "Attach Domain",
+            "tags": ["Domains"],
+            "parameters": [account.clone()],
+            "requestBody": {
+                "required": true,
+                "content": {"application/json": {"schema": {
+                    "allOf": [
+                        {
+                            "type": "object",
+                            "required": ["zone_id", "zone_name", "hostname", "service"],
+                            "properties": {
+                                "hostname": {"type": "string"},
+                                "service": {"type": "string"},
+                                "zone_id": {"type": "string"},
+                                "zone_name": {"type": "string"}
+                            }
+                        },
+                        {"type": "object", "required": ["hostname", "service"]}
+                    ]
+                }}}
+            },
+            "responses": worker_domain_result_responses(),
+            "x-api-token-group": ["Workers Scripts Write"]
+        }
+    });
+    document["paths"]["/accounts/{account_id}/workers/domains/{domain_id}"] = json!({
+        "get": {
+            "operationId": "workers.domains.get",
+            "summary": "Get Domain",
+            "tags": ["Domains"],
+            "parameters": [account.clone(), domain.clone()],
+            "responses": worker_domain_result_responses(),
+            "x-api-token-group": ["Workers Scripts Write", "Workers Scripts Read"]
+        },
+        "delete": {
+            "operationId": "workers.domains.delete",
+            "summary": "Detach Domain",
+            "tags": ["Domains"],
+            "parameters": [account, domain],
+            "responses": cloudflare_envelope_responses(),
+            "x-api-token-group": ["Workers Scripts Write"]
+        }
+    });
+    document
+}
+
 fn pages_project_result_schema() -> Value {
     json!({
         "type":"object",
@@ -2460,6 +2552,138 @@ fn pages_domain_create_binds_exact_readback_and_reviewed_delete_compensation() {
     assert!(create.verification_contract_supported());
     assert!(create.rollback_contract_supported());
     assert!(create.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn worker_domain_attach_is_exact_identity_bound_and_separately_reversible() {
+    let snapshot = normalize_openapi(&worker_domain_fixture()).expect("Worker domain catalog");
+    let attach = snapshot
+        .get("workers.domains.update")
+        .expect("Worker domain attach");
+
+    assert_eq!(attach.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(attach.method, "PUT");
+    assert_eq!(attach.path, "/accounts/{account_id}/workers/domains");
+    assert_eq!(attach.permissions, ["Workers Scripts Write"]);
+    assert_eq!(attach.risk, RiskClass::CrossConfig);
+    assert_eq!(attach.effect, EffectClass::ReversibleWrite);
+    assert_eq!(attach.entitlement.available, Some(true));
+    assert!(attach.entitlement.plans.is_empty());
+    assert_eq!(
+        attach.entitlement.source.as_deref(),
+        Some("https://developers.cloudflare.com/workers/configuration/routing/custom-domains/")
+    );
+    assert_eq!(attach.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(attach.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(attach.cost.maximum, Some(0.0));
+    assert!(attach.cost.basis.as_deref().is_some_and(|basis| {
+        basis.contains("no direct attachment charge")
+            && basis.contains("request and CPU usage exposure")
+    }));
+
+    let schema = attach
+        .request_schema
+        .as_ref()
+        .expect("closed Worker domain request");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["required"],
+        json!(["hostname", "service", "zone_id"])
+    );
+    assert!(schema["properties"].get("zone_name").is_none());
+    assert_eq!(schema["properties"]["zone_id"]["minLength"], 32);
+    assert_eq!(schema["properties"]["zone_id"]["maxLength"], 32);
+
+    assert_eq!(
+        attach.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    let target = attach
+        .created_resource
+        .as_ref()
+        .expect("created Worker domain contract");
+    assert_eq!(
+        target.detail_path,
+        "/accounts/{account_id}/workers/domains/{domain_id}"
+    );
+    assert_eq!(target.identity_selector, "domain_id");
+    assert_eq!(target.response_result_identity_pointer, "/id");
+    assert_eq!(target.read_capability_id, "workers.domains.get");
+    assert_eq!(target.delete_capability_id, "workers.domains.delete");
+    assert_eq!(
+        target.verified_response_fields,
+        ["hostname", "service", "zone_id"]
+    );
+    assert_eq!(
+        attach.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    assert!(attach.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("separate exact-domain detach plan")
+            && warning.contains("Advanced Certificate")
+    }));
+    assert!(attach.verification_contract_supported());
+    assert!(attach.rollback_contract_supported());
+    assert!(attach.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn worker_domain_attach_fails_closed_on_every_lifecycle_contract_drift() {
+    let assert_blocked = |document: Value, dimension: &str| {
+        let snapshot = normalize_openapi(&document).expect("drifted Worker domain catalog");
+        let attach = snapshot
+            .get("workers.domains.update")
+            .expect("blocked Worker domain attach");
+        assert_eq!(attach.adapter_status, AdapterStatus::Blocked, "{dimension}");
+        assert!(attach.created_resource.is_none(), "{dimension}");
+        assert!(
+            attach
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("contract drifted")),
+            "{dimension}"
+        );
+    };
+
+    let mut method = worker_domain_fixture();
+    let operation = method["paths"]["/accounts/{account_id}/workers/domains"]
+        .as_object_mut()
+        .expect("collection path")
+        .remove("put")
+        .expect("attach operation");
+    method["paths"]["/accounts/{account_id}/workers/domains"]["post"] = operation;
+    assert_blocked(method, "method");
+
+    let mut permission = worker_domain_fixture();
+    permission["paths"]["/accounts/{account_id}/workers/domains"]["put"]["x-api-token-group"] =
+        json!(["Workers Scripts Read"]);
+    assert_blocked(permission, "permission");
+
+    let mut request = worker_domain_fixture();
+    request["paths"]["/accounts/{account_id}/workers/domains"]["put"]["requestBody"]
+        ["content"]["application/json"]["schema"]["allOf"][0]["properties"]
+        .as_object_mut()
+        .expect("request properties")
+        .remove("zone_id");
+    assert_blocked(request, "request schema");
+
+    let mut identity = worker_domain_fixture();
+    identity["paths"]["/accounts/{account_id}/workers/domains"]["put"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("attach response properties")
+        .remove("id");
+    assert_blocked(identity, "identity pointer");
+
+    let mut readback = worker_domain_fixture();
+    readback["paths"]["/accounts/{account_id}/workers/domains/{domain_id}"]["get"]["operationId"] =
+        json!("workers.domains.get-drifted");
+    assert_blocked(readback, "readback");
+
+    let mut detach = worker_domain_fixture();
+    detach["paths"]["/accounts/{account_id}/workers/domains/{domain_id}"]["delete"]["x-api-token-group"] =
+        json!(["Workers Scripts Read"]);
+    assert_blocked(detach, "detach");
 }
 
 #[test]

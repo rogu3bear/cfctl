@@ -658,6 +658,21 @@ compensation path is a new, independently reviewed delete plan. A created
 domain resource is not proof that DNS and TLS have converged, so release proof
 must still include live hostname readback.
 
+Worker custom-domain attachment is the distinct `workers.domains.update`
+dynamic API capability. cfctl narrows Cloudflare's request alternatives to one
+exact `hostname`, Worker `service`, and 32-character `zone_id`; it does not
+infer `www`, accept `zone_name` substitution, or displace an existing CNAME.
+The target must already be an active Cloudflare zone and the named Worker must
+already exist; those live prerequisites are read and pinned before planning.
+The apply response must return a domain ID, and verification reads that exact
+ID back and matches all three planned fields. Detachment is never automatic:
+compensation is a separately reviewed and explicitly approved
+`workers.domains.delete` plan. The attach operation has no direct charge, but
+traffic routed through the Worker retains plan-specific request and CPU usage
+exposure. A successful resource readback still does not prove certificate,
+DNS, route, or application-content convergence; those remain release readback
+gates.
+
 Mint an account token only through the dedicated key workflow. The generic
 `account-api-tokens-update-token` and `user-api-tokens-update-token`
 capabilities stay blocked by design, not by a schema gap: their request

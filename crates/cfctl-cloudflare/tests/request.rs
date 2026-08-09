@@ -6503,6 +6503,117 @@ async fn created_resource_is_read_back_by_hash_bound_identity_and_planned_fields
     assert!(!request.contains("\"name\":\"created\""));
 }
 
+fn worker_domain_attach_plan() -> PlanV1 {
+    let body = json!({
+        "hostname": "cfctl.com",
+        "service": "cfctl-site",
+        "zone_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    });
+    let mut plan = dns_record_plan(
+        "workers.domains.update",
+        "PUT",
+        "/accounts/{account_id}/workers/domains",
+        "created_resource_contains_planned_fields_by_returned_id",
+        json!({"account_id":"account-1"}),
+        Some(body),
+    );
+    "Domains".clone_into(&mut plan.capability.product);
+    "account".clone_into(&mut plan.capability.account_scope);
+    plan.capability.permissions = vec!["Workers Scripts Write".to_owned()];
+    plan.capability.selectors = vec![SelectorV1 {
+        name: "account_id".to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }];
+    plan.capability.request_schema = Some(json!({
+        "type": "object",
+        "additionalProperties": false,
+        "x-cfctl-body-required": true,
+        "required": ["hostname", "service", "zone_id"],
+        "properties": {
+            "hostname": {"type": "string", "minLength": 1, "maxLength": 253},
+            "service": {"type": "string", "minLength": 1},
+            "zone_id": {"type": "string", "minLength": 32, "maxLength": 32}
+        }
+    }));
+    plan.capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/workers/domains/{domain_id}".to_owned(),
+        identity_selector: "domain_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: "workers.domains.get".to_owned(),
+        delete_capability_id: "workers.domains.delete".to_owned(),
+        verified_response_fields: vec![
+            "hostname".to_owned(),
+            "service".to_owned(),
+            "zone_id".to_owned(),
+        ],
+    });
+    plan.capability.rollback.supported = true;
+    plan.capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    plan.capability.rollback.warning = Some("separate reviewed detach plan".to_owned());
+    plan
+}
+
+#[tokio::test]
+async fn worker_domain_put_is_built_exactly_and_verified_by_returned_domain_id() {
+    let plan = worker_domain_attach_plan();
+    assert!(plan.capability.verification_contract_supported());
+    assert!(plan.capability.rollback_contract_supported());
+    let input: CallInput = serde_json::from_value(plan.input.clone()).expect("plan input");
+    let prepared = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("request builder")
+        .build_unchecked(&plan.capability, &input)
+        .expect("Worker domain attach request");
+    assert_eq!(prepared.method, "PUT");
+    assert_eq!(
+        prepared.url.as_str(),
+        "https://api.cloudflare.com/client/v4/accounts/account-1/workers/domains"
+    );
+    assert_eq!(
+        prepared.body,
+        Some(json!({
+            "hostname": "cfctl.com",
+            "service": "cfctl-site",
+            "zone_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }))
+    );
+
+    let body = r#"{"success":true,"result":{"id":"domain-1","hostname":"cfctl.com","service":"cfctl-site","zone_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"errors":[]}"#;
+    let (address, server) = json_response_sequence_server(vec![body]).await;
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({"id":"domain-1"}),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let verification = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .verify_plan(
+        &plan,
+        &apply,
+        &AuthCredential::Bearer {
+            token: "governing-token".to_owned(),
+        },
+    )
+    .await
+    .expect("Worker domain verification");
+
+    assert!(verification.passed, "{}", verification.basis);
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("GET /client/v4/accounts/account-1/workers/domains/domain-1 "));
+    assert!(!requests[0].contains("cfctl.com"));
+}
+
 fn access_application_create_plan(body: serde_json::Value) -> PlanV1 {
     let mut plan = dns_record_plan(
         "access-applications-add-an-application",
