@@ -2364,6 +2364,38 @@ fn web_analytics_site_tag_is_an_explicit_non_secret_identity_mapping() {
 }
 
 #[test]
+fn oauth_client_id_is_an_explicit_non_secret_identity_mapping() {
+    let mut capability = CapabilityV1::new(
+        "oauth-clients-create",
+        "Create OAuth Client",
+        "POST",
+        "/accounts/{account_id}/oauth_clients",
+    );
+    capability.verification.strategy =
+        "created_resource_contains_planned_fields_by_returned_id".to_owned();
+    capability.request_schema = Some(json!({
+        "type":"object",
+        "properties":{"client_name":{"type":"string"}}
+    }));
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/oauth_clients/{oauth_client_id}".to_owned(),
+        identity_selector: "oauth_client_id".to_owned(),
+        response_result_identity_pointer: "/client_id".to_owned(),
+        read_capability_id: "oauth-clients-get".to_owned(),
+        delete_capability_id: "oauth-clients-delete".to_owned(),
+        verified_response_fields: vec!["client_name".to_owned()],
+    });
+    assert!(capability.verification_contract_supported());
+
+    capability
+        .created_resource
+        .as_mut()
+        .expect("OAuth create contract")
+        .response_result_identity_pointer = "/client_secret".to_owned();
+    assert!(!capability.verification_contract_supported());
+}
+
+#[test]
 fn pointer_names_secret_field_flags_only_secret_leaves() {
     for secret in cfctl_core::SECRET_FIELD_NAMES {
         assert!(

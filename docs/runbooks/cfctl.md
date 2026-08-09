@@ -587,7 +587,10 @@ Consumed and completed plans are history, not authority, and cannot be
 cancelled.
 
 Secret outputs require `--value-out /new/secure/path`; cfctl refuses an
-existing destination.
+existing destination. OAuth client creation is stricter: the destination must
+be absolute, its parent must already exist with mode `0700`, and no ancestor
+may be a Git repository. The output file, when Cloudflare actually returns a
+secret, is created with mode `0600`.
 
 For `wrangler.deploy`, pass an absolute `config` selector. An optional `var`
 selector binds one plain-text `KEY:VALUE` Worker variable into the plan and
@@ -851,6 +854,57 @@ printf '%s' '{"invalidate_immediately":false}' | \
     --selector account_id=<account-id> --selector sitekey=<sitekey> \
     --body-stdin --value-out /new/secure/path --json
 ```
+
+Create an OAuth client only after preparing a dedicated operator-secret
+directory outside every repository. Creation is an identity/ownership change,
+so `call` creates an approval-gated plan and does not create the client:
+
+```bash
+install -d -m 700 /absolute/operator-secrets
+printf '%s' '{
+  "client_name":"example client",
+  "grant_types":["authorization_code","refresh_token"],
+  "redirect_uris":["https://example.com/oauth/callback"],
+  "response_types":["code"],
+  "scopes":["<exact-live-scope-id>"],
+  "token_endpoint_auth_method":"none"
+}' | cfctl call oauth-clients-create \
+  --selector account_id=<account-id> --body-stdin \
+  --value-out /absolute/operator-secrets/oauth-client.json --json
+```
+
+The plan binds the exact request, all-plan entitlement, zero direct creation
+cost, and a returned `/client_id` identity. After execution, cfctl reads that
+exact client through `oauth-clients-get` and compares every planned non-secret
+field. It never automatically deletes a failed client; deletion is a separate
+destructive plan. Cloudflare may return `client_secret` only once. If one is
+returned, cfctl writes only `{client_id,client_secret}` to the new mode-0600
+JSON sink and removes the secret from output, journal, plan, and evidence. For
+`token_endpoint_auth_method=none`, an omitted optional secret records
+`secret_returned:false` and leaves the fresh sink path absent. For
+secret-authenticated methods, an omitted secret requires rectification.
+
+OAuth metadata updates first read and hash-bind the exact current client, then
+re-read it immediately before execution. Restore metadata only with another
+snapshot-bound update. Public promotion is a distinct, permanent one-field
+change and cannot be combined with metadata edits:
+
+```bash
+printf '%s' '{"client_name":"updated example client"}' | \
+  cfctl call oauth-clients-update \
+    --selector account_id=<account-id> \
+    --selector oauth_client_id=<oauth-client-id> --body-stdin --json
+
+printf '%s' '{"visibility":"public"}' | \
+  cfctl call oauth-clients-update \
+    --selector account_id=<account-id> \
+    --selector oauth_client_id=<oauth-client-id> --body-stdin --json
+```
+
+The second plan is eligible only from a live `private` snapshot. Cloudflare
+does not support demotion, so its review must treat public promotion as
+irreversible and verify that every other field and the client ID remain
+unchanged.
 
 Rotate an OAuth client secret as a staged two-secret cutover. Planning and
 execution both require the exact client to report that no overlap secret exists;

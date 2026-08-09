@@ -6503,6 +6503,151 @@ async fn created_resource_is_read_back_by_hash_bound_identity_and_planned_fields
     assert!(!request.contains("\"name\":\"created\""));
 }
 
+fn oauth_client_create_plan() -> PlanV1 {
+    let body = json!({
+        "client_name":"cfctl",
+        "grant_types":["authorization_code","refresh_token"],
+        "redirect_uris":["https://cfctl.com/oauth/callback"],
+        "response_types":["code"],
+        "scopes":["account:read"],
+        "token_endpoint_auth_method":"none"
+    });
+    let mut plan = dns_record_plan(
+        "oauth-clients-create",
+        "POST",
+        "/accounts/{account_id}/oauth_clients",
+        "created_resource_contains_planned_fields_by_returned_id",
+        json!({"account_id":"account-1"}),
+        Some(body),
+    );
+    "OAuth Clients".clone_into(&mut plan.capability.product);
+    "account".clone_into(&mut plan.capability.account_scope);
+    plan.capability.permissions = vec!["OAuth Client Write".to_owned()];
+    plan.capability.selectors = vec![SelectorV1 {
+        name: "account_id".to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: None,
+        contract: None,
+    }];
+    plan.capability.request_schema = Some(json!({
+        "type":"object",
+        "additionalProperties":false,
+        "x-cfctl-body-required":true,
+        "required":[
+            "client_name",
+            "grant_types",
+            "redirect_uris",
+            "response_types",
+            "scopes",
+            "token_endpoint_auth_method"
+        ],
+        "properties":{
+            "allowed_cors_origins":{"type":"array","items":{"type":"string"}},
+            "client_name":{"type":"string"},
+            "client_uri":{"type":"string"},
+            "grant_types":{"type":"array","items":{"type":"string"}},
+            "logo_uri":{"type":"string"},
+            "policy_uri":{"type":"string"},
+            "post_logout_redirect_uris":{"type":"array","items":{"type":"string"}},
+            "redirect_uris":{"type":"array","items":{"type":"string"}},
+            "response_types":{"type":"array","items":{"type":"string"}},
+            "scopes":{"type":"array","items":{"type":"string"}},
+            "token_endpoint_auth_method":{"type":"string","enum":["none","client_secret_basic","client_secret_post"]},
+            "tos_uri":{"type":"string"}
+        }
+    }));
+    plan.capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: "/accounts/{account_id}/oauth_clients/{oauth_client_id}".to_owned(),
+        identity_selector: "oauth_client_id".to_owned(),
+        response_result_identity_pointer: "/client_id".to_owned(),
+        read_capability_id: "oauth-clients-get".to_owned(),
+        delete_capability_id: "oauth-clients-delete".to_owned(),
+        verified_response_fields: vec![
+            "allowed_cors_origins".to_owned(),
+            "client_name".to_owned(),
+            "client_uri".to_owned(),
+            "grant_types".to_owned(),
+            "logo_uri".to_owned(),
+            "policy_uri".to_owned(),
+            "post_logout_redirect_uris".to_owned(),
+            "redirect_uris".to_owned(),
+            "response_types".to_owned(),
+            "scopes".to_owned(),
+            "token_endpoint_auth_method".to_owned(),
+            "tos_uri".to_owned(),
+        ],
+    });
+    plan.capability.rollback.supported = false;
+    plan.capability.rollback.strategy = None;
+    plan.capability.rollback.warning =
+        Some("deletion requires a separately reviewed destructive plan".to_owned());
+    plan
+}
+
+#[tokio::test]
+async fn oauth_client_create_uses_returned_client_id_for_exact_non_secret_readback() {
+    let plan = oauth_client_create_plan();
+    assert!(plan.capability.verification_contract_supported());
+    let input: CallInput = serde_json::from_value(plan.input.clone()).expect("plan input");
+    let prepared = RequestBuilder::new("https://api.cloudflare.com/client/v4")
+        .expect("request builder")
+        .build_unchecked(&plan.capability, &input)
+        .expect("OAuth client create request");
+    assert_eq!(prepared.method, "POST");
+    assert_eq!(
+        prepared.url.as_str(),
+        "https://api.cloudflare.com/client/v4/accounts/account-1/oauth_clients"
+    );
+    assert_eq!(prepared.body, input.body);
+    assert!(
+        !prepared
+            .body
+            .expect("request body")
+            .to_string()
+            .contains("secret")
+    );
+
+    let body = r#"{"success":true,"result":{"client_id":"oauth-client-1","client_name":"cfctl","grant_types":["authorization_code","refresh_token"],"redirect_uris":["https://cfctl.com/oauth/callback"],"response_types":["code"],"scopes":["account:read"],"token_endpoint_auth_method":"none","visibility":"private"},"errors":[]}"#;
+    let (address, server) = json_response_sequence_server(vec![body]).await;
+    let apply = CloudflareResponseV1 {
+        status: 200,
+        success: true,
+        result: json!({
+            "client_id":"oauth-client-1",
+            "client_secret":"one-time-response-only"
+        }),
+        errors: Vec::new(),
+        result_info: None,
+        etag: None,
+        cf_ray: None,
+    };
+    let verification = Executor::new(
+        reqwest::Client::new(),
+        &format!("http://{address}/client/v4"),
+    )
+    .expect("executor")
+    .verify_plan(
+        &plan,
+        &apply,
+        &AuthCredential::Bearer {
+            token: "governing-token".to_owned(),
+        },
+    )
+    .await
+    .expect("OAuth client verification");
+
+    assert!(verification.passed, "{}", verification.basis);
+    assert!(!verification.basis.contains("one-time-response-only"));
+    let requests = server.await.expect("server joins");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].starts_with("GET /client/v4/accounts/account-1/oauth_clients/oauth-client-1 ")
+    );
+    assert!(!requests[0].contains("one-time-response-only"));
+}
+
 fn worker_domain_attach_plan() -> PlanV1 {
     let body = json!({
         "hostname": "cfctl.com",

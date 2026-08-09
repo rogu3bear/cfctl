@@ -9572,9 +9572,9 @@ fn resource_identity_value(value: &Value) -> Option<Value> {
 // Kept in sync with `cfctl_core::response_identity_pointer_supported` — the
 // classifier gate (core) and the executor verify gate (here) must accept the
 // same identity pointers, or a capability the catalog marks `dynamic_api` fails
-// closed at verify time. The `database_id`->`/uuid` branch mirrors core so D1
-// database creates (identity `database_id`, pointer `/uuid`) verify instead of
-// falsely landing in RectificationRequired after a successful create.
+// closed at verify time. The explicit D1, Pages, and OAuth mappings mirror core
+// so their provider-native identities verify instead of falsely landing in
+// RectificationRequired after a successful create.
 fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
     // Fail closed: an identity pointer that names a secret field is never
     // supported (mirrors the core gate), so no verifier dereferences secret
@@ -9586,6 +9586,7 @@ fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
         || (selector.ends_with("_name") && pointer == "/name")
         || (selector == "database_id" && pointer == "/uuid")
         || (selector == "site_id" && pointer == "/site_tag")
+        || (selector == "oauth_client_id" && pointer == "/client_id")
         || (!selector
             .chars()
             .any(|character| matches!(character, '/' | '~'))
@@ -9597,12 +9598,16 @@ mod identity_pointer_parity_tests {
     use super::response_identity_pointer_supported;
 
     #[test]
-    fn executor_gate_matches_core_including_database_id_uuid() {
+    fn executor_gate_matches_core_for_provider_native_non_secret_identities() {
         // Regression: the D1 create contract (identity `database_id`, pointer
         // `/uuid`) is classified `dynamic_api` by the core gate, so the executor
         // gate must accept it too — otherwise a successful create verifies
         // false and lands in RectificationRequired.
         assert!(response_identity_pointer_supported("database_id", "/uuid"));
+        assert!(response_identity_pointer_supported(
+            "oauth_client_id",
+            "/client_id"
+        ));
         // Standard identities still hold.
         assert!(response_identity_pointer_supported("id", "/id"));
         assert!(response_identity_pointer_supported("widget_name", "/name"));
@@ -9612,6 +9617,10 @@ mod identity_pointer_parity_tests {
         assert!(!response_identity_pointer_supported(
             "secretAccessKey",
             "/secretAccessKey"
+        ));
+        assert!(!response_identity_pointer_supported(
+            "oauth_client_id",
+            "/client_secret"
         ));
         // A pointer that does not match its selector is rejected.
         assert!(!response_identity_pointer_supported("database_id", "/name"));

@@ -3317,6 +3317,7 @@ fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
         || (selector.ends_with("_name") && pointer == "/name")
         || (selector == "database_id" && pointer == "/uuid")
         || (selector == "site_id" && pointer == "/site_tag")
+        || (selector == "oauth_client_id" && pointer == "/client_id")
         || (!selector
             .chars()
             .any(|character| matches!(character, '/' | '~'))

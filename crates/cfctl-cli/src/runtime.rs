@@ -7218,8 +7218,27 @@ const ACCESS_POLICY_READ_CAPABILITY_ID: &str = "access-policies-get-an-access-po
 const ACCESS_POLICY_DETAIL_PATH: &str =
     "/accounts/{account_id}/access/apps/{app_id}/policies/{policy_id}";
 const OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID: &str = "oauth-clients-get";
+const OAUTH_CLIENT_CREATE_CAPABILITY_ID: &str = "oauth-clients-create";
+const OAUTH_CLIENT_UPDATE_CAPABILITY_ID: &str = "oauth-clients-update";
+const OAUTH_CLIENT_COLLECTION_PATH: &str = "/accounts/{account_id}/oauth_clients";
 const OAUTH_CLIENT_DETAIL_PATH: &str = "/accounts/{account_id}/oauth_clients/{oauth_client_id}";
 const OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION: &str = "oauth_client_key_overlap";
+const OAUTH_CLIENT_UPDATE_STATE_PRECONDITION: &str = "oauth_client_update_state";
+const OAUTH_CLIENT_MUTABLE_FIELDS: [&str; 13] = [
+    "allowed_cors_origins",
+    "client_name",
+    "client_uri",
+    "grant_types",
+    "logo_uri",
+    "policy_uri",
+    "post_logout_redirect_uris",
+    "redirect_uris",
+    "response_types",
+    "scopes",
+    "token_endpoint_auth_method",
+    "tos_uri",
+    "visibility",
+];
 const ZONE_DETAILS_CAPABILITY_ID: &str = "zones-0-get";
 const ZONE_SUBSCRIPTION_CAPABILITY_ID: &str = "zone-subscription-zone-subscription-details";
 
@@ -8512,6 +8531,309 @@ fn oauth_client_detail_read_contract_supported(capability: &CapabilityV1) -> boo
                 ) && contract.success_statuses == ["200"]
                     && contract.success_media_types == ["application/json"]
             })
+}
+
+fn oauth_client_all_plan_entitlement_supported(capability: &CapabilityV1) -> bool {
+    capability.entitlement.available == Some(true)
+        && capability.entitlement.plans
+            == BTreeMap::from([
+                ("business".to_owned(), true),
+                ("enterprise".to_owned(), true),
+                ("free".to_owned(), true),
+                ("pro".to_owned(), true),
+            ])
+}
+
+fn oauth_client_success_response_contract_supported(capability: &CapabilityV1) -> bool {
+    capability
+        .response_contract
+        .as_ref()
+        .is_some_and(|contract| {
+            matches!(
+                contract.body_mode,
+                cfctl_core::ResponseBodyModeV1::CloudflareJsonEnvelope
+            ) && contract.success_statuses == ["200"]
+                && contract.success_media_types == ["application/json"]
+        })
+}
+
+fn is_oauth_client_create_operation_identity(capability: &CapabilityV1) -> bool {
+    capability.id == OAUTH_CLIENT_CREATE_CAPABILITY_ID
+        && capability.method == "POST"
+        && capability.path == OAUTH_CLIENT_COLLECTION_PATH
+        && capability.product == "OAuth Clients"
+        && capability.account_scope == "account"
+        && capability.permissions == ["OAuth Client Write"]
+}
+
+fn is_oauth_client_create_capability(capability: &CapabilityV1) -> bool {
+    is_oauth_client_create_operation_identity(capability)
+        && capability.risk == RiskClass::IdentityOrOwnership
+        && capability.effect == EffectClass::IdentityOrOwnership
+        && capability.cost.known
+        && !capability.cost.incremental
+        && oauth_client_all_plan_entitlement_supported(capability)
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && oauth_client_success_response_contract_supported(capability)
+        && capability.selectors.len() == 1
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "account_id"
+                && selector.location == "path"
+                && selector.required
+                && selector.value_type == "string"
+        })
+        && capability.request_object_fields()
+            == Some(
+                OAUTH_CLIENT_MUTABLE_FIELDS[..12]
+                    .iter()
+                    .map(|field| (*field).to_owned())
+                    .collect(),
+            )
+        && capability.request_schema.as_ref().is_some_and(|schema| {
+            schema.get("type").and_then(Value::as_str) == Some("object")
+                && schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
+                && schema.get("x-cfctl-body-required").and_then(Value::as_bool) == Some(true)
+        })
+        && capability.verification.strategy
+            == "created_resource_contains_planned_fields_by_returned_id"
+        && capability.verification_contract_supported()
+        && capability.created_resource.as_ref().is_some_and(|created| {
+            created.detail_path == OAUTH_CLIENT_DETAIL_PATH
+                && created.identity_selector == "oauth_client_id"
+                && created.response_result_identity_pointer == "/client_id"
+                && created.read_capability_id == OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID
+                && created.delete_capability_id == "oauth-clients-delete"
+                && created.verified_response_fields
+                    == OAUTH_CLIENT_MUTABLE_FIELDS[..12]
+                        .iter()
+                        .map(|field| (*field).to_owned())
+                        .collect::<Vec<_>>()
+        })
+        && !capability.rollback.supported
+        && capability.rollback.strategy.is_none()
+}
+
+fn is_oauth_client_update_capability(capability: &CapabilityV1) -> bool {
+    capability.id == OAUTH_CLIENT_UPDATE_CAPABILITY_ID
+        && capability.method == "PATCH"
+        && capability.path == OAUTH_CLIENT_DETAIL_PATH
+        && capability.product == "OAuth Clients"
+        && capability.account_scope == "account"
+        && capability.permissions == ["OAuth Client Write"]
+        && capability.risk == RiskClass::IdentityOrOwnership
+        && capability.effect == EffectClass::IdentityOrOwnership
+        && capability.cost.known
+        && !capability.cost.incremental
+        && oauth_client_all_plan_entitlement_supported(capability)
+        && matches!(
+            capability.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+        && oauth_client_success_response_contract_supported(capability)
+        && capability.selectors.len() == 2
+        && ["account_id", "oauth_client_id"].iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+        && capability.request_object_fields()
+            == Some(
+                OAUTH_CLIENT_MUTABLE_FIELDS
+                    .iter()
+                    .map(|field| (*field).to_owned())
+                    .collect(),
+            )
+        && capability.request_schema.as_ref().is_some_and(|schema| {
+            schema.get("type").and_then(Value::as_str) == Some("object")
+                && schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
+                && schema.get("minProperties").and_then(Value::as_u64) == Some(1)
+                && schema.get("x-cfctl-body-required").and_then(Value::as_bool) == Some(true)
+                && schema.pointer("/properties/visibility/enum") == Some(&json!(["public"]))
+        })
+        && capability.verification.strategy == "same_resource_contains_planned_fields_after_update"
+        && capability.verification_contract_supported()
+        && capability.same_path_read.as_ref().is_some_and(|read| {
+            read.path == OAUTH_CLIENT_DETAIL_PATH
+                && read.read_capability_id == OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID
+                && read.verified_response_fields
+                    == OAUTH_CLIENT_MUTABLE_FIELDS
+                        .iter()
+                        .map(|field| (*field).to_owned())
+                        .collect::<Vec<_>>()
+        })
+        && !capability.rollback.supported
+        && capability.rollback.strategy.is_none()
+        && capability
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("permanent"))
+}
+
+fn should_bind_oauth_client_update_state(capability: &CapabilityV1) -> bool {
+    is_oauth_client_update_capability(capability) && capability.mutating
+}
+
+fn apply_oauth_client_update_state_response(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    response: &CloudflareResponseV1,
+) -> Result<Value> {
+    if !should_bind_oauth_client_update_state(capability) {
+        return Err(CliError::Input(
+            "OAuth client update drifted from its governed snapshot contract".to_owned(),
+        ));
+    }
+    if !response.success || response.status != 200 {
+        return Err(CliError::Input(format!(
+            "OAuth client snapshot read did not return the exact successful HTTP 200 contract (received {}); the mutation boundary was not crossed",
+            response.status
+        )));
+    }
+    let oauth_client_id = input
+        .selectors
+        .get("oauth_client_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth client update requires an exact oauth_client_id selector".to_owned(),
+            )
+        })?;
+    if response.result.get("client_id").and_then(Value::as_str) != Some(oauth_client_id) {
+        return Err(CliError::Input(
+            "OAuth client snapshot read returned a different or missing client id; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    if redact_json(&response.result) != response.result {
+        return Err(CliError::Input(
+            "OAuth client snapshot unexpectedly contained secret-bearing fields; no plan or evidence was created"
+                .to_owned(),
+        ));
+    }
+    let visibility = response
+        .result
+        .get("visibility")
+        .and_then(Value::as_str)
+        .filter(|visibility| matches!(*visibility, "private" | "public"))
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth client snapshot omitted its exact private/public visibility state"
+                    .to_owned(),
+            )
+        })?;
+    let planned = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|body| !body.is_empty())
+        .ok_or_else(|| CliError::Input("OAuth client update body is empty".to_owned()))?;
+    if planned.contains_key("visibility")
+        && (planned.len() != 1
+            || planned.get("visibility").and_then(Value::as_str) != Some("public")
+            || visibility != "private")
+    {
+        return Err(CliError::Input(
+            "public OAuth visibility is an irreversible one-field promotion from a private client and cannot be combined with metadata changes"
+                .to_owned(),
+        ));
+    }
+    if planned
+        .iter()
+        .all(|(field, value)| response.result.get(field) == Some(value))
+    {
+        return Err(CliError::Input(
+            "OAuth client already has every requested field; no mutation plan was created"
+                .to_owned(),
+        ));
+    }
+
+    let mut prior_state = serde_json::Map::new();
+    let mut absent_fields = Vec::new();
+    for field in OAUTH_CLIENT_MUTABLE_FIELDS {
+        if let Some(value) = response.result.get(field) {
+            prior_state.insert(field.to_owned(), value.clone());
+        } else {
+            absent_fields.push(field);
+        }
+    }
+    Ok(json!({
+        "schema_version":1,
+        "source_capability_id":OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID,
+        "source_path":OAUTH_CLIENT_DETAIL_PATH,
+        "target_capability_id":capability.id,
+        "target_method":capability.method,
+        "target_path":capability.path,
+        "target_scope":"account",
+        "account_id":account_id,
+        "oauth_client_id":oauth_client_id,
+        "observed_result_hash":hash_value(&response.result)?,
+        "prior_state":prior_state,
+        "absent_fields":absent_fields,
+    }))
+}
+
+async fn read_live_oauth_client_update_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !should_bind_oauth_client_update_state(capability) {
+        return Err(CliError::Input(
+            "OAuth client update drifted from its governed prior-state contract".to_owned(),
+        ));
+    }
+    let selected_account = input
+        .selectors
+        .get("account_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth client snapshot requires string selector `account_id`".to_owned(),
+            )
+        })?;
+    if selected_account != account_id {
+        return Err(CliError::Input(
+            "OAuth client target account differs from the selected account; the mutation boundary was not crossed"
+                .to_owned(),
+        ));
+    }
+    let source = catalog
+        .get(OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID))?;
+    if !oauth_client_detail_read_contract_supported(source) {
+        return Err(CliError::Input(
+            "OAuth client detail source drifted from the governed exact-client read".to_owned(),
+        ));
+    }
+    let response = Executor::new(http_client()?, API_BASE_URL)?
+        .execute_read(
+            source,
+            &CallInput {
+                selectors: input.selectors.clone(),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt =
+        apply_oauth_client_update_state_response(capability, input, account_id, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
 }
 
 fn apply_oauth_client_secret_state_response(
@@ -11447,6 +11769,25 @@ async fn prepare_oauth_client_secret_state_precondition(
         .map(Some)
 }
 
+async fn prepare_oauth_client_update_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if !should_bind_oauth_client_update_state(capability) {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input("OAuth client snapshot credential was not resolved".to_owned())
+    })?;
+    read_live_oauth_client_update_state(store, catalog, capability, input, account_id, credential)
+        .await
+        .map(Some)
+}
+
 async fn prepare_same_path_prior_state_precondition(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -11580,6 +11921,10 @@ async fn prepare_live_plan_preconditions(
             store, catalog, capability, input, account_id, credential,
         )
         .await?,
+        oauth_client_update_state: prepare_oauth_client_update_state_precondition(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await?,
     })
 }
 
@@ -11604,6 +11949,7 @@ struct LivePlanPreconditions {
     same_path_prior_state: Option<(Value, EvidenceV1)>,
     security_action_state: Option<(Value, EvidenceV1)>,
     oauth_client_secret_state: Option<(Value, EvidenceV1)>,
+    oauth_client_update_state: Option<(Value, EvidenceV1)>,
 }
 
 fn plan_targets(
@@ -11654,6 +12000,9 @@ fn plan_targets(
     }
     if let Some((receipt, _)) = &live_preconditions.oauth_client_secret_state {
         targets["live_preconditions"][OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.oauth_client_update_state {
+        targets["live_preconditions"][OAUTH_CLIENT_UPDATE_STATE_PRECONDITION] = receipt.clone();
     }
     if let Some((receipt, _)) = &live_preconditions.r2_parent_token {
         targets["live_preconditions"][R2_PARENT_TOKEN_PRECONDITION] = receipt.clone();
@@ -11715,6 +12064,10 @@ fn bind_live_plan_preconditions(
         (
             OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION,
             &live_preconditions.oauth_client_secret_state,
+        ),
+        (
+            OAUTH_CLIENT_UPDATE_STATE_PRECONDITION,
+            &live_preconditions.oauth_client_update_state,
         ),
         (
             R2_PARENT_TOKEN_PRECONDITION,
@@ -11830,7 +12183,22 @@ fn planned_cloudflare_diff(
             "key_overlap_active": !observed_before.as_bool().unwrap_or(false)
         });
     }
+    apply_oauth_client_update_plan_diff(&mut diff, input, live_preconditions);
     diff
+}
+
+fn apply_oauth_client_update_plan_diff(
+    diff: &mut Value,
+    input: &CallInput,
+    live_preconditions: &LivePlanPreconditions,
+) {
+    if let Some((receipt, _)) = &live_preconditions.oauth_client_update_state {
+        diff["observed_before"] = receipt.get("prior_state").cloned().unwrap_or(Value::Null);
+        diff["planned_after"] = input.body.clone().unwrap_or(Value::Null);
+        diff["irreversible_visibility_promotion"] = Value::Bool(
+            input.body.as_ref().and_then(|body| body.get("visibility")) == Some(&json!("public")),
+        );
+    }
 }
 
 fn prepare_pages_source_remote_precondition(
@@ -11905,6 +12273,9 @@ fn persist_prepared_plan(
     }
     .clone_into(&mut plan.permission_lane);
     plan.input = serde_json::to_value(&input)?;
+    if is_oauth_client_create_operation_identity(&plan.capability) {
+        preflight_secret_sink(&plan)?;
+    }
     plan.precondition_hashes
         .insert("catalog".to_owned(), catalog.schema_hash.clone());
     plan.precondition_hashes
@@ -12032,6 +12403,8 @@ fn prepend_prepared_plan_evidence(
         live_preconditions.dns_record_state,
         live_preconditions.same_path_prior_state,
         live_preconditions.security_action_state,
+        live_preconditions.oauth_client_secret_state,
+        live_preconditions.oauth_client_update_state,
         live_preconditions.r2_parent_token,
     ]
     .into_iter()
@@ -14082,6 +14455,7 @@ struct LivePreconditionEvidence {
     same_path_prior_state: Option<EvidenceV1>,
     security_action_state: Option<EvidenceV1>,
     oauth_client_secret_state: Option<EvidenceV1>,
+    oauth_client_update_state: Option<EvidenceV1>,
     r2_parent_token: Option<EvidenceV1>,
 }
 
@@ -14157,6 +14531,10 @@ async fn validate_live_plan_precondition_evidence(
         )
         .await?,
         oauth_client_secret_state: validate_live_oauth_client_secret_state_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        oauth_client_update_state: validate_live_oauth_client_update_state_precondition(
             store, catalog, plan, input, credential,
         )
         .await?,
@@ -14241,6 +14619,7 @@ fn prepend_live_precondition_evidence(
         evidence.pages_project_absence,
         evidence.r2_parent_token,
         evidence.oauth_client_secret_state,
+        evidence.oauth_client_update_state,
         evidence.dns_record_state,
         evidence.same_path_prior_state,
         evidence.security_action_state,
@@ -15336,6 +15715,162 @@ async fn validate_live_oauth_client_secret_state_precondition(
     if hash_value(&receipt)? != expected_hash {
         return Err(CliError::Input(
             "live OAuth client two-secret state drifted after planning; the mutation boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
+}
+
+fn validate_oauth_client_update_state_receipt(plan: &PlanV1, receipt: &Value) -> Result<()> {
+    let account_id = plan
+        .targets
+        .pointer("/selectors/account_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth client update omitted its hash-bound account selector; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let oauth_client_id = plan
+        .targets
+        .pointer("/selectors/oauth_client_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth client update omitted its hash-bound client selector; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let prior_state = receipt
+        .get("prior_state")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth client update receipt omitted its projected prior state; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let absent_fields = receipt
+        .get("absent_fields")
+        .and_then(Value::as_array)
+        .and_then(|fields| {
+            fields
+                .iter()
+                .map(|field| field.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth client update receipt omitted its exact absent-field set; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let mut projected_fields = prior_state.keys().cloned().collect::<Vec<_>>();
+    projected_fields.extend(absent_fields.iter().cloned());
+    projected_fields.sort();
+    let expected_fields = OAUTH_CLIENT_MUTABLE_FIELDS
+        .iter()
+        .map(|field| (*field).to_owned())
+        .collect::<Vec<_>>();
+    let exact = receipt.as_object().is_some_and(|object| object.len() == 12)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && receipt.get("source_capability_id").and_then(Value::as_str)
+            == Some(OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID)
+        && receipt.get("source_path").and_then(Value::as_str) == Some(OAUTH_CLIENT_DETAIL_PATH)
+        && receipt.get("target_capability_id").and_then(Value::as_str)
+            == Some(plan.capability.id.as_str())
+        && receipt.get("target_method").and_then(Value::as_str)
+            == Some(plan.capability.method.as_str())
+        && receipt.get("target_path").and_then(Value::as_str)
+            == Some(plan.capability.path.as_str())
+        && receipt.get("target_scope").and_then(Value::as_str) == Some("account")
+        && receipt.get("account_id").and_then(Value::as_str) == Some(account_id)
+        && account_id == plan.account_id
+        && receipt.get("oauth_client_id").and_then(Value::as_str) == Some(oauth_client_id)
+        && receipt
+            .get("observed_result_hash")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| hash.starts_with("sha256:"))
+        && projected_fields == expected_fields
+        && !projected_fields.windows(2).any(|pair| pair[0] == pair[1])
+        && prior_state
+            .get("visibility")
+            .and_then(Value::as_str)
+            .is_some_and(|visibility| matches!(visibility, "private" | "public"))
+        && redact_json(&Value::Object(prior_state.clone())) == Value::Object(prior_state.clone());
+    if !exact {
+        return Err(CliError::Input(
+            "OAuth client update receipt has an invalid account, client, source, hash, visibility, or field projection; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn required_oauth_client_update_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    if !is_oauth_client_update_capability(&plan.capability) {
+        return Ok(None);
+    }
+    if !should_bind_oauth_client_update_state(&plan.capability) {
+        return Err(CliError::Input(
+            "OAuth client update is inconsistent with its hash-bound snapshot contract; create a new plan"
+                .to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(OAUTH_CLIENT_UPDATE_STATE_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the live OAuth client update snapshot contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer("/live_preconditions/oauth_client_update_state")
+        .ok_or_else(|| {
+            CliError::Input(
+                "plan predates the hash-bound OAuth client update state receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    validate_oauth_client_update_state_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "plan OAuth client update receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+async fn validate_live_oauth_client_update_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_oauth_client_update_state_precondition(plan)? else {
+        return Ok(None);
+    };
+    let (receipt, evidence) = read_live_oauth_client_update_state(
+        store,
+        catalog,
+        &plan.capability,
+        input,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live OAuth client state drifted after planning; the mutation boundary was not crossed and a new plan is required"
                 .to_owned(),
         ));
     }
@@ -19697,17 +20232,72 @@ fn boundary_failure_artifact(adapter: &str, outcome: &str) -> Value {
     })
 }
 
-fn secret_sink_artifact(
+fn oauth_client_secret_output_state(
     plan: &PlanV1,
     response_success: bool,
+    response_result: Option<&Value>,
+) -> Result<(bool, Option<bool>)> {
+    if !is_oauth_client_create_operation_identity(&plan.capability) {
+        return Ok((response_success && is_secret_output_plan(plan), None));
+    }
+    if !is_oauth_client_create_capability(&plan.capability) {
+        return Err(CliError::Input(
+            "OAuth client creation drifted from its governed identity, entitlement, verification, or secret-output contract"
+                .to_owned(),
+        ));
+    }
+    if !response_success {
+        return Ok((false, None));
+    }
+    let result = response_result.ok_or_else(|| {
+        CliError::Input(
+            "Cloudflare reported OAuth client creation success without a response result"
+                .to_owned(),
+        )
+    })?;
+    let secret_returned = match result.get("client_secret") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(secret)) if !secret.is_empty() => true,
+        Some(_) => {
+            return Err(CliError::Input(
+                "Cloudflare returned a malformed OAuth client_secret; the operation requires rectification"
+                    .to_owned(),
+            ));
+        }
+    };
+    let auth_method = plan
+        .input
+        .pointer("/body/token_endpoint_auth_method")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "OAuth client creation plan omitted token_endpoint_auth_method".to_owned(),
+            )
+        })?;
+    let output_required = match auth_method {
+        "none" => secret_returned,
+        "client_secret_basic" | "client_secret_post" => true,
+        _ => {
+            return Err(CliError::Input(
+                "OAuth client creation plan contains an unsupported token authentication method"
+                    .to_owned(),
+            ));
+        }
+    };
+    Ok((output_required, Some(secret_returned)))
+}
+
+fn secret_sink_artifact(
+    plan: &PlanV1,
     path: Option<&Path>,
     input_cleanup_required: bool,
     input_cleanup_completed: bool,
+    output_required: bool,
+    secret_returned: Option<bool>,
     failure: Option<&str>,
 ) -> Value {
-    let output_required = response_success && is_secret_output_plan(plan);
     let output_completed = !output_required || path.is_some();
-    json!({
+    let mut artifact = json!({
         "completed": input_cleanup_completed && output_completed && failure.is_none(),
         "failure": failure,
         "input_cleanup": {
@@ -19722,7 +20312,13 @@ fn secret_sink_artifact(
             "unix_mode": cfg!(unix).then_some("0600"),
         },
         "path": path.map(|path| path.display().to_string()),
-    })
+    });
+    if is_oauth_client_create_operation_identity(&plan.capability) {
+        artifact["secret_returned"] = secret_returned.map_or(Value::Null, Value::Bool);
+        artifact["output_sink"]["requested"] = Value::Bool(is_secret_output_plan(plan));
+        artifact["path"] = Value::Null;
+    }
+    artifact
 }
 
 /// Persists the secret-sink outcome and then reconciles token lineage from the
@@ -19786,6 +20382,13 @@ fn persist_secret_lifecycle(
     secrets: &dyn SecretStore,
 ) -> Result<Option<PathBuf>> {
     let input_cleanup_required = plan_secret_body_ref(plan).is_some();
+    let (output_required, secret_returned) = initialize_secret_output_state(
+        store,
+        plan,
+        response_success,
+        response_result,
+        input_cleanup_required,
+    )?;
     let input_cleanup_completed = match delete_plan_secret(plan, secrets) {
         Ok(deleted) => !input_cleanup_required || deleted,
         Err(error) => {
@@ -19796,17 +20399,17 @@ fn persist_secret_lifecycle(
                 TransactionStageV1::SecretSinkPersisted,
                 secret_sink_artifact(
                     plan,
-                    response_success,
                     None,
                     input_cleanup_required,
                     false,
+                    output_required,
+                    secret_returned,
                     Some("input_cleanup_failed"),
                 ),
             )?;
             return Err(error);
         }
     };
-    let output_required = response_success && is_secret_output_plan(plan);
     let sink_path = if output_required {
         let Some(result) = response_result else {
             plan.status = PlanStatus::RectificationRequired;
@@ -19816,10 +20419,11 @@ fn persist_secret_lifecycle(
                 TransactionStageV1::SecretSinkPersisted,
                 secret_sink_artifact(
                     plan,
-                    response_success,
                     None,
                     input_cleanup_required,
                     input_cleanup_completed,
+                    output_required,
+                    secret_returned,
                     Some("output_missing"),
                 ),
             )?;
@@ -19838,10 +20442,11 @@ fn persist_secret_lifecycle(
                     TransactionStageV1::SecretSinkPersisted,
                     secret_sink_artifact(
                         plan,
-                        response_success,
                         None,
                         input_cleanup_required,
                         input_cleanup_completed,
+                        output_required,
+                        secret_returned,
                         Some("output_sink_failed"),
                     ),
                 )?;
@@ -19857,14 +20462,45 @@ fn persist_secret_lifecycle(
         TransactionStageV1::SecretSinkPersisted,
         secret_sink_artifact(
             plan,
-            response_success,
             sink_path.as_deref(),
             input_cleanup_required,
             input_cleanup_completed,
+            output_required,
+            secret_returned,
             None,
         ),
     )?;
     Ok(sink_path)
+}
+
+fn initialize_secret_output_state(
+    store: &StateStore,
+    plan: &mut PlanV1,
+    response_success: bool,
+    response_result: Option<&Value>,
+    input_cleanup_required: bool,
+) -> Result<(bool, Option<bool>)> {
+    match oauth_client_secret_output_state(plan, response_success, response_result) {
+        Ok(state) => Ok(state),
+        Err(error) => {
+            plan.status = PlanStatus::RectificationRequired;
+            persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::SecretSinkPersisted,
+                secret_sink_artifact(
+                    plan,
+                    None,
+                    input_cleanup_required,
+                    !input_cleanup_required,
+                    response_success && is_secret_output_plan(plan),
+                    None,
+                    Some("output_contract_invalid"),
+                ),
+            )?;
+            Err(error)
+        }
+    }
 }
 
 fn verification_response_artifact(outcome: &ApiVerificationOutcome) -> Result<Value> {
@@ -25458,7 +26094,9 @@ fn operation_specific_current_state_command(capability: &CapabilityV1) -> Option
             "--json".to_owned(),
         ]);
     }
-    should_bind_oauth_client_secret_state(capability).then(|| {
+    (should_bind_oauth_client_secret_state(capability)
+        || should_bind_oauth_client_update_state(capability))
+    .then(|| {
         vec![
             "cfctl".to_owned(),
             "call".to_owned(),
@@ -25621,7 +26259,45 @@ fn preflight_secret_sink(plan: &PlanV1) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| CliError::Input("secret sink has no parent directory".to_owned()))?;
-    fs::create_dir_all(parent).map_err(|source| cli_io(parent, source))
+    if !is_oauth_client_create_operation_identity(&plan.capability) {
+        return fs::create_dir_all(parent).map_err(|source| cli_io(parent, source));
+    }
+    if !path.is_absolute() {
+        return Err(CliError::Input(
+            "OAuth client --value-out must be an absolute path under a pre-existing mode-0700 operator-secret directory outside every Git repository"
+                .to_owned(),
+        ));
+    }
+    let canonical_parent = fs::canonicalize(parent).map_err(|source| cli_io(parent, source))?;
+    if canonical_parent
+        .ancestors()
+        .any(|ancestor| ancestor.join(".git").exists())
+    {
+        return Err(CliError::Input(
+            "OAuth client secret output is forbidden inside a Git repository".to_owned(),
+        ));
+    }
+    let metadata =
+        fs::metadata(&canonical_parent).map_err(|source| cli_io(&canonical_parent, source))?;
+    if !metadata.is_dir() {
+        return Err(CliError::Input(
+            "OAuth client secret output parent is not a directory".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(CliError::Input(format!(
+            "OAuth client secret output parent {} must have mode 0700",
+            canonical_parent.display()
+        )));
+    }
+    #[cfg(not(unix))]
+    return Err(CliError::Input(
+        "OAuth client creation requires a platform where cfctl can prove a mode-0700 operator-secret directory"
+            .to_owned(),
+    ));
+    #[cfg(unix)]
+    Ok(())
 }
 
 fn resolved_plan_input(plan: &PlanV1, secrets: &dyn SecretStore) -> Result<CallInput> {
@@ -25743,6 +26419,32 @@ fn secret_sink_payload(capability: &CapabilityV1, result: &Value) -> Result<Vec<
             "client_secret": client_secret,
         }))?);
     }
+    if is_oauth_client_create_operation_identity(capability) {
+        let client_id = result
+            .get("client_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "Cloudflare reported OAuth client creation success without a non-empty client_id; no credential sink was created and the operation requires rectification"
+                        .to_owned(),
+                )
+            })?;
+        let client_secret = result
+            .get("client_secret")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Input(
+                    "Cloudflare omitted the required OAuth client secret; no credential sink was created and the operation requires rectification"
+                        .to_owned(),
+                )
+            })?;
+        return Ok(serde_json::to_vec(&json!({
+            "client_id":client_id,
+            "client_secret":client_secret,
+        }))?);
+    }
 
     let Some(secret) = find_secret_value(result) else {
         return Err(CliError::Input(
@@ -25787,6 +26489,8 @@ fn secret_sink_format(capability: &CapabilityV1) -> Option<&'static str> {
         Some("r2_temporary_credentials_json")
     } else if is_access_service_token_create_capability(capability) {
         Some("access_service_token_json")
+    } else if is_oauth_client_create_operation_identity(capability) {
+        Some("oauth_client_json")
     } else {
         Some("opaque_text")
     }
@@ -25809,12 +26513,14 @@ fn is_secret_output_capability(capability: &CapabilityV1) -> bool {
         && !is_worker_script_secret_input_only_capability(capability))
         || is_access_service_token_create_capability(capability)
         || is_r2_temporary_credentials_operation_identity(capability)
+        || is_oauth_client_create_operation_identity(capability)
 }
 
 fn should_redact_secret_response(capability: &CapabilityV1) -> bool {
     capability.risk == RiskClass::SecretSensitive
         || is_access_service_token_create_capability(capability)
         || is_r2_temporary_credentials_operation_identity(capability)
+        || is_oauth_client_create_operation_identity(capability)
 }
 
 fn is_worker_tail_create_capability(capability: &CapabilityV1) -> bool {
@@ -26173,21 +26879,23 @@ mod tests {
         DNS_RECORD_DETAIL_READ_CAPABILITY_ID, DNS_RECORD_STATE_PRECONDITION,
         ImportPrerequisiteContext, KEYCHAIN_REPAIR_WARNING, LivePlanPreconditions,
         Mln0143PreImportExpectation, Mln0143RestoreAnchorJoin,
-        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, PAGES_PROJECT_ABSENCE_PRECONDITION,
-        PAGES_PROJECT_CREATE_CAPABILITY_ID, PAGES_PROJECT_DETAIL_PATH,
-        PAGES_PROJECT_READ_CAPABILITY_ID, PlanAuthority, SECURITY_IP_RULE_COLLECTION_PATH,
-        SECURITY_IP_RULE_CREATE_ID, SECURITY_IP_RULE_STATE_CAPABILITY_ID,
-        SECURITY_LIST_MEMBER_COLLECTION_PATH, SECURITY_LIST_MEMBER_CREATE_ID,
-        SECURITY_LIST_MEMBER_REMOVE_ID, SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
+        OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION, OAUTH_CLIENT_UPDATE_STATE_PRECONDITION,
+        PAGES_PROJECT_ABSENCE_PRECONDITION, PAGES_PROJECT_CREATE_CAPABILITY_ID,
+        PAGES_PROJECT_DETAIL_PATH, PAGES_PROJECT_READ_CAPABILITY_ID, PlanAuthority,
+        SECURITY_IP_RULE_COLLECTION_PATH, SECURITY_IP_RULE_CREATE_ID,
+        SECURITY_IP_RULE_STATE_CAPABILITY_ID, SECURITY_LIST_MEMBER_COLLECTION_PATH,
+        SECURITY_LIST_MEMBER_CREATE_ID, SECURITY_LIST_MEMBER_REMOVE_ID,
+        SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
         SECURITY_WAF_RULE_STATE_CAPABILITY_ID, TokenPolicyBinding, admit_standing_plan,
         apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
         apply_dns_record_state_response, apply_entitlement_probe_response,
         apply_global_warp_override_state_response, apply_kv_empty_namespace_state_response,
-        apply_oauth_client_secret_state_response, apply_operational_proof_index_result,
-        apply_pages_project_absence_response, apply_r2_parent_token_response,
-        apply_warp_connector_configuration_state_response, apply_web_analytics_rum_state_response,
-        apply_zone_account_response, apply_zone_entitlement_response, approve_plan,
+        apply_oauth_client_secret_state_response, apply_oauth_client_update_state_response,
+        apply_operational_proof_index_result, apply_pages_project_absence_response,
+        apply_r2_parent_token_response, apply_warp_connector_configuration_state_response,
+        apply_web_analytics_rum_state_response, apply_zone_account_response,
+        apply_zone_entitlement_response, approve_plan,
         approved_mln_import_execution_error_envelope, bind_required_empty_compensation_body,
         blocked_capability_envelope, boundary_response_artifact, build_mint_policy_body,
         call_command, cancel_plan, capability_call_argv, compensation_request, configured_origin,
@@ -26207,7 +26915,7 @@ mod tests {
         pages_source_remote_receipt, parse_pages_remote_head, permission_inventory_call,
         permission_inventory_envelope, persist_d1_import_checkpoint, persist_prepared_plan,
         persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage, plan_impact,
-        plan_state_next_step, plan_status_label, preflight_call_input,
+        plan_state_next_step, plan_status_label, preflight_call_input, preflight_secret_sink,
         preflight_standing_authority, prepare_r2_temporary_credentials_input,
         prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
         read_import_secret, read_r2_log_retrieval_credentials, read_secret_file,
@@ -26218,14 +26926,16 @@ mod tests {
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
-        required_oauth_client_secret_state_precondition, required_r2_parent_token_precondition,
+        required_oauth_client_secret_state_precondition,
+        required_oauth_client_update_state_precondition, required_r2_parent_token_precondition,
         required_warp_connector_configuration_state_precondition,
         required_web_analytics_rum_state_precondition, required_zone_account_precondition,
         resolve_kv_empty_namespace_delete_cost, resolve_mint_token_bindings,
-        resolve_mint_token_scope, run_bounded_pages_git_program, secret_sink_format,
-        should_bind_cloudflare_tunnel_configuration_state, should_bind_d1_read_replication_state,
-        should_bind_dns_record_state, should_bind_global_warp_override_state,
-        should_bind_kv_empty_namespace_state, should_bind_oauth_client_secret_state,
+        resolve_mint_token_scope, run_bounded_pages_git_program, secret_sink_artifact,
+        secret_sink_format, should_bind_cloudflare_tunnel_configuration_state,
+        should_bind_d1_read_replication_state, should_bind_dns_record_state,
+        should_bind_global_warp_override_state, should_bind_kv_empty_namespace_state,
+        should_bind_oauth_client_secret_state, should_bind_oauth_client_update_state,
         should_bind_pages_project_absence, should_bind_warp_connector_configuration_state,
         should_bind_web_analytics_rum_state, should_bind_zone_account,
         should_redact_secret_response, should_resolve_entitlement_probe,
@@ -26272,17 +26982,19 @@ mod tests {
         EntitlementProbeV1, EvidenceClass, EvidenceV1, Mln0142GovernedExecutionBindingV1,
         Mln0143GovernedExecutionBindingV1, OperationalProofOutcomeV1, OperationalProofScopeV1,
         OperationalProofV1, OutputFormatV1, PaginationModeV1, PlanPinsV2, PlanStatus, PlanV1,
-        PlanV2, QuerySerializationV1, ResultEnvelopeV2, RiskClass, SECRET_FIELD_NAMES,
-        SamePathReadContractV1, SecurityActionContractV1, SecurityActionKindV1,
-        SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1, StandingAuthorityStatus,
-        StandingAuthorityV1, TransactionStageV1, VerificationState, WorkflowContractV1,
-        WorkflowStepV1, hash_value,
+        PlanV2, QuerySerializationV1, ResponseBodyModeV1, ResponseContractV1, ResultEnvelopeV2,
+        RiskClass, SECRET_FIELD_NAMES, SamePathReadContractV1, SecurityActionContractV1,
+        SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorContractV1, SelectorV1,
+        StandingAuthorityStatus, StandingAuthorityV1, TransactionStageV1, VerificationState,
+        WorkflowContractV1, WorkflowStepV1, hash_value,
     };
     use cfctl_storage::{RuntimePaths, StateStore};
     use chrono::{Duration as ChronoDuration, Utc};
     use md5::Md5;
     use serde_json::{Value, json};
     use sha2::{Digest as _, Sha256};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::{
         collections::BTreeMap,
@@ -33267,6 +33979,7 @@ mod tests {
             same_path_prior_state: None,
             security_action_state: None,
             oauth_client_secret_state: None,
+            oauth_client_update_state: None,
         };
 
         // Without a bound empty precondition, nothing changes.
@@ -34165,6 +34878,475 @@ mod tests {
         capability
     }
 
+    fn oauth_client_request_properties(include_visibility: bool) -> serde_json::Map<String, Value> {
+        let mut properties = json!({
+            "allowed_cors_origins":{"items":{"type":"string"},"type":"array"},
+            "client_name":{"type":"string"},
+            "client_uri":{"type":"string"},
+            "grant_types":{"items":{"enum":["authorization_code","refresh_token"],"type":"string"},"type":"array"},
+            "logo_uri":{"type":"string"},
+            "policy_uri":{"type":"string"},
+            "post_logout_redirect_uris":{"items":{"type":"string"},"type":"array"},
+            "redirect_uris":{"items":{"type":"string"},"type":"array"},
+            "response_types":{"items":{"enum":["token","id_token","code"],"type":"string"},"type":"array"},
+            "scopes":{"items":{"type":"string"},"type":"array"},
+            "token_endpoint_auth_method":{"enum":["none","client_secret_basic","client_secret_post"],"type":"string"},
+            "tos_uri":{"type":"string"}
+        })
+        .as_object()
+        .expect("OAuth request properties")
+        .clone();
+        if include_visibility {
+            properties.insert(
+                "visibility".to_owned(),
+                json!({"enum":["public"],"type":"string"}),
+            );
+        }
+        properties
+    }
+
+    fn oauth_client_test_selectors(update: bool) -> Vec<SelectorV1> {
+        let names: &[&str] = if update {
+            &["account_id", "oauth_client_id"]
+        } else {
+            &["account_id"]
+        };
+        names
+            .iter()
+            .map(|name| SelectorV1 {
+                name: (*name).to_owned(),
+                location: "path".to_owned(),
+                required: true,
+                value_type: "string".to_owned(),
+                description: None,
+                contract: None,
+            })
+            .collect()
+    }
+
+    fn oauth_client_test_request_schema(update: bool) -> Value {
+        let mut schema = json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":oauth_client_request_properties(update),
+            "x-cfctl-body-required":true,
+        });
+        if update {
+            schema["minProperties"] = json!(1);
+        } else {
+            schema["required"] = json!([
+                "client_name",
+                "grant_types",
+                "redirect_uris",
+                "response_types",
+                "scopes",
+                "token_endpoint_auth_method"
+            ]);
+        }
+        schema
+    }
+
+    fn oauth_client_capability(update: bool) -> CapabilityV1 {
+        let (id, method, path) = if update {
+            (
+                "oauth-clients-update",
+                "PATCH",
+                "/accounts/{account_id}/oauth_clients/{oauth_client_id}",
+            )
+        } else {
+            (
+                "oauth-clients-create",
+                "POST",
+                "/accounts/{account_id}/oauth_clients",
+            )
+        };
+        let mut capability = CapabilityV1::new(id, id, method, path);
+        capability.product = "OAuth Clients".to_owned();
+        capability.permissions = vec!["OAuth Client Write".to_owned()];
+        capability.adapter_status = AdapterStatus::DynamicApi;
+        capability.risk = RiskClass::IdentityOrOwnership;
+        capability.effect = EffectClass::IdentityOrOwnership;
+        capability.cost = CostV1::default();
+        capability.entitlement.available = Some(true);
+        capability.entitlement.plans = BTreeMap::from([
+            ("business".to_owned(), true),
+            ("enterprise".to_owned(), true),
+            ("free".to_owned(), true),
+            ("pro".to_owned(), true),
+        ]);
+        capability.selectors = oauth_client_test_selectors(update);
+        capability.request_schema = Some(oauth_client_test_request_schema(update));
+        capability.response_contract = Some(ResponseContractV1 {
+            success_statuses: vec!["200".to_owned()],
+            success_media_types: vec!["application/json".to_owned()],
+            body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+        });
+        capability.verification.strategy = if update {
+            "same_resource_contains_planned_fields_after_update"
+        } else {
+            "created_resource_contains_planned_fields_by_returned_id"
+        }
+        .to_owned();
+        capability.rollback.supported = false;
+        capability.rollback.strategy = None;
+        capability.rollback.warning = Some(if update {
+            "restore metadata only through a separately reviewed snapshot-bound update; public visibility promotion is permanent"
+                .to_owned()
+        } else {
+            "OAuth client deletion requires a separately reviewed destructive plan".to_owned()
+        });
+        let verified_response_fields = oauth_client_request_properties(update)
+            .into_iter()
+            .map(|(field, _)| field)
+            .collect::<Vec<_>>();
+        if update {
+            capability.same_path_read = Some(SamePathReadContractV1 {
+                path: path.to_owned(),
+                read_capability_id: "oauth-clients-get".to_owned(),
+                verified_response_fields,
+            });
+        } else {
+            capability.created_resource = Some(CreatedResourceContractV1 {
+                detail_path: "/accounts/{account_id}/oauth_clients/{oauth_client_id}".to_owned(),
+                identity_selector: "oauth_client_id".to_owned(),
+                response_result_identity_pointer: "/client_id".to_owned(),
+                read_capability_id: "oauth-clients-get".to_owned(),
+                delete_capability_id: "oauth-clients-delete".to_owned(),
+                verified_response_fields,
+            });
+        }
+        capability
+    }
+
+    fn oauth_client_update_response(visibility: &str) -> CloudflareResponseV1 {
+        CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!({
+                "client_id":"oauth-client-a",
+                "client_name":"old name",
+                "grant_types":["authorization_code","refresh_token"],
+                "redirect_uris":["https://example.com/oauth/callback"],
+                "response_types":["code"],
+                "scopes":["account:read"],
+                "token_endpoint_auth_method":"none",
+                "visibility":visibility,
+                "modified_on":"future provider metadata"
+            }),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        }
+    }
+
+    fn oauth_client_update_input(body: Value) -> CallInput {
+        CallInput {
+            selectors: json!({
+                "account_id":"account-a",
+                "oauth_client_id":"oauth-client-a"
+            }),
+            body: Some(body),
+            ..CallInput::default()
+        }
+    }
+
+    #[test]
+    fn oauth_client_update_snapshot_is_exact_target_bound_and_visibility_safe() {
+        let capability = oauth_client_capability(true);
+        assert!(should_bind_oauth_client_update_state(&capability));
+        assert!(
+            capability.mutation_contract_gaps().is_empty(),
+            "{:?}",
+            capability.mutation_contract_gaps()
+        );
+        let input = oauth_client_update_input(json!({"client_name":"new name"}));
+        let response = oauth_client_update_response("private");
+        let receipt =
+            apply_oauth_client_update_state_response(&capability, &input, "account-a", &response)
+                .expect("snapshot-bound OAuth update receipt");
+        assert_eq!(receipt["prior_state"]["client_name"], "old name");
+        assert_eq!(
+            receipt["observed_result_hash"],
+            hash_value(&response.result).expect("full provider result hash")
+        );
+        assert!(
+            receipt["absent_fields"]
+                .as_array()
+                .is_some_and(|fields| fields.contains(&json!("client_uri")))
+        );
+        assert!(receipt["prior_state"].get("modified_on").is_none());
+
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability.clone(),
+            json!({
+                "selectors":input.selectors,
+                "account_id":"account-a",
+                "adapter":{},
+                "live_preconditions":{
+                    OAUTH_CLIENT_UPDATE_STATE_PRECONDITION:receipt
+                }
+            }),
+        )
+        .expect("OAuth update plan");
+        plan.input = serde_json::to_value(&input).expect("serialized OAuth update input");
+        plan.precondition_hashes.insert(
+            OAUTH_CLIENT_UPDATE_STATE_PRECONDITION.to_owned(),
+            hash_value(&receipt).expect("receipt hash"),
+        );
+        assert_eq!(
+            required_oauth_client_update_state_precondition(&plan)
+                .expect("bound OAuth update precondition"),
+            plan.precondition_hashes
+                .get(OAUTH_CLIENT_UPDATE_STATE_PRECONDITION)
+                .map(String::as_str)
+        );
+
+        let mut retargeted = receipt.clone();
+        retargeted["oauth_client_id"] = json!("oauth-client-b");
+        plan.precondition_hashes.insert(
+            OAUTH_CLIENT_UPDATE_STATE_PRECONDITION.to_owned(),
+            hash_value(&retargeted).expect("retargeted receipt hash"),
+        );
+        plan.targets["live_preconditions"][OAUTH_CLIENT_UPDATE_STATE_PRECONDITION] = retargeted;
+        required_oauth_client_update_state_precondition(&plan)
+            .expect_err("a rehashed cross-client snapshot must fail");
+
+        let mut secret_response = response.clone();
+        secret_response.result["client_secret"] = json!("must-never-persist");
+        apply_oauth_client_update_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &secret_response,
+        )
+        .expect_err("a secret-bearing detail response must fail closed");
+
+        let promotion = oauth_client_update_input(json!({"visibility":"public"}));
+        apply_oauth_client_update_state_response(&capability, &promotion, "account-a", &response)
+            .expect("private to public one-field promotion");
+        let combined = oauth_client_update_input(json!({
+            "visibility":"public",
+            "client_name":"new name"
+        }));
+        apply_oauth_client_update_state_response(&capability, &combined, "account-a", &response)
+            .expect_err("irreversible promotion cannot be combined with metadata changes");
+        apply_oauth_client_update_state_response(
+            &capability,
+            &promotion,
+            "account-a",
+            &oauth_client_update_response("public"),
+        )
+        .expect_err("public OAuth clients cannot be promoted again or demoted");
+
+        let mut response_drift = capability;
+        response_drift.response_contract = None;
+        assert!(!should_bind_oauth_client_update_state(&response_drift));
+    }
+
+    #[test]
+    fn prepared_oauth_client_update_plan_carries_snapshot_and_irreversibility() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");
+        let capability = oauth_client_capability(true);
+        let mut catalog = CatalogSnapshot {
+            schema_version: 2,
+            generated_at: Utc::now(),
+            source_url: "https://example.invalid/openapi.json".to_owned(),
+            source_hash: "source-sha".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::from([(capability.id.clone(), capability.clone())]),
+        };
+        catalog.refresh_hash().expect("catalog hash");
+        let profile = ProfileMetadata::new("profile-a", ProfileKind::ApiToken, Some("account-a"));
+        let input = oauth_client_update_input(json!({"visibility":"public"}));
+        let receipt = apply_oauth_client_update_state_response(
+            &capability,
+            &input,
+            "account-a",
+            &oauth_client_update_response("private"),
+        )
+        .expect("OAuth update snapshot");
+        let receipt_hash = hash_value(&receipt).expect("receipt hash");
+        let evidence = store
+            .write_evidence(EvidenceClass::LiveRead, &receipt)
+            .expect("live-read evidence");
+        let envelope = persist_prepared_plan(
+            &store,
+            &catalog,
+            capability,
+            input,
+            PlanAuthority {
+                profile: &profile,
+                account_id: "account-a",
+            },
+            json!({}),
+            LivePlanPreconditions {
+                entitlement: None,
+                zone_account: None,
+                pages_project_absence: None,
+                r2_parent_token: None,
+                global_warp_override_state: None,
+                d1_read_replication_state: None,
+                d1_empty_database_state: None,
+                kv_empty_namespace_state: None,
+                cloudflare_tunnel_configuration_state: None,
+                warp_connector_configuration_state: None,
+                web_analytics_rum_state: None,
+                dns_record_state: None,
+                same_path_prior_state: None,
+                security_action_state: None,
+                oauth_client_secret_state: None,
+                oauth_client_update_state: Some((receipt.clone(), evidence)),
+            },
+        )
+        .expect("prepared OAuth update plan");
+        let plan = &envelope.result["plan"];
+        assert_eq!(
+            plan["precondition_hashes"][OAUTH_CLIENT_UPDATE_STATE_PRECONDITION],
+            receipt_hash
+        );
+        assert_eq!(
+            plan["targets"]["live_preconditions"][OAUTH_CLIENT_UPDATE_STATE_PRECONDITION],
+            receipt
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["observed_before"]["visibility"],
+            "private"
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["planned_after"],
+            json!({"visibility":"public"})
+        );
+        assert_eq!(
+            plan["cloudflare_diffs"][0]["irreversible_visibility_promotion"],
+            true
+        );
+    }
+
+    #[cfg(unix)]
+    fn oauth_client_create_test_plan(sink: &Path) -> (CapabilityV1, PlanV1) {
+        let capability = oauth_client_capability(false);
+        let input = CallInput {
+            selectors: json!({"account_id":"account-a"}),
+            body: Some(json!({
+                "client_name":"cfctl",
+                "grant_types":["authorization_code","refresh_token"],
+                "redirect_uris":["https://cfctl.com/oauth/callback"],
+                "response_types":["code"],
+                "scopes":["account:read"],
+                "token_endpoint_auth_method":"none"
+            })),
+            ..CallInput::default()
+        };
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            capability.clone(),
+            json!({
+                "selectors":input.selectors,
+                "account_id":"account-a",
+                "adapter":{"value_out":sink}
+            }),
+        )
+        .expect("OAuth create plan");
+        plan.input = serde_json::to_value(&input).expect("serialized OAuth create input");
+        (capability, plan)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oauth_client_creation_secret_sink_is_conditional_private_and_redacted() {
+        let root = tempfile::tempdir().expect("operator-secret root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("mode-0700 operator-secret root");
+        let sink = root.path().join("oauth-client.json");
+        let (capability, mut plan) = oauth_client_create_test_plan(&sink);
+        assert!(is_secret_output_capability(&capability));
+        assert!(should_redact_secret_response(&capability));
+        assert_eq!(secret_sink_format(&capability), Some("oauth_client_json"));
+        preflight_secret_sink(&plan).expect("fresh external OAuth secret sink");
+
+        let public_result = json!({"client_id":"oauth-client-a"});
+        assert_eq!(
+            super::oauth_client_secret_output_state(&plan, true, Some(&public_result))
+                .expect("public-client secret state"),
+            (false, Some(false))
+        );
+        assert!(
+            !sink.exists(),
+            "an omitted optional secret must not create an empty sink"
+        );
+        let no_secret_artifact =
+            secret_sink_artifact(&plan, None, false, true, false, Some(false), None);
+        assert_eq!(no_secret_artifact["secret_returned"], false);
+        assert_eq!(no_secret_artifact["output_sink"]["requested"], true);
+        assert_eq!(no_secret_artifact["output_sink"]["required"], false);
+        assert!(no_secret_artifact["path"].is_null());
+
+        let secret_result = json!({
+            "client_id":"oauth-client-a",
+            "client_secret":"one-time-secret"
+        });
+        assert_eq!(
+            super::oauth_client_secret_output_state(&plan, true, Some(&secret_result))
+                .expect("returned-secret state"),
+            (true, Some(true))
+        );
+        let written = sink_secret_result(&plan, &secret_result).expect("OAuth secret sink");
+        assert_eq!(written, sink);
+        assert_eq!(
+            fs::metadata(&written)
+                .expect("sink metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&written).expect("sink bytes"))
+                .expect("OAuth sink JSON"),
+            secret_result
+        );
+        let redacted = redact_response_for_capability(
+            &capability,
+            &json!({"success":true,"result":secret_result}),
+        );
+        assert_eq!(redacted["result"]["client_id"], "oauth-client-a");
+        assert_eq!(redacted["result"]["client_secret"], "[SUNK]");
+        assert!(!redacted.to_string().contains("one-time-secret"));
+
+        let repo = root.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).expect("test Git marker");
+        let repo_secret_dir = repo.join("operator-secrets");
+        fs::create_dir(&repo_secret_dir).expect("repo secret directory");
+        fs::set_permissions(&repo_secret_dir, fs::Permissions::from_mode(0o700))
+            .expect("repo secret mode");
+        plan.targets["adapter"]["value_out"] = json!(repo_secret_dir.join("client.json"));
+        preflight_secret_sink(&plan).expect_err("OAuth secret output inside Git must fail");
+
+        let basic_sink = root.path().join("oauth-client-basic.json");
+        plan.targets["adapter"]["value_out"] = json!(basic_sink);
+        plan.input["body"]["token_endpoint_auth_method"] = json!("client_secret_basic");
+        assert_eq!(
+            super::oauth_client_secret_output_state(&plan, true, Some(&public_result))
+                .expect("secret-authenticated client state"),
+            (true, Some(false))
+        );
+        sink_secret_result(&plan, &public_result)
+            .expect_err("missing required OAuth secret must require rectification");
+        assert!(!basic_sink.exists());
+
+        let mut risk_drift = capability;
+        risk_drift.risk = RiskClass::ScopedWrite;
+        assert!(is_secret_output_capability(&risk_drift));
+        assert!(should_redact_secret_response(&risk_drift));
+    }
+
     fn oauth_client_secret_state_response(has_rotated_secret: bool) -> CloudflareResponseV1 {
         CloudflareResponseV1 {
             status: 200,
@@ -34360,6 +35542,7 @@ mod tests {
                 same_path_prior_state: None,
                 security_action_state: None,
                 oauth_client_secret_state: Some((receipt.clone(), evidence)),
+                oauth_client_update_state: None,
             },
         )
         .expect("prepared OAuth rotation plan");
@@ -35321,6 +36504,7 @@ mod tests {
                 same_path_prior_state: None,
                 security_action_state: None,
                 oauth_client_secret_state: None,
+                oauth_client_update_state: None,
             },
         )
         .expect("prepared plan");
@@ -35411,6 +36595,7 @@ mod tests {
                 same_path_prior_state: None,
                 security_action_state: None,
                 oauth_client_secret_state: None,
+                oauth_client_update_state: None,
             },
         )
         .expect("prepared plan");
@@ -35506,6 +36691,7 @@ mod tests {
                 same_path_prior_state: None,
                 security_action_state: None,
                 oauth_client_secret_state: None,
+                oauth_client_update_state: None,
             },
         )
         .expect("prepared plan");
@@ -35597,6 +36783,7 @@ mod tests {
                 same_path_prior_state: None,
                 security_action_state: None,
                 oauth_client_secret_state: None,
+                oauth_client_update_state: None,
             },
         )
         .expect("prepared plan");
@@ -35682,6 +36869,7 @@ mod tests {
                 same_path_prior_state: None,
                 security_action_state: None,
                 oauth_client_secret_state: None,
+                oauth_client_update_state: None,
             },
         )
         .expect("prepared plan");
@@ -35783,6 +36971,7 @@ mod tests {
                 same_path_prior_state: None,
                 security_action_state: None,
                 oauth_client_secret_state: None,
+                oauth_client_update_state: None,
             },
         )
         .expect("prepared plan");

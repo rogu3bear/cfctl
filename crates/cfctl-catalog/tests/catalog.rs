@@ -1,5 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::collections::BTreeMap;
+
 use cfctl_catalog::{
     CatalogChangeKind, CatalogIndex, CatalogSnapshot, LEGACY_EMBEDDED_CAPABILITY_IDS,
     OfficialTextFeedsV1, attach_official_product_knowledge, ingest_cli_help,
@@ -8923,6 +8925,265 @@ fn oauth_client_rotation_fixture() -> serde_json::Value {
             }
         }
     })
+}
+
+fn oauth_client_configuration_properties_fixture() -> serde_json::Value {
+    json!({
+        "allowed_cors_origins":{"items":{"type":"string"},"type":"array"},
+        "client_name":{"type":"string"},
+        "client_uri":{"type":"string"},
+        "grant_types":{"items":{"enum":["authorization_code","refresh_token"],"type":"string"},"type":"array"},
+        "logo_uri":{"type":"string"},
+        "policy_uri":{"type":"string"},
+        "post_logout_redirect_uris":{"items":{"type":"string"},"type":"array"},
+        "redirect_uris":{"items":{"type":"string"},"type":"array"},
+        "response_types":{"items":{"enum":["token","id_token","code"],"type":"string"},"type":"array"},
+        "scopes":{"items":{"type":"string"},"type":"array"},
+        "token_endpoint_auth_method":{"enum":["none","client_secret_basic","client_secret_post"],"type":"string"},
+        "tos_uri":{"type":"string"}
+    })
+}
+
+fn oauth_client_response_fixture(
+    properties: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    json!({
+        "description":"OAuth client response",
+        "content":{"application/json":{"schema":{"allOf":[
+            {"$ref":"#/components/schemas/ApiEnvelope"},
+            {"type":"object","properties":{"result":{"type":"object","properties":properties}}}
+        ]}}}
+    })
+}
+
+fn oauth_client_create_update_fixture() -> serde_json::Value {
+    let configuration_properties = oauth_client_configuration_properties_fixture();
+    let mut read_properties = configuration_properties
+        .as_object()
+        .expect("configuration properties")
+        .clone();
+    read_properties.insert("client_id".to_owned(), json!({"type":"string"}));
+    read_properties.insert(
+        "visibility".to_owned(),
+        json!({"type":"string","enum":["private","public"]}),
+    );
+    let account_selector = json!({
+        "in":"path","name":"account_id","required":true,
+        "description":"Account identifier tag.",
+        "schema":{"allOf":[{"$ref":"#/components/schemas/Identifier"}]}
+    });
+    let client_selector = json!({
+        "in":"path","name":"oauth_client_id","required":true,
+        "description":"The unique identifier for an OAuth client.",
+        "schema":{"type":"string"}
+    });
+    let plans = json!({"business":true,"enterprise":true,"free":true,"pro":true});
+    let mut create_response_properties = read_properties.clone();
+    create_response_properties.insert(
+        "client_secret".to_owned(),
+        json!({"type":"string","readOnly":true,"x-sensitive":true}),
+    );
+
+    json!({
+        "openapi":"3.0.3",
+        "info":{"title":"OAuth client fixture","version":"1"},
+        "components":{"schemas":{
+            "Identifier":{"type":"string","minLength":32,"maxLength":32},
+            "ApiEnvelope":{
+                "type":"object","required":["success","result"],
+                "properties":{
+                    "success":{"type":"boolean"},"errors":{"type":"array"},
+                    "messages":{"type":"array"},"result":{"type":"object"}
+                }
+            }
+        }},
+        "paths":{
+            "/accounts/{account_id}/oauth_clients":{
+                "post":{
+                    "operationId":"oauth-clients-create",
+                    "summary":"Create OAuth Client",
+                    "description":"Create a new OAuth client for an account.",
+                    "tags":["OAuth Clients"],
+                    "x-api-token-group":["OAuth Client Write"],
+                    "x-cfPlanAvailability":plans.clone(),
+                    "parameters":[account_selector.clone()],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{"allOf":[
+                        {"type":"object","properties":configuration_properties.clone()},
+                        {"type":"object","required":["client_name","grant_types","redirect_uris","response_types","scopes","token_endpoint_auth_method"]}
+                    ]}}}},
+                    "responses":{"200":oauth_client_response_fixture(create_response_properties)}
+                }
+            },
+            "/accounts/{account_id}/oauth_clients/{oauth_client_id}":{
+                "get":{
+                    "operationId":"oauth-clients-get",
+                    "summary":"OAuth Client Details",
+                    "description":"Get details of a specific OAuth client.",
+                    "tags":["OAuth Clients"],
+                    "x-api-token-group":["OAuth Client Read"],
+                    "x-cfPlanAvailability":plans.clone(),
+                    "parameters":[account_selector.clone(),client_selector.clone()],
+                    "responses":{"200":oauth_client_response_fixture(read_properties.clone())}
+                },
+                "patch":{
+                    "operationId":"oauth-clients-update",
+                    "summary":"Update OAuth Client",
+                    "description":"Update an existing OAuth client. Only include fields you want to update.",
+                    "tags":["OAuth Clients"],
+                    "x-api-token-group":["OAuth Client Write"],
+                    "x-cfPlanAvailability":plans.clone(),
+                    "parameters":[account_selector.clone(),client_selector.clone()],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{"allOf":[
+                        {"type":"object","properties":configuration_properties},
+                        {"type":"object","properties":{"visibility":{"type":"string","enum":["public"]}}}
+                    ]}}}},
+                    "responses":{"200":oauth_client_response_fixture(read_properties.clone())}
+                },
+                "delete":{
+                    "operationId":"oauth-clients-delete",
+                    "summary":"Delete OAuth Client",
+                    "description":"Delete an OAuth client.",
+                    "tags":["OAuth Clients"],
+                    "x-api-token-group":["OAuth Client Write"],
+                    "x-cfPlanAvailability":plans,
+                    "parameters":[account_selector,client_selector],
+                    "responses":{"200":oauth_client_response_fixture(read_properties)}
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn oauth_client_create_and_update_are_identity_bound_and_snapshot_ready() {
+    let snapshot =
+        normalize_openapi(&oauth_client_create_update_fixture()).expect("OAuth client catalog");
+    let create = snapshot
+        .get("oauth-clients-create")
+        .expect("OAuth client create");
+    let update = snapshot
+        .get("oauth-clients-update")
+        .expect("OAuth client update");
+
+    for capability in [create, update] {
+        assert_eq!(capability.adapter_status, AdapterStatus::DynamicApi);
+        assert_eq!(capability.risk, RiskClass::IdentityOrOwnership);
+        assert_eq!(capability.effect, EffectClass::IdentityOrOwnership);
+        assert!(capability.cost.known);
+        assert!(!capability.cost.incremental);
+        assert_eq!(capability.cost.maximum, Some(0.0));
+        assert_eq!(capability.entitlement.available, Some(true));
+        assert_eq!(
+            capability.entitlement.plans,
+            BTreeMap::from([
+                ("business".to_owned(), true),
+                ("enterprise".to_owned(), true),
+                ("free".to_owned(), true),
+                ("pro".to_owned(), true),
+            ])
+        );
+        assert_eq!(
+            capability
+                .request_schema
+                .as_ref()
+                .and_then(|schema| schema.get("additionalProperties")),
+            Some(&json!(false))
+        );
+        assert!(!capability.rollback.supported);
+        assert!(capability.mutation_contract_gaps().is_empty());
+    }
+
+    let created = create.created_resource.as_ref().expect("created client");
+    assert_eq!(created.identity_selector, "oauth_client_id");
+    assert_eq!(created.response_result_identity_pointer, "/client_id");
+    assert_eq!(created.read_capability_id, "oauth-clients-get");
+    assert_eq!(created.delete_capability_id, "oauth-clients-delete");
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    assert!(
+        create
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("separately reviewed"))
+    );
+
+    assert_eq!(
+        update.verification.strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+    assert_eq!(
+        update
+            .same_path_read
+            .as_ref()
+            .expect("update readback")
+            .verified_response_fields
+            .last()
+            .map(String::as_str),
+        Some("visibility")
+    );
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("minProperties")),
+        Some(&json!(1))
+    );
+    assert!(
+        update
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("permanent"))
+    );
+}
+
+#[test]
+fn oauth_client_create_update_classifier_fails_closed_on_contract_drift() {
+    let blocked = |document: serde_json::Value, capability_id: &str| {
+        normalize_openapi(&document)
+            .expect("drifted OAuth client catalog")
+            .get(capability_id)
+            .expect("OAuth client capability")
+            .adapter_status
+            == AdapterStatus::Blocked
+    };
+
+    let mut permission = oauth_client_create_update_fixture();
+    permission["paths"]["/accounts/{account_id}/oauth_clients"]["post"]["x-api-token-group"] =
+        json!(["Account Settings Write"]);
+    assert!(blocked(permission, "oauth-clients-create"));
+
+    let mut request = oauth_client_create_update_fixture();
+    request["paths"]["/accounts/{account_id}/oauth_clients/{oauth_client_id}"]["patch"]["requestBody"]
+        ["content"]["application/json"]["schema"]["allOf"][0]["properties"]["future_field"] =
+        json!({"type":"string"});
+    assert!(blocked(request, "oauth-clients-update"));
+
+    let mut secret = oauth_client_create_update_fixture();
+    secret["paths"]["/accounts/{account_id}/oauth_clients"]["post"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["allOf"][1]["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("create response properties")
+        .remove("client_secret");
+    assert!(blocked(secret, "oauth-clients-create"));
+
+    let mut read = oauth_client_create_update_fixture();
+    read["paths"]["/accounts/{account_id}/oauth_clients/{oauth_client_id}"]["get"]
+        ["responses"]["200"]["content"]["application/json"]["schema"]["allOf"][1]
+        ["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("read properties")
+        .remove("scopes");
+    assert!(blocked(read.clone(), "oauth-clients-create"));
+    assert!(blocked(read, "oauth-clients-update"));
+
+    let mut plan = oauth_client_create_update_fixture();
+    plan["paths"]["/accounts/{account_id}/oauth_clients/{oauth_client_id}"]["patch"]["x-cfPlanAvailability"]
+        ["free"] = json!(false);
+    assert!(blocked(plan, "oauth-clients-update"));
 }
 
 #[test]

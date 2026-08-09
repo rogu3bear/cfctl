@@ -7505,6 +7505,7 @@ fn apply_post_normalization_contracts(
     finalize_r2_temporary_credentials_contract(document, capabilities);
     finalize_zone_cache_purge_contracts(document, capabilities);
     finalize_websocket_zone_setting_contract(document, capabilities);
+    finalize_oauth_client_create_update_contracts(document, capabilities);
     finalize_oauth_client_secret_rotation_contract(document, capabilities);
     finalize_global_warp_override_rollback_contract(capabilities);
     finalize_d1_read_replication_rollback_contract(capabilities);
@@ -12176,10 +12177,107 @@ enum OAuthClientSecretOperationKind {
     DeleteOld,
 }
 
+const OAUTH_CLIENT_COLLECTION_PATH: &str = "/accounts/{account_id}/oauth_clients";
 const OAUTH_CLIENT_DETAIL_PATH: &str = "/accounts/{account_id}/oauth_clients/{oauth_client_id}";
+const OAUTH_CLIENT_CREATE_CAPABILITY_ID: &str = "oauth-clients-create";
+const OAUTH_CLIENT_UPDATE_CAPABILITY_ID: &str = "oauth-clients-update";
 const OAUTH_CLIENT_SECRET_PATH: &str =
     "/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret";
 const OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID: &str = "oauth-clients-get";
+const OAUTH_CLIENT_DELETE_CAPABILITY_ID: &str = "oauth-clients-delete";
+const OAUTH_CLIENT_CONFIGURATION_FIELDS: [&str; 12] = [
+    "allowed_cors_origins",
+    "client_name",
+    "client_uri",
+    "grant_types",
+    "logo_uri",
+    "policy_uri",
+    "post_logout_redirect_uris",
+    "redirect_uris",
+    "response_types",
+    "scopes",
+    "token_endpoint_auth_method",
+    "tos_uri",
+];
+
+fn oauth_client_collection_selectors_supported(capability: &CapabilityV1) -> bool {
+    capability.selectors.len() == 1
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "account_id"
+                && selector.location == "path"
+                && selector.required
+                && selector.value_type == "string"
+                && selector.contract.as_ref().is_some_and(|contract| {
+                    contract.schema
+                        == serde_json::json!({
+                            "allOf":[{"maxLength":32,"minLength":32,"type":"string"}]
+                        })
+                        && contract.query.is_none()
+                })
+        })
+}
+
+fn oauth_client_configuration_properties() -> Value {
+    serde_json::json!({
+        "allowed_cors_origins":{"items":{"type":"string"},"type":"array"},
+        "client_name":{"type":"string"},
+        "client_uri":{"type":"string"},
+        "grant_types":{"items":{"enum":["authorization_code","refresh_token"],"type":"string"},"type":"array"},
+        "logo_uri":{"type":"string"},
+        "policy_uri":{"type":"string"},
+        "post_logout_redirect_uris":{"items":{"type":"string"},"type":"array"},
+        "redirect_uris":{"items":{"type":"string"},"type":"array"},
+        "response_types":{"items":{"enum":["token","id_token","code"],"type":"string"},"type":"array"},
+        "scopes":{"items":{"type":"string"},"type":"array"},
+        "token_endpoint_auth_method":{"enum":["none","client_secret_basic","client_secret_post"],"type":"string"},
+        "tos_uri":{"type":"string"}
+    })
+}
+
+fn oauth_client_upstream_create_schema() -> Value {
+    serde_json::json!({
+        "allOf":[
+            {"properties":oauth_client_configuration_properties(),"type":"object"},
+            {
+                "required":["client_name","grant_types","redirect_uris","response_types","scopes","token_endpoint_auth_method"],
+                "type":"object"
+            }
+        ],
+        "x-cfctl-body-required":true
+    })
+}
+
+fn oauth_client_upstream_update_schema() -> Value {
+    serde_json::json!({
+        "allOf":[
+            {"properties":oauth_client_configuration_properties(),"type":"object"},
+            {"properties":{"visibility":{"enum":["public"],"type":"string"}},"type":"object"}
+        ],
+        "x-cfctl-body-required":true
+    })
+}
+
+fn oauth_client_closed_create_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["client_name","grant_types","redirect_uris","response_types","scopes","token_endpoint_auth_method"],
+        "properties":oauth_client_configuration_properties(),
+        "x-cfctl-body-required":true
+    })
+}
+
+fn oauth_client_closed_update_schema() -> Value {
+    let mut properties = oauth_client_configuration_properties();
+    properties["visibility"] = serde_json::json!({"enum":["public"],"type":"string"});
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "minProperties":1,
+        "properties":properties,
+        "x-cfctl-body-required":true
+    })
+}
 
 fn oauth_client_secret_operation_kind(
     capability: &CapabilityV1,
@@ -12262,6 +12360,213 @@ fn oauth_client_all_plan_entitlement_supported(capability: &CapabilityV1) -> boo
             ("free".to_owned(), true),
             ("pro".to_owned(), true),
         ])
+}
+
+fn oauth_client_detail_read_supported(
+    document: &Value,
+    capabilities: &BTreeMap<String, CapabilityV1>,
+) -> bool {
+    let fields = OAUTH_CLIENT_CONFIGURATION_FIELDS
+        .iter()
+        .copied()
+        .chain(["client_id", "visibility"])
+        .collect::<Vec<_>>();
+    capabilities
+        .get(OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.id == OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID
+                && capability.method == "GET"
+                && capability.path == OAUTH_CLIENT_DETAIL_PATH
+                && capability.product == "OAuth Clients"
+                && capability.account_scope == "account"
+                && capability.permissions == ["OAuth Client Read"]
+                && capability.request_schema.is_none()
+                && oauth_client_selectors_supported(capability)
+                && oauth_client_all_plan_entitlement_supported(capability)
+                && capability
+                    .response_contract
+                    .as_ref()
+                    .is_some_and(oauth_client_json_response_supported)
+        })
+        && document
+            .pointer("/paths/~1accounts~1{account_id}~1oauth_clients~1{oauth_client_id}/get")
+            .is_some_and(|operation| {
+                success_response_declares_result_string_field(document, operation, "client_id")
+                    && success_response_declares_result_fields(document, operation, &fields)
+            })
+}
+
+fn oauth_client_delete_supported(capabilities: &BTreeMap<String, CapabilityV1>) -> bool {
+    capabilities
+        .get(OAUTH_CLIENT_DELETE_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.id == OAUTH_CLIENT_DELETE_CAPABILITY_ID
+                && capability.method == "DELETE"
+                && capability.path == OAUTH_CLIENT_DETAIL_PATH
+                && capability.product == "OAuth Clients"
+                && capability.account_scope == "account"
+                && capability.permissions == ["OAuth Client Write"]
+                && capability.request_schema.is_none()
+                && oauth_client_selectors_supported(capability)
+                && oauth_client_all_plan_entitlement_supported(capability)
+                && capability.verification.strategy
+                    == "same_resource_returns_not_found_after_delete"
+                && capability.same_path_read.as_ref().is_some_and(|read| {
+                    read.path == OAUTH_CLIENT_DETAIL_PATH
+                        && read.read_capability_id == OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID
+                        && read.verified_response_fields.is_empty()
+                })
+                && capability.mutation_contract_gaps().is_empty()
+        })
+}
+
+fn classify_oauth_client_cost_and_entitlement(capability: &mut CapabilityV1) {
+    capability.cost = CostV1::default();
+    capability.cost.basis = Some(
+        "creating or updating one OAuth client does not purchase a plan or add a direct operation charge, so the direct incremental ceiling is zero"
+            .to_owned(),
+    );
+    capability.cost.references = vec![official_reference(
+        "Create your OAuth client",
+        "https://developers.cloudflare.com/fundamentals/oauth/create-an-oauth-client/",
+    )];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.source = Some("official OpenAPI x-cfPlanAvailability".to_owned());
+    capability.entitlement.blocker = None;
+    capability.entitlement.requires_live_resolution = false;
+}
+
+fn finalize_oauth_client_create_update_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let companions_supported = oauth_client_detail_read_supported(document, capabilities)
+        && oauth_client_delete_supported(capabilities);
+    let create_response_supported = document
+        .pointer("/paths/~1accounts~1{account_id}~1oauth_clients/post")
+        .is_some_and(|operation| {
+            success_response_declares_result_string_field(document, operation, "client_id")
+                && success_response_declares_result_string_field(
+                    document,
+                    operation,
+                    "client_secret",
+                )
+        });
+
+    finalize_oauth_client_create_contract(
+        capabilities,
+        companions_supported && create_response_supported,
+    );
+    finalize_oauth_client_update_contract(capabilities, companions_supported);
+}
+
+fn finalize_oauth_client_create_contract(
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+    companions_supported: bool,
+) {
+    if let Some(capability) = capabilities.get_mut(OAUTH_CLIENT_CREATE_CAPABILITY_ID) {
+        let create_supported = capability.id == OAUTH_CLIENT_CREATE_CAPABILITY_ID
+            && capability.method == "POST"
+            && capability.path == OAUTH_CLIENT_COLLECTION_PATH
+            && capability.product == "OAuth Clients"
+            && capability.account_scope == "account"
+            && capability.permissions == ["OAuth Client Write"]
+            && oauth_client_collection_selectors_supported(capability)
+            && oauth_client_all_plan_entitlement_supported(capability)
+            && capability.request_schema.as_ref() == Some(&oauth_client_upstream_create_schema())
+            && capability
+                .response_contract
+                .as_ref()
+                .is_some_and(oauth_client_json_response_supported);
+        if create_supported && companions_supported {
+            capability.request_schema = Some(oauth_client_closed_create_schema());
+            capability.risk = RiskClass::IdentityOrOwnership;
+            capability.effect = EffectClass::IdentityOrOwnership;
+            classify_oauth_client_cost_and_entitlement(capability);
+            capability.created_resource = Some(CreatedResourceContractV1 {
+                detail_path: OAUTH_CLIENT_DETAIL_PATH.to_owned(),
+                identity_selector: "oauth_client_id".to_owned(),
+                response_result_identity_pointer: "/client_id".to_owned(),
+                read_capability_id: OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID.to_owned(),
+                delete_capability_id: OAUTH_CLIENT_DELETE_CAPABILITY_ID.to_owned(),
+                verified_response_fields: OAUTH_CLIENT_CONFIGURATION_FIELDS
+                    .iter()
+                    .map(|field| (*field).to_owned())
+                    .collect(),
+            });
+            capability.verification.required = true;
+            "created_resource_contains_planned_fields_by_returned_id"
+                .clone_into(&mut capability.verification.strategy);
+            capability.rollback.supported = false;
+            capability.rollback.strategy = None;
+            capability.rollback.warning = Some(
+                "OAuth client creation is not automatically rolled back; removing a failed private client requires a separately reviewed and explicitly approved destructive delete plan bound to the returned client_id"
+                    .to_owned(),
+            );
+            refresh_dynamic_mutation_contract(capability);
+        } else {
+            capability.created_resource = None;
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(
+                "OAuth client create, secret response, detail read, delete, request, permission, entitlement, or response contract drifted"
+                    .to_owned(),
+            );
+        }
+    }
+}
+
+fn finalize_oauth_client_update_contract(
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+    companions_supported: bool,
+) {
+    if let Some(capability) = capabilities.get_mut(OAUTH_CLIENT_UPDATE_CAPABILITY_ID) {
+        let update_fields = OAUTH_CLIENT_CONFIGURATION_FIELDS
+            .iter()
+            .copied()
+            .chain(["visibility"])
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let update_supported = capability.id == OAUTH_CLIENT_UPDATE_CAPABILITY_ID
+            && capability.method == "PATCH"
+            && capability.path == OAUTH_CLIENT_DETAIL_PATH
+            && capability.product == "OAuth Clients"
+            && capability.account_scope == "account"
+            && capability.permissions == ["OAuth Client Write"]
+            && oauth_client_selectors_supported(capability)
+            && oauth_client_all_plan_entitlement_supported(capability)
+            && capability.request_schema.as_ref() == Some(&oauth_client_upstream_update_schema())
+            && capability
+                .response_contract
+                .as_ref()
+                .is_some_and(oauth_client_json_response_supported);
+        if update_supported && companions_supported {
+            capability.request_schema = Some(oauth_client_closed_update_schema());
+            capability.risk = RiskClass::IdentityOrOwnership;
+            capability.effect = EffectClass::IdentityOrOwnership;
+            classify_oauth_client_cost_and_entitlement(capability);
+            capability.verification.required = true;
+            "same_resource_contains_planned_fields_after_update"
+                .clone_into(&mut capability.verification.strategy);
+            capability.same_path_read = Some(SamePathReadContractV1 {
+                path: OAUTH_CLIENT_DETAIL_PATH.to_owned(),
+                read_capability_id: OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID.to_owned(),
+                verified_response_fields: update_fields,
+            });
+            capability.rollback.supported = false;
+            capability.rollback.strategy = None;
+            capability.rollback.warning = Some(
+                "cfctl hash-binds and rechecks the exact existing client before update; metadata restoration requires a separate snapshot-bound update, while promotion to public is permanent because Cloudflare does not permit demotion"
+                    .to_owned(),
+            );
+            refresh_dynamic_mutation_contract(capability);
+        } else {
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(
+                "OAuth client update, detail read, delete, request, permission, entitlement, or response contract drifted"
+                    .to_owned(),
+            );
+        }
+    }
 }
 
 fn classify_oauth_client_secret_operation(
