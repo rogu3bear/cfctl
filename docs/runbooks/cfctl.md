@@ -667,6 +667,11 @@ exact `hostname`, Worker `service`, and 32-character `zone_id`; it does not
 infer `www`, accept `zone_name` substitution, or displace an existing CNAME.
 The target must already be an active Cloudflare zone and the named Worker must
 already exist; those live prerequisites are read and pinned before planning.
+The catalog separately validates Cloudflare's raw `Workers Scripts Write`
+attach operation, then exposes the governed lifecycle as the exact all-of
+permission set `Workers Scripts Write` plus `DNS Read`. The latter authorizes
+the mandatory exact-host DNS conflict read; `DNS Write` is neither requested
+nor implied by attachment.
 The apply response must return a domain ID, and verification reads that exact
 ID back and matches all three planned fields. Detachment is never automatic:
 compensation is a separately reviewed and explicitly approved
@@ -874,7 +879,12 @@ printf '%s' '{
 ```
 
 The plan binds the exact request, all-plan entitlement, zero direct creation
-cost, and a returned `/client_id` identity. After execution, cfctl reads that
+cost, a returned `/client_id` identity, and the exact all-of permission set
+`OAuth Client Write` plus `OAuth Client Read`. The catalog still requires the
+raw mutation operation itself to declare Write and its exact companion GET to
+declare Read; it projects both onto the governed lifecycle so a token prepared
+from the reviewed plan can complete preconditions and verification. After
+execution, cfctl reads that
 exact client through `oauth-clients-get` and compares every planned non-secret
 field. It never automatically deletes a failed client; deletion is a separate
 destructive plan. Cloudflare may return `client_secret` only once. If one is

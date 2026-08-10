@@ -249,6 +249,29 @@ fn worker_domain_fixture() -> Value {
             "x-api-token-group": ["Workers Scripts Write"]
         }
     });
+    document["paths"]["/zones/{zone_id}/dns_records"] = json!({
+        "get": {
+            "operationId": "dns-records-for-a-zone-list-dns-records",
+            "summary": "List DNS Records",
+            "tags": ["DNS Records for a Zone"],
+            "x-api-token-group": ["DNS Read", "DNS Write"],
+            "parameters": [
+                {
+                    "in": "path",
+                    "name": "zone_id",
+                    "required": true,
+                    "schema": {"maxLength": 32, "type": "string"}
+                },
+                {
+                    "in": "query",
+                    "name": "name.exact",
+                    "required": false,
+                    "schema": {"type": "string"}
+                }
+            ],
+            "responses": cloudflare_envelope_responses()
+        }
+    });
     document
 }
 
@@ -2566,7 +2589,11 @@ fn worker_domain_attach_is_exact_identity_bound_and_separately_reversible() {
     assert_eq!(attach.adapter_status, AdapterStatus::DynamicApi);
     assert_eq!(attach.method, "PUT");
     assert_eq!(attach.path, "/accounts/{account_id}/workers/domains");
-    assert_eq!(attach.permissions, ["Workers Scripts Write"]);
+    assert_eq!(
+        attach.permissions,
+        ["Workers Scripts Write", "DNS Read"],
+        "the governed attach lifecycle must disclose its exact-host DNS conflict read"
+    );
     assert_eq!(attach.risk, RiskClass::CrossConfig);
     assert_eq!(attach.effect, EffectClass::ReversibleWrite);
     assert_eq!(attach.entitlement.available, Some(true));
@@ -2660,6 +2687,18 @@ fn worker_domain_attach_fails_closed_on_every_lifecycle_contract_drift() {
     permission["paths"]["/accounts/{account_id}/workers/domains"]["put"]["x-api-token-group"] =
         json!(["Workers Scripts Read"]);
     assert_blocked(permission, "permission");
+
+    let mut missing_dns_read = worker_domain_fixture();
+    missing_dns_read["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/zones/{zone_id}/dns_records");
+    assert_blocked(missing_dns_read, "missing DNS conflict read");
+
+    let mut dns_permission = worker_domain_fixture();
+    dns_permission["paths"]["/zones/{zone_id}/dns_records"]["get"]["x-api-token-group"] =
+        json!(["DNS Write"]);
+    assert_blocked(dns_permission, "DNS read permission");
 
     let mut request = worker_domain_fixture();
     request["paths"]["/accounts/{account_id}/workers/domains"]["put"]["requestBody"]
@@ -9067,6 +9106,11 @@ fn oauth_client_create_and_update_are_identity_bound_and_snapshot_ready() {
 
     for capability in [create, update] {
         assert_eq!(capability.adapter_status, AdapterStatus::DynamicApi);
+        assert_eq!(
+            capability.permissions,
+            ["OAuth Client Write", "OAuth Client Read"],
+            "the governed mutation lifecycle must declare both its write and exact-detail read authority"
+        );
         assert_eq!(capability.risk, RiskClass::IdentityOrOwnership);
         assert_eq!(capability.effect, EffectClass::IdentityOrOwnership);
         assert!(capability.cost.known);
@@ -9197,6 +9241,10 @@ fn oauth_client_rotation_is_a_sink_bound_two_secret_cutover() {
         .expect("OAuth old-secret delete");
 
     assert_eq!(rotate.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(
+        rotate.permissions,
+        ["OAuth Client Write", "OAuth Client Read"]
+    );
     assert_eq!(rotate.risk, RiskClass::SecretSensitive);
     assert_eq!(rotate.effect, EffectClass::IdentityOrOwnership);
     assert!(rotate.cost.known);
@@ -9226,6 +9274,10 @@ fn oauth_client_rotation_is_a_sink_bound_two_secret_cutover() {
     assert!(rotate.mutation_contract_gaps().is_empty());
 
     assert_eq!(delete_old.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(
+        delete_old.permissions,
+        ["OAuth Client Write", "OAuth Client Read"]
+    );
     assert_eq!(delete_old.risk, RiskClass::Destructive);
     assert_eq!(delete_old.effect, EffectClass::Irreversible);
     assert!(delete_old.cost.known);

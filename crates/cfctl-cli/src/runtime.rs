@@ -8564,7 +8564,7 @@ fn is_oauth_client_create_operation_identity(capability: &CapabilityV1) -> bool 
         && capability.path == OAUTH_CLIENT_COLLECTION_PATH
         && capability.product == "OAuth Clients"
         && capability.account_scope == "account"
-        && capability.permissions == ["OAuth Client Write"]
+        && capability.permissions == ["OAuth Client Write", "OAuth Client Read"]
 }
 
 fn is_oauth_client_create_capability(capability: &CapabilityV1) -> bool {
@@ -8623,7 +8623,7 @@ fn is_oauth_client_update_capability(capability: &CapabilityV1) -> bool {
         && capability.path == OAUTH_CLIENT_DETAIL_PATH
         && capability.product == "OAuth Clients"
         && capability.account_scope == "account"
-        && capability.permissions == ["OAuth Client Write"]
+        && capability.permissions == ["OAuth Client Write", "OAuth Client Read"]
         && capability.risk == RiskClass::IdentityOrOwnership
         && capability.effect == EffectClass::IdentityOrOwnership
         && capability.cost.known
@@ -26972,7 +26972,7 @@ mod tests {
         required_oauth_client_update_state_precondition, required_r2_parent_token_precondition,
         required_warp_connector_configuration_state_precondition,
         required_web_analytics_rum_state_precondition, required_zone_account_precondition,
-        resolve_kv_empty_namespace_delete_cost, resolve_mint_token_bindings,
+        resolve_actionable, resolve_kv_empty_namespace_delete_cost, resolve_mint_token_bindings,
         resolve_mint_token_scope, run_bounded_pages_git_program, secret_sink_artifact,
         secret_sink_format, should_bind_cloudflare_tunnel_configuration_state,
         should_bind_d1_read_replication_state, should_bind_dns_record_state,
@@ -34885,7 +34885,10 @@ mod tests {
             "/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret",
         );
         capability.product = "OAuth Clients".to_owned();
-        capability.permissions = vec!["OAuth Client Write".to_owned()];
+        capability.permissions = vec![
+            "OAuth Client Write".to_owned(),
+            "OAuth Client Read".to_owned(),
+        ];
         capability.adapter_status = AdapterStatus::DynamicApi;
         capability.cost = CostV1::default();
         capability.entitlement.available = Some(true);
@@ -35005,7 +35008,10 @@ mod tests {
         };
         let mut capability = CapabilityV1::new(id, id, method, path);
         capability.product = "OAuth Clients".to_owned();
-        capability.permissions = vec!["OAuth Client Write".to_owned()];
+        capability.permissions = vec![
+            "OAuth Client Write".to_owned(),
+            "OAuth Client Read".to_owned(),
+        ];
         capability.adapter_status = AdapterStatus::DynamicApi;
         capability.risk = RiskClass::IdentityOrOwnership;
         capability.effect = EffectClass::IdentityOrOwnership;
@@ -35250,6 +35256,10 @@ mod tests {
         .expect("prepared OAuth update plan");
         let plan = &envelope.result["plan"];
         assert_eq!(
+            plan["capability"]["permissions"],
+            json!(["OAuth Client Write", "OAuth Client Read"])
+        );
+        assert_eq!(
             plan["precondition_hashes"][OAUTH_CLIENT_UPDATE_STATE_PRECONDITION],
             receipt_hash
         );
@@ -35279,6 +35289,16 @@ mod tests {
     fn oauth_client_update_snapshot_routes_through_live_credential_resolution() {
         let capability = oauth_client_capability(true);
 
+        let (resolved, _) = resolve_actionable(
+            &capability,
+            "promote the exact OAuth client",
+            Some("account-a"),
+        );
+        assert_eq!(
+            resolved["permission_lane"],
+            json!(["OAuth Client Write", "OAuth Client Read"])
+        );
+
         assert!(
             should_bind_oauth_client_update_state(&capability),
             "the governed update requires a hash-bound live snapshot"
@@ -35287,6 +35307,10 @@ mod tests {
             plan_requires_live_credential(&capability, &json!({})),
             "planning must resolve a credential before preparing the OAuth snapshot"
         );
+
+        let mut missing_read = capability;
+        missing_read.permissions = vec!["OAuth Client Write".to_owned()];
+        assert!(!should_bind_oauth_client_update_state(&missing_read));
     }
 
     #[cfg(unix)]
@@ -35328,6 +35352,10 @@ mod tests {
             .expect("mode-0700 operator-secret root");
         let sink = root.path().join("oauth-client.json");
         let (capability, mut plan) = oauth_client_create_test_plan(&sink);
+        assert_eq!(
+            capability.permissions,
+            ["OAuth Client Write", "OAuth Client Read"]
+        );
         assert!(is_secret_output_capability(&capability));
         assert!(should_redact_secret_response(&capability));
         assert_eq!(secret_sink_format(&capability), Some("oauth_client_json"));

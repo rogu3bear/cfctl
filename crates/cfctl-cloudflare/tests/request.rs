@@ -6522,7 +6522,10 @@ fn oauth_client_create_plan() -> PlanV1 {
     );
     "OAuth Clients".clone_into(&mut plan.capability.product);
     "account".clone_into(&mut plan.capability.account_scope);
-    plan.capability.permissions = vec!["OAuth Client Write".to_owned()];
+    plan.capability.permissions = vec![
+        "OAuth Client Write".to_owned(),
+        "OAuth Client Read".to_owned(),
+    ];
     plan.capability.selectors = vec![SelectorV1 {
         name: "account_id".to_owned(),
         location: "path".to_owned(),
@@ -8831,7 +8834,10 @@ fn oauth_client_secret_plan(id: &str, method: &str, verification_strategy: &str)
         "/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret",
     );
     "OAuth Clients".clone_into(&mut capability.product);
-    capability.permissions = vec!["OAuth Client Write".to_owned()];
+    capability.permissions = vec![
+        "OAuth Client Write".to_owned(),
+        "OAuth Client Read".to_owned(),
+    ];
     verification_strategy.clone_into(&mut capability.verification.strategy);
     capability.selectors = vec![
         SelectorV1 {

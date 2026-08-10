@@ -7905,6 +7905,9 @@ const WORKER_DOMAIN_READ_CAPABILITY_ID: &str = "workers.domains.get";
 const WORKER_DOMAIN_DELETE_CAPABILITY_ID: &str = "workers.domains.delete";
 const WORKER_DOMAIN_COLLECTION_PATH: &str = "/accounts/{account_id}/workers/domains";
 const WORKER_DOMAIN_DETAIL_PATH: &str = "/accounts/{account_id}/workers/domains/{domain_id}";
+const WORKER_DOMAIN_DNS_LIST_CAPABILITY_ID: &str = "dns-records-for-a-zone-list-dns-records";
+const WORKER_DOMAIN_DNS_LIST_PATH: &str = "/zones/{zone_id}/dns_records";
+const WORKER_DOMAIN_ATTACH_LIFECYCLE_PERMISSIONS: [&str; 2] = ["Workers Scripts Write", "DNS Read"];
 
 fn worker_domain_path_selectors_supported(capability: &CapabilityV1, expected: &[&str]) -> bool {
     capability.selectors.len() == expected.len()
@@ -7982,6 +7985,45 @@ fn worker_domain_companions_supported(capabilities: &BTreeMap<String, Capability
             })
 }
 
+fn worker_domain_dns_conflict_read_supported(
+    capabilities: &BTreeMap<String, CapabilityV1>,
+) -> bool {
+    capabilities
+        .get(WORKER_DOMAIN_DNS_LIST_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.method == "GET"
+                && capability.path == WORKER_DOMAIN_DNS_LIST_PATH
+                && capability.product == "DNS Records for a Zone"
+                && capability.account_scope == "zone"
+                && !capability.mutating
+                && capability.request_schema.is_none()
+                && capability
+                    .permissions
+                    .iter()
+                    .any(|permission| permission == "DNS Read")
+                && capability.selectors.iter().any(|selector| {
+                    selector.name == "zone_id"
+                        && selector.location == "path"
+                        && selector.required
+                        && selector.value_type == "string"
+                })
+                && capability.selectors.iter().any(|selector| {
+                    selector.name == "name.exact"
+                        && selector.location == "query"
+                        && !selector.required
+                        && selector.value_type == "string"
+                })
+                && capability
+                    .response_contract
+                    .as_ref()
+                    .is_some_and(|contract| {
+                        contract.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                            && contract.success_statuses == ["200"]
+                            && contract.success_media_types == ["application/json"]
+                    })
+        })
+}
+
 fn worker_domain_responses_supported(document: &Value) -> bool {
     let attach_operation =
         document.pointer("/paths/~1accounts~1{account_id}~1workers~1domains/put");
@@ -8009,6 +8051,7 @@ fn finalize_worker_custom_domain_attach_contract(
     capabilities: &mut BTreeMap<String, CapabilityV1>,
 ) {
     let companions_supported = worker_domain_companions_supported(capabilities);
+    let dns_conflict_read_supported = worker_domain_dns_conflict_read_supported(capabilities);
     let response_supported = worker_domain_responses_supported(document);
 
     let Some(capability) = capabilities.get_mut(WORKER_DOMAIN_ATTACH_CAPABILITY_ID) else {
@@ -8021,15 +8064,23 @@ fn finalize_worker_custom_domain_attach_contract(
         && capability.permissions == ["Workers Scripts Write"]
         && worker_domain_path_selectors_supported(capability, &["account_id"])
         && worker_domain_upstream_request_supported(capability.request_schema.as_ref());
-    if !attach_supported || !companions_supported || !response_supported {
+    if !attach_supported
+        || !companions_supported
+        || !dns_conflict_read_supported
+        || !response_supported
+    {
         capability.created_resource = None;
         capability.adapter_status = AdapterStatus::Blocked;
         capability.blocked_reason = Some(format!(
-            "Worker custom-domain attach, exact readback, detach, request, permission, or response contract drifted (attach={attach_supported}, companions={companions_supported}, response={response_supported})"
+            "Worker custom-domain attach, exact readback, detach, DNS conflict read, request, permission, or response contract drifted (attach={attach_supported}, companions={companions_supported}, dns_conflict_read={dns_conflict_read_supported}, response={response_supported})"
         ));
         return;
     }
 
+    capability.permissions = WORKER_DOMAIN_ATTACH_LIFECYCLE_PERMISSIONS
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     capability.request_schema = Some(worker_domain_attach_request_schema());
     capability.risk = RiskClass::CrossConfig;
     capability.effect = EffectClass::ReversibleWrite;
@@ -12185,6 +12236,7 @@ const OAUTH_CLIENT_SECRET_PATH: &str =
     "/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret";
 const OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID: &str = "oauth-clients-get";
 const OAUTH_CLIENT_DELETE_CAPABILITY_ID: &str = "oauth-clients-delete";
+const OAUTH_CLIENT_LIFECYCLE_PERMISSIONS: [&str; 2] = ["OAuth Client Write", "OAuth Client Read"];
 const OAUTH_CLIENT_CONFIGURATION_FIELDS: [&str; 12] = [
     "allowed_cors_origins",
     "client_name",
@@ -12479,6 +12531,10 @@ fn finalize_oauth_client_create_contract(
                 .as_ref()
                 .is_some_and(oauth_client_json_response_supported);
         if create_supported && companions_supported {
+            capability.permissions = OAUTH_CLIENT_LIFECYCLE_PERMISSIONS
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
             capability.request_schema = Some(oauth_client_closed_create_schema());
             capability.risk = RiskClass::IdentityOrOwnership;
             capability.effect = EffectClass::IdentityOrOwnership;
@@ -12540,6 +12596,10 @@ fn finalize_oauth_client_update_contract(
                 .as_ref()
                 .is_some_and(oauth_client_json_response_supported);
         if update_supported && companions_supported {
+            capability.permissions = OAUTH_CLIENT_LIFECYCLE_PERMISSIONS
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
             capability.request_schema = Some(oauth_client_closed_update_schema());
             capability.risk = RiskClass::IdentityOrOwnership;
             capability.effect = EffectClass::IdentityOrOwnership;
@@ -12669,6 +12729,10 @@ fn finalize_oauth_client_secret_rotation_contract(
         let Some(capability) = capabilities.get_mut(capability_id) else {
             continue;
         };
+        capability.permissions = OAUTH_CLIENT_LIFECYCLE_PERMISSIONS
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         capability.same_path_read = Some(SamePathReadContractV1 {
             path: OAUTH_CLIENT_DETAIL_PATH.to_owned(),
             read_capability_id: OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID.to_owned(),

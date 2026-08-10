@@ -3126,7 +3126,7 @@ fn oauth_client_secret_verification_contract_supported(capability: &CapabilityV1
     operation_supported
         && capability.product == "OAuth Clients"
         && capability.account_scope == "account"
-        && capability.permissions == ["OAuth Client Write"]
+        && capability.permissions == ["OAuth Client Write", "OAuth Client Read"]
         && capability.path == "/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret"
         && capability.request_schema.is_none()
         && capability.selectors.len() == 2

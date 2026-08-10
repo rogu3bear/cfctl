@@ -37,6 +37,7 @@ pub(super) fn should_bind_state(capability: &CapabilityV1) -> bool {
         && capability.path == ATTACH_PATH
         && capability.product == "Domains"
         && capability.account_scope == "account"
+        && capability.permissions == ["Workers Scripts Write", "DNS Read"]
         && capability.mutating
         && matches!(
             capability.adapter_status,
@@ -194,7 +195,11 @@ fn dns_list_supported(capability: &CapabilityV1) -> bool {
         DNS_LIST_PATH,
         "DNS Records for a Zone",
         "zone",
-    ) && selector_supported(capability, "zone_id", "path", true)
+    ) && capability
+        .permissions
+        .iter()
+        .any(|permission| permission == "DNS Read")
+        && selector_supported(capability, "zone_id", "path", true)
         && selector_supported(capability, "name.exact", "query", false)
 }
 
@@ -570,7 +575,9 @@ mod tests {
     use cfctl_storage::{RuntimePaths, StateStore};
     use serde_json::json;
 
-    use super::super::{plan_requires_live_credential, validate_plan_preconditions};
+    use super::super::{
+        plan_requires_live_credential, resolve_actionable, validate_plan_preconditions,
+    };
 
     fn attach_capability() -> CapabilityV1 {
         let mut capability = CapabilityV1::new(
@@ -581,7 +588,7 @@ mod tests {
         );
         capability.product = "Domains".to_owned();
         capability.account_scope = "account".to_owned();
-        capability.permissions = vec!["Workers Scripts Write".to_owned()];
+        capability.permissions = vec!["Workers Scripts Write".to_owned(), "DNS Read".to_owned()];
         capability.adapter_status = AdapterStatus::DynamicApi;
         capability.mutating = true;
         capability.risk = RiskClass::CrossConfig;
@@ -730,6 +737,11 @@ mod tests {
     #[test]
     fn custom_domain_plan_routes_and_hash_binds_live_state() {
         let capability = attach_capability();
+        let (resolved, _) = resolve_actionable(&capability, "attach cfctl.com", Some("account-a"));
+        assert_eq!(
+            resolved["permission_lane"],
+            json!(["Workers Scripts Write", "DNS Read"])
+        );
         let input = CallInput {
             selectors: json!({"account_id":"account-a"}),
             query: json!({}),
@@ -771,6 +783,10 @@ mod tests {
         )
         .expect("custom-domain plan");
         plan.input = serde_json::to_value(&input).expect("serialized custom-domain input");
+        assert_eq!(
+            plan.capability.permissions,
+            ["Workers Scripts Write", "DNS Read"]
+        );
         plan.precondition_hashes.insert(
             WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION.to_owned(),
             hash_value(&receipt).expect("receipt hash"),
@@ -794,5 +810,9 @@ mod tests {
         );
         plan.targets["live_preconditions"][WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION] = retargeted;
         required_precondition(&plan).expect_err("a rehashed cross-host receipt must fail");
+
+        let mut missing_dns_permission = attach_capability();
+        missing_dns_permission.permissions = vec!["Workers Scripts Write".to_owned()];
+        assert!(!should_bind_state(&missing_dns_permission));
     }
 }
