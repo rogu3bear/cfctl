@@ -207,12 +207,55 @@ fn verify() -> Result<(), TaskError> {
             "--locked",
         ],
     )?;
+    verify_site()?;
     verify_event_ingress_bridge()?;
     verify_security_contract()?;
     verify_source_contract()?;
     verify_cross_target()?;
     report_pre_push_registration();
     Ok(())
+}
+
+fn verify_site() -> Result<(), TaskError> {
+    let root = repository_root()?.join("site");
+
+    let mut fmt = Command::new("cargo");
+    fmt.args(["fmt", "--", "--check"]).current_dir(&root);
+    run_command(&mut fmt, "cargo fmt -- --check (site)")?;
+
+    let mut clippy = Command::new("cargo");
+    clippy
+        .args([
+            "clippy",
+            "--all-targets",
+            "--features",
+            "ssr",
+            "--locked",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .current_dir(&root);
+    run_command(
+        &mut clippy,
+        "cargo clippy --all-targets --features ssr --locked -- -D warnings (site)",
+    )?;
+
+    let mut test = Command::new("cargo");
+    test.args(["test", "--all-targets", "--features", "ssr", "--locked"])
+        .current_dir(&root);
+    run_command(
+        &mut test,
+        "cargo test --all-targets --features ssr --locked (site)",
+    )?;
+
+    let mut edge = Command::new("bash");
+    edge.arg("./scripts/verify-reproducible-edge.sh")
+        .current_dir(&root);
+    run_command(
+        &mut edge,
+        "bash ./scripts/verify-reproducible-edge.sh (site)",
+    )
 }
 
 fn verify_event_ingress_bridge() -> Result<(), TaskError> {
@@ -2715,6 +2758,36 @@ mod tests {
         verify_quickstart_pins_the_release_version, verify_tracked_cfctl_command_references,
         verify_v1_cutover_contract, verify_workspace_dependency_versions,
     };
+
+    #[test]
+    fn hosted_proof_checks_out_and_verifies_the_exact_event_candidate() {
+        let workflow = include_str!("../../.github/workflows/hosted-proof.yml");
+        let selected_sha = "${{ github.event.pull_request.head.sha || github.sha }}";
+
+        assert_eq!(
+            workflow
+                .matches(&format!("PROOF_SHA: {selected_sha}"))
+                .count(),
+            1,
+            "the event-specific proof identity must be single-sourced"
+        );
+        assert_eq!(
+            workflow.matches("ref: ${{ env.PROOF_SHA }}").count(),
+            2,
+            "both hosted jobs must explicitly check out the selected source SHA"
+        );
+        assert_eq!(
+            workflow
+                .matches("test \"$(git rev-parse HEAD)\" = \"$PROOF_SHA\"")
+                .count(),
+            2,
+            "both hosted jobs must compare HEAD with that same selected source SHA"
+        );
+        assert!(
+            !workflow.contains("$GITHUB_SHA"),
+            "pull_request GITHUB_SHA names the synthetic merge commit, not the PR head"
+        );
+    }
 
     #[test]
     fn bootstrap_does_not_hold_an_outer_cargo_gate_around_xtask() {

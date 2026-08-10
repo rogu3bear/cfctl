@@ -35,6 +35,33 @@ fn discovery_stays_inside_registered_roots_and_finds_cloudflare_configs() {
 }
 
 #[test]
+fn pages_output_config_is_discovered_as_a_pages_project_not_a_worker() {
+    let root = tempfile::tempdir().expect("workspace root");
+    init_repo(
+        &root.path().join("site-source"),
+        "wrangler.toml",
+        concat!(
+            "name = \"site-project\"\n",
+            "compatibility_date = \"2026-04-22\"\n",
+            "pages_build_output_dir = \"./target/site\"\n",
+        ),
+    );
+
+    let graph =
+        WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).expect("Pages discovery");
+
+    assert!(graph.resources.iter().any(|resource| {
+        resource.key == "pages_project:site-project" && resource.kind == "wrangler_pages"
+    }));
+    assert!(
+        graph
+            .resources
+            .iter()
+            .all(|resource| resource.key != "worker:site-project")
+    );
+}
+
+#[test]
 fn nested_fixture_directories_are_excluded_but_explicit_fixture_roots_are_discoverable() {
     let root = tempfile::tempdir().expect("workspace root");
     let repository = root.path().join("production-app");

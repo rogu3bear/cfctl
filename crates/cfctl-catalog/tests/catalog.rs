@@ -1,16 +1,20 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::collections::BTreeMap;
+
 use cfctl_catalog::{
-    CatalogChangeKind, CatalogIndex, CatalogSnapshot, OfficialTextFeedsV1,
-    attach_official_product_knowledge, ingest_cli_help, ingest_native_control_capabilities,
-    ingest_telemetry_capabilities, ingest_wrangler_pages_deploy_help,
-    ingest_wrangler_worker_versions_help, markdown_link, markdown_links, normalize_openapi,
+    CatalogChangeKind, CatalogIndex, CatalogSnapshot, LEGACY_EMBEDDED_CAPABILITY_IDS,
+    OfficialTextFeedsV1, attach_official_product_knowledge, ingest_cli_help,
+    ingest_native_control_capabilities, ingest_telemetry_capabilities,
+    ingest_wrangler_pages_deploy_help, ingest_wrangler_worker_versions_help, markdown_link,
+    markdown_links, normalize_openapi,
 };
 use cfctl_core::{
-    AdapterStatus, AnalyticsQueryKindV1, BillingModelV1, CapabilityV1, CostExposureV1,
-    CreatedResourceContractV1, DeletedResourceContractV1, EffectClass, KnowledgeReferenceV1,
-    PaginationModeV1, ResponseBodyModeV1, ResponseContractV1, RiskClass, SamePathReadContractV1,
-    SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorV1, TimestampFormatV1, hash_value,
+    AdapterStatus, AnalyticsQueryKindV1, BillingModelV1, CapabilityAuthorityScopeV1, CapabilityV1,
+    CostExposureV1, CreatedResourceContractV1, DeletedResourceContractV1, EffectClass,
+    KnowledgeReferenceV1, PaginationModeV1, ResponseBodyModeV1, ResponseContractV1, RiskClass,
+    SamePathReadContractV1, SecurityActionKindV1, SecurityActionSafetyProfileV1, SelectorV1,
+    TimestampFormatV1, hash_value,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -151,6 +155,245 @@ fn pages_domain_fixture() -> Value {
             "parameters": [account, project, domain],
             "responses": cloudflare_envelope_responses(),
             "x-api-token-group": ["Pages Write"]
+        }
+    });
+    document
+}
+
+fn worker_domain_result_responses() -> Value {
+    json!({
+        "200": {
+            "description": "Cloudflare API envelope with a Worker domain",
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["success", "result"],
+                "properties": {
+                    "success": {"type": "boolean"},
+                    "result": {
+                        "type": "object",
+                        "required": ["cert_id", "hostname", "id", "service", "zone_id", "zone_name"],
+                        "properties": {
+                            "cert_id": {"type": "string"},
+                            "hostname": {"type": "string"},
+                            "id": {"type": "string"},
+                            "service": {"type": "string"},
+                            "zone_id": {"type": "string"},
+                            "zone_name": {"type": "string"}
+                        }
+                    }
+                }
+            }}}
+        }
+    })
+}
+
+fn worker_domain_fixture() -> Value {
+    let mut document = fixture();
+    let account = json!({
+        "in": "path",
+        "name": "account_id",
+        "required": true,
+        "description": "Identifier.",
+        "schema": {"maxLength": 32, "type": "string"}
+    });
+    let domain = json!({
+        "in": "path",
+        "name": "domain_id",
+        "required": true,
+        "description": "ID of the domain.",
+        "schema": {"type": "string"}
+    });
+    document["paths"]["/accounts/{account_id}/workers/domains"] = json!({
+        "put": {
+            "operationId": "workers.domains.update",
+            "summary": "Attach Domain",
+            "tags": ["Domains"],
+            "parameters": [account.clone()],
+            "requestBody": {
+                "required": true,
+                "content": {"application/json": {"schema": {
+                    "allOf": [
+                        {
+                            "type": "object",
+                            "required": ["zone_id", "zone_name", "hostname", "service"],
+                            "properties": {
+                                "hostname": {"type": "string"},
+                                "service": {"type": "string"},
+                                "zone_id": {"type": "string"},
+                                "zone_name": {"type": "string"}
+                            }
+                        },
+                        {"type": "object", "required": ["hostname", "service"]}
+                    ]
+                }}}
+            },
+            "responses": worker_domain_result_responses(),
+            "x-api-token-group": ["Workers Scripts Write"]
+        }
+    });
+    document["paths"]["/accounts/{account_id}/workers/domains/{domain_id}"] = json!({
+        "get": {
+            "operationId": "workers.domains.get",
+            "summary": "Get Domain",
+            "tags": ["Domains"],
+            "parameters": [account.clone(), domain.clone()],
+            "responses": worker_domain_result_responses(),
+            "x-api-token-group": ["Workers Scripts Write", "Workers Scripts Read"]
+        },
+        "delete": {
+            "operationId": "workers.domains.delete",
+            "summary": "Detach Domain",
+            "tags": ["Domains"],
+            "parameters": [account, domain],
+            "responses": cloudflare_envelope_responses(),
+            "x-api-token-group": ["Workers Scripts Write"]
+        }
+    });
+    document["paths"]["/zones/{zone_id}/dns_records"] = json!({
+        "get": {
+            "operationId": "dns-records-for-a-zone-list-dns-records",
+            "summary": "List DNS Records",
+            "tags": ["DNS Records for a Zone"],
+            "x-api-token-group": ["DNS Read", "DNS Write"],
+            "parameters": [
+                {
+                    "in": "path",
+                    "name": "zone_id",
+                    "required": true,
+                    "schema": {"maxLength": 32, "type": "string"}
+                },
+                {
+                    "in": "query",
+                    "name": "name.exact",
+                    "required": false,
+                    "schema": {"type": "string"}
+                }
+            ],
+            "responses": cloudflare_envelope_responses()
+        }
+    });
+    document
+}
+
+fn pages_project_result_schema() -> Value {
+    json!({
+        "type":"object",
+        "required":["name","production_branch","build_config","source"],
+        "properties":{
+            "name":{"type":"string"},
+            "production_branch":{"type":"string"},
+            "build_config":{"type":"object","properties":{
+                "build_command":{"type":"string"},
+                "destination_dir":{"type":"string"},
+                "root_dir":{"type":"string"}
+            }},
+            "source":{"type":"object","properties":{
+                "type":{"type":"string"},
+                "config":{"type":"object"}
+            }}
+        }
+    })
+}
+
+fn pages_project_source_config_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "deployments_enabled":{"type":"boolean"},
+            "owner":{"type":"string"},
+            "owner_id":{"type":"string"},
+            "path_excludes":{"type":"array","items":{"type":"string"}},
+            "path_includes":{"type":"array","items":{"type":"string"}},
+            "pr_comments_enabled":{"type":"boolean"},
+            "preview_branch_excludes":{"type":"array","items":{"type":"string"}},
+            "preview_branch_includes":{"type":"array","items":{"type":"string"}},
+            "preview_deployment_setting":{"type":"string","enum":["all","none","custom"]},
+            "production_branch":{"type":"string"},
+            "production_deployments_enabled":{"type":"boolean"},
+            "repo_id":{"type":"string"},
+            "repo_name":{"type":"string"}
+        }
+    })
+}
+
+fn pages_project_request_schema() -> Value {
+    json!({
+        "type":"object",
+        "required":["name","production_branch"],
+        "properties":{
+            "name":{"type":"string"},
+            "production_branch":{"type":"string"},
+            "build_config":{"type":"object","properties":{
+                "build_caching":{"type":"boolean"},
+                "build_command":{"type":"string"},
+                "destination_dir":{"type":"string"},
+                "root_dir":{"type":"string"},
+                "web_analytics_tag":{"type":"string"}
+            }},
+            "deployment_configs":{"type":"object"},
+            "source":{
+                "type":"object",
+                "required":["type","config"],
+                "properties":{
+                    "type":{"type":"string","enum":["github","gitlab"]},
+                    "config":pages_project_source_config_schema()
+                }
+            }
+        }
+    })
+}
+
+fn pages_project_create_fixture() -> Value {
+    let mut document = fixture();
+    let account = json!({
+        "in": "path",
+        "name": "account_id",
+        "required": true,
+        "schema": {"maxLength": 32, "type": "string"}
+    });
+    let project = json!({
+        "in": "path",
+        "name": "project_name",
+        "required": true,
+        "schema": {"type": "string"}
+    });
+    let project_response = json!({
+        "200":{"description":"ok","content":{"application/json":{"schema":{
+            "type":"object",
+            "required":["success","result"],
+            "properties":{
+                "success":{"type":"boolean"},
+                "result":pages_project_result_schema()
+            }
+        }}}}
+    });
+    document["paths"]["/accounts/{account_id}/pages/projects"] = json!({
+        "post":{
+            "operationId":"pages-project-create-project",
+            "summary":"Create project",
+            "tags":["Pages Project"],
+            "x-api-token-group":["Pages Write"],
+            "parameters":[account.clone()],
+            "requestBody":{"required":true,"content":{"application/json":{"schema":pages_project_request_schema()}}},
+            "responses":project_response.clone()
+        }
+    });
+    document["paths"]["/accounts/{account_id}/pages/projects/{project_name}"] = json!({
+        "get":{
+            "operationId":"pages-project-get-project",
+            "summary":"Get project",
+            "tags":["Pages Project"],
+            "x-api-token-group":["Pages Read","Pages Write"],
+            "parameters":[account.clone(),project.clone()],
+            "responses":project_response
+        },
+        "delete":{
+            "operationId":"pages-project-delete-project",
+            "summary":"Delete project",
+            "tags":["Pages Project"],
+            "x-api-token-group":["Pages Write"],
+            "parameters":[account,project],
+            "responses":cloudflare_envelope_responses()
         }
     });
     document
@@ -2029,6 +2272,59 @@ fn selector_contract_preserves_bounded_query_schema_and_serialization() {
 }
 
 #[test]
+fn pages_deployment_uuid_selector_corrects_only_pages_deployment_paths() {
+    let mut document = fixture();
+    let bounded_deployment = json!({
+        "in": "path",
+        "name": "deployment_id",
+        "required": true,
+        "schema": {"type": "string", "maxLength": 32}
+    });
+    let operation = |operation_id: &str, tag: &str| {
+        json!({
+            "get": {
+                "operationId": operation_id,
+                "summary": "Read deployment logs",
+                "tags": [tag],
+                "parameters": [
+                    {"in":"path","name":"account_id","required":true,"schema":{"type":"string","maxLength":32}},
+                    {"in":"path","name":"project_name","required":true,"schema":{"type":"string"}},
+                    bounded_deployment.clone()
+                ],
+                "responses": cloudflare_envelope_responses()
+            }
+        })
+    };
+    document["paths"]["/accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}/history/logs"] =
+        operation("pages-deployment-get-deployment-logs", "Pages Deployment");
+    document["paths"]["/accounts/{account_id}/unrelated/{deployment_id}"] =
+        operation("unrelated-get-deployment", "Unrelated");
+
+    let snapshot = normalize_openapi(&document).expect("Pages deployment selector catalog");
+    let selector_schema = |capability_id: &str| {
+        snapshot
+            .get(capability_id)
+            .expect("capability")
+            .selectors
+            .iter()
+            .find(|selector| selector.name == "deployment_id")
+            .and_then(|selector| selector.contract.as_ref())
+            .map(|contract| contract.schema.clone())
+            .expect("deployment selector schema")
+    };
+
+    let pages = selector_schema("pages-deployment-get-deployment-logs");
+    assert_eq!(pages["minLength"], 36);
+    assert_eq!(pages["maxLength"], 36);
+    assert!(
+        pages["pattern"]
+            .as_str()
+            .is_some_and(|value| value.contains('-'))
+    );
+    assert_eq!(selector_schema("unrelated-get-deployment")["maxLength"], 32);
+}
+
+#[test]
 fn selector_contract_resolves_local_parameter_references_and_operation_overrides() {
     let mut document = fixture();
     document["components"]["parameters"] = json!({
@@ -2284,6 +2580,292 @@ fn pages_domain_create_binds_exact_readback_and_reviewed_delete_compensation() {
 }
 
 #[test]
+fn worker_domain_attach_is_exact_identity_bound_and_separately_reversible() {
+    let snapshot = normalize_openapi(&worker_domain_fixture()).expect("Worker domain catalog");
+    let attach = snapshot
+        .get("workers.domains.update")
+        .expect("Worker domain attach");
+
+    assert_eq!(attach.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(attach.method, "PUT");
+    assert_eq!(attach.path, "/accounts/{account_id}/workers/domains");
+    assert_eq!(
+        attach.permissions,
+        ["Workers Scripts Write", "DNS Read"],
+        "the governed attach lifecycle must disclose its exact-host DNS conflict read"
+    );
+    assert_eq!(attach.risk, RiskClass::CrossConfig);
+    assert_eq!(attach.effect, EffectClass::ReversibleWrite);
+    assert_eq!(attach.entitlement.available, Some(true));
+    assert!(attach.entitlement.plans.is_empty());
+    assert_eq!(
+        attach.entitlement.source.as_deref(),
+        Some("https://developers.cloudflare.com/workers/configuration/routing/custom-domains/")
+    );
+    assert_eq!(attach.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(attach.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(attach.cost.maximum, Some(0.0));
+    assert!(attach.cost.basis.as_deref().is_some_and(|basis| {
+        basis.contains("no direct attachment charge")
+            && basis.contains("request and CPU usage exposure")
+    }));
+
+    let schema = attach
+        .request_schema
+        .as_ref()
+        .expect("closed Worker domain request");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["required"],
+        json!(["hostname", "service", "zone_id"])
+    );
+    assert!(schema["properties"].get("zone_name").is_none());
+    assert_eq!(schema["properties"]["zone_id"]["minLength"], 32);
+    assert_eq!(schema["properties"]["zone_id"]["maxLength"], 32);
+
+    assert_eq!(
+        attach.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    let target = attach
+        .created_resource
+        .as_ref()
+        .expect("created Worker domain contract");
+    assert_eq!(
+        target.detail_path,
+        "/accounts/{account_id}/workers/domains/{domain_id}"
+    );
+    assert_eq!(target.identity_selector, "domain_id");
+    assert_eq!(target.response_result_identity_pointer, "/id");
+    assert_eq!(target.read_capability_id, "workers.domains.get");
+    assert_eq!(target.delete_capability_id, "workers.domains.delete");
+    assert_eq!(
+        target.verified_response_fields,
+        ["hostname", "service", "zone_id"]
+    );
+    assert_eq!(
+        attach.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    assert!(attach.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("separate exact-domain detach plan")
+            && warning.contains("Advanced Certificate")
+    }));
+    assert!(attach.verification_contract_supported());
+    assert!(attach.rollback_contract_supported());
+    assert!(attach.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn worker_domain_attach_fails_closed_on_every_lifecycle_contract_drift() {
+    let assert_blocked = |document: Value, dimension: &str| {
+        let snapshot = normalize_openapi(&document).expect("drifted Worker domain catalog");
+        let attach = snapshot
+            .get("workers.domains.update")
+            .expect("blocked Worker domain attach");
+        assert_eq!(attach.adapter_status, AdapterStatus::Blocked, "{dimension}");
+        assert!(attach.created_resource.is_none(), "{dimension}");
+        assert!(
+            attach
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("contract drifted")),
+            "{dimension}"
+        );
+    };
+
+    let mut method = worker_domain_fixture();
+    let operation = method["paths"]["/accounts/{account_id}/workers/domains"]
+        .as_object_mut()
+        .expect("collection path")
+        .remove("put")
+        .expect("attach operation");
+    method["paths"]["/accounts/{account_id}/workers/domains"]["post"] = operation;
+    assert_blocked(method, "method");
+
+    let mut permission = worker_domain_fixture();
+    permission["paths"]["/accounts/{account_id}/workers/domains"]["put"]["x-api-token-group"] =
+        json!(["Workers Scripts Read"]);
+    assert_blocked(permission, "permission");
+
+    let mut missing_dns_read = worker_domain_fixture();
+    missing_dns_read["paths"]
+        .as_object_mut()
+        .expect("paths")
+        .remove("/zones/{zone_id}/dns_records");
+    assert_blocked(missing_dns_read, "missing DNS conflict read");
+
+    let mut dns_permission = worker_domain_fixture();
+    dns_permission["paths"]["/zones/{zone_id}/dns_records"]["get"]["x-api-token-group"] =
+        json!(["DNS Write"]);
+    assert_blocked(dns_permission, "DNS read permission");
+
+    let mut request = worker_domain_fixture();
+    request["paths"]["/accounts/{account_id}/workers/domains"]["put"]["requestBody"]
+        ["content"]["application/json"]["schema"]["allOf"][0]["properties"]
+        .as_object_mut()
+        .expect("request properties")
+        .remove("zone_id");
+    assert_blocked(request, "request schema");
+
+    let mut identity = worker_domain_fixture();
+    identity["paths"]["/accounts/{account_id}/workers/domains"]["put"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("attach response properties")
+        .remove("id");
+    assert_blocked(identity, "identity pointer");
+
+    let mut readback = worker_domain_fixture();
+    readback["paths"]["/accounts/{account_id}/workers/domains/{domain_id}"]["get"]["operationId"] =
+        json!("workers.domains.get-drifted");
+    assert_blocked(readback, "readback");
+
+    let mut detach = worker_domain_fixture();
+    detach["paths"]["/accounts/{account_id}/workers/domains/{domain_id}"]["delete"]["x-api-token-group"] =
+        json!(["Workers Scripts Read"]);
+    assert_blocked(detach, "detach");
+}
+
+#[test]
+fn pages_project_create_is_bounded_to_git_integrated_static_pages() {
+    let snapshot = normalize_openapi(&pages_project_create_fixture()).expect("Pages catalog");
+    let create = snapshot
+        .get("pages-project-create-project")
+        .expect("Pages project create");
+
+    assert_eq!(create.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(create.risk, RiskClass::CrossConfig);
+    assert_eq!(create.effect, EffectClass::ReversibleWrite);
+    assert_eq!(create.cost.billing_model, BillingModelV1::UsageBased);
+    assert_eq!(create.cost.exposure, CostExposureV1::DownstreamUsage);
+    assert_eq!(create.cost.maximum, Some(0.0));
+    assert!(create.cost.basis.as_deref().is_some_and(|basis| {
+        basis.contains("no direct API-operation charge")
+            && basis.contains("Git integration starts and continues builds/deployments")
+            && basis.contains("Pages Functions")
+            && basis.contains("plan-specific downstream exposure")
+    }));
+
+    let schema = create
+        .request_schema
+        .as_ref()
+        .expect("closed request schema");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["required"],
+        json!(["name", "production_branch", "build_config", "source"])
+    );
+    assert!(schema["properties"].get("deployment_configs").is_none());
+    assert_eq!(
+        schema["properties"]["production_branch"]["enum"],
+        json!(["main"])
+    );
+    assert!(
+        schema["properties"]["build_config"]["properties"]
+            .get("web_analytics_tag")
+            .is_none()
+    );
+    assert_eq!(
+        schema["properties"]["source"]["properties"]["type"]["enum"],
+        json!(["github"])
+    );
+    let source_config = &schema["properties"]["source"]["properties"]["config"]["properties"];
+    assert_eq!(source_config["production_branch"]["enum"], json!(["main"]));
+    assert_eq!(
+        source_config["preview_deployment_setting"]["enum"],
+        json!(["all"])
+    );
+    assert_eq!(source_config["deployments_enabled"]["enum"], json!([true]));
+    assert_eq!(
+        source_config["production_deployments_enabled"]["enum"],
+        json!([true])
+    );
+    for excluded in [
+        "path_excludes",
+        "path_includes",
+        "preview_branch_excludes",
+        "preview_branch_includes",
+    ] {
+        assert!(source_config.get(excluded).is_none());
+    }
+    assert_eq!(
+        schema["properties"]["source"]["properties"]["config"]["additionalProperties"],
+        false
+    );
+
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    let target = create
+        .created_resource
+        .as_ref()
+        .expect("created Pages project contract");
+    assert_eq!(
+        target.detail_path,
+        "/accounts/{account_id}/pages/projects/{project_name}"
+    );
+    assert_eq!(target.identity_selector, "project_name");
+    assert_eq!(target.response_result_identity_pointer, "/name");
+    assert_eq!(target.read_capability_id, "pages-project-get-project");
+    assert_eq!(target.delete_capability_id, "pages-project-delete-project");
+    assert_eq!(
+        target.verified_response_fields,
+        ["build_config", "name", "production_branch", "source"]
+    );
+    assert_eq!(
+        create.rollback.strategy.as_deref(),
+        Some("delete_created_resource_by_returned_id")
+    );
+    assert!(create.rollback.warning.as_deref().is_some_and(|warning| {
+        warning.contains("separate exact-project deletion plan")
+            && warning.contains("does not delete the connected Git repository")
+    }));
+    assert!(create.verification_contract_supported());
+    assert!(create.rollback_contract_supported());
+    assert!(create.mutation_contract_gaps().is_empty());
+}
+
+#[test]
+fn pages_project_create_fails_closed_when_git_or_readback_contracts_drift() {
+    let mut missing_github = pages_project_create_fixture();
+    missing_github["paths"]["/accounts/{account_id}/pages/projects"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"]["properties"]["source"]["properties"]["type"]["enum"] =
+        json!(["gitlab"]);
+    let snapshot = normalize_openapi(&missing_github).expect("drifted catalog");
+    let create = snapshot
+        .get("pages-project-create-project")
+        .expect("blocked Pages create");
+    assert_eq!(create.adapter_status, AdapterStatus::Blocked);
+    assert!(
+        create
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("create=false"))
+    );
+
+    let mut missing_source_readback = pages_project_create_fixture();
+    missing_source_readback["paths"]
+        ["/accounts/{account_id}/pages/projects/{project_name}"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("result properties")
+        .remove("source");
+    let snapshot = normalize_openapi(&missing_source_readback).expect("drifted catalog");
+    let create = snapshot
+        .get("pages-project-create-project")
+        .expect("blocked Pages create");
+    assert_eq!(create.adapter_status, AdapterStatus::Blocked);
+    assert!(
+        create
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("response=false"))
+    );
+}
+
+#[test]
 fn cloudflared_quick_tunnel_has_a_closed_publication_contract() {
     let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
     ingest_cli_help(
@@ -2346,6 +2928,106 @@ fn sqlite_index_is_rebuildable_from_the_authoritative_snapshot() {
         index.schema_hash().expect("schema hash"),
         snapshot.schema_hash
     );
+}
+
+#[test]
+fn catalog_v2_classifies_generic_and_frozen_legacy_authority() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    assert_eq!(snapshot.schema_version, 2);
+    assert!(snapshot.capabilities.values().all(|capability| {
+        capability.authority_scope == Some(CapabilityAuthorityScopeV1::ProviderGeneric)
+    }));
+
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    let legacy_ids = snapshot
+        .capabilities
+        .values()
+        .filter(|capability| {
+            capability.authority_scope == Some(CapabilityAuthorityScopeV1::LegacyEmbedded)
+        })
+        .map(|capability| capability.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(legacy_ids, LEGACY_EMBEDDED_CAPABILITY_IDS);
+    assert_eq!(
+        snapshot.coverage().authority_scopes["legacy_embedded"],
+        LEGACY_EMBEDDED_CAPABILITY_IDS.len()
+    );
+    snapshot
+        .validate_authority_contracts()
+        .expect("exact legacy allowlist is valid");
+}
+
+#[test]
+fn catalog_v2_rejects_legacy_authority_disguised_as_generic() {
+    let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+    snapshot
+        .capabilities
+        .get_mut("d1-import-approved-osint-research-migration")
+        .expect("legacy capability")
+        .authority_scope = Some(CapabilityAuthorityScopeV1::ProviderGeneric);
+
+    let error = snapshot
+        .refresh_hash()
+        .expect_err("embedded workspace authority must fail closed")
+        .to_string();
+    assert!(error.contains("embeds application authority"), "{error}");
+}
+
+#[test]
+fn catalog_v2_rejects_new_legacy_and_compiled_workspace_owned_entries() {
+    for (id, scope, expected) in [
+        (
+            "new-embedded-app-operation",
+            CapabilityAuthorityScopeV1::LegacyEmbedded,
+            "not one of the frozen exact legacy contracts",
+        ),
+        (
+            "workspace-owned-operation",
+            CapabilityAuthorityScopeV1::WorkspaceOwned,
+            "require a separate typed declaration loader",
+        ),
+    ] {
+        let mut snapshot = normalize_openapi(&fixture()).expect("catalog");
+        let mut capability = CapabilityV1::new(id, "App operation", "GET", "/app");
+        capability.authority_scope = Some(scope);
+        snapshot.capabilities.insert(id.to_owned(), capability);
+
+        let error = snapshot
+            .refresh_hash()
+            .expect_err("provider catalog must reject authority expansion")
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn schema_v1_catalog_without_authority_metadata_remains_hash_readable() {
+    let snapshot = normalize_openapi(&fixture()).expect("catalog");
+    let mut stored = serde_json::to_value(snapshot).expect("serialize catalog");
+    stored["schema_version"] = json!(1);
+    for capability in stored["capabilities"]
+        .as_object_mut()
+        .expect("capabilities object")
+        .values_mut()
+    {
+        capability
+            .as_object_mut()
+            .expect("capability object")
+            .remove("authority_scope");
+    }
+    stored["schema_hash"] = json!(hash_value(&stored["capabilities"]).expect("legacy hash"));
+
+    let loaded: CatalogSnapshot = serde_json::from_value(stored).expect("v1 catalog decodes");
+    assert!(
+        loaded
+            .capabilities
+            .values()
+            .all(|capability| capability.authority_scope.is_none())
+    );
+    loaded
+        .validate_hash()
+        .expect("v1 hash remains valid until catalog sync replaces it");
 }
 
 #[test]
@@ -8284,6 +8966,270 @@ fn oauth_client_rotation_fixture() -> serde_json::Value {
     })
 }
 
+fn oauth_client_configuration_properties_fixture() -> serde_json::Value {
+    json!({
+        "allowed_cors_origins":{"items":{"type":"string"},"type":"array"},
+        "client_name":{"type":"string"},
+        "client_uri":{"type":"string"},
+        "grant_types":{"items":{"enum":["authorization_code","refresh_token"],"type":"string"},"type":"array"},
+        "logo_uri":{"type":"string"},
+        "policy_uri":{"type":"string"},
+        "post_logout_redirect_uris":{"items":{"type":"string"},"type":"array"},
+        "redirect_uris":{"items":{"type":"string"},"type":"array"},
+        "response_types":{"items":{"enum":["token","id_token","code"],"type":"string"},"type":"array"},
+        "scopes":{"items":{"type":"string"},"type":"array"},
+        "token_endpoint_auth_method":{"enum":["none","client_secret_basic","client_secret_post"],"type":"string"},
+        "tos_uri":{"type":"string"}
+    })
+}
+
+fn oauth_client_response_fixture(
+    properties: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    json!({
+        "description":"OAuth client response",
+        "content":{"application/json":{"schema":{"allOf":[
+            {"$ref":"#/components/schemas/ApiEnvelope"},
+            {"type":"object","properties":{"result":{"type":"object","properties":properties}}}
+        ]}}}
+    })
+}
+
+fn oauth_client_create_update_fixture() -> serde_json::Value {
+    let configuration_properties = oauth_client_configuration_properties_fixture();
+    let mut read_properties = configuration_properties
+        .as_object()
+        .expect("configuration properties")
+        .clone();
+    read_properties.insert("client_id".to_owned(), json!({"type":"string"}));
+    read_properties.insert(
+        "visibility".to_owned(),
+        json!({"type":"string","enum":["private","public"]}),
+    );
+    let account_selector = json!({
+        "in":"path","name":"account_id","required":true,
+        "description":"Account identifier tag.",
+        "schema":{"allOf":[{"$ref":"#/components/schemas/Identifier"}]}
+    });
+    let client_selector = json!({
+        "in":"path","name":"oauth_client_id","required":true,
+        "description":"The unique identifier for an OAuth client.",
+        "schema":{"type":"string"}
+    });
+    let plans = json!({"business":true,"enterprise":true,"free":true,"pro":true});
+    let mut create_response_properties = read_properties.clone();
+    create_response_properties.insert(
+        "client_secret".to_owned(),
+        json!({"type":"string","readOnly":true,"x-sensitive":true}),
+    );
+
+    json!({
+        "openapi":"3.0.3",
+        "info":{"title":"OAuth client fixture","version":"1"},
+        "components":{"schemas":{
+            "Identifier":{"type":"string","minLength":32,"maxLength":32},
+            "ApiEnvelope":{
+                "type":"object","required":["success","result"],
+                "properties":{
+                    "success":{"type":"boolean"},"errors":{"type":"array"},
+                    "messages":{"type":"array"},"result":{"type":"object"}
+                }
+            }
+        }},
+        "paths":{
+            "/accounts/{account_id}/oauth_clients":{
+                "post":{
+                    "operationId":"oauth-clients-create",
+                    "summary":"Create OAuth Client",
+                    "description":"Create a new OAuth client for an account.",
+                    "tags":["OAuth Clients"],
+                    "x-api-token-group":["OAuth Client Write"],
+                    "x-cfPlanAvailability":plans.clone(),
+                    "parameters":[account_selector.clone()],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{"allOf":[
+                        {"type":"object","properties":configuration_properties.clone()},
+                        {"type":"object","required":["client_name","grant_types","redirect_uris","response_types","scopes","token_endpoint_auth_method"]}
+                    ]}}}},
+                    "responses":{"200":oauth_client_response_fixture(create_response_properties)}
+                }
+            },
+            "/accounts/{account_id}/oauth_clients/{oauth_client_id}":{
+                "get":{
+                    "operationId":"oauth-clients-get",
+                    "summary":"OAuth Client Details",
+                    "description":"Get details of a specific OAuth client.",
+                    "tags":["OAuth Clients"],
+                    "x-api-token-group":["OAuth Client Read"],
+                    "x-cfPlanAvailability":plans.clone(),
+                    "parameters":[account_selector.clone(),client_selector.clone()],
+                    "responses":{"200":oauth_client_response_fixture(read_properties.clone())}
+                },
+                "patch":{
+                    "operationId":"oauth-clients-update",
+                    "summary":"Update OAuth Client",
+                    "description":"Update an existing OAuth client. Only include fields you want to update.",
+                    "tags":["OAuth Clients"],
+                    "x-api-token-group":["OAuth Client Write"],
+                    "x-cfPlanAvailability":plans.clone(),
+                    "parameters":[account_selector.clone(),client_selector.clone()],
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{"allOf":[
+                        {"type":"object","properties":configuration_properties},
+                        {"type":"object","properties":{"visibility":{"type":"string","enum":["public"]}}}
+                    ]}}}},
+                    "responses":{"200":oauth_client_response_fixture(read_properties.clone())}
+                },
+                "delete":{
+                    "operationId":"oauth-clients-delete",
+                    "summary":"Delete OAuth Client",
+                    "description":"Delete an OAuth client.",
+                    "tags":["OAuth Clients"],
+                    "x-api-token-group":["OAuth Client Write"],
+                    "x-cfPlanAvailability":plans,
+                    "parameters":[account_selector,client_selector],
+                    "responses":{"200":oauth_client_response_fixture(read_properties)}
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn oauth_client_create_and_update_are_identity_bound_and_snapshot_ready() {
+    let snapshot =
+        normalize_openapi(&oauth_client_create_update_fixture()).expect("OAuth client catalog");
+    let create = snapshot
+        .get("oauth-clients-create")
+        .expect("OAuth client create");
+    let update = snapshot
+        .get("oauth-clients-update")
+        .expect("OAuth client update");
+
+    for capability in [create, update] {
+        assert_eq!(capability.adapter_status, AdapterStatus::DynamicApi);
+        assert_eq!(
+            capability.permissions,
+            ["OAuth Client Write", "OAuth Client Read"],
+            "the governed mutation lifecycle must declare both its write and exact-detail read authority"
+        );
+        assert_eq!(capability.risk, RiskClass::IdentityOrOwnership);
+        assert_eq!(capability.effect, EffectClass::IdentityOrOwnership);
+        assert!(capability.cost.known);
+        assert!(!capability.cost.incremental);
+        assert_eq!(capability.cost.maximum, Some(0.0));
+        assert_eq!(capability.entitlement.available, Some(true));
+        assert_eq!(
+            capability.entitlement.plans,
+            BTreeMap::from([
+                ("business".to_owned(), true),
+                ("enterprise".to_owned(), true),
+                ("free".to_owned(), true),
+                ("pro".to_owned(), true),
+            ])
+        );
+        assert_eq!(
+            capability
+                .request_schema
+                .as_ref()
+                .and_then(|schema| schema.get("additionalProperties")),
+            Some(&json!(false))
+        );
+        assert!(!capability.rollback.supported);
+        assert!(capability.mutation_contract_gaps().is_empty());
+    }
+
+    let created = create.created_resource.as_ref().expect("created client");
+    assert_eq!(created.identity_selector, "oauth_client_id");
+    assert_eq!(created.response_result_identity_pointer, "/client_id");
+    assert_eq!(created.read_capability_id, "oauth-clients-get");
+    assert_eq!(created.delete_capability_id, "oauth-clients-delete");
+    assert_eq!(
+        create.verification.strategy,
+        "created_resource_contains_planned_fields_by_returned_id"
+    );
+    assert!(
+        create
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("separately reviewed"))
+    );
+
+    assert_eq!(
+        update.verification.strategy,
+        "same_resource_contains_planned_fields_after_update"
+    );
+    assert_eq!(
+        update
+            .same_path_read
+            .as_ref()
+            .expect("update readback")
+            .verified_response_fields
+            .last()
+            .map(String::as_str),
+        Some("visibility")
+    );
+    assert_eq!(
+        update
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("minProperties")),
+        Some(&json!(1))
+    );
+    assert!(
+        update
+            .rollback
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("permanent"))
+    );
+}
+
+#[test]
+fn oauth_client_create_update_classifier_fails_closed_on_contract_drift() {
+    let blocked = |document: serde_json::Value, capability_id: &str| {
+        normalize_openapi(&document)
+            .expect("drifted OAuth client catalog")
+            .get(capability_id)
+            .expect("OAuth client capability")
+            .adapter_status
+            == AdapterStatus::Blocked
+    };
+
+    let mut permission = oauth_client_create_update_fixture();
+    permission["paths"]["/accounts/{account_id}/oauth_clients"]["post"]["x-api-token-group"] =
+        json!(["Account Settings Write"]);
+    assert!(blocked(permission, "oauth-clients-create"));
+
+    let mut request = oauth_client_create_update_fixture();
+    request["paths"]["/accounts/{account_id}/oauth_clients/{oauth_client_id}"]["patch"]["requestBody"]
+        ["content"]["application/json"]["schema"]["allOf"][0]["properties"]["future_field"] =
+        json!({"type":"string"});
+    assert!(blocked(request, "oauth-clients-update"));
+
+    let mut secret = oauth_client_create_update_fixture();
+    secret["paths"]["/accounts/{account_id}/oauth_clients"]["post"]["responses"]["200"]["content"]
+        ["application/json"]["schema"]["allOf"][1]["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("create response properties")
+        .remove("client_secret");
+    assert!(blocked(secret, "oauth-clients-create"));
+
+    let mut read = oauth_client_create_update_fixture();
+    read["paths"]["/accounts/{account_id}/oauth_clients/{oauth_client_id}"]["get"]
+        ["responses"]["200"]["content"]["application/json"]["schema"]["allOf"][1]
+        ["properties"]["result"]["properties"]
+        .as_object_mut()
+        .expect("read properties")
+        .remove("scopes");
+    assert!(blocked(read.clone(), "oauth-clients-create"));
+    assert!(blocked(read, "oauth-clients-update"));
+
+    let mut plan = oauth_client_create_update_fixture();
+    plan["paths"]["/accounts/{account_id}/oauth_clients/{oauth_client_id}"]["patch"]["x-cfPlanAvailability"]
+        ["free"] = json!(false);
+    assert!(blocked(plan, "oauth-clients-update"));
+}
+
 #[test]
 fn oauth_client_rotation_is_a_sink_bound_two_secret_cutover() {
     let snapshot = normalize_openapi(&oauth_client_rotation_fixture()).expect("OAuth catalog");
@@ -8295,6 +9241,10 @@ fn oauth_client_rotation_is_a_sink_bound_two_secret_cutover() {
         .expect("OAuth old-secret delete");
 
     assert_eq!(rotate.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(
+        rotate.permissions,
+        ["OAuth Client Write", "OAuth Client Read"]
+    );
     assert_eq!(rotate.risk, RiskClass::SecretSensitive);
     assert_eq!(rotate.effect, EffectClass::IdentityOrOwnership);
     assert!(rotate.cost.known);
@@ -8324,6 +9274,10 @@ fn oauth_client_rotation_is_a_sink_bound_two_secret_cutover() {
     assert!(rotate.mutation_contract_gaps().is_empty());
 
     assert_eq!(delete_old.adapter_status, AdapterStatus::DynamicApi);
+    assert_eq!(
+        delete_old.permissions,
+        ["OAuth Client Write", "OAuth Client Read"]
+    );
     assert_eq!(delete_old.risk, RiskClass::Destructive);
     assert_eq!(delete_old.effect, EffectClass::Irreversible);
     assert!(delete_old.cost.known);

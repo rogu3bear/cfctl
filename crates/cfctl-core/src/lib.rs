@@ -818,6 +818,28 @@ pub enum AdapterStatus {
     Blocked,
 }
 
+/// Identifies whose authority makes a catalog capability executable.
+///
+/// This is deliberately independent of [`AdapterStatus`]: a native adapter can
+/// still be generic provider machinery, cfctl's own product behavior, or
+/// legacy application logic that must eventually move back to its workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityAuthorityScopeV1 {
+    /// Portable Cloudflare behavior whose contract is not owned by one
+    /// application repository, account, database, or deployment.
+    ProviderGeneric,
+    /// Behavior owned by cfctl itself, including its public site and release
+    /// identity. This must not be used to disguise another product's policy.
+    CfctlProduct,
+    /// An application-owned operation supplied by a typed, hash-bound
+    /// workspace declaration rather than compiled into cfctl.
+    WorkspaceOwned,
+    /// A frozen pre-operation-pack exception. New entries are rejected unless
+    /// the catalog's exact migration allowlist is deliberately changed.
+    LegacyEmbedded,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskClass {
@@ -1622,6 +1644,11 @@ pub struct CapabilityV1 {
     pub id: String,
     pub title: String,
     pub description: Option<String>,
+    /// `None` exists only so v1 catalog snapshots remain hash-readable. Every
+    /// newly constructed capability sets this field, and v2 snapshots reject
+    /// an absent value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_scope: Option<CapabilityAuthorityScopeV1>,
     pub product: String,
     pub source: String,
     pub method: String,
@@ -1724,6 +1751,7 @@ impl CapabilityV1 {
             id: id.to_owned(),
             title: title.to_owned(),
             description: None,
+            authority_scope: Some(CapabilityAuthorityScopeV1::ProviderGeneric),
             product: "Cloudflare API".to_owned(),
             source: "cloudflare-api-schemas".to_owned(),
             method: normalized_method,
@@ -2122,7 +2150,8 @@ impl CapabilityV1 {
                     })
             }
             "created_resource_contains_planned_fields_by_returned_id" => {
-                self.method == "POST" && self.created_resource_contract_supported()
+                self.created_resource_creation_method_supported()
+                    && self.created_resource_contract_supported()
             }
             // An Access application body is a 13-way `anyOf` over app types
             // with no universally-required field, so the generic binder — which
@@ -2695,7 +2724,7 @@ impl CapabilityV1 {
     }
 
     fn delete_created_resource_rollback_supported(&self) -> bool {
-        self.method == "POST"
+        self.created_resource_creation_method_supported()
             && self.id != "d1-create-database"
             && (self.created_resource_contract_supported()
                 || self.created_collection_resource_contract_supported()
@@ -2705,6 +2734,13 @@ impl CapabilityV1 {
                     && self.created_resource_contract_supported_with_curated_fields(&[
                         "name", "type",
                     ])))
+    }
+
+    fn created_resource_creation_method_supported(&self) -> bool {
+        self.method == "POST"
+            || (self.id == "workers.domains.update"
+                && self.method == "PUT"
+                && self.path == "/accounts/{account_id}/workers/domains")
     }
 
     fn created_resource_contract_supported(&self) -> bool {
@@ -3090,7 +3126,7 @@ fn oauth_client_secret_verification_contract_supported(capability: &CapabilityV1
     operation_supported
         && capability.product == "OAuth Clients"
         && capability.account_scope == "account"
-        && capability.permissions == ["OAuth Client Write"]
+        && capability.permissions == ["OAuth Client Write", "OAuth Client Read"]
         && capability.path == "/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret"
         && capability.request_schema.is_none()
         && capability.selectors.len() == 2
@@ -3281,6 +3317,7 @@ fn response_identity_pointer_supported(selector: &str, pointer: &str) -> bool {
         || (selector.ends_with("_name") && pointer == "/name")
         || (selector == "database_id" && pointer == "/uuid")
         || (selector == "site_id" && pointer == "/site_tag")
+        || (selector == "oauth_client_id" && pointer == "/client_id")
         || (!selector
             .chars()
             .any(|character| matches!(character, '/' | '~'))

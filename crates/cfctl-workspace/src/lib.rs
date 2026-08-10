@@ -641,7 +641,20 @@ fn collect_wrangler_scope(
     resources: &mut Vec<ResourceNode>,
 ) {
     if let Some(name) = scope.get("name").and_then(Value::as_str) {
-        push_resource(resources, path, "wrangler_worker", format!("worker:{name}"));
+        if scope
+            .get("pages_build_output_dir")
+            .and_then(Value::as_str)
+            .is_some_and(|directory| !directory.trim().is_empty())
+        {
+            push_resource(
+                resources,
+                path,
+                "wrangler_pages",
+                format!("pages_project:{name}"),
+            );
+        } else {
+            push_resource(resources, path, "wrangler_worker", format!("worker:{name}"));
+        }
     }
     for route in scope
         .get("routes")

@@ -1,9 +1,10 @@
 #!/bin/bash
 # Local pre-push gate: refuse to push what the local gate has not proven.
 #
-# Remote CI is intentionally absent from this repo (see LOCAL_CI.md), so this
-# hook is the only thing standing between an unrun gate and a red `main`.
-# PR #75 merged two clippy failures because nothing checked; this is that check.
+# Hosted proof covers the native Rust baseline, while this hook remains the
+# complete lane for Bun, policy, secret-scan, governance, and Linux cross-build
+# checks (see CONTRIBUTING.md). PR #75 merged two clippy failures before either
+# independent gate protected `main`; these gates are the response.
 #
 # Invoked by .githooks/pre-push, which is SHA-256 pinned in
 # ~/.agent/repo-hook-allowlist. This file is deliberately NOT pinned so gate

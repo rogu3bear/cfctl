@@ -1,0 +1,15 @@
+name = "cfctl-site"
+main = "build/_worker.js"
+compatibility_date = "2026-08-05"
+workers_dev = true
+upload_source_maps = false
+
+[build]
+command = "bash ./scripts/build-edge.sh"
+
+[assets]
+directory = "./target/site"
+binding = "ASSETS"
+
+[observability]
+enabled = false

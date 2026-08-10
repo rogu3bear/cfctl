@@ -28,6 +28,7 @@ hex.workspace = true
 md-5.workspace = true
 libc.workspace = true
 sha2.workspace = true
+processkit = { version = "=2.2.5", default-features = false }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

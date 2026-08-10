@@ -51,10 +51,11 @@ routed through `keys mint`, which refreshes and binds the matching live
 permission-group inventory; user-owned creation is explicit
 (`--user --account <id>`), limited to one exact account resource, and never
 offers arbitrary or wildcard token policies. Secret-producing lifecycles such
-as Turnstile widgets, Access service tokens, and OAuth client-secret rotation
-write one-time values only to a new mode-0600 sink, verify through exact
-readbacks, and expose destructive follow-ups only as separate reviewed plans;
-the per-capability invariants are in [docs/v2-security.md](v2-security.md).
+as Turnstile widgets, Access service tokens, OAuth client creation, and OAuth
+client-secret rotation write one-time values only to a new mode-0600 sink,
+verify through exact readbacks, and expose destructive follow-ups only as
+separate reviewed plans; the per-capability invariants are in
+[docs/v2-security.md](v2-security.md).
 
 ## Deterministic execution
 

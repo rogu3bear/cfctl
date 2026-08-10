@@ -217,9 +217,10 @@ the truthful terminal proof is the successful Cloudflare response plus the
 durable sink receipt; cfctl does not claim that a later read verified the value.
 
 The per-capability secret-sink exceptions and verifiers — the Access
-service-token creation/update/refresh contracts and the two-phase OAuth
-client-secret rotation — are owned by [docs/v2-security.md](v2-security.md),
-which this file defers to for every secret, journal, or redaction detail.
+service-token creation/update/refresh contracts, OAuth client creation, and the
+two-phase OAuth client-secret rotation — are owned by
+[docs/v2-security.md](v2-security.md), which this file defers to for every
+secret, journal, or redaction detail.
 
 ## Adapter boundary
 

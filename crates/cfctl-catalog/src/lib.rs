@@ -8,8 +8,8 @@ use std::{
 
 use cfctl_core::{
     AdapterStatus, AnalyticsQueryContractV1, AnalyticsQueryKindV1,
-    AsyncCollectionMutationContractV1, BillingModelV1, CapabilityV1, CostExposureV1, CostV1,
-    CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
+    AsyncCollectionMutationContractV1, BillingModelV1, CapabilityAuthorityScopeV1, CapabilityV1,
+    CostExposureV1, CostV1, CreatedCollectionResourceContractV1, CreatedNestedResourceContractV1,
     CreatedResourceContractV1, D1FullExportContractV1, D1SchemaIntrospectionContractV1,
     DeletedNestedResourceContractV1, DeletedResourceContractV1, EffectClass, EntitlementProbeV1,
     EntitlementV1, EventBatchContractV1, GraphqlAnalyticsContractV1, KnowledgeReferenceV1,
@@ -31,6 +31,51 @@ pub const OFFICIAL_OPENAPI_URL: &str =
     "https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json";
 pub const OFFICIAL_DOCS_INDEX_URL: &str = "https://developers.cloudflare.com/llms.txt";
 pub const OFFICIAL_CHANGELOG_URL: &str = "https://developers.cloudflare.com/changelog/";
+
+/// Frozen migration debt from before workspace-owned operation packs existed.
+/// Adding an id here is a public architecture decision, not the normal path for
+/// extending cfctl. Keep this sorted for the fail-closed binary search below.
+pub const LEGACY_EMBEDDED_CAPABILITY_IDS: [&str; 5] = [
+    "d1-import-approved-mln-migration",
+    "d1-import-approved-osint-research-migration",
+    "d1-resume-approved-mln-import-poll",
+    "mln-0142-post-import-schema",
+    "mln-0143-data-invariants",
+];
+
+fn legacy_embedded_contract_matches(capability: &CapabilityV1) -> bool {
+    match capability.id.as_str() {
+        "d1-import-approved-mln-migration" => capability
+            .d1_approved_mln_import
+            .as_ref()
+            .is_some_and(|contract| contract.repository_id == "github.com/rogu3bear/mln-web"),
+        "d1-import-approved-osint-research-migration" => capability
+            .d1_approved_mln_import
+            .as_ref()
+            .is_some_and(|contract| {
+                contract.repository_id == "github.com/rogu3bear/osint-research-center"
+            }),
+        "d1-resume-approved-mln-import-poll" => capability
+            .d1_approved_mln_import_poll_resume
+            .as_ref()
+            .is_some_and(|contract| {
+                contract.root_capability_id == "d1-import-approved-mln-migration"
+            }),
+        "mln-0142-post-import-schema" => capability.mln_0142_post_import_schema.is_some(),
+        "mln-0143-data-invariants" => capability.mln_0143_data_invariants.is_some(),
+        _ => false,
+    }
+}
+
+const fn authority_scope_name(scope: Option<CapabilityAuthorityScopeV1>) -> &'static str {
+    match scope {
+        Some(CapabilityAuthorityScopeV1::ProviderGeneric) => "provider_generic",
+        Some(CapabilityAuthorityScopeV1::CfctlProduct) => "cfctl_product",
+        Some(CapabilityAuthorityScopeV1::WorkspaceOwned) => "workspace_owned",
+        Some(CapabilityAuthorityScopeV1::LegacyEmbedded) => "legacy_embedded",
+        None => "unclassified",
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum CatalogError {
@@ -56,6 +101,8 @@ pub enum CatalogError {
     ResponseReferenceDepth(String),
     #[error("catalog content hash mismatch: recorded {recorded}, actual {actual}")]
     ContentHashMismatch { recorded: String, actual: String },
+    #[error("catalog capability authority contract is invalid: {0}")]
+    InvalidAuthorityContract(String),
     #[error(transparent)]
     Core(#[from] cfctl_core::CoreError),
     #[error(transparent)]
@@ -86,17 +133,75 @@ pub struct CatalogSnapshot {
 
 impl CatalogSnapshot {
     pub fn refresh_hash(&mut self) -> Result<()> {
+        self.validate_authority_contracts()?;
         self.schema_hash = hash_value(&serde_json::to_value(&self.capabilities)?)?;
         Ok(())
     }
 
     pub fn validate_hash(&self) -> Result<()> {
+        self.validate_authority_contracts()?;
         let actual = hash_value(&serde_json::to_value(&self.capabilities)?)?;
         if self.schema_hash != actual {
             return Err(CatalogError::ContentHashMismatch {
                 recorded: self.schema_hash.clone(),
                 actual,
             });
+        }
+        Ok(())
+    }
+
+    /// Enforces the ownership boundary introduced with catalog schema v2.
+    ///
+    /// Schema v1 remains hash-readable so an installed pre-v2 catalog can be
+    /// preserved during sync. It does not acquire authority metadata by
+    /// inference. Every newly normalized v2 snapshot must classify every
+    /// capability, and its frozen embedded-workspace set cannot grow through a
+    /// generic constructor or a plausible-looking label.
+    pub fn validate_authority_contracts(&self) -> Result<()> {
+        if self.schema_version < 2 {
+            return Ok(());
+        }
+        for capability in self.capabilities.values() {
+            let scope = capability.authority_scope.ok_or_else(|| {
+                CatalogError::InvalidAuthorityContract(format!(
+                    "`{}` is unclassified in a v2 snapshot",
+                    capability.id
+                ))
+            })?;
+            let legacy_contract_matches = legacy_embedded_contract_matches(capability);
+            let embeds_workspace_contract = capability.mln_0142_post_import_schema.is_some()
+                || capability.mln_0143_data_invariants.is_some()
+                || capability.d1_approved_mln_import.is_some()
+                || capability.d1_approved_mln_import_poll_resume.is_some();
+            match scope {
+                CapabilityAuthorityScopeV1::LegacyEmbedded if !legacy_contract_matches => {
+                    return Err(CatalogError::InvalidAuthorityContract(format!(
+                        "`{}` is not one of the frozen exact legacy contracts",
+                        capability.id
+                    )));
+                }
+                CapabilityAuthorityScopeV1::WorkspaceOwned => {
+                    return Err(CatalogError::InvalidAuthorityContract(format!(
+                        "`{}` is workspace-owned but was inserted into the provider catalog; workspace operations require a separate typed declaration loader",
+                        capability.id
+                    )));
+                }
+                CapabilityAuthorityScopeV1::ProviderGeneric
+                | CapabilityAuthorityScopeV1::CfctlProduct
+                    if embeds_workspace_contract
+                        || LEGACY_EMBEDDED_CAPABILITY_IDS
+                            .binary_search(&capability.id.as_str())
+                            .is_ok() =>
+                {
+                    return Err(CatalogError::InvalidAuthorityContract(format!(
+                        "`{}` embeds application authority but is classified as {scope:?}",
+                        capability.id
+                    )));
+                }
+                CapabilityAuthorityScopeV1::LegacyEmbedded
+                | CapabilityAuthorityScopeV1::ProviderGeneric
+                | CapabilityAuthorityScopeV1::CfctlProduct => {}
+            }
         }
         Ok(())
     }
@@ -168,6 +273,7 @@ impl CatalogSnapshot {
     #[must_use]
     pub fn coverage(&self) -> CatalogCoverageV1 {
         let mut adapter_statuses = BTreeMap::new();
+        let mut authority_scopes = BTreeMap::new();
         let mut sources = BTreeMap::new();
         let mut mutating = 0;
         let mut blocked = 0;
@@ -181,6 +287,9 @@ impl CatalogSnapshot {
         let mut blocked_adapters_without_contract_gaps = 0;
         let mut mutation_contract_gap_counts = BTreeMap::new();
         for capability in self.capabilities.values() {
+            *authority_scopes
+                .entry(authority_scope_name(capability.authority_scope).to_owned())
+                .or_insert(0) += 1;
             *adapter_statuses
                 .entry(adapter_status_name(capability.adapter_status).to_owned())
                 .or_insert(0) += 1;
@@ -244,6 +353,7 @@ impl CatalogSnapshot {
             blocked_adapters_without_contract_gaps,
             mutation_contract_gap_counts,
             adapter_statuses,
+            authority_scopes,
             sources,
             telemetry_targeted,
             telemetry_ledger,
@@ -284,6 +394,7 @@ pub struct CatalogCoverageV1 {
     pub blocked_adapters_without_contract_gaps: usize,
     pub mutation_contract_gap_counts: BTreeMap<String, usize>,
     pub adapter_statuses: BTreeMap<String, usize>,
+    pub authority_scopes: BTreeMap<String, usize>,
     pub sources: BTreeMap<String, usize>,
     pub telemetry_targeted: TelemetryCoverageSummaryV1,
     pub telemetry_ledger: Vec<TelemetryCoverageEntryV1>,
@@ -2056,7 +2167,7 @@ pub fn normalize_openapi(document: &Value) -> Result<CatalogSnapshot> {
 
     let source_hash = hash_value(document)?;
     let mut snapshot = CatalogSnapshot {
-        schema_version: 1,
+        schema_version: 2,
         generated_at: Utc::now(),
         source_url: OFFICIAL_OPENAPI_URL.to_owned(),
         source_hash,
@@ -2147,6 +2258,7 @@ fn mln_0142_post_import_schema_capability() -> CapabilityV1 {
         "sha256:cb32c4ed1b14799465b90693ac73cf03d4650c3db573f080acc3d3b4cc436c2b";
     let mut capability = d1_schema_introspection_capability();
     "mln-0142-post-import-schema".clone_into(&mut capability.id);
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::LegacyEmbedded);
     "Prove MLN 0142 post-import trigger authority".clone_into(&mut capability.title);
     capability.description = Some(
         "Run one exact compiler-owned equality assertion for the reviewed MLNavigator 0142 trigger and bind the result to its durable import boundary."
@@ -2212,6 +2324,7 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
         "POST",
         "/accounts/{account_id}/d1/database/{database_id}/import",
     );
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::LegacyEmbedded);
     capability.description = Some(
         "Stage and import exactly MLNavigator migration 0142 or 0143. The reviewed source is one exact clean Git repository revision, relative path, and blob; local origin configuration establishes snapshot identity, not hosted ownership. For 0143, the shared admission and consumption gate requires verified 0142 closure, then the governed recovery export, then exactly one current-authority pre_import proof, all before the immutable plan cutoff. This is evidence chronology, not a claim that out-of-band provider writes were absent. A 0143 post-restore proof must restore the exact post-0142 recovery anchor and re-prove the exact 0142 terminal-generation trigger. A 0142 rollback is a different boundary: it must target the pre-0142 anchor and separately prove that the 0142 trigger is absent; it cannot use the 0143 post-restore contract. The plan binds reviewed source bytes, the phase-specific recovery anchor with its provider bookmark, and proof authority; provider completion remains unverified until the governed post-import proof is attached."
             .to_owned(),
@@ -2377,6 +2490,7 @@ fn d1_import_approved_osint_research_migration_capability() -> CapabilityV1 {
         "POST",
         "/accounts/{account_id}/d1/database/{database_id}/import",
     );
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::LegacyEmbedded);
     capability.description = Some(
         "Stage and import exactly one reviewed OSINT Research Center migration from 0028 through 0034. The adapter pins the private repository, clean release HEAD, relative path, Git blob, source hashes, account, and database. Every plan requires one governed current time-travel bookmark read created before the plan, and execution closes only after a compiler-owned schema-marker readback proves that exact migration's durable effect. No caller SQL or provider protocol control is accepted."
             .to_owned(),
@@ -2561,6 +2675,7 @@ fn d1_resume_approved_mln_import_poll_capability() -> CapabilityV1 {
         "POST",
         "/accounts/{account_id}/d1/database/{database_id}/import",
     );
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::LegacyEmbedded);
     capability.description = Some(
         "Create a separately approved poll-only child of one exact durable MLNavigator import exhaustion. The runtime derives the root migration, source, target, credential, catalog, accepted bookmark, and provider request from immutable parent authority. It never replays init, upload, or ingest; each exhaustion admits at most one non-cancelled child."
             .to_owned(),
@@ -2656,6 +2771,7 @@ fn mln_0143_data_invariants_capability() -> CapabilityV1 {
         "POST",
         "/accounts/{account_id}/d1/database/{database_id}/query",
     );
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::LegacyEmbedded);
     capability.description = Some(
         "Run fixed compiler-owned reads for the bounded pre-import, post-import, or post-restore MLNavigator 0143 boundary. Raw evidence rows and identifiers are digested in volatile memory and never persisted."
             .to_owned(),
@@ -7368,6 +7484,7 @@ fn apply_post_normalization_contracts(
     document: &Value,
     capabilities: &mut BTreeMap<String, CapabilityV1>,
 ) {
+    finalize_pages_deployment_id_selector_contracts(capabilities);
     finalize_worker_script_secret_contracts(document, capabilities);
     classify_exact_resource_contracts(document, capabilities);
     finalize_singleton_resource_delete_contracts(document, capabilities);
@@ -7377,7 +7494,9 @@ fn apply_post_normalization_contracts(
     classify_access_service_token_refresh_contract(document, capabilities);
     classify_created_resource_contracts(document, capabilities);
     classify_created_collection_resource_contracts(document, capabilities);
+    finalize_pages_project_create_contract(document, capabilities);
     finalize_pages_domain_create_contract(document, capabilities);
+    finalize_worker_custom_domain_attach_contract(document, capabilities);
     classify_global_warp_override_contract(document, capabilities);
     classify_same_path_object_mutation_contracts(document, capabilities);
     finalize_r2_bucket_create_contract(document, capabilities);
@@ -7386,6 +7505,7 @@ fn apply_post_normalization_contracts(
     finalize_r2_temporary_credentials_contract(document, capabilities);
     finalize_zone_cache_purge_contracts(document, capabilities);
     finalize_websocket_zone_setting_contract(document, capabilities);
+    finalize_oauth_client_create_update_contracts(document, capabilities);
     finalize_oauth_client_secret_rotation_contract(document, capabilities);
     finalize_global_warp_override_rollback_contract(capabilities);
     finalize_d1_read_replication_rollback_contract(capabilities);
@@ -7402,6 +7522,284 @@ fn apply_post_normalization_contracts(
     for capability in capabilities.values_mut() {
         block_unsupported_response_contract(capability);
     }
+}
+
+const PAGES_DEPLOYMENT_DETAIL_PATH_PREFIX: &str =
+    "/accounts/{account_id}/pages/projects/{project_name}/deployments/{deployment_id}";
+
+/// Cloudflare Pages deployment identifiers are UUIDs. The generated `OpenAPI`
+/// currently reuses the 32-character account identifier bound for this path
+/// selector, which rejects the API's canonical 36-character deployment IDs
+/// before a governed read can reach the provider. Keep this correction scoped
+/// to Pages deployment-resource paths and preserve every other selector bound.
+fn finalize_pages_deployment_id_selector_contracts(
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    for capability in capabilities.values_mut().filter(|capability| {
+        capability
+            .path
+            .starts_with(PAGES_DEPLOYMENT_DETAIL_PATH_PREFIX)
+    }) {
+        let Some(selector) = capability.selectors.iter_mut().find(|selector| {
+            selector.name == "deployment_id"
+                && selector.location == "path"
+                && selector.value_type == "string"
+        }) else {
+            continue;
+        };
+        selector.contract = Some(SelectorContractV1 {
+            schema: serde_json::json!({
+                "type": "string",
+                "minLength": 36,
+                "maxLength": 36,
+                "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+            }),
+            query: None,
+        });
+    }
+}
+
+const PAGES_PROJECT_CREATE_CAPABILITY_ID: &str = "pages-project-create-project";
+const PAGES_PROJECT_READ_CAPABILITY_ID: &str = "pages-project-get-project";
+const PAGES_PROJECT_DELETE_CAPABILITY_ID: &str = "pages-project-delete-project";
+const PAGES_PROJECT_COLLECTION_PATH: &str = "/accounts/{account_id}/pages/projects";
+const PAGES_PROJECT_DETAIL_PATH: &str = "/accounts/{account_id}/pages/projects/{project_name}";
+
+fn finalize_pages_project_create_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let companions_supported = capabilities
+        .get(PAGES_PROJECT_READ_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.method == "GET"
+                && capability.path == PAGES_PROJECT_DETAIL_PATH
+                && capability.product == "Pages Project"
+                && capability
+                    .selectors
+                    .iter()
+                    .all(|selector| selector.location == "path")
+        })
+        && capabilities
+            .get(PAGES_PROJECT_DELETE_CAPABILITY_ID)
+            .is_some_and(|capability| {
+                capability.method == "DELETE"
+                    && capability.path == PAGES_PROJECT_DETAIL_PATH
+                    && capability.product == "Pages Project"
+                    && capability.permissions == ["Pages Write"]
+            });
+    let create_operation =
+        document.pointer("/paths/~1accounts~1{account_id}~1pages~1projects/post");
+    let read_operation =
+        document.pointer("/paths/~1accounts~1{account_id}~1pages~1projects~1{project_name}/get");
+    let response_fields = ["build_config", "name", "production_branch", "source"];
+    let response_supported = create_operation.is_some_and(|operation| {
+        success_response_declares_result_string_field(document, operation, "name")
+            && success_response_declares_result_fields(document, operation, &response_fields)
+    }) && read_operation.is_some_and(|operation| {
+        success_response_declares_result_string_field(document, operation, "name")
+            && success_response_declares_result_fields(document, operation, &response_fields)
+    });
+
+    let Some(capability) = capabilities.get_mut(PAGES_PROJECT_CREATE_CAPABILITY_ID) else {
+        return;
+    };
+    let create_supported = capability.method == "POST"
+        && capability.path == PAGES_PROJECT_COLLECTION_PATH
+        && capability.product == "Pages Project"
+        && capability.permissions == ["Pages Write"]
+        && pages_project_upstream_request_supported(capability.request_schema.as_ref());
+    if !create_supported || !companions_supported || !response_supported {
+        capability.created_resource = None;
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(format!(
+            "Pages Git-integrated project create, exact readback, delete, or response contract drifted (create={create_supported}, companions={companions_supported}, response={response_supported})"
+        ));
+        return;
+    }
+
+    capability.request_schema = Some(pages_git_project_create_request_schema());
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.cost = CostV1::default();
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.basis = Some(
+        "creating one Git-integrated Pages project has no direct API-operation charge; the closed request contract excludes deployment configuration and resource bindings, but Git integration starts and continues builds/deployments, and any Pages Functions present in repository output plus build quotas remain plan-specific downstream exposure"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        official_reference(
+            "Cloudflare Pages pricing",
+            "https://developers.cloudflare.com/pages/functions/pricing/",
+        ),
+        official_reference(
+            "Cloudflare Pages Git integration",
+            "https://developers.cloudflare.com/pages/configuration/git-integration/",
+        ),
+    ];
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: PAGES_PROJECT_DETAIL_PATH.to_owned(),
+        identity_selector: "project_name".to_owned(),
+        response_result_identity_pointer: "/name".to_owned(),
+        read_capability_id: PAGES_PROJECT_READ_CAPABILITY_ID.to_owned(),
+        delete_capability_id: PAGES_PROJECT_DELETE_CAPABILITY_ID.to_owned(),
+        verified_response_fields: response_fields.map(str::to_owned).to_vec(),
+    });
+    capability.verification.required = true;
+    "created_resource_contains_planned_fields_by_returned_id"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    capability.rollback.warning = Some(
+        "compensation creates a separate exact-project deletion plan that must be reviewed and explicitly approved; deletion removes the Pages project and deployments but does not delete the connected Git repository"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
+
+fn pages_project_upstream_request_supported(schema: Option<&Value>) -> bool {
+    let Some(schema) = schema else {
+        return false;
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    let has_string = |object: &serde_json::Map<String, Value>, field: &str| {
+        object
+            .get(field)
+            .and_then(|field| field.get("type"))
+            .and_then(Value::as_str)
+            == Some("string")
+    };
+    let Some(build) = properties
+        .get("build_config")
+        .and_then(|value| value.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(source) = properties
+        .get("source")
+        .and_then(|value| value.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(source_config) = source
+        .get("config")
+        .and_then(|value| value.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let source_types = source
+        .get("type")
+        .and_then(|value| value.get("enum"))
+        .and_then(Value::as_array);
+    let required = schema.get("required").and_then(Value::as_array);
+    let source_required = properties
+        .get("source")
+        .and_then(|value| value.get("required"))
+        .and_then(Value::as_array);
+    schema.get("type").and_then(Value::as_str) == Some("object")
+        && required.is_some_and(|required| {
+            ["name", "production_branch"]
+                .iter()
+                .all(|field| required.contains(&Value::String((*field).to_owned())))
+        })
+        && has_string(properties, "name")
+        && has_string(properties, "production_branch")
+        && ["build_command", "destination_dir", "root_dir"]
+            .iter()
+            .all(|field| has_string(build, field))
+        && source_types.is_some_and(|types| types.contains(&Value::String("github".to_owned())))
+        && source_required.is_some_and(|required| {
+            ["type", "config"]
+                .iter()
+                .all(|field| required.contains(&Value::String((*field).to_owned())))
+        })
+        && [
+            "owner",
+            "owner_id",
+            "production_branch",
+            "repo_id",
+            "repo_name",
+        ]
+        .iter()
+        .all(|field| has_string(source_config, field))
+        && [
+            "deployments_enabled",
+            "pr_comments_enabled",
+            "production_deployments_enabled",
+        ]
+        .iter()
+        .all(|field| {
+            source_config
+                .get(*field)
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+                == Some("boolean")
+        })
+        && source_config
+            .get("preview_deployment_setting")
+            .and_then(|value| value.get("enum"))
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                ["all", "none", "custom"]
+                    .iter()
+                    .all(|value| values.contains(&Value::String((*value).to_owned())))
+            })
+}
+
+fn pages_git_project_create_request_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "x-cfctl-body-required":true,
+        "required":["name","production_branch","build_config","source"],
+        "properties":{
+            "name":{"type":"string","minLength":1},
+            "production_branch":{"type":"string","enum":["main"]},
+            "build_config":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["build_command","destination_dir"],
+                "properties":{
+                    "build_command":{"type":"string","minLength":1},
+                    "destination_dir":{"type":"string","minLength":1},
+                    "root_dir":{"type":"string"}
+                }
+            },
+            "source":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["type","config"],
+                "properties":{
+                    "type":{"type":"string","enum":["github"]},
+                    "config":{
+                        "type":"object",
+                        "additionalProperties":false,
+                        "required":[
+                            "deployments_enabled","owner","owner_id","preview_deployment_setting",
+                            "production_branch","production_deployments_enabled","repo_id","repo_name"
+                        ],
+                        "properties":{
+                            "deployments_enabled":{"type":"boolean","enum":[true]},
+                            "owner":{"type":"string","minLength":1},
+                            "owner_id":{"type":"string","minLength":1},
+                            "preview_deployment_setting":{"type":"string","enum":["all"]},
+                            "production_branch":{"type":"string","enum":["main"]},
+                            "production_deployments_enabled":{"type":"boolean","enum":[true]},
+                            "repo_id":{"type":"string","minLength":1},
+                            "repo_name":{"type":"string","minLength":1}
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 
 const PAGES_DOMAIN_CREATE_CAPABILITY_ID: &str = "pages-domains-add-domain";
@@ -7497,6 +7895,237 @@ fn finalize_pages_domain_create_contract(
     capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
     capability.rollback.warning = Some(
         "compensation creates a separate exact-domain delete plan that must be reviewed and explicitly approved"
+            .to_owned(),
+    );
+    refresh_dynamic_mutation_contract(capability);
+}
+
+const WORKER_DOMAIN_ATTACH_CAPABILITY_ID: &str = "workers.domains.update";
+const WORKER_DOMAIN_READ_CAPABILITY_ID: &str = "workers.domains.get";
+const WORKER_DOMAIN_DELETE_CAPABILITY_ID: &str = "workers.domains.delete";
+const WORKER_DOMAIN_COLLECTION_PATH: &str = "/accounts/{account_id}/workers/domains";
+const WORKER_DOMAIN_DETAIL_PATH: &str = "/accounts/{account_id}/workers/domains/{domain_id}";
+const WORKER_DOMAIN_DNS_LIST_CAPABILITY_ID: &str = "dns-records-for-a-zone-list-dns-records";
+const WORKER_DOMAIN_DNS_LIST_PATH: &str = "/zones/{zone_id}/dns_records";
+const WORKER_DOMAIN_ATTACH_LIFECYCLE_PERMISSIONS: [&str; 2] = ["Workers Scripts Write", "DNS Read"];
+
+fn worker_domain_path_selectors_supported(capability: &CapabilityV1, expected: &[&str]) -> bool {
+    capability.selectors.len() == expected.len()
+        && expected.iter().all(|name| {
+            capability.selectors.iter().any(|selector| {
+                selector.name == *name
+                    && selector.location == "path"
+                    && selector.required
+                    && selector.value_type == "string"
+            })
+        })
+}
+
+fn worker_domain_upstream_request_supported(schema: Option<&Value>) -> bool {
+    schema
+        == Some(&serde_json::json!({
+            "allOf": [
+                {
+                    "properties": {
+                        "hostname": {"type": "string"},
+                        "service": {"type": "string"},
+                        "zone_id": {"type": "string"},
+                        "zone_name": {"type": "string"}
+                    },
+                    "required": ["zone_id", "zone_name", "hostname", "service"],
+                    "type": "object"
+                },
+                {
+                    "required": ["hostname", "service"],
+                    "type": "object"
+                }
+            ],
+            "x-cfctl-body-required": true
+        }))
+}
+
+fn worker_domain_attach_request_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "x-cfctl-body-required": true,
+        "required": ["hostname", "service", "zone_id"],
+        "properties": {
+            "hostname": {"type": "string", "minLength": 1, "maxLength": 253},
+            "service": {"type": "string", "minLength": 1},
+            "zone_id": {"type": "string", "minLength": 32, "maxLength": 32}
+        }
+    })
+}
+
+fn worker_domain_companions_supported(capabilities: &BTreeMap<String, CapabilityV1>) -> bool {
+    capabilities
+        .get(WORKER_DOMAIN_READ_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.method == "GET"
+                && capability.path == WORKER_DOMAIN_DETAIL_PATH
+                && capability.product == "Domains"
+                && capability.account_scope == "account"
+                && capability.permissions == ["Workers Scripts Write", "Workers Scripts Read"]
+                && worker_domain_path_selectors_supported(capability, &["account_id", "domain_id"])
+        })
+        && capabilities
+            .get(WORKER_DOMAIN_DELETE_CAPABILITY_ID)
+            .is_some_and(|capability| {
+                capability.method == "DELETE"
+                    && capability.path == WORKER_DOMAIN_DETAIL_PATH
+                    && capability.product == "Domains"
+                    && capability.account_scope == "account"
+                    && capability.permissions == ["Workers Scripts Write"]
+                    && capability.request_schema.is_none()
+                    && worker_domain_path_selectors_supported(
+                        capability,
+                        &["account_id", "domain_id"],
+                    )
+            })
+}
+
+fn worker_domain_dns_conflict_read_supported(
+    capabilities: &BTreeMap<String, CapabilityV1>,
+) -> bool {
+    capabilities
+        .get(WORKER_DOMAIN_DNS_LIST_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.method == "GET"
+                && capability.path == WORKER_DOMAIN_DNS_LIST_PATH
+                && capability.product == "DNS Records for a Zone"
+                && capability.account_scope == "zone"
+                && !capability.mutating
+                && capability.request_schema.is_none()
+                && capability
+                    .permissions
+                    .iter()
+                    .any(|permission| permission == "DNS Read")
+                && capability.selectors.iter().any(|selector| {
+                    selector.name == "zone_id"
+                        && selector.location == "path"
+                        && selector.required
+                        && selector.value_type == "string"
+                })
+                && capability.selectors.iter().any(|selector| {
+                    selector.name == "name.exact"
+                        && selector.location == "query"
+                        && !selector.required
+                        && selector.value_type == "string"
+                })
+                && capability
+                    .response_contract
+                    .as_ref()
+                    .is_some_and(|contract| {
+                        contract.body_mode == ResponseBodyModeV1::CloudflareJsonEnvelope
+                            && contract.success_statuses == ["200"]
+                            && contract.success_media_types == ["application/json"]
+                    })
+        })
+}
+
+fn worker_domain_responses_supported(document: &Value) -> bool {
+    let attach_operation =
+        document.pointer("/paths/~1accounts~1{account_id}~1workers~1domains/put");
+    let read_operation =
+        document.pointer("/paths/~1accounts~1{account_id}~1workers~1domains~1{domain_id}/get");
+    let response_fields = [
+        "cert_id",
+        "hostname",
+        "id",
+        "service",
+        "zone_id",
+        "zone_name",
+    ];
+    attach_operation.is_some_and(|operation| {
+        success_response_declares_result_string_field(document, operation, "id")
+            && success_response_declares_result_fields(document, operation, &response_fields)
+    }) && read_operation.is_some_and(|operation| {
+        success_response_declares_result_string_field(document, operation, "id")
+            && success_response_declares_result_fields(document, operation, &response_fields)
+    })
+}
+
+fn finalize_worker_custom_domain_attach_contract(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let companions_supported = worker_domain_companions_supported(capabilities);
+    let dns_conflict_read_supported = worker_domain_dns_conflict_read_supported(capabilities);
+    let response_supported = worker_domain_responses_supported(document);
+
+    let Some(capability) = capabilities.get_mut(WORKER_DOMAIN_ATTACH_CAPABILITY_ID) else {
+        return;
+    };
+    let attach_supported = capability.method == "PUT"
+        && capability.path == WORKER_DOMAIN_COLLECTION_PATH
+        && capability.product == "Domains"
+        && capability.account_scope == "account"
+        && capability.permissions == ["Workers Scripts Write"]
+        && worker_domain_path_selectors_supported(capability, &["account_id"])
+        && worker_domain_upstream_request_supported(capability.request_schema.as_ref());
+    if !attach_supported
+        || !companions_supported
+        || !dns_conflict_read_supported
+        || !response_supported
+    {
+        capability.created_resource = None;
+        capability.adapter_status = AdapterStatus::Blocked;
+        capability.blocked_reason = Some(format!(
+            "Worker custom-domain attach, exact readback, detach, DNS conflict read, request, permission, or response contract drifted (attach={attach_supported}, companions={companions_supported}, dns_conflict_read={dns_conflict_read_supported}, response={response_supported})"
+        ));
+        return;
+    }
+
+    capability.permissions = WORKER_DOMAIN_ATTACH_LIFECYCLE_PERMISSIONS
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    capability.request_schema = Some(worker_domain_attach_request_schema());
+    capability.risk = RiskClass::CrossConfig;
+    capability.effect = EffectClass::ReversibleWrite;
+    capability.entitlement.available = Some(true);
+    capability.entitlement.source = Some(
+        "https://developers.cloudflare.com/workers/configuration/routing/custom-domains/"
+            .to_owned(),
+    );
+    capability.cost = CostV1::default();
+    capability.cost.billing_model = BillingModelV1::UsageBased;
+    capability.cost.exposure = CostExposureV1::DownstreamUsage;
+    capability.cost.maximum = Some(0.0);
+    capability.cost.basis = Some(
+        "attaching one exact hostname to a Worker has no direct attachment charge; traffic routed through the Worker retains plan-specific request and CPU usage exposure"
+            .to_owned(),
+    );
+    capability.cost.references = vec![
+        official_reference(
+            "Cloudflare Workers custom domains",
+            "https://developers.cloudflare.com/workers/configuration/routing/custom-domains/",
+        ),
+        official_reference(
+            "Cloudflare Workers pricing",
+            "https://developers.cloudflare.com/workers/platform/pricing/",
+        ),
+    ];
+    capability.created_resource = Some(CreatedResourceContractV1 {
+        detail_path: WORKER_DOMAIN_DETAIL_PATH.to_owned(),
+        identity_selector: "domain_id".to_owned(),
+        response_result_identity_pointer: "/id".to_owned(),
+        read_capability_id: WORKER_DOMAIN_READ_CAPABILITY_ID.to_owned(),
+        delete_capability_id: WORKER_DOMAIN_DELETE_CAPABILITY_ID.to_owned(),
+        verified_response_fields: vec![
+            "hostname".to_owned(),
+            "service".to_owned(),
+            "zone_id".to_owned(),
+        ],
+    });
+    capability.verification.required = true;
+    "created_resource_contains_planned_fields_by_returned_id"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy = Some("delete_created_resource_by_returned_id".to_owned());
+    capability.rollback.warning = Some(
+        "compensation creates a separate exact-domain detach plan that must be reviewed and explicitly approved; detaching does not remove an associated Advanced Certificate and cannot undo traffic already served"
             .to_owned(),
     );
     refresh_dynamic_mutation_contract(capability);
@@ -11599,10 +12228,108 @@ enum OAuthClientSecretOperationKind {
     DeleteOld,
 }
 
+const OAUTH_CLIENT_COLLECTION_PATH: &str = "/accounts/{account_id}/oauth_clients";
 const OAUTH_CLIENT_DETAIL_PATH: &str = "/accounts/{account_id}/oauth_clients/{oauth_client_id}";
+const OAUTH_CLIENT_CREATE_CAPABILITY_ID: &str = "oauth-clients-create";
+const OAUTH_CLIENT_UPDATE_CAPABILITY_ID: &str = "oauth-clients-update";
 const OAUTH_CLIENT_SECRET_PATH: &str =
     "/accounts/{account_id}/oauth_clients/{oauth_client_id}/rotate_secret";
 const OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID: &str = "oauth-clients-get";
+const OAUTH_CLIENT_DELETE_CAPABILITY_ID: &str = "oauth-clients-delete";
+const OAUTH_CLIENT_LIFECYCLE_PERMISSIONS: [&str; 2] = ["OAuth Client Write", "OAuth Client Read"];
+const OAUTH_CLIENT_CONFIGURATION_FIELDS: [&str; 12] = [
+    "allowed_cors_origins",
+    "client_name",
+    "client_uri",
+    "grant_types",
+    "logo_uri",
+    "policy_uri",
+    "post_logout_redirect_uris",
+    "redirect_uris",
+    "response_types",
+    "scopes",
+    "token_endpoint_auth_method",
+    "tos_uri",
+];
+
+fn oauth_client_collection_selectors_supported(capability: &CapabilityV1) -> bool {
+    capability.selectors.len() == 1
+        && capability.selectors.iter().any(|selector| {
+            selector.name == "account_id"
+                && selector.location == "path"
+                && selector.required
+                && selector.value_type == "string"
+                && selector.contract.as_ref().is_some_and(|contract| {
+                    contract.schema
+                        == serde_json::json!({
+                            "allOf":[{"maxLength":32,"minLength":32,"type":"string"}]
+                        })
+                        && contract.query.is_none()
+                })
+        })
+}
+
+fn oauth_client_configuration_properties() -> Value {
+    serde_json::json!({
+        "allowed_cors_origins":{"items":{"type":"string"},"type":"array"},
+        "client_name":{"type":"string"},
+        "client_uri":{"type":"string"},
+        "grant_types":{"items":{"enum":["authorization_code","refresh_token"],"type":"string"},"type":"array"},
+        "logo_uri":{"type":"string"},
+        "policy_uri":{"type":"string"},
+        "post_logout_redirect_uris":{"items":{"type":"string"},"type":"array"},
+        "redirect_uris":{"items":{"type":"string"},"type":"array"},
+        "response_types":{"items":{"enum":["token","id_token","code"],"type":"string"},"type":"array"},
+        "scopes":{"items":{"type":"string"},"type":"array"},
+        "token_endpoint_auth_method":{"enum":["none","client_secret_basic","client_secret_post"],"type":"string"},
+        "tos_uri":{"type":"string"}
+    })
+}
+
+fn oauth_client_upstream_create_schema() -> Value {
+    serde_json::json!({
+        "allOf":[
+            {"properties":oauth_client_configuration_properties(),"type":"object"},
+            {
+                "required":["client_name","grant_types","redirect_uris","response_types","scopes","token_endpoint_auth_method"],
+                "type":"object"
+            }
+        ],
+        "x-cfctl-body-required":true
+    })
+}
+
+fn oauth_client_upstream_update_schema() -> Value {
+    serde_json::json!({
+        "allOf":[
+            {"properties":oauth_client_configuration_properties(),"type":"object"},
+            {"properties":{"visibility":{"enum":["public"],"type":"string"}},"type":"object"}
+        ],
+        "x-cfctl-body-required":true
+    })
+}
+
+fn oauth_client_closed_create_schema() -> Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["client_name","grant_types","redirect_uris","response_types","scopes","token_endpoint_auth_method"],
+        "properties":oauth_client_configuration_properties(),
+        "x-cfctl-body-required":true
+    })
+}
+
+fn oauth_client_closed_update_schema() -> Value {
+    let mut properties = oauth_client_configuration_properties();
+    properties["visibility"] = serde_json::json!({"enum":["public"],"type":"string"});
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "minProperties":1,
+        "properties":properties,
+        "x-cfctl-body-required":true
+    })
+}
 
 fn oauth_client_secret_operation_kind(
     capability: &CapabilityV1,
@@ -11685,6 +12412,221 @@ fn oauth_client_all_plan_entitlement_supported(capability: &CapabilityV1) -> boo
             ("free".to_owned(), true),
             ("pro".to_owned(), true),
         ])
+}
+
+fn oauth_client_detail_read_supported(
+    document: &Value,
+    capabilities: &BTreeMap<String, CapabilityV1>,
+) -> bool {
+    let fields = OAUTH_CLIENT_CONFIGURATION_FIELDS
+        .iter()
+        .copied()
+        .chain(["client_id", "visibility"])
+        .collect::<Vec<_>>();
+    capabilities
+        .get(OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.id == OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID
+                && capability.method == "GET"
+                && capability.path == OAUTH_CLIENT_DETAIL_PATH
+                && capability.product == "OAuth Clients"
+                && capability.account_scope == "account"
+                && capability.permissions == ["OAuth Client Read"]
+                && capability.request_schema.is_none()
+                && oauth_client_selectors_supported(capability)
+                && oauth_client_all_plan_entitlement_supported(capability)
+                && capability
+                    .response_contract
+                    .as_ref()
+                    .is_some_and(oauth_client_json_response_supported)
+        })
+        && document
+            .pointer("/paths/~1accounts~1{account_id}~1oauth_clients~1{oauth_client_id}/get")
+            .is_some_and(|operation| {
+                success_response_declares_result_string_field(document, operation, "client_id")
+                    && success_response_declares_result_fields(document, operation, &fields)
+            })
+}
+
+fn oauth_client_delete_supported(capabilities: &BTreeMap<String, CapabilityV1>) -> bool {
+    capabilities
+        .get(OAUTH_CLIENT_DELETE_CAPABILITY_ID)
+        .is_some_and(|capability| {
+            capability.id == OAUTH_CLIENT_DELETE_CAPABILITY_ID
+                && capability.method == "DELETE"
+                && capability.path == OAUTH_CLIENT_DETAIL_PATH
+                && capability.product == "OAuth Clients"
+                && capability.account_scope == "account"
+                && capability.permissions == ["OAuth Client Write"]
+                && capability.request_schema.is_none()
+                && oauth_client_selectors_supported(capability)
+                && oauth_client_all_plan_entitlement_supported(capability)
+                && capability.verification.strategy
+                    == "same_resource_returns_not_found_after_delete"
+                && capability.same_path_read.as_ref().is_some_and(|read| {
+                    read.path == OAUTH_CLIENT_DETAIL_PATH
+                        && read.read_capability_id == OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID
+                        && read.verified_response_fields.is_empty()
+                })
+                && capability.mutation_contract_gaps().is_empty()
+        })
+}
+
+fn classify_oauth_client_cost_and_entitlement(capability: &mut CapabilityV1) {
+    capability.cost = CostV1::default();
+    capability.cost.basis = Some(
+        "creating or updating one OAuth client does not purchase a plan or add a direct operation charge, so the direct incremental ceiling is zero"
+            .to_owned(),
+    );
+    capability.cost.references = vec![official_reference(
+        "Create your OAuth client",
+        "https://developers.cloudflare.com/fundamentals/oauth/create-an-oauth-client/",
+    )];
+    capability.entitlement.available = Some(true);
+    capability.entitlement.source = Some("official OpenAPI x-cfPlanAvailability".to_owned());
+    capability.entitlement.blocker = None;
+    capability.entitlement.requires_live_resolution = false;
+}
+
+fn finalize_oauth_client_create_update_contracts(
+    document: &Value,
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+) {
+    let companions_supported = oauth_client_detail_read_supported(document, capabilities)
+        && oauth_client_delete_supported(capabilities);
+    let create_response_supported = document
+        .pointer("/paths/~1accounts~1{account_id}~1oauth_clients/post")
+        .is_some_and(|operation| {
+            success_response_declares_result_string_field(document, operation, "client_id")
+                && success_response_declares_result_string_field(
+                    document,
+                    operation,
+                    "client_secret",
+                )
+        });
+
+    finalize_oauth_client_create_contract(
+        capabilities,
+        companions_supported && create_response_supported,
+    );
+    finalize_oauth_client_update_contract(capabilities, companions_supported);
+}
+
+fn finalize_oauth_client_create_contract(
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+    companions_supported: bool,
+) {
+    if let Some(capability) = capabilities.get_mut(OAUTH_CLIENT_CREATE_CAPABILITY_ID) {
+        let create_supported = capability.id == OAUTH_CLIENT_CREATE_CAPABILITY_ID
+            && capability.method == "POST"
+            && capability.path == OAUTH_CLIENT_COLLECTION_PATH
+            && capability.product == "OAuth Clients"
+            && capability.account_scope == "account"
+            && capability.permissions == ["OAuth Client Write"]
+            && oauth_client_collection_selectors_supported(capability)
+            && oauth_client_all_plan_entitlement_supported(capability)
+            && capability.request_schema.as_ref() == Some(&oauth_client_upstream_create_schema())
+            && capability
+                .response_contract
+                .as_ref()
+                .is_some_and(oauth_client_json_response_supported);
+        if create_supported && companions_supported {
+            capability.permissions = OAUTH_CLIENT_LIFECYCLE_PERMISSIONS
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            capability.request_schema = Some(oauth_client_closed_create_schema());
+            capability.risk = RiskClass::IdentityOrOwnership;
+            capability.effect = EffectClass::IdentityOrOwnership;
+            classify_oauth_client_cost_and_entitlement(capability);
+            capability.created_resource = Some(CreatedResourceContractV1 {
+                detail_path: OAUTH_CLIENT_DETAIL_PATH.to_owned(),
+                identity_selector: "oauth_client_id".to_owned(),
+                response_result_identity_pointer: "/client_id".to_owned(),
+                read_capability_id: OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID.to_owned(),
+                delete_capability_id: OAUTH_CLIENT_DELETE_CAPABILITY_ID.to_owned(),
+                verified_response_fields: OAUTH_CLIENT_CONFIGURATION_FIELDS
+                    .iter()
+                    .map(|field| (*field).to_owned())
+                    .collect(),
+            });
+            capability.verification.required = true;
+            "created_resource_contains_planned_fields_by_returned_id"
+                .clone_into(&mut capability.verification.strategy);
+            capability.rollback.supported = false;
+            capability.rollback.strategy = None;
+            capability.rollback.warning = Some(
+                "OAuth client creation is not automatically rolled back; removing a failed private client requires a separately reviewed and explicitly approved destructive delete plan bound to the returned client_id"
+                    .to_owned(),
+            );
+            refresh_dynamic_mutation_contract(capability);
+        } else {
+            capability.created_resource = None;
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(
+                "OAuth client create, secret response, detail read, delete, request, permission, entitlement, or response contract drifted"
+                    .to_owned(),
+            );
+        }
+    }
+}
+
+fn finalize_oauth_client_update_contract(
+    capabilities: &mut BTreeMap<String, CapabilityV1>,
+    companions_supported: bool,
+) {
+    if let Some(capability) = capabilities.get_mut(OAUTH_CLIENT_UPDATE_CAPABILITY_ID) {
+        let update_fields = OAUTH_CLIENT_CONFIGURATION_FIELDS
+            .iter()
+            .copied()
+            .chain(["visibility"])
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let update_supported = capability.id == OAUTH_CLIENT_UPDATE_CAPABILITY_ID
+            && capability.method == "PATCH"
+            && capability.path == OAUTH_CLIENT_DETAIL_PATH
+            && capability.product == "OAuth Clients"
+            && capability.account_scope == "account"
+            && capability.permissions == ["OAuth Client Write"]
+            && oauth_client_selectors_supported(capability)
+            && oauth_client_all_plan_entitlement_supported(capability)
+            && capability.request_schema.as_ref() == Some(&oauth_client_upstream_update_schema())
+            && capability
+                .response_contract
+                .as_ref()
+                .is_some_and(oauth_client_json_response_supported);
+        if update_supported && companions_supported {
+            capability.permissions = OAUTH_CLIENT_LIFECYCLE_PERMISSIONS
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            capability.request_schema = Some(oauth_client_closed_update_schema());
+            capability.risk = RiskClass::IdentityOrOwnership;
+            capability.effect = EffectClass::IdentityOrOwnership;
+            classify_oauth_client_cost_and_entitlement(capability);
+            capability.verification.required = true;
+            "same_resource_contains_planned_fields_after_update"
+                .clone_into(&mut capability.verification.strategy);
+            capability.same_path_read = Some(SamePathReadContractV1 {
+                path: OAUTH_CLIENT_DETAIL_PATH.to_owned(),
+                read_capability_id: OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID.to_owned(),
+                verified_response_fields: update_fields,
+            });
+            capability.rollback.supported = false;
+            capability.rollback.strategy = None;
+            capability.rollback.warning = Some(
+                "cfctl hash-binds and rechecks the exact existing client before update; metadata restoration requires a separate snapshot-bound update, while promotion to public is permanent because Cloudflare does not permit demotion"
+                    .to_owned(),
+            );
+            refresh_dynamic_mutation_contract(capability);
+        } else {
+            capability.adapter_status = AdapterStatus::Blocked;
+            capability.blocked_reason = Some(
+                "OAuth client update, detail read, delete, request, permission, entitlement, or response contract drifted"
+                    .to_owned(),
+            );
+        }
+    }
 }
 
 fn classify_oauth_client_secret_operation(
@@ -11787,6 +12729,10 @@ fn finalize_oauth_client_secret_rotation_contract(
         let Some(capability) = capabilities.get_mut(capability_id) else {
             continue;
         };
+        capability.permissions = OAUTH_CLIENT_LIFECYCLE_PERMISSIONS
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         capability.same_path_read = Some(SamePathReadContractV1 {
             path: OAUTH_CLIENT_DETAIL_PATH.to_owned(),
             read_capability_id: OAUTH_CLIENT_DETAIL_READ_CAPABILITY_ID.to_owned(),

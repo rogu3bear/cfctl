@@ -12,6 +12,12 @@ documentation, and evidence model agree.
 - Search the catalog before adding behavior. New writes remain blocked until
   risk, effect, cost, permission, entitlement, verification, and rollback or
   explicit irreversibility are known.
+- Classify capability authority separately from its adapter. Reusable
+  Cloudflare behavior is `provider_generic`; cfctl's own public identity is
+  `cfctl_product`. Do not compile a customer or application repository,
+  account, database, migration, or deployment policy into either class. New
+  `legacy_embedded` entries are prohibited; workspace-owned behavior must wait
+  for the typed operation-pack loader and remain in its owning repository.
 - Reads are not plans, plans are not applies, and apply artifacts are not
   post-change verification. Keep those evidence classes distinct.
 - All mutations use the one-use `PlanV1` lifecycle. Never weaken approval,
@@ -50,11 +56,13 @@ lanes separate so a reviewer can see the risky change alone.
 
 ## Development setup
 
-Rust 1.97 is pinned by the repository. The local proof lane needs `cargo-deny`
-and Gitleaks, and — because `cargo xtask verify` cross-builds the Linux ship
-target — `zig` with `cargo-zigbuild` and the `x86_64-unknown-linux-musl` Rust
-target. `verify` fails closed when the cross toolchain is absent rather than
-skipping the Linux build. Install them, then orient through the public CLI:
+Rust 1.97 is pinned by the repository. The local proof lane needs `cargo-deny`,
+Gitleaks, Bun 1.3.14, cargo-leptos 0.3.5, worker-build 0.7.5, and the
+`wasm32-unknown-unknown` target. Because `cargo xtask verify` also cross-builds
+the Linux ship target, it needs `zig`, `cargo-zigbuild`, and the
+`x86_64-unknown-linux-musl` Rust target. `verify` fails closed when either the
+site or cross-build toolchain is absent rather than skipping that proof.
+Install them, then orient through the public CLI:
 
 ```bash
 ./bootstrap.sh
@@ -76,11 +84,21 @@ Authentication is optional for offline development. Use `cfctl auth login` or
 an explicitly scoped token profile when live-read proof is required; never
 create a repository `.env` with Cloudflare credentials.
 
-### Pre-push gate
+### Hosted and pre-push gates
 
-Remote CI is intentionally absent, so nothing catches a gate that was never
-run — this repository has shipped a red `main` that way. `.githooks/pre-push`
-runs `cargo xtask verify` and refuses the push when it fails.
+GitHub runs two read-only hosted proofs for every pull request and `main` push.
+The Rust job runs formatting, workspace Clippy, workspace tests, and the
+Cloudflare request-contract test. The website job pins its Bun and Rust build
+tools, runs site formatting/Clippy/tests, and builds the complete edge artifact
+twice to reject nondeterminism. Hosted proof still does not replace the complete
+local lane: Bun bridge proof, dependency policy, full-history secret scanning,
+source/governance contracts, and the Linux musl cross-build remain in
+`cargo xtask verify`.
+
+`.githooks/pre-push` runs that complete local proof and refuses the push when
+it fails. This repository has previously shipped a red `main` when the local
+gate was not run; hosted Rust proof now supplies an independent baseline while
+the pre-push gate preserves the broader release-target contract.
 
 The hook is tracked, but it does not run merely because you cloned the
 repository. It executes only where an agentOS-style delegate pins its digest in
@@ -160,7 +178,8 @@ releases are unsigned by operator decision**, with integrity from `SHA256SUMS`,
 reproducible double-builds, SPDX SBOMs, and commit-bound provenance. Because
 the rendered Linux installer verifies a Cosign identity and has no
 checksum-only fallback, it is deliberately not shipped with unsigned releases.
-GitHub-hosted Rust builds are intentionally absent.
+The hosted Rust proof never assembles, signs, uploads, or publishes release
+artifacts.
 
 An account-backed disposable token smoke test
 (`tests/account-backed-smoke.sh`) is kept out of the local proof lane because
