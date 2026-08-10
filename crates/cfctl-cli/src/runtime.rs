@@ -28930,12 +28930,14 @@ mod tests {
             ..CallInput::default()
         };
         let result = json!({
-            "output_file":{
-                "sha256":format!("sha256:{}", "a".repeat(64)),
-                "complete":true,
-                "hash_matches":true,
-            },
-            "provider":{"at_bookmark":"bookmark-after-0142"},
+            "result": {
+                "output_file":{
+                    "sha256":format!("sha256:{}", "a".repeat(64)),
+                    "complete":true,
+                    "hash_matches":true,
+                },
+                "provider":{"at_bookmark":"bookmark-after-0142"},
+            }
         });
         let evidence = store
             .write_evidence(EvidenceClass::LiveRead, &result)
