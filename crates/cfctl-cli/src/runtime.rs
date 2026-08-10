@@ -35523,6 +35523,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the regression keeps the full sink-only two-secret plan and its execution-time live-precondition routing in one lifecycle proof"
+    )]
     fn prepared_oauth_client_rotation_plan_carries_exact_two_secret_transition() {
         let root = tempfile::tempdir().expect("runtime root");
         let store = StateStore::open(RuntimePaths::from_root(root.path())).expect("state store");

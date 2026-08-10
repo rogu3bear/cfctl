@@ -557,6 +557,7 @@ pub(super) async fn validate_live_precondition(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::{
         WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION, apply_state_responses, required_precondition,
