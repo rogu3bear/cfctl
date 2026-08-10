@@ -1,6 +1,7 @@
 //! Deterministic command handlers for the cfctl v2 binary.
 
 mod event_batch;
+mod worker_custom_domain;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11101,6 +11102,8 @@ fn plan_requires_live_credential(capability: &CapabilityV1, adapter_targets: &Va
         || should_bind_same_path_prior_state(capability)
         || should_bind_security_action_state(capability, adapter_targets)
         || should_bind_oauth_client_secret_state(capability)
+        || should_bind_oauth_client_update_state(capability)
+        || worker_custom_domain::should_bind_state(capability)
         || should_bind_r2_parent_token(capability)
         || is_access_application_login_methods_mutation(capability)
         || is_access_human_policy_mutation(capability)
@@ -11925,6 +11928,10 @@ async fn prepare_live_plan_preconditions(
             store, catalog, capability, input, account_id, credential,
         )
         .await?,
+        worker_custom_domain_state: worker_custom_domain::prepare_state_precondition(
+            store, catalog, capability, input, account_id, credential,
+        )
+        .await?,
     })
 }
 
@@ -11950,6 +11957,7 @@ struct LivePlanPreconditions {
     security_action_state: Option<(Value, EvidenceV1)>,
     oauth_client_secret_state: Option<(Value, EvidenceV1)>,
     oauth_client_update_state: Option<(Value, EvidenceV1)>,
+    worker_custom_domain_state: Option<(Value, EvidenceV1)>,
 }
 
 fn plan_targets(
@@ -12003,6 +12011,10 @@ fn plan_targets(
     }
     if let Some((receipt, _)) = &live_preconditions.oauth_client_update_state {
         targets["live_preconditions"][OAUTH_CLIENT_UPDATE_STATE_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.worker_custom_domain_state {
+        targets["live_preconditions"]
+            [worker_custom_domain::WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION] = receipt.clone();
     }
     if let Some((receipt, _)) = &live_preconditions.r2_parent_token {
         targets["live_preconditions"][R2_PARENT_TOKEN_PRECONDITION] = receipt.clone();
@@ -12068,6 +12080,10 @@ fn bind_live_plan_preconditions(
         (
             OAUTH_CLIENT_UPDATE_STATE_PRECONDITION,
             &live_preconditions.oauth_client_update_state,
+        ),
+        (
+            worker_custom_domain::WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION,
+            &live_preconditions.worker_custom_domain_state,
         ),
         (
             R2_PARENT_TOKEN_PRECONDITION,
@@ -14456,6 +14472,7 @@ struct LivePreconditionEvidence {
     security_action_state: Option<EvidenceV1>,
     oauth_client_secret_state: Option<EvidenceV1>,
     oauth_client_update_state: Option<EvidenceV1>,
+    worker_custom_domain_state: Option<EvidenceV1>,
     r2_parent_token: Option<EvidenceV1>,
 }
 
@@ -14535,6 +14552,10 @@ async fn validate_live_plan_precondition_evidence(
         )
         .await?,
         oauth_client_update_state: validate_live_oauth_client_update_state_precondition(
+            store, catalog, plan, input, credential,
+        )
+        .await?,
+        worker_custom_domain_state: worker_custom_domain::validate_live_precondition(
             store, catalog, plan, input, credential,
         )
         .await?,
@@ -14620,6 +14641,7 @@ fn prepend_live_precondition_evidence(
         evidence.r2_parent_token,
         evidence.oauth_client_secret_state,
         evidence.oauth_client_update_state,
+        evidence.worker_custom_domain_state,
         evidence.dns_record_state,
         evidence.same_path_prior_state,
         evidence.security_action_state,
@@ -24766,6 +24788,9 @@ fn is_live_plan_precondition_hash(name: &str) -> bool {
             | DNS_RECORD_STATE_PRECONDITION
             | SAME_PATH_PRIOR_STATE_PRECONDITION
             | SECURITY_ACTION_STATE_PRECONDITION
+            | OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION
+            | OAUTH_CLIENT_UPDATE_STATE_PRECONDITION
+            | worker_custom_domain::WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION
             | R2_PARENT_TOKEN_PRECONDITION
     )
 }
@@ -25631,6 +25656,7 @@ enum GuideLiveRead {
     WebAnalyticsRumState,
     DnsRecordState,
     OAuthClientSecretState,
+    WorkerCustomDomainState,
 }
 
 fn guide_live_reads(capability: &CapabilityV1) -> Vec<GuideLiveRead> {
@@ -25674,6 +25700,10 @@ fn guide_live_reads(capability: &CapabilityV1) -> Vec<GuideLiveRead> {
         (
             should_bind_oauth_client_secret_state(capability),
             GuideLiveRead::OAuthClientSecretState,
+        ),
+        (
+            worker_custom_domain::should_bind_state(capability),
+            GuideLiveRead::WorkerCustomDomainState,
         ),
     ]
     .into_iter()
@@ -25731,6 +25761,7 @@ fn guide_stage_contract_state(
                         | GuideLiveRead::WebAnalyticsRumState
                         | GuideLiveRead::DnsRecordState
                         | GuideLiveRead::OAuthClientSecretState
+                        | GuideLiveRead::WorkerCustomDomainState
                 )
             }) =>
         {
@@ -25844,6 +25875,13 @@ fn guide_live_read_summary(
                 "Read and bind the exact live writable DNS record state; execution repeats this read and rejects drift before crossing the mutation boundary.",
             )
         }
+        GuideStage::InspectCurrentState
+            if live_reads.contains(&GuideLiveRead::WorkerCustomDomainState) =>
+        {
+            Some(
+                "Read and bind the active zone and exact Worker settings, then require the hostname to be absent from both Worker custom domains and DNS records; execution repeats all four reads and rejects drift before attachment.",
+            )
+        }
         _ => None,
     }
 }
@@ -25866,6 +25904,7 @@ fn guide_stage_uses_live_read(stage: cfctl_core::GuideStage, live_reads: &[Guide
                     | GuideLiveRead::WarpConnectorConfigurationState
                     | GuideLiveRead::WebAnalyticsRumState
                     | GuideLiveRead::DnsRecordState
+                    | GuideLiveRead::WorkerCustomDomainState
             )
         }),
         _ => false,
@@ -26026,6 +26065,9 @@ fn guide_stage_evidence_class(stage: cfctl_core::GuideStage, mutating: bool) -> 
 }
 
 fn operation_specific_current_state_command(capability: &CapabilityV1) -> Option<Vec<String>> {
+    if worker_custom_domain::should_bind_state(capability) {
+        return Some(worker_custom_domain::current_state_command());
+    }
     if should_bind_global_warp_override_state(capability) {
         return Some(vec![
             "cfctl".to_owned(),
@@ -26915,14 +26957,14 @@ mod tests {
         pages_source_remote_receipt, parse_pages_remote_head, permission_inventory_call,
         permission_inventory_envelope, persist_d1_import_checkpoint, persist_prepared_plan,
         persist_secret_lifecycle, persist_secret_lifecycle_and_reconcile_lineage, plan_impact,
-        plan_state_next_step, plan_status_label, preflight_call_input, preflight_secret_sink,
-        preflight_standing_authority, prepare_r2_temporary_credentials_input,
-        prepare_security_action_input, preserve_previous_catalog, query_object_from_pairs,
-        read_import_secret, read_r2_log_retrieval_credentials, read_secret_file,
-        reconcile_standing_lineage_from_plan, rectify_approved_mln_import, rectify_plan,
-        redact_response_for_capability, redact_secret_payload, redact_secret_result,
-        repair_keychain_access_with_warning, request_body_contains_secret,
-        required_cloudflare_tunnel_configuration_state_precondition,
+        plan_requires_live_credential, plan_state_next_step, plan_status_label,
+        preflight_call_input, preflight_secret_sink, preflight_standing_authority,
+        prepare_r2_temporary_credentials_input, prepare_security_action_input,
+        preserve_previous_catalog, query_object_from_pairs, read_import_secret,
+        read_r2_log_retrieval_credentials, read_secret_file, reconcile_standing_lineage_from_plan,
+        rectify_approved_mln_import, rectify_plan, redact_response_for_capability,
+        redact_secret_payload, redact_secret_result, repair_keychain_access_with_warning,
+        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -26946,12 +26988,12 @@ mod tests {
         validate_global_warp_override_state_receipt_precondition,
         validate_managed_mln_stage_authority, validate_mln_0143_lineage_result,
         validate_pages_project_absence_receipt, validate_pages_source_remote_receipt,
-        validate_permission_group_resource_scope, validate_request_contract,
-        validate_selected_permission_groups, validate_standing_authority_group_scopes,
-        validate_standing_authority_permission_inventory, validate_token_policy_body,
-        validate_worker_script_secret_semantics, validate_wrangler_worker_versions_input,
-        validate_zone_account_receipt_precondition, validate_zone_id,
-        validated_standing_lineage_token_id, verification_outcome,
+        validate_permission_group_resource_scope, validate_plan_preconditions,
+        validate_request_contract, validate_selected_permission_groups,
+        validate_standing_authority_group_scopes, validate_standing_authority_permission_inventory,
+        validate_token_policy_body, validate_worker_script_secret_semantics,
+        validate_wrangler_worker_versions_input, validate_zone_account_receipt_precondition,
+        validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
         workspace_operational_proof_posture, workspace_precondition_hashes_for_scope,
         workspace_resource_keys, wrangler_config_directory, wrangler_deploy_version_id,
         wrangler_pages_deployment_has_commit, wrangler_status_has_promoted_version,
@@ -33980,6 +34022,7 @@ mod tests {
             security_action_state: None,
             oauth_client_secret_state: None,
             oauth_client_update_state: None,
+            worker_custom_domain_state: None,
         };
 
         // Without a bound empty precondition, nothing changes.
@@ -35201,6 +35244,7 @@ mod tests {
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: Some((receipt.clone(), evidence)),
+                worker_custom_domain_state: None,
             },
         )
         .expect("prepared OAuth update plan");
@@ -35224,6 +35268,24 @@ mod tests {
         assert_eq!(
             plan["cloudflare_diffs"][0]["irreversible_visibility_promotion"],
             true
+        );
+        let persisted_plan: PlanV1 =
+            serde_json::from_value(plan.clone()).expect("persisted OAuth update plan");
+        validate_plan_preconditions(&store, &persisted_plan)
+            .expect("live OAuth snapshot is re-read by its dedicated execution precondition");
+    }
+
+    #[test]
+    fn oauth_client_update_snapshot_routes_through_live_credential_resolution() {
+        let capability = oauth_client_capability(true);
+
+        assert!(
+            should_bind_oauth_client_update_state(&capability),
+            "the governed update requires a hash-bound live snapshot"
+        );
+        assert!(
+            plan_requires_live_credential(&capability, &json!({})),
+            "planning must resolve a credential before preparing the OAuth snapshot"
         );
     }
 
@@ -35543,6 +35605,7 @@ mod tests {
                 security_action_state: None,
                 oauth_client_secret_state: Some((receipt.clone(), evidence)),
                 oauth_client_update_state: None,
+                worker_custom_domain_state: None,
             },
         )
         .expect("prepared OAuth rotation plan");
@@ -35563,6 +35626,11 @@ mod tests {
         assert_eq!(
             plan["cloudflare_diffs"][0]["planned_after"],
             json!({"key_overlap_active":true})
+        );
+        let persisted_plan: PlanV1 =
+            serde_json::from_value(plan.clone()).expect("persisted OAuth rotation plan");
+        validate_plan_preconditions(&store, &persisted_plan).expect(
+            "live OAuth key-overlap state is re-read by its dedicated execution precondition",
         );
     }
 
@@ -36505,6 +36573,7 @@ mod tests {
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
+                worker_custom_domain_state: None,
             },
         )
         .expect("prepared plan");
@@ -36596,6 +36665,7 @@ mod tests {
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
+                worker_custom_domain_state: None,
             },
         )
         .expect("prepared plan");
@@ -36692,6 +36762,7 @@ mod tests {
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
+                worker_custom_domain_state: None,
             },
         )
         .expect("prepared plan");
@@ -36784,6 +36855,7 @@ mod tests {
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
+                worker_custom_domain_state: None,
             },
         )
         .expect("prepared plan");
@@ -36870,6 +36942,7 @@ mod tests {
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
+                worker_custom_domain_state: None,
             },
         )
         .expect("prepared plan");
@@ -36972,6 +37045,7 @@ mod tests {
                 security_action_state: None,
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
+                worker_custom_domain_state: None,
             },
         )
         .expect("prepared plan");

@@ -2760,6 +2760,36 @@ mod tests {
     };
 
     #[test]
+    fn hosted_proof_checks_out_and_verifies_the_exact_event_candidate() {
+        let workflow = include_str!("../../.github/workflows/hosted-proof.yml");
+        let selected_sha = "${{ github.event.pull_request.head.sha || github.sha }}";
+
+        assert_eq!(
+            workflow
+                .matches(&format!("PROOF_SHA: {selected_sha}"))
+                .count(),
+            1,
+            "the event-specific proof identity must be single-sourced"
+        );
+        assert_eq!(
+            workflow.matches("ref: ${{ env.PROOF_SHA }}").count(),
+            2,
+            "both hosted jobs must explicitly check out the selected source SHA"
+        );
+        assert_eq!(
+            workflow
+                .matches("test \"$(git rev-parse HEAD)\" = \"$PROOF_SHA\"")
+                .count(),
+            2,
+            "both hosted jobs must compare HEAD with that same selected source SHA"
+        );
+        assert!(
+            !workflow.contains("$GITHUB_SHA"),
+            "pull_request GITHUB_SHA names the synthetic merge commit, not the PR head"
+        );
+    }
+
+    #[test]
     fn bootstrap_does_not_hold_an_outer_cargo_gate_around_xtask() {
         validate_bootstrap_contract("(cd \"$root\" && cargo xtask verify)\n")
             .expect("the public xtask entrypoint is safe for nested Cargo commands");

@@ -35,6 +35,8 @@ async function main() {
   const outputName = leptos["output-name"];
   const siteRoot = join(workspaceRoot, leptos["site-root"]);
   const pkgDir = join(siteRoot, leptos["site-pkg-dir"]);
+  await rm(join(pkgDir, `${outputName}.d.ts`), { force: true });
+  await rm(join(pkgDir, `${outputName}_bg.wasm.d.ts`), { force: true });
   const paths = Object.fromEntries(["js", "wasm", "css"].map((extension) => [extension, join(pkgDir, `${outputName}.${extension}`)]));
   for (const path of Object.values(paths)) if (!existsSync(path)) throw new Error(`missing build artifact: ${path}`);
   for (const extension of Object.keys(paths)) await removeStale(pkgDir, outputName, extension);

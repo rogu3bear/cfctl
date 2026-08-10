@@ -1,16 +1,29 @@
 #!/usr/bin/env bun
 
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 const root = process.cwd();
 const workerBundle = join(root, "build/index.js");
 const shimPath = join(root, "build/_worker.js");
+const manifestPath = join(root, "target/site/asset-manifest.json");
 if (!existsSync(workerBundle)) {
   console.error(`[write-worker-shim] missing Worker bundle: ${workerBundle}`);
   process.exit(1);
 }
+if (!existsSync(manifestPath)) {
+  console.error(`[write-worker-shim] missing asset manifest: ${manifestPath}`);
+  process.exit(1);
+}
+const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+const packageAssets = ["js", "wasm", "css"].map((kind) => {
+  const path = manifest[kind];
+  if (typeof path !== "string" || !/^\/pkg\/[^/]+\.[a-f0-9]{16}\.(?:js|wasm|css)$/.test(path)) {
+    throw new Error(`asset manifest has an invalid ${kind} path`);
+  }
+  return path;
+});
 
 await mkdir(dirname(shimPath), { recursive: true });
 await writeFile(shimPath, [
@@ -21,12 +34,11 @@ await writeFile(shimPath, [
   '  "/favicon.svg",',
   '  "/site.webmanifest",',
   '  "/robots.txt",',
+  ...packageAssets.map((path) => `  ${JSON.stringify(path)},`),
   "];",
-  'const STATIC_ASSET_PREFIXES = ["/pkg/"];',
   "",
   "function shouldServeAsset(pathname) {",
-  "  return STATIC_ASSET_PATHS.includes(pathname)",
-  "    || STATIC_ASSET_PREFIXES.some((prefix) => pathname.startsWith(prefix));",
+  "  return STATIC_ASSET_PATHS.includes(pathname);",
   "}",
   "",
   "export default class extends LeptosWorker {",

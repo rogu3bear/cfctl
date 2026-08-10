@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 function runOrThrow(command, args) {
@@ -26,6 +26,18 @@ const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
 const generatedHashes = await readFile(hashesPath, "utf8");
 const headers = await readFile(headersPath, "utf8");
 
+async function filesUnder(root, relative = "") {
+  const entries = await readdir(join(root, relative), { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const path = join(relative, entry.name);
+    if (entry.isDirectory()) files.push(...await filesUnder(root, path));
+    else if (entry.isFile()) files.push(path);
+    else throw new Error(`deployment asset is not a regular file: ${path}`);
+  }
+  return files;
+}
+
 for (const kind of ["js", "wasm", "css"]) {
   const href = manifest[kind];
   if (typeof href !== "string" || !href.includes(`.${manifest.hashes[kind]}.`)) throw new Error(`${kind} is not hashed`);
@@ -36,5 +48,20 @@ for (const kind of ["js", "wasm", "css"]) {
 
 for (const snippet of ["/pkg/*", "Cache-Control: public, max-age=31536000, immutable", "/asset-manifest.json", "Cache-Control: no-store"]) {
   if (!headers.includes(snippet)) throw new Error(`_headers is missing: ${snippet}`);
+}
+
+const expectedFiles = [
+  "_headers",
+  "asset-manifest.json",
+  "favicon.svg",
+  "robots.txt",
+  "site.webmanifest",
+  ...[manifest.js, manifest.wasm, manifest.css].map((path) => path.replace(/^\//, "")),
+].sort();
+const actualFiles = (await filesUnder(siteRoot)).sort();
+if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
+  const missing = expectedFiles.filter((path) => !actualFiles.includes(path));
+  const unexpected = actualFiles.filter((path) => !expectedFiles.includes(path));
+  throw new Error(`deployment asset allowlist drifted; missing=[${missing.join(", ")}], unexpected=[${unexpected.join(", ")}]`);
 }
 console.log("[verify-hashed-assets] immutable hashed assets and manifest are aligned");

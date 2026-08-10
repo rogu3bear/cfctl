@@ -17,6 +17,8 @@ if [ "$(worker-build --version 2>/dev/null | awk '{print $1}')" != "$EXPECTED_WO
   exit 1
 fi
 
+rm -rf -- "$SITE_ROOT/build" "$SITE_ROOT/target/site" "$SITE_ROOT/target/front"
+
 ./scripts/with-wasm-bindgen-cli.sh cargo leptos build --release
 bun ./scripts/hash-assets.mjs
 source "$SITE_ROOT/target/asset-hashes.env"
