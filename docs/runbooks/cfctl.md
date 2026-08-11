@@ -596,9 +596,10 @@ For `wrangler.deploy`, pass an absolute `config`, the exact Worker `name`, and
 the exact identity message cfctl reports after hashing the clean repository's
 source SHA and every file under the config's `main` bundle directory and
 `assets.directory`. The plan binds those artifact roots, the aggregate artifact
-hash, the Wrangler config hash, the clean Git HEAD, and the current live Worker
-settings or exact absence. Execution rereads both local artifacts and live
-Worker state before crossing the upload boundary. An optional `var` selector
+hash, the Wrangler config hash, the clean Git HEAD, and either exact Worker
+absence or both the current live Worker settings and complete active-deployment
+identity. Execution rereads both local artifacts and both live Worker views
+before crossing the upload boundary. An optional `var` selector
 binds one plain-text `KEY:VALUE` Worker variable into the plan and evidence;
 never pass a secret through `var`. Both the deploy subprocess and the
 deployment-status verifier run from the reviewed config file's own directory,

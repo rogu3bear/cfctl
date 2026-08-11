@@ -11814,42 +11814,64 @@ async fn read_live_worker_deployment_state(
             "Worker deployment state read was requested for another capability".to_owned(),
         ));
     }
-    let source = catalog
-        .get(worker_deployment::SETTINGS_CAPABILITY_ID)
-        .ok_or_else(|| capability_missing(worker_deployment::SETTINGS_CAPABILITY_ID))?;
+    let service_name = worker_deployment::service_name(adapter_targets)?;
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let settings_source = exact_worker_deployment_read_capability(
+        catalog,
+        worker_deployment::SETTINGS_CAPABILITY_ID,
+        worker_deployment::SETTINGS_PATH,
+    )?;
+    let input = CallInput {
+        selectors: json!({
+            "account_id": account_id,
+            "script_name": service_name,
+        }),
+        query: json!({}),
+        body: None,
+        ..CallInput::default()
+    };
+    let settings = executor
+        .execute_read(settings_source, &input, credential)
+        .await?;
+    let deployments = if settings.success && (200..300).contains(&settings.status) {
+        let source = exact_worker_deployment_read_capability(
+            catalog,
+            worker_deployment::DEPLOYMENTS_CAPABILITY_ID,
+            worker_deployment::DEPLOYMENTS_PATH,
+        )?;
+        Some(executor.execute_read(source, &input, credential).await?)
+    } else {
+        None
+    };
+    let receipt = worker_deployment::apply_state_responses(
+        account_id,
+        service_name,
+        &settings,
+        deployments.as_ref(),
+    )?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
+
+fn exact_worker_deployment_read_capability<'a>(
+    catalog: &'a CatalogSnapshot,
+    id: &str,
+    path: &str,
+) -> Result<&'a CapabilityV1> {
+    let source = catalog.get(id).ok_or_else(|| capability_missing(id))?;
     if source.method != "GET"
-        || source.path != worker_deployment::SETTINGS_PATH
+        || source.path != path
         || source.mutating
         || !matches!(
             source.adapter_status,
             AdapterStatus::Native | AdapterStatus::DynamicApi
         )
     {
-        return Err(CliError::Input(
-            "Worker deployment state source drifted from the governed exact-settings read"
-                .to_owned(),
-        ));
+        return Err(CliError::Input(format!(
+            "Worker deployment state source `{id}` drifted from its governed exact read"
+        )));
     }
-    let service_name = worker_deployment::service_name(adapter_targets)?;
-    let executor = Executor::new(http_client()?, API_BASE_URL)?;
-    let response = executor
-        .execute_read(
-            source,
-            &CallInput {
-                selectors: json!({
-                    "account_id": account_id,
-                    "script_name": service_name,
-                }),
-                query: json!({}),
-                body: None,
-                ..CallInput::default()
-            },
-            credential,
-        )
-        .await?;
-    let receipt = worker_deployment::apply_state_response(account_id, service_name, &response)?;
-    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
-    Ok((receipt, evidence))
+    Ok(source)
 }
 
 async fn prepare_worker_deployment_state_precondition(
@@ -15019,13 +15041,18 @@ async fn validate_live_worker_deployment_state_precondition(
         credential,
     )
     .await?;
-    if hash_value(&receipt)? != expected_hash {
+    validate_current_worker_deployment_state(expected_hash, &receipt)?;
+    Ok(Some(evidence))
+}
+
+fn validate_current_worker_deployment_state(expected_hash: &str, receipt: &Value) -> Result<()> {
+    if hash_value(receipt)? != expected_hash {
         return Err(CliError::Input(
             "live Worker service state drifted after planning; the deployment boundary was not crossed and a new plan is required"
                 .to_owned(),
         ));
     }
-    Ok(Some(evidence))
+    Ok(())
 }
 
 fn required_pages_project_absence_precondition(plan: &PlanV1) -> Result<Option<&str>> {
@@ -27205,7 +27232,8 @@ mod tests {
         should_resolve_zone_entitlement, sink_secret_result, stage_approved_mln_migration,
         store_imported_api_token, validate_api_token_creation_contract,
         validate_approved_mln_repository_authority, validate_closed_import_recovery_bookmark,
-        validate_current_permission_groups, validate_entitlement_receipt_precondition,
+        validate_current_permission_groups, validate_current_worker_deployment_state,
+        validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
         validate_managed_mln_stage_authority, validate_mln_0143_lineage_result,
         validate_pages_project_absence_receipt, validate_pages_source_remote_receipt,
@@ -43051,6 +43079,37 @@ mod tests {
         assert!(envelope.performed);
         assert_eq!(envelope.capability_id.as_deref(), Some("delegated.read"));
         assert_eq!(envelope.evidence[0].class, EvidenceClass::LiveRead);
+    }
+
+    #[test]
+    fn worker_deployment_identity_drift_stops_before_delegated_boundary() {
+        let planned = json!({
+            "schema_version": 1,
+            "source_capability_id": "worker-script-get-settings",
+            "source_path": "/accounts/{account_id}/workers/scripts/{script_name}/settings",
+            "deployment_source_capability_id": "worker-deployments-list-deployments",
+            "deployment_source_path": "/accounts/{account_id}/workers/scripts/{script_name}/deployments",
+            "account_id": "account-a",
+            "service_name": "cfctl-site",
+            "http_status": 200,
+            "deployment_http_status": 200,
+            "exists": true,
+            "redacted_settings_hash": "sha256:same-settings",
+            "redacted_deployments_hash": "sha256:deployment-a",
+        });
+        let mut current = planned.clone();
+        current["redacted_deployments_hash"] = json!("sha256:deployment-b");
+        let planned_hash = hash_value(&planned).expect("planned state hash");
+        let mut delegated_boundary_crossed = false;
+
+        let result = (|| -> std::result::Result<(), super::CliError> {
+            validate_current_worker_deployment_state(&planned_hash, &current)?;
+            delegated_boundary_crossed = true;
+            Ok(())
+        })();
+
+        assert!(result.is_err());
+        assert!(!delegated_boundary_crossed);
     }
 
     #[test]
