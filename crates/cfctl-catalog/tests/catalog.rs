@@ -2436,9 +2436,15 @@ fn official_cli_help_becomes_delegated_capabilities() {
     );
     assert!(deploy.verification_contract_supported());
     assert!(deploy.mutation_contract_gaps().is_empty());
-    assert!(deploy.selectors.iter().any(|selector| {
-        selector.name == "config" && selector.location == "query" && selector.required
-    }));
+    assert_eq!(
+        deploy.permissions,
+        ["Workers Scripts Write", "Workers Scripts Read"]
+    );
+    for name in ["config", "name", "message"] {
+        assert!(deploy.selectors.iter().any(|selector| {
+            selector.name == name && selector.location == "query" && selector.required
+        }));
+    }
     assert!(
         !snapshot
             .get("wrangler.tail")
@@ -2508,7 +2514,11 @@ fn exact_wrangler_worker_versions_help_governs_upload_and_promotion_separately()
     );
     assert!(upload.verification_contract_supported());
     assert!(upload.mutation_contract_gaps().is_empty());
-    for name in ["config", "message"] {
+    assert_eq!(
+        upload.permissions,
+        ["Workers Scripts Write", "Workers Scripts Read"]
+    );
+    for name in ["config", "message", "name"] {
         assert!(upload.selectors.iter().any(|selector| {
             selector.name == name && selector.location == "query" && selector.required
         }));
@@ -2525,6 +2535,10 @@ fn exact_wrangler_worker_versions_help_governs_upload_and_promotion_separately()
     );
     assert!(deploy.verification_contract_supported());
     assert!(deploy.mutation_contract_gaps().is_empty());
+    assert_eq!(
+        deploy.permissions,
+        ["Workers Scripts Write", "Workers Scripts Read"]
+    );
     for name in ["argument", "config", "message"] {
         assert!(deploy.selectors.iter().any(|selector| {
             selector.name == name && selector.location == "query" && selector.required

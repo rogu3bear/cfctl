@@ -462,6 +462,37 @@ fn config_kind(path: &Path) -> &'static str {
     }
 }
 
+/// Load one Wrangler configuration through the same TOML/JSON/JSONC parser
+/// used by workspace discovery. Deployment planning consumes this public
+/// projection so config interpretation cannot drift from resource discovery.
+pub fn load_wrangler_config(path: &Path) -> Result<Value> {
+    let content = fs::read_to_string(path).map_err(|source| WorkspaceError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    match config_kind(path) {
+        "wrangler_toml" => toml::from_str::<toml::Value>(&content)
+            .ok()
+            .and_then(|value| serde_json::to_value(value).ok())
+            .ok_or_else(|| {
+                WorkspaceError::DiscoveryInvariant(format!(
+                    "Wrangler TOML configuration `{}` is malformed",
+                    path.display()
+                ))
+            }),
+        "wrangler_json" => serde_json::from_str::<Value>(&strip_jsonc(&content)).map_err(|error| {
+            WorkspaceError::DiscoveryInvariant(format!(
+                "Wrangler JSON configuration `{}` is malformed: {error}",
+                path.display()
+            ))
+        }),
+        _ => Err(WorkspaceError::DiscoveryInvariant(format!(
+            "deployment configuration `{}` is not wrangler.toml, wrangler.json, or wrangler.jsonc",
+            path.display()
+        ))),
+    }
+}
+
 fn find_repository_root(path: &Path, boundary: &Path) -> Option<PathBuf> {
     path.ancestors()
         .take_while(|candidate| candidate.starts_with(boundary))

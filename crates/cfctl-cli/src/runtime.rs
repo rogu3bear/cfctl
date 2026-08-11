@@ -2,6 +2,7 @@
 
 mod event_batch;
 mod worker_custom_domain;
+mod worker_deployment;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1432,6 +1433,14 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
     let secrets = platform_secrets(store);
     let mut secret_ref = None;
     let mut adapter_targets = Map::new();
+    if worker_deployment::binds_artifact(&capability) {
+        let graph = discover_registered(store)?;
+        let target = worker_deployment::prepare_target(&graph, &capability, &prepared.input)?
+            .ok_or_else(|| {
+                CliError::Input("Worker deployment target could not be derived".to_owned())
+            })?;
+        adapter_targets.insert("worker_deployment".to_owned(), target);
+    }
     if let Some(security_action) = security_action {
         adapter_targets.insert("security_action".to_owned(), security_action);
     }
@@ -11425,6 +11434,7 @@ async fn read_live_zone_account(
 
 fn plan_requires_live_credential(capability: &CapabilityV1, adapter_targets: &Value) -> bool {
     should_bind_pages_project_absence(capability)
+        || worker_deployment::target(adapter_targets).is_some()
         || should_resolve_entitlement_probe(capability)
         || should_resolve_zone_entitlement(capability)
         || should_bind_zone_account(capability)
@@ -12128,6 +12138,83 @@ async fn prepare_oauth_client_update_state_precondition(
         .map(Some)
 }
 
+async fn read_live_worker_deployment_state(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    adapter_targets: &Value,
+    account_id: &str,
+    credential: &AuthCredential,
+) -> Result<(Value, EvidenceV1)> {
+    if !worker_deployment::binds_artifact(capability) {
+        return Err(CliError::Input(
+            "Worker deployment state read was requested for another capability".to_owned(),
+        ));
+    }
+    let source = catalog
+        .get(worker_deployment::SETTINGS_CAPABILITY_ID)
+        .ok_or_else(|| capability_missing(worker_deployment::SETTINGS_CAPABILITY_ID))?;
+    if source.method != "GET"
+        || source.path != worker_deployment::SETTINGS_PATH
+        || source.mutating
+        || !matches!(
+            source.adapter_status,
+            AdapterStatus::Native | AdapterStatus::DynamicApi
+        )
+    {
+        return Err(CliError::Input(
+            "Worker deployment state source drifted from the governed exact-settings read"
+                .to_owned(),
+        ));
+    }
+    let service_name = worker_deployment::service_name(adapter_targets)?;
+    let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let response = executor
+        .execute_read(
+            source,
+            &CallInput {
+                selectors: json!({
+                    "account_id": account_id,
+                    "script_name": service_name,
+                }),
+                query: json!({}),
+                body: None,
+                ..CallInput::default()
+            },
+            credential,
+        )
+        .await?;
+    let receipt = worker_deployment::apply_state_response(account_id, service_name, &response)?;
+    let evidence = store.write_evidence(EvidenceClass::LiveRead, &receipt)?;
+    Ok((receipt, evidence))
+}
+
+async fn prepare_worker_deployment_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    capability: &CapabilityV1,
+    adapter_targets: &Value,
+    account_id: &str,
+    credential: Option<&AuthCredential>,
+) -> Result<Option<(Value, EvidenceV1)>> {
+    if worker_deployment::target(adapter_targets).is_none() {
+        return Ok(None);
+    }
+    let credential = credential.ok_or_else(|| {
+        CliError::Input("Worker deployment state credential was not resolved".to_owned())
+    })?;
+    read_live_worker_deployment_state(
+        store,
+        catalog,
+        capability,
+        adapter_targets,
+        account_id,
+        credential,
+    )
+    .await
+    .map(Some)
+}
+
 async fn prepare_same_path_prior_state_precondition(
     store: &StateStore,
     catalog: &CatalogSnapshot,
@@ -12269,6 +12356,15 @@ async fn prepare_live_plan_preconditions(
             store, catalog, capability, input, account_id, credential,
         )
         .await?,
+        worker_deployment_state: prepare_worker_deployment_state_precondition(
+            store,
+            catalog,
+            capability,
+            adapter_targets,
+            account_id,
+            credential,
+        )
+        .await?,
     })
 }
 
@@ -12295,6 +12391,7 @@ struct LivePlanPreconditions {
     oauth_client_secret_state: Option<(Value, EvidenceV1)>,
     oauth_client_update_state: Option<(Value, EvidenceV1)>,
     worker_custom_domain_state: Option<(Value, EvidenceV1)>,
+    worker_deployment_state: Option<(Value, EvidenceV1)>,
 }
 
 fn plan_targets(
@@ -12352,6 +12449,9 @@ fn plan_targets(
     if let Some((receipt, _)) = &live_preconditions.worker_custom_domain_state {
         targets["live_preconditions"]
             [worker_custom_domain::WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION] = receipt.clone();
+    }
+    if let Some((receipt, _)) = &live_preconditions.worker_deployment_state {
+        targets["live_preconditions"][worker_deployment::STATE_PRECONDITION] = receipt.clone();
     }
     if let Some((receipt, _)) = &live_preconditions.r2_parent_token {
         targets["live_preconditions"][R2_PARENT_TOKEN_PRECONDITION] = receipt.clone();
@@ -12421,6 +12521,10 @@ fn bind_live_plan_preconditions(
         (
             worker_custom_domain::WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION,
             &live_preconditions.worker_custom_domain_state,
+        ),
+        (
+            worker_deployment::STATE_PRECONDITION,
+            &live_preconditions.worker_deployment_state,
         ),
         (
             R2_PARENT_TOKEN_PRECONDITION,
@@ -12537,7 +12641,18 @@ fn planned_cloudflare_diff(
         });
     }
     apply_oauth_client_update_plan_diff(&mut diff, input, live_preconditions);
+    apply_worker_deployment_plan_diff(&mut diff, plan, live_preconditions);
     diff
+}
+
+fn apply_worker_deployment_plan_diff(
+    diff: &mut Value,
+    plan: &PlanV1,
+    live_preconditions: &LivePlanPreconditions,
+) {
+    if let Some((state, _)) = &live_preconditions.worker_deployment_state {
+        worker_deployment::apply_plan_diff(diff, plan, state);
+    }
 }
 
 fn apply_oauth_client_update_plan_diff(
@@ -13822,6 +13937,7 @@ fn plan_impact(
         .iter()
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    append_local_artifact_diffs(&graph, &local_artifact_paths, &mut local_diffs)?;
     for repository_id in &affected_repositories {
         let Some(repository) = graph.repository(repository_id) else {
             continue;
@@ -13863,7 +13979,35 @@ fn plan_impact(
     })
 }
 
+fn append_local_artifact_diffs(
+    graph: &WorkspaceGraph,
+    artifact_paths: &[PathBuf],
+    local_diffs: &mut Vec<Value>,
+) -> Result<()> {
+    for artifact in artifact_paths {
+        let repository = repository_owning_path(graph, artifact).ok_or_else(|| {
+            CliError::Input(format!(
+                "local deployment artifact `{}` is not owned by a registered repository",
+                artifact.display()
+            ))
+        })?;
+        local_diffs.push(json!({
+            "repository": repository.path,
+            "path": artifact,
+            "kind": "deployment_artifact",
+            "content_hash": hash_directory_artifact(artifact)?,
+            "head_content_hash": Value::Null,
+            "worktree_diff_hash": Value::Null,
+            "dirty": false,
+        }));
+    }
+    Ok(())
+}
+
 fn plan_local_artifact_paths(capability: &CapabilityV1, input: &CallInput) -> Result<Vec<PathBuf>> {
+    if worker_deployment::binds_artifact(capability) {
+        return worker_deployment::artifact_paths(capability, input);
+    }
     if capability.id != "wrangler.pages-deploy" {
         return Ok(Vec::new());
     }
@@ -14810,6 +14954,7 @@ struct LivePreconditionEvidence {
     oauth_client_secret_state: Option<EvidenceV1>,
     oauth_client_update_state: Option<EvidenceV1>,
     worker_custom_domain_state: Option<EvidenceV1>,
+    worker_deployment_state: Option<EvidenceV1>,
     r2_parent_token: Option<EvidenceV1>,
 }
 
@@ -14896,6 +15041,10 @@ async fn validate_live_plan_precondition_evidence(
             store, catalog, plan, input, credential,
         )
         .await?,
+        worker_deployment_state: validate_live_worker_deployment_state_precondition(
+            store, catalog, plan, credential,
+        )
+        .await?,
         r2_parent_token: validate_live_r2_parent_token_precondition(
             store, catalog, plan, input, credential,
         )
@@ -14979,6 +15128,7 @@ fn prepend_live_precondition_evidence(
         evidence.oauth_client_secret_state,
         evidence.oauth_client_update_state,
         evidence.worker_custom_domain_state,
+        evidence.worker_deployment_state,
         evidence.dns_record_state,
         evidence.same_path_prior_state,
         evidence.security_action_state,
@@ -15143,6 +15293,76 @@ fn validate_pages_project_absence_receipt(plan: &PlanV1, receipt: &Value) -> Res
         ));
     }
     Ok(())
+}
+
+fn required_worker_deployment_state_precondition(plan: &PlanV1) -> Result<Option<&str>> {
+    let adapter = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    if worker_deployment::target(adapter).is_none() {
+        return Ok(None);
+    }
+    if !worker_deployment::binds_artifact(&plan.capability) {
+        return Err(CliError::Input(
+            "Worker deployment target is attached to an unrelated capability".to_owned(),
+        ));
+    }
+    let expected_hash = plan
+        .precondition_hashes
+        .get(worker_deployment::STATE_PRECONDITION)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            CliError::Input(
+                "Worker deployment plan predates the exact live-state contract; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    let receipt = plan
+        .targets
+        .pointer(&format!(
+            "/live_preconditions/{}",
+            worker_deployment::STATE_PRECONDITION
+        ))
+        .ok_or_else(|| {
+            CliError::Input(
+                "Worker deployment plan omitted its hash-bound live-state receipt; create a new plan"
+                    .to_owned(),
+            )
+        })?;
+    worker_deployment::validate_state_receipt(plan, receipt)?;
+    if hash_value(receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "Worker deployment state receipt does not match its precondition hash; create a new plan"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(expected_hash))
+}
+
+async fn validate_live_worker_deployment_state_precondition(
+    store: &StateStore,
+    catalog: &CatalogSnapshot,
+    plan: &PlanV1,
+    credential: &AuthCredential,
+) -> Result<Option<EvidenceV1>> {
+    let Some(expected_hash) = required_worker_deployment_state_precondition(plan)? else {
+        return Ok(None);
+    };
+    let adapter = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    let (receipt, evidence) = read_live_worker_deployment_state(
+        store,
+        catalog,
+        &plan.capability,
+        adapter,
+        &plan.account_id,
+        credential,
+    )
+    .await?;
+    if hash_value(&receipt)? != expected_hash {
+        return Err(CliError::Input(
+            "live Worker service state drifted after planning; the deployment boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(evidence))
 }
 
 fn required_pages_project_absence_precondition(plan: &PlanV1) -> Result<Option<&str>> {
@@ -25464,6 +25684,7 @@ fn is_live_plan_precondition_hash(name: &str) -> bool {
             | OAUTH_CLIENT_KEY_OVERLAP_PRECONDITION
             | OAUTH_CLIENT_UPDATE_STATE_PRECONDITION
             | worker_custom_domain::WORKER_CUSTOM_DOMAIN_STATE_PRECONDITION
+            | worker_deployment::STATE_PRECONDITION
             | R2_PARENT_TOKEN_PRECONDITION
     )
 }
@@ -34826,6 +35047,7 @@ mod tests {
             oauth_client_secret_state: None,
             oauth_client_update_state: None,
             worker_custom_domain_state: None,
+            worker_deployment_state: None,
         };
 
         // Without a bound empty precondition, nothing changes.
@@ -36054,6 +36276,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: Some((receipt.clone(), evidence)),
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared OAuth update plan");
@@ -36441,6 +36664,7 @@ mod tests {
                 oauth_client_secret_state: Some((receipt.clone(), evidence)),
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared OAuth rotation plan");
@@ -37409,6 +37633,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared plan");
@@ -37501,6 +37726,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared plan");
@@ -37598,6 +37824,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared plan");
@@ -37691,6 +37918,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared plan");
@@ -37778,6 +38006,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared plan");
@@ -37881,6 +38110,7 @@ mod tests {
                 oauth_client_secret_state: None,
                 oauth_client_update_state: None,
                 worker_custom_domain_state: None,
+                worker_deployment_state: None,
             },
         )
         .expect("prepared plan");
