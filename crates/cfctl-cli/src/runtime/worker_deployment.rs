@@ -18,6 +18,9 @@ pub(super) const STATE_PRECONDITION: &str = "worker_deployment_state";
 pub(super) const SETTINGS_CAPABILITY_ID: &str = "worker-script-get-settings";
 pub(super) const SETTINGS_PATH: &str =
     "/accounts/{account_id}/workers/scripts/{script_name}/settings";
+pub(super) const DEPLOYMENTS_CAPABILITY_ID: &str = "worker-deployments-list-deployments";
+pub(super) const DEPLOYMENTS_PATH: &str =
+    "/accounts/{account_id}/workers/scripts/{script_name}/deployments";
 const NOT_FOUND_ERROR_CODE: i64 = 10_007;
 
 pub(super) fn binds_artifact(capability: &CapabilityV1) -> bool {
@@ -211,17 +214,23 @@ pub(super) fn service_name(adapter_targets: &Value) -> Result<&str, CliError> {
         })
 }
 
-pub(super) fn apply_state_response(
+pub(super) fn apply_state_responses(
     account_id: &str,
     service_name: &str,
-    response: &CloudflareResponseV1,
+    settings: &CloudflareResponseV1,
+    deployments: Option<&CloudflareResponseV1>,
 ) -> Result<Value, CliError> {
-    let exact_not_found = response.status == 404
-        && !response.success
-        && response.result.is_null()
-        && response.errors.len() == 1
-        && response.errors[0].code == Some(NOT_FOUND_ERROR_CODE);
+    let exact_not_found = settings.status == 404
+        && !settings.success
+        && settings.result.is_null()
+        && settings.errors.len() == 1
+        && settings.errors[0].code == Some(NOT_FOUND_ERROR_CODE);
     if exact_not_found {
+        if deployments.is_some() {
+            return Err(CliError::Input(
+                "absent Worker state must not carry a deployments response".to_owned(),
+            ));
+        }
         return Ok(json!({
             "schema_version": 1,
             "source_capability_id": SETTINGS_CAPABILITY_ID,
@@ -232,35 +241,74 @@ pub(super) fn apply_state_response(
             "exists": false,
         }));
     }
-    if response.success && (200..300).contains(&response.status) {
+    let Some(deployments) = deployments else {
+        return Err(CliError::Input(
+            "existing Worker state requires its exact deployments read".to_owned(),
+        ));
+    };
+    if settings.success
+        && (200..300).contains(&settings.status)
+        && deployments.success
+        && (200..300).contains(&deployments.status)
+    {
         return Ok(json!({
             "schema_version": 1,
             "source_capability_id": SETTINGS_CAPABILITY_ID,
             "source_path": SETTINGS_PATH,
+            "deployment_source_capability_id": DEPLOYMENTS_CAPABILITY_ID,
+            "deployment_source_path": DEPLOYMENTS_PATH,
             "account_id": account_id,
             "service_name": service_name,
-            "http_status": response.status,
+            "http_status": settings.status,
+            "deployment_http_status": deployments.status,
             "exists": true,
-            "redacted_state_hash": hash_value(&redact_json(&response.result))?,
+            "redacted_settings_hash": hash_value(&redact_json(&settings.result))?,
+            "redacted_deployments_hash": hash_value(&redact_json(&deployments.result))?,
         }));
     }
     Err(CliError::Input(format!(
-        "Worker settings read for `{service_name}` returned HTTP {} and cannot prove exact current state",
-        response.status
+        "Worker settings/deployments reads for `{service_name}` returned HTTP {}/{} and cannot prove exact current state",
+        settings.status, deployments.status
     )))
 }
 
 pub(super) fn validate_state_receipt(plan: &PlanV1, receipt: &Value) -> Result<(), CliError> {
     let adapter = plan.targets.get("adapter").unwrap_or(&Value::Null);
     let expected_service = service_name(adapter)?;
-    let exact = receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
+    let exists = receipt.get("exists").and_then(Value::as_bool);
+    let exact_field_count = match exists {
+        Some(false) => 7,
+        Some(true) => 12,
+        None => 0,
+    };
+    let exact = receipt
+        .as_object()
+        .is_some_and(|object| object.len() == exact_field_count)
+        && receipt.get("schema_version").and_then(Value::as_u64) == Some(1)
         && receipt.get("source_capability_id").and_then(Value::as_str)
             == Some(SETTINGS_CAPABILITY_ID)
         && receipt.get("source_path").and_then(Value::as_str) == Some(SETTINGS_PATH)
         && receipt.get("account_id").and_then(Value::as_str) == Some(plan.account_id.as_str())
         && receipt.get("service_name").and_then(Value::as_str) == Some(expected_service)
-        && receipt.get("exists").and_then(Value::as_bool).is_some();
-    if !exact {
+        && exists.is_some();
+    let existing_state_is_exact = exists != Some(true)
+        || (receipt
+            .get("deployment_source_capability_id")
+            .and_then(Value::as_str)
+            == Some(DEPLOYMENTS_CAPABILITY_ID)
+            && receipt
+                .get("deployment_source_path")
+                .and_then(Value::as_str)
+                == Some(DEPLOYMENTS_PATH)
+            && receipt
+                .get("redacted_settings_hash")
+                .and_then(Value::as_str)
+                .is_some()
+            && receipt
+                .get("redacted_deployments_hash")
+                .and_then(Value::as_str)
+                .is_some());
+    if !exact || !existing_state_is_exact {
         return Err(CliError::Input(
             "Worker deployment live-state receipt is malformed or targets another service"
                 .to_owned(),
@@ -275,7 +323,8 @@ pub(super) fn apply_plan_diff(diff: &mut Value, plan: &PlanV1, state: &Value) {
         diff["observed_before"] = json!({
             "service_name": state.get("service_name"),
             "exists": state.get("exists"),
-            "redacted_state_hash": state.get("redacted_state_hash"),
+            "redacted_settings_hash": state.get("redacted_settings_hash"),
+            "redacted_deployments_hash": state.get("redacted_deployments_hash"),
         });
         diff["planned_after"] = target.clone();
     }
@@ -511,9 +560,11 @@ mod tests {
             etag: None,
             cf_ray: None,
         };
-        let absent = apply_state_response("account-a", "cfctl-site", &absent).expect("absence");
+        let absent =
+            apply_state_responses("account-a", "cfctl-site", &absent, None).expect("absence");
         assert_eq!(absent["exists"], false);
-        assert!(absent.get("redacted_state_hash").is_none());
+        assert!(absent.get("redacted_settings_hash").is_none());
+        assert!(absent.get("redacted_deployments_hash").is_none());
 
         let ambiguous = CloudflareResponseV1 {
             status: 404,
@@ -527,7 +578,7 @@ mod tests {
             etag: None,
             cf_ray: None,
         };
-        assert!(apply_state_response("account-a", "cfctl-site", &ambiguous).is_err());
+        assert!(apply_state_responses("account-a", "cfctl-site", &ambiguous, None).is_err());
 
         let existing = CloudflareResponseV1 {
             status: 200,
@@ -538,10 +589,30 @@ mod tests {
             etag: None,
             cf_ray: None,
         };
-        let existing =
-            apply_state_response("account-a", "cfctl-site", &existing).expect("existing");
+        let deployment_a = CloudflareResponseV1 {
+            status: 200,
+            success: true,
+            result: json!([{"id": "deployment-a", "versions": [{"version_id": "version-a", "percentage": 100}]}]),
+            errors: Vec::new(),
+            result_info: None,
+            etag: None,
+            cf_ray: None,
+        };
+        let deployment_b = CloudflareResponseV1 {
+            result: json!([{"id": "deployment-b", "versions": [{"version_id": "version-b", "percentage": 100}]}]),
+            ..deployment_a.clone()
+        };
+        let existing_a =
+            apply_state_responses("account-a", "cfctl-site", &existing, Some(&deployment_a))
+                .expect("existing");
+        let existing_b =
+            apply_state_responses("account-a", "cfctl-site", &existing, Some(&deployment_b))
+                .expect("drifted deployment");
+        let existing = existing_a;
         assert_eq!(existing["exists"], true);
-        assert!(existing["redacted_state_hash"].as_str().is_some());
+        assert!(existing["redacted_settings_hash"].as_str().is_some());
+        assert!(existing["redacted_deployments_hash"].as_str().is_some());
+        assert_ne!(existing, existing_b);
         assert!(!existing.to_string().contains("hidden"));
     }
 }
