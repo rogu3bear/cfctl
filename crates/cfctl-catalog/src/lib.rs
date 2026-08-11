@@ -1757,9 +1757,14 @@ fn ingest_wrangler_versions_upload_help(
     version: &str,
     upload_help: &str,
 ) {
-    if ["wrangler versions upload [path]", "--config", "--message"]
-        .iter()
-        .all(|marker| upload_help.contains(marker))
+    if [
+        "wrangler versions upload [path]",
+        "--config",
+        "--message",
+        "--name",
+    ]
+    .iter()
+    .all(|marker| upload_help.contains(marker))
     {
         let mut capability = CapabilityV1::new(
             "wrangler.versions-upload",
@@ -1793,7 +1798,11 @@ fn ingest_wrangler_versions_upload_help(
                 false,
                 "Optional Worker entry path resolved from the reviewed config directory",
             ),
-            ("name", false, "Optional Worker name override"),
+            (
+                "name",
+                true,
+                "Exact Worker name; must match the reviewed config",
+            ),
         ]
         .into_iter()
         .map(|(name, required, description)| SelectorV1 {
@@ -1895,6 +1904,10 @@ fn classify_wrangler_worker_versions_capability(capability: &mut CapabilityV1) {
     }];
     capability.verification.required = true;
     capability.rollback.supported = false;
+    capability.permissions = vec![
+        "Workers Scripts Write".to_owned(),
+        "Workers Scripts Read".to_owned(),
+    ];
 }
 
 fn classify_delegated_cli_capability(capability: &mut CapabilityV1) {
@@ -1928,14 +1941,36 @@ fn classify_wrangler_deploy_capability(capability: &mut CapabilityV1) {
         "automatic rollback is not implemented; rollback requires a separate reviewed wrangler rollback plan targeting a known prior version"
             .to_owned(),
     );
+    capability.permissions = vec![
+        "Workers Scripts Write".to_owned(),
+        "Workers Scripts Read".to_owned(),
+    ];
     capability.selectors = vec![
         SelectorV1 {
             name: "config".to_owned(),
             location: "query".to_owned(),
             required: true,
             value_type: "string".to_owned(),
+            description: Some("Absolute reviewed Wrangler configuration path".to_owned()),
+            contract: None,
+        },
+        SelectorV1 {
+            name: "name".to_owned(),
+            location: "query".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
             description: Some(
-                "Absolute or workspace-relative Wrangler configuration path".to_owned(),
+                "Exact Worker service name; must match the reviewed config".to_owned(),
+            ),
+            contract: None,
+        },
+        SelectorV1 {
+            name: "message".to_owned(),
+            location: "query".to_owned(),
+            required: true,
+            value_type: "string".to_owned(),
+            description: Some(
+                "Exact source and artifact identity generated from the reviewed config".to_owned(),
             ),
             contract: None,
         },
