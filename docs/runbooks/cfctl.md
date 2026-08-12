@@ -670,10 +670,14 @@ cfctl call wrangler.versions-deploy \
 
 Promotion verification reads Wrangler's production deployment status and
 requires the planned version at 100 percent. The promotion plan also binds the
-exact Worker settings and complete active-deployments state, then rereads both
-immediately before consumption; any intervening promotion leaves the approved
-plan unconsumed and requires a new plan. Rolling back remains a separate
-reviewed `wrangler.versions-deploy` plan targeting a known prior version.
+exact clean source commit, config bytes, service, Worker settings, and complete
+active-deployments state. Execution recomputes the local target before and
+after the live reads; any intervening local or provider drift leaves the
+approved plan unconsumed. The delegated promotion removes the mutable config
+path, passes the reviewed service explicitly, and runs from a private
+configless directory so a later config edit cannot retarget Wrangler. Rolling
+back remains a separate reviewed `wrangler.versions-deploy` plan targeting a
+known prior version.
 
 For a Cloudflare Pages direct upload, use the exact
 `wrangler.pages-deploy` capability rather than the aggregate

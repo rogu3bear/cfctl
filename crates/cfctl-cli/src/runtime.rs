@@ -6159,18 +6159,7 @@ async fn execute_delegated_plan(
     credential: &AuthCredential,
     secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
-    let receipt = if plan.capability.id == "cloudflared.tunnel" {
-        run_quick_tunnel(store, plan, input).await?
-    } else {
-        run_delegated_cli(
-            &plan.capability,
-            input,
-            credential,
-            Some(&plan.account_id),
-            &store.paths().cache_dir,
-        )
-        .await?
-    };
+    let receipt = run_delegated_plan_boundary(store, plan, input, credential).await?;
     let success = receipt
         .get("success")
         .and_then(Value::as_bool)
@@ -6261,6 +6250,30 @@ async fn execute_delegated_plan(
         });
     }
     Ok(envelope)
+}
+
+async fn run_delegated_plan_boundary(
+    store: &StateStore,
+    plan: &PlanV1,
+    input: &CallInput,
+    credential: &AuthCredential,
+) -> Result<Value> {
+    let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    let delegated_input =
+        worker_deployment::delegated_execution_input(&plan.capability, input, adapter_targets)?;
+    let receipt = if plan.capability.id == "cloudflared.tunnel" {
+        run_quick_tunnel(store, plan, input).await?
+    } else {
+        run_delegated_cli(
+            &plan.capability,
+            &delegated_input,
+            credential,
+            Some(&plan.account_id),
+            &store.paths().cache_dir,
+        )
+        .await?
+    };
+    Ok(receipt)
 }
 
 fn delegated_cli_failure_envelope(
@@ -6991,6 +7004,17 @@ async fn run_delegated_cli(
     }
     let mut command = ProcessCommand::new(program);
     command.args(path_parts);
+    let isolated_wrangler_directory =
+        if worker_deployment::requires_configless_working_directory(capability, input) {
+            Some(
+                tempfile::Builder::new()
+                    .prefix("configless-worker-promotion-")
+                    .tempdir()
+                    .map_err(|source| cli_io(cache_dir, source))?,
+            )
+        } else {
+            None
+        };
     if let Some(config) = input
         .query
         .get("config")
@@ -6998,6 +7022,8 @@ async fn run_delegated_cli(
         .filter(|value| !value.is_empty())
     {
         command.current_dir(wrangler_config_directory(config)?);
+    } else if let Some(directory) = &isolated_wrangler_directory {
+        command.current_dir(directory.path());
     }
     append_cli_input(&mut command, &input.selectors)?;
     append_cli_input(&mut command, &input.query)?;
@@ -14532,6 +14558,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
         None,
     )
     .await?;
+    validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     plan.mark_consumed()?;
     store.save_plan(&plan)?;
     persist_transaction_stage(
@@ -14616,6 +14643,7 @@ async fn run_plan_under_standing_authority(
         Some(&authority_snapshot),
     )
     .await?;
+    validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     authorize_standing_execution(&authority_snapshot, &plan, &execution_input)?;
     let standing_evidence =
         admit_standing_plan(store, &mut plan, &authority_snapshot, &execution_input)?;

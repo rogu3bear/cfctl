@@ -298,6 +298,35 @@ pub(super) fn validate_current_target(
     Ok(())
 }
 
+pub(super) fn delegated_execution_input(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    adapter_targets: &Value,
+) -> Result<CallInput, CliError> {
+    if capability.id != "wrangler.versions-deploy" {
+        return Ok(input.clone());
+    }
+    let mut execution = input.clone();
+    let query = execution.query.as_object_mut().ok_or_else(|| {
+        CliError::Input("Worker promotion query is not an exact object".to_owned())
+    })?;
+    query.remove("config");
+    query.insert(
+        "name".to_owned(),
+        Value::String(service_name(adapter_targets)?.to_owned()),
+    );
+    Ok(execution)
+}
+
+pub(super) fn requires_configless_working_directory(
+    capability: &CapabilityV1,
+    input: &CallInput,
+) -> bool {
+    capability.id == "wrangler.versions-deploy"
+        && input.query.get("config").is_none()
+        && input.query.get("name").and_then(Value::as_str).is_some()
+}
+
 pub(super) fn service_name(adapter_targets: &Value) -> Result<&str, CliError> {
     target(adapter_targets)
         .and_then(|target| target.get("service_name"))
@@ -671,6 +700,21 @@ mod tests {
         )
         .expect("promotion plan");
         promotion_plan.approve(true, None).expect("approve plan");
+        let configless_input = delegated_execution_input(
+            &promotion,
+            &promotion_input,
+            promotion_plan
+                .targets
+                .get("adapter")
+                .expect("adapter targets"),
+        )
+        .expect("derive immutable promotion boundary");
+        assert!(configless_input.query.get("config").is_none());
+        assert_eq!(configless_input.query["name"], "cfctl-site");
+        assert!(requires_configless_working_directory(
+            &promotion,
+            &configless_input
+        ));
         fs::write(
             &config,
             "name = \"retargeted-service\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"target/site\"\n",
@@ -693,6 +737,8 @@ mod tests {
         assert!(result.is_err());
         assert!(!delegated_boundary_crossed);
         assert_eq!(promotion_plan.status, PlanStatus::Approved);
+        assert_eq!(configless_input.query["name"], "cfctl-site");
+        assert!(configless_input.query.get("config").is_none());
         fs::write(
             &config,
             "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"target/site\"\n",
