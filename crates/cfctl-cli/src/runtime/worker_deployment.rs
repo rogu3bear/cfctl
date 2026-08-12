@@ -262,6 +262,42 @@ pub(super) fn target(adapter_targets: &Value) -> Option<&Value> {
     adapter_targets.get("worker_deployment")
 }
 
+pub(super) fn validate_current_target(
+    graph: &WorkspaceGraph,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    adapter_targets: &Value,
+) -> Result<(), CliError> {
+    let planned = target(adapter_targets);
+    if !binds_live_state(capability) {
+        if planned.is_some() {
+            return Err(CliError::Input(
+                "Worker deployment target is attached to an unrelated capability".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let planned = planned.ok_or_else(|| {
+        CliError::Input(
+            "Worker deployment plan omitted its exact local source target; create a new plan"
+                .to_owned(),
+        )
+    })?;
+    let current = prepare_target(graph, capability, input)?.ok_or_else(|| {
+        CliError::Input(
+            "Worker deployment local source target could not be recomputed; create a new plan"
+                .to_owned(),
+        )
+    })?;
+    if &current != planned {
+        return Err(CliError::Input(
+            "Worker deployment config, source, service, or operation drifted after planning; the delegated boundary was not crossed and a new plan is required"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn service_name(adapter_targets: &Value) -> Result<&str, CliError> {
     target(adapter_targets)
         .and_then(|target| target.get("service_name"))
@@ -489,7 +525,7 @@ fn is_full_source_sha(value: &str) -> bool {
 mod tests {
     use super::*;
     use cfctl_cloudflare::CloudflareApiErrorV1;
-    use cfctl_core::{AdapterStatus, EffectClass, RiskClass};
+    use cfctl_core::{AdapterStatus, EffectClass, PlanStatus, RiskClass};
     use cfctl_workspace::RegisteredRoot;
     use std::process::Command;
 
@@ -579,6 +615,7 @@ mod tests {
             WorkspaceGraph::discover(&[RegisteredRoot::new(root.path())]).expect("workspace graph");
         let mut capability =
             CapabilityV1::new("wrangler.deploy", "Deploy Worker", "CLI", "wrangler deploy");
+        capability.mutating = true;
         capability.adapter_status = AdapterStatus::DelegatedCli;
         capability.risk = RiskClass::CrossConfig;
         capability.effect = EffectClass::ReversibleWrite;
@@ -608,7 +645,6 @@ mod tests {
             query: json!({
                 "argument": format!("{version_id}@100"),
                 "config": config.canonicalize().expect("canonical config"),
-                "name": "cfctl-site",
                 "message": format!("promote release {source_sha}"),
             }),
             ..CallInput::default()
@@ -622,6 +658,46 @@ mod tests {
         assert_eq!(promotion_projection["promotion"]["traffic_percentage"], 100);
         assert!(promotion_projection.get("artifact").is_none());
         assert!(binds_live_state(&promotion));
+
+        let adapter_targets = json!({"worker_deployment": promotion_projection});
+        validate_current_target(&graph, &promotion, &promotion_input, &adapter_targets)
+            .expect("unchanged promotion target remains executable");
+        let mut promotion_plan = PlanV1::draft(
+            "profile-a",
+            "account-a",
+            "catalog-sha",
+            promotion.clone(),
+            json!({"adapter": adapter_targets}),
+        )
+        .expect("promotion plan");
+        promotion_plan.approve(true, None).expect("approve plan");
+        fs::write(
+            &config,
+            "name = \"retargeted-service\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"target/site\"\n",
+        )
+        .expect("retarget config after approval");
+        let mut delegated_boundary_crossed = false;
+        let result = validate_current_target(
+            &graph,
+            &promotion,
+            &promotion_input,
+            promotion_plan
+                .targets
+                .get("adapter")
+                .expect("adapter targets"),
+        );
+        if result.is_ok() {
+            promotion_plan.mark_consumed().expect("consume plan");
+            delegated_boundary_crossed = true;
+        }
+        assert!(result.is_err());
+        assert!(!delegated_boundary_crossed);
+        assert_eq!(promotion_plan.status, PlanStatus::Approved);
+        fs::write(
+            &config,
+            "name = \"cfctl-site\"\nmain = \"build/_worker.js\"\n[assets]\ndirectory = \"target/site\"\n",
+        )
+        .expect("restore config for artifact drift proof");
 
         fs::write(site.join("index.html"), "drift\n").expect("artifact drift");
         let error = prepare_target(&graph, &capability, &input)

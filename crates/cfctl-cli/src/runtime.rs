@@ -14516,6 +14516,7 @@ async fn run_plan(store: &StateStore, selector: &PlanSelector) -> Result<ResultE
     let credential = fresh_credential(profile, &secrets).await?;
     let execution_input = resolved_plan_input(&plan, &secrets)?;
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     validate_api_token_creation_contract(
         &plan.capability,
         &execution_input,
@@ -14599,6 +14600,7 @@ async fn run_plan_under_standing_authority(
     let credential = fresh_credential(profile, &secrets).await?;
     let execution_input = resolved_plan_input(&plan, &secrets)?;
     let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    validate_worker_deployment_local_authority(store, &plan, &execution_input)?;
     validate_api_token_creation_contract(
         &plan.capability,
         &execution_input,
@@ -25701,6 +25703,21 @@ fn validate_plan_preconditions(store: &StateStore, plan: &PlanV1) -> Result<()> 
         }
     }
     Ok(())
+}
+
+fn validate_worker_deployment_local_authority(
+    store: &StateStore,
+    plan: &PlanV1,
+    input: &CallInput,
+) -> Result<()> {
+    let adapter = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    if !worker_deployment::binds_live_state(&plan.capability)
+        && worker_deployment::target(adapter).is_none()
+    {
+        return Ok(());
+    }
+    let graph = discover_registered(store)?;
+    worker_deployment::validate_current_target(&graph, &plan.capability, input, adapter)
 }
 
 fn is_live_plan_precondition_hash(name: &str) -> bool {
