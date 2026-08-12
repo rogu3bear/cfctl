@@ -675,9 +675,11 @@ active-deployments state. Execution recomputes the local target before and
 after the live reads; any intervening local or provider drift leaves the
 approved plan unconsumed. The delegated promotion removes the mutable config
 path, passes the reviewed service explicitly, and runs from a private
-configless directory so a later config edit cannot retarget Wrangler. Rolling
-back remains a separate reviewed `wrangler.versions-deploy` plan targeting a
-known prior version.
+configless directory so a later config edit cannot retarget Wrangler. The
+deployment-status verifier uses that same exact service in a separate private
+configless directory and records it in the readback receipt. Rolling back
+remains a separate reviewed `wrangler.versions-deploy` plan targeting a known
+prior version.
 
 For a Cloudflare Pages direct upload, use the exact
 `wrangler.pages-deploy` capability rather than the aggregate

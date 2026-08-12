@@ -6407,7 +6407,7 @@ async fn verify_delegated_cli_plan(
     };
 
     verify_wrangler_deployment_status(
-        config,
+        WranglerDeploymentStatusTarget::Config(config),
         &version_id,
         credential,
         &plan.account_id,
@@ -6471,15 +6471,16 @@ async fn verify_wrangler_worker_versions_deploy_plan(
             "basis": "the versions deployment plan did not contain exactly one UUID@100 traffic target",
         });
     };
-    let Some(config) = input.query.get("config").and_then(Value::as_str) else {
+    let adapter_targets = plan.targets.get("adapter").unwrap_or(&Value::Null);
+    let Ok(service_name) = worker_deployment::service_name(adapter_targets) else {
         return json!({
             "passed": false,
-            "basis": "the versions deployment plan omitted its required Wrangler config selector",
+            "basis": "the versions deployment plan omitted its exact reviewed service identity",
             "version_id": version_id,
         });
     };
     verify_wrangler_deployment_status(
-        config,
+        WranglerDeploymentStatusTarget::Service(service_name),
         &version_id,
         credential,
         &plan.account_id,
@@ -6656,27 +6657,43 @@ fn wrangler_config_directory(config: &str) -> Result<PathBuf> {
     }
 }
 
-async fn verify_wrangler_deployment_status(
-    config: &str,
-    version_id: &str,
-    credential: &AuthCredential,
+enum WranglerDeploymentStatusTarget<'a> {
+    Config(&'a str),
+    Service(&'a str),
+}
+
+struct WranglerDeploymentStatusCommand<'a> {
+    command: ProcessCommand,
+    isolated_directory: Option<tempfile::TempDir>,
+    exact_service_name: Option<&'a str>,
+}
+
+fn prepare_wrangler_deployment_status_command<'a>(
+    target: WranglerDeploymentStatusTarget<'a>,
     account_id: &str,
     cache_dir: &Path,
-) -> Value {
-    let working_directory = match wrangler_config_directory(config) {
-        Ok(directory) => directory,
-        Err(error) => {
-            return json!({
-                "passed": false,
-                "basis": format!("Wrangler deployment-status verification could not resolve the reviewed config directory: {error}"),
-                "version_id": version_id,
-            });
+) -> Result<WranglerDeploymentStatusCommand<'a>> {
+    let mut command = ProcessCommand::new("wrangler");
+    command.args(["deployments", "status"]);
+    let (isolated_directory, exact_service_name) = match target {
+        WranglerDeploymentStatusTarget::Config(config) => {
+            command
+                .args(["--config", config])
+                .current_dir(wrangler_config_directory(config)?);
+            (None, None)
+        }
+        WranglerDeploymentStatusTarget::Service(service_name) => {
+            command.args(["--name", service_name]);
+            let directory = tempfile::Builder::new()
+                .prefix("configless-worker-readback-")
+                .tempdir()
+                .map_err(|source| cli_io(cache_dir, source))?;
+            command.current_dir(directory.path());
+            (Some(directory), Some(service_name))
         }
     };
-    let mut command = ProcessCommand::new("wrangler");
     command
-        .args(["deployments", "status", "--config", config, "--json"])
-        .current_dir(working_directory)
+        .arg("--json")
         .env_clear()
         .env("PATH", env::var_os("PATH").unwrap_or_default())
         .env("HOME", env::var_os("HOME").unwrap_or_default())
@@ -6688,6 +6705,35 @@ async fn verify_wrangler_deployment_status(
     for (name, value) in governed_cli_workspace_env("wrangler", Some(account_id), cache_dir) {
         command.env(name, value);
     }
+    Ok(WranglerDeploymentStatusCommand {
+        command,
+        isolated_directory,
+        exact_service_name,
+    })
+}
+
+async fn verify_wrangler_deployment_status(
+    target: WranglerDeploymentStatusTarget<'_>,
+    version_id: &str,
+    credential: &AuthCredential,
+    account_id: &str,
+    cache_dir: &Path,
+) -> Value {
+    let prepared = match prepare_wrangler_deployment_status_command(target, account_id, cache_dir) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return json!({
+                "passed": false,
+                "basis": format!("Wrangler deployment-status verification could not prepare its exact target: {error}"),
+                "version_id": version_id,
+            });
+        }
+    };
+    let WranglerDeploymentStatusCommand {
+        mut command,
+        isolated_directory: _isolated_directory,
+        exact_service_name,
+    } = prepared;
     match credential {
         AuthCredential::Bearer { token } => {
             command.env("CLOUDFLARE_API_TOKEN", token);
@@ -6743,11 +6789,18 @@ async fn verify_wrangler_deployment_status(
     json!({
         "passed": passed,
         "basis": if passed {
-            format!("Wrangler production deployment reports promoted version {version_id}")
+            exact_service_name.map_or_else(
+                || format!("Wrangler production deployment reports promoted version {version_id}"),
+                |service_name| format!("Wrangler production deployment for exact service {service_name} reports promoted version {version_id}"),
+            )
         } else {
-            format!("Wrangler production deployment does not report version {version_id} at 100 percent")
+            exact_service_name.map_or_else(
+                || format!("Wrangler production deployment does not report version {version_id} at 100 percent"),
+                |service_name| format!("Wrangler production deployment for exact service {service_name} does not report version {version_id} at 100 percent"),
+            )
         },
         "version_id": version_id,
+        "service_name": exact_service_name,
         "readback": status,
         "stderr": stderr,
     })
@@ -27906,8 +27959,8 @@ mod tests {
         SECURITY_IP_RULE_STATE_CAPABILITY_ID, SECURITY_LIST_MEMBER_COLLECTION_PATH,
         SECURITY_LIST_MEMBER_CREATE_ID, SECURITY_LIST_MEMBER_REMOVE_ID,
         SECURITY_WAF_RULE_CREATE_ID, SECURITY_WAF_RULE_PARENT_PATH,
-        SECURITY_WAF_RULE_STATE_CAPABILITY_ID, TokenPolicyBinding, admit_standing_plan,
-        apply_cloudflare_tunnel_configuration_state_response,
+        SECURITY_WAF_RULE_STATE_CAPABILITY_ID, TokenPolicyBinding, WranglerDeploymentStatusTarget,
+        admit_standing_plan, apply_cloudflare_tunnel_configuration_state_response,
         apply_d1_empty_database_state_response, apply_d1_read_replication_state_response,
         apply_dns_record_state_response, apply_entitlement_probe_response,
         apply_global_warp_override_state_response, apply_kv_empty_namespace_state_response,
@@ -27938,11 +27991,12 @@ mod tests {
         plan_requires_live_credential, plan_state_next_step, plan_status_label,
         preflight_call_input, preflight_secret_sink, preflight_standing_authority,
         prepare_r2_temporary_credentials_input, prepare_security_action_input,
-        preserve_previous_catalog, query_object_from_pairs, read_import_secret,
-        read_r2_log_retrieval_credentials, read_secret_file, reconcile_standing_lineage_from_plan,
-        rectify_approved_mln_import, rectify_plan, redact_response_for_capability,
-        redact_secret_payload, redact_secret_result, repair_keychain_access_with_warning,
-        request_body_contains_secret, required_cloudflare_tunnel_configuration_state_precondition,
+        prepare_wrangler_deployment_status_command, preserve_previous_catalog,
+        query_object_from_pairs, read_import_secret, read_r2_log_retrieval_credentials,
+        read_secret_file, reconcile_standing_lineage_from_plan, rectify_approved_mln_import,
+        rectify_plan, redact_response_for_capability, redact_secret_payload, redact_secret_result,
+        repair_keychain_access_with_warning, request_body_contains_secret,
+        required_cloudflare_tunnel_configuration_state_precondition,
         required_d1_empty_database_state_precondition,
         required_d1_read_replication_state_precondition, required_dns_record_state_precondition,
         required_entitlement_precondition, required_global_warp_override_state_precondition,
@@ -44011,6 +44065,37 @@ mod tests {
         assert!(result.is_err());
         assert!(!delegated_boundary_crossed);
         assert_eq!(plan.status, PlanStatus::Draft);
+    }
+
+    #[test]
+    fn worker_promotion_readback_is_exact_service_and_configless() {
+        let cache = tempfile::tempdir().expect("cache root");
+        let prepared = prepare_wrangler_deployment_status_command(
+            WranglerDeploymentStatusTarget::Service("cfctl-site"),
+            "account-a",
+            cache.path(),
+        )
+        .expect("exact-service readback command");
+        let args = prepared
+            .command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            ["deployments", "status", "--name", "cfctl-site", "--json"]
+        );
+        assert!(!args.iter().any(|argument| argument == "--config"));
+        assert_eq!(prepared.exact_service_name, Some("cfctl-site"));
+        let isolated = prepared
+            .isolated_directory
+            .as_ref()
+            .expect("private configless readback directory");
+        assert_eq!(
+            prepared.command.as_std().get_current_dir(),
+            Some(isolated.path())
+        );
     }
 
     #[test]
