@@ -19016,12 +19016,17 @@ fn exact_durable_init_response_failure(
                 "type",
                 "status",
                 "success",
-                "at_bookmark",
+                "at_bookmark_present",
+                "at_bookmark_is_string",
                 "upload_url_present",
                 "upload_url_sha256",
+                "upload_url_host_is_exact_account_endpoint",
+                "upload_url_host_is_cloudflare_r2",
                 "filename_present",
                 "filename_sha256",
+                "filename_shape_valid",
                 "provider_error_present",
+                "cfctl_classification_failure",
             ];
             let exact_result = result.len() == exact_result_fields.len()
                 && exact_result_fields
@@ -22351,6 +22356,49 @@ async fn rectify_plan(store: &StateStore, selector: &PlanSelector) -> Result<Res
     reason = "rectification is one no-replay verified-state transition"
 )]
 fn rectify_approved_mln_import(store: &StateStore, plan: &mut PlanV1) -> Result<ResultEnvelopeV2> {
+    let resume_from_init_attempt = plan.status == PlanStatus::Consumed
+        && plan.transaction_stage == TransactionStageV1::BoundaryAttemptPersisted;
+    let resume_from_init_response = plan.status == PlanStatus::RectificationRequired
+        && plan.transaction_stage == TransactionStageV1::BoundaryResponsePersisted;
+    if resume_from_init_attempt || resume_from_init_response {
+        let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
+        if checkpoints.len() == 1
+            && checkpoints[0].1.get("step").and_then(Value::as_str) == Some("init_response")
+        {
+            let (init_evidence, _) = exact_durable_init_response_failure(store, plan)?;
+            let boundary_artifact = json!({
+                "adapter":"dynamic_api",
+                "performed":true,
+                "success":false,
+                "outcome":"invalid_provider_response",
+                "receipt_available":true,
+                "init_response_evidence_hash":init_evidence.content_hash,
+            });
+            if resume_from_init_attempt {
+                plan.status = PlanStatus::RectificationRequired;
+                persist_transaction_stage_with_artifact(
+                    store,
+                    plan,
+                    TransactionStageV1::BoundaryResponsePersisted,
+                    boundary_artifact,
+                )?;
+            } else if plan.transaction_artifact(TransactionStageV1::BoundaryResponsePersisted)
+                != Some(&boundary_artifact)
+            {
+                return Err(CliError::Input(
+                    "init-only recovery boundary artifact drifted from its exact durable checkpoint"
+                        .to_owned(),
+                ));
+            }
+            let sink_artifact = secret_sink_artifact(plan, None, false, true, false, None, None);
+            persist_transaction_stage_with_artifact(
+                store,
+                plan,
+                TransactionStageV1::SecretSinkPersisted,
+                sink_artifact,
+            )?;
+        }
+    }
     if plan.status == PlanStatus::RectificationRequired
         && plan.transaction_stage == TransactionStageV1::SecretSinkPersisted
     {
@@ -33077,14 +33125,19 @@ mod tests {
                 "plan_input_hash":hash_value(&init_plan.input).expect("input hash"),
                 "result":{
                     "type":"import",
-                    "status":"unsupported",
+                    "status":null,
                     "success":true,
-                    "at_bookmark":null,
+                    "at_bookmark_present":false,
+                    "at_bookmark_is_string":false,
                     "upload_url_present":true,
                     "upload_url_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "upload_url_host_is_exact_account_endpoint":true,
+                    "upload_url_host_is_cloudflare_r2":true,
                     "filename_present":true,
                     "filename_sha256":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "filename_shape_valid":true,
                     "provider_error_present":true,
+                    "cfctl_classification_failure":"nested_state_rejected",
                 },
                 "errors":[],
                 "provider_errors_present":true,
@@ -33126,6 +33179,16 @@ mod tests {
         let abandoned_store = StateStore::open(RuntimePaths::from_root(abandoned_root.path()))
             .expect("abandoned init store");
         let mut abandoned_plan = build_plan();
+        abandoned_plan.status = PlanStatus::Draft;
+        abandoned_plan
+            .approve(true, None)
+            .expect("approve abandoned plan");
+        abandoned_plan
+            .mark_consumed()
+            .expect("consume abandoned plan");
+        abandoned_plan
+            .record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("persist abandoned boundary attempt");
         let abandoned_checkpoint = D1ImportCheckpointV1 {
             schema_version: 1,
             operation_id: abandoned_plan.operation_id.clone(),
@@ -33148,12 +33211,17 @@ mod tests {
                     "type":null,
                     "status":null,
                     "success":true,
-                    "at_bookmark":null,
+                    "at_bookmark_present":false,
+                    "at_bookmark_is_string":false,
                     "upload_url_present":true,
                     "upload_url_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "upload_url_host_is_exact_account_endpoint":false,
+                    "upload_url_host_is_cloudflare_r2":true,
                     "filename_present":true,
                     "filename_sha256":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "filename_shape_valid":true,
                     "provider_error_present":false,
+                    "cfctl_classification_failure":"upload_url_authority_or_shape_rejected",
                 },
                 "errors":[],
                 "provider_errors_present":false,
@@ -33169,19 +33237,8 @@ mod tests {
             &abandoned_checkpoint,
         )
         .expect("durable abandoned init response");
-        let abandoned_failure = approved_mln_import_execution_error_envelope(
-            &abandoned_store,
-            &mut abandoned_plan,
-            CloudflareError::D1ImportInitResponseFailure,
-            &MemorySecretStore::default(),
-        );
-        assert_eq!(abandoned_failure.result["receipt_available"], true);
-        assert_eq!(
-            abandoned_plan.transaction_stage,
-            TransactionStageV1::SecretSinkPersisted
-        );
         let rectified = rectify_approved_mln_import(&abandoned_store, &mut abandoned_plan)
-            .expect("rectify abandoned unuploaded session");
+            .expect("rectify interrupted abandoned unuploaded session");
         assert!(rectified.ok);
         assert!(!rectified.performed);
         assert_eq!(rectified.result["upload_performed"], false);
@@ -33195,6 +33252,62 @@ mod tests {
                 .len(),
             1
         );
+
+        let resumed_root = tempfile::tempdir().expect("resumed init root");
+        let resumed_store = StateStore::open(RuntimePaths::from_root(resumed_root.path()))
+            .expect("resumed init store");
+        let mut resumed_plan = build_plan();
+        resumed_plan.status = PlanStatus::Draft;
+        resumed_plan
+            .approve(true, None)
+            .expect("approve resumed plan");
+        resumed_plan.mark_consumed().expect("consume resumed plan");
+        resumed_plan
+            .record_transaction_stage(TransactionStageV1::BoundaryAttemptPersisted)
+            .expect("persist resumed boundary attempt");
+        let mut resumed_checkpoint = abandoned_checkpoint.clone();
+        resumed_checkpoint
+            .operation_id
+            .clone_from(&resumed_plan.operation_id);
+        resumed_checkpoint.receipt["plan_input_hash"] =
+            json!(hash_value(&resumed_plan.input).expect("resumed input hash"));
+        persist_d1_import_checkpoint(
+            &resumed_store,
+            &resumed_plan.operation_id,
+            &resumed_checkpoint,
+        )
+        .expect("durable resumed init response");
+        let (resumed_evidence, _) =
+            super::exact_durable_init_response_failure(&resumed_store, &resumed_plan)
+                .expect("exact resumed init response");
+        resumed_plan.status = PlanStatus::RectificationRequired;
+        resumed_plan
+            .record_transaction_stage_with_artifact(
+                TransactionStageV1::BoundaryResponsePersisted,
+                json!({
+                    "adapter":"dynamic_api",
+                    "performed":true,
+                    "success":false,
+                    "outcome":"invalid_provider_response",
+                    "receipt_available":true,
+                    "init_response_evidence_hash":resumed_evidence.content_hash,
+                }),
+            )
+            .expect("persist interrupted boundary response");
+        resumed_store
+            .save_plan(&resumed_plan)
+            .expect("persist interrupted recovery state");
+        let mut reloaded = resumed_store
+            .load_plan(&resumed_plan.operation_id)
+            .expect("reload interrupted recovery state");
+        let resumed = rectify_approved_mln_import(&resumed_store, &mut reloaded)
+            .expect("resume interrupted init-only rectification");
+        assert!(resumed.ok);
+        assert!(!resumed.performed);
+        assert_eq!(resumed.result["upload_performed"], false);
+        assert_eq!(resumed.result["database_write_performed"], false);
+        assert_eq!(reloaded.status, PlanStatus::Rectified);
+        assert_eq!(reloaded.transaction_stage, TransactionStageV1::Closed);
 
         for (action, step, error) in [
             (
