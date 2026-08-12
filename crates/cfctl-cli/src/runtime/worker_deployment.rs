@@ -87,6 +87,10 @@ pub(super) fn artifact_paths(
     Ok(roots.into_iter().collect())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fail-closed projection binds repository, config, artifact or promotion, and release-message identity"
+)]
 pub(super) fn prepare_target(
     graph: &WorkspaceGraph,
     capability: &CapabilityV1,
@@ -508,6 +512,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one executable repository fixture proves upload and promotion projections share exact source authority"
+    )]
     fn target_binds_clean_source_config_service_and_complete_artifact() {
         let root = tempfile::tempdir().expect("repository root");
         let build = root.path().join("build");

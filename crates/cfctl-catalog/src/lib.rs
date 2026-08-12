@@ -2319,23 +2319,7 @@ fn d1_import_database_capability() -> CapabilityV1 {
     capability.maturity = Maturity::GenerallyAvailable;
     capability.adapter_status = AdapterStatus::Native;
     capability.blocked_reason = None;
-    capability.cost = CostV1 {
-        incremental: false,
-        currency: None,
-        maximum: Some(0.0),
-        basis: Some(
-            "D1 import has no separate operation charge; ordinary D1 storage, rows-written, and rows-read accounting remains"
-                .to_owned(),
-        ),
-        known: true,
-        billing_model: BillingModelV1::UsageBased,
-        exposure: CostExposureV1::DownstreamUsage,
-        references: vec![KnowledgeReferenceV1 {
-            title: "D1 pricing".to_owned(),
-            url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
-            source: "official Cloudflare docs".to_owned(),
-        }],
-    };
+    capability.cost = d1_import_cost();
     capability.entitlement.available = Some(true);
     capability.verification.required = true;
     "d1_import_provider_completion_matches_reviewed_source"
@@ -2401,6 +2385,26 @@ fn d1_import_database_capability() -> CapabilityV1 {
         requires_create_new_mode_0600_stage: true,
     });
     capability
+}
+
+fn d1_import_cost() -> CostV1 {
+    CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: Some(0.0),
+        basis: Some(
+            "D1 import has no separate operation charge; ordinary D1 storage, rows-written, and rows-read accounting remains"
+                .to_owned(),
+        ),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![KnowledgeReferenceV1 {
+            title: "D1 pricing".to_owned(),
+            url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        }],
+    }
 }
 
 fn d1_resume_database_import_poll_capability() -> CapabilityV1 {

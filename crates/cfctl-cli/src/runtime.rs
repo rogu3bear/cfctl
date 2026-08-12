@@ -17356,6 +17356,10 @@ async fn execute_api_plan(
     ))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "poll continuation execution keeps lineage admission, journal persistence, bounded provider polling, and terminal proof visible as one no-replay state machine"
+)]
 async fn execute_approved_mln_import_poll_resume_plan(
     store: &StateStore,
     executor: &Executor,
@@ -19895,6 +19899,10 @@ fn exact_resume_poll_exhaustion(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "resume completion validates one exact durable checkpoint and every root-to-child lineage field together"
+)]
 fn exact_durable_resume_provider_complete_boundary(
     store: &StateStore,
     plan: &PlanV1,
@@ -20677,6 +20685,10 @@ fn validate_managed_mln_stage_authority(plan: &PlanV1) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "execution-time authority revalidates Git, target, content, and private-stage identities as one fail-closed boundary"
+)]
 fn validate_managed_reviewed_git_stage_authority(plan: &PlanV1) -> Result<()> {
     let contract = plan
         .capability

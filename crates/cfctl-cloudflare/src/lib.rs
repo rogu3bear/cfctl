@@ -1074,94 +1074,7 @@ fn d1_import_source_binding(plan: &PlanV1, input: &CallInput) -> Result<D1Import
             CloudflareError::InvalidRequestBody("governed D1 import contract is missing".to_owned())
         })?;
     if plan.capability.id == "d1-import-database" {
-        let stage = plan
-            .targets
-            .pointer("/adapter/approved_mln_import")
-            .ok_or_else(|| {
-                CloudflareError::InvalidRequestBody(
-                    "reviewed-Git import stage binding is missing".to_owned(),
-                )
-            })?;
-        let required = |field: &str| {
-            stage
-                .get(field)
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    CloudflareError::InvalidRequestBody(format!(
-                        "reviewed-Git import stage omitted {field}"
-                    ))
-                })
-        };
-        let migration_id = required("migration_id")?;
-        let basename = required("catalog_basename")?;
-        let sha256 = required("sha256")?
-            .strip_prefix("sha256:")
-            .filter(|value| value.len() == 64)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                CloudflareError::InvalidRequestBody(
-                    "reviewed-Git import SHA-256 is malformed".to_owned(),
-                )
-            })?;
-        let md5 = required("md5")?;
-        let bytes = stage
-            .get("bytes")
-            .and_then(Value::as_u64)
-            .filter(|bytes| *bytes > 0 && *bytes <= contract.max_source_bytes)
-            .ok_or_else(|| {
-                CloudflareError::InvalidRequestBody(
-                    "reviewed-Git import source size is outside its bound".to_owned(),
-                )
-            })?;
-        let account_id = input
-            .selectors
-            .get("account_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                CloudflareError::InvalidRequestBody(
-                    "reviewed-Git import account target is missing".to_owned(),
-                )
-            })?
-            .to_owned();
-        let database_id = input
-            .selectors
-            .get("database_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                CloudflareError::InvalidRequestBody(
-                    "reviewed-Git import database target is missing".to_owned(),
-                )
-            })?
-            .to_owned();
-        let target = serde_json::json!({
-            "account_id":account_id,
-            "database_id":database_id,
-        });
-        if stage.get("target") != Some(&target)
-            || md5.len() != 32
-            || migration_id
-                != stage
-                    .get("source_authority_hash")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-        {
-            return Err(CloudflareError::InvalidRequestBody(
-                "reviewed-Git import stage source or target identity drifted".to_owned(),
-            ));
-        }
-        return Ok(D1ImportSourceBinding {
-            migration_id,
-            basename,
-            bytes,
-            sha256,
-            md5,
-            account_id,
-            database_id,
-        });
+        return reviewed_git_d1_import_source_binding(plan, input, contract.max_source_bytes);
     }
     let migration_id = input
         .body
@@ -1186,6 +1099,94 @@ fn d1_import_source_binding(plan: &PlanV1, input: &CallInput) -> Result<D1Import
         md5: migration.md5.clone(),
         account_id: contract.account_id.clone(),
         database_id: contract.database_id.clone(),
+    })
+}
+
+fn reviewed_git_d1_import_source_binding(
+    plan: &PlanV1,
+    input: &CallInput,
+    max_source_bytes: u64,
+) -> Result<D1ImportSourceBinding> {
+    let stage = plan
+        .targets
+        .pointer("/adapter/approved_mln_import")
+        .ok_or_else(|| {
+            CloudflareError::InvalidRequestBody(
+                "reviewed-Git import stage binding is missing".to_owned(),
+            )
+        })?;
+    let required = |field: &str| {
+        stage
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                CloudflareError::InvalidRequestBody(format!(
+                    "reviewed-Git import stage omitted {field}"
+                ))
+            })
+    };
+    let migration_id = required("migration_id")?;
+    let basename = required("catalog_basename")?;
+    let sha256 = required("sha256")?
+        .strip_prefix("sha256:")
+        .filter(|value| value.len() == 64)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            CloudflareError::InvalidRequestBody(
+                "reviewed-Git import SHA-256 is malformed".to_owned(),
+            )
+        })?;
+    let md5 = required("md5")?;
+    let bytes = stage
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .filter(|bytes| *bytes > 0 && *bytes <= max_source_bytes)
+        .ok_or_else(|| {
+            CloudflareError::InvalidRequestBody(
+                "reviewed-Git import source size is outside its bound".to_owned(),
+            )
+        })?;
+    let selector = |name: &str| {
+        input
+            .selectors
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                CloudflareError::InvalidRequestBody(format!(
+                    "reviewed-Git import {name} target is missing"
+                ))
+            })
+    };
+    let account_id = selector("account_id")?;
+    let database_id = selector("database_id")?;
+    let target = serde_json::json!({
+        "account_id":account_id,
+        "database_id":database_id,
+    });
+    if stage.get("target") != Some(&target)
+        || md5.len() != 32
+        || migration_id
+            != stage
+                .get("source_authority_hash")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+    {
+        return Err(CloudflareError::InvalidRequestBody(
+            "reviewed-Git import stage source or target identity drifted".to_owned(),
+        ));
+    }
+    Ok(D1ImportSourceBinding {
+        migration_id,
+        basename,
+        bytes,
+        sha256,
+        md5,
+        account_id,
+        database_id,
     })
 }
 
@@ -11777,7 +11778,25 @@ mod approved_mln_import_tests {
             .expect_err("rejected top-level response"),
             D1ImportInitRejection::TopLevel
         );
+    }
 
+    #[test]
+    fn approved_import_rejects_invalid_init_shapes_before_upload() {
+        let contract = contract();
+        let signed_query = concat!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256",
+            "&X-Amz-Credential=credential",
+            "&X-Amz-Date=20260730T000000Z",
+            "&X-Amz-Expires=3600",
+            "&X-Amz-SignedHeaders=host",
+            "&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let valid_url = format!(
+            "https://ca30e922fda7f5578e49873542e4aaca.r2.cloudflarestorage.com/import/object?{signed_query}"
+        );
+        let response = |success, result| {
+            parse_response(200, &json!({"success":success,"result":result}), None, None)
+        };
         let invalid_results = [
             json!({"filename":"upload.sql"}),
             json!({"filename":"upload.sql","upload_url":7}),
