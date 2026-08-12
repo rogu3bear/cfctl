@@ -35,6 +35,7 @@ use cfctl_catalog::{
 use cfctl_cloudflare::{
     CallInput, CloudflareError, CloudflareResponseV1, D1ImportCheckpointV1, Executor,
     OperationVerificationV1, R2LogRetrievalCredentials, validate_request_contract,
+    validate_reviewed_schema_migration_sql,
 };
 use cfctl_core::{
     AdapterStatus, AdmissionPolicyBundleStatusV1, AdmissionPolicyBundleV1, AdmissionPolicyRuleV1,
@@ -1496,7 +1497,10 @@ fn stage_approved_mln_migration(
     input: &CallInput,
     source: &Path,
 ) -> Result<Value> {
-    if capability.id == "d1-import-database" {
+    if matches!(
+        capability.id.as_str(),
+        "d1-import-database" | "d1-apply-reviewed-schema-migration"
+    ) {
         return stage_reviewed_git_d1_migration(store, capability, input, source);
     }
     let contract = capability
@@ -1844,6 +1848,14 @@ fn stage_reviewed_git_d1_migration(
     }
     let sha256 = hex::encode(Sha256::digest(&bytes));
     let md5 = hex::encode(Md5::digest(&bytes));
+    let statement_count = if capability.id == "d1-apply-reviewed-schema-migration" {
+        let sql = std::str::from_utf8(&bytes).map_err(|_| {
+            CliError::Input("reviewed D1 schema migration must be UTF-8".to_owned())
+        })?;
+        Some(validate_reviewed_schema_migration_sql(sql)?)
+    } else {
+        None
+    };
     let source_authority = json!({
         "schema_version":1,
         "repository_id":repository_id,
@@ -1920,7 +1932,7 @@ fn stage_reviewed_git_d1_migration(
             "reviewed D1 import target selectors are missing".to_owned(),
         ));
     }
-    Ok(json!({
+    let mut staged = json!({
         "schema_version":1,
         "migration_id":source_authority_hash,
         "catalog_basename":basename,
@@ -1933,7 +1945,14 @@ fn stage_reviewed_git_d1_migration(
         "stage_lifecycle":"preserve_until_verified_or_explicitly_retired",
         "target":target,
         "prerequisites":input.body,
-    }))
+    });
+    if let Some(statement_count) = statement_count {
+        staged
+            .as_object_mut()
+            .ok_or_else(|| CliError::Input("reviewed migration stage is not an object".to_owned()))?
+            .insert("statement_count".to_owned(), Value::from(statement_count));
+    }
+    Ok(staged)
 }
 
 fn normalize_reviewed_git_repository_id(remote: &str) -> Result<String> {
@@ -2169,7 +2188,10 @@ fn validate_approved_mln_import_prerequisites(
     input: &CallInput,
     context: ImportPrerequisiteContext<'_>,
 ) -> Result<()> {
-    if capability.id == "d1-import-database" {
+    if matches!(
+        capability.id.as_str(),
+        "d1-import-database" | "d1-apply-reviewed-schema-migration"
+    ) {
         return validate_reviewed_git_import_prerequisites(store, input, context);
     }
     let contract = capability
@@ -17356,6 +17378,10 @@ async fn execute_api_plan(
     secrets: &dyn SecretStore,
 ) -> Result<ResultEnvelopeV2> {
     let executor = Executor::new(http_client()?, API_BASE_URL)?;
+    let is_reviewed_schema_migration = plan.capability.id == "d1-apply-reviewed-schema-migration";
+    if is_reviewed_schema_migration {
+        validate_managed_reviewed_git_stage_authority(plan)?;
+    }
     if plan.capability.d1_approved_mln_import_poll_resume.is_some() {
         return execute_approved_mln_import_poll_resume_plan(
             store,
@@ -17367,7 +17393,7 @@ async fn execute_api_plan(
         )
         .await;
     }
-    if plan.capability.d1_approved_mln_import.is_some() {
+    if plan.capability.d1_approved_mln_import.is_some() && !is_reviewed_schema_migration {
         return execute_approved_mln_import_plan(
             store,
             &executor,
@@ -17629,7 +17655,10 @@ fn validate_trusted_root_import_plan(store: &StateStore, plan_v2: &PlanV2) -> Re
             "governed D1 import does not match its trusted native catalog declaration".to_owned(),
         ));
     }
-    if plan.capability.id == "d1-import-database" {
+    if matches!(
+        plan.capability.id.as_str(),
+        "d1-import-database" | "d1-apply-reviewed-schema-migration"
+    ) {
         return validate_trusted_reviewed_git_root_plan(store, plan_v2, &trusted);
     }
     let contract = trusted
@@ -20679,7 +20708,10 @@ async fn execute_approved_mln_import_plan(
 }
 
 fn validate_managed_mln_stage_authority(plan: &PlanV1) -> Result<()> {
-    if plan.capability.id == "d1-import-database" {
+    if matches!(
+        plan.capability.id.as_str(),
+        "d1-import-database" | "d1-apply-reviewed-schema-migration"
+    ) {
         return validate_managed_reviewed_git_stage_authority(plan);
     }
     let contract = plan
@@ -20930,6 +20962,17 @@ fn validate_managed_reviewed_git_stage_authority(plan: &PlanV1) -> Result<()> {
         return Err(CliError::Input(
             "private managed import stage no longer matches the reviewed source".to_owned(),
         ));
+    }
+    if plan.capability.id == "d1-apply-reviewed-schema-migration" {
+        let sql = std::str::from_utf8(&staged_bytes).map_err(|_| {
+            CliError::Input("reviewed D1 schema migration must remain UTF-8".to_owned())
+        })?;
+        let statement_count = validate_reviewed_schema_migration_sql(sql)?;
+        if staged.get("statement_count").and_then(Value::as_u64) != Some(statement_count) {
+            return Err(CliError::Input(
+                "reviewed D1 schema migration statement count drifted after planning".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -30363,6 +30406,27 @@ mod tests {
         plan.refresh_hash().expect("plan hash");
         validate_managed_reviewed_git_stage_authority(&plan)
             .expect("exact source and stage remain executable");
+
+        let schema_capability = catalog
+            .get("d1-apply-reviewed-schema-migration")
+            .expect("reviewed schema migration")
+            .clone();
+        let schema_staged =
+            stage_approved_mln_migration(&store, &schema_capability, &input, &source)
+                .expect("the production schema lane stages the same clean Git source");
+        assert_eq!(schema_staged["statement_count"], 1);
+        let mut schema_plan = PlanV1::draft(
+            "profile-a",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "catalog-sha",
+            schema_capability,
+            json!({"adapter":{"approved_mln_import":schema_staged}}),
+        )
+        .expect("schema plan");
+        schema_plan.input = serde_json::to_value(&input).expect("schema plan input");
+        schema_plan.refresh_hash().expect("schema plan hash");
+        validate_managed_reviewed_git_stage_authority(&schema_plan)
+            .expect("schema lane revalidates Git, private stage, and statement count");
 
         fs::write(&source, b"CREATE TABLE drifted (id TEXT);\n").expect("dirty source");
         assert!(

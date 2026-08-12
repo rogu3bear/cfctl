@@ -441,6 +441,7 @@ dependencies = [
  "md-5",
  "memchr",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.0",

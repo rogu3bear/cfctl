@@ -6,6 +6,10 @@ use std::{
     io::{self, Read},
     net::{Ipv4Addr, Ipv6Addr},
     path::{Component, Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -22,6 +26,10 @@ use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use md5::Md5;
+use rusqlite::{
+    Connection,
+    hooks::{AuthAction, AuthContext, Authorization},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -30,7 +38,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, timeout};
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use url::Url;
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -1020,7 +1028,10 @@ fn import_lineage_value<'a>(plan: &'a PlanV1, field: &str) -> Option<&'a str> {
 }
 
 fn import_target(plan: &PlanV1) -> Option<Value> {
-    if plan.capability.id == "d1-import-database" {
+    if matches!(
+        plan.capability.id.as_str(),
+        "d1-import-database" | "d1-apply-reviewed-schema-migration"
+    ) {
         return plan
             .targets
             .pointer("/adapter/approved_mln_import/target")
@@ -1073,7 +1084,10 @@ fn d1_import_source_binding(plan: &PlanV1, input: &CallInput) -> Result<D1Import
         .ok_or_else(|| {
             CloudflareError::InvalidRequestBody("governed D1 import contract is missing".to_owned())
         })?;
-    if plan.capability.id == "d1-import-database" {
+    if matches!(
+        plan.capability.id.as_str(),
+        "d1-import-database" | "d1-apply-reviewed-schema-migration"
+    ) {
         return reviewed_git_d1_import_source_binding(plan, input, contract.max_source_bytes);
     }
     let migration_id = input
@@ -1188,6 +1202,197 @@ fn reviewed_git_d1_import_source_binding(
         account_id,
         database_id,
     })
+}
+
+fn reviewed_schema_object_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value.starts_with("sqlite_")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn reviewed_schema_statement_count(sql: &str) -> Option<u64> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LexState {
+        Normal,
+        SingleQuote,
+        DoubleQuote,
+        Backtick,
+        Bracket,
+        LineComment,
+        BlockComment,
+    }
+
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    let mut state = LexState::Normal;
+    let mut statement_has_token = false;
+    let mut count = 0_u64;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        match state {
+            LexState::Normal => match (byte, next) {
+                (b'-', Some(b'-')) => {
+                    state = LexState::LineComment;
+                    index += 1;
+                }
+                (b'/', Some(b'*')) => {
+                    state = LexState::BlockComment;
+                    index += 1;
+                }
+                (b'\'', _) => {
+                    statement_has_token = true;
+                    state = LexState::SingleQuote;
+                }
+                (b'"', _) => {
+                    statement_has_token = true;
+                    state = LexState::DoubleQuote;
+                }
+                (b'`', _) => {
+                    statement_has_token = true;
+                    state = LexState::Backtick;
+                }
+                (b'[', _) => {
+                    statement_has_token = true;
+                    state = LexState::Bracket;
+                }
+                (b';', _) if statement_has_token => {
+                    count = count.checked_add(1)?;
+                    statement_has_token = false;
+                }
+                _ if !byte.is_ascii_whitespace() => statement_has_token = true,
+                _ => {}
+            },
+            LexState::SingleQuote if byte == b'\'' => {
+                if next == Some(b'\'') {
+                    index += 1;
+                } else {
+                    state = LexState::Normal;
+                }
+            }
+            LexState::DoubleQuote if byte == b'"' => {
+                if next == Some(b'"') {
+                    index += 1;
+                } else {
+                    state = LexState::Normal;
+                }
+            }
+            LexState::Backtick if byte == b'`' => {
+                if next == Some(b'`') {
+                    index += 1;
+                } else {
+                    state = LexState::Normal;
+                }
+            }
+            LexState::Bracket if byte == b']' => state = LexState::Normal,
+            LexState::LineComment if matches!(byte, b'\n' | b'\r') => state = LexState::Normal,
+            LexState::BlockComment if byte == b'*' && next == Some(b'/') => {
+                state = LexState::Normal;
+                index += 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if !matches!(state, LexState::Normal | LexState::LineComment) {
+        return None;
+    }
+    if statement_has_token {
+        count = count.checked_add(1)?;
+    }
+    Some(count)
+}
+
+fn validate_reviewed_schema_sql(sql: &str, max_statements: u64) -> Result<u64> {
+    if sql.trim().is_empty() || sql.as_bytes().contains(&0) || !(1..=64).contains(&max_statements) {
+        return Err(CloudflareError::InvalidRequestBody(
+            "reviewed schema migration is empty, contains NUL, or has invalid bounds".to_owned(),
+        ));
+    }
+    let connection = Connection::open_in_memory().map_err(|_| {
+        CloudflareError::InvalidRequestBody(
+            "reviewed schema migration validator could not open its private database".to_owned(),
+        )
+    })?;
+    let statement_count = Arc::new(AtomicU64::new(0));
+    let observed_count = Arc::clone(&statement_count);
+    connection
+        .authorizer(Some(move |context: AuthContext<'_>| match context.action {
+            AuthAction::CreateTable { table_name } if reviewed_schema_object_name(table_name) => {
+                observed_count.fetch_add(1, Ordering::Relaxed);
+                Authorization::Allow
+            }
+            AuthAction::CreateIndex {
+                index_name,
+                table_name,
+            } if index_name.starts_with("sqlite_autoindex_")
+                && reviewed_schema_object_name(table_name) =>
+            {
+                Authorization::Allow
+            }
+            AuthAction::CreateIndex {
+                index_name,
+                table_name,
+            } if reviewed_schema_object_name(index_name)
+                && reviewed_schema_object_name(table_name) =>
+            {
+                observed_count.fetch_add(1, Ordering::Relaxed);
+                Authorization::Allow
+            }
+            AuthAction::Pragma {
+                pragma_name,
+                pragma_value: Some(value),
+            } if pragma_name.eq_ignore_ascii_case("foreign_keys")
+                && matches!(value.to_ascii_lowercase().as_str(), "on" | "1") =>
+            {
+                observed_count.fetch_add(1, Ordering::Relaxed);
+                Authorization::Allow
+            }
+            AuthAction::Insert { table_name }
+            | AuthAction::Delete { table_name }
+            | AuthAction::Update { table_name, .. }
+                if matches!(table_name, "sqlite_master" | "sqlite_schema") =>
+            {
+                Authorization::Allow
+            }
+            AuthAction::Read { .. } | AuthAction::Transaction { .. } | AuthAction::Recursive => {
+                Authorization::Allow
+            }
+            AuthAction::Reindex { index_name } if reviewed_schema_object_name(index_name) => {
+                Authorization::Allow
+            }
+            _ => Authorization::Deny,
+        }))
+        .map_err(|_| {
+            CloudflareError::InvalidRequestBody(
+                "reviewed schema migration authorizer could not be installed".to_owned(),
+            )
+        })?;
+    connection.execute_batch(sql).map_err(|_| {
+        CloudflareError::InvalidRequestBody(
+            "reviewed schema migration contains syntax or effects outside the DDL allowlist"
+                .to_owned(),
+        )
+    })?;
+    let count = statement_count.load(Ordering::Relaxed);
+    if !(1..=max_statements).contains(&count) || reviewed_schema_statement_count(sql) != Some(count)
+    {
+        return Err(CloudflareError::InvalidRequestBody(
+            "reviewed schema migration contains extra, unterminated, or out-of-bound statements"
+                .to_owned(),
+        ));
+    }
+    Ok(count)
+}
+
+/// Validates one Git-reviewed D1 schema migration against the exact local DDL
+/// allowlist used again at the provider boundary. Callers cannot lower or
+/// raise the production statement bound.
+pub fn validate_reviewed_schema_migration_sql(sql: &str) -> Result<u64> {
+    validate_reviewed_schema_sql(sql, 64)
 }
 
 #[cfg(test)]
@@ -2523,6 +2728,11 @@ impl Executor {
                 .execute_d1_restore_exact_bookmark(plan, input, credential)
                 .await;
         }
+        if plan.capability.id == "d1-apply-reviewed-schema-migration" {
+            return self
+                .execute_d1_reviewed_schema_migration(plan, input, credential)
+                .await;
+        }
         if plan.capability.d1_approved_mln_import.is_some()
             || plan.capability.d1_approved_mln_import_poll_resume.is_some()
         {
@@ -2538,6 +2748,159 @@ impl Executor {
                 .map_err(|_| CloudflareError::InvalidConditionalHeader)?,
         );
         match self.send(&request, credential).await {
+            Ok(response) => {
+                plan.status = if response.success {
+                    PlanStatus::Running
+                } else {
+                    PlanStatus::Failed
+                };
+                Ok(response)
+            }
+            Err(error) => {
+                plan.status = PlanStatus::Failed;
+                Err(error)
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "source, private-stage, DDL reauthorization, exact request, and single response remain one auditable provider boundary"
+    )]
+    async fn execute_d1_reviewed_schema_migration(
+        &self,
+        plan: &mut PlanV1,
+        input: &CallInput,
+        credential: &AuthCredential,
+    ) -> Result<CloudflareResponseV1> {
+        validate_d1_reviewed_schema_migration_contract(
+            &plan.capability,
+            input,
+            plan.capability
+                .d1_approved_mln_import
+                .as_ref()
+                .ok_or_else(|| {
+                    CloudflareError::InvalidRequestBody(
+                        "reviewed schema migration contract is missing".to_owned(),
+                    )
+                })?,
+        )?;
+        let source = d1_import_source_binding(plan, input)?;
+        let stage = plan
+            .targets
+            .pointer("/adapter/approved_mln_import")
+            .ok_or_else(|| {
+                CloudflareError::InvalidRequestBody(
+                    "reviewed schema migration stage binding is missing".to_owned(),
+                )
+            })?;
+        let stage_path = stage
+            .get("stage_path")
+            .and_then(Value::as_str)
+            .map(Path::new)
+            .ok_or_else(|| {
+                CloudflareError::InvalidRequestBody(
+                    "reviewed schema migration stage path is missing".to_owned(),
+                )
+            })?;
+        if stage_path.file_name().and_then(|value| value.to_str()) != Some(source.basename.as_str())
+        {
+            return Err(CloudflareError::InvalidRequestBody(
+                "reviewed schema migration stage basename drifted".to_owned(),
+            ));
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(stage_path).map_err(|_| {
+            CloudflareError::InvalidRequestBody(
+                "reviewed schema migration stage could not be opened safely".to_owned(),
+            )
+        })?;
+        let metadata = file.metadata().map_err(|_| {
+            CloudflareError::InvalidRequestBody(
+                "reviewed schema migration stage metadata is unavailable".to_owned(),
+            )
+        })?;
+        #[cfg(unix)]
+        let private_mode = metadata.permissions().mode() & 0o777 == 0o600;
+        #[cfg(not(unix))]
+        let private_mode = true;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|_| {
+            CloudflareError::InvalidRequestBody(
+                "reviewed schema migration stage could not be read".to_owned(),
+            )
+        })?;
+        if !metadata.is_file()
+            || !private_mode
+            || metadata.len() != source.bytes
+            || bytes.len() as u64 != source.bytes
+            || hex::encode(Sha256::digest(&bytes)) != source.sha256
+            || hex::encode(Md5::digest(&bytes)) != source.md5
+        {
+            return Err(CloudflareError::InvalidRequestBody(
+                "reviewed schema migration stage no longer matches its exact planned bytes"
+                    .to_owned(),
+            ));
+        }
+        let sql = std::str::from_utf8(&bytes).map_err(|_| {
+            CloudflareError::InvalidRequestBody("reviewed schema migration is not UTF-8".to_owned())
+        })?;
+        let statement_count = validate_reviewed_schema_migration_sql(sql)?;
+        if stage.get("statement_count").and_then(Value::as_u64) != Some(statement_count) {
+            return Err(CloudflareError::InvalidRequestBody(
+                "reviewed schema migration statement count drifted after planning".to_owned(),
+            ));
+        }
+
+        let mut wire_capability = plan.capability.clone();
+        "d1-reviewed-schema-migration-wire".clone_into(&mut wire_capability.id);
+        wire_capability.d1_approved_mln_import = None;
+        wire_capability.request_schema = Some(serde_json::json!({
+            "type":"object",
+            "additionalProperties":false,
+            "x-cfctl-body-required":true,
+            "required":["sql"],
+            "properties":{
+                "sql":{
+                    "type":"string",
+                    "minLength":1,
+                    "maxLength":plan.capability.d1_approved_mln_import.as_ref().map_or(0, |contract| contract.max_source_bytes)
+                }
+            }
+        }));
+        let wire_input = CallInput {
+            selectors: input.selectors.clone(),
+            query: serde_json::json!({}),
+            body: Some(serde_json::json!({"sql":sql})),
+            ..CallInput::default()
+        };
+        let mut request = self
+            .builder
+            .build_unchecked(&wire_capability, &wire_input)?;
+        request.max_bytes = plan
+            .capability
+            .d1_approved_mln_import
+            .as_ref()
+            .map_or(0, |contract| contract.max_response_bytes);
+        request.timeout_seconds = plan
+            .capability
+            .d1_approved_mln_import
+            .as_ref()
+            .map_or(0, |contract| contract.max_timeout_seconds);
+        request.headers.insert(
+            HeaderName::from_static("idempotency-key"),
+            HeaderValue::from_str(&plan.operation_id)
+                .map_err(|_| CloudflareError::InvalidConditionalHeader)?,
+        );
+        match self
+            .clone()
+            .with_max_retries(0)
+            .send(&request, credential)
+            .await
+        {
             Ok(response) => {
                 plan.status = if response.success {
                     PlanStatus::Running
@@ -3221,6 +3584,9 @@ impl Executor {
         }
         if strategy == "d1_import_provider_completion_matches_reviewed_source" {
             return verify_reviewed_git_import_completion(plan, apply_response);
+        }
+        if strategy == "d1_reviewed_schema_batch_reports_every_statement_success" {
+            return verify_reviewed_schema_migration_response(plan, apply_response);
         }
         if strategy.starts_with("api_token_details_") {
             return self
@@ -9211,6 +9577,52 @@ fn verify_reviewed_git_import_completion(
     })
 }
 
+fn verify_reviewed_schema_migration_response(
+    plan: &PlanV1,
+    apply_response: &CloudflareResponseV1,
+) -> Result<OperationVerificationV1> {
+    let expected = plan
+        .targets
+        .pointer("/adapter/approved_mln_import/statement_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=64).contains(value))
+        .ok_or_else(|| {
+            CloudflareError::MissingVerificationTarget(
+                "reviewed schema migration statement count is missing".to_owned(),
+            )
+        })?;
+    let result = apply_response.result.as_array();
+    let every_statement_succeeded = result.is_some_and(|results| {
+        results.len() == expected
+            && results.iter().all(|result| {
+                result.as_object().is_some_and(|result| {
+                    result.get("success").and_then(Value::as_bool) == Some(true)
+                })
+            })
+    });
+    let passed = apply_response.status == 200
+        && apply_response.success
+        && apply_response.errors.is_empty()
+        && every_statement_succeeded;
+    let basis = if passed {
+        format!(
+            "Cloudflare reported one successful D1 query result for each of the {expected} locally admitted schema statements"
+        )
+    } else {
+        format!(
+            "reviewed schema migration response did not prove {expected} individually successful statements"
+        )
+    };
+    Ok(OperationVerificationV1 {
+        strategy: plan.capability.verification.strategy.clone(),
+        passed,
+        basis,
+        readback: apply_response.clone(),
+        correlated_resource_id: None,
+    })
+}
+
 fn osint_research_schema_marker_sql(migration_id: &str) -> Result<&'static str> {
     match migration_id {
         "0028" => Ok(
@@ -10418,6 +10830,9 @@ fn validate_d1_approved_mln_import_contract(
     if capability.id == "d1-import-database" {
         return validate_d1_reviewed_git_import_contract(capability, input, contract);
     }
+    if capability.id == "d1-apply-reviewed-schema-migration" {
+        return validate_d1_reviewed_schema_migration_contract(capability, input, contract);
+    }
     if capability.id == "d1-import-approved-osint-research-migration" {
         return validate_d1_approved_osint_research_import_contract(capability, input, contract);
     }
@@ -10590,6 +11005,81 @@ fn validate_d1_reviewed_git_import_contract(
     if !supported {
         return Err(CloudflareError::InvalidRequestBody(
             "reviewed-Git D1 import identity, target, closed prerequisites, or bounds drifted"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_d1_reviewed_schema_migration_contract(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    contract: &D1ApprovedMlnImportContractV1,
+) -> Result<()> {
+    let expected = [
+        "pre_recovery_anchor_operation_id",
+        "pre_recovery_anchor_evidence_hash",
+        "pre_recovery_anchor_output_sha256",
+        "pre_recovery_anchor_bookmark_hash",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let keys = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .map(|body| body.keys().map(String::as_str).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let account = input.selectors.get("account_id").and_then(Value::as_str);
+    let database = input.selectors.get("database_id").and_then(Value::as_str);
+    let supported = capability.authority_scope
+        == Some(cfctl_core::CapabilityAuthorityScopeV1::ProviderGeneric)
+        && capability.method == "POST"
+        && capability.path == contract.import_path
+        && capability.path == "/accounts/{account_id}/d1/database/{database_id}/query"
+        && capability.product == "D1"
+        && capability.account_scope == "account"
+        && capability.adapter_status == AdapterStatus::Native
+        && capability.mutating
+        && capability.risk == RiskClass::Irreversible
+        && capability.effect == cfctl_core::EffectClass::DataWrite
+        && capability.permissions == ["D1 Write"]
+        && capability.verification.strategy
+            == "d1_reviewed_schema_batch_reports_every_statement_success"
+        && input
+            .selectors
+            .as_object()
+            .is_some_and(|selectors| selectors.len() == 2)
+        && account.is_some_and(|value| value.len() == 32)
+        && database.is_some_and(|value| value.len() == 36)
+        && keys == expected
+        && contract.repository_id.is_empty()
+        && contract.repository_head.is_empty()
+        && contract.pre_import_capability_version == 0
+        && contract.pre_import_validator_contract_hash.is_empty()
+        && contract.pre_import_fixed_query_sha256.is_empty()
+        && contract.account_id.is_empty()
+        && contract.database_id.is_empty()
+        && contract.migrations.is_empty()
+        && contract.max_source_bytes == 1024 * 1024
+        && contract.requires_create_new_mode_0600_stage
+        && contract.upload_url_suffix.is_empty()
+        && (1..=1024 * 1024).contains(&contract.max_response_bytes)
+        && contract.max_poll_attempts == 0
+        && (1..=30).contains(&contract.max_timeout_seconds)
+        && capability.analytics_query.is_none()
+        && capability.d1_schema_introspection.is_none()
+        && capability.mln_0143_data_invariants.is_none()
+        && capability.d1_full_export.is_none()
+        && capability.d1_restore_exact_bookmark.is_none()
+        && capability.r2_log_retrieval.is_none()
+        && input
+            .query
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+    if !supported {
+        return Err(CloudflareError::InvalidRequestBody(
+            "reviewed-Git D1 schema migration identity, target, DDL bounds, or recovery prerequisites drifted"
                 .to_owned(),
         ));
     }
