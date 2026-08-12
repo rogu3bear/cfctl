@@ -1281,13 +1281,13 @@ async fn call_command(store: &StateStore, arguments: CallArgs) -> Result<ResultE
         capability.d1_approved_mln_import_poll_resume.is_some();
     if is_d1_approved_mln_import != arguments.source_file.is_some() {
         return Err(CliError::Input(
-            "the approved MLNavigator D1 import requires exactly one plan-creation-only `--source-file`; no other capability accepts it"
+            "governed D1 imports require exactly one plan-creation-only `--source-file`; no other capability accepts it"
                 .to_owned(),
         ));
     }
     if is_d1_approved_mln_import_poll_resume && arguments.source_file.is_some() {
         return Err(CliError::Input(
-            "approved MLNavigator import poll continuation derives source authority from its parent and never accepts `--source-file`"
+            "D1 import poll continuation derives source authority from its parent and never accepts `--source-file`"
                 .to_owned(),
         ));
     }
@@ -1487,6 +1487,9 @@ fn stage_approved_mln_migration(
     input: &CallInput,
     source: &Path,
 ) -> Result<Value> {
+    if capability.id == "d1-import-database" {
+        return stage_reviewed_git_d1_migration(store, capability, input, source);
+    }
     let contract = capability
         .d1_approved_mln_import
         .as_ref()
@@ -1696,6 +1699,270 @@ fn stage_approved_mln_migration(
     }))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "generic Git source identity, byte capture, and private staging are one fail-closed planning boundary"
+)]
+fn stage_reviewed_git_d1_migration(
+    store: &StateStore,
+    capability: &CapabilityV1,
+    input: &CallInput,
+    source: &Path,
+) -> Result<Value> {
+    let contract = capability
+        .d1_approved_mln_import
+        .as_ref()
+        .filter(|contract| contract.repository_id.is_empty() && contract.migrations.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("provider-generic reviewed-Git import contract is missing".to_owned())
+        })?;
+    if !source.is_absolute()
+        || source.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        || source.extension().and_then(|value| value.to_str()) != Some("sql")
+    {
+        return Err(CliError::Input(
+            "reviewed D1 migration source must be an absolute normalized `.sql` path".to_owned(),
+        ));
+    }
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| CliError::Input("reviewed migration source has no parent".to_owned()))?;
+    let discovered_root = PathBuf::from(git_authority_output(
+        source_parent,
+        &["rev-parse", "--show-toplevel"],
+    )?);
+    let canonical_root = fs::canonicalize(&discovered_root).map_err(|source| CliError::Io {
+        path: discovered_root.display().to_string(),
+        source,
+    })?;
+    if canonical_root != discovered_root || !source.starts_with(&canonical_root) {
+        return Err(CliError::Input(
+            "reviewed migration source is outside its canonical Git worktree".to_owned(),
+        ));
+    }
+    let relative = source
+        .strip_prefix(&canonical_root)
+        .ok()
+        .and_then(Path::to_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("reviewed migration path is not a portable Git path".to_owned())
+        })?;
+    let head = git_authority_output(&canonical_root, &["rev-parse", "HEAD"])?;
+    let remote = git_authority_output(&canonical_root, &["remote", "get-url", "origin"])?;
+    let repository_id = normalize_reviewed_git_repository_id(&remote)?;
+    let tracked = git_authority_output(
+        &canonical_root,
+        &["ls-files", "--error-unmatch", "--", relative],
+    )?;
+    let blob_spec = format!("{head}:{relative}");
+    let git_blob_oid = git_authority_output(&canonical_root, &["rev-parse", &blob_spec])?;
+    let status = git_authority_output(
+        &canonical_root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if tracked != relative || !status.is_empty() {
+        return Err(CliError::Input(
+            "reviewed migration repository must be clean and the source must be tracked at HEAD"
+                .to_owned(),
+        ));
+    }
+    let common = git_authority_output(&canonical_root, &["rev-parse", "--git-common-dir"])?;
+    let common_path = if Path::new(&common).is_absolute() {
+        PathBuf::from(common)
+    } else {
+        canonical_root.join(common)
+    };
+    let canonical_common = fs::canonicalize(&common_path).map_err(|source| CliError::Io {
+        path: common_path.display().to_string(),
+        source,
+    })?;
+    let mut cursor = PathBuf::new();
+    for component in source.components() {
+        cursor.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&cursor).map_err(|source| CliError::Io {
+            path: cursor.display().to_string(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(CliError::Input(format!(
+                "reviewed migration source has symlink component `{}`",
+                cursor.display()
+            )));
+        }
+    }
+    let mut source_options = OpenOptions::new();
+    source_options.read(true);
+    #[cfg(unix)]
+    source_options.custom_flags(libc::O_NOFOLLOW);
+    let mut source_file = source_options
+        .open(source)
+        .map_err(|source_error| CliError::Io {
+            path: source.display().to_string(),
+            source: source_error,
+        })?;
+    let metadata = source_file
+        .metadata()
+        .map_err(|source_error| CliError::Io {
+            path: source.display().to_string(),
+            source: source_error,
+        })?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > contract.max_source_bytes {
+        return Err(CliError::Input(format!(
+            "reviewed migration must be a non-empty regular file no larger than {} bytes",
+            contract.max_source_bytes
+        )));
+    }
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| CliError::Input("reviewed migration size exceeds this host".to_owned()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    source_file
+        .read_to_end(&mut bytes)
+        .map_err(|source_error| CliError::Io {
+            path: source.display().to_string(),
+            source: source_error,
+        })?;
+    let blob_bytes = git_authority_bytes(&canonical_root, &["cat-file", "blob", &git_blob_oid])?;
+    if bytes != blob_bytes || bytes.len() as u64 != metadata.len() {
+        return Err(CliError::Input(
+            "reviewed migration source differs from its exact HEAD Git blob".to_owned(),
+        ));
+    }
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let md5 = hex::encode(Md5::digest(&bytes));
+    let source_authority = json!({
+        "schema_version":1,
+        "repository_id":repository_id,
+        "observed_worktree_root":canonical_root,
+        "observed_git_common_dir":canonical_common,
+        "head":head,
+        "repository_relative_path":relative,
+        "git_blob_oid":git_blob_oid,
+    });
+    let source_authority_hash = hash_value(&source_authority)?;
+    let basename = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| CliError::Input("reviewed migration basename is not UTF-8".to_owned()))?;
+    let stage_dir = store
+        .paths()
+        .data_dir
+        .join("import-stages")
+        .join(Uuid::new_v4().to_string());
+    fs::create_dir_all(&stage_dir).map_err(|source| CliError::Io {
+        path: stage_dir.display().to_string(),
+        source,
+    })?;
+    #[cfg(unix)]
+    fs::set_permissions(&stage_dir, fs::Permissions::from_mode(0o700)).map_err(|source| {
+        CliError::Io {
+            path: stage_dir.display().to_string(),
+            source,
+        }
+    })?;
+    let stage_path = stage_dir.join(basename);
+    let mut stage_options = OpenOptions::new();
+    stage_options.write(true).create_new(true);
+    #[cfg(unix)]
+    stage_options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let mut stage = stage_options
+        .open(&stage_path)
+        .map_err(|source| CliError::Io {
+            path: stage_path.display().to_string(),
+            source,
+        })?;
+    stage.write_all(&bytes).map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    stage.sync_all().map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    drop(stage);
+    let staged = fs::read(&stage_path).map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    if staged != bytes {
+        return Err(CliError::Input(
+            "private import stage did not reopen with the reviewed bytes".to_owned(),
+        ));
+    }
+    let target = json!({
+        "account_id":input.selectors.get("account_id"),
+        "database_id":input.selectors.get("database_id"),
+    });
+    if target
+        .pointer("/account_id")
+        .and_then(Value::as_str)
+        .is_none()
+        || target
+            .pointer("/database_id")
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        return Err(CliError::Input(
+            "reviewed D1 import target selectors are missing".to_owned(),
+        ));
+    }
+    Ok(json!({
+        "schema_version":1,
+        "migration_id":source_authority_hash,
+        "catalog_basename":basename,
+        "source_authority":source_authority,
+        "source_authority_hash":source_authority_hash,
+        "bytes":bytes.len(),
+        "sha256":format!("sha256:{sha256}"),
+        "md5":md5,
+        "stage_path":stage_path,
+        "stage_lifecycle":"preserve_until_verified_or_explicitly_retired",
+        "target":target,
+        "prerequisites":input.body,
+    }))
+}
+
+fn normalize_reviewed_git_repository_id(remote: &str) -> Result<String> {
+    let trimmed = remote.trim().trim_end_matches(".git");
+    if trimmed.contains('?') || trimmed.contains('#') || trimmed.contains('\n') {
+        return Err(CliError::Input(
+            "Git origin contains query, fragment, or control data and cannot be retained safely"
+                .to_owned(),
+        ));
+    }
+    let normalized = if let Some(rest) = trimmed.strip_prefix("https://") {
+        if rest
+            .split('/')
+            .next()
+            .is_none_or(|authority| authority.contains('@'))
+        {
+            return Err(CliError::Input(
+                "Git HTTPS origin must not contain embedded credentials".to_owned(),
+            ));
+        }
+        rest.to_owned()
+    } else if let Some(rest) = trimmed.strip_prefix("ssh://git@") {
+        rest.to_owned()
+    } else if let Some(rest) = trimmed.strip_prefix("git@") {
+        rest.replacen(':', "/", 1)
+    } else {
+        return Err(CliError::Input(
+            "Git origin must be a credential-free HTTPS or git SSH repository identity".to_owned(),
+        ));
+    };
+    if normalized.split('/').count() < 3 || normalized.contains('@') || normalized.contains(':') {
+        return Err(CliError::Input(
+            "Git origin is not a portable host/owner/repository identity".to_owned(),
+        ));
+    }
+    Ok(normalized)
+}
+
 fn git_authority_output(repository_root: &Path, arguments: &[&str]) -> Result<String> {
     let mut command = StdCommand::new("git");
     command.arg("-C").arg(repository_root).args(arguments);
@@ -1893,6 +2160,9 @@ fn validate_approved_mln_import_prerequisites(
     input: &CallInput,
     context: ImportPrerequisiteContext<'_>,
 ) -> Result<()> {
+    if capability.id == "d1-import-database" {
+        return validate_reviewed_git_import_prerequisites(store, input, context);
+    }
     let contract = capability
         .d1_approved_mln_import
         .as_ref()
@@ -2161,6 +2431,73 @@ fn validate_approved_mln_import_prerequisites(
             validator_contract_hash: &contract.pre_import_validator_contract_hash,
             fixed_query_sha256: &contract.pre_import_fixed_query_sha256,
             after: anchor_completed_at,
+            before: context.before,
+        },
+    )?;
+    Ok(())
+}
+
+fn validate_reviewed_git_import_prerequisites(
+    store: &StateStore,
+    input: &CallInput,
+    context: ImportPrerequisiteContext<'_>,
+) -> Result<()> {
+    let body = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::Input("reviewed D1 import body is missing".to_owned()))?;
+    let operation_id = body
+        .get("pre_recovery_anchor_operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .ok_or_else(|| {
+            CliError::Input(
+                "pre_recovery_anchor_operation_id must be a canonical operation id".to_owned(),
+            )
+        })?;
+    if context.import_operation_id == Some(operation_id) {
+        return Err(CliError::Input(
+            "pre-import recovery export must be distinct from the import operation".to_owned(),
+        ));
+    }
+    let evidence_hash = required_body_string(body, "pre_recovery_anchor_evidence_hash")?;
+    let output_sha256 = required_body_string(body, "pre_recovery_anchor_output_sha256")?;
+    let bookmark_hash = required_body_string(body, "pre_recovery_anchor_bookmark_hash")?;
+    store.read_evidence_value(evidence_hash)?;
+    let account_id = input
+        .selectors
+        .get("account_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("reviewed import account_id is missing".to_owned()))?;
+    let database_id = input
+        .selectors
+        .get("database_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("reviewed import database_id is missing".to_owned()))?;
+    let expected_target_hash = hash_value(&json!({
+        "account_id":account_id,
+        "database_id":database_id,
+    }))?;
+    let expected_request_hash = hash_value(&serde_json::to_value(CallInput {
+        selectors: input.selectors.clone(),
+        query: json!({}),
+        ..CallInput::default()
+    })?)?;
+    validate_exact_d1_recovery_anchor(
+        store,
+        &D1RecoveryAnchorExpectation {
+            operation_id,
+            evidence_hash,
+            output_sha256: Some(output_sha256),
+            bookmark_hash,
+            catalog_hash: context.catalog_hash,
+            request_hash: &expected_request_hash,
+            target_scope_hash: &expected_target_hash,
+            account_id,
+            profile_id: context.profile_id,
+            credential_generation_id: context.credential_generation_id,
+            after: None,
             before: context.before,
         },
     )?;
@@ -16840,6 +17177,47 @@ async fn execute_approved_mln_import_poll_resume_plan(
             "the poll-only boundary was crossed but exact durable provider completion was not proven",
         ));
     }
+    if plan.capability.id == "d1-resume-database-import-poll" {
+        let verification = match verify_api_plan(
+            store,
+            executor,
+            plan,
+            &response,
+            execution_input,
+            credential,
+        )
+        .await
+        {
+            Ok(verification) => verification,
+            Err(error) => {
+                return Ok(post_boundary_failure_envelope(
+                    plan,
+                    response_value,
+                    Some(apply_evidence),
+                    lineage_evidence,
+                    &error,
+                    true,
+                    "the reviewed-Git D1 import completed through a poll child, but its exact source receipt could not be persisted",
+                ));
+            }
+        };
+        let finalization: Result<()> =
+            if matches!(plan.status, PlanStatus::Verified | PlanStatus::Failed) {
+                persist_transaction_stage(store, plan, TransactionStageV1::Closed)
+            } else {
+                store.save_plan(plan).map_err(CliError::from)
+            };
+        let finalization_error = finalization.err();
+        return Ok(api_plan_result_envelope(
+            plan,
+            response_value,
+            apply_evidence,
+            lineage_evidence,
+            verification,
+            true,
+            finalization_error.as_ref(),
+        ));
+    }
     plan.status = PlanStatus::Running;
     store.save_plan(plan)?;
     let mut envelope =
@@ -16908,14 +17286,17 @@ fn trusted_native_capability(capability_id: &str) -> Result<CapabilityV1> {
 fn validate_trusted_root_import_plan(store: &StateStore, plan_v2: &PlanV2) -> Result<()> {
     plan_v2.validate()?;
     let plan = &plan_v2.plan;
-    let trusted = trusted_native_capability("d1-import-approved-mln-migration")?;
+    let trusted = trusted_native_capability(&plan.capability.id)?;
     if plan.capability != trusted
         || plan_v2.pins.catalog_hash != plan.catalog_hash
         || plan.precondition_hashes.get("catalog") != Some(&plan.catalog_hash)
     {
         return Err(CliError::Input(
-            "approved MLN import does not match the trusted native catalog declaration".to_owned(),
+            "governed D1 import does not match its trusted native catalog declaration".to_owned(),
         ));
+    }
+    if plan.capability.id == "d1-import-database" {
+        return validate_trusted_reviewed_git_root_plan(store, plan_v2, &trusted);
     }
     let contract = trusted
         .d1_approved_mln_import
@@ -17014,6 +17395,52 @@ fn validate_trusted_root_import_plan(store: &StateStore, plan_v2: &PlanV2) -> Re
         ));
     }
     Ok(())
+}
+
+fn validate_trusted_reviewed_git_root_plan(
+    store: &StateStore,
+    plan_v2: &PlanV2,
+    trusted: &CapabilityV1,
+) -> Result<()> {
+    let plan = &plan_v2.plan;
+    let input: CallInput = serde_json::from_value(plan.input.clone())?;
+    let stage = plan
+        .targets
+        .pointer("/adapter/approved_mln_import")
+        .ok_or_else(|| CliError::Input("trusted reviewed-Git stage is missing".to_owned()))?;
+    let target = stage
+        .get("target")
+        .ok_or_else(|| CliError::Input("trusted reviewed-Git target is missing".to_owned()))?;
+    if input.selectors != *target
+        || input.query != json!({})
+        || input.if_match.is_some()
+        || input.if_none_match.is_some()
+        || stage.get("prerequisites") != input.body.as_ref()
+        || plan.account_id
+            != input
+                .selectors
+                .get("account_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+    {
+        return Err(CliError::Input(
+            "reviewed-Git root input, target, or prerequisite binding drifted".to_owned(),
+        ));
+    }
+    preflight_call_input(trusted, &input, None)?;
+    validate_approved_mln_import_prerequisites(
+        store,
+        trusted,
+        &input,
+        ImportPrerequisiteContext {
+            profile_id: &plan.profile_id,
+            credential_generation_id: Some(&plan_v2.pins.credential_generation_id),
+            catalog_hash: &plan.catalog_hash,
+            import_operation_id: Some(&plan.operation_id),
+            before: plan.created_at,
+        },
+    )?;
+    validate_managed_reviewed_git_stage_authority(plan)
 }
 
 #[expect(
@@ -17188,23 +17615,7 @@ fn exact_durable_provider_complete_boundary(
                 .to_owned(),
         ));
     }
-    let contract = plan
-        .capability
-        .d1_approved_mln_import
-        .as_ref()
-        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
     let input: CallInput = serde_json::from_value(plan.input.clone())?;
-    let migration_id = input
-        .body
-        .as_ref()
-        .and_then(|body| body.get("migration_id"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Input("import migration identity is missing".to_owned()))?;
-    let migration = contract
-        .migrations
-        .iter()
-        .find(|migration| migration.migration_id == migration_id)
-        .ok_or_else(|| CliError::Input("managed import migration is not catalogued".to_owned()))?;
     let staged = plan
         .targets
         .pointer("/adapter/approved_mln_import")
@@ -17214,22 +17625,68 @@ fn exact_durable_provider_complete_boundary(
         .ok_or_else(|| CliError::Input("managed source authority is missing".to_owned()))?;
     let expected_source_authority_hash = hash_value(source_authority)?;
     let expected_stage_identity_hash = hash_value(staged)?;
+    let migration_id = staged
+        .get("migration_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("import migration identity is missing".to_owned()))?;
+    let expected_sha256 = staged
+        .get("sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source SHA-256 is missing".to_owned()))?;
+    let expected_md5 = staged
+        .get("md5")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source MD5 is missing".to_owned()))?;
+    let expected_bytes = staged
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CliError::Input("managed source size is missing".to_owned()))?;
+    let target = staged
+        .get("target")
+        .cloned()
+        .ok_or_else(|| CliError::Input("managed import target is missing".to_owned()))?;
+    let legacy_catalog_matches = if plan.capability.id == "d1-import-database" {
+        staged.get("source_authority_hash").and_then(Value::as_str) == Some(migration_id)
+    } else {
+        let contract = plan
+            .capability
+            .d1_approved_mln_import
+            .as_ref()
+            .ok_or_else(|| CliError::Input("approved import contract is missing".to_owned()))?;
+        contract
+            .migrations
+            .iter()
+            .find(|migration| migration.migration_id == migration_id)
+            .is_some_and(|migration| {
+                source_authority
+                    .get("repository_id")
+                    .and_then(Value::as_str)
+                    == Some(contract.repository_id.as_str())
+                    && source_authority.get("head").and_then(Value::as_str)
+                        == Some(contract.repository_head.as_str())
+                    && source_authority
+                        .get("repository_relative_path")
+                        .and_then(Value::as_str)
+                        == Some(migration.repository_relative_path.as_str())
+                    && source_authority.get("git_blob_oid").and_then(Value::as_str)
+                        == Some(migration.git_blob_oid.as_str())
+                    && staged.get("catalog_basename").and_then(Value::as_str)
+                        == Some(migration.basename.as_str())
+                    && expected_sha256 == format!("sha256:{}", migration.sha256)
+                    && expected_md5 == migration.md5
+                    && expected_bytes == migration.bytes
+                    && target
+                        == json!({
+                            "account_id":contract.account_id,
+                            "database_id":contract.database_id,
+                        })
+            })
+    };
     if source_authority
         .get("schema_version")
         .and_then(Value::as_u64)
         != Some(1)
-        || source_authority
-            .get("repository_id")
-            .and_then(Value::as_str)
-            != Some(contract.repository_id.as_str())
-        || source_authority.get("head").and_then(Value::as_str)
-            != Some(contract.repository_head.as_str())
-        || source_authority
-            .get("repository_relative_path")
-            .and_then(Value::as_str)
-            != Some(migration.repository_relative_path.as_str())
-        || source_authority.get("git_blob_oid").and_then(Value::as_str)
-            != Some(migration.git_blob_oid.as_str())
+        || !legacy_catalog_matches
         || source_authority
             .get("observed_worktree_root")
             .and_then(Value::as_str)
@@ -17242,18 +17699,7 @@ fn exact_durable_provider_complete_boundary(
         || staged.get("source_authority_hash").and_then(Value::as_str)
             != Some(expected_source_authority_hash.as_str())
         || staged.get("migration_id").and_then(Value::as_str) != Some(migration_id)
-        || staged.get("catalog_basename").and_then(Value::as_str)
-            != Some(migration.basename.as_str())
-        || staged.pointer("/target/account_id").and_then(Value::as_str)
-            != Some(contract.account_id.as_str())
-        || staged
-            .pointer("/target/database_id")
-            .and_then(Value::as_str)
-            != Some(contract.database_id.as_str())
-        || staged.get("sha256").and_then(Value::as_str)
-            != Some(format!("sha256:{}", migration.sha256).as_str())
-        || staged.get("md5").and_then(Value::as_str) != Some(migration.md5.as_str())
-        || staged.get("bytes").and_then(Value::as_u64) != Some(migration.bytes)
+        || target.get("account_id").and_then(Value::as_str) != Some(plan.account_id.as_str())
         || staged
             .get("stage_path")
             .and_then(Value::as_str)
@@ -17267,10 +17713,6 @@ fn exact_durable_provider_complete_boundary(
                 .to_owned(),
         ));
     }
-    let target = json!({
-        "account_id":contract.account_id,
-        "database_id":contract.database_id,
-    });
     let input_hash = hash_value(&plan.input)?;
     let checkpoints = store.read_d1_import_checkpoints(operation_id)?;
     let provider_complete = checkpoints
@@ -17348,15 +17790,15 @@ fn exact_durable_provider_complete_boundary(
         && checkpoint
             .pointer("/receipt/source_sha256")
             .and_then(Value::as_str)
-            == Some(format!("sha256:{}", migration.sha256).as_str())
+            == Some(expected_sha256)
         && checkpoint
             .pointer("/receipt/source_md5")
             .and_then(Value::as_str)
-            == Some(migration.md5.as_str())
+            == Some(expected_md5)
         && checkpoint
             .pointer("/receipt/source_bytes")
             .and_then(Value::as_u64)
-            == Some(migration.bytes)
+            == Some(expected_bytes)
         && checkpoint
             .pointer("/receipt/source_authority_hash")
             .and_then(Value::as_str)
@@ -17395,7 +17837,12 @@ fn exact_linear_poll_child_provider_complete(
     store: &StateStore,
     root: &PlanV1,
 ) -> Result<DurableProviderCompleteBoundary> {
-    let canonical_capability = trusted_native_capability("d1-resume-approved-mln-import-poll")?;
+    let resume_capability_id = if root.capability.id == "d1-import-database" {
+        "d1-resume-database-import-poll"
+    } else {
+        "d1-resume-approved-mln-import-poll"
+    };
+    let canonical_capability = trusted_native_capability(resume_capability_id)?;
     let canonical_contract_hash = hash_value(&serde_json::to_value(&canonical_capability)?)?;
     let root_v2 = store.load_plan_v2(&root.operation_id)?;
     validate_trusted_root_import_plan(store, &root_v2)?;
@@ -17415,13 +17862,29 @@ fn exact_linear_poll_child_provider_complete(
         .ok_or_else(|| {
             CliError::Input("trusted poll continuation contract is missing".to_owned())
         })?;
-    let root_target = json!({
-        "account_id":root_contract.account_id,
-        "database_id":root_contract.database_id,
-    });
-    if root.account_id != root_contract.account_id
-        || canonical_contract.account_id != root_contract.account_id
-        || canonical_contract.database_id != root_contract.database_id
+    let root_target = if root.capability.id == "d1-import-database" {
+        root.targets
+            .pointer("/adapter/approved_mln_import/target")
+            .cloned()
+            .ok_or_else(|| CliError::Input("reviewed root import target is missing".to_owned()))?
+    } else {
+        json!({
+            "account_id":root_contract.account_id,
+            "database_id":root_contract.database_id,
+        })
+    };
+    let canonical_target_matches = if root.capability.id == "d1-import-database" {
+        canonical_contract.account_id.is_empty()
+            && canonical_contract.database_id.is_empty()
+            && canonical_contract.root_capability_id == "d1-import-database"
+            && root_target.get("account_id").and_then(Value::as_str)
+                == Some(root.account_id.as_str())
+    } else {
+        root.account_id == root_contract.account_id
+            && canonical_contract.account_id == root_contract.account_id
+            && canonical_contract.database_id == root_contract.database_id
+    };
+    if !canonical_target_matches
         || root.targets.pointer("/adapter/approved_mln_import/target") != Some(&root_target)
     {
         return Err(CliError::Input(
@@ -17432,7 +17895,7 @@ fn exact_linear_poll_child_provider_complete(
         .list_plans()?
         .into_iter()
         .filter(|candidate| {
-            candidate.capability.id == "d1-resume-approved-mln-import-poll"
+            candidate.capability.id == resume_capability_id
                 && candidate
                     .targets
                     .pointer("/adapter/approved_mln_import_poll_resume/root_operation_id")
@@ -17456,7 +17919,7 @@ fn exact_linear_poll_child_provider_complete(
                 || current.pins.catalog_hash != root_v2.pins.catalog_hash
                 || current.pins.credential_generation_id
                     != root_v2.pins.credential_generation_id
-                || current.plan.capability.id != "d1-resume-approved-mln-import-poll"
+                || current.plan.capability.id != resume_capability_id
                 || current.plan.capability != canonical_capability
                 || current.plan.approval.is_none()
             {
@@ -17477,10 +17940,17 @@ fn exact_linear_poll_child_provider_complete(
                 .d1_approved_mln_import_poll_resume
                 .as_ref()
                 .ok_or_else(|| CliError::Input("poll child contract is missing".to_owned()))?;
-            let target = json!({
-                "account_id":contract.account_id,
-                "database_id":contract.database_id,
-            });
+            let target = if resume_capability_id == "d1-resume-database-import-poll" {
+                authority
+                    .get("target")
+                    .cloned()
+                    .ok_or_else(|| CliError::Input("poll child target is missing".to_owned()))?
+            } else {
+                json!({
+                    "account_id":contract.account_id,
+                    "database_id":contract.database_id,
+                })
+            };
             let input: CallInput = serde_json::from_value(current.plan.input.clone())?;
             let body = input
                 .body
@@ -17687,6 +18157,10 @@ fn exact_accepted_ingest_bookmarks(
     let migration_id = plan
         .input
         .pointer("/body/migration_id")
+        .or_else(|| {
+            plan.targets
+                .pointer("/adapter/approved_mln_import/migration_id")
+        })
         .and_then(Value::as_str);
     checkpoints
         .iter()
@@ -17767,15 +18241,23 @@ fn import_plan_runtime_lineage(plan: &PlanV1) -> Result<(Value, String, Option<S
         let migration_id = plan
             .input
             .pointer("/body/migration_id")
+            .or_else(|| {
+                plan.targets
+                    .pointer("/adapter/approved_mln_import/migration_id")
+            })
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 CliError::Input("approved MLN import migration id is missing".to_owned())
             })?;
-        return Ok((
-            json!({"account_id":contract.account_id,"database_id":contract.database_id}),
-            migration_id.to_owned(),
-            None,
-        ));
+        let target = if plan.capability.id == "d1-import-database" {
+            plan.targets
+                .pointer("/adapter/approved_mln_import/target")
+                .cloned()
+                .ok_or_else(|| CliError::Input("reviewed import target is missing".to_owned()))?
+        } else {
+            json!({"account_id":contract.account_id,"database_id":contract.database_id})
+        };
+        return Ok((target, migration_id.to_owned(), None));
     }
     let contract = plan
         .capability
@@ -17787,6 +18269,10 @@ fn import_plan_runtime_lineage(plan: &PlanV1) -> Result<(Value, String, Option<S
     let migration_id = plan
         .targets
         .pointer("/adapter/approved_mln_import_poll_resume/root_input/body/migration_id")
+        .or_else(|| {
+            plan.targets
+                .pointer("/adapter/approved_mln_import_poll_resume/root_stage/migration_id")
+        })
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("poll continuation migration id is missing".to_owned()))?;
     let bookmark = plan
@@ -17794,11 +18280,15 @@ fn import_plan_runtime_lineage(plan: &PlanV1) -> Result<(Value, String, Option<S
         .pointer("/adapter/approved_mln_import_poll_resume/accepted_bookmark")
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("poll continuation bookmark is missing".to_owned()))?;
-    Ok((
-        json!({"account_id":contract.account_id,"database_id":contract.database_id}),
-        migration_id.to_owned(),
-        Some(bookmark.to_owned()),
-    ))
+    let target = if plan.capability.id == "d1-resume-database-import-poll" {
+        plan.targets
+            .pointer("/adapter/approved_mln_import_poll_resume/target")
+            .cloned()
+            .ok_or_else(|| CliError::Input("poll continuation target is missing".to_owned()))?
+    } else {
+        json!({"account_id":contract.account_id,"database_id":contract.database_id})
+    };
+    Ok((target, migration_id.to_owned(), Some(bookmark.to_owned())))
 }
 
 #[expect(
@@ -18176,20 +18666,7 @@ fn exact_durable_init_response_failure(
     store: &StateStore,
     plan: &PlanV1,
 ) -> Result<(EvidenceV1, Value)> {
-    let contract = plan
-        .capability
-        .d1_approved_mln_import
-        .as_ref()
-        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
-    let migration_id = plan
-        .input
-        .pointer("/body/migration_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Input("approved MLN import migration id is missing".to_owned()))?;
-    let target = json!({
-        "account_id":contract.account_id,
-        "database_id":contract.database_id,
-    });
+    let (target, migration_id, _) = import_plan_runtime_lineage(plan)?;
     let input_hash = hash_value(&plan.input)?;
     let failures = store
         .read_d1_import_checkpoints(&plan.operation_id)?
@@ -18251,7 +18728,7 @@ fn exact_durable_init_response_failure(
                 && checkpoint
                     .pointer("/receipt/migration_id")
                     .and_then(Value::as_str)
-                    == Some(migration_id)
+                    == Some(migration_id.as_str())
                 && checkpoint.pointer("/receipt/target") == Some(&target)
                 && checkpoint
                     .pointer("/receipt/plan_input_hash")
@@ -18694,21 +19171,14 @@ fn exact_durable_poll_exhaustion(
     store: &StateStore,
     plan: &PlanV1,
 ) -> Result<(EvidenceV1, Value, EvidenceV1)> {
-    let contract = plan
+    let (target, migration_id, _) = import_plan_runtime_lineage(plan)?;
+    let max_poll_attempts = plan
         .capability
         .d1_approved_mln_import
         .as_ref()
-        .ok_or_else(|| CliError::Input("approved MLN import contract is missing".to_owned()))?;
-    let target = json!({
-        "account_id":contract.account_id,
-        "database_id":contract.database_id,
-    });
+        .map(|contract| contract.max_poll_attempts)
+        .ok_or_else(|| CliError::Input("governed D1 import contract is missing".to_owned()))?;
     let input_hash = hash_value(&plan.input)?;
-    let migration_id = plan
-        .input
-        .pointer("/body/migration_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Input("approved MLN import migration id is missing".to_owned()))?;
     let source_sha256 = plan
         .targets
         .pointer("/adapter/approved_mln_import/sha256")
@@ -18763,14 +19233,14 @@ fn exact_durable_poll_exhaustion(
                 attempt,
                 &target,
                 &input_hash,
-                migration_id,
+                migration_id.as_str(),
                 bookmark,
             );
             exact.then_some((index, attempt))
         })
         .collect::<Vec<_>>();
     attempts.sort_unstable_by_key(|(_, attempt)| *attempt);
-    let expected_attempts = (1..=contract.max_poll_attempts)
+    let expected_attempts = (1..=max_poll_attempts)
         .enumerate()
         .map(|(offset, attempt)| (accepted_index + offset + 1, attempt))
         .collect::<Vec<_>>();
@@ -18795,10 +19265,7 @@ fn exact_durable_poll_exhaustion(
                 .get("receipt")
                 .and_then(Value::as_object)
                 .is_some_and(|receipt| receipt.len() == 12);
-            *index
-                == accepted_index
-                    + usize::try_from(contract.max_poll_attempts).unwrap_or(usize::MAX)
-                    + 1
+            *index == accepted_index + usize::try_from(max_poll_attempts).unwrap_or(usize::MAX) + 1
                 && *index + 1 == checkpoints.len()
                 && checkpoint.get("step").and_then(Value::as_str)
                     == Some("poll_in_progress_exhausted")
@@ -18818,7 +19285,7 @@ fn exact_durable_poll_exhaustion(
                 && checkpoint
                     .pointer("/receipt/migration_id")
                     .and_then(Value::as_str)
-                    == Some(migration_id)
+                    == Some(migration_id.as_str())
                 && checkpoint.pointer("/receipt/target") == Some(&target)
                 && checkpoint
                     .pointer("/receipt/plan_input_hash")
@@ -18835,11 +19302,11 @@ fn exact_durable_poll_exhaustion(
                 && checkpoint
                     .pointer("/receipt/attempt_count")
                     .and_then(Value::as_u64)
-                    == Some(contract.max_poll_attempts)
+                    == Some(max_poll_attempts)
                 && checkpoint
                     .pointer("/receipt/attempt_bound")
                     .and_then(Value::as_u64)
-                    == Some(contract.max_poll_attempts)
+                    == Some(max_poll_attempts)
                 && checkpoint
                     .pointer("/receipt/outcome")
                     .and_then(Value::as_str)
@@ -18960,10 +19427,18 @@ fn exact_resume_poll_exhaustion(
         .d1_approved_mln_import_poll_resume
         .as_ref()
         .ok_or_else(|| CliError::Input("poll continuation contract is missing".to_owned()))?;
-    let target = json!({"account_id":contract.account_id,"database_id":contract.database_id});
+    let target = if plan.capability.id == "d1-resume-database-import-poll" {
+        authority
+            .get("target")
+            .cloned()
+            .ok_or_else(|| CliError::Input("poll continuation target is missing".to_owned()))?
+    } else {
+        json!({"account_id":contract.account_id,"database_id":contract.database_id})
+    };
     let input_hash = hash_value(&plan.input)?;
     let migration_id = root_input
         .pointer("/body/migration_id")
+        .or_else(|| root_stage.get("migration_id"))
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("root migration identity is missing".to_owned()))?;
     let source_sha256 = root_stage
@@ -19194,13 +19669,21 @@ fn exact_durable_resume_provider_complete_boundary(
         .ok_or_else(|| CliError::Input("root stage is missing".to_owned()))?;
     let migration_id = root_input
         .pointer("/body/migration_id")
+        .or_else(|| root_stage.get("migration_id"))
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("root migration identity is missing".to_owned()))?;
     let accepted_bookmark = authority
         .get("accepted_bookmark")
         .and_then(Value::as_str)
         .ok_or_else(|| CliError::Input("accepted bookmark is missing".to_owned()))?;
-    let target = json!({"account_id":contract.account_id,"database_id":contract.database_id});
+    let target = if plan.capability.id == "d1-resume-database-import-poll" {
+        authority
+            .get("target")
+            .cloned()
+            .ok_or_else(|| CliError::Input("poll continuation target is missing".to_owned()))?
+    } else {
+        json!({"account_id":contract.account_id,"database_id":contract.database_id})
+    };
     let input_hash = hash_value(&plan.input)?;
     let checkpoints = store.read_d1_import_checkpoints(&plan.operation_id)?;
     let completed = checkpoints
@@ -19330,6 +19813,28 @@ fn validate_and_derive_resume_poll_authority(
         ));
     };
     let parent = &parent_v2.plan;
+    let parent_target = if contract.root_capability_id == "d1-import-database" {
+        if parent.capability.id == contract.root_capability_id {
+            parent
+                .targets
+                .pointer("/adapter/approved_mln_import/target")
+        } else {
+            parent
+                .targets
+                .pointer("/adapter/approved_mln_import_poll_resume/target")
+        }
+        .cloned()
+        .ok_or_else(|| CliError::Input("poll parent target is missing".to_owned()))?
+    } else {
+        json!({
+            "account_id":contract.account_id,
+            "database_id":contract.database_id,
+        })
+    };
+    let parent_account_id = parent_target
+        .get("account_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("poll parent account target is missing".to_owned()))?;
     if parent.content_hash != field("parent_plan_hash")?
         || parent_v2.pins.catalog_hash != parent.catalog_hash
         || parent_v2.pins.credential_generation_id.is_empty()
@@ -19337,7 +19842,8 @@ fn validate_and_derive_resume_poll_authority(
         || parent.profile_id != profile_id
         || parent.catalog_hash != catalog_hash
         || parent_v2.pins.credential_generation_id != credential_generation_id.unwrap_or_default()
-        || parent.account_id != contract.account_id
+        || parent.account_id != parent_account_id
+        || input.selectors != parent_target
     {
         return Err(CliError::Input(
             "poll continuation parent PlanV2, chronology, profile, credential, account, or catalog drifted"
@@ -19463,7 +19969,7 @@ fn validate_and_derive_resume_poll_authority(
         "root_plan_hash":exhaustion.root_plan_hash,
         "root_input":exhaustion.root_input,
         "root_stage":exhaustion.root_stage,
-        "target":{"account_id":contract.account_id,"database_id":contract.database_id},
+        "target":parent_target,
         "profile_id":profile_id,
         "credential_generation_id":credential_generation_id,
         "catalog_hash":catalog_hash,
@@ -19731,8 +20237,15 @@ async fn execute_approved_mln_import_plan(
             "the import boundary was crossed but exact durable provider completion was not proven",
         ));
     }
-    if plan.capability.id == "d1-import-approved-osint-research-migration" {
-        let subject = "OSINT Research";
+    if matches!(
+        plan.capability.id.as_str(),
+        "d1-import-approved-osint-research-migration" | "d1-import-database"
+    ) {
+        let subject = if plan.capability.id == "d1-import-database" {
+            "reviewed-Git D1"
+        } else {
+            "OSINT Research"
+        };
         let verification = match verify_api_plan(
             store,
             executor,
@@ -19823,6 +20336,9 @@ async fn execute_approved_mln_import_plan(
 }
 
 fn validate_managed_mln_stage_authority(plan: &PlanV1) -> Result<()> {
+    if plan.capability.id == "d1-import-database" {
+        return validate_managed_reviewed_git_stage_authority(plan);
+    }
     let contract = plan
         .capability
         .d1_approved_mln_import
@@ -19909,6 +20425,163 @@ fn validate_managed_mln_stage_authority(plan: &PlanV1) -> Result<()> {
     {
         return Err(CliError::Input(
             "managed import stage no longer matches the consumed reviewed source".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_managed_reviewed_git_stage_authority(plan: &PlanV1) -> Result<()> {
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .filter(|contract| contract.repository_id.is_empty() && contract.migrations.is_empty())
+        .ok_or_else(|| {
+            CliError::Input("provider-generic reviewed-Git import contract is missing".to_owned())
+        })?;
+    let staged = plan
+        .targets
+        .pointer("/adapter/approved_mln_import")
+        .ok_or_else(|| CliError::Input("managed import stage binding is missing".to_owned()))?;
+    let authority = staged
+        .get("source_authority")
+        .ok_or_else(|| CliError::Input("managed source authority is missing".to_owned()))?;
+    let authority_hash = hash_value(authority)?;
+    let root = authority
+        .get("observed_worktree_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::Input("managed source worktree root is missing".to_owned()))?;
+    let common = authority
+        .get("observed_git_common_dir")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            CliError::Input("managed source Git common directory is missing".to_owned())
+        })?;
+    let repository_id = authority
+        .get("repository_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Input("managed source repository identity is missing".to_owned())
+        })?;
+    let head = authority
+        .get("head")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source HEAD is missing".to_owned()))?;
+    let relative = authority
+        .get("repository_relative_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source relative path is missing".to_owned()))?;
+    let blob = authority
+        .get("git_blob_oid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source Git blob is missing".to_owned()))?;
+    let canonical_root = fs::canonicalize(&root).map_err(|source| CliError::Io {
+        path: root.display().to_string(),
+        source,
+    })?;
+    let canonical_common = fs::canonicalize(&common).map_err(|source| CliError::Io {
+        path: common.display().to_string(),
+        source,
+    })?;
+    let remote = git_authority_output(&canonical_root, &["remote", "get-url", "origin"])?;
+    let blob_spec = format!("{head}:{relative}");
+    let observed_blob = git_authority_output(&canonical_root, &["rev-parse", &blob_spec])?;
+    let status = git_authority_output(
+        &canonical_root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    let observed_common =
+        git_authority_output(&canonical_root, &["rev-parse", "--git-common-dir"])?;
+    let observed_common = if Path::new(&observed_common).is_absolute() {
+        PathBuf::from(observed_common)
+    } else {
+        canonical_root.join(observed_common)
+    };
+    let source_path = canonical_root.join(relative);
+    let source_bytes = git_authority_bytes(&canonical_root, &["cat-file", "blob", blob])?;
+    let worktree_bytes = fs::read(&source_path).map_err(|source| CliError::Io {
+        path: source_path.display().to_string(),
+        source,
+    })?;
+    if canonical_root != root
+        || fs::canonicalize(observed_common).ok().as_ref() != Some(&canonical_common)
+        || normalize_reviewed_git_repository_id(&remote)?.as_str() != repository_id
+        || git_authority_output(&canonical_root, &["rev-parse", "HEAD"])? != head
+        || observed_blob != blob
+        || !status.is_empty()
+        || source_bytes != worktree_bytes
+    {
+        return Err(CliError::Input(
+            "reviewed Git source authority changed after planning; do not execute the import"
+                .to_owned(),
+        ));
+    }
+    let bytes = staged
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .filter(|bytes| *bytes > 0 && *bytes <= contract.max_source_bytes)
+        .ok_or_else(|| CliError::Input("managed source size is outside its bound".to_owned()))?;
+    let sha256 = staged
+        .get("sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source SHA-256 is missing".to_owned()))?;
+    let md5 = staged
+        .get("md5")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Input("managed source MD5 is missing".to_owned()))?;
+    let target = json!({
+        "account_id":plan.input.pointer("/selectors/account_id"),
+        "database_id":plan.input.pointer("/selectors/database_id"),
+    });
+    if authority.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || staged.get("source_authority_hash").and_then(Value::as_str)
+            != Some(authority_hash.as_str())
+        || staged.get("migration_id").and_then(Value::as_str) != Some(authority_hash.as_str())
+        || staged.get("target") != Some(&target)
+        || source_bytes.len() as u64 != bytes
+        || format!("sha256:{}", hex::encode(Sha256::digest(&source_bytes))) != sha256
+        || hex::encode(Md5::digest(&source_bytes)) != md5
+    {
+        return Err(CliError::Input(
+            "managed import stage lost its exact source, target, or byte identity".to_owned(),
+        ));
+    }
+    let stage_path = staged
+        .get("stage_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::Input("managed import stage path is missing".to_owned()))?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(&stage_path).map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| CliError::Io {
+        path: stage_path.display().to_string(),
+        source,
+    })?;
+    let mut staged_bytes = Vec::new();
+    file.read_to_end(&mut staged_bytes)
+        .map_err(|source| CliError::Io {
+            path: stage_path.display().to_string(),
+            source,
+        })?;
+    #[cfg(unix)]
+    let private_mode = metadata.permissions().mode() & 0o777 == 0o600;
+    #[cfg(not(unix))]
+    let private_mode = true;
+    if !metadata.is_file()
+        || !private_mode
+        || metadata.len() != bytes
+        || staged_bytes != source_bytes
+    {
+        return Err(CliError::Input(
+            "private managed import stage no longer matches the reviewed source".to_owned(),
         ));
     }
     Ok(())
@@ -26986,14 +27659,15 @@ mod tests {
         validate_approved_mln_repository_authority, validate_closed_import_recovery_bookmark,
         validate_current_permission_groups, validate_entitlement_receipt_precondition,
         validate_global_warp_override_state_receipt_precondition,
-        validate_managed_mln_stage_authority, validate_mln_0143_lineage_result,
-        validate_pages_project_absence_receipt, validate_pages_source_remote_receipt,
-        validate_permission_group_resource_scope, validate_plan_preconditions,
-        validate_request_contract, validate_selected_permission_groups,
-        validate_standing_authority_group_scopes, validate_standing_authority_permission_inventory,
-        validate_token_policy_body, validate_worker_script_secret_semantics,
-        validate_wrangler_worker_versions_input, validate_zone_account_receipt_precondition,
-        validate_zone_id, validated_standing_lineage_token_id, verification_outcome,
+        validate_managed_mln_stage_authority, validate_managed_reviewed_git_stage_authority,
+        validate_mln_0143_lineage_result, validate_pages_project_absence_receipt,
+        validate_pages_source_remote_receipt, validate_permission_group_resource_scope,
+        validate_plan_preconditions, validate_request_contract,
+        validate_selected_permission_groups, validate_standing_authority_group_scopes,
+        validate_standing_authority_permission_inventory, validate_token_policy_body,
+        validate_worker_script_secret_semantics, validate_wrangler_worker_versions_input,
+        validate_zone_account_receipt_precondition, validate_zone_id,
+        validated_standing_lineage_token_id, verification_outcome,
         workspace_operational_proof_posture, workspace_precondition_hashes_for_scope,
         workspace_resource_keys, wrangler_config_directory, wrangler_deploy_version_id,
         wrangler_pages_deployment_has_commit, wrangler_status_has_promoted_version,
@@ -29169,6 +29843,133 @@ mod tests {
         assert!(
             validate_managed_mln_stage_authority(&plan).is_err(),
             "execution must reject a managed stage that drifted after planning"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one executable Git fixture proves generic source capture and execution-time drift gates"
+    )]
+    fn reviewed_git_d1_import_stages_one_exact_clean_head_and_fails_on_drift() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let repository = root.path().join("portable-import");
+        fs::create_dir_all(&repository).expect("repo directory");
+        let repository = fs::canonicalize(repository).expect("canonical repository");
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(arguments)
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {}: {}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .expect("git output")
+                .trim()
+                .to_owned()
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/portable-import.git",
+        ]);
+        let relative = "migrations/0001_authority.sql";
+        let source = repository.join(relative);
+        fs::create_dir_all(source.parent().expect("source parent")).expect("migration directory");
+        let bytes = b"CREATE TABLE authority (id TEXT PRIMARY KEY);\n";
+        fs::write(&source, bytes).expect("migration source");
+        git(&["add", relative]);
+        git(&["commit", "-m", "fixture"]);
+
+        let mut catalog = CatalogSnapshot {
+            schema_version: 1,
+            generated_at: Utc::now(),
+            source_url: "fixture".to_owned(),
+            source_hash: "fixture".to_owned(),
+            schema_hash: String::new(),
+            capabilities: BTreeMap::new(),
+        };
+        ingest_native_control_capabilities(&mut catalog).expect("native capabilities");
+        let capability = catalog
+            .get("d1-import-database")
+            .expect("generic import")
+            .clone();
+        let input = CallInput {
+            selectors: json!({
+                "account_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "database_id":"11111111-1111-4111-8111-111111111111",
+            }),
+            body: Some(json!({
+                "pre_recovery_anchor_operation_id":"22222222-2222-4222-8222-222222222222",
+                "pre_recovery_anchor_evidence_hash":format!("sha256:{}", "a".repeat(64)),
+                "pre_recovery_anchor_output_sha256":format!("sha256:{}", "b".repeat(64)),
+                "pre_recovery_anchor_bookmark_hash":format!("sha256:{}", "c".repeat(64)),
+            })),
+            ..CallInput::default()
+        };
+        let state = tempfile::tempdir().expect("state root");
+        let store = StateStore::open(RuntimePaths::from_root(state.path())).expect("state store");
+        let staged = stage_approved_mln_migration(&store, &capability, &input, &source)
+            .expect("clean reviewed source stages");
+        assert_eq!(staged["bytes"], bytes.len());
+        assert_eq!(
+            staged["sha256"],
+            format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+        );
+        assert_eq!(staged["md5"], hex::encode(Md5::digest(bytes)));
+        assert_eq!(staged["target"], input.selectors);
+        assert_eq!(
+            staged.pointer("/source_authority/repository_id"),
+            Some(&json!("github.com/example/portable-import"))
+        );
+        let stage_path = PathBuf::from(staged["stage_path"].as_str().expect("stage path"));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&stage_path)
+                .expect("stage metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let mut plan = PlanV1::draft(
+            "profile-a",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "catalog-sha",
+            capability.clone(),
+            json!({"adapter":{"approved_mln_import":staged}}),
+        )
+        .expect("generic plan");
+        plan.input = serde_json::to_value(&input).expect("plan input");
+        plan.refresh_hash().expect("plan hash");
+        validate_managed_reviewed_git_stage_authority(&plan)
+            .expect("exact source and stage remain executable");
+
+        fs::write(&source, b"CREATE TABLE drifted (id TEXT);\n").expect("dirty source");
+        assert!(
+            validate_managed_reviewed_git_stage_authority(&plan).is_err(),
+            "execution must fail after checkout drift"
+        );
+        assert!(
+            stage_approved_mln_migration(&store, &capability, &input, &source).is_err(),
+            "planning must reject a dirty repository"
+        );
+        git(&["checkout", "--", relative]);
+        fs::write(&stage_path, b"tampered stage\n").expect("tamper stage");
+        assert!(
+            validate_managed_reviewed_git_stage_authority(&plan).is_err(),
+            "execution must reject a changed private stage"
         );
     }
 
@@ -34457,7 +35258,7 @@ mod tests {
             "required":["name"],
             "x-cfctl-body-required":true,
             "properties":{
-                "jurisdiction":{"type":"string","enum":["eu","fedramp"]},
+                "jurisdiction":{"type":"string","enum":["eu","fedramp","us"]},
                 "name":{"type":"string"},
                 "primary_location_hint":{
                     "type":"string",

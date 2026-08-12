@@ -483,7 +483,7 @@ fn d1_database_create_fixture() -> Value {
                         "type":"object",
                         "required":["name"],
                         "properties":{
-                            "jurisdiction":{"type":"string","enum":["eu","fedramp"]},
+                            "jurisdiction":{"type":"string","enum":["eu","fedramp","us"]},
                             "name":{"type":"string"},
                             "primary_location_hint":{"type":"string","enum":["wnam","enam","weur","eeur","apac","oc"]},
                             "read_replication":{"type":"object","required":["mode"],"properties":{
@@ -14115,4 +14115,85 @@ fn native_control_overlay_adds_exact_bookmark_restore_as_approval_required_recov
     assert!(!encoded.contains("\"timestamp\""));
     assert!(!encoded.contains("\"url\""));
     assert!(capability.rollback.supported);
+}
+
+#[test]
+fn native_control_overlay_graduates_d1_import_to_a_closed_provider_generic_contract() {
+    let mut snapshot = CatalogSnapshot {
+        schema_version: 1,
+        generated_at: Utc::now(),
+        source_url: "fixture".to_owned(),
+        source_hash: "fixture".to_owned(),
+        schema_hash: String::new(),
+        capabilities: BTreeMap::new(),
+    };
+    ingest_native_control_capabilities(&mut snapshot).expect("native control overlay");
+
+    let import = snapshot
+        .get("d1-import-database")
+        .expect("provider-generic D1 import");
+    assert_eq!(import.adapter_status, AdapterStatus::Native);
+    assert_eq!(
+        import.authority_scope,
+        Some(CapabilityAuthorityScopeV1::ProviderGeneric)
+    );
+    assert_eq!(import.risk, RiskClass::Irreversible);
+    assert_eq!(import.effect, EffectClass::DataWrite);
+    assert_eq!(import.permissions, ["D1 Write"]);
+    assert!(import.verification_contract_supported());
+    assert!(import.rollback_contract_supported());
+    let contract = import
+        .d1_approved_mln_import
+        .as_ref()
+        .expect("closed reviewed-Git contract");
+    assert!(contract.repository_id.is_empty());
+    assert!(contract.repository_head.is_empty());
+    assert!(contract.account_id.is_empty());
+    assert!(contract.database_id.is_empty());
+    assert!(contract.migrations.is_empty());
+    assert_eq!(contract.max_source_bytes, 64 * 1024 * 1024);
+    assert!(contract.requires_create_new_mode_0600_stage);
+    let request = import
+        .request_schema
+        .as_ref()
+        .expect("closed request schema");
+    assert_eq!(request["additionalProperties"], false);
+    assert_eq!(
+        request["required"],
+        json!([
+            "pre_recovery_anchor_operation_id",
+            "pre_recovery_anchor_evidence_hash",
+            "pre_recovery_anchor_output_sha256",
+            "pre_recovery_anchor_bookmark_hash"
+        ])
+    );
+    let encoded = serde_json::to_string(request).expect("request JSON");
+    for forbidden in ["action", "etag", "filename", "upload_url", "bookmark"] {
+        if forbidden == "bookmark" {
+            assert!(!encoded.contains("\"bookmark\""));
+        } else {
+            assert!(!encoded.contains(&format!("\"{forbidden}\"")));
+        }
+    }
+
+    let resume = snapshot
+        .get("d1-resume-database-import-poll")
+        .expect("provider-generic poll continuation");
+    assert_eq!(resume.adapter_status, AdapterStatus::Native);
+    assert_eq!(
+        resume.authority_scope,
+        Some(CapabilityAuthorityScopeV1::ProviderGeneric)
+    );
+    assert!(resume.verification_contract_supported());
+    let resume_contract = resume
+        .d1_approved_mln_import_poll_resume
+        .as_ref()
+        .expect("poll-only contract");
+    assert_eq!(resume_contract.root_capability_id, "d1-import-database");
+    assert!(resume_contract.account_id.is_empty());
+    assert!(resume_contract.database_id.is_empty());
+    assert_eq!(
+        resume.request_schema.as_ref().expect("resume body")["additionalProperties"],
+        false
+    );
 }

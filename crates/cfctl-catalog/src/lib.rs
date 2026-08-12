@@ -171,8 +171,24 @@ impl CatalogSnapshot {
             let legacy_contract_matches = legacy_embedded_contract_matches(capability);
             let embeds_workspace_contract = capability.mln_0142_post_import_schema.is_some()
                 || capability.mln_0143_data_invariants.is_some()
-                || capability.d1_approved_mln_import.is_some()
-                || capability.d1_approved_mln_import_poll_resume.is_some();
+                || capability
+                    .d1_approved_mln_import
+                    .as_ref()
+                    .is_some_and(|contract| {
+                        !contract.repository_id.is_empty()
+                            || !contract.repository_head.is_empty()
+                            || !contract.account_id.is_empty()
+                            || !contract.database_id.is_empty()
+                            || !contract.migrations.is_empty()
+                    })
+                || capability
+                    .d1_approved_mln_import_poll_resume
+                    .as_ref()
+                    .is_some_and(|contract| {
+                        !contract.account_id.is_empty()
+                            || !contract.database_id.is_empty()
+                            || contract.root_capability_id != "d1-import-database"
+                    });
             match scope {
                 CapabilityAuthorityScopeV1::LegacyEmbedded if !legacy_contract_matches => {
                     return Err(CatalogError::InvalidAuthorityContract(format!(
@@ -2221,6 +2237,8 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
         d1_schema_introspection_capability(),
         d1_full_export_capability(),
         d1_restore_exact_bookmark_capability(),
+        d1_import_database_capability(),
+        d1_resume_database_import_poll_capability(),
         d1_import_approved_mln_migration_capability(),
         d1_import_approved_osint_research_migration_capability(),
         d1_resume_approved_mln_import_poll_capability(),
@@ -2232,6 +2250,225 @@ pub fn ingest_native_control_capabilities(snapshot: &mut CatalogSnapshot) -> Res
             .insert(capability.id.clone(), capability);
     }
     snapshot.refresh_hash()
+}
+
+fn d1_import_database_capability() -> CapabilityV1 {
+    let hash = serde_json::json!({
+        "type":"string","pattern":"^sha256:[0-9a-f]{64}$","minLength":71,"maxLength":71
+    });
+    let operation = serde_json::json!({
+        "type":"string","format":"uuid","minLength":36,"maxLength":36
+    });
+    let mut capability = CapabilityV1::new(
+        "d1-import-database",
+        "Import one reviewed Git migration into D1",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/import",
+    );
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::ProviderGeneric);
+    capability.description = Some(
+        "Stage one clean tracked SQL file from an exact Git HEAD into a private immutable plan target, then execute Cloudflare's import protocol without accepting caller action, upload URL, filename, ETag, or bookmark controls. Planning requires one exact governed full-export recovery anchor for the same target, profile, credential generation, and catalog. Provider completion verifies the import transaction; schema meaning remains a separate governed D1 introspection receipt."
+            .to_owned(),
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native reviewed-Git D1 import adapter".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec![
+        "apply reviewed D1 migration".to_owned(),
+        "import tracked SQL into D1".to_owned(),
+    ];
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.mutating = true;
+    capability.risk = RiskClass::Irreversible;
+    capability.effect = EffectClass::DataWrite;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.blocked_reason = None;
+    capability.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: Some(0.0),
+        basis: Some(
+            "D1 import has no separate operation charge; ordinary D1 storage, rows-written, and rows-read accounting remains"
+                .to_owned(),
+        ),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![KnowledgeReferenceV1 {
+            title: "D1 pricing".to_owned(),
+            url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        }],
+    };
+    capability.entitlement.available = Some(true);
+    capability.verification.required = true;
+    "d1_import_provider_completion_matches_reviewed_source"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("no_automatic_rollback_use_separately_approved_bookmark_restore".to_owned());
+    capability.rollback.warning = Some(
+        "Import is irreversible in place. Recovery requires a separately planned exact-bookmark restore to the bound pre-import export after quiescence and impact review."
+            .to_owned(),
+    );
+    capability.selectors = [
+        ("account_id", 32_u64, 32_u64),
+        ("database_id", 36_u64, 36_u64),
+    ]
+    .map(|(name, min, max)| SelectorV1 {
+        name: name.to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: Some(format!("Exact D1 {name} bound into the immutable plan.")),
+        contract: Some(SelectorContractV1 {
+            schema: serde_json::json!({"type":"string","minLength":min,"maxLength":max}),
+            query: None,
+        }),
+    })
+    .to_vec();
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object","additionalProperties":false,"x-cfctl-body-required":true,
+        "required":[
+            "pre_recovery_anchor_operation_id",
+            "pre_recovery_anchor_evidence_hash",
+            "pre_recovery_anchor_output_sha256",
+            "pre_recovery_anchor_bookmark_hash"
+        ],
+        "properties":{
+            "pre_recovery_anchor_operation_id":operation,
+            "pre_recovery_anchor_evidence_hash":hash,
+            "pre_recovery_anchor_output_sha256":hash,
+            "pre_recovery_anchor_bookmark_hash":hash
+        }
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_approved_mln_import = Some(cfctl_core::D1ApprovedMlnImportContractV1 {
+        repository_id: String::new(),
+        repository_head: String::new(),
+        pre_import_capability_version: 0,
+        pre_import_validator_contract_hash: String::new(),
+        pre_import_fixed_query_sha256: String::new(),
+        account_id: String::new(),
+        database_id: String::new(),
+        import_path: capability.path.clone(),
+        migrations: Vec::new(),
+        max_source_bytes: 64 * 1024 * 1024,
+        max_response_bytes: 1024 * 1024,
+        max_poll_attempts: 120,
+        max_timeout_seconds: 30,
+        upload_url_suffix: ".r2.cloudflarestorage.com".to_owned(),
+        requires_create_new_mode_0600_stage: true,
+    });
+    capability
+}
+
+fn d1_resume_database_import_poll_capability() -> CapabilityV1 {
+    let hash = serde_json::json!({
+        "type":"string","pattern":"^sha256:[0-9a-f]{64}$","minLength":71,"maxLength":71
+    });
+    let operation = serde_json::json!({
+        "type":"string","format":"uuid","minLength":36,"maxLength":36
+    });
+    let mut capability = CapabilityV1::new(
+        "d1-resume-database-import-poll",
+        "Resume polling one reviewed D1 import",
+        "POST",
+        "/accounts/{account_id}/d1/database/{database_id}/import",
+    );
+    capability.authority_scope = Some(CapabilityAuthorityScopeV1::ProviderGeneric);
+    capability.description = Some(
+        "Create a separately approved poll-only child of one exact durable provider-generic D1 import exhaustion. The runtime derives source, target, profile, credential generation, catalog, accepted bookmark, and provider request from immutable parent authority and never replays init, upload, or ingest."
+            .to_owned(),
+    );
+    "D1".clone_into(&mut capability.product);
+    "cfctl native reviewed-Git D1 import poll continuation".clone_into(&mut capability.source);
+    "account".clone_into(&mut capability.account_scope);
+    capability.aliases = vec!["continue reviewed D1 import polling".to_owned()];
+    capability.permissions = vec!["D1 Write".to_owned()];
+    capability.mutating = true;
+    capability.risk = RiskClass::Irreversible;
+    capability.effect = EffectClass::DataWrite;
+    capability.maturity = Maturity::GenerallyAvailable;
+    capability.adapter_status = AdapterStatus::Native;
+    capability.cost = CostV1 {
+        incremental: false,
+        currency: None,
+        maximum: Some(0.0),
+        basis: Some("Bounded D1 import polling has no incremental operation charge.".to_owned()),
+        known: true,
+        billing_model: BillingModelV1::UsageBased,
+        exposure: CostExposureV1::DownstreamUsage,
+        references: vec![KnowledgeReferenceV1 {
+            title: "D1 pricing".to_owned(),
+            url: "https://developers.cloudflare.com/d1/platform/pricing/".to_owned(),
+            source: "official Cloudflare docs".to_owned(),
+        }],
+    };
+    capability.entitlement.available = Some(true);
+    capability.verification.required = true;
+    "d1_import_provider_completion_matches_reviewed_source"
+        .clone_into(&mut capability.verification.strategy);
+    capability.rollback.supported = true;
+    capability.rollback.strategy =
+        Some("no_automatic_rollback_use_separately_approved_bookmark_restore".to_owned());
+    capability.rollback.warning = Some(
+        "Polling may observe completion. Recovery remains a separately approved exact-bookmark restore."
+            .to_owned(),
+    );
+    capability.selectors = [
+        ("account_id", 32_u64, 32_u64),
+        ("database_id", 36_u64, 36_u64),
+    ]
+    .map(|(name, min, max)| SelectorV1 {
+        name: name.to_owned(),
+        location: "path".to_owned(),
+        required: true,
+        value_type: "string".to_owned(),
+        description: Some(format!(
+            "Target {name} derived from the immutable import root."
+        )),
+        contract: Some(SelectorContractV1 {
+            schema: serde_json::json!({"type":"string","minLength":min,"maxLength":max}),
+            query: None,
+        }),
+    })
+    .to_vec();
+    capability.request_schema = Some(serde_json::json!({
+        "type":"object","additionalProperties":false,"x-cfctl-body-required":true,
+        "required":[
+            "parent_operation_id","parent_plan_hash","exhaustion_evidence_hash",
+            "accepted_ingest_evidence_hash","accepted_bookmark_hash"
+        ],
+        "properties":{
+            "parent_operation_id":operation,
+            "parent_plan_hash":hash,
+            "exhaustion_evidence_hash":hash,
+            "accepted_ingest_evidence_hash":hash,
+            "accepted_bookmark_hash":hash
+        }
+    }));
+    capability.response_contract = Some(ResponseContractV1 {
+        success_statuses: vec!["200".to_owned()],
+        success_media_types: vec!["application/json".to_owned()],
+        body_mode: ResponseBodyModeV1::CloudflareJsonEnvelope,
+    });
+    capability.d1_approved_mln_import_poll_resume =
+        Some(cfctl_core::D1ApprovedMlnImportPollResumeContractV1 {
+            root_capability_id: "d1-import-database".to_owned(),
+            account_id: String::new(),
+            database_id: String::new(),
+            import_path: capability.path.clone(),
+            max_response_bytes: 1024 * 1024,
+            max_poll_attempts: 120,
+            max_timeout_seconds: 30,
+        });
+    capability
 }
 
 const MLN_0142_TRIGGER_DEFINITION: &str = r"CREATE TRIGGER document_render_jobs_terminal_generation_guard
@@ -2465,6 +2702,7 @@ fn d1_import_approved_mln_migration_capability() -> CapabilityV1 {
                 md5: "bd50b7e05cc13c20f17eb8748472eb4b".to_owned(),
             },
         ],
+        max_source_bytes: 16 * 1024 * 1024,
         max_response_bytes: 1024 * 1024,
         max_poll_attempts: 120,
         max_timeout_seconds: 30,
@@ -2652,6 +2890,7 @@ fn d1_import_approved_osint_research_migration_capability() -> CapabilityV1 {
                 md5: "88bd54cd5a408fe3234513af4abd3d8d".to_owned(),
             },
         ],
+        max_source_bytes: 16 * 1024 * 1024,
         max_response_bytes: 1024 * 1024,
         max_poll_attempts: 120,
         max_timeout_seconds: 30,
@@ -13515,7 +13754,7 @@ fn d1_database_create_operation_supported(capability: &CapabilityV1) -> bool {
         && capability.request_schema.as_ref()
             == Some(&serde_json::json!({
                 "properties": {
-                    "jurisdiction": {"enum": ["eu", "fedramp"], "type": "string"},
+                    "jurisdiction": {"enum": ["eu", "fedramp", "us"], "type": "string"},
                     "name": {"type": "string"},
                     "primary_location_hint": {
                         "enum": ["wnam", "enam", "weur", "eeur", "apac", "oc"],

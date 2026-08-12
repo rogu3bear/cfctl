@@ -945,24 +945,23 @@ fn persist_import_poll_exhausted<F>(persist: &mut F, plan: &PlanV1, at_bookmark:
 where
     F: FnMut(&D1ImportCheckpointV1) -> std::result::Result<(), String>,
 {
-    let (account_id, database_id, max_poll_attempts) =
-        if let Some(contract) = plan.capability.d1_approved_mln_import.as_ref() {
-            (
-                contract.account_id.as_str(),
-                contract.database_id.as_str(),
-                contract.max_poll_attempts,
-            )
-        } else if let Some(contract) = plan.capability.d1_approved_mln_import_poll_resume.as_ref() {
-            (
-                contract.account_id.as_str(),
-                contract.database_id.as_str(),
-                contract.max_poll_attempts,
-            )
-        } else {
-            return Err(CloudflareError::InvalidRequestBody(
-                "approved MLN import poll contract is missing".to_owned(),
-            ));
-        };
+    let max_poll_attempts = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .map(|contract| contract.max_poll_attempts)
+        .or_else(|| {
+            plan.capability
+                .d1_approved_mln_import_poll_resume
+                .as_ref()
+                .map(|contract| contract.max_poll_attempts)
+        })
+        .ok_or_else(|| {
+            CloudflareError::InvalidRequestBody("governed D1 import contract is missing".to_owned())
+        })?;
+    let target = import_target(plan).ok_or_else(|| {
+        CloudflareError::InvalidRequestBody("governed D1 import target is missing".to_owned())
+    })?;
     let migration_id = import_lineage_value(plan, "migration_id");
     let source_sha256 = import_lineage_value(plan, "source_sha256");
     persist(&D1ImportCheckpointV1 {
@@ -975,10 +974,7 @@ where
             "provider":"cloudflare",
             "effect":"d1_import_poll_in_progress_exhausted",
             "migration_id":migration_id,
-            "target":{
-                "account_id":account_id,
-                "database_id":database_id,
-            },
+            "target":target,
             "plan_input_hash":hash_value(&plan.input)?,
             "source_sha256":source_sha256,
             "at_bookmark":at_bookmark,
@@ -998,9 +994,17 @@ fn import_lineage_value<'a>(plan: &'a PlanV1, field: &str) -> Option<&'a str> {
             .input
             .pointer("/body/migration_id")
             .or_else(|| {
+                plan.targets
+                    .pointer("/adapter/approved_mln_import/migration_id")
+            })
+            .or_else(|| {
                 plan.targets.pointer(
                     "/adapter/approved_mln_import_poll_resume/root_input/body/migration_id",
                 )
+            })
+            .or_else(|| {
+                plan.targets
+                    .pointer("/adapter/approved_mln_import_poll_resume/root_stage/migration_id")
             })
             .and_then(Value::as_str),
         "source_sha256" => plan
@@ -1016,6 +1020,18 @@ fn import_lineage_value<'a>(plan: &'a PlanV1, field: &str) -> Option<&'a str> {
 }
 
 fn import_target(plan: &PlanV1) -> Option<Value> {
+    if plan.capability.id == "d1-import-database" {
+        return plan
+            .targets
+            .pointer("/adapter/approved_mln_import/target")
+            .cloned();
+    }
+    if plan.capability.id == "d1-resume-database-import-poll" {
+        return plan
+            .targets
+            .pointer("/adapter/approved_mln_import_poll_resume/target")
+            .cloned();
+    }
     plan.capability
         .d1_approved_mln_import
         .as_ref()
@@ -1036,6 +1052,141 @@ fn import_target(plan: &PlanV1) -> Option<Value> {
                     })
                 })
         })
+}
+
+#[derive(Debug)]
+struct D1ImportSourceBinding {
+    migration_id: String,
+    basename: String,
+    bytes: u64,
+    sha256: String,
+    md5: String,
+    account_id: String,
+    database_id: String,
+}
+
+fn d1_import_source_binding(plan: &PlanV1, input: &CallInput) -> Result<D1ImportSourceBinding> {
+    let contract = plan
+        .capability
+        .d1_approved_mln_import
+        .as_ref()
+        .ok_or_else(|| {
+            CloudflareError::InvalidRequestBody("governed D1 import contract is missing".to_owned())
+        })?;
+    if plan.capability.id == "d1-import-database" {
+        let stage = plan
+            .targets
+            .pointer("/adapter/approved_mln_import")
+            .ok_or_else(|| {
+                CloudflareError::InvalidRequestBody(
+                    "reviewed-Git import stage binding is missing".to_owned(),
+                )
+            })?;
+        let required = |field: &str| {
+            stage
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    CloudflareError::InvalidRequestBody(format!(
+                        "reviewed-Git import stage omitted {field}"
+                    ))
+                })
+        };
+        let migration_id = required("migration_id")?;
+        let basename = required("catalog_basename")?;
+        let sha256 = required("sha256")?
+            .strip_prefix("sha256:")
+            .filter(|value| value.len() == 64)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                CloudflareError::InvalidRequestBody(
+                    "reviewed-Git import SHA-256 is malformed".to_owned(),
+                )
+            })?;
+        let md5 = required("md5")?;
+        let bytes = stage
+            .get("bytes")
+            .and_then(Value::as_u64)
+            .filter(|bytes| *bytes > 0 && *bytes <= contract.max_source_bytes)
+            .ok_or_else(|| {
+                CloudflareError::InvalidRequestBody(
+                    "reviewed-Git import source size is outside its bound".to_owned(),
+                )
+            })?;
+        let account_id = input
+            .selectors
+            .get("account_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::InvalidRequestBody(
+                    "reviewed-Git import account target is missing".to_owned(),
+                )
+            })?
+            .to_owned();
+        let database_id = input
+            .selectors
+            .get("database_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CloudflareError::InvalidRequestBody(
+                    "reviewed-Git import database target is missing".to_owned(),
+                )
+            })?
+            .to_owned();
+        let target = serde_json::json!({
+            "account_id":account_id,
+            "database_id":database_id,
+        });
+        if stage.get("target") != Some(&target)
+            || md5.len() != 32
+            || migration_id
+                != stage
+                    .get("source_authority_hash")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+        {
+            return Err(CloudflareError::InvalidRequestBody(
+                "reviewed-Git import stage source or target identity drifted".to_owned(),
+            ));
+        }
+        return Ok(D1ImportSourceBinding {
+            migration_id,
+            basename,
+            bytes,
+            sha256,
+            md5,
+            account_id,
+            database_id,
+        });
+    }
+    let migration_id = input
+        .body
+        .as_ref()
+        .and_then(|body| body.get("migration_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| CloudflareError::MissingRequestBody(plan.capability.id.clone()))?;
+    let migration = contract
+        .migrations
+        .iter()
+        .find(|migration| migration.migration_id == migration_id)
+        .ok_or_else(|| {
+            CloudflareError::InvalidRequestBody(
+                "migration is absent from the approved catalogue".to_owned(),
+            )
+        })?;
+    Ok(D1ImportSourceBinding {
+        migration_id: migration.migration_id.clone(),
+        basename: migration.basename.clone(),
+        bytes: migration.bytes,
+        sha256: migration.sha256.clone(),
+        md5: migration.md5.clone(),
+        account_id: contract.account_id.clone(),
+        database_id: contract.database_id.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -2549,21 +2700,8 @@ impl Executor {
                 )
             })?;
         validate_d1_approved_mln_import_contract(&plan.capability, input)?;
-        let migration_id = input
-            .body
-            .as_ref()
-            .and_then(|body| body.get("migration_id"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| CloudflareError::MissingRequestBody(plan.capability.id.clone()))?;
-        let migration = contract
-            .migrations
-            .iter()
-            .find(|migration| migration.migration_id == migration_id)
-            .ok_or_else(|| {
-                CloudflareError::InvalidRequestBody(
-                    "migration is absent from the approved catalogue".to_owned(),
-                )
-            })?;
+        let migration = d1_import_source_binding(plan, input)?;
+        let migration_id = migration.migration_id.as_str();
         if stage_path.file_name().and_then(|name| name.to_str())
             != Some(migration.basename.as_str())
         {
@@ -2649,7 +2787,11 @@ impl Executor {
                 return Err(error);
             }
         };
-        let init_fields = match classify_d1_import_init_response(&init, contract) {
+        let init_fields = match classify_d1_import_init_response(
+            &init,
+            &migration.account_id,
+            &contract.upload_url_suffix,
+        ) {
             Ok(fields) => fields,
             Err(rejection) => {
                 plan.status = PlanStatus::RectificationRequired;
@@ -2694,8 +2836,8 @@ impl Executor {
         };
         let upload_status = upload_status.as_u16();
         let upload_target = serde_json::json!({
-            "account_id":contract.account_id,
-            "database_id":contract.database_id,
+            "account_id":migration.account_id,
+            "database_id":migration.database_id,
         });
         let upload_binding = serde_json::json!({
             "provider":"cloudflare",
@@ -2863,7 +3005,7 @@ impl Executor {
                             "source_bytes":migration.bytes,
                             "source_authority_hash":staged_identity.get("source_authority_hash"),
                             "stage_identity_hash":hash_value(staged_identity)?,
-                            "target":{"account_id":contract.account_id,"database_id":contract.database_id},
+                            "target":{"account_id":migration.account_id,"database_id":migration.database_id},
                             "plan_input_hash":hash_value(&plan.input)?,
                             "prerequisites":input.body,
                             "at_bookmark":at_bookmark,
@@ -3075,6 +3217,9 @@ impl Executor {
             return self
                 .verify_closed_schema_migration(plan, apply_response, input, credential)
                 .await;
+        }
+        if strategy == "d1_import_provider_completion_matches_reviewed_source" {
+            return verify_reviewed_git_import_completion(plan, apply_response);
         }
         if strategy.starts_with("api_token_details_") {
             return self
@@ -8989,6 +9134,82 @@ fn validate_verification_preconditions(capability: &CapabilityV1, input: &CallIn
     }
 }
 
+fn verify_reviewed_git_import_completion(
+    plan: &PlanV1,
+    apply_response: &CloudflareResponseV1,
+) -> Result<OperationVerificationV1> {
+    let stage = if plan.capability.id == "d1-import-database" {
+        plan.targets.pointer("/adapter/approved_mln_import")
+    } else if plan.capability.id == "d1-resume-database-import-poll" {
+        plan.targets
+            .pointer("/adapter/approved_mln_import_poll_resume/root_stage")
+    } else {
+        None
+    }
+    .ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "reviewed-Git import verification stage is missing".to_owned(),
+        )
+    })?;
+    let target = import_target(plan).ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "reviewed-Git import verification target is missing".to_owned(),
+        )
+    })?;
+    let receipt = apply_response.result.get("_cfctl").ok_or_else(|| {
+        CloudflareError::MissingVerificationTarget(
+            "reviewed-Git import completion receipt is missing".to_owned(),
+        )
+    })?;
+    let expected_stage_hash = hash_value(stage)?;
+    let expected_prerequisites = if plan.capability.id == "d1-import-database" {
+        plan.input.get("body")
+    } else {
+        plan.targets
+            .pointer("/adapter/approved_mln_import_poll_resume/root_input/body")
+    };
+    let passed = apply_response.status == 200
+        && apply_response.success
+        && apply_response.errors.is_empty()
+        && receipt.get("provider").and_then(Value::as_str) == Some("cloudflare")
+        && receipt.get("effect").and_then(Value::as_str) == Some("d1_import_provider_complete")
+        && receipt.get("response_action").and_then(Value::as_str) == Some("poll")
+        && receipt.get("no_replay").and_then(Value::as_bool) == Some(true)
+        && receipt.get("provider_status").and_then(Value::as_str) == Some("complete")
+        && receipt.get("provider_success").and_then(Value::as_bool) == Some(true)
+        && receipt.get("state").and_then(Value::as_str) == Some("provider_complete")
+        && receipt.get("migration_id") == stage.get("migration_id")
+        && receipt.get("source_sha256") == stage.get("sha256")
+        && receipt.get("source_md5") == stage.get("md5")
+        && receipt.get("source_bytes") == stage.get("bytes")
+        && receipt.get("source_authority_hash") == stage.get("source_authority_hash")
+        && receipt.get("stage_identity_hash").and_then(Value::as_str)
+            == Some(expected_stage_hash.as_str())
+        && receipt.get("target") == Some(&target)
+        && receipt.get("prerequisites") == expected_prerequisites
+        && receipt
+            .get("at_bookmark")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && receipt
+            .get("final_bookmark")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+    Ok(OperationVerificationV1 {
+        strategy: plan.capability.verification.strategy.clone(),
+        passed,
+        basis: if passed {
+            "Cloudflare reported provider completion for the exact reviewed Git source, immutable target, and recovery prerequisites; schema semantics require separate governed D1 introspection"
+                .to_owned()
+        } else {
+            "Cloudflare's provider-complete receipt did not match the exact reviewed Git source, immutable target, or recovery prerequisites"
+                .to_owned()
+        },
+        readback: apply_response.clone(),
+        correlated_resource_id: None,
+    })
+}
+
 fn osint_research_schema_marker_sql(migration_id: &str) -> Result<&'static str> {
     match migration_id {
         "0028" => Ok(
@@ -10193,6 +10414,9 @@ fn validate_d1_approved_mln_import_contract(
     let Some(contract) = capability.d1_approved_mln_import.as_ref() else {
         return Ok(());
     };
+    if capability.id == "d1-import-database" {
+        return validate_d1_reviewed_git_import_contract(capability, input, contract);
+    }
     if capability.id == "d1-import-approved-osint-research-migration" {
         return validate_d1_approved_osint_research_import_contract(capability, input, contract);
     }
@@ -10273,6 +10497,7 @@ fn validate_d1_approved_mln_import_contract(
         && contract.migrations[1].sha256
             == "9b089ead4c284fe92f8a9f81296ac34aa98702585305e36b5c4f345fe774871d"
         && contract.migrations[1].md5 == "bd50b7e05cc13c20f17eb8748472eb4b"
+        && contract.max_source_bytes == 16 * 1024 * 1024
         && contract.requires_create_new_mode_0600_stage
         && contract.upload_url_suffix == ".r2.cloudflarestorage.com"
         && (1..=1024 * 1024).contains(&contract.max_response_bytes)
@@ -10291,6 +10516,79 @@ fn validate_d1_approved_mln_import_contract(
     if !supported {
         return Err(CloudflareError::InvalidRequestBody(
             "approved MLN import identity, target, closed prerequisites, or bounds drifted"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_d1_reviewed_git_import_contract(
+    capability: &CapabilityV1,
+    input: &CallInput,
+    contract: &D1ApprovedMlnImportContractV1,
+) -> Result<()> {
+    let expected = [
+        "pre_recovery_anchor_operation_id",
+        "pre_recovery_anchor_evidence_hash",
+        "pre_recovery_anchor_output_sha256",
+        "pre_recovery_anchor_bookmark_hash",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let keys = input
+        .body
+        .as_ref()
+        .and_then(Value::as_object)
+        .map(|body| body.keys().map(String::as_str).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let selectors = input.selectors.as_object();
+    let account = input.selectors.get("account_id").and_then(Value::as_str);
+    let database = input.selectors.get("database_id").and_then(Value::as_str);
+    let supported = capability.authority_scope
+        == Some(cfctl_core::CapabilityAuthorityScopeV1::ProviderGeneric)
+        && capability.method == "POST"
+        && capability.path == contract.import_path
+        && capability.path == "/accounts/{account_id}/d1/database/{database_id}/import"
+        && capability.product == "D1"
+        && capability.account_scope == "account"
+        && capability.adapter_status == AdapterStatus::Native
+        && capability.mutating
+        && capability.risk == RiskClass::Irreversible
+        && capability.effect == cfctl_core::EffectClass::DataWrite
+        && capability.permissions == ["D1 Write"]
+        && capability.verification.strategy
+            == "d1_import_provider_completion_matches_reviewed_source"
+        && selectors.is_some_and(|selectors| selectors.len() == 2)
+        && account.is_some_and(|value| value.len() == 32)
+        && database.is_some_and(|value| value.len() == 36)
+        && keys == expected
+        && contract.repository_id.is_empty()
+        && contract.repository_head.is_empty()
+        && contract.pre_import_capability_version == 0
+        && contract.pre_import_validator_contract_hash.is_empty()
+        && contract.pre_import_fixed_query_sha256.is_empty()
+        && contract.account_id.is_empty()
+        && contract.database_id.is_empty()
+        && contract.migrations.is_empty()
+        && contract.max_source_bytes == 64 * 1024 * 1024
+        && contract.requires_create_new_mode_0600_stage
+        && contract.upload_url_suffix == ".r2.cloudflarestorage.com"
+        && (1..=1024 * 1024).contains(&contract.max_response_bytes)
+        && (1..=120).contains(&contract.max_poll_attempts)
+        && (1..=30).contains(&contract.max_timeout_seconds)
+        && capability.analytics_query.is_none()
+        && capability.d1_schema_introspection.is_none()
+        && capability.mln_0143_data_invariants.is_none()
+        && capability.d1_full_export.is_none()
+        && capability.d1_restore_exact_bookmark.is_none()
+        && capability.r2_log_retrieval.is_none()
+        && input
+            .query
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+    if !supported {
+        return Err(CloudflareError::InvalidRequestBody(
+            "reviewed-Git D1 import identity, target, closed prerequisites, or bounds drifted"
                 .to_owned(),
         ));
     }
@@ -10427,6 +10725,7 @@ fn validate_d1_approved_osint_research_import_contract(
         && contract.account_id == "ca30e922fda7f5578e49873542e4aaca"
         && contract.database_id == "1c1ce476-73ab-4dd6-a2e2-de0c155ade61"
         && migration_catalog_matches
+        && contract.max_source_bytes == 16 * 1024 * 1024
         && contract.requires_create_new_mode_0600_stage
         && contract.upload_url_suffix == ".r2.cloudflarestorage.com"
         && (1..=1024 * 1024).contains(&contract.max_response_bytes)
@@ -10475,8 +10774,11 @@ fn validate_d1_approved_mln_import_poll_resume_contract(
         .unwrap_or_default();
     let account = input.selectors.get("account_id").and_then(Value::as_str);
     let database = input.selectors.get("database_id").and_then(Value::as_str);
-    let supported = capability.id == "d1-resume-approved-mln-import-poll"
-        && capability.method == "POST"
+    let generic = capability.id == "d1-resume-database-import-poll";
+    let supported = matches!(
+        capability.id.as_str(),
+        "d1-resume-approved-mln-import-poll" | "d1-resume-database-import-poll"
+    ) && capability.method == "POST"
         && capability.path == contract.import_path
         && capability.path == "/accounts/{account_id}/d1/database/{database_id}/import"
         && capability.product == "D1"
@@ -10486,9 +10788,21 @@ fn validate_d1_approved_mln_import_poll_resume_contract(
         && capability.risk == RiskClass::Irreversible
         && capability.effect == cfctl_core::EffectClass::DataWrite
         && capability.permissions == ["D1 Write"]
-        && account == Some(contract.account_id.as_str())
-        && database == Some(contract.database_id.as_str())
-        && contract.root_capability_id == "d1-import-approved-mln-migration"
+        && if generic {
+            capability.authority_scope
+                == Some(cfctl_core::CapabilityAuthorityScopeV1::ProviderGeneric)
+                && account.is_some_and(|value| value.len() == 32)
+                && database.is_some_and(|value| value.len() == 36)
+                && contract.account_id.is_empty()
+                && contract.database_id.is_empty()
+                && contract.root_capability_id == "d1-import-database"
+                && capability.verification.strategy
+                    == "d1_import_provider_completion_matches_reviewed_source"
+        } else {
+            account == Some(contract.account_id.as_str())
+                && database == Some(contract.database_id.as_str())
+                && contract.root_capability_id == "d1-import-approved-mln-migration"
+        }
         && keys == expected
         && (1..=1024 * 1024).contains(&contract.max_response_bytes)
         && (1..=120).contains(&contract.max_poll_attempts)
@@ -10537,9 +10851,9 @@ fn validate_d1_import_upload_url(
     raw: &str,
     contract: &D1ApprovedMlnImportContractV1,
 ) -> Result<Url> {
-    classify_d1_import_upload_url(raw, contract).map_err(|rejection| {
-        CloudflareError::InvalidRequestBody(rejection.provider_message().to_owned())
-    })
+    classify_d1_import_upload_url(raw, &contract.account_id, &contract.upload_url_suffix).map_err(
+        |rejection| CloudflareError::InvalidRequestBody(rejection.provider_message().to_owned()),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10564,7 +10878,8 @@ impl D1ImportUploadUrlRejection {
 
 fn classify_d1_import_upload_url(
     raw: &str,
-    contract: &D1ApprovedMlnImportContractV1,
+    account_id: &str,
+    upload_url_suffix: &str,
 ) -> std::result::Result<Url, D1ImportUploadUrlRejection> {
     let raw_authority = raw
         .split_once("://")
@@ -10572,7 +10887,7 @@ fn classify_d1_import_upload_url(
         .unwrap_or_default();
     let url = Url::parse(raw).map_err(|_| D1ImportUploadUrlRejection::AuthorityOrShape)?;
     let host = url.host_str().unwrap_or_default();
-    let expected_host = format!("{}{}", contract.account_id, contract.upload_url_suffix);
+    let expected_host = format!("{account_id}{upload_url_suffix}");
     let required_query_keys = [
         "X-Amz-Algorithm",
         "X-Amz-Credential",
@@ -10794,7 +11109,8 @@ impl D1ImportInitRejection {
 
 fn classify_d1_import_init_response(
     response: &CloudflareResponseV1,
-    contract: &D1ApprovedMlnImportContractV1,
+    account_id: &str,
+    upload_url_suffix: &str,
 ) -> std::result::Result<AcceptedD1ImportInit, D1ImportInitRejection> {
     if !response.success {
         return Err(D1ImportInitRejection::TopLevel);
@@ -10814,14 +11130,13 @@ fn classify_d1_import_init_response(
         .get("upload_url")
         .and_then(Value::as_str)
         .ok_or(D1ImportInitRejection::UploadUrlMissingOrNonString)?;
-    let upload_url = classify_d1_import_upload_url(upload_url_raw, contract).map_err(
-        |rejection| match rejection {
-            D1ImportUploadUrlRejection::AuthorityOrShape => {
-                D1ImportInitRejection::UploadUrlAuthorityOrShape
-            }
-            D1ImportUploadUrlRejection::Signature => D1ImportInitRejection::UploadUrlSignature,
-        },
-    )?;
+    let upload_url = classify_d1_import_upload_url(upload_url_raw, account_id, upload_url_suffix)
+        .map_err(|rejection| match rejection {
+        D1ImportUploadUrlRejection::AuthorityOrShape => {
+            D1ImportInitRejection::UploadUrlAuthorityOrShape
+        }
+        D1ImportUploadUrlRejection::Signature => D1ImportInitRejection::UploadUrlSignature,
+    })?;
     Ok(AcceptedD1ImportInit {
         filename,
         upload_url,
@@ -10963,11 +11278,20 @@ fn projected_d1_import_init_result(
     let filename = response.result.get("filename").and_then(Value::as_str);
     let parsed_upload_url = upload_url.and_then(|value| Url::parse(value).ok());
     let upload_url_host = parsed_upload_url.as_ref().and_then(Url::host_str);
-    let expected_upload_url_host = plan
-        .capability
-        .d1_approved_mln_import
-        .as_ref()
-        .map(|contract| format!("{}{}", contract.account_id, contract.upload_url_suffix));
+    let expected_upload_url_host =
+        plan.capability
+            .d1_approved_mln_import
+            .as_ref()
+            .and_then(|contract| {
+                import_target(plan)
+                    .and_then(|target| {
+                        target
+                            .get("account_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .map(|account_id| format!("{account_id}{}", contract.upload_url_suffix))
+            });
     serde_json::json!({
         "type":projected_d1_import_type(&response.result),
         "status":projected_d1_import_status(&response.result),
@@ -11162,6 +11486,7 @@ mod approved_mln_import_tests {
             database_id: "7c282983-2e48-4ea4-9f0d-09b0d718fe65".to_owned(),
             import_path: "/accounts/{account_id}/d1/database/{database_id}/import".to_owned(),
             migrations: Vec::new(),
+            max_source_bytes: 16 * 1024 * 1024,
             max_response_bytes: 1_048_576,
             max_poll_attempts: 120,
             max_timeout_seconds: 300,
@@ -11394,8 +11719,12 @@ mod approved_mln_import_tests {
                 "upload_url":valid_url,
             }),
         );
-        let accepted =
-            classify_d1_import_init_response(&valid, &contract).expect("official init response");
+        let accepted = classify_d1_import_init_response(
+            &valid,
+            &contract.account_id,
+            &contract.upload_url_suffix,
+        )
+        .expect("official init response");
         assert_eq!(accepted.filename, "upload.sql");
         assert_eq!(accepted.upload_url.scheme(), "https");
 
@@ -11427,8 +11756,12 @@ mod approved_mln_import_tests {
             ),
         ] {
             assert_eq!(
-                classify_d1_import_init_response(&response(true, result), &contract)
-                    .expect_err("rejected init shape"),
+                classify_d1_import_init_response(
+                    &response(true, result),
+                    &contract.account_id,
+                    &contract.upload_url_suffix,
+                )
+                .expect_err("rejected init shape"),
                 expected
             );
         }
@@ -11438,7 +11771,8 @@ mod approved_mln_import_tests {
                     false,
                     json!({"filename":"upload.sql","upload_url":valid_url})
                 ),
-                &contract
+                &contract.account_id,
+                &contract.upload_url_suffix,
             )
             .expect_err("rejected top-level response"),
             D1ImportInitRejection::TopLevel
@@ -11457,7 +11791,14 @@ mod approved_mln_import_tests {
         ];
         let upload_attempts = 0_u8;
         for result in invalid_results {
-            assert!(classify_d1_import_init_response(&response(true, result), &contract).is_err());
+            assert!(
+                classify_d1_import_init_response(
+                    &response(true, result),
+                    &contract.account_id,
+                    &contract.upload_url_suffix,
+                )
+                .is_err()
+            );
         }
         assert!(
             classify_d1_import_init_response(
@@ -11465,7 +11806,8 @@ mod approved_mln_import_tests {
                     false,
                     json!({"filename":"upload.sql","upload_url":valid_url})
                 ),
-                &contract
+                &contract.account_id,
+                &contract.upload_url_suffix,
             )
             .is_err()
         );
